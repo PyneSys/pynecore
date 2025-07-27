@@ -9,9 +9,9 @@ from ..utils.error_hook import setup_global_error_logging
 from ...providers import available_providers
 
 # Import commands
-from . import run, data, compile, benchmark
+from . import run, data, compile, benchmark, plugins
 
-__all__ = ['run', 'data', 'compile', 'benchmark']
+__all__ = ['run', 'data', 'compile', 'benchmark', 'plugins']
 
 
 @app.callback()

@@ -11,7 +11,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
 from ..app import app, app_state
-from ...providers import available_providers
+from ...providers import get_available_providers, get_provider_class
 from ...providers.provider import Provider
 
 from ...utils.rich.date_column import DateColumn
@@ -22,8 +22,9 @@ __all__ = []
 app_data = Typer(help="OHLCV related commands")
 app.add_typer(app_data, name="data")
 
-# Create an enum from it
-AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
+# Create an enum from available providers (built-in + plugins)
+_available_providers = get_available_providers()
+AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in _available_providers})
 
 # Available intervals (The same fmt as described in timeframe.period)
 TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W')})
@@ -83,9 +84,11 @@ def download(
     """
     Download historical OHLCV data
     """
-    # Import provider module from
-    provider_module = __import__(f"pynecore.providers.{provider.value}", fromlist=[''])
-    provider_class = getattr(provider_module, [p for p in dir(provider_module) if p.endswith('Provider')][0])
+    # Get provider class using the new discovery system
+    provider_class = get_provider_class(provider.value)
+    if not provider_class:
+        secho(f"Error: Provider '{provider.value}' not found or failed to load", err=True, fg=colors.RED)
+        raise Exit(1)
 
     try:
         # If list_symbols is True, we show the available symbols then exit

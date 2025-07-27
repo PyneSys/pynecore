@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynecore-{{plugin_name_kebab}}-provider"
+version = "0.1.0"
+description = "{{plugin_name_pascal}} data provider plugin for PyneCore"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+keywords = ["trading", "finance", "data", "provider", "pynecore"]
+
+dependencies = [
+    "pynesys-pynecore{{pynecore_version}}",
+    # Add your provider-specific dependencies here
+    # "requests>=2.28.0",
+    # "websocket-client>=1.4.0",
+    # Note: Use only raw Python and PyneCore methods, avoid pandas/numpy
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "isort>=5.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pynecore-{{plugin_name_kebab}}-provider"
+Repository = "https://github.com/yourusername/pynecore-{{plugin_name_kebab}}-provider"
+Issues = "https://github.com/yourusername/pynecore-{{plugin_name_kebab}}-provider/issues"
+Documentation = "https://github.com/yourusername/pynecore-{{plugin_name_kebab}}-provider#readme"
+
+# Entry point for PyneCore plugin discovery
+[project.entry-points."pynecore.providers"]
+{{plugin_name_snake}} = "{{plugin_name_snake}}_provider:{{plugin_name_pascal}}Provider"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.toml", "*.yaml", "*.yml", "*.json"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]

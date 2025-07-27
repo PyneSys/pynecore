@@ -1,0 +1,1 @@
+"""Tests for {{plugin_name_pascal}} Provider Plugin"""

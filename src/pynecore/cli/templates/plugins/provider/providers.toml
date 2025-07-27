@@ -1,0 +1,55 @@
+# {{plugin_name_pascal}} Provider Configuration
+# Add this configuration to your PyneCore providers.toml file
+
+[{{plugin_name_snake}}]
+# Provider-specific configuration
+# Uncomment and configure the following settings as needed:
+
+# API credentials (if required)
+# api_key = "your_api_key_here"
+# api_secret = "your_api_secret_here"
+# api_passphrase = "your_passphrase_here"  # Some providers require this
+
+# API endpoints
+# base_url = "https://api.example.com"
+# sandbox_url = "https://sandbox-api.example.com"  # For testing
+# use_sandbox = false  # Set to true for testing
+
+# Rate limiting
+# requests_per_second = 10
+# requests_per_minute = 600
+
+# Timeouts (in seconds)
+# connect_timeout = 10
+# read_timeout = 30
+
+# Data settings
+# max_candles_per_request = 1000
+# default_timeframe = "1h"
+
+# Retry settings
+# max_retries = 3
+# retry_delay = 1.0  # seconds
+
+# Logging
+# log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
+# log_requests = false  # Log all API requests
+
+# Example configuration for common provider types:
+
+# For REST API providers:
+# [{{plugin_name_snake}}]
+# api_key = "your_api_key"
+# base_url = "https://api.example.com/v1"
+# requests_per_second = 10
+
+# For WebSocket providers:
+# [{{plugin_name_snake}}]
+# api_key = "your_api_key"
+# ws_url = "wss://ws.example.com/v1"
+# reconnect_interval = 30
+
+# For file-based providers:
+# [{{plugin_name_snake}}]
+# data_directory = "/path/to/data"
+# file_format = "csv"  # csv, parquet, json
