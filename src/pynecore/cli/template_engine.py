@@ -20,7 +20,7 @@ class TemplateEngine:
         
         # Replace variables in format {{variable_name}}
         for key, value in self.variables.items():
-            pattern = f"{{{{\s*{key}\s*}}}}"
+            pattern = rf"{{{{\s*{key}\s*}}}}"
             result = re.sub(pattern, str(value), result)
         
         return result
@@ -67,11 +67,30 @@ def get_default_template_variables(plugin_name: str, plugin_type: str) -> Dict[s
 
 
 def _get_pynecore_version() -> str:
-    """Get PyneCore version from main pyproject.toml"""
+    """Get PyneCore version from PyPI"""
     try:
-        # Get the path to the main pyproject.toml (relative to this file)
+        import subprocess
+        import json
+        
+        # Use curl to fetch version from PyPI API (avoids SSL issues)
+        url = "https://pypi.org/pypi/pynesys-pynecore/json"
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "10", url],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        if result.returncode == 0 and result.stdout:
+            data = json.loads(result.stdout)
+            version = data.get('info', {}).get('version', '0.1.0')
+            return f">={version}"
+    except Exception:
+        pass
+    
+    # Fallback on any error - try to get from local pyproject.toml
+    try:
         current_file = Path(__file__)
-        # Navigate up to the project root: cli/template_engine.py -> cli -> pynecore -> src -> root
         project_root = current_file.parent.parent.parent.parent
         pyproject_path = project_root / "pyproject.toml"
         
@@ -81,9 +100,8 @@ def _get_pynecore_version() -> str:
                 data = tomllib.load(f)
                 version = data.get('project', {}).get('version', '0.1.0')
                 return f">={version}"
-        else:
-            # Fallback if pyproject.toml not found
-            return ">=0.1.0"
     except Exception:
-        # Fallback on any error
-        return ">=0.1.0"
+        pass
+    
+    # Final fallback
+    return ">=0.1.0"
