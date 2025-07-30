@@ -179,8 +179,19 @@ def compile(
                 raise typer.Exit(1)
                 
     except ValueError as e:
-        console.print(f"[red]Configuration error: {e}[/red]")
-        console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API configuration.")
+        error_msg = str(e)
+        if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
+            # No API configuration found - show helpful setup message
+            console.print("[yellow]⚠️  No API configuration found[/yellow]")
+            console.print()
+            console.print("To get started with PyneSys API:")
+            console.print("1. 🌐 Visit [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] to get your API key")
+            console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to set up your configuration")
+            console.print()
+            console.print("[dim]Need help? Check our documentation at https://pynesys.io/docs[/dim]")
+        else:
+            console.print(f"[red]Configuration error: {e}[/red]")
+            console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API configuration.")
         raise typer.Exit(1)
         
     except Exception as e:

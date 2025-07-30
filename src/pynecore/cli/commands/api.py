@@ -114,12 +114,18 @@ def configure(
                         console.print(f"[blue]Expires:[/blue] {result.expires_at}")
                 else:
                     progress.update(task, description="[red]API key validation failed[/red]")
-                    console.print(f"[red]✗[/red] API key validation failed: {result.message}")
+                    console.print("[red]✗[/red] The provided API key appears to be invalid.")
+                    console.print("[yellow]💡 Please check your API key at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] and try again.")
+                    console.print("[dim]Make sure you've copied the complete API key without any extra spaces.[/dim]")
+                    if result.message:
+                        console.print(f"[dim]Details: {result.message}[/dim]")
                     raise typer.Exit(1)
                     
             except AuthError:
                 progress.update(task, description="[red]Invalid API key[/red]")
-                console.print("[red]✗[/red] Invalid API key. Please check your key and try again.")
+                console.print("[red]✗[/red] The provided API key appears to be invalid.")
+                console.print("[yellow]💡 Please check your API key at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] and try again.")
+                console.print("[dim]Make sure you've copied the complete API key without any extra spaces.[/dim]")
                 raise typer.Exit(1)
                 
             except APIError as e:
@@ -208,8 +214,19 @@ def status(
                 console.print(f"[red]✗[/red] API error: {e}")
                 
     except ValueError as e:
-        console.print(f"[red]Configuration error: {e}[/red]")
-        console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API configuration.")
+        error_msg = str(e)
+        if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
+            # No API configuration found - show helpful setup message
+            console.print("[yellow]⚠️  No API configuration found[/yellow]")
+            console.print()
+            console.print("To get started with PyneSys API:")
+            console.print("1. 🌐 Visit [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] to get your API key")
+            console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to set up your configuration")
+            console.print()
+            console.print("[dim]Need help? Check our documentation at https://pynesys.io/docs[/dim]")
+        else:
+            console.print(f"[red]Configuration error: {e}[/red]")
+            console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API configuration.")
         raise typer.Exit(1)
         
     except Exception as e:
