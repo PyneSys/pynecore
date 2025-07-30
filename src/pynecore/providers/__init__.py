@@ -28,7 +28,7 @@ def get_available_providers() -> tuple[str, ...]:
     plugin_names = set()
     try:
         # Import here to avoid circular imports
-        from ..cli.plugin_manager import plugin_manager
+        from ..core.plugin import plugin_manager
         plugin_names = set(plugin_manager.get_available_providers())
     except ImportError:
         # Plugin manager not available (e.g., in minimal installations)
@@ -56,7 +56,7 @@ def get_provider_class(provider_name: str) -> Optional[Type[Provider]]:
     
     # Try to load from plugins
     try:
-        from ..cli.plugin_manager import plugin_manager
+        from ..core.plugin import plugin_manager
         provider_class = plugin_manager.load_plugin(provider_name)
         if provider_class:
             # Cache the loaded provider

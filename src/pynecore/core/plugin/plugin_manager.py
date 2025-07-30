@@ -120,7 +120,7 @@ class PluginManager:
         
         try:
             # Import built-in providers info
-            from ..providers import _builtin_providers
+            from ...providers import _builtin_providers
             
             for name, provider_class in _builtin_providers.items():
                 # Get version from the main package

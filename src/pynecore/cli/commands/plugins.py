@@ -13,7 +13,7 @@ from rich.prompt import Confirm
 
 from ..app import app, app_state
 from ..template_engine import TemplateEngine, get_plugin_templates_dir, get_default_template_variables
-from ..plugin_manager import plugin_manager
+from ...core.plugin import plugin_manager
 
 app_plugins = Typer(help="Plugin management commands")
 app.add_typer(app_plugins, name="plugin")
