@@ -38,6 +38,10 @@ def setup(
         return
     if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
         return
+    
+    # Skip workdir setup for plugin commands as they don't need it
+    if ctx.invoked_subcommand == 'plugin':
+        return
 
     typer.echo("")
 
