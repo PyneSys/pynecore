@@ -57,40 +57,23 @@ def configure(
         help="PyneSys API key",
         prompt="Enter your PyneSys API key",
         hide_input=True
-    ),
-    base_url: str = typer.Option(
-        "https://api.pynesys.io",
-        "--base-url",
-        help="API base URL"
-    ),
-    timeout: int = typer.Option(
-        30,
-        "--timeout",
-        help="Request timeout in seconds"
-    ),
-    config_path: Optional[Path] = typer.Option(
-        None,
-        "--config",
-        help="Configuration file path (defaults to ~/.pynecore/config.json)"
     )
 ):
     """Configure PyneSys API settings and validate your API key.
     
     This command sets up your PyneSys API configuration including:
     - API key for authentication
-    - Request timeout settings
     
-    The configuration is saved to ~/.pynecore/config.json by default.
-    You can specify a custom config path using --config option.
+    The configuration is saved to ~/.pynecore/config.json.
     
     The API key will be validated during configuration to ensure it's working.
     """
     try:
-        # Create configuration
+        # Create configuration with default values
         config = APIConfig(
             api_key=api_key,
-            base_url=base_url,
-            timeout=timeout
+            base_url="https://api.pynesys.io",
+            timeout=30
         )
         
         # Test the API key
@@ -134,9 +117,9 @@ def configure(
                 raise typer.Exit(1)
         
         # Save configuration
-        ConfigManager.save_config(config, config_path)
+        ConfigManager.save_config(config, None)
         
-        config_file = config_path or ConfigManager.get_default_config_path()
+        config_file = ConfigManager.get_default_config_path()
         console.print(f"[green]✓[/green] Configuration saved to: {config_file}")
         
     except Exception as e:
@@ -145,13 +128,7 @@ def configure(
 
 
 @api_app.command()
-def status(
-    config_path: Optional[Path] = typer.Option(
-        None,
-        "--config",
-        help="Configuration file path"
-    )
-):
+def status():
     """Check API configuration and connection status.
     
     This command displays:
@@ -162,10 +139,12 @@ def status(
     
     Use this command to verify your API setup is working correctly
     and to check when your API token will expire.
+    
+    Configuration is loaded from the default location (~/.pynecore/config.json).
     """
     try:
         # Load configuration
-        config = ConfigManager.load_config(config_path)
+        config = ConfigManager.load_config(None)
         
         # Display configuration info
         table = Table(title="API Configuration")
@@ -236,11 +215,6 @@ def status(
 
 @api_app.command()
 def reset(
-    config_path: Optional[Path] = typer.Option(
-        None,
-        "--config",
-        help="Configuration file path"
-    ),
     force: bool = typer.Option(
         False,
         "--force",
@@ -250,7 +224,7 @@ def reset(
     """Reset API configuration by removing the configuration file.
     
     This command will:
-    - Delete the API configuration file
+    - Delete the default API configuration file (~/.pynecore/config.json)
     - Remove all stored API settings (API key, timeout)
     - Require you to run 'pyne api configure' again to set up the API
     
@@ -258,7 +232,7 @@ def reset(
     This is useful when you want to start fresh with API configuration
     or switch to a different API key.
     """
-    config_file = config_path or ConfigManager.get_default_config_path()
+    config_file = ConfigManager.get_default_config_path()
     
     if not config_file.exists():
         console.print(f"[yellow]No configuration file found at: {config_file}[/yellow]")
