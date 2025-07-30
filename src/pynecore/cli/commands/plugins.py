@@ -16,7 +16,7 @@ from ..template_engine import TemplateEngine, get_plugin_templates_dir, get_defa
 from ..plugin_manager import plugin_manager
 
 app_plugins = Typer(help="Plugin management commands")
-app.add_typer(app_plugins, name="plugins")
+app.add_typer(app_plugins, name="plugin")
 console = Console()
 
 
