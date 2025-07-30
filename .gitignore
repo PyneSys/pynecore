@@ -23,7 +23,3 @@ dist/
 # macOS
 #
 .DS_Store
-
-# ide files
-.vscode/
-.idea/
