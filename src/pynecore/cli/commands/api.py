@@ -128,7 +128,13 @@ def configure(
 
 
 @api_app.command()
-def status():
+def status(
+    api_key: Optional[str] = typer.Option(
+        None,
+        "--api-key",
+        help="Test a specific API key directly (without saving to config)"
+    )
+):
     """Check API configuration and connection status.
     
     This command displays:
@@ -140,22 +146,45 @@ def status():
     Use this command to verify your API setup is working correctly
     and to check when your API token will expire.
     
-    Configuration is loaded from the default location (~/.pynecore/config.json).
+    If --api-key is provided, it will test that specific key directly without
+    saving it to the configuration. Otherwise, it loads the saved configuration
+    from ~/.pynecore/config.json.
     """
     try:
-        # Load configuration
-        config = ConfigManager.load_config(None)
-        
-        # Display configuration info
-        table = Table(title="API Configuration")
-        table.add_column("Setting", style="cyan")
-        table.add_column("Value", style="white")
-        
-        table.add_row("Base URL", config.base_url)
-        table.add_row("Timeout", f"{config.timeout}s")
-        table.add_row("API Key", f"{config.api_key[:8]}...{config.api_key[-4:]}" if len(config.api_key) > 12 else "***")
-        
-        console.print(table)
+        if api_key:
+            # Test the provided API key directly
+            config = APIConfig(
+                api_key=api_key,
+                base_url="https://api.pynesys.io",
+                timeout=30
+            )
+            
+            # Display test configuration info
+            table = Table(title="API Key Test")
+            table.add_column("Setting", style="cyan")
+            table.add_column("Value", style="white")
+            
+            table.add_row("Base URL", config.base_url)
+            table.add_row("Timeout", f"{config.timeout}s")
+            table.add_row("API Key", f"{config.api_key[:8]}...{config.api_key[-4:]}" if len(config.api_key) > 12 else "***")
+            table.add_row("Mode", "[yellow]Direct Test (not saved)[/yellow]")
+            
+            console.print(table)
+        else:
+            # Load configuration from file
+            config = ConfigManager.load_config(None)
+            
+            # Display configuration info
+            table = Table(title="API Configuration")
+            table.add_column("Setting", style="cyan")
+            table.add_column("Value", style="white")
+            
+            table.add_row("Base URL", config.base_url)
+            table.add_row("Timeout", f"{config.timeout}s")
+            table.add_row("API Key", f"{config.api_key[:8]}...{config.api_key[-4:]}" if len(config.api_key) > 12 else "***")
+            table.add_row("Mode", "[green]Saved Configuration[/green]")
+            
+            console.print(table)
         
         # Test connection
         with Progress(
@@ -194,13 +223,14 @@ def status():
                 
     except ValueError as e:
         error_msg = str(e)
-        if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
-            # No API configuration found - show helpful setup message
+        if not api_key and ("No configuration file found" in error_msg or "Configuration file not found" in error_msg):
+            # No API configuration found and no API key provided - show helpful setup message
             console.print("[yellow]⚠️  No API configuration found[/yellow]")
             console.print()
             console.print("To get started with PyneSys API:")
             console.print("1. 🌐 Visit [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] to get your API key")
             console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to set up your configuration")
+            console.print("3. 🧪 Or test a key directly with [cyan]pyne api status --api-key YOUR_KEY[/cyan]")
             console.print()
             console.print("[dim]Need help? Check our documentation at https://pynesys.io/docs[/dim]")
         else:
