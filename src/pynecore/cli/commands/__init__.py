@@ -9,9 +9,9 @@ from ..utils.error_hook import setup_global_error_logging
 from ...providers import available_providers
 
 # Import commands
-from . import run, data, compile, benchmark
+from . import run, data, compile, benchmark, plugins
 
-__all__ = ['run', 'data', 'compile', 'benchmark']
+__all__ = ['run', 'data', 'compile', 'benchmark', 'plugins']
 
 
 @app.callback()
@@ -37,6 +37,10 @@ def setup(
     if ctx.resilient_parsing or ctx.invoked_subcommand is None:
         return
     if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
+        return
+    
+    # Skip workdir setup for plugin commands as they don't need it
+    if ctx.invoked_subcommand == 'plugin':
         return
 
     typer.echo("")
