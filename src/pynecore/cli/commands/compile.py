@@ -165,7 +165,9 @@ def compile(
                 
             except RateLimitError:
                 progress.update(task, description="[red]Rate limit exceeded[/red]")
-                console.print("[red]✗[/red] Rate limit exceeded. Please try again later.")
+                console.print("[red]✗[/red] You've reached your API rate limit.")
+                console.print("[yellow]💡 To increase your limits, consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+                console.print("[dim]You can also try again in a few minutes/hours when your rate limit resets.[/dim]")
                 raise typer.Exit(1)
                 
             except CompilationError as e:
