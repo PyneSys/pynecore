@@ -38,6 +38,9 @@ dependencies = []
 # With user-friendly CLI
 optional-dependencies.cli = ["typer", "rich", "tzdata"]
 
+# For API functionality (PyneSys compiler API)
+optional-dependencies.api = ["httpx"]
+
 # All optional dependencies for cli and all built-in providers
 optional-dependencies.all = ["typer", "rich", "httpx", "ccxt", "pycryptodome", "tzdata"]
 
