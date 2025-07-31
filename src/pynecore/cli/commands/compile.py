@@ -139,9 +139,9 @@ def compile(
             raise typer.Exit(1)
             
         except RateLimitError as e:
-            console.print(f"[red]✗[/red] Rate limit exceeded: {str(e)}")
+            console.print("[red]🚦 Rate Limit Exceeded:[/red] You've hit your compilation limit")
             if e.retry_after:
-                console.print(f"[yellow]Please try again in {e.retry_after} seconds[/yellow]")
+                console.print(f"[yellow]⏰ Please try again in {e.retry_after} seconds[/yellow]")
             console.print("[yellow]💡 To increase your limits, consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
             raise typer.Exit(1)
             

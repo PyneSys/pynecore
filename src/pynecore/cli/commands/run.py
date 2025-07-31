@@ -220,10 +220,10 @@ def run(
                     raise Exit(1)
                     
                 except RateLimitError as e:
-                    console.print(f"[red]Rate limit exceeded: {str(e)}[/red]")
+                    console.print("[red]🚦 Rate Limit Exceeded:[/red] You've hit your compilation limit")
                     if e.retry_after:
-                        console.print(f"[yellow]⏰ Just a moment - please try again in {e.retry_after} seconds[/yellow]")
-                    console.print("[yellow]🚀 Want more compilation? Consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] for higher limits![/yellow]")
+                        console.print(f"[yellow]⏰ Please try again in {e.retry_after} seconds[/yellow]")
+                    console.print("[yellow]💡 To increase your limits, consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
                     raise Exit(1)
                     
                 except APIError as e:
