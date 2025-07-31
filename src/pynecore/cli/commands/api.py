@@ -64,7 +64,7 @@ def configure(
     This command sets up your PyneSys API configuration including:
     - API key for authentication
     
-    The configuration is saved to ~/.pynecore/config.json.
+    The configuration is saved to workdir/config/api.toml.
     
     The API key will be validated during configuration to ensure it's working.
     """
@@ -138,7 +138,7 @@ def status(
     """Check API configuration and connection status.
     
     This command displays:
-    - Current API configuration (base URL, timeout, masked API key)
+    - Current API configuration (timeout, masked API key)
     - API connection test results
     - User information (User ID, token type)
     - Token expiration details (expires at, expires in human-readable format)
@@ -148,7 +148,7 @@ def status(
     
     If --api-key is provided, it will test that specific key directly without
     saving it to the configuration. Otherwise, it loads the saved configuration
-    from ~/.pynecore/config.json.
+    from ~/.pynecore/api.toml.
     """
     try:
         if api_key:
@@ -164,7 +164,6 @@ def status(
             table.add_column("Setting", style="cyan")
             table.add_column("Value", style="white")
             
-            table.add_row("Base URL", config.base_url)
             table.add_row("Timeout", f"{config.timeout}s")
             table.add_row("API Key", f"{config.api_key[:8]}...{config.api_key[-4:]}" if len(config.api_key) > 12 else "***")
             table.add_row("Mode", "[yellow]Direct Test (not saved)[/yellow]")
@@ -179,7 +178,6 @@ def status(
             table.add_column("Setting", style="cyan")
             table.add_column("Value", style="white")
             
-            table.add_row("Base URL", config.base_url)
             table.add_row("Timeout", f"{config.timeout}s")
             table.add_row("API Key", f"{config.api_key[:8]}...{config.api_key[-4:]}" if len(config.api_key) > 12 else "***")
             table.add_row("Mode", "[green]Saved Configuration[/green]")
@@ -254,7 +252,7 @@ def reset(
     """Reset API configuration by removing the configuration file.
     
     This command will:
-    - Delete the default API configuration file (~/.pynecore/config.json)
+    - Delete the default API configuration file (workdir/config/api.toml)
     - Remove all stored API settings (API key, timeout)
     - Require you to run 'pyne api configure' again to set up the API
     

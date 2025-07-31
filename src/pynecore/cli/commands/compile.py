@@ -7,8 +7,9 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from ..app import app, app_state
-from ...api import PynesysAPIClient, ConfigManager, APIError, AuthError, RateLimitError, CompilationError
-from ...utils.file_utils import should_compile, preserve_mtime
+from ...api import ConfigManager, APIError, AuthError, RateLimitError, CompilationError
+from ...core.compiler import create_compilation_service
+from ...utils.file_utils import preserve_mtime
 
 __all__ = []
 
@@ -44,7 +45,7 @@ def compile(
     config_path: Optional[Path] = typer.Option(
         None,
         "--config",
-        help="Path to TOML configuration file (defaults to workdir/config/api_config.toml)"
+        help="Path to TOML configuration file (defaults to workdir/config/api.toml)"
     ),
     api_key: Optional[str] = typer.Option(
         None,
@@ -62,8 +63,8 @@ def compile(
         pyne compile <file.pine> --output <path>    # Specify output file path
     
     CONFIGURATION:
-        Default config: workdir/config/api_config.toml
-        Fallback config: ~/.pynecore/api_config.toml
+        Default config: workdir/config/api.toml
+        Fallback config: ~/.pynecore/api.toml
         Custom config: --config /path/to/config.toml
         
         Config format (TOML only):
@@ -86,99 +87,138 @@ def compile(
     Use 'pyne api configure' to set up your API configuration.
     """
     try:
-        # Load configuration
-        if api_key:
-            from ...api.config import APIConfig
-            config = APIConfig(api_key=api_key)
-        else:
-            config = ConfigManager.load_config(config_path)
-        
-        # Read Pine Script content
-        try:
-            with open(script_path, 'r', encoding='utf-8') as f:
-                script_content = f.read()
-        except Exception as e:
-            console.print(f"[red]Error reading script file: {e}[/red]")
-            raise typer.Exit(1)
+        # Create compilation service
+        compilation_service = create_compilation_service(
+            api_key=api_key,
+            config_path=config_path
+        )
         
         # Determine output path
         if output is None:
             output = script_path.with_suffix('.py')
         
         # Check if compilation is needed (smart compilation)
-        if not should_compile(script_path, output, force):
+        if not compilation_service.needs_compilation(script_path, output) and not force:
             console.print(f"[green]✓[/green] Output file is up-to-date: {output}")
             console.print("[dim]Use --force to recompile anyway[/dim]")
             return
         
         # Compile script
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
-        ) as progress:
-            task = progress.add_task("Compiling Pine Script...", total=None)
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+            ) as progress:
+                progress.add_task("Compiling Pine Script...", total=None)
+                
+                # Compile the .pine file
+                compiled_path = compilation_service.compile_file(
+                    script_path,
+                    output,
+                    force=force,
+                    strict=strict
+                )
+                
+            # Preserve modification time from source file
+            preserve_mtime(script_path, output)
             
-            try:
-                # Use synchronous client for CLI
-                client = PynesysAPIClient(config.api_key, config.base_url, config.timeout)
-                result = client.compile_script_sync(script_content, strict=strict)
+            console.print(f"[green]Compilation successful![/green] Your Pine Script is now ready: [cyan]{compiled_path}[/cyan]")
                 
-                if result.success:
-                    # Write compiled Python code to output file
-                    try:
-                        output.parent.mkdir(parents=True, exist_ok=True)
-                        with open(output, 'w', encoding='utf-8') as f:
-                            f.write(result.compiled_code)
-                        
-                        # Preserve modification time from source file
-                        preserve_mtime(script_path, output)
-                        
-                        progress.update(task, description="[green]Compilation successful![/green]")
-                        console.print(f"[green]✓[/green] Compiled successfully to: {output}")
-                        
-                        if result.warnings:
-                            console.print("[yellow]Warnings:[/yellow]")
-                            for warning in result.warnings:
-                                console.print(f"  [yellow]•[/yellow] {warning}")
-                                
-                    except Exception as e:
-                        console.print(f"[red]Error writing output file: {e}[/red]")
-                        raise typer.Exit(1)
-                        
+        except CompilationError as e:
+            console.print(f"[red]❌ Oops! Compilation encountered an issue:[/red] {str(e)}")
+            if e.validation_errors:
+                console.print("[red]Validation errors:[/red]")
+                for error in e.validation_errors:
+                    console.print(f"  [red]• {error}[/red]")
+            raise typer.Exit(1)
+            
+        except AuthError as e:
+            console.print(f"[red]🔐 Authentication issue:[/red] {str(e)}")
+            console.print("[yellow]🚀 Quick fix:[/yellow] Run [cyan]'pyne api configure'[/cyan] to set up your API key and get back on track!")
+            raise typer.Exit(1)
+            
+        except RateLimitError as e:
+            console.print(f"[red]✗[/red] Rate limit exceeded: {str(e)}")
+            if e.retry_after:
+                console.print(f"[yellow]Please try again in {e.retry_after} seconds[/yellow]")
+            console.print("[yellow]💡 To increase your limits, consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+            raise typer.Exit(1)
+            
+        except APIError as e:
+            error_msg = str(e).lower()
+            
+            # Handle specific API error scenarios based on HTTP status codes
+            if "400" in error_msg or "bad request" in error_msg:
+                if "compilation fails" in error_msg or "script is too large" in error_msg:
+                    console.print("[red]📝 Script Issue:[/red] Your Pine Script couldn't be compiled")
+                    console.print("[yellow]💡 Common fixes:[/yellow]")
+                    console.print("  • Check if your script is too large (try breaking it into smaller parts)")
+                    console.print("  • Verify your Pine Script syntax is correct")
+                    console.print("  • Make sure you're using Pine Script v6 syntax")
                 else:
-                    progress.update(task, description="[red]Compilation failed[/red]")
-                    console.print(f"[red]✗[/red] Compilation failed: {result.error}")
+                    console.print(f"[red]⚠️  Request Error:[/red] {str(e)}")
+                    console.print("[yellow]💡 This usually means there's an issue with the request format[/yellow]")
                     
-                    if result.details:
-                        console.print("[red]Details:[/red]")
-                        for detail in result.details:
-                            console.print(f"  [red]•[/red] {detail}")
+            elif "401" in error_msg or "authentication" in error_msg or "no permission" in error_msg:
+                console.print("[red]🔐 Authentication Failed:[/red] Your API credentials aren't working")
+                console.print("[yellow]🚀 Quick fixes:[/yellow]")
+                console.print("  • Check if your API key is valid and active")
+                console.print("  • Verify your token type is allowed for compilation")
+                console.print("[blue]🔑 Get a new API key at [link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+                console.print("[blue]⚙️  Then run [cyan]'pyne api configure'[/cyan] to update your configuration[/blue]")
+                
+            elif "404" in error_msg or "not found" in error_msg:
+                console.print("[red]🔍 Not Found:[/red] The API endpoint or user wasn't found")
+                console.print("[yellow]💡 This might indicate:[/yellow]")
+                console.print("  • Your account may not exist or be accessible")
+                console.print("  • There might be a temporary service issue")
+                
+            elif "422" in error_msg or "validation error" in error_msg:
+                console.print("[red]📋 Validation Error:[/red] Your request data has validation issues")
+                console.print("[yellow]💡 Common causes:[/yellow]")
+                console.print("  • Invalid Pine Script syntax or structure")
+                console.print("  • Missing required parameters")
+                console.print("  • Incorrect data format")
+                console.print(f"[dim]Details: {str(e)}[/dim]")
+                
+            elif "429" in error_msg or "rate limit" in error_msg or "too many requests" in error_msg:
+                console.print("[red]🚦 Rate Limit Exceeded:[/red] You've hit your compilation limit")
+                console.print("[yellow]⏰ What you can do:[/yellow]")
+                console.print("  • Wait a bit before trying again")
+                console.print("  • Consider upgrading your plan for higher limits")
+                console.print("[blue]💎 Upgrade at [link=https://pynesys.io/pricing]https://pynesys.io/pricing[/link][/blue]")
+                
+            elif "500" in error_msg or "server" in error_msg or "internal" in error_msg:
+                console.print("[red]🔧 Server Error:[/red] Something went wrong on our end")
+                console.print("[yellow]😅 Don't worry, it's not you![/yellow]")
+                console.print("  • This is a temporary server issue")
+                console.print("  • Please try again in a few moments")
+                
+            elif "unsupported pinescript version" in error_msg:
+                console.print("[red]📌 Version Issue:[/red] Your Pine Script version isn't supported")
+                if "version 5" in error_msg:
+                    console.print("[yellow]🔄 Pine Script v5 → v6 Migration:[/yellow]")
+                    console.print("  • Update your script to Pine Script version 6")
+                    console.print("  • Most v5 scripts need minimal changes")
+                    console.print("[blue]📖 Migration guide: [link=https://www.tradingview.com/pine-script-docs/en/v6/migration_guides/v5_to_v6_migration_guide.html]Pine Script v5→v6 Guide[/link][/blue]")
+                else:
+                    console.print("[yellow]💡 Only Pine Script version 6 is currently supported[/yellow]")
                     
-                    raise typer.Exit(1)
-                    
-            except AuthError:
-                progress.update(task, description="[red]Authentication failed[/red]")
-                console.print("[red]✗[/red] Authentication failed. Please check your API key.")
-                console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API key.")
-                raise typer.Exit(1)
+            elif "api key" in error_msg:
+                console.print("[red]🔑 API Key Issue:[/red] There's a problem with your API key")
+                console.print("[blue]🔑 Get your API key at [link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+                console.print("[blue]⚙️  Then run [cyan]'pyne api configure'[/cyan] to set up your configuration[/blue]")
                 
-            except RateLimitError:
-                progress.update(task, description="[red]Rate limit exceeded[/red]")
-                console.print("[red]✗[/red] You've reached your API rate limit.")
-                console.print("[yellow]💡 To increase your limits, consider upgrading your subscription at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
-                console.print("[dim]You can also try again in a few minutes/hours when your rate limit resets.[/dim]")
-                raise typer.Exit(1)
+            else:
+                # Generic API error fallback
+                console.print(f"[red]🌐 API Error:[/red] {str(e)}")
+                console.print("[yellow]💡 If this persists, please check:[/yellow]")
+                console.print("  • Your internet connection")
+                console.print("  • API service status")
+                console.print("[blue]📞 Need help? [link=https://pynesys.io/support]Contact Support[/link][/blue]")
                 
-            except CompilationError as e:
-                progress.update(task, description="[red]Compilation error[/red]")
-                console.print(f"[red]✗[/red] Compilation error: {e}")
-                raise typer.Exit(1)
-                
-            except APIError as e:
-                progress.update(task, description="[red]API error[/red]")
-                console.print(f"[red]✗[/red] API error: {e}")
-                raise typer.Exit(1)
+            raise typer.Exit(1)
                 
     except ValueError as e:
         error_msg = str(e)
@@ -186,16 +226,14 @@ def compile(
             # No API configuration found - show helpful setup message
             console.print("[yellow]⚠️  No API configuration found[/yellow]")
             console.print()
-            console.print("To get started with PyneSys API:")
-            console.print("1. 🌐 Visit [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue] to get your API key")
-            console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to set up your configuration")
+            console.print("[bold]Quick setup (takes just few minutes):[/bold]")
+            console.print("1. 🌐 Get your API key at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+            console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to save your configuration")
             console.print()
-            console.print("[dim]Need help? Check our documentation at https://pynesys.io/docs[/dim]")
+            console.print("[dim]💬 Need assistance? Our docs are here: https://pynesys.io/docs[/dim]")
+        elif "this file format isn't supported" in error_msg:
+            # File format error - show the friendly message directly
+            console.print(f"[red]{e}[/red]")
         else:
-            console.print(f"[red]Configuration error: {e}[/red]")
-            console.print("[yellow]Hint:[/yellow] Use 'pyne api configure' to set up your API configuration.")
-        raise typer.Exit(1)
-        
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
+            console.print(f"[red]Attention:[/red] {e}")
         raise typer.Exit(1)

@@ -152,8 +152,8 @@ class APIConfig:
 class ConfigManager:
     """Manages API configuration loading and saving."""
     
-    DEFAULT_CONFIG_PATH = Path("workdir/config/api_config.toml")
-    DEFAULT_FALLBACK_CONFIG_PATH = Path.home() / ".pynecore" / "api_config.toml"
+    DEFAULT_CONFIG_PATH = Path("workdir/config/api.toml")
+    DEFAULT_FALLBACK_CONFIG_PATH = Path.home() / ".pynecore" / "api.toml"
     
     @classmethod
     def load_config(cls, config_path: Optional[Path] = None) -> APIConfig:
