@@ -12,13 +12,7 @@ from typing import Optional, Dict, Any
 from ..api.client import PynesysAPIClient
 from ..api.config import APIConfig, ConfigManager
 from ..api.exceptions import APIError, AuthError, RateLimitError, CompilationError
-from ..utils.hash_utils import (
-    file_needs_compilation,
-    update_hash_after_compilation,
-    calculate_file_md5,
-    get_stored_hash,
-    store_hash
-)
+from ..utils.mtime_utils import file_needs_compilation
 
 
 class CompilationService:
@@ -108,8 +102,7 @@ class CompilationService:
             with open(output_file_path, 'w', encoding='utf-8') as f:
                 f.write(response.compiled_code)
             
-            # Update hash after successful compilation
-            update_hash_after_compilation(pine_file_path)
+            # No need to update tracking info with mtime approach
             
             return output_file_path
             
@@ -121,7 +114,7 @@ class CompilationService:
             raise APIError(f"Unexpected error during compilation: {e}")
     
     def needs_compilation(self, pine_file_path: Path, output_file_path: Path) -> bool:
-        """Check if a .pine file needs compilation using MD5 hash comparison.
+        """Check if a .pine file needs compilation using modification time comparison.
         
         Args:
             pine_file_path: Path to the .pine file
@@ -177,36 +170,7 @@ class CompilationService:
         except Exception as e:
             raise RuntimeError(f"Error executing compiled script: {e}")
     
-    def _calculate_file_hash(self, pine_file_path: Path) -> str:
-        """Calculate MD5 hash of file content.
-        
-        Args:
-            pine_file_path: Path to the .pine file
-            
-        Returns:
-            MD5 hash as hexadecimal string
-        """
-        return calculate_file_md5(pine_file_path)
-    
-    def _get_stored_hash(self, pine_file_path: Path) -> Optional[str]:
-        """Get stored hash from .pine.hash file.
-        
-        Args:
-            pine_file_path: Path to the .pine file
-            
-        Returns:
-            Stored MD5 hash string or None if not found
-        """
-        return get_stored_hash(pine_file_path)
-    
-    def _store_hash(self, pine_file_path: Path, hash_value: str) -> None:
-        """Store hash in .pine.hash file.
-        
-        Args:
-            pine_file_path: Path to the .pine file
-            hash_value: MD5 hash to store
-        """
-        store_hash(pine_file_path, hash_value)
+
 
 
 def create_compilation_service(
