@@ -1,7 +1,9 @@
-"""Data models for PyneCore API responses."""
+"""
+Data models for PyneCore API responses.
+"""
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Any
 from datetime import datetime
 
 
@@ -10,26 +12,26 @@ class TokenValidationResponse:
     """Response from token validation endpoint."""
     valid: bool
     message: str
-    user_id: Optional[str] = None
-    token_type: Optional[str] = None
-    expiration: Optional[datetime] = None
-    expires_at: Optional[datetime] = None
-    expires_in: Optional[int] = None
-    raw_response: Optional[Dict[str, Any]] = None
+    user_id: str | None = None
+    token_type: str | None = None
+    expiration: datetime | None = None
+    expires_at: datetime | None = None
+    expires_in: int | None = None
+    raw_response: dict[str, Any] | None = None
 
 
 @dataclass
 class CompileResponse:
     """Response from script compilation endpoint."""
     success: bool
-    compiled_code: Optional[str] = None
-    error_message: Optional[str] = None
-    error: Optional[str] = None
-    validation_errors: Optional[List[Dict[str, Any]]] = None
-    warnings: Optional[List[str]] = None
-    details: Optional[List[str]] = None
-    status_code: Optional[int] = None
-    raw_response: Optional[Dict[str, Any]] = None
+    compiled_code: str | None = None
+    error_message: str | None = None
+    error: str | None = None
+    validation_errors: list[dict[str, Any]] | None = None
+    warnings: list[str] | None = None
+    details: list[str] | None = None
+    status_code: int | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def has_validation_errors(self) -> bool:

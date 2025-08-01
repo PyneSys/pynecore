@@ -20,8 +20,6 @@ from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from ...core.compiler import create_compilation_service
-from ...api.exceptions import APIError, AuthError, RateLimitError, CompilationError
-from ...api.config import ConfigManager
 from ...cli.utils.api_error_handler import handle_api_errors
 
 __all__ = []
@@ -128,10 +126,7 @@ def run(
     The system checks for changes in .pine files and only recompiles when necessary.
     Use --force to bypass this check and force recompilation.
     """  # noqa
-    # Handle script file extension and path
-    original_script = script
-    compiled_file = None
-    
+
     # Support both .py and .pine files
     if script.suffix not in [".py", ".pine"]:
         # Check if the file exists with the given extension first
@@ -139,7 +134,7 @@ def run(
             full_script_path = app_state.scripts_dir / script
         else:
             full_script_path = script
-            
+
         if full_script_path.exists():
             # File exists but has unsupported extension
             console.print(f"[red]This file format isn't supported:[/red] {script.suffix}")
@@ -147,31 +142,31 @@ def run(
             if script.suffix in [".ohlcv", ".csv", ".json"]:
                 console.print(f"[blue]💡 Heads up:[/blue] {script.suffix} files are data files, not executable scripts.")
             raise Exit(1)
-        
+
         # File doesn't exist, try .pine first, then .py
         pine_script = script.with_suffix(".pine")
         py_script = script.with_suffix(".py")
-        
+
         if len(script.parts) == 1:
             pine_script = app_state.scripts_dir / pine_script
             py_script = app_state.scripts_dir / py_script
-            
+
         if pine_script.exists():
             script = pine_script
         elif py_script.exists():
             script = py_script
         else:
             script = py_script  # Default to .py for error message
-    
+
     # Expand script path if it's just a filename
     if len(script.parts) == 1:
         script = app_state.scripts_dir / script
-    
+
     # Check if script exists
     if not script.exists():
         secho(f"Script file '{script}' not found!", fg="red", err=True)
         raise Exit(1)
-    
+
     # Handle .pine files - compile them first
     if script.suffix == ".pine":
         try:
@@ -180,10 +175,10 @@ def run(
                 api_key=api_key,
                 config_path=config_path
             )
-            
+
             # Determine output path for compiled file
             compiled_file = script.with_suffix(".py")
-            
+
             # Check if compilation is needed
             if compilation_service.needs_compilation(script, compiled_file) or force:
                 with handle_api_errors(console):
@@ -193,7 +188,7 @@ def run(
                         console=console
                     ) as progress:
                         progress.add_task("Compiling Pine Script...", total=None)
-                        
+
                         # Compile the .pine file
                         compiled_path = compilation_service.compile_file(
                             script,
@@ -201,31 +196,32 @@ def run(
                             force=force,
                             strict=strict
                         )
-                        
+
                     console.print(f"[green]Compilation successful![/green] Ready to run: [cyan]{compiled_path}[/cyan]")
                     compiled_file = compiled_path
-                        
+
             else:
                 console.print(f"[green]⚡ Using cached version:[/green] [cyan]{compiled_file}[/cyan]")
                 console.print("[dim]Use --force to recompile[/dim]")
-            
+
             # Update script to point to the compiled file
             script = compiled_file
-            
+
         except ValueError as e:
             error_msg = str(e)
             if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
                 console.print("[yellow]⚠️  No API configuration found[/yellow]")
                 console.print()
                 console.print("[bold]Quick setup (takes few minutes):[/bold]")
-                console.print("1. 🌐 Get your API key at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
+                console.print("1. 🌐 Get your API key at "
+                              "[blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
                 console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to save your configuration")
                 console.print()
                 console.print("[dim]💬 Need assistance? Our docs are here: https://pynesys.io/docs[/dim]")
             else:
                 console.print(f"[red] Attention:[/red] {e}")
             raise Exit(1)
-    
+
     # Ensure we have a .py file at this point
     if script.suffix != ".py":
         console.print(f"[red]This file format isn't supported:[/red] {script.suffix}")
