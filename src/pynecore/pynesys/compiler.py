@@ -1,19 +1,16 @@
 """
 Core compilation service for programmatic use.
 """
-
-import subprocess
-import sys
 from pathlib import Path
 
-from pynecore.pynesys.api import APIClient
-from pynecore.pynesys.api import APIError, AuthError, RateLimitError, CompilationError
+from pynecore.pynesys.api import (APIClient, APIError, AuthError, RateLimitError, CompilationError, UsageResponse,
+                                  TokenValidationResponse)
 from pynecore.utils.file_utils import is_updated
 
 
 class PyneComp:
     """
-    COmpiler through the PyneSys API.
+    Compiler through the PyneSys API.
     """
 
     api_client: APIClient
@@ -91,6 +88,18 @@ class PyneComp:
             # Wrap unexpected errors
             raise APIError(f"Unexpected error during compilation: {e}")
 
+    def get_usage(self) -> UsageResponse:
+        """
+        Get current usage statistics and limits for the authenticated user.
+        """
+        return self.api_client.get_usage()
+
+    def validate_api_key(self) -> TokenValidationResponse:
+        """
+        Validate API key.
+        """
+        return self.api_client.verify_token_local()
+
     @staticmethod
     def needs_compilation(pine_file_path: Path, output_file_path: Path) -> bool:
         """
@@ -101,44 +110,3 @@ class PyneComp:
         :return: True if compilation is needed, False otherwise
         """
         return is_updated(pine_file_path, output_file_path)
-
-    def compile_and_run(
-            self,
-            pine_file_path: Path,
-            script_args: list | None = None,
-            force: bool = False,
-            strict: bool = False,
-            output_file_path: Path | None = None
-    ) -> int:
-        """
-        Compile a .pine file and run the resulting Python script.
-
-        :param pine_file_path: Path to the .pine file
-        :param script_args: Arguments to pass to the compiled script
-        :param force: Force recompilation even if file hasn't changed
-        :param strict: Enable strict compilation mode
-        :param output_file_path: Optional output path (defaults to .py extension)
-        :return: Exit code from the executed script
-        :raises FileNotFoundError: If pine file doesn't exist
-        :raises CompilationError: If compilation fails
-        :raises APIError: If API request fails
-        """
-        # Compile the file
-        compiled_file = self.compile(
-            pine_path=pine_file_path,
-            output_path=output_file_path,
-            force=force,
-            strict=strict
-        )
-
-        # Prepare command to run the compiled script
-        cmd = [sys.executable, str(compiled_file)]
-        if script_args:
-            cmd.extend(script_args)
-
-        # Run the compiled script
-        try:
-            result = subprocess.run(cmd, check=False)
-            return result.returncode
-        except Exception as e:
-            raise RuntimeError(f"Error executing compiled script: {e}")

@@ -4,6 +4,7 @@ PyneCore API client
 from typing import Any
 
 import json
+import base64
 
 from datetime import datetime
 
@@ -28,6 +29,24 @@ class TokenValidationResponse:
     expiration: datetime | None = None
     expires_at: datetime | None = None
     expires_in: int | None = None
+    raw_response: dict[str, Any] | None = None
+
+
+@dataclass
+class UsageLimits:
+    """Usage limits for daily and hourly periods."""
+    limit: int
+    used: int
+    remaining: int
+    reset_at: datetime
+
+
+@dataclass
+class UsageResponse:
+    """Response from account usage endpoint."""
+    daily: UsageLimits
+    hourly: UsageLimits
+    api_keys: dict[str, Any]
     raw_response: dict[str, Any] | None = None
 
 
@@ -219,6 +238,132 @@ class APIClient:
                 raise
 
         raise APIError("Unexpected error during token verification.")
+
+    def verify_token_local(self) -> TokenValidationResponse:
+        """
+        Verify JWT token locally without server request.
+        
+        :return: TokenValidationResponse with validation details
+        :raises AuthError: If token format is invalid or expired
+        """
+        try:
+            # JWT tokens have format: header.payload.signature
+            parts = self.api_key.split('.')
+            if len(parts) != 3:
+                return TokenValidationResponse(
+                    valid=False,
+                    message="Invalid JWT format: must have 3 parts separated by dots"
+                )
+            
+            header_b64, payload_b64, signature_b64 = parts
+            
+            # Decode header
+            try:
+                # Add padding if needed
+                header_b64 += '=' * (4 - len(header_b64) % 4)
+                header_data = json.loads(base64.urlsafe_b64decode(header_b64).decode('utf-8'))
+            except (ValueError, json.JSONDecodeError):
+                return TokenValidationResponse(
+                    valid=False,
+                    message="Invalid JWT header format"
+                )
+            
+            # Decode payload
+            try:
+                # Add padding if needed
+                payload_b64 += '=' * (4 - len(payload_b64) % 4)
+                payload_data = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8'))
+            except (ValueError, json.JSONDecodeError):
+                return TokenValidationResponse(
+                    valid=False,
+                    message="Invalid JWT payload format"
+                )
+            
+            # Check expiration - try both 'exp' (standard) and 'e' (custom format)
+            exp = payload_data.get('exp') or payload_data.get('e')
+            if exp:
+                exp_time = datetime.fromtimestamp(exp)
+                if datetime.now() >= exp_time:
+                    return TokenValidationResponse(
+                        valid=False,
+                        message="Token has expired",
+                        expiration=exp_time,
+                        expires_at=exp_time
+                    )
+            
+            # Extract user info
+            user_id = payload_data.get('s')  # Based on the image, 's' contains user ID
+            
+            return TokenValidationResponse(
+                valid=True,
+                message="Token is valid",
+                user_id=user_id,
+                token_type=header_data.get('typ', 'JWT'),
+                expiration=datetime.fromtimestamp(exp) if exp else None,
+                expires_at=datetime.fromtimestamp(exp) if exp else None,
+                raw_response={
+                    'header': header_data,
+                    'payload': payload_data
+                }
+            )
+            
+        except Exception as e:
+            return TokenValidationResponse(
+                valid=False,
+                message=f"Token validation error: {str(e)}"
+            )
+
+    def get_usage(self) -> UsageResponse:
+        """
+        Get current usage statistics and limits for the authenticated user.
+
+        :return: UsageResponse with usage details
+        :raises AuthError: If authentication fails
+        :raises NetworkError: If network request fails
+        :raises APIError: For other API errors
+        """
+        try:
+            request = self._make_request("GET", "account/usage")
+
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode('utf-8'))
+
+                # Parse daily usage
+                daily_data = data["daily"]
+                daily = UsageLimits(
+                    limit=daily_data["limit"],
+                    used=daily_data["used"],
+                    remaining=daily_data["remaining"],
+                    reset_at=datetime.fromisoformat(daily_data["reset_at"].replace("Z", "+00:00"))
+                )
+
+                # Parse hourly usage
+                hourly_data = data["hourly"]
+                hourly = UsageLimits(
+                    limit=hourly_data["limit"],
+                    used=hourly_data["used"],
+                    remaining=hourly_data["remaining"],
+                    reset_at=datetime.fromisoformat(hourly_data["reset_at"].replace("Z", "+00:00"))
+                )
+
+                return UsageResponse(
+                    daily=daily,
+                    hourly=hourly,
+                    api_keys=data.get("api_keys", {}),
+                    raw_response=data
+                )
+
+        except urllib.error.HTTPError as e:
+            self._handle_http_error(e)
+        except urllib.error.URLError as e:
+            raise NetworkError(f"Network error during usage retrieval: {e}")
+        except Exception as e:
+            if not isinstance(e, APIError):
+                raise APIError(f"Unexpected error during usage retrieval: {e}")
+            else:
+                raise
+
+        raise APIError("Unexpected error during usage retrieval.")
 
     def compile_script(
             self,
