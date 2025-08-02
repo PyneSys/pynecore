@@ -1,10 +1,11 @@
-from pathlib import Path
-from datetime import datetime
 import queue
 import threading
 import time
 import sys
-from typing import Optional
+import tomllib
+
+from pathlib import Path
+from datetime import datetime
 
 from typer import Option, Argument, secho, Exit
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -19,8 +20,8 @@ from pynecore.core.ohlcv_file import OHLCVReader
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
-from ...core.compiler import create_compilation_service
-from ...cli.utils.api_error_handler import handle_api_errors
+from pynecore.pynesys.compiler import PyneComp
+from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
 
@@ -80,31 +81,10 @@ def run(
         trade_path: Path | None = Option(None, "--trade", "-tp",
                                          help="Path to save the trade data",
                                          rich_help_panel="Out Path Options"),
-        force: bool = Option(
-            False,
-            "--force",
-            help="Force recompilation for .pine files (ignore smart compilation)",
-            rich_help_panel="Compilation Options"
-        ),
-        strict: bool = Option(
-            False,
-            "--strict",
-            help="Enable strict compilation mode for .pine files",
-            rich_help_panel="Compilation Options"
-        ),
-        api_key: Optional[str] = Option(
-            None,
-            "--api-key",
-            help="PyneSys API key (overrides configuration file)",
-            envvar="PYNESYS_API_KEY",
-            rich_help_panel="Compilation Options"
-        ),
-        config_path: Optional[Path] = Option(
-            None,
-            "--config",
-            help="Path to TOML configuration file",
-            rich_help_panel="Compilation Options"
-        ),
+        api_key: str | None = Option(None, "--api-key", "-a",
+                                     help="PyneSys API key for compilation (overrides configuration file)",
+                                     envvar="PYNESYS_API_KEY",
+                                     rich_help_panel="Compilation Options"),
 ):
     """
     Run a script (.py or .pine)
@@ -118,49 +98,22 @@ def run(
     they will be saved in the [italic]"workdir/output"[/] directory.
     
     [bold]Pine Script Support:[/bold]
-    When running a .pine file, it will be automatically compiled to Python before execution.
-    Use the compilation options (--force, --strict) to control the compilation process.
-    A valid PyneSys API key is required for Pine Script compilation.
-    
-    [bold]Smart Compilation:[/bold]
-    The system checks for changes in .pine files and only recompiles when necessary.
-    Use --force to bypass this check and force recompilation.
+    Also Pine Script (.pine) files could be automatically compiled to Python (.py) before execution, if the 
+    file is newer than the [italic]py[/] file or if the [italic].py[/] file doesn't exist. The compiled [italic].py[/] file will be saved 
+    into the same folder as the original [italic].pine[/] file.
+    A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
     """  # noqa
 
-    # Support both .py and .pine files
-    if script.suffix not in [".py", ".pine"]:
-        # Check if the file exists with the given extension first
-        if len(script.parts) == 1:
-            full_script_path = app_state.scripts_dir / script
-        else:
-            full_script_path = script
-
-        if full_script_path.exists():
-            # File exists but has unsupported extension
-            console.print(f"[red]This file format isn't supported:[/red] {script.suffix}")
-            console.print("[yellow]✨ Currently supported formats:[/yellow] .py, .pine")
-            if script.suffix in [".ohlcv", ".csv", ".json"]:
-                console.print(f"[blue]💡 Heads up:[/blue] {script.suffix} files are data files, not executable scripts.")
-            raise Exit(1)
-
-        # File doesn't exist, try .pine first, then .py
-        pine_script = script.with_suffix(".pine")
-        py_script = script.with_suffix(".py")
-
-        if len(script.parts) == 1:
-            pine_script = app_state.scripts_dir / pine_script
-            py_script = app_state.scripts_dir / py_script
-
-        if pine_script.exists():
-            script = pine_script
-        elif py_script.exists():
-            script = py_script
-        else:
-            script = py_script  # Default to .py for error message
-
-    # Expand script path if it's just a filename
+    # Expand script path
     if len(script.parts) == 1:
         script = app_state.scripts_dir / script
+
+    # If no script suffix, try .pine 1st
+    if script.suffix == "":
+        script = script.with_suffix(".pine")
+    # If doesn't exist, try .py
+    if not script.exists():
+        script = script.with_suffix(".py")
 
     # Check if script exists
     if not script.exists():
@@ -169,66 +122,44 @@ def run(
 
     # Handle .pine files - compile them first
     if script.suffix == ".pine":
+        # Read api.toml configuration
+        api_config = {}
         try:
-            # Create compilation service
-            compilation_service = create_compilation_service(
-                api_key=api_key,
-                config_path=config_path
-            )
+            with open(app_state.config_dir / 'api.toml', 'rb') as f:
+                api_config = tomllib.load(f)['api']
+        except KeyError:
+            console.print("[red]Invalid API config file (api.toml)![/red]")
+            raise Exit(1)
+        except FileNotFoundError:
+            pass
 
-            # Determine output path for compiled file
-            compiled_file = script.with_suffix(".py")
+        # Override API key if provided
+        if api_key:
+            api_config['api_key'] = api_key
 
-            # Check if compilation is needed
-            if compilation_service.needs_compilation(script, compiled_file) or force:
-                with handle_api_errors(console):
-                    with Progress(
-                        SpinnerColumn(),
+        # Create the compiler instance
+        compiler = PyneComp(**api_config)
+
+        # Determine output path for compiled file
+        out_path = script.with_suffix(".py")
+
+        # Check if compilation is needed
+        if compiler.needs_compilation(script, out_path):
+            with APIErrorHandler(console):
+                with Progress(
+                        SpinnerColumn(finished_text="[green]✓"),
                         TextColumn("[progress.description]{task.description}"),
                         console=console
-                    ) as progress:
-                        progress.add_task("Compiling Pine Script...", total=None)
+                ) as progress:
+                    task = progress.add_task("Compiling Pine Script...", total=1)
 
-                        # Compile the .pine file
-                        compiled_path = compilation_service.compile_file(
-                            script,
-                            compiled_file,
-                            force=force,
-                            strict=strict
-                        )
+                    # Compile the .pine file
+                    compiler.compile(script, out_path)
 
-                    console.print(f"[green]Compilation successful![/green] Ready to run: [cyan]{compiled_path}[/cyan]")
-                    compiled_file = compiled_path
+                    progress.update(task, completed=1)
 
-            else:
-                console.print(f"[green]⚡ Using cached version:[/green] [cyan]{compiled_file}[/cyan]")
-                console.print("[dim]Use --force to recompile[/dim]")
-
-            # Update script to point to the compiled file
-            script = compiled_file
-
-        except ValueError as e:
-            error_msg = str(e)
-            if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
-                console.print("[yellow]⚠️  No API configuration found[/yellow]")
-                console.print()
-                console.print("[bold]Quick setup (takes few minutes):[/bold]")
-                console.print("1. 🌐 Get your API key at "
-                              "[blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
-                console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to save your configuration")
-                console.print()
-                console.print("[dim]💬 Need assistance? Our docs are here: https://pynesys.io/docs[/dim]")
-            else:
-                console.print(f"[red] Attention:[/red] {e}")
-            raise Exit(1)
-
-    # Ensure we have a .py file at this point
-    if script.suffix != ".py":
-        console.print(f"[red]This file format isn't supported:[/red] {script.suffix}")
-        console.print("[yellow]✨ Currently supported formats:[/yellow] .py, .pine")
-        if script.suffix in [".ohlcv", ".csv", ".json"]:
-            console.print(f"[blue]💡 Heads up:[/blue] {script.suffix} files are data files, not executable scripts.")
-        raise Exit(1)
+        # Update script to point to the compiled file
+        script = out_path
 
     # Check file format and extension
     if data.suffix == "":

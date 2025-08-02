@@ -30,6 +30,16 @@ def setup(
             "--recreate-demo",
             help="Recreate demo.py and demo.ohlcv files even if workdir exists",
         ),
+        recreate_provider_config: bool = typer.Option(
+            False,
+            "--recreate-provider-config",
+            help="Recreate provider.toml file even if workdir exists",
+        ),
+        recreate_api_config: bool = typer.Option(
+            False,
+            "--recreate-api-config",
+            help="Recreate api.toml file even if workdir exists",
+        )
 ):
     """
     Pyne Command Line Interface
@@ -211,7 +221,7 @@ def main(
 
     # Create providers.toml file for all supported providers (if not exists)
     providers_file = config_dir / 'providers.toml'
-    if not providers_file.exists():
+    if not providers_file.exists() or recreate_provider_config:
         with providers_file.open('w') as f:
             for provider in available_providers:
                 f.write(f"[{provider}]\n")
@@ -233,6 +243,16 @@ def main(
                         else:
                             raise ValueError(f"Unsupported type for {key}: {type(value)}")
                 f.write("\n")
+
+    # Create api.toml file for PyneSys API (if not exists)
+    api_file = config_dir / 'api.toml'
+    if not api_file.exists() or recreate_api_config:
+        with api_file.open('w') as f:
+            f.write("""[api]
+api_key = ""
+base_url = "https://api.pynesys.io"
+timeout = 30
+""")
 
     # Set workdir in app_state
     app_state.workdir = workdir

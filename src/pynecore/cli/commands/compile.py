@@ -1,14 +1,14 @@
+import tomllib
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from ..app import app
-from ..utils.api_error_handler import handle_api_errors
-from ...core.compiler import create_compilation_service
-from ...utils.file_utils import preserve_mtime
+from ..app import app, app_state
+from ..utils.api_error_handler import APIErrorHandler
+from pynecore.pynesys.compiler import PyneComp
+from ...utils.file_utils import copy_mtime
 
 __all__ = []
 
@@ -18,32 +18,24 @@ console = Console()
 # noinspection PyShadowingBuiltins
 @app.command()
 def compile(
-        script_path: Path = typer.Argument(
-            ...,
-            help="Path to Pine Script file (.pine extension)",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True
+        script: Path = typer.Argument(
+            ..., file_okay=True, dir_okay=False,
+            help="Path to Pine Script file (.pine extension)"
         ),
-        output: Optional[Path] = typer.Option(
-            None,
-            "--output", "-o",
+        output: Path | None = typer.Option(
+            None, "--output", "-o",
             help="Output Python file path (defaults to same name with .py extension)"
         ),
         strict: bool = typer.Option(
-            False,
-            "--strict",
+            False, "--strict", '-s',
             help="Enable strict compilation mode with enhanced error checking"
         ),
         force: bool = typer.Option(
-            False,
-            "--force",
+            False, "--force", "-f",
             help="Force recompilation even if output file is up-to-date"
         ),
-        api_key: Optional[str] = typer.Option(
-            None,
-            "--api-key",
+        api_key: str | None = typer.Option(
+            None, "--api-key", "-a",
             help="PyneSys API key (overrides configuration file)",
             envvar="PYNESYS_API_KEY"
         )
@@ -51,89 +43,65 @@ def compile(
     """
     Compile Pine Script to Python using PyneSys API.
 
-    USAGE:
-        pyne compile <file.pine>                    # Compile single file
-        pyne compile <file.pine> --force            # Force recompile even if up-to-date
-        pyne compile <file.pine> --strict           # Enable strict compilation mode
-        pyne compile <file.pine> --output <path>    # Specify output file path
-
     CONFIGURATION:
         Default config: workdir/config/api.toml
         Fallback config: ~/.pynecore/api.toml
 
-        Config format (TOML only):
-        [api]
-        pynesys_api_key = "your_api_key_here"
-        base_url = "https://api.pynesys.io/"  # optional
-        timeout = 30  # optional, seconds
-
-    SMART COMPILATION:
-        - Automatically skips recompilation if output is newer than input
-        - Use --force to override this behavior
-        - Preserves file modification timestamps
-
     REQUIREMENTS:
         - Pine Script version 6 only (version 5 not supported)
-        - Valid PyneSys API key required
-        - Input file must have .pine extension
-        - Output defaults to same name with .py extension
-
-    Use 'pyne api configure' to set up your API configuration.
+        - Valid PyneSys API key required (get one at [blue]https://app.pynesys.io[/])
     """
+
+    # Ensure .py extension
+    if script.suffix != ".pine":
+        script = script.with_suffix(".pine")
+    # Expand script path
+    if len(script.parts) == 1:
+        script = app_state.scripts_dir / script
+
+    # Determine output path
+    if output is None:
+        output = script.with_suffix('.py')
+
+    # Read api.toml configuration
+    api_config = {}
     try:
-        # Create compilation service
-        compilation_service = create_compilation_service(
-            api_key=api_key,
-
-        )
-
-        # Determine output path
-        if output is None:
-            output = script_path.with_suffix('.py')
-
-        # Check if compilation is needed (smart compilation)
-        if not compilation_service.needs_compilation(script_path, output) and not force:
-            console.print(f"[green]✓[/green] Output file is up-to-date: {output}")
-            console.print("[dim]Use --force to recompile anyway[/dim]")
-            return
-
-        # Compile script
-        with handle_api_errors(console):
-            with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console
-            ) as progress:
-                progress.add_task("Compiling Pine Script...", total=None)
-
-                # Compile the .pine file
-                compiled_path = compilation_service.compile_file(
-                    script_path,
-                    output,
-                    force=force,
-                    strict=strict
-                )
-
-            # Preserve modification time from source file
-            preserve_mtime(script_path, output)
-
-            console.print(f"[green]Compilation successful![/green] Your Pine Script is now ready: "
-                          f"[cyan]{compiled_path}[/cyan]")
-
-    except ValueError as e:
-        error_msg = str(e)
-        if "No configuration file found" in error_msg or "Configuration file not found" in error_msg:
-            # No API configuration found - show helpful setup message
-            console.print("[yellow]⚠️  No API configuration found[/yellow]")
-            console.print()
-            console.print("[bold]Quick setup (takes just few minutes):[/bold]")
-            console.print("1. 🌐 Get your API key at [blue][link=https://pynesys.io]https://pynesys.io[/link][/blue]")
-            console.print("2. 🔧 Run [cyan]pyne api configure[/cyan] to save your configuration")
-            console.print()
-            console.print("[dim]💬 Need assistance? Our docs are here: https://pynesys.io/docs[/dim]")
-        elif "this file format isn't supported" in error_msg:
-            # File format error - show the friendly message directly
-            console.print(f"[red]{e}[/red]")
-        else:
-            console.print(f"[red]Attention:[/red] {e}")
+        with open(app_state.config_dir / 'api.toml', 'rb') as f:
+            api_config = tomllib.load(f)['api']
+    except KeyError:
+        console.print("[red]Invalid API config file (api.toml)![/red]")
         raise typer.Exit(1)
+    except FileNotFoundError:
+        pass
+
+    # Override API key if provided
+    if api_key:
+        api_config['api_key'] = api_key
+
+    # Create the compiler instance
+    compiler = PyneComp(**api_config)
+
+    # Check if compilation is needed (smart compilation)
+    if not compiler.needs_compilation(script, output) and not force:
+        console.print(f"[green]✓[/green] Output file is up-to-date: {output}")
+        console.print("[dim]Use --force to recompile anyway[/dim]")
+        return
+
+    # Compile script
+    with APIErrorHandler(console):
+        with Progress(
+                SpinnerColumn(finished_text="[green]✓"),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+        ) as progress:
+            task = progress.add_task("Compiling Pine Script...", total=1)
+
+            # Compile the .pine file to .py
+            out_path = compiler.compile(script, output, force=force, strict=strict)
+
+            progress.update(task, completed=1)
+
+        # Preserve modification time from source file
+        copy_mtime(script, output)
+
+        console.print(f"The compiled script is located at: [cyan]{out_path}[/cyan]")
