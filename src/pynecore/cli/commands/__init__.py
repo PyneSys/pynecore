@@ -250,7 +250,6 @@ def main(
         with api_file.open('w') as f:
             f.write("""[api]
 api_key = ""
-base_url = "https://api.pynesys.io"
 timeout = 30
 """)
 

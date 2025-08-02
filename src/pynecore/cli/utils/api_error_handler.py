@@ -54,10 +54,10 @@ class APIErrorHandler:
         if e.retry_after:
             self.console.print(f"[yellow]⏰  Please try again in {e.retry_after} seconds[/yellow]")
         self.console.print(
-            "[yellow]💡 To increase your limits, consider upgrading your subscription at "
+            "[yellow]💡  To increase your limits, consider upgrading your subscription at "
             "[link=https://pynesys.io]https://pynesys.io[/link]")
         self.console.print(
-            "💎 Upgrade at [link=https://pynesys.io/pricing]https://pynesys.io/pricing[/link]")
+            "💎  Upgrade at [link=https://pynesys.io/pricing]https://pynesys.io/pricing[/link]")
 
     def _handle_api_error(self, e: APIError):
         """Handle general API errors with specific status code handling."""
@@ -112,11 +112,8 @@ class APIErrorHandler:
 
         elif "500" in error_msg or "server" in error_msg or "internal" in error_msg:
             self.console.print("[red]🔧  Server Error:[/red] Something went wrong on our end")
-            self.console.print("[yellow]😅  Don't worry, it's not you![/yellow]")
             self.console.print("  • This is a temporary server issue")
             self.console.print("  • Please try again in a few moments")
-            self.console.print(
-                "📊 Check service status: [link=https://status.pynesys.io]https://status.pynesys.io[/link]")
 
         elif "unsupported pinescript version" in error_msg:
             self.console.print("[red]📌  Version Issue:[/red] Your Pine Script version isn't supported")
@@ -125,8 +122,7 @@ class APIErrorHandler:
                 self.console.print("  • Update your script to Pine Script version 6")
                 self.console.print("  • Most v5 scripts need minimal changes")
                 self.console.print(
-                    "📖  Migration guide: [link=https://www.tradingview.com/pine-script-docs/en/v6/"
-                    "migration_guides/v5_to_v6_migration_guide.html]Pine Script v5→v6 Guide[/link]")
+                    "📖  Migration guide: [link=https://www.tradingview.com/pine-script-docs/en/v6/migration_guides/v5_to_v6_migration_guide.html]Pine Script v5→v6 Guide[/link]")
             else:
                 self.console.print("[yellow]💡  Only Pine Script version 6 is currently supported[/yellow]")
 
@@ -138,8 +134,8 @@ class APIErrorHandler:
 
         else:
             # Generic API error fallback
-            self.console.print(f"[red]🌐 API Error:[/red] {str(e)}")
-            self.console.print("[yellow]💡 If this persists, please check:[/yellow]")
+            self.console.print(f"[red]🌐  API Error:[/red] {str(e)}")
+            self.console.print("[yellow]💡  If this persists, please check:[/yellow]")
             self.console.print("  • Your internet connection")
             self.console.print("  • API service status")
             self.console.print("📞 Need help? [link=https://pynesys.io/support]Contact Support[/link]")

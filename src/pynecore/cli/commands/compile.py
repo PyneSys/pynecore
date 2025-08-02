@@ -1,4 +1,5 @@
 import tomllib
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -17,7 +18,7 @@ __all__ = []
 console = Console()
 
 
-def _print_usage(compiler: PyneComp):
+def _print_usage(compiler: PyneComp, sleep: float = 0):
     """Print usage statistics in a nicely formatted table."""
     usage = compiler.get_usage()
 
@@ -51,6 +52,10 @@ def _print_usage(compiler: PyneComp):
 
     # Show API key expiration information
     try:
+        # Sleep to wait for usage is saved in the background of the DB
+        if sleep > 0:
+            time.sleep(sleep)
+
         token_info = compiler.validate_api_key()
         if token_info.valid and token_info.expiration:
             print()
@@ -185,4 +190,4 @@ def compile(
 
         if show_usage:
             print()
-            _print_usage(compiler)
+            _print_usage(compiler, 1.0)
