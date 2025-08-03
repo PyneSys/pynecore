@@ -1,5 +1,7 @@
 """Centralized API error handling utilities for CLI commands."""
 
+import re
+
 from rich.console import Console
 from typer import Exit
 
@@ -62,8 +64,14 @@ class APIErrorHandler:
         error_msg = str(e).lower()
 
         # Handle specific API error scenarios based on HTTP status codes
-        if "400" in error_msg or "bad request" in error_msg or (
-                '"detail":' in error_msg and '"error":' in error_msg and '"line":' in error_msg):
+        has_400_error = "400" in error_msg or "bad request" in error_msg
+        has_structured_error = (
+            '"detail":' in error_msg and 
+            '"error":' in error_msg and 
+            '"line":' in error_msg
+        )
+        
+        if has_400_error or has_structured_error:
             if "compilation fails" in error_msg or "script is too large" in error_msg:
                 self.console.print("[red]Script Issue:[/red] Your Pine Script couldn't be compiled")
                 self.console.print("[yellow]Common fixes:[/yellow]")
@@ -76,16 +84,27 @@ class APIErrorHandler:
                 structured_error_parsed = False
 
                 # Check for structured JSON error format
-                if "'error':" in error_str and "'line':" in error_str or '"error":' in error_str and '"line":' in error_str:
-                    import re
+                has_error_and_line = (
+                    ("'error':" in error_str and "'line':" in error_str) or
+                    ('"error":' in error_str and '"line":' in error_str)
+                )
+                
+                if has_error_and_line:
                     # Pattern for JSON format: {"detail":{"error":"...","line":...,"file":"..."}}
-                    json_pattern = r'\{"detail":\{"status":"error","error":"([^"]+)","line":(\d+),"file":"([^"]+)"\}\}'
+                    json_pattern = (
+                        r'\{"detail":\{"status":"error","error":"([^"]+)",' +
+                        r'"line":(\d+),"file":"([^"]+)"\}\}'
+                    )
                     match = re.search(json_pattern, error_str)
                     if match:
                         error_msg, line_num, file_name = match.groups()
                         self.console.print(f"[red]Script Error:[/red] {error_msg}")
-                        self.console.print(f"[yellow]Location:[/yellow] Line {line_num} in {file_name}")
-                        self.console.print("[yellow]Quick fix:[/yellow] Check the variable declaration and spelling")
+                        self.console.print(
+                            f"[yellow]Location:[/yellow] Line {line_num} in {file_name}"
+                        )
+                        self.console.print(
+                            "[yellow]Quick fix:[/yellow] Check the variable declaration and spelling"
+                        )
                         structured_error_parsed = True
 
                 # Fallback to generic error display if structured parsing failed
