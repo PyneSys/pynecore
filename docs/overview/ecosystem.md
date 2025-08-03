@@ -15,7 +15,8 @@ tags: ["ecosystem", "pynecomp", "pynecore", "services", "business-model", "commu
 
 # Pyne Ecosystem
 
-The Pyne ecosystem consists of multiple interconnected components that together form a complete solution for TradingView Pine Script compatibility in Python. This page provides an overview of these components and how they work together.
+The Pyne ecosystem consists of multiple interconnected components that together form a complete solution for TradingView
+Pine Script compatibility in Python. This page provides an overview of these components and how they work together.
 
 ## Core Components
 
@@ -23,7 +24,8 @@ The Pyne ecosystem is built around two main components:
 
 ### PyneCore (Open Source)
 
-PyneCore is the foundation of the ecosystem - an open-source Python implementation of a Pine Script-like environment. It provides:
+PyneCore is the foundation of the ecosystem - an open-source Python implementation of a Pine Script-like environment. It
+provides:
 
 - A Pine Script compatible runtime in Python
 - AST transformations that enable Pine Script-like syntax and features
@@ -33,24 +35,28 @@ PyneCore is the foundation of the ecosystem - an open-source Python implementati
 - NA class, which works the same way as Pine Script's NA
 - Strategy backtesting capabilities, compatible with Pine Script's strategy tester
 
-PyneCore allows you to write Pine Script-like code directly in Python, leveraging Python's ecosystem while maintaining the advantages of Pine Script's execution model.
+PyneCore allows you to write Pine Script-like code directly in Python, leveraging Python's ecosystem while maintaining
+the advantages of Pine Script's execution model.
 
 Learn more about PyneCore in the [What is PyneCore](/docs/overview/what-is-pynecore/) page.
 
 ### PyneComp - Pine Script to PyneCore Compiler/Transpiler (SaaS Service)
 
-PyneComp is a compiler service that translates existing Pine Script code into PyneCore-compatible Python code. It offers:
+PyneComp is a compiler service that translates existing Pine Script code into PyneCore-compatible Python code. It
+offers:
 
 - Clean, readable Python code generation (PyneCore)
 - Strict mode with full scope isolation (it is not needed most of the time)
 - 100% Pine Script compatibility
 
 This service is available through:
+
 - The PyneSys API
 - The [pynesys.io](https://pynesys.io) web interface
 - Direct integration with PyneCore CLI (if you have API key)
 
-PyneComp enables a smooth migration path from TradingView Pine Script to Python with minimal effort. PyneCore has all the tools to run the compiled python code.
+PyneComp enables a smooth migration path from TradingView Pine Script to Python with minimal effort. PyneCore has all
+the tools to run the compiled python code.
 
 ## Planned Services
 
@@ -58,7 +64,8 @@ The following services are planned and/or already being developed:
 
 ### MetaTrader 4/5 Compiler (Transpiler)
 
-We are planning a compiler which can convert Pine Scripts to MetaTrader 4/5 expert advisors. We have the knowledge and experience to do this.
+We are planning a compiler which can convert Pine Scripts to MetaTrader 4/5 expert advisors. We have the knowledge and
+experience to do this.
 
 ### Strategy Leaderboard
 
@@ -126,5 +133,5 @@ The Pyne ecosystem combines open-source and commercial components:
 Join our community to get help and share your experiences:
 
 - [GitHub Discussions](https://github.com/PyneSys/pynecore/discussions)
-- [Discord Server](https://discord.com/invite/7rhPbSqSG7)
+- [Discord Server](https://discord.com/invite/jegnhtq6gy)
 - [Stack Overflow](https://stackoverflow.com/questions/tagged/pynecore)
