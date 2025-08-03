@@ -6,6 +6,7 @@ __pycache__/
 # Environments
 .env
 venv/
+.venv/
 
 # PyPI configuration file
 .pypirc
@@ -23,3 +24,19 @@ dist/
 # macOS
 #
 .DS_Store
+
+#
+# Editors + AI
+#
+
+.idea/
+.vscode/
+.cursor/
+.windsurf/
+.claude/
+.mcp.json
+CLAUDE.md
+MEMORY.md
+
+# Others
+uv.lock

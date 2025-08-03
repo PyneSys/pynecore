@@ -152,6 +152,23 @@ pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT"
 pyne run my_script.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 ```
 
+### Working with Pine Script Files
+
+PyneCore also supports running Pine Script files directly with automatic compilation:
+
+```bash
+# Run a Pine Script file directly (requires PyneSys API key)
+pyne run my_indicator.pine ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv --api-key YOUR_API_KEY
+
+# Or compile Pine Script to Python first
+pyne compile my_indicator.pine --api-key YOUR_API_KEY
+
+# Then run the compiled Python file
+pyne run my_indicator.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
+```
+
+> **Note**: Pine Script compilation requires a PyneSys API key. Get yours at [pynesys.io](https://pynesys.io).
+
 ## Why Choose PyneCore?
 
 - **Beyond TradingView Limitations**: No more platform restrictions, code size limits, or subscription fees
@@ -164,10 +181,10 @@ pyne run my_script.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 ## Pine Script Migration Made Easy
 
 Have existing Pine Script code you want to run in Python? **PyneSys now offers automatic Pine 
-Script to PyneCore translation** through our [web platform](https://pynesys.io) and [Discord bot](https://discord.com/invite/7rhPbSqSG7).
+Script to PyneCore translation** through our [web platform](https://pynesys.io) and [Discord bot](https://discord.com/invite/jegnhtq6gy).
 
 ### 🚀 Get Started Instantly
-- **Try for free on Discord**: Use `/pine-help` in our [Discord](https://discord.com/invite/7rhPbSqSG7) for instant conversion - 3 free translations!
+- **Try for free on Discord**: Use `/pine-help` in our [Discord](https://discord.com/invite/jegnhtq6gy) for instant conversion - 3 free translations!
 - **Full service**: Visit [pynesys.io](https://pynesys.io) for subscriptions and higher limits
 
 ### 💡 Support the Ecosystem
@@ -185,7 +202,7 @@ Love PyneCore and want to see it grow? Consider a **Seed subscription or higher*
 ### Community
 
 - **Discussions**: [GitHub Discussions](https://github.com/pynesys/pynecore/discussions)
-- **Discord**: [discord.com/invite/7rhPbSqSG7](https://discord.com/invite/7rhPbSqSG7)
+- **Discord**: [discord.com/invite/jegnhtq6gy](https://discord.com/invite/jegnhtq6gy)
 - **X**: [x.com/pynesys](https://x.com/pynesys)
 - **Website**: [pynecore.org](https://pynecore.org)
 

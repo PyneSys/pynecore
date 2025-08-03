@@ -156,13 +156,14 @@ PYNE_WORK_DIR=/path/to/my/workdir pyne run my_script.py my_data.ohlcv
 
 The PyneCore CLI provides the following main commands:
 
-- `run`: Run a PyneCore script
+- `run`: Run a PyneCore script (.py or .pine)
+- `compile`: Compile Pine Script to Python using PyneSys API
 - `data`: OHLCV related commands
-- `compile`: Compile Pine Script to Python through pynesys.com (coming soon)
 
 ## Next Steps
 
 Now that you understand the basic concepts, you can learn about specific commands:
 
 - [Running Scripts](run.md): How to run PyneCore scripts
+- [Compiling Pine Scripts](compile.md): How to compile Pine Scripts to Python
 - [Data Management](data.md): Data download and conversion commands
