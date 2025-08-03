@@ -152,6 +152,23 @@ pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT"
 pyne run my_script.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 ```
 
+### Working with Pine Script Files
+
+PyneCore also supports running Pine Script files directly with automatic compilation:
+
+```bash
+# Run a Pine Script file directly (requires PyneSys API key)
+pyne run my_indicator.pine ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv --api-key YOUR_API_KEY
+
+# Or compile Pine Script to Python first
+pyne compile my_indicator.pine --output my_indicator.py --api-key YOUR_API_KEY
+
+# Then run the compiled Python file
+pyne run my_indicator.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
+```
+
+> **Note**: Pine Script compilation requires a PyneSys API key. Get yours at [pynesys.io](https://pynesys.io) or try it free on our [Discord](https://discord.com/invite/7rhPbSqSG7).
+
 ## Why Choose PyneCore?
 
 - **Beyond TradingView Limitations**: No more platform restrictions, code size limits, or subscription fees
