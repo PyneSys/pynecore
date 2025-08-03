@@ -75,7 +75,7 @@ class CompileResponse:
 
     @property
     def is_auth_error(self) -> bool:
-        """Check if response indicates authentication error."""
+        """Check if response indicates an authentication error."""
         return self.status_code == 401
 
 
@@ -254,9 +254,9 @@ class APIClient:
                     valid=False,
                     message="Invalid JWT format: must have 3 parts separated by dots"
                 )
-            
+
             header_b64, payload_b64, signature_b64 = parts
-            
+
             # Decode header
             try:
                 # Add padding if needed
@@ -267,7 +267,7 @@ class APIClient:
                     valid=False,
                     message="Invalid JWT header format"
                 )
-            
+
             # Decode payload
             try:
                 # Add padding if needed
@@ -278,7 +278,7 @@ class APIClient:
                     valid=False,
                     message="Invalid JWT payload format"
                 )
-            
+
             # Check expiration - try both 'exp' (standard) and 'e' (custom format)
             exp = payload_data.get('exp') or payload_data.get('e')
             if exp:
@@ -290,10 +290,10 @@ class APIClient:
                         expiration=exp_time,
                         expires_at=exp_time
                     )
-            
+
             # Extract user info
             user_id = payload_data.get('s')  # Based on the image, 's' contains user ID
-            
+
             return TokenValidationResponse(
                 valid=True,
                 message="Token is valid",
@@ -306,7 +306,7 @@ class APIClient:
                     'payload': payload_data
                 }
             )
-            
+
         except Exception as e:
             return TokenValidationResponse(
                 valid=False,
@@ -417,21 +417,23 @@ class APIClient:
                 raise
 
     @staticmethod
-    def _handle_http_error(error: urllib.error.HTTPError) -> None:
+    def _handle_http_error(error: urllib.error.HTTPError, message: str = None) -> None:
         """
         Handle HTTP error responses.
 
         :param error: HTTPError object
+        :param message: Optional pre-extracted error message
         :raises: Appropriate exception based on status code
         """
         status_code = error.code
 
-        try:
-            error_content = error.read().decode('utf-8')
-            error_data = json.loads(error_content)
-            message = error_data.get("message", error_content)
-        except (json.JSONDecodeError, ValueError):
-            message = error.reason or f"HTTP {status_code} error"
+        if message is None:
+            try:
+                error_content = error.read().decode('utf-8')
+                error_data = json.loads(error_content)
+                message = error_data.get("message", error_content)
+            except (json.JSONDecodeError, ValueError):
+                message = error.reason or f"HTTP {status_code} error"
 
         if status_code == 401:
             raise AuthError(message, status_code=status_code)
@@ -470,6 +472,10 @@ class APIClient:
             # Validation error format (422)
             validation_errors = error_data["detail"]
             error_message = "Validation errors occurred"
+        elif "detail" in error_data and isinstance(error_data["detail"], dict):
+            # Structured error format (400) - pass the complete JSON for parsing
+            validation_errors = None
+            error_message = error_content  # Pass the full JSON response
         else:
             validation_errors = None
             error_message = error_data.get("message", error_content)
@@ -478,8 +484,9 @@ class APIClient:
         if status_code == 422:
             raise CompilationError(error_message, status_code=status_code, validation_errors=validation_errors)
 
-        # For other errors, use the general error handler
-        self._handle_http_error(error)
+        # For other errors, use the general error handler with the extracted message
+        else:
+            self._handle_http_error(error, error_message)
 
         # This should never be reached
         return CompileResponse(
