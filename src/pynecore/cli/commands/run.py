@@ -17,6 +17,7 @@ from ..app import app, app_state
 
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
@@ -85,6 +86,12 @@ def run(
                                      help="PyneSys API key for compilation (overrides configuration file)",
                                      envvar="PYNESYS_API_KEY",
                                      rich_help_panel="Compilation Options"),
+        symbol: str | None = Option(None, "--symbol", "-s",
+                                    help="Symbol name for conversion (required for CSV/TXT/JSON files)",
+                                    rich_help_panel="Data Options"),
+        timeframe: str | None = Option(None, "--timeframe", "-tf",
+                                       help="Timeframe for conversion (required for CSV/TXT/JSON files)",
+                                       rich_help_panel="Data Options"),
 ):
     """
     Run a script (.py or .pine)
@@ -102,6 +109,9 @@ def run(
     file is newer than the [italic]py[/] file or if the [italic].py[/] file doesn't exist. The compiled [italic].py[/] file will be saved 
     into the same folder as the original [italic].pine[/] file.
     A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
+    
+    [bold]Data Support:[/bold]
+    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Requires [bold]--symbol[/bold] and [bold]--timeframe[/bold] for CSV/TXT/JSON.
     """  # noqa
 
     # Expand script path
@@ -161,20 +171,60 @@ def run(
         # Update script to point to the compiled file
         script = out_path
 
-    # Check file format and extension
+    # Handle data file format and auto-conversion
     if data.suffix == "":
         # No extension, add .ohlcv
         data = data.with_suffix(".ohlcv")
     elif data.suffix != ".ohlcv":
-        # Has extension but not .ohlcv
-        secho(f"Cannot run with '{data.suffix}' files. The PyneCore runtime requires .ohlcv format.",
-              fg="red", err=True)
-        secho("If you're trying to use a different data format, please convert it first:", fg="red")
-        symbol_placeholder = "YOUR_SYMBOL"
-        timeframe_placeholder = "YOUR_TIMEFRAME"
-        secho(f"pyne data convert-from {data} --symbol {symbol_placeholder} --timeframe {timeframe_placeholder}",
-              fg="yellow")
-        raise Exit(1)
+        # Has extension but not .ohlcv - automatically convert
+        try:
+            converter = DataConverter()
+
+            # Check if conversion is needed
+            if converter.is_conversion_required(data):
+                # Validate required parameters for conversion
+                if not symbol or not timeframe:
+                    secho(f"Converting '{data.suffix}' file requires symbol and timeframe parameters.",
+                          fg="red", err=True)
+                    secho("Please provide --symbol and --timeframe:", fg="red")
+                    secho(f"pyne run {script} {data} --symbol YOUR_SYMBOL --timeframe YOUR_TIMEFRAME",
+                          fg="yellow")
+                    raise Exit(1)
+
+                with Progress(
+                        SpinnerColumn(finished_text="[green]✓"),
+                        TextColumn("[progress.description]{task.description}"),
+                        console=console
+                ) as progress:
+                    task = progress.add_task(f"Converting {data.suffix} to OHLCV format...", total=1)
+
+                    # Perform conversion
+                    result = converter.convert_if_needed(data, symbol=symbol, timeframe=timeframe)
+
+                    progress.update(task, completed=1)
+
+                    if result.converted:
+                        console.print(f"[green]✓[/green] Converted {data} to {result.ohlcv_path}")
+                        data = result.ohlcv_path
+                    else:
+                        console.print(f"[blue]ℹ[/blue] Using existing OHLCV file: {result.ohlcv_path}")
+                        data = result.ohlcv_path
+            else:
+                # File is already up-to-date, use existing OHLCV file
+                ohlcv_path = data.with_suffix(".ohlcv")
+                console.print(f"[blue]ℹ[/blue] Using existing OHLCV file: {ohlcv_path}")
+                data = ohlcv_path
+
+        except (DataFormatError, ConversionError) as e:
+            secho(f"Conversion failed: {e}", fg="red", err=True)
+            secho("Please convert the file manually:", fg="red")
+            symbol_placeholder = "YOUR_SYMBOL"
+            timeframe_placeholder = "YOUR_TIMEFRAME"
+            secho(f"pyne data convert-from {data} "
+                  f"--symbol {symbol_placeholder} "
+                  f"--timeframe {timeframe_placeholder}",
+                  fg="yellow")
+            raise Exit(1)
 
     # Expand data path
     if len(data.parts) == 1:

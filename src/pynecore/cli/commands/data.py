@@ -15,7 +15,7 @@ from ...providers import available_providers
 from ...providers.provider import Provider
 
 from ...utils.rich.date_column import DateColumn
-from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv_file import OHLCVReader
 
 __all__ = []
 
@@ -230,47 +230,130 @@ def convert_to(
                 task = progress.add_task(description="Converting to JSON...", total=1)
                 ohlcv_reader.save_to_json(str(ohlcv_path.with_suffix('.json')), as_datetime=as_datetime)
 
-        # Complete task
-        progress.update(task, completed=1)
+            # Complete task
+            progress.update(task, completed=1)
+
+
+def _auto_detect_symbol_timeframe(file_path: Path) -> tuple[str | None, str | None]:
+    """Auto-detect symbol and timeframe from filename.
+    
+    :param file_path: Path to the data file
+    :return: Tuple of (symbol, timeframe_str) or (None, None) if not detected
+    """
+    filename = file_path.stem  # Filename without extension
+
+    # Common patterns for symbol detection
+    symbol = None
+    timeframe_str = None
+
+    # Try to extract symbol and timeframe from common filename patterns
+    # Examples: BTCUSD_1h.csv, AAPL_daily.csv, EUR_USD_4h.csv
+    parts = filename.replace('-', '_').split('_')
+
+    if len(parts) >= 1:
+        # The First part is likely the symbol
+        potential_symbol = parts[0].upper()
+        if len(potential_symbol) >= 3:  # Minimum symbol length
+            symbol = potential_symbol
+
+    # Look for timeframe indicators
+    timeframe_map = {
+        '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+        '1h': '1H', '4h': '4H', '1d': '1D', 'daily': '1D',
+        '1w': '1W', 'weekly': '1W', '1M': '1M', 'monthly': '1M'
+    }
+
+    for part in parts:
+        part_lower = part.lower()
+        if part_lower in timeframe_map:
+            timeframe_str = timeframe_map[part_lower]
+            break
+
+    return symbol, timeframe_str
 
 
 @app_data.command()
 def convert_from(
-        file_path: Path = Argument(..., help="Path to CSV file to convert"),
+        file_path: Path = Argument(..., help="Path to CSV/JSON file to convert"),
         provider: str = Option("custom", '--provider', '-p',
                                help="Data provider, can be any name"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
-                                    help="Symbol (e.g. BYBIT:BTCUSDT:USDT)"),
-        timeframe: TimeframeEnum = Option('1D', '--timeframe', '-tf', case_sensitive=False,  # type: ignore
-                                          help="Timeframe in TradingView fmt"),
+                                    help="Symbol (e.g. BTCUSD, auto-detected from filename if not provided)"),
+        timeframe: TimeframeEnum | None = Option(None, '--timeframe', '-tf', case_sensitive=False,  # type: ignore
+                                                 help="Timeframe (auto-detected from filename if not provided)"),
         fmt: Enum('Format', {'csv': 'csv', 'json': 'json'}) | None = Option(  # noqa # type: ignore
             None, '--fmt', '-f',
             case_sensitive=False,
-            help="Output fmt"),
+            help="Input format (auto-detected from file extension if not provided)"),
         tz: str = Option('UTC', '--timezone', '-tz',
                          help="Timezone"),
 ):
     """
-    Convert data from other sources to pyne's OHLCV format
+    Convert data from other sources to pyne's OHLCV format with automatic symbol detection
     """
-    with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
-        ohlcv_path = Provider.get_ohlcv_path(symbol, timeframe.value, app_state.data_dir, provider)
-        if fmt is None:
-            fmt = file_path.suffix[1:]  # noqa
+    from pynecore.core.data_converter import DataConverter
+
+    # Auto-detect symbol and timeframe from filename if not provided
+    if symbol is None or timeframe is None:
+        detected_symbol, detected_timeframe_str = _auto_detect_symbol_timeframe(file_path)
+        if symbol is None:
+            symbol = detected_symbol
+        if timeframe is None and detected_timeframe_str:
+            try:
+                timeframe = detected_timeframe_str
+            except ValueError:
+                timeframe = None
+
+    # Ensure we have required parameters
+    if symbol is None:
+        symbol = "UNKNOWN"  # Fallback symbol
+    if timeframe is None:
+        timeframe = "1D"  # Fallback timeframe
+
+    # Auto-detect format from file extension
+    if fmt is None:
+        file_ext = file_path.suffix[1:].lower()
+        if file_ext in ['csv', 'json']:
+            fmt = file_ext
         else:
-            fmt = fmt.value
-        # Convert
-        with OHLCVWriter(ohlcv_path) as ohlcv_writer:
-            if fmt == 'csv':
-                task = progress.add_task(description="Converting from CSV...", total=1)
-                ohlcv_writer.load_from_csv(file_path, tz=tz)
+            fmt = 'csv'  # Default to CSV
+    else:
+        fmt = fmt.value
 
-            elif fmt == 'json':
-                task = progress.add_task(description="Converting from JSON...", total=1)
-                ohlcv_writer.load_from_json(file_path, tz=tz)
-            else:
-                secho(f"Error: Invalid format: {fmt}", err=True, fg=colors.RED)
-                raise Exit(1)
+    # Use the enhanced DataConverter for automatic conversion
+    converter = DataConverter()
 
-            # Complete task
+    try:
+        with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
+            task = progress.add_task(description=f"Converting {fmt.upper() if fmt else 'CSV'} to OHLCV format...",
+                                     total=1)
+
+            # Convert timeframe to string value
+            timeframe_str = "1D"  # Default
+            if timeframe:
+                if hasattr(timeframe, 'value'):
+                    timeframe_str = timeframe.value
+                else:
+                    timeframe_str = str(timeframe)
+
+            # Perform conversion with automatic TOML generation
+            result = converter.convert_if_needed(
+                file_path=Path(file_path),
+                provider=provider,
+                symbol=symbol,
+                timeframe=timeframe_str,
+                timezone=tz
+            )
+
             progress.update(task, completed=1)
+
+            # Show success message with generated files
+            secho(f"✓ Converted to: {result.ohlcv_path}", fg=colors.GREEN)
+            toml_path = file_path.with_suffix('.toml')
+            if toml_path.exists():
+                secho(f"✓ Generated symbol info: {toml_path}", fg=colors.GREEN)
+                secho("⚠️  Please review the auto-generated symbol parameters in the .toml file", fg=colors.YELLOW)
+
+    except Exception as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
+        raise Exit(1)

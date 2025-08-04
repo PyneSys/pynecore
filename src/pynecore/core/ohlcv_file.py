@@ -25,7 +25,7 @@ from pynecore.types.ohlcv import OHLCV
 RECORD_SIZE = 24  # 6 * 4
 STRUCT_FORMAT = 'Ifffff'  # I: uint32, f: float32
 
-__all__ = ['OHLCVWriter', 'OHLCVReader']
+__all__ = ['OHLCVWriter', 'OHLCVReader', 'STRUCT_FORMAT']
 
 
 def format_float(value: float) -> str:
