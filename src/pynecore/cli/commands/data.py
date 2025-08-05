@@ -26,7 +26,8 @@ app.add_typer(app_data, name="data")
 AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
 
 # Available intervals (The same fmt as described in timeframe.period)
-TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W')})
+# Numeric values represent minutes: 1=1min, 5=5min, 15=15min, 30=30min, 60=1hour, 240=4hours
+TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W', 'AUTO')})
 
 # Trick to avoid type checking errors
 DateOrDays = datetime if TYPE_CHECKING else str
@@ -278,9 +279,9 @@ def convert_from(
         provider: str = Option("custom", '--provider', '-p',
                                help="Data provider, can be any name"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
-                                    help="Symbol (e.g. BTCUSD, auto-detected from filename if not provided)"),
+                                    help="Symbol (default: auto-detected from filename)"),
         timeframe: TimeframeEnum | None = Option(None, '--timeframe', '-tf', case_sensitive=False,  # type: ignore
-                                                 help="Timeframe (auto-detected from filename if not provided)"),
+                                                 help="Timeframe (default: auto-detected from filename)"),
         fmt: Enum('Format', {'csv': 'csv', 'json': 'json'}) | None = Option(  # noqa # type: ignore
             None, '--fmt', '-f',
             case_sensitive=False,

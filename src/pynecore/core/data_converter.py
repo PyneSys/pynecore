@@ -269,7 +269,7 @@ class DataConverter:
         :param format_type: Detected format type
         :param provider: Data provider name (reserved for future use)
         :param symbol: Symbol name
-        :param timeframe: Timeframe
+        :param timeframe: Timeframe (will be auto-detected if "AUTO")
         :param timezone: Timezone
         :raises ConversionError: If conversion fails
         """
@@ -296,6 +296,9 @@ class DataConverter:
                 else:
                     raise ConversionError(f"Unsupported format for conversion: {format_type}")
 
+            # Auto-detect timeframe if needed
+            detected_timeframe = self._detect_timeframe_from_ohlcv(temp_path, timeframe)
+
             # Atomic rename to final location
             temp_path.replace(ohlcv_path)
             temp_path = None  # Prevent cleanup
@@ -307,7 +310,7 @@ class DataConverter:
             self._create_symbol_info_file(
                 source_path=source_path,
                 symbol=symbol,
-                timeframe=timeframe,
+                timeframe=detected_timeframe,
                 timezone=timezone
             )
 
@@ -373,10 +376,11 @@ ticker = "{symbol_upper}"
 currency = "{currency}"
 """
 
+        # Use smart defaults for currency fields
         if base_currency:
             toml_content += f'basecurrency = "{base_currency}"\n'
         else:
-            toml_content += '#basecurrency =\n'
+            toml_content += 'basecurrency = "EUR"  # Default base currency - change if needed\n'
 
         toml_content += f"""period = "{timeframe}"
 type = "{symbol_type}"
@@ -604,3 +608,125 @@ time = "23:59:59"
             return 10.0
         else:  # crypto, stock, or unknown
             return 1.0
+
+    def _detect_timeframe_from_ohlcv(self, ohlcv_path: Path, requested_timeframe: str) -> str:
+        """Detect timeframe from OHLCV data by analyzing timestamp differences.
+        
+        :param ohlcv_path: Path to the OHLCV file
+        :param requested_timeframe: Requested timeframe ("AUTO" for auto-detection)
+        :return: Detected or original timeframe
+        """
+        if requested_timeframe.upper() != "AUTO":
+            return requested_timeframe
+
+        try:
+            # Read first few records to analyze timestamp differences
+            with open(ohlcv_path, 'rb') as f:
+                # Read first 10 records (or less if file is smaller)
+                timestamps = []
+                for _ in range(10):
+                    record = f.read(24)  # OHLCV record size
+                    if len(record) < 24:
+                        break
+                    
+                    # Unpack timestamp (first 8 bytes as uint64)
+                    timestamp = struct.unpack('<Q', record[:8])[0]
+                    timestamps.append(timestamp)
+
+            if len(timestamps) < 2:
+                return "1D"  # Default fallback
+
+            # Calculate differences between consecutive timestamps
+            differences = []
+            for i in range(1, len(timestamps)):
+                diff = timestamps[i] - timestamps[i-1]
+                if diff > 0:  # Only positive differences
+                    differences.append(diff)
+
+            if not differences:
+                return "1D"  # Default fallback
+
+            # Find the most common difference (mode)
+            from collections import Counter
+            diff_counts = Counter(differences)
+            most_common_diff = diff_counts.most_common(1)[0][0]
+
+            # Convert nanoseconds to timeframe string
+            return self._nanoseconds_to_timeframe(most_common_diff)
+
+        except (OSError, IOError, struct.error, IndexError, ValueError):
+            # If detection fails, return default
+            return "1D"
+
+    @staticmethod
+    def _nanoseconds_to_timeframe(nanoseconds: int) -> str:
+        """Convert nanoseconds difference to timeframe string.
+        
+        :param nanoseconds: Time difference in nanoseconds
+        :return: Timeframe string (e.g., '1m', '5m', '1h', '1D')
+        """
+        # Convert to seconds
+        seconds = nanoseconds / 1_000_000_000
+
+        # Define common timeframes in seconds
+        timeframes = [
+            (60, "1m"),
+            (300, "5m"),
+            (900, "15m"),
+            (1800, "30m"),
+            (3600, "1h"),
+            (14400, "4h"),
+            (86400, "1D"),
+            (604800, "1W"),
+            (2592000, "1M"),  # Approximate month
+        ]
+
+        # Find the closest match
+        best_match = "1D"  # Default
+        min_diff = float('inf')
+        
+        for tf_seconds, tf_string in timeframes:
+            diff = abs(seconds - tf_seconds)
+            if diff < min_diff:
+                min_diff = diff
+                best_match = tf_string
+
+        return best_match
+
+    def _detect_timeframe_from_data(self, df, requested_timeframe: str) -> str:
+        """Detect timeframe from DataFrame by analyzing timestamp differences.
+        
+        :param df: DataFrame with timestamp column
+        :param requested_timeframe: Requested timeframe ("AUTO" for auto-detection)
+        :return: Detected or original timeframe
+        """
+        if requested_timeframe.upper() != "AUTO":
+            return requested_timeframe
+            
+        try:
+            if len(df) < 2:
+                return "1D"  # Default fallback
+                
+            # Calculate differences between consecutive timestamps
+            timestamps = df['timestamp'].values
+            differences = []
+            
+            for i in range(1, min(len(timestamps), 10)):  # Check first 10 records
+                diff = timestamps[i] - timestamps[i-1]
+                if diff > 0:  # Only positive differences
+                    differences.append(diff)
+                    
+            if not differences:
+                return "1D"  # Default fallback
+                
+            # Find the most common difference (mode)
+            from collections import Counter
+            diff_counts = Counter(differences)
+            most_common_diff = diff_counts.most_common(1)[0][0]
+            
+            # Convert nanoseconds to timeframe string
+            return self._nanoseconds_to_timeframe(most_common_diff)
+            
+        except (KeyError, IndexError, ValueError, TypeError):
+            # If detection fails, return default
+            return "1D"
