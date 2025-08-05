@@ -23,3 +23,4 @@ Advanced topics and features of PyneCore
 - [Function Isolation](./function-isolation.md) - Function isolation implementation
 - [OHLCV Reader/Writer](./ohlcv-reader-writer.md) - OHLCV data handling
 - [CSV Reader/Writer](./csv-reader-writer.md) - Fast CSV processing
+- [Programmatic API](./programmatic/README.md) - Complete guide to using PyneCore's API programmatically
