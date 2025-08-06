@@ -16,6 +16,7 @@ from ...providers.provider import Provider
 
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.core.aggregator import TimeframeAggregator
 
 __all__ = []
 
@@ -26,7 +27,7 @@ app.add_typer(app_data, name="data")
 AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
 
 # Available intervals (The same fmt as described in timeframe.period)
-TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W')})
+TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W', '1M')})
 
 # Trick to avoid type checking errors
 DateOrDays = datetime if TYPE_CHECKING else str
@@ -274,3 +275,234 @@ def convert_from(
 
             # Complete task
             progress.update(task, completed=1)
+
+
+@app_data.command()
+def aggregate(
+        source_file: Path = Argument(...,
+                                     help="Source .ohlcv file (auto-searches in workdir/data/ if only filename given)"),
+        target_timeframe: TimeframeEnum = Option(..., '--target-timeframe', '-tf',  # type: ignore
+                                                 help="Target timeframe: 1,5,15,30,60,240 (minutes), 1D (daily), 1W (weekly), 1M (monthly). Must be larger than source."),
+        output: Path | None = Option(None, '--output', '-o',
+                                     help="Custom output file path (auto-generated if not specified)"),
+        truncate: bool = Option(False, '--truncate', '-tr',
+                                help="Truncate/overwrite existing target file"),
+        force: bool = Option(False, '--force', '-f',
+                             help="Force re-aggregation even if target file is newer than source"),
+
+):
+    """
+    Aggregate OHLCV candlestick data from smaller to larger timeframes.
+    
+    WHAT IT DOES:
+    Combines multiple small timeframe candles into fewer large timeframe candles.
+    For example: 12 five-minute candles → 1 one-hour candle.
+    
+    AGGREGATION RULES:
+    • Open: First candle's open price
+    • High: Highest price across all candles
+    • Low: Lowest price across all candles  
+    • Close: Last candle's close price
+    • Volume: Sum of all volumes
+    
+    SUPPORTED TIMEFRAMES:
+    Minutes: 1, 5, 15, 30, 60, 240 (where 60=1hour, 240=4hours)
+    Daily: 1D | Weekly: 1W | Monthly: 1M
+    
+    IMPORTANT: Only upscaling supported (small → large timeframes).
+    Downscaling (1H → 5min) is impossible without creating artificial data.
+    
+    FILE HANDLING:
+    • Source file must have matching .toml metadata file
+    • Output filename auto-generated if not specified
+    • Skips aggregation if target is newer (use --force to override)
+    
+    EXAMPLES:
+      # Basic aggregation (searches workdir/data/ automatically)
+      pyne data aggregate btc_5.ohlcv --target-timeframe 60
+      
+      # Full path with custom output
+      pyne data aggregate /path/to/data_1.ohlcv -tf 5 -o custom_5min.ohlcv
+      
+      # Force overwrite existing target
+      pyne data aggregate data_60.ohlcv --target-timeframe 1D --force
+      
+      # Truncate existing file (start fresh)
+      pyne data aggregate data_5.ohlcv -tf 1D --truncate
+    """
+
+    # Expand data path - if only filename is provided, look in workdir/data
+    if len(source_file.parts) == 1:
+        source_file = app_state.data_dir / source_file
+
+    # Validate source file
+    if not source_file.exists():
+        secho(f"Error: Source file not found: {source_file}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    if source_file.suffix != '.ohlcv':
+        secho(f"Error: Source file must be .ohlcv format, got: {source_file.suffix}",
+              err=True, fg=colors.RED)
+        raise Exit(1)
+
+    # Check for required .toml metadata file
+    source_toml = source_file.with_suffix('.toml')
+    if not source_toml.exists():
+        secho(f"Error: Required .toml metadata file not found: {source_toml}",
+              err=True, fg=colors.RED)
+        secho("Aggregation requires symbol metadata. Please ensure the .toml file exists.",
+              err=True, fg=colors.YELLOW)
+        raise Exit(1)
+
+    # Extract source timeframe from filename
+    source_timeframe = _extract_timeframe_from_filename(source_file)
+    if not source_timeframe:
+        secho(f"Error: Cannot determine source timeframe from filename: {source_file.name}",
+              err=True, fg=colors.RED)
+        raise Exit(1)
+
+    # Generate target file path if not provided
+    if output is None:
+        output = _generate_target_filename(source_file, target_timeframe.value)
+
+    # Check if target file is newer than source (unless force is used)
+    if not force and not truncate and output.exists():
+        source_mtime = source_file.stat().st_mtime
+        target_mtime = output.stat().st_mtime
+        if target_mtime > source_mtime:
+            secho(f"Target file is newer than source. Use --force to re-aggregate.",
+                  fg=colors.YELLOW)
+            return
+
+    try:
+        # Create aggregator
+        aggregator = TimeframeAggregator(source_timeframe, target_timeframe.value)
+
+        # Show aggregation info
+        rprint(f"[bold]Aggregating OHLCV Data[/bold]")
+        rprint(f"Source: {source_file}")
+        rprint(f"Target: {output}")
+        rprint(f"Timeframe: {source_timeframe} → {target_timeframe.value}")
+        rprint(f"Window size: {aggregator.window_size} candles")
+
+        # Get source file size for progress tracking
+        with OHLCVReader(source_file) as reader:
+            total_candles = reader.size
+
+        # Perform aggregation with progress tracking
+        with Progress(
+                SpinnerColumn(finished_text="[green]✓"),
+                TextColumn("{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                "/",
+                TimeRemainingColumn(),
+        ) as progress:
+
+            task = progress.add_task(
+                description="Aggregating candles...",
+                total=total_candles
+            )
+
+            # Perform aggregation
+            result = aggregator.aggregate_file(
+                source_path=source_file,
+                target_path=output,
+                truncate=truncate
+            )
+
+            # Update progress to completion
+            progress.update(task, completed=total_candles)
+
+        # Handle .toml metadata file
+        source_toml = source_file.with_suffix('.toml')
+        target_toml = output.with_suffix('.toml')
+
+        if source_toml.exists():
+            try:
+                # Load source symbol info
+                from ...core.syminfo import SymInfo
+                syminfo = SymInfo.load_toml(source_toml)
+
+                # Update period to match target timeframe
+                syminfo.period = target_timeframe.value
+
+                # Save updated symbol info to target location
+                syminfo.save_toml(target_toml)
+
+                rprint(f"Symbol info copied: {target_toml}")
+            except Exception as e:
+                secho(f"Warning: Could not copy symbol info: {e}", fg=colors.YELLOW)
+
+        # Show results
+        rprint(f"\n[bold green]Aggregation Complete![/bold green]")
+        rprint(f"Processed: {result.candles_processed:,} candles")
+        rprint(f"Aggregated: {result.candles_aggregated:,} candles")
+        rprint(f"Duration: {result.duration_seconds:.2f} seconds")
+        rprint(f"Output: {result.target_path}")
+        if source_toml.exists():
+            rprint(f"Metadata: {target_toml}")
+
+    except ValueError as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
+        raise Exit(1)
+    except Exception as e:
+        secho(f"Unexpected error: {e}", err=True, fg=colors.RED)
+        raise Exit(2)
+
+
+def _extract_timeframe_from_filename(file_path: Path) -> str | None:
+    """
+    Extract timeframe from OHLCV filename.
+    :param file_path: Path to OHLCV file
+    :return: Timeframe string or None if not found
+    """
+    name_parts = file_path.stem.split('_')
+    if len(name_parts) >= 2:
+        timeframe = name_parts[-1]  # Last part should be timeframe
+
+        # Convert common timeframe formats to PyneCore format
+        # e.g., '5min' -> '5', '1hour' -> '1H', '1day' -> '1D'
+        if timeframe.endswith('min'):
+            return timeframe[:-3]  # Remove 'min' suffix
+        elif timeframe.endswith('hour') or timeframe.endswith('h'):
+            if timeframe.endswith('hour'):
+                return timeframe[:-4] + 'H'  # Replace 'hour' with 'H'
+            else:
+                return timeframe[:-1] + 'H'  # Replace 'h' with 'H'
+        elif timeframe.endswith('day') or timeframe.endswith('d'):
+            if timeframe.endswith('day'):
+                return timeframe[:-3] + 'D'  # Replace 'day' with 'D'
+            else:
+                return timeframe[:-1] + 'D'  # Replace 'd' with 'D'
+        elif timeframe.endswith('week') or timeframe.endswith('w'):
+            if timeframe.endswith('week'):
+                return timeframe[:-4] + 'W'  # Replace 'week' with 'W'
+            else:
+                return timeframe[:-1] + 'W'  # Replace 'w' with 'W'
+        elif timeframe.endswith('month') or timeframe.endswith('m'):
+            if timeframe.endswith('month'):
+                return timeframe[:-5] + 'M'  # Replace 'month' with 'M'
+            else:
+                return timeframe[:-1] + 'M'  # Replace 'm' with 'M'
+
+        return timeframe  # Return as-is if no conversion needed
+    return None
+
+
+def _generate_target_filename(source_path: Path, target_timeframe: str) -> Path:
+    """
+    Generate target filename by replacing timeframe.
+    :param source_path: Path to source file
+    :param target_timeframe: Target timeframe string
+    :return: Generated target file path
+    """
+    name_parts = source_path.stem.split('_')
+    if len(name_parts) >= 2:
+        name_parts[-1] = target_timeframe  # Replace timeframe
+        new_name = '_'.join(name_parts) + '.ohlcv'
+        return source_path.parent / new_name
+
+    # Fallback: append target timeframe
+    return source_path.parent / f"{source_path.stem}_{target_timeframe}.ohlcv"
