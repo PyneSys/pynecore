@@ -90,10 +90,6 @@ def run(
                                     help="Symbol name for conversion (default: SYMBOL)",
                                     show_default=False,
                                     rich_help_panel="Data Options"),
-        timeframe: str | None = Option(None, "--timeframe", "-tf",
-                                       help="Timeframe for conversion (default: AUTO - detected from data)",
-                                       show_default=False,
-                                       rich_help_panel="Data Options"),
 ):
     """
     Run a script (.py or .pine)
@@ -113,7 +109,7 @@ def run(
     A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
     
     [bold]Data Support:[/bold]
-    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Optional [bold]--symbol[/bold] and [bold]--timeframe[/bold] for CSV/TXT/JSON (smart defaults applied).
+    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Optional [bold]--symbol[/bold] for CSV/TXT/JSON (smart defaults applied).
     """  # noqa
 
     # Expand script path
@@ -190,7 +186,7 @@ def run(
             if converter.is_conversion_required(data):
                 # Use smart defaults - no longer require symbol and timeframe
                 default_symbol = symbol or "SYMBOL"  # Default symbol name
-                default_timeframe = timeframe or "AUTO"  # Auto-detect timeframe from data
+                default_timeframe = "AUTO"  # Auto-detect timeframe from data
 
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
