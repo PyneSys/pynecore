@@ -294,6 +294,15 @@ def convert_from(
     """
     from pynecore.core.data_converter import DataConverter
 
+    # Expand file path if only filename is provided (look in workdir/data)
+    if len(file_path.parts) == 1:
+        file_path = app_state.data_dir / file_path
+    
+    # Check if file exists
+    if not file_path.exists():
+        secho(f"File '{file_path}' not found!", fg=colors.RED, err=True)
+        raise Exit(1)
+
     # Auto-detect symbol and timeframe from filename if not provided
     if symbol is None or timeframe is None:
         detected_symbol, detected_timeframe_str = _auto_detect_symbol_timeframe(file_path)

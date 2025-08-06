@@ -111,9 +111,7 @@ def run(
     [bold]Data Support:[/bold]
     Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Optional [bold]--symbol[/bold] for CSV/TXT/JSON (smart defaults applied).
     """  # noqa
-    # Ensure .py extension
-    if script.suffix != ".py":
-        script = script.with_suffix(".py")
+
     # Expand script path
     if len(script.parts) == 1:
         script = app_state.scripts_dir / script
@@ -147,7 +145,7 @@ def run(
         if api_key:
             api_config['api_key'] = api_key
 
-        if api_config['api_key']:
+        if api_config.get('api_key'):
             # Create the compiler instance
             compiler = PyneComp(**api_config)
 
