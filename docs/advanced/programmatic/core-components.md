@@ -227,29 +227,6 @@ For strategy scripts, contains individual trade records.
 #### Strategy Statistics (`strat_path`)
 For strategy scripts, contains performance metrics and statistics.
 
-### Important Notes
-
-#### Parameter Name Correction
-⚠️ **Important**: Use `trade_path` parameter, not `equity_path`. This is a common source of confusion.
-
-```python
-# Correct
-runner = ScriptRunner(
-    script_path="strategy.py",
-    ohlcv_iter=reader,
-    syminfo=syminfo,
-    trade_path="trades.csv"  # ✅ Correct parameter name
-)
-
-# Incorrect
-runner = ScriptRunner(
-    script_path="strategy.py",
-    ohlcv_iter=reader,
-    syminfo=syminfo,
-    equity_path="trades.csv"  # ❌ This parameter doesn't exist
-)
-```
-
 #### Parallel Execution
 When running multiple scripts in parallel, always set `update_syminfo_every_run=True`:
 
