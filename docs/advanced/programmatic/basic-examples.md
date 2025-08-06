@@ -4,8 +4,8 @@ weight: 10002
 title: "Basic Examples"
 description: "Simple examples of using PyneCore programmatically"
 icon: "play_circle"
-date: "2025-03-31"
-lastmod: "2025-03-31"
+date: "2025-08-06"
+lastmod: "2025-08-06"
 draft: false
 toc: true
 categories: ["Advanced", "API", "Examples"]
@@ -243,9 +243,9 @@ run_indicator_with_output(
 
 ```python
 def run_simple_strategy(data_path: str, strategy_path: str, output_dir: str):
-    """Run a strategy script with trade output."""
+    """Run a Pine strategy script and save outputs."""
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     syminfo = SymInfo(symbol="BTCUSD", exchange="BINANCE", timeframe="1D")
     
@@ -255,26 +255,12 @@ def run_simple_strategy(data_path: str, strategy_path: str, output_dir: str):
             ohlcv_iter=reader,
             syminfo=syminfo,
             plot_path=str(output_path / "strategy_plot.csv"),
-            trade_path=str(output_path / "trades.csv"),  # Note: trade_path, not equity_path
+            trade_path=str(output_path / "trades.csv"),
             strat_path=str(output_path / "strategy_stats.csv")
         )
         
-        print(f"Running strategy on {reader.get_size()} bars...")
         success = runner.run()
-        
-        if success:
-            print("✅ Strategy backtest completed")
-            
-            # Check generated files
-            files_created = []
-            for file_name in ["strategy_plot.csv", "trades.csv", "strategy_stats.csv"]:
-                file_path = output_path / file_name
-                if file_path.exists():
-                    files_created.append(file_name)
-            
-            print(f"   Files created: {', '.join(files_created)}")
-        else:
-            print("❌ Strategy execution failed")
+        return success
 
 # Usage
 run_simple_strategy(
@@ -371,8 +357,6 @@ def analyze_multiple_symbols(symbols_data: list[dict], script_path: str):
     results = []
     
     for symbol_data in symbols_data:
-        print(f"\nAnalyzing {symbol_data['symbol']}...")
-        
         try:
             syminfo = SymInfo(
                 symbol=symbol_data['symbol'],
@@ -389,29 +373,17 @@ def analyze_multiple_symbols(symbols_data: list[dict], script_path: str):
                 )
                 
                 success = runner.run()
-                
                 results.append({
                     'symbol': symbol_data['symbol'],
-                    'success': success,
-                    'bars_processed': reader.get_size()
+                    'success': success
                 })
                 
-                if success:
-                    print(f"  ✅ {symbol_data['symbol']}: {reader.get_size()} bars processed")
-                else:
-                    print(f"  ❌ {symbol_data['symbol']}: Analysis failed")
-                    
         except Exception as e:
-            print(f"  ❌ {symbol_data['symbol']}: Error - {e}")
             results.append({
                 'symbol': symbol_data['symbol'],
                 'success': False,
                 'error': str(e)
             })
-    
-    # Summary
-    successful = sum(1 for r in results if r['success'])
-    print(f"\nSummary: {successful}/{len(results)} symbols analyzed successfully")
     
     return results
 

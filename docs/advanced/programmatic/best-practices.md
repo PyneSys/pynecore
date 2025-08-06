@@ -4,8 +4,8 @@ weight: 10004
 title: "Best Practices"
 description: "Performance optimization, error handling, and common pitfalls for PyneCore programmatic usage"
 icon: "tips_and_updates"
-date: "2025-03-31"
-lastmod: "2025-03-31"
+date: "2025-08-06"
+lastmod: "2025-08-06"
 draft: false
 toc: true
 categories: ["Advanced", "API", "Best Practices"]
@@ -44,34 +44,17 @@ finally:
 For large datasets, monitor memory consumption:
 
 ```python
-import psutil
-import os
-
-def get_memory_usage() -> float:
-    """Get current memory usage in MB."""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+import gc
 
 def memory_efficient_analysis(data_paths: list[Path], script_path: Path):
     """Process multiple files with memory monitoring."""
-    initial_memory = get_memory_usage()
-    print(f"Starting memory: {initial_memory:.1f} MB")
-    
-    for i, data_path in enumerate(data_paths):
+    for data_path in data_paths:
         with OHLCVReader.open(data_path) as reader:
-            # Process data
             runner = ScriptRunner(script_path, reader, syminfo)
             runner.run()
         
-        # Check memory after each file
-        current_memory = get_memory_usage()
-        memory_increase = current_memory - initial_memory
-        
-        print(f"File {i+1}/{len(data_paths)}: {current_memory:.1f} MB (+{memory_increase:.1f} MB)")
-        
-        # Warning if memory usage is growing unexpectedly
-        if memory_increase > 500:  # 500 MB threshold
-            print(f"⚠️  High memory usage detected: {memory_increase:.1f} MB")
+        # Force garbage collection after each file
+        gc.collect()
 ```
 
 #### Process Large Datasets in Chunks
@@ -89,29 +72,14 @@ def process_large_dataset_efficiently(
         
         for start_idx in range(0, total_bars, chunk_size):
             end_idx = min(start_idx + chunk_size, total_bars)
-            
-            # Create chunk iterator
             chunk_iter = reader.read_from(start_idx)
             
-            # Limit iterator to chunk size
-            def limited_iter(iterator, limit):
-                for i, item in enumerate(iterator):
-                    if i >= limit:
-                        break
-                    yield item
-            
-            chunk_data = limited_iter(chunk_iter, end_idx - start_idx)
-            
-            # Process chunk
             runner = ScriptRunner(
                 script_path=script_path,
-                ohlcv_iter=chunk_data,
-                syminfo=syminfo,
-                update_syminfo_every_run=True
+                ohlcv_iter=chunk_iter,
+                syminfo=syminfo
             )
             runner.run()
-            
-            print(f"Processed chunk {start_idx:,}-{end_idx:,}")
 ```
 
 ### Parallel Processing
@@ -122,63 +90,27 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 
 def parallel_symbol_analysis(symbol_tasks: list, max_workers: int = None):
-    """Efficiently process multiple symbols in parallel."""
+    """Process multiple symbols in parallel."""
     if max_workers is None:
         max_workers = min(mp.cpu_count(), len(symbol_tasks))
     
-    print(f"Using {max_workers} workers for {len(symbol_tasks)} symbols")
-    
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
         futures = [executor.submit(process_single_symbol, task) for task in symbol_tasks]
-        
-        # Collect results as they complete
-        results = []
-        for future in futures:
-            try:
-                result = future.result(timeout=300)  # 5-minute timeout per symbol
-                results.append(result)
-            except Exception as e:
-                print(f"Task failed: {e}")
-                results.append({"status": "failed", "error": str(e)})
-    
-    return results
+        return [future.result() for future in futures]
 
 def process_single_symbol(task):
     """Process a single symbol (designed for parallel execution)."""
-    # Important: Always set update_syminfo_every_run=True for parallel execution
     with OHLCVReader.open(task.data_path) as reader:
         runner = ScriptRunner(
             script_path=task.script_path,
             ohlcv_iter=reader,
             syminfo=task.syminfo,
-            update_syminfo_every_run=True  # Critical for parallel execution
+            update_syminfo_every_run=True  # Required for parallel execution
         )
         return runner.run()
 ```
 
-#### Optimize Worker Count
-```python
-def determine_optimal_workers(task_count: int, task_complexity: str = "medium") -> int:
-    """Determine optimal number of workers based on task characteristics."""
-    cpu_count = mp.cpu_count()
-    
-    if task_complexity == "light":
-        # I/O bound tasks can use more workers
-        return min(task_count, cpu_count * 2)
-    elif task_complexity == "heavy":
-        # CPU intensive tasks should use fewer workers
-        return min(task_count, max(1, cpu_count - 1))
-    else:  # medium
-        # Balanced approach
-        return min(task_count, cpu_count)
 
-# Usage
-optimal_workers = determine_optimal_workers(
-    task_count=len(symbol_list),
-    task_complexity="medium"
-)
-```
 
 ### Data Access Optimization
 
@@ -186,12 +118,6 @@ optimal_workers = determine_optimal_workers(
 ```python
 # ✅ Good: Single file open, multiple operations
 with OHLCVReader.open(data_path) as reader:
-    # Get metadata once
-    total_bars = reader.get_size()
-    start_date = reader.start_datetime
-    end_date = reader.end_datetime
-    
-    # Run multiple analyses on same data
     for script_path in script_list:
         runner = ScriptRunner(script_path, reader, syminfo)
         runner.run()
@@ -206,30 +132,14 @@ for script_path in script_list:
 #### Cache Symbol Information
 ```python
 class SymInfoCache:
-    """Cache for symbol information to avoid repeated file reads."""
-    
     def __init__(self):
         self._cache = {}
     
     def get_syminfo(self, syminfo_path: Path) -> SymInfo:
-        """Get symbol info from cache or load from file."""
         cache_key = str(syminfo_path)
-        
         if cache_key not in self._cache:
             self._cache[cache_key] = SymInfo.load_from_file(syminfo_path)
-        
         return self._cache[cache_key]
-    
-    def clear(self):
-        """Clear the cache."""
-        self._cache.clear()
-
-# Usage
-syminfo_cache = SymInfoCache()
-
-for symbol_data in symbol_list:
-    syminfo = syminfo_cache.get_syminfo(symbol_data.syminfo_path)
-    # Use cached syminfo...
 ```
 
 ## Error Handling Strategies

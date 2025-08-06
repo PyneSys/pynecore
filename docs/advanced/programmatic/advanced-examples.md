@@ -4,8 +4,8 @@ weight: 10003
 title: "Advanced Examples"
 description: "Complex examples with error handling, parallel processing, and production patterns"
 icon: "settings"
-date: "2025-03-31"
-lastmod: "2025-03-31"
+date: "2025-08-06"
+lastmod: "2025-08-06"
 draft: false
 toc: true
 categories: ["Advanced", "API", "Examples"]
@@ -33,150 +33,56 @@ def run_indicator_analysis(
     data_path: Path,
     script_path: Path,
     syminfo_path: Path,
-    output_dir: Path,
-    progress_callback: Optional[callable] = None
+    output_dir: Path
 ) -> Dict[str, Any]:
     """
-    Run a PyneCore indicator script with comprehensive error handling.
+    Run a PyneCore indicator script with error handling.
     
     :param data_path: Path to OHLCV data file
     :param script_path: Path to Pine script file
     :param syminfo_path: Path to symbol info file
     :param output_dir: Directory for output files
-    :param progress_callback: Optional callback for progress updates
-    :return: Dictionary with execution results and metadata
-    :raises FileNotFoundError: If required files don't exist
-    :raises ValueError: If data is invalid
-    :raises RuntimeError: If script execution fails
+    :return: Dictionary with execution results
     """
-    # Validate input files
-    missing_files = []
-    if not data_path.exists():
-        missing_files.append(f"OHLCV data: {data_path}")
-    if not script_path.exists():
-        missing_files.append(f"Script: {script_path}")
-    if not syminfo_path.exists():
-        missing_files.append(f"Symbol info: {syminfo_path}")
+    # Validate files exist
+    for path in [data_path, script_path, syminfo_path]:
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
     
-    if missing_files:
-        raise FileNotFoundError(f"Missing required files: {', '.join(missing_files)}")
-    
-    # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Define output paths
     plot_output = output_dir / "plot_data.csv"
     
-    # Execution metadata
     start_time = datetime.now()
-    result = {
-        'success': False,
-        'start_time': start_time,
-        'end_time': None,
-        'duration_seconds': None,
-        'bars_processed': 0,
-        'output_files': [],
-        'errors': []
-    }
+    result = {'success': False, 'bars_processed': 0, 'errors': []}
     
     try:
-        # Load symbol information
-        if progress_callback:
-            progress_callback("Loading symbol information...")
-        
-        try:
-            syminfo = SymInfo.load_from_file(syminfo_path)
-        except Exception as e:
-            raise ValueError(f"Failed to load symbol info from {syminfo_path}: {e}")
-        
-        # Validate symbol info
-        required_fields = ['symbol', 'exchange', 'timeframe']
-        missing_fields = [field for field in required_fields if not hasattr(syminfo, field)]
-        if missing_fields:
-            raise ValueError(f"Symbol info missing required fields: {missing_fields}")
-        
-        # Create OHLCV reader and validate data
-        if progress_callback:
-            progress_callback(f"Opening OHLCV data from {data_path}...")
+        syminfo = SymInfo.load_from_file(syminfo_path)
         
         with OHLCVReader.open(data_path) as reader:
-            # Check data availability
             data_size = reader.get_size()
-            if data_size == 0:
-                raise ValueError(f"No data found in {data_path}")
-            
-            if data_size < 10:  # Minimum bars for meaningful analysis
-                raise ValueError(f"Insufficient data: only {data_size} bars (minimum 10 required)")
+            if data_size < 10:
+                raise ValueError(f"Insufficient data: {data_size} bars")
             
             result['bars_processed'] = data_size
-            
-            if progress_callback:
-                progress_callback(f"Found {data_size} bars from {reader.start_datetime} to {reader.end_datetime}")
-            
-            # Create script runner with progress tracking
-            if progress_callback:
-                progress_callback(f"Initializing script runner for {script_path.name}...")
-            
-            def on_progress(current_time: datetime) -> None:
-                if progress_callback and current_time != datetime.max:
-                    progress_callback(f"Processing: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             runner = ScriptRunner(
                 script_path=str(script_path),
                 ohlcv_iter=reader,
                 syminfo=syminfo,
-                plot_path=str(plot_output),
-                last_bar_index=data_size - 1
+                plot_path=str(plot_output)
             )
             
-            # Run the script
-            if progress_callback:
-                progress_callback("Running script analysis...")
+            success = runner.run()
+            if not success:
+                raise RuntimeError("Script execution failed")
             
-            try:
-                # Use run_iter for progress tracking
-                for _ in runner.run_iter():
-                    pass  # Progress handled by callback
-                
-                result['success'] = True
-                
-            except ImportError as e:
-                if "@pyne" in str(e):
-                    raise RuntimeError(f"Script missing @pyne decorator: {script_path}")
-                elif "main" in str(e):
-                    raise RuntimeError(f"Script missing main function: {script_path}")
-                else:
-                    raise RuntimeError(f"Script import failed: {e}")
+            result['success'] = True
             
-            except Exception as e:
-                raise RuntimeError(f"Script execution failed: {e}")
-        
-        # Verify and catalog output files
-        if plot_output.exists():
-            result['output_files'].append({
-                'type': 'plot_data',
-                'path': str(plot_output),
-                'size_bytes': plot_output.stat().st_size
-            })
-        else:
-            result['errors'].append("Script completed but no plot data was generated")
-        
-        if progress_callback:
-            progress_callback("Analysis completed successfully!")
-        
     except Exception as e:
         result['errors'].append(str(e))
-        # Clean up partial outputs on failure
-        if plot_output.exists():
-            try:
-                plot_output.unlink()
-            except Exception:
-                pass  # Ignore cleanup errors
         raise
-    
     finally:
-        result['end_time'] = datetime.now()
-        result['duration_seconds'] = (result['end_time'] - start_time).total_seconds()
+        result['duration'] = (datetime.now() - start_time).total_seconds()
     
     return result
 
@@ -213,165 +119,73 @@ def run_strategy_backtest(
     data_path: Path,
     strategy_path: Path,
     syminfo_path: Path,
-    output_dir: Path,
-    initial_capital: float = 10000.0
+    output_dir: Path
 ) -> Dict[str, Any]:
     """
-    Run a comprehensive strategy backtest with all outputs.
+    Run a strategy backtest with basic performance metrics.
     
     :param data_path: Path to OHLCV data file
-    :param strategy_path: Path to Pine strategy script
+    :param strategy_path: Path to strategy script
     :param syminfo_path: Path to symbol info file
     :param output_dir: Directory for output files
-    :param initial_capital: Starting capital for backtest
-    :return: Dictionary with backtest results and performance metrics
+    :return: Dictionary with backtest results
     """
-    # Validate inputs
-    if not data_path.exists():
-        raise FileNotFoundError(f"OHLCV data file not found: {data_path}")
-    if not strategy_path.exists():
-        raise FileNotFoundError(f"Strategy file not found: {strategy_path}")
-    if not syminfo_path.exists():
-        raise FileNotFoundError(f"Symbol info file not found: {syminfo_path}")
-    
-    if initial_capital <= 0:
-        raise ValueError(f"Initial capital must be positive, got: {initial_capital}")
+    # Validate files exist
+    for path in [data_path, strategy_path, syminfo_path]:
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
     
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Define output paths for strategy
     plot_output = output_dir / "plot_data.csv"
     trades_output = output_dir / "trades.csv"
-    stats_output = output_dir / "strategy_stats.csv"
     
-    start_time = datetime.now()
-    result = {
-        'success': False,
-        'start_time': start_time,
-        'end_time': None,
-        'duration_seconds': None,
-        'initial_capital': initial_capital,
-        'bars_processed': 0,
-        'trades_count': 0,
-        'output_files': [],
-        'performance_metrics': {},
-        'errors': []
-    }
+    result = {'success': False, 'trades_count': 0, 'errors': []}
     
     try:
-        # Load symbol information
         syminfo = SymInfo.load_from_file(syminfo_path)
         
         with OHLCVReader.open(data_path) as reader:
             data_size = reader.get_size()
-            if data_size == 0:
-                raise ValueError(f"No data found in {data_path}")
+            if data_size < 50:
+                raise ValueError(f"Insufficient data: {data_size} bars")
             
-            result['bars_processed'] = data_size
-            
-            print(f"Running strategy backtest on {data_size} bars...")
-            print(f"Period: {reader.start_datetime} to {reader.end_datetime}")
-            print(f"Initial capital: ${initial_capital:,.2f}")
-            
-            # Create strategy runner with all outputs
             runner = ScriptRunner(
                 script_path=str(strategy_path),
                 ohlcv_iter=reader,
                 syminfo=syminfo,
                 plot_path=str(plot_output),
-                trade_path=str(trades_output),  # Note: trade_path, not equity_path
-                strat_path=str(stats_output),
-                last_bar_index=data_size - 1
+                trade_path=str(trades_output)
             )
             
-            # Execute strategy
             success = runner.run()
-            
             if not success:
                 raise RuntimeError("Strategy execution failed")
             
-            result['success'] = True
-            
-        # Analyze generated outputs
-        output_files = []
-        
-        # Plot data
-        if plot_output.exists():
-            output_files.append({
-                'type': 'plot_data',
-                'path': str(plot_output),
-                'size_bytes': plot_output.stat().st_size
-            })
-        
-        # Trades data
-        if trades_output.exists():
-            import pandas as pd
-            try:
-                trades_df = pd.read_csv(trades_output)
-                result['trades_count'] = len(trades_df)
-                
-                # Calculate basic performance metrics
-                if not trades_df.empty and 'pnl' in trades_df.columns:
-                    total_pnl = trades_df['pnl'].sum()
-                    winning_trades = len(trades_df[trades_df['pnl'] > 0])
-                    losing_trades = len(trades_df[trades_df['pnl'] < 0])
+            # Count trades if file exists
+            if trades_output.exists():
+                try:
+                    import pandas as pd
+                    trades_df = pd.read_csv(trades_output)
+                    result['trades_count'] = len(trades_df)
                     
-                    result['performance_metrics'] = {
-                        'total_pnl': total_pnl,
-                        'final_capital': initial_capital + total_pnl,
-                        'total_return_pct': (total_pnl / initial_capital) * 100,
-                        'winning_trades': winning_trades,
-                        'losing_trades': losing_trades,
-                        'win_rate_pct': (winning_trades / len(trades_df)) * 100 if len(trades_df) > 0 else 0
-                    }
-                
-                output_files.append({
-                    'type': 'trades',
-                    'path': str(trades_output),
-                    'size_bytes': trades_output.stat().st_size,
-                    'records_count': len(trades_df)
-                })
-                
-            except Exception as e:
-                result['errors'].append(f"Failed to analyze trades data: {e}")
-        
-        # Strategy statistics
-        if stats_output.exists():
-            output_files.append({
-                'type': 'strategy_stats',
-                'path': str(stats_output),
-                'size_bytes': stats_output.stat().st_size
-            })
-        
-        result['output_files'] = output_files
-        
-        # Print summary
-        print(f"\n✅ Strategy backtest completed!")
-        print(f"   Trades executed: {result['trades_count']}")
-        
-        if result['performance_metrics']:
-            metrics = result['performance_metrics']
-            print(f"   Total P&L: ${metrics['total_pnl']:,.2f}")
-            print(f"   Final capital: ${metrics['final_capital']:,.2f}")
-            print(f"   Total return: {metrics['total_return_pct']:.2f}%")
-            print(f"   Win rate: {metrics['win_rate_pct']:.1f}%")
-        
-        return result
-        
+                    if not trades_df.empty and 'pnl' in trades_df.columns:
+                        total_pnl = trades_df['pnl'].sum()
+                        winning_trades = len(trades_df[trades_df['pnl'] > 0])
+                        result['total_pnl'] = round(total_pnl, 2)
+                        result['win_rate'] = round((winning_trades / len(trades_df)) * 100, 2)
+                        
+                except ImportError:
+                    result['errors'].append("pandas not available for trade analysis")
+                except Exception as e:
+                    result['errors'].append(f"Error analyzing trades: {e}")
+            
+            result['success'] = True
+    
     except Exception as e:
         result['errors'].append(str(e))
-        # Clean up on failure
-        for output_file in [plot_output, trades_output, stats_output]:
-            if output_file.exists():
-                try:
-                    output_file.unlink()
-                except Exception:
-                    pass
         raise
     
-    finally:
-        result['end_time'] = datetime.now()
-        result['duration_seconds'] = (result['end_time'] - start_time).total_seconds()
+    return result
 
 # Usage example
 if __name__ == "__main__":

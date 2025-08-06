@@ -4,8 +4,8 @@ weight: 10001
 title: "Core Components"
 description: "Detailed documentation of PyneCore's programmatic API components"
 icon: "layers"
-date: "2025-03-31"
-lastmod: "2025-03-31"
+date: "2025-08-06"
+lastmod: "2025-08-06"
 draft: false
 toc: true
 categories: ["Advanced", "API"]
