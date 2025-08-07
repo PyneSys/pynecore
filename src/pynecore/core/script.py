@@ -1,7 +1,9 @@
-from typing import cast, Any, Callable
+from typing import cast, Any, Callable, TypeVar
 import os
 import sys
+
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 import pynecore.lib.format as _format
@@ -23,6 +25,9 @@ from . import safe_convert
 
 # Global registry for library main functions
 _registered_libraries: list[tuple[str, Callable]] = []
+
+# TypeVar for enum type preservation
+TEnum = TypeVar('TEnum', bound=StrEnum)
 
 
 @dataclass(kw_only=True)
@@ -736,6 +741,52 @@ class _Input:
         )
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
         return cast(Series[float], defval if _id not in old_input_values else old_input_values[_id])
+
+    @classmethod
+    def enum(cls, defval: TEnum, title: str | None = None, *,
+             tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
+             confirm: bool | None = False,
+             options: tuple[str] | None = None,
+             display: _display.Display | None = None,
+             _id: str | None = None, **__) -> TEnum:
+        """
+        Adds an input to your script's settings, which allows you to provide configuration options
+        to script users. This function adds a field for a enum input to the script's inputs.
+
+        :param defval: The default value of the input
+        :param title: The title of the input
+        :param tooltip: The tooltip of the input
+        :param inline: If True, the input will be displayed inline
+        :param group: The group of the input
+        :param confirm: If True, the user will be asked to confirm the input
+        :param display: Controls where the script will display the input's information
+        :param options: A tuple of strings that the user can select from
+        :param _id: The unique identifier of the input, it is filled by the InputTransformer
+        :return: The input value from toml file or the default
+        """
+        inputs[_id] = InputData(
+            id=_id,
+            input_type='enum',
+            defval=defval,
+            title=title,
+            tooltip=tooltip,
+            inline=inline,
+            group=group,
+            confirm=confirm,
+            display=display,
+            options=options,
+        )
+        if _id not in old_input_values:
+            return defval
+        else:
+            # Convert string value back to the specific enum type
+            value = old_input_values[_id]
+            if isinstance(value, str):
+                try:
+                    return defval.__class__(value)
+                except ValueError:
+                    return defval
+            return defval
 
     int = _int
     bool = _bool

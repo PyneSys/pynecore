@@ -137,29 +137,38 @@ def run(
         if api_key:
             api_config['api_key'] = api_key
 
-        # Create the compiler instance
-        compiler = PyneComp(**api_config)
+        if api_config['api_key']:
+            # Create the compiler instance
+            compiler = PyneComp(**api_config)
 
-        # Determine output path for compiled file
-        out_path = script.with_suffix(".py")
+            # Determine output path for compiled file
+            out_path = script.with_suffix(".py")
 
-        # Check if compilation is needed
-        if compiler.needs_compilation(script, out_path):
-            with APIErrorHandler(console):
-                with Progress(
-                        SpinnerColumn(finished_text="[green]✓"),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console
-                ) as progress:
-                    task = progress.add_task("Compiling Pine Script...", total=1)
+            # Check if compilation is needed
+            if compiler.needs_compilation(script, out_path):
+                with APIErrorHandler(console):
+                    with Progress(
+                            SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=console
+                    ) as progress:
+                        task = progress.add_task("Compiling Pine Script...", total=1)
 
-                    # Compile the .pine file
-                    compiler.compile(script, out_path)
+                        # Compile the .pine file
+                        compiler.compile(script, out_path)
 
-                    progress.update(task, completed=1)
+                        progress.update(task, completed=1)
 
-        # Update script to point to the compiled file
-        script = out_path
+            # Update script to point to the compiled file
+            script = out_path
+
+        # Go back to normal .py file
+        else:
+            script = script.with_suffix(".py")
+            # Check if script exists
+            if not script.exists():
+                secho(f"Script file '{script}' not found!", fg="red", err=True)
+                raise Exit(1)
 
     # Check file format and extension
     if data.suffix == "":
