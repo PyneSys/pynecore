@@ -36,6 +36,7 @@ __all__ = [
     'bar_index', 'last_bar_index', 'last_bar_time',
     'open', 'high', 'low', 'close', 'volume',
     'hl2', 'hlc3', 'ohlc4', 'hlcc4',
+    'extra_fields',
 
     # Functions / objects
     'input', 'script',
@@ -81,6 +82,9 @@ hl2: Series[float] | NA[float] = Source("hl2")
 hlc3: Series[float] | NA[float] = Source("hlc3")
 ohlc4: Series[float] | NA[float] = Source("ohlc4")
 hlcc4: Series[float] | NA[float] = Source("hlcc4")
+
+# Extra fields from CSV data
+extra_fields: dict[str, Series[float] | Series[bool] | Any] = {}
 
 # Store time as integer as in Pine Scripts timestamp format
 _time: int = 0

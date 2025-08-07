@@ -12,7 +12,7 @@ The file is a binary file with the following 24 bytes structure:
 The .ohlcv format cannot have gaps in it. All gaps are filled with the previous close price and -1 volume.
 """
 
-from typing import Iterator
+from typing import Iterator, Any
 import os
 import mmap
 import struct
@@ -38,7 +38,7 @@ class OHLCVWriter:
     Binary OHLCV data writer using direct file operations
     """
 
-    __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp')
+    __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp', '_extra_fields_data')
 
     def __init__(self, path: str | Path):
         self.path: str = str(path)
@@ -48,6 +48,7 @@ class OHLCVWriter:
         self._interval: int | None = None
         self._current_pos: int = 0
         self._last_timestamp: int | None = None
+        self._extra_fields_data: dict[int, dict[str, Any]] = {}  # timestamp -> extra_fields mapping
 
     def __enter__(self):
         self.open()
@@ -194,6 +195,10 @@ class OHLCVWriter:
                         self._size = max(self._size, self._current_pos)
                         expected_ts += self._interval
 
+        # Store extra_fields if present
+        if candle.extra_fields:
+            self._extra_fields_data[candle.timestamp] = candle.extra_fields
+
         # Write actual data
         self._file.seek(self._current_pos * RECORD_SIZE)
         data = struct.pack(STRUCT_FORMAT,
@@ -254,11 +259,26 @@ class OHLCVWriter:
 
     def close(self):
         """
-        Close the file
+        Close the file and save extra_fields if any
         """
         if self._file:
             self._file.close()
             self._file = None
+        
+        # Save extra_fields to companion JSON file if any exist
+        if self._extra_fields_data:
+            self._save_extra_fields()
+    
+    def _save_extra_fields(self) -> None:
+        """
+        Save extra_fields data to companion JSON file
+        """
+        import json
+        from pathlib import Path
+        
+        extra_fields_path = Path(self.path).with_suffix('.extra_fields.json')
+        with open(extra_fields_path, 'w') as f:
+            json.dump(self._extra_fields_data, f, indent=2)
 
     def load_from_csv(self, path: str | Path,
                       timestamp_format: str | None = None,
@@ -341,6 +361,21 @@ class OHLCVWriter:
             except ValueError as e:
                 raise ValueError(f"Missing required column: {str(e)}")
 
+            # Identify extra fields (columns not part of standard OHLCV or timestamp)
+            standard_columns = {'open', 'high', 'low', 'close', 'volume'}
+            timestamp_columns = {'timestamp', 'time', 'date'}
+            if date_column:
+                timestamp_columns.add(date_column.lower())
+            if time_column:
+                timestamp_columns.add(time_column.lower())
+            if timestamp_column:
+                timestamp_columns.add(timestamp_column.lower())
+            
+            extra_field_indices = {}
+            for i, header in enumerate(headers):
+                if header not in standard_columns and header not in timestamp_columns:
+                    extra_field_indices[header] = i
+
             # Process data rows
             for row in reader:
                 # Handle timestamp
@@ -385,7 +420,23 @@ class OHLCVWriter:
                 except Exception as e:
                     raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
 
-                # Write OHLCV data
+                # Collect extra fields data
+                extra_fields_data = {}
+                for field_name, field_idx in extra_field_indices.items():
+                    try:
+                        # Try to convert to float first, then bool, then keep as string
+                        value = row[field_idx].strip()
+                        if value.lower() in ('true', 'false'):
+                            extra_fields_data[field_name] = value.lower() == 'true'
+                        else:
+                            try:
+                                extra_fields_data[field_name] = float(value)
+                            except ValueError:
+                                extra_fields_data[field_name] = value
+                    except (IndexError, AttributeError):
+                        extra_fields_data[field_name] = None
+
+                # Write OHLCV data with extra_fields
                 try:
                     self.write(OHLCV(
                         timestamp,
@@ -393,7 +444,8 @@ class OHLCVWriter:
                         float(row[h_idx]),
                         float(row[l_idx]),
                         float(row[c_idx]),
-                        float(row[v_idx])
+                        float(row[v_idx]),
+                        extra_fields=extra_fields_data if extra_fields_data else None
                     ))
                 except (ValueError, IndexError) as e:
                     raise ValueError(f"Invalid data in row: {e}")
@@ -551,7 +603,7 @@ class OHLCVReader:
     Very fast OHLCV data reader using memory mapping.
     """
 
-    __slots__ = ('path', '_file', '_mmap', '_size', '_start_timestamp', '_interval')
+    __slots__ = ('path', '_file', '_mmap', '_size', '_start_timestamp', '_interval', '_extra_fields_data')
 
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -560,6 +612,7 @@ class OHLCVReader:
         self._size = 0
         self._start_timestamp = None
         self._interval = None
+        self._extra_fields_data: dict[int, dict[str, Any]] = {}
 
     def __enter__(self):
         self.open()
@@ -643,8 +696,29 @@ class OHLCVReader:
                 self._start_timestamp = struct.unpack('I', self._mmap[0:4])[0]
                 second_timestamp = struct.unpack('I', self._mmap[RECORD_SIZE:RECORD_SIZE + 4])[0]
                 self._interval = second_timestamp - self._start_timestamp
+        
+        # Load extra_fields from companion JSON file if it exists
+        self._load_extra_fields()
 
         return self
+    
+    def _load_extra_fields(self) -> None:
+        """
+        Load extra_fields data from companion JSON file
+        """
+        import json
+        from pathlib import Path
+        
+        extra_fields_path = Path(self.path).with_suffix('.extra_fields.json')
+        if extra_fields_path.exists():
+            try:
+                with open(extra_fields_path, 'r') as f:
+                    data = json.load(f)
+                    # Convert string keys back to integers
+                    self._extra_fields_data = {int(k): v for k, v in data.items()}
+            except (json.JSONDecodeError, ValueError, OSError):
+                # If we can't load extra_fields, just continue without them
+                self._extra_fields_data = {}
 
     def __iter__(self) -> Iterator[OHLCV]:
         """
@@ -664,7 +738,9 @@ class OHLCVReader:
 
         offset = position * RECORD_SIZE
         data = struct.unpack(STRUCT_FORMAT, self._mmap[offset:offset + RECORD_SIZE])
-        return OHLCV(*data, extra_fields={})
+        timestamp = data[0]
+        extra_fields = self._extra_fields_data.get(timestamp, {})
+        return OHLCV(*data, extra_fields=extra_fields if extra_fields else None)
 
     def read_from(self, start_timestamp: int, end_timestamp: int | None = None, skip_gaps: bool = True) \
             -> Iterator[OHLCV]:
