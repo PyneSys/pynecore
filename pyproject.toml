@@ -16,7 +16,7 @@ egg_info.egg_base = "build"
 
 [project]
 name = "pynesys-pynecore"
-version = "6.2.1" # PineVersion.Major.Minor
+version = "6.3.1" # PineVersion.Major.Minor
 description = "Python based Pine Script like runtime and API"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
 readme = "README.md"
