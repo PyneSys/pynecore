@@ -13,6 +13,8 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
 from ..app import app, app_state
 from ...providers import available_providers
 from ...providers.provider import Provider
+from ...lib.timeframe import in_seconds
+from ...core.data_converter import DataConverter
 
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
@@ -25,9 +27,31 @@ app.add_typer(app_data, name="data")
 # Create an enum from it
 AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
 
-# Available intervals (The same fmt as described in timeframe.period)
-# Numeric values represent minutes: 1=1min, 5=5min, 15=15min, 30=30min, 60=1hour, 240=4hours
-TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W', 'AUTO')})
+
+# TV-compatible timeframe validation function
+def validate_timeframe(value: str) -> str:
+    """Validate TV-compatible timeframe string.
+    
+    :param value: Timeframe string to validate
+    :return: Validated timeframe string
+    :raises ValueError: If timeframe is invalid
+    """
+    if value.upper() == 'AUTO':
+        return value.upper()
+
+    try:
+        # Test if it's a valid TV timeframe by trying to convert to seconds
+        in_seconds(value)
+        return value
+    except (ValueError, AssertionError):
+        # Fallback to common timeframes for validation
+        valid_timeframes = ['1', '2', '3', '5', '10', '15', '30', '45', '60', '120', '180', '240', '360', '480', '720',
+                            '1D', '1W', '1M', '1S', '2S', '5S', '10S', '15S', '30S', 'AUTO']
+        if value in valid_timeframes:
+            return value
+        raise ValueError(
+            f"Invalid timeframe: {value}. Must be a valid TradingView timeframe (e.g., '1', '5S', '1D', '1W') or 'AUTO'")
+
 
 # Trick to avoid type checking errors
 DateOrDays = datetime if TYPE_CHECKING else str
@@ -65,8 +89,8 @@ def download(
                                     help="Symbol (e.g. BYBIT:BTC/USDT:USDT)"),
         list_symbols: bool = Option(False, '--list-symbols', '-ls',
                                     help="List available symbols of the provider"),
-        timeframe: TimeframeEnum = Option('1D', '--timeframe', '-tf', case_sensitive=False,  # type: ignore
-                                          help="Timeframe in TradingView fmt"),
+        timeframe: str = Option('1D', '--timeframe', '-tf', callback=validate_timeframe,
+                                help="Timeframe in TradingView format (e.g., '1', '5S', '1D', '1W')"),
         time_from: DateOrDays = Option("continue", '--from', '-f',  # type: ignore
                                        callback=parse_date_or_days, formats=[],
                                        metavar="[%Y-%m-%d|%Y-%m-%d %H:%M:%S|NUMBER]|continue",
@@ -105,7 +129,7 @@ def download(
             raise Exit(1)
 
         # Create provider instance
-        provider_instance: Provider = provider_class(symbol=symbol, timeframe=timeframe.value,
+        provider_instance: Provider = provider_class(symbol=symbol, timeframe=timeframe,
                                                      ohlv_dir=app_state.data_dir)
 
         # Download symbol info if not exists
@@ -203,8 +227,8 @@ def convert_to(
                                                     help="Data provider"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
                                     help="Symbol (e.g. BYBIT:BTCUSDT:USDT)"),
-        timeframe: TimeframeEnum = Option('1D', '--timeframe', '-tf', case_sensitive=False,  # type: ignore
-                                          help="Timeframe in TradingView fmt"),
+        timeframe: str = Option('1D', '--timeframe', '-tf', callback=validate_timeframe,
+                                help="Timeframe in TradingView format (e.g., '1', '5S', '1D', '1W')"),
         fmt: Enum('Format', {'csv': 'csv', 'json': 'json'}) = Option(  # noqa # type: ignore
             'csv', '--format', '-f',
             case_sensitive=False,
@@ -218,7 +242,7 @@ def convert_to(
     # Import provider module from
     provider_module = __import__(f"pynecore.providers.{provider.value}", fromlist=[''])
     provider_class = getattr(provider_module, [p for p in dir(provider_module) if p.endswith('Provider')][0])
-    ohlcv_path = provider_class.get_ohlcv_path(symbol, timeframe.value, app_state.data_dir)
+    ohlcv_path = provider_class.get_ohlcv_path(symbol, timeframe, app_state.data_dir)
 
     with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
         # Convert
@@ -235,44 +259,6 @@ def convert_to(
             progress.update(task, completed=1)
 
 
-def _auto_detect_symbol_timeframe(file_path: Path) -> tuple[str | None, str | None]:
-    """Auto-detect symbol and timeframe from filename.
-    
-    :param file_path: Path to the data file
-    :return: Tuple of (symbol, timeframe_str) or (None, None) if not detected
-    """
-    filename = file_path.stem  # Filename without extension
-
-    # Common patterns for symbol detection
-    symbol = None
-    timeframe_str = None
-
-    # Try to extract symbol and timeframe from common filename patterns
-    # Examples: BTCUSD_1h.csv, AAPL_daily.csv, EUR_USD_4h.csv
-    parts = filename.replace('-', '_').split('_')
-
-    if len(parts) >= 1:
-        # The First part is likely the symbol
-        potential_symbol = parts[0].upper()
-        if len(potential_symbol) >= 3:  # Minimum symbol length
-            symbol = potential_symbol
-
-    # Look for timeframe indicators
-    timeframe_map = {
-        '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
-        '1h': '1H', '4h': '4H', '1d': '1D', 'daily': '1D',
-        '1w': '1W', 'weekly': '1W', '1M': '1M', 'monthly': '1M'
-    }
-
-    for part in parts:
-        part_lower = part.lower()
-        if part_lower in timeframe_map:
-            timeframe_str = timeframe_map[part_lower]
-            break
-
-    return symbol, timeframe_str
-
-
 @app_data.command()
 def convert_from(
         file_path: Path = Argument(..., help="Path to CSV/JSON file to convert"),
@@ -280,8 +266,8 @@ def convert_from(
                                help="Data provider, can be any name"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
                                     help="Symbol (default: auto-detected from filename)"),
-        timeframe: TimeframeEnum | None = Option(None, '--timeframe', '-tf', case_sensitive=False,  # type: ignore
-                                                 help="Timeframe (default: auto-detected from filename)"),
+        timeframe: str | None = Option(None, '--timeframe', '-tf',
+                                       help="Timeframe (default: auto-detected from data, e.g., '1', '5S', '1D', '1W')"),
         fmt: Enum('Format', {'csv': 'csv', 'json': 'json'}) | None = Option(  # noqa # type: ignore
             None, '--fmt', '-f',
             case_sensitive=False,
@@ -292,33 +278,39 @@ def convert_from(
     """
     Convert data from other sources to pyne's OHLCV format with automatic symbol detection
     """
-    from pynecore.core.data_converter import DataConverter
 
     # Expand file path if only filename is provided (look in workdir/data)
     if len(file_path.parts) == 1:
         file_path = app_state.data_dir / file_path
-    
+
     # Check if file exists
     if not file_path.exists():
         secho(f"File '{file_path}' not found!", fg=colors.RED, err=True)
         raise Exit(1)
 
-    # Auto-detect symbol and timeframe from filename if not provided
-    if symbol is None or timeframe is None:
-        detected_symbol, detected_timeframe_str = _auto_detect_symbol_timeframe(file_path)
-        if symbol is None:
-            symbol = detected_symbol
-        if timeframe is None and detected_timeframe_str:
-            try:
-                timeframe = detected_timeframe_str
-            except ValueError:
-                timeframe = None
+    # Auto-detect symbol from filename if not provided
+    if symbol is None:
+        symbol = DataConverter.auto_detect_symbol_from_filename(file_path)
+
+    # Use AUTO for timeframe detection from data if not provided
+    if timeframe is None:
+        timeframe = "AUTO"
+
+    # Validate timeframe if provided (skip validation for AUTO)
+    if timeframe is not None and timeframe.upper() != "AUTO":
+        try:
+            validate_timeframe(timeframe)
+        except ValueError as e:
+            secho(f"Invalid timeframe '{timeframe}': {e}", fg=colors.RED, err=True)
+            raise Exit(1)
 
     # Ensure we have required parameters
     if symbol is None:
-        symbol = "UNKNOWN"  # Fallback symbol
-    if timeframe is None:
-        timeframe = "1D"  # Fallback timeframe
+        secho(f"Error: Could not detect symbol from filename '{file_path.name}'!", fg=colors.RED, err=True)
+        secho("Please provide a symbol using --symbol option or rename your file to include the symbol.",
+              fg=colors.YELLOW, err=True)
+        secho("Example: 'BTCUSD_1h.csv' or use '--symbol BTCUSD'", fg=colors.YELLOW, err=True)
+        raise Exit(1)
 
     # Auto-detect format from file extension
     if fmt is None:
@@ -340,11 +332,8 @@ def convert_from(
 
             # Convert timeframe to string value
             timeframe_str = "1D"  # Default
-            if timeframe:
-                if hasattr(timeframe, 'value'):
-                    timeframe_str = timeframe.value
-                else:
-                    timeframe_str = str(timeframe)
+            if timeframe is not None:
+                timeframe_str = str(timeframe)
 
             # Perform conversion with automatic TOML generation
             result = converter.convert_if_needed(

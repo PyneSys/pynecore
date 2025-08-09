@@ -275,6 +275,23 @@ def __test_ohlcv_reader_from_to__(tmp_path):
         assert candles[-1].timestamp == 1609459500
 
 
+def __test_ohlcv_reader_rejects_text_disguised_as_ohlcv__(tmp_path):
+    """OHLCVReader should raise a clear error when opening a text file renamed to .ohlcv."""
+    file_path = tmp_path / "fake_text.ohlcv"
+
+    # Arrange: create a plain-text CSV-like file but with .ohlcv extension
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("timestamp,open,high,low,close,volume\n")
+        f.write("1609459200,100,110,90,105,1000\n")
+
+    # Act & Assert: opening via OHLCVReader should fail with a helpful message
+    with pytest.raises(ValueError) as excinfo:
+        with OHLCVReader(file_path) as _:
+            pass  # Should not reach here
+
+    assert "Text file detected with .ohlcv extension" in str(excinfo.value)
+
+
 def __test_chronological_order_validation__(tmp_path):
     """Test validation of chronological order in timestamps"""
     file_path = tmp_path / "test_chronological.ohlcv"

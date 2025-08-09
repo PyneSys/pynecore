@@ -86,10 +86,7 @@ def run(
                                      help="PyneSys API key for compilation (overrides configuration file)",
                                      envvar="PYNESYS_API_KEY",
                                      rich_help_panel="Compilation Options"),
-        symbol: str | None = Option(None, "--symbol", "-s",
-                                    help="Symbol name for conversion (default: SYMBOL)",
-                                    show_default=False,
-                                    rich_help_panel="Data Options"),
+
 ):
     """
     Run a script (.py or .pine)
@@ -109,7 +106,7 @@ def run(
     A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
     
     [bold]Data Support:[/bold]
-    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Optional [bold]--symbol[/bold] for CSV/TXT/JSON (smart defaults applied).
+    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Symbol is auto-detected from filename.
     """  # noqa
 
     # Expand script path
@@ -189,8 +186,15 @@ def run(
 
             # Check if conversion is needed
             if converter.is_conversion_required(data):
-                # Use smart defaults - no longer require symbol and timeframe
-                default_symbol = symbol or "SYMBOL"  # Default symbol name
+                # Auto-detect symbol from filename using existing function
+                detected_symbol = DataConverter.auto_detect_symbol_from_filename(data)
+                if not detected_symbol:
+                    # Use filename without extension as default symbol
+                    default_symbol = data.stem.upper()
+                    secho(f"Warning: Could not detect symbol from filename '{data.name}'", fg="yellow", err=True)
+                    secho(f"Using default symbol: '{default_symbol}'", fg="yellow")
+                else:
+                    default_symbol = detected_symbol
                 default_timeframe = "AUTO"  # Auto-detect timeframe from data
 
                 with Progress(

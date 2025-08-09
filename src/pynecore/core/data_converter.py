@@ -9,12 +9,16 @@ from __future__ import annotations
 import json
 import struct
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Literal
 
-from pynecore.core.ohlcv_file import OHLCVWriter, STRUCT_FORMAT
+from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 from pynecore.utils.file_utils import copy_mtime, is_updated
+from ..lib.timeframe import from_seconds
+from .syminfo import SymInfo, SymInfoInterval, SymInfoSession
 
 
 @dataclass
@@ -50,10 +54,46 @@ class DataConverter:
     """
 
     SUPPORTED_FORMATS = {'csv', 'txt', 'json'}
-    OHLCV_MAGIC_BYTES = b'\x00\x00\x00\x00'  # First 4 bytes pattern for binary OHLCV
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def auto_detect_symbol_from_filename(file_path: Path) -> str | None:
+        """Auto-detect symbol from filename.
+        
+        :param file_path: Path to the data file
+        :return: Symbol name or None if not detected
+        """
+        filename = file_path.stem  # Filename without extension
+
+        # Common patterns to try:
+        # 1. BTCUSD_1h.csv, AAPL_daily.csv, EUR_USD_4h.csv
+        # 2. BTCUSD-1h.csv, AAPL-daily.csv
+        # 3. btcusd.csv, aapl.csv (simple symbol only)
+        # 4. BTC_USD_1D.csv, EUR_USD_4H.csv (with separators)
+
+        # Normalize separators
+        normalized = filename.replace('-', '_').upper()
+        parts = normalized.split('_')
+
+        if len(parts) >= 1:
+            potential_symbol = parts[0]
+
+            # Check if it looks like a valid symbol (3+ chars, alphanumeric)
+            if len(potential_symbol) >= 3 and potential_symbol.isalnum():
+                # Handle common forex patterns like EUR_USD -> EURUSD
+                if len(parts) >= 2 and len(parts[1]) == 3 and parts[1].isalpha():
+                    # Likely forex pair: EUR_USD -> EURUSD
+                    return potential_symbol + parts[1]
+                else:
+                    return potential_symbol
+
+        # Try the whole filename if it's a simple symbol
+        if len(filename) >= 3 and filename.replace('_', '').replace('-', '').isalnum():
+            return filename.upper().replace('_', '').replace('-', '')
+
+        return None
 
     @staticmethod
     def detect_format(file_path: Path) -> Literal['csv', 'txt', 'json', 'ohlcv', 'unknown']:
@@ -70,34 +110,14 @@ class DataConverter:
         # Check extension first
         ext = file_path.suffix.lower()
         if ext == '.ohlcv':
-            # Validate if it's actually binary OHLCV format
+            # Using OHLCVReader to validate. If it raises an error, it's not a valid OHLCV file.
             try:
-                with open(file_path, 'rb') as f:
-                    # Check if file size is multiple of 24 (OHLCV record size)
-                    file_size = f.seek(0, 2)  # Seek to end
-                    f.seek(0)  # Back to start
-
-                    if file_size == 0:
-                        return 'ohlcv'  # Empty OHLCV file is valid
-
-                    if file_size % 24 != 0:
-                        # Not a valid OHLCV file, likely renamed
-                        return DataConverter._detect_content_format(file_path)
-
-                    # Read first record to validate structure
-                    first_record = f.read(24)
-                    if len(first_record) == 24:
-                        try:
-                            # Try to unpack as OHLCV record
-                            struct.unpack(STRUCT_FORMAT, first_record)
-                            return 'ohlcv'
-                        except struct.error:
-                            # Invalid binary format, likely renamed
-                            return DataConverter._detect_content_format(file_path)
-
+                with OHLCVReader(file_path):
+                    # If we can open it successfully, it's a valid OHLCV file
                     return 'ohlcv'
-            except (OSError, IOError) as e:
-                raise DataFormatError(f"Cannot read file {file_path}: {e}")
+            except (ValueError, OSError, IOError):
+                # Not a valid OHLCV file, likely renamed - detect by content
+                return DataConverter._detect_content_format(file_path)
 
         elif ext == '.csv':
             return 'csv'
@@ -120,8 +140,6 @@ class DataConverter:
             with open(file_path, 'r', encoding='utf-8') as f:
                 # Read first few lines for analysis
                 first_line = f.readline().strip()
-                if not first_line:
-                    return 'unknown'
 
                 # Try JSON first (most specific)
                 f.seek(0)
@@ -131,19 +149,19 @@ class DataConverter:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
 
-                # Check for CSV patterns
-                if ',' in first_line:
+                # Check for CSV patterns (only if we have content)
+                if first_line and ',' in first_line:
                     # Count commas to see if it looks like structured data
                     comma_count = first_line.count(',')
                     if comma_count >= 4:  # At least OHLC columns
                         return 'csv'
 
                 # Check for other delimiters (TXT)
-                if any(delim in first_line for delim in ['\t', ';', '|']):
+                if first_line and any(delim in first_line for delim in ['\t', ';', '|']):
                     return 'txt'
 
                 # Default to CSV if it has some structure
-                if ',' in first_line:
+                if first_line and ',' in first_line:
                     return 'csv'
 
                 return 'unknown'
@@ -330,7 +348,8 @@ class DataConverter:
             timeframe: str,
             timezone: str
     ) -> None:
-        """Create TOML symbol info file if it doesn't exist or is outdated.
+        """
+        Create TOML symbol info file using SymInfo class if it doesn't exist or is outdated.
         
         :param source_path: Path to the source data file
         :param symbol: Symbol name (e.g., 'BTCUSD')
@@ -360,88 +379,60 @@ class DataConverter:
         minmove = price_analysis['min_move']
         pointvalue = self._get_default_pointvalue(symbol_type)
 
-        # Create TOML content with warnings
-        toml_content = f"""# WARNING: This file was auto-generated from price data analysis.
-# Please review and adjust the following values according to your broker's specifications:
-# - mintick: Minimum price movement (currently: {mintick})
-# - pricescale: Price scale factor (currently: {pricescale})
-# - minmove: Minimum move in price scale units (currently: {minmove})
-# - pointvalue: Market value per price scale unit (currently: {pointvalue})
-# - opening_hours: Trading hours may vary by broker and market
-
-[symbol]
-prefix = "CUSTOM"
-description = "{symbol} - Auto-generated symbol info"
-ticker = "{symbol_upper}"
-currency = "{currency}"
-"""
-
-        # Use smart defaults for currency fields
-        if base_currency:
-            toml_content += f'basecurrency = "{base_currency}"\n'
-        else:
-            toml_content += 'basecurrency = "EUR"  # Default base currency - change if needed\n'
-
-        toml_content += f"""period = "{timeframe}"
-type = "{symbol_type}"
-mintick = {mintick}
-pricescale = {pricescale}
-minmove = {minmove}
-pointvalue = {pointvalue}
-timezone = "{timezone}"
-volumettype = "base"
-#avg_spread =
-#taker_fee =
-#maker_fee =
-#target_price_average =
-#target_price_high =
-#target_price_low =
-#target_price_date =
-
-# Opening hours (24/7 for crypto, business hours for others)
-"""
-
+        # Create opening hours based on symbol type
+        opening_hours = []
         if symbol_type == 'crypto':
             # 24/7 trading for crypto
             for day in range(1, 8):
-                toml_content += f"""[[opening_hours]]
-day = {day}
-start = "00:00:00"
-end = "23:59:59"
-
-"""
+                opening_hours.append(SymInfoInterval(
+                    day=day,
+                    start=time(0, 0, 0),
+                    end=time(23, 59, 59)
+                ))
         else:
             # Business hours for stocks/forex (Mon-Fri)
             for day in range(1, 6):
-                toml_content += f"""[[opening_hours]]
-day = {day}
-start = "09:30:00"
-end = "16:00:00"
+                opening_hours.append(SymInfoInterval(
+                    day=day,
+                    start=time(9, 30, 0),
+                    end=time(16, 0, 0)
+                ))
 
-"""
+        # Create session starts and ends
+        session_starts = [SymInfoSession(day=1, time=time(0, 0, 0))]
+        session_ends = [SymInfoSession(day=7, time=time(23, 59, 59))]
 
-        toml_content += """# Session starts
-[[session_starts]]
-day = 1
-time = "00:00:00"
+        # Create SymInfo instance
+        syminfo = SymInfo(
+            prefix="CUSTOM",
+            description=f"{symbol} - Auto-generated symbol info",
+            ticker=symbol_upper,
+            currency=currency,
+            basecurrency=base_currency or "EUR",
+            period=timeframe,
+            type=symbol_type if symbol_type in ["stock", "fund", "dr", "right", "bond",
+                                                "warrant", "structured", "index", "forex",
+                                                "futures", "spread", "economic", "fundamental",
+                                                "crypto", "spot", "swap", "option", "commodity",
+                                                "other"] else "other",
+            mintick=mintick,
+            pricescale=int(pricescale),
+            minmove=int(minmove),
+            pointvalue=pointvalue,
+            opening_hours=opening_hours,
+            session_starts=session_starts,
+            session_ends=session_ends,
+            timezone=timezone,
+            volumetype="base"
+        )
 
-# Session ends
-[[session_ends]]
-day = 7
-time = "23:59:59"
-"""
-
-        # Write TOML file
+        # Save using SymInfo's built-in method
         try:
-            with open(toml_path, 'w', encoding='utf-8') as f:
-                f.write(toml_content)
-
+            syminfo.save_toml(toml_path)
             # Copy modification time from source to maintain consistency
             copy_mtime(source_path, toml_path)
-
         except (OSError, IOError):
             # Don't fail the entire conversion if TOML creation fails
-            # Just log the issue (could be added later)
             pass
 
     def _analyze_price_data(self, source_path: Path) -> dict[str, float]:
@@ -450,126 +441,71 @@ time = "23:59:59"
         :param source_path: Path to the source data file
         :return: Dictionary with tick_size, price_scale, and min_move
         """
-        try:
-            # Try to import pandas for data analysis
-            try:
-                import pandas as pd  # type: ignore
-            except ImportError:
-                # Pandas not available, use basic CSV analysis
-                return self._analyze_price_data_basic(source_path)
-
-            # Determine file format and read data
-            if source_path.suffix.lower() == '.csv':
-                df = pd.read_csv(source_path, nrows=1000)  # Sample first 1000 rows
-            elif source_path.suffix.lower() == '.json':
-                df = pd.read_json(source_path, lines=True, nrows=1000)
-            else:
-                # Default fallback values
-                return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
-
-            # Find price columns (common names)
-            price_cols = []
-            for col in df.columns:
-                col_lower = col.lower()
-                if any(price_name in col_lower for price_name in ['close', 'price', 'high', 'low', 'open']):
-                    price_cols.append(col)
-
-            if not price_cols:
-                # No price columns found, use defaults
-                return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
-
-            # Use the first price column for analysis
-            prices = pd.to_numeric(df[price_cols[0]], errors='coerce').dropna()
-
-            if len(prices) == 0:
-                return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
-
-            # Calculate decimal places from price data
-            decimal_places = 0
-            for price in prices.head(100):  # Check first 100 valid prices
-                if pd.notna(price):
-                    price_str = str(float(price))
-                    if '.' in price_str and not price_str.endswith('.0'):
-                        current_decimals = len(price_str.split('.')[1])
-                        decimal_places = max(decimal_places, current_decimals)
-
-            # Calculate price scale (10^decimal_places)
-            # Use at least 2 decimal places for reasonable trading precision
-            decimal_places = max(decimal_places, 2)
-            price_scale = 10 ** decimal_places
-
-            # Calculate minimum tick size
-            tick_size = 1.0 / price_scale
-
-            # Min move is typically 1 in price scale units
-            min_move = 1
-
-            return {
-                'tick_size': tick_size,
-                'price_scale': price_scale,
-                'min_move': min_move
-            }
-
-        except (ImportError, ValueError, KeyError, TypeError):
-            # If analysis fails, return sensible defaults
-            return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
+        # Always use the basic method for maximum precision without external dependencies
+        return self._analyze_price_data_basic(source_path)
 
     @staticmethod
     def _analyze_price_data_basic(source_path: Path) -> dict[str, float]:
-        """Basic price data analysis without pandas dependency.
+        """Basic price data analysis by converting to OHLCV and using OHLCVReader.
         
         :param source_path: Path to the source data file
         :return: Dictionary with tick_size, price_scale, and min_move
         """
         try:
-            import csv
+            # Convert file to temporary OHLCV format first
+            with tempfile.NamedTemporaryFile(suffix='.ohlcv', delete=False) as temp_file:
+                temp_ohlcv_path = Path(temp_file.name)
 
-            if source_path.suffix.lower() != '.csv':
-                return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
+            try:
+                # Use existing conversion logic
+                with OHLCVWriter(temp_ohlcv_path) as ohlcv_writer:
+                    if source_path.suffix.lower() == '.csv':
+                        ohlcv_writer.load_from_csv(source_path, tz='UTC')
+                    elif source_path.suffix.lower() == '.json':
+                        ohlcv_writer.load_from_json(source_path, tz='UTC')
+                    else:
+                        # Treat as CSV with different delimiters
+                        ohlcv_writer.load_from_csv(source_path, tz='UTC')
 
-            with open(source_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
+                # Now analyze price data using OHLCVReader
+                with OHLCVReader(temp_ohlcv_path) as reader:
+                    if reader.size == 0:
+                        return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
 
-                # Find price column
-                price_col = None
-                for col in reader.fieldnames or []:
-                    col_lower = col.lower()
-                    if any(price_name in col_lower for price_name in ['close', 'price', 'high', 'low', 'open']):
-                        price_col = col
-                        break
+                    # Analyze first 100 records (or all if less)
+                    decimal_places = 0
+                    sample_size = min(100, reader.size)
 
-                if not price_col:
-                    return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
+                    for i in range(sample_size):
+                        ohlcv = reader.read(i)
+                        # Check all price fields for decimal precision
+                        for price in [ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close]:
+                            # Detect actual decimal precision without artificial limits
+                            if price != int(price):  # Has decimal component
+                                # Use high precision to capture actual decimal places
+                                price_str = f"{price:.15f}".rstrip('0').rstrip('.')
+                                if '.' in price_str:
+                                    current_decimals = len(price_str.split('.')[1])
+                                    decimal_places = max(decimal_places, current_decimals)
 
-                # Analyze first 100 rows
-                decimal_places = 0
-                count = 0
-                for row in reader:
-                    if count >= 100:
-                        break
+                    # Calculate parameters preserving full precision
+                    decimal_places = max(decimal_places, 2)  # At least 2 decimal places for safety
+                    price_scale = 10 ** decimal_places
+                    tick_size = 1.0 / price_scale
+                    min_move = 1
 
-                    try:
-                        price = float(row[price_col])
-                        price_str = f"{price:.10f}".rstrip('0')
-                        if '.' in price_str:
-                            current_decimals = len(price_str.split('.')[1])
-                            decimal_places = max(decimal_places, current_decimals)
-                        count += 1
-                    except (ValueError, KeyError):
-                        continue
+                    return {
+                        'tick_size': tick_size,
+                        'price_scale': price_scale,
+                        'min_move': min_move
+                    }
 
-                # Calculate parameters
-                price_scale = 10 ** decimal_places
-                tick_size = 1.0 / price_scale if decimal_places > 0 else 1.0
-                min_move = 1
+            finally:
+                # Clean up temporary file
+                if temp_ohlcv_path.exists():
+                    temp_ohlcv_path.unlink()
 
-                return {
-                    'tick_size': tick_size,
-                    'price_scale': price_scale,
-                    'min_move': min_move
-                }
-
-        except (OSError, IOError, ValueError, KeyError, TypeError):
+        except (OSError, IOError, ValueError, ConversionError):
             return {'tick_size': 0.01, 'price_scale': 100, 'min_move': 1}
 
     @staticmethod
@@ -628,9 +564,9 @@ time = "23:59:59"
                     record = f.read(24)  # OHLCV record size
                     if len(record) < 24:
                         break
-                    
-                    # Unpack timestamp (first 8 bytes as uint64)
-                    timestamp = struct.unpack('<Q', record[:8])[0]
+
+                    # Unpack timestamp (first 4 bytes as uint32)
+                    timestamp = struct.unpack('<I', record[:4])[0]
                     timestamps.append(timestamp)
 
             if len(timestamps) < 2:
@@ -639,7 +575,7 @@ time = "23:59:59"
             # Calculate differences between consecutive timestamps
             differences = []
             for i in range(1, len(timestamps)):
-                diff = timestamps[i] - timestamps[i-1]
+                diff = timestamps[i] - timestamps[i - 1]
                 if diff > 0:  # Only positive differences
                     differences.append(diff)
 
@@ -647,51 +583,34 @@ time = "23:59:59"
                 return "1D"  # Default fallback
 
             # Find the most common difference (mode)
-            from collections import Counter
             diff_counts = Counter(differences)
             most_common_diff = diff_counts.most_common(1)[0][0]
 
-            # Convert nanoseconds to timeframe string
-            return self._nanoseconds_to_timeframe(most_common_diff)
+            # Convert seconds to timeframe string (timestamps are in seconds, not nanoseconds)
+            return self._seconds_to_timeframe(most_common_diff)
 
         except (OSError, IOError, struct.error, IndexError, ValueError):
             # If detection fails, return default
             return "1D"
 
     @staticmethod
-    def _nanoseconds_to_timeframe(nanoseconds: int) -> str:
-        """Convert nanoseconds difference to timeframe string.
+    def _seconds_to_timeframe(seconds: int) -> str:
+        """
+        Convert seconds difference to timeframe string using TV-compatible timeframe module.
         
-        :param nanoseconds: Time difference in nanoseconds
+        :param seconds: Time difference in seconds
         :return: Timeframe string (e.g., '1m', '5m', '1h', '1D')
         """
-        # Convert to seconds
-        seconds = nanoseconds / 1_000_000_000
+        # Handle edge cases
+        if seconds <= 0:
+            return "1D"  # Default fallback
 
-        # Define common timeframes in seconds
-        timeframes = [
-            (60, "1m"),
-            (300, "5m"),
-            (900, "15m"),
-            (1800, "30m"),
-            (3600, "1h"),
-            (14400, "4h"),
-            (86400, "1D"),
-            (604800, "1W"),
-            (2592000, "1M"),  # Approximate month
-        ]
-
-        # Find the closest match
-        best_match = "1D"  # Default
-        min_diff = float('inf')
-        
-        for tf_seconds, tf_string in timeframes:
-            diff = abs(seconds - tf_seconds)
-            if diff < min_diff:
-                min_diff = diff
-                best_match = tf_string
-
-        return best_match
+        # Use TV-compatible timeframe conversion
+        try:
+            return from_seconds(seconds)
+        except (ValueError, AssertionError):
+            # Fallback to closest standard timeframe if conversion fails
+            return "1D"
 
     def _detect_timeframe_from_data(self, df, requested_timeframe: str) -> str:
         """Detect timeframe from DataFrame by analyzing timestamp differences.
@@ -702,31 +621,30 @@ time = "23:59:59"
         """
         if requested_timeframe.upper() != "AUTO":
             return requested_timeframe
-            
+
         try:
             if len(df) < 2:
                 return "1D"  # Default fallback
-                
+
             # Calculate differences between consecutive timestamps
             timestamps = df['timestamp'].values
             differences = []
-            
+
             for i in range(1, min(len(timestamps), 10)):  # Check first 10 records
-                diff = timestamps[i] - timestamps[i-1]
+                diff = timestamps[i] - timestamps[i - 1]
                 if diff > 0:  # Only positive differences
                     differences.append(diff)
-                    
+
             if not differences:
                 return "1D"  # Default fallback
-                
+
             # Find the most common difference (mode)
-            from collections import Counter
             diff_counts = Counter(differences)
             most_common_diff = diff_counts.most_common(1)[0][0]
-            
-            # Convert nanoseconds to timeframe string
-            return self._nanoseconds_to_timeframe(most_common_diff)
-            
+
+            # Convert seconds to timeframe string (assuming timestamps are in seconds)
+            return self._seconds_to_timeframe(most_common_diff)
+
         except (KeyError, IndexError, ValueError, TypeError):
             # If detection fails, return default
             return "1D"
