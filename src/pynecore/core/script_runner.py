@@ -97,6 +97,27 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.ohlc4 = (lib.open + lib.high + lib.low + lib.close) / 4.0
     lib.hlcc4 = (lib.high + lib.low + 2 * lib.close) / 4.0
 
+    # Set extra_fields from OHLCV data if available
+    if ohlcv.extra_fields:
+        from ..core.series import SeriesImpl
+        # Initialize extra_fields dict if it doesn't exist
+        if not hasattr(lib, 'extra_fields') or lib.extra_fields is None:
+            lib.extra_fields = {}
+        
+        for key, value in ohlcv.extra_fields.items():
+            # Create Series object for new extra fields, or add to existing ones
+            if key not in lib.extra_fields:
+                series = SeriesImpl()
+                series.add(value)
+                lib.extra_fields[key] = series
+            else:
+                # Add new value to existing Series
+                lib.extra_fields[key].add(value)
+    else:
+        # Initialize empty extra_fields if it doesn't exist
+        if not hasattr(lib, 'extra_fields') or lib.extra_fields is None:
+            lib.extra_fields = {}
+
     dt = lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, UTC).astimezone(tz)
     lib._time = lib.last_bar_time = int(dt.timestamp() * 1000)  # PineScript representation of time
 
@@ -148,6 +169,9 @@ def _reset_lib_vars(lib: ModuleType):
     lib.hlc3 = Source("hlc3")
     lib.ohlc4 = Source("ohlc4")
     lib.hlcc4 = Source("hlcc4")
+
+    # Reset extra_fields
+    lib.extra_fields = {}
 
     lib._time = 0
     lib._datetime = datetime.fromtimestamp(0, UTC)
