@@ -3,7 +3,7 @@
 weight: 10001
 title: "Quick Start"
 description: "Quick start guide for PyneCore's programmatic API"
-icon: "play"
+icon: "tips_and_updates"
 date: "2025-08-11"
 lastmod: "2025-08-11"
 draft: false
