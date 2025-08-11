@@ -9,9 +9,9 @@ from ..utils.error_hook import setup_global_error_logging
 from ...providers import available_providers
 
 # Import commands
-from . import run, data, compile, benchmark
+from . import run, data, compile, benchmark, plugins
 
-__all__ = ['run', 'data', 'compile', 'benchmark']
+__all__ = ['run', 'data', 'compile', 'benchmark', 'plugins']
 
 
 @app.callback()
@@ -45,6 +45,10 @@ def setup(
     Pyne Command Line Interface
     """
     if ctx.resilient_parsing:
+        return
+    
+    # Skip workdir setup for plugin commands as they don't need it
+    if ctx.invoked_subcommand == 'plugin':
         return
     
     # If no subcommand is provided, show complete help like --help
