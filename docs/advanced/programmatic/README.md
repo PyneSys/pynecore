@@ -4,8 +4,8 @@ weight: 10000
 title: "Programmatic Usage"
 description: "Using PyneCore programmatically in Python applications"
 icon: "code"
-date: "2025-08-06"
-lastmod: "2025-08-06"
+date: "2025-08-11"
+lastmod: "2025-08-11"
 draft: false
 toc: true
 categories: ["Advanced", "API"]
@@ -19,8 +19,8 @@ Using PyneCore programmatically in Python applications
 
 ## In this section
 
-- [Core Components](./core-components.md) - Detailed reference for `OHLCVReader`, `SymInfo`, and `ScriptRunner`
+- [Quick Start](./quick-start.md) - Fastest way to use PyneCore programmatically
 - [Basic Examples](./basic-examples.md) - Simple usage patterns and common tasks
-- [Advanced Examples](./advanced-examples.md) - Complex scenarios and production patterns
-- [Best Practices](./best-practices.md) - Performance optimization, error handling, and common pitfalls
-- [CLI Documentation](../../cli/README.md) for command-line usage
+- [CSV Reader/Writer](../csv-reader-writer.md) - Work with CSV data sources and outputs
+- [OHLCV Reader/Writer](../ohlcv-reader-writer.md) - Binary OHLCV format, reading, writing, performance
+- [CLI Documentation](../../cli/README.md) - Command-line usage
