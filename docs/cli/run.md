@@ -26,7 +26,7 @@ pyne run SCRIPT DATA [OPTIONS]
 ```
 
 Where:
-- `SCRIPT`: Path to the PyneCore script (.py) file
+- `SCRIPT`: Path to the PyneCore script (.py) or Pine Script (.pine) file
 - `DATA`: Path to the OHLCV data (.ohlcv) file
 - `OPTIONS`: Additional options to customize the execution
 
@@ -43,6 +43,44 @@ This command will:
 3. Execute the script with the provided data
 4. Save outputs to the `workdir/output/` directory
 
+## Pine Script Support
+
+The `run` command now supports Pine Script (.pine) files in addition to Python (.py) files. When you specify a `.pine` file:
+
+1. **Automatic Compilation**: The system automatically compiles the Pine Script to Python if:
+   - The `.py` file doesn't exist, or
+   - The `.pine` file is newer than the existing `.py` file
+
+2. **API Key Required**: A valid PyneSys API key is required for Pine Script compilation. You can get one at [https://pynesys.io](https://pynesys.io).
+
+3. **Output Location**: The compiled `.py` file is saved in the same folder as the original `.pine` file.
+
+### Pine Script Example
+
+```bash
+# Run a Pine Script directly
+pyne run my_strategy.pine eurusd_data.ohlcv
+```
+
+This command will:
+1. Check if `my_strategy.py` exists and is up-to-date
+2. If not, compile `my_strategy.pine` to `my_strategy.py` using the PyneSys API
+3. Run the compiled Python script with the provided data
+
+### API Key Configuration
+
+For Pine Script compilation, you can provide the API key in several ways:
+
+1. **Command line option**: Use the `--api-key` flag
+2. **Environment variable**: Set `PYNESYS_API_KEY`
+3. **Configuration file**: Store in `workdir/config/api.toml`
+
+Example with API key:
+```bash
+# Run Pine Script with API key
+pyne run my_strategy.pine eurusd_data.ohlcv --api-key "your-api-key"
+```
+
 ## Command Arguments
 
 The `run` command has two required arguments:
@@ -57,6 +95,10 @@ Note: you don't need to write the `.py` and `.ohlcv` extensions in the command.
 ## Command Options
 
 The `run` command supports several options to customize the execution:
+
+### Compilation Options
+
+- `--api-key`, `-a`: PyneSys API key for Pine Script compilation (overrides configuration file)
 
 ### Date Range Options
 

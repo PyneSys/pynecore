@@ -1,14 +1,17 @@
-from pathlib import Path
-from datetime import datetime
 import queue
 import threading
 import time
 import sys
+import tomllib
+
+from pathlib import Path
+from datetime import datetime
 
 from typer import Option, Argument, secho, Exit
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            ProgressColumn, Task)
 from rich.text import Text
+from rich.console import Console
 
 from ..app import app, app_state
 
@@ -17,8 +20,12 @@ from pynecore.core.ohlcv_file import OHLCVReader
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
+from pynecore.pynesys.compiler import PyneComp
+from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
+
+console = Console()
 
 
 class CustomTimeElapsedColumn(ProgressColumn):
@@ -53,7 +60,7 @@ class CustomTimeRemainingColumn(ProgressColumn):
 
 @app.command()
 def run(
-        script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run"),
+        script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
         data: Path = Argument(..., dir_okay=False, file_okay=True,
                               help="Data file to use (*.ohlcv)"),
         time_from: datetime | None = Option(None, '--from', '-f',
@@ -74,9 +81,13 @@ def run(
         trade_path: Path | None = Option(None, "--trade", "-tp",
                                          help="Path to save the trade data",
                                          rich_help_panel="Out Path Options"),
+        api_key: str | None = Option(None, "--api-key", "-a",
+                                     help="PyneSys API key for compilation (overrides configuration file)",
+                                     envvar="PYNESYS_API_KEY",
+                                     rich_help_panel="Compilation Options"),
 ):
     """
-    Run a script
+    Run a script (.py or .pine)
 
     The system automatically searches for the workdir folder in the current and parent directories.
     If not found, it creates or uses a workdir folder in the current directory.
@@ -85,17 +96,79 @@ def run(
     Similarly, if [bold]data[/] path is a name without full path, it will be searched in the [italic]"workdir/data"[/] directory.
     The [bold]plot_path[/], [bold]strat_path[/], and [bold]trade_path[/] work the same way - if they are names without full paths,
     they will be saved in the [italic]"workdir/output"[/] directory.
+    
+    [bold]Pine Script Support:[/bold]
+    Also Pine Script (.pine) files could be automatically compiled to Python (.py) before execution, if the 
+    file is newer than the [italic]py[/] file or if the [italic].py[/] file doesn't exist. The compiled [italic].py[/] file will be saved 
+    into the same folder as the original [italic].pine[/] file.
+    A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
     """  # noqa
-    # Ensure .py extension
-    if script.suffix != ".py":
-        script = script.with_suffix(".py")
+
     # Expand script path
     if len(script.parts) == 1:
         script = app_state.scripts_dir / script
+
+    # If no script suffix, try .pine 1st
+    if script.suffix == "":
+        script = script.with_suffix(".pine")
+    # If doesn't exist, try .py
+    if not script.exists():
+        script = script.with_suffix(".py")
+
     # Check if script exists
     if not script.exists():
         secho(f"Script file '{script}' not found!", fg="red", err=True)
         raise Exit(1)
+
+    # Handle .pine files - compile them first
+    if script.suffix == ".pine":
+        # Read api.toml configuration
+        api_config = {}
+        try:
+            with open(app_state.config_dir / 'api.toml', 'rb') as f:
+                api_config = tomllib.load(f)['api']
+        except KeyError:
+            console.print("[red]Invalid API config file (api.toml)![/red]")
+            raise Exit(1)
+        except FileNotFoundError:
+            pass
+
+        # Override API key if provided
+        if api_key:
+            api_config['api_key'] = api_key
+
+        if api_config['api_key']:
+            # Create the compiler instance
+            compiler = PyneComp(**api_config)
+
+            # Determine output path for compiled file
+            out_path = script.with_suffix(".py")
+
+            # Check if compilation is needed
+            if compiler.needs_compilation(script, out_path):
+                with APIErrorHandler(console):
+                    with Progress(
+                            SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=console
+                    ) as progress:
+                        task = progress.add_task("Compiling Pine Script...", total=1)
+
+                        # Compile the .pine file
+                        compiler.compile(script, out_path)
+
+                        progress.update(task, completed=1)
+
+            # Update script to point to the compiled file
+            script = out_path
+
+        # Go back to normal .py file
+        else:
+            script = script.with_suffix(".py")
+            # Check if script exists
+            if not script.exists():
+                secho(f"Script file '{script}' not found!", fg="red", err=True)
+                raise Exit(1)
 
     # Check file format and extension
     if data.suffix == "":

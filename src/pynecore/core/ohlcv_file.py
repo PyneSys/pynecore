@@ -40,8 +40,8 @@ class OHLCVWriter:
 
     __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp')
 
-    def __init__(self, path: Path):
-        self.path: Path = path
+    def __init__(self, path: str | Path):
+        self.path: str = str(path)
         self._file: BufferedWriter | BufferedRandom | None = None
         self._size: int = 0
         self._start_timestamp: int | None = None
@@ -260,7 +260,7 @@ class OHLCVWriter:
             self._file.close()
             self._file = None
 
-    def load_from_csv(self, path: Path,
+    def load_from_csv(self, path: str | Path,
                       timestamp_format: str | None = None,
                       timestamp_column: str | None = None,
                       date_column: str | None = None,
@@ -398,7 +398,7 @@ class OHLCVWriter:
                 except (ValueError, IndexError) as e:
                     raise ValueError(f"Invalid data in row: {e}")
 
-    def load_from_json(self, path: Path,
+    def load_from_json(self, path: str | Path,
                        timestamp_format: str | None = None,
                        timestamp_field: str | None = None,
                        date_field: str | None = None,
@@ -553,8 +553,8 @@ class OHLCVReader:
 
     __slots__ = ('path', '_file', '_mmap', '_size', '_start_timestamp', '_interval')
 
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, path: str | Path):
+        self.path = str(path)
         self._file = None
         self._mmap = None
         self._size = 0
@@ -629,7 +629,7 @@ class OHLCVReader:
                 raise ValueError(
                     f"Text file detected with .ohlcv extension!\n"
                     f"To convert CSV to binary OHLCV format:\n"
-                    f"  pyne data convert-from {self.path.replace('.ohlcv', '.csv')} "
+                    f"  pyne data convert-from {Path(self.path).with_suffix('.csv')} "
                     f"--symbol YOUR_SYMBOL --provider custom"
                 )
             except UnicodeDecodeError:

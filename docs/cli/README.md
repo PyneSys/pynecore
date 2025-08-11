@@ -21,4 +21,5 @@ PyneCore Command Line Interface (CLI) overview and usage
 
 - [Basics](./basics.md) - Basic CLI usage and getting started
 - [Run](./run.md) - Running scripts with the CLI
+- [Compile](./compile.md) - Compiling Pine Scripts to Python
 - [Data](./data.md) - Data management commands
