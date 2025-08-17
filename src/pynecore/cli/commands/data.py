@@ -30,7 +30,8 @@ AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name i
 
 # TV-compatible timeframe validation function
 def validate_timeframe(value: str) -> str:
-    """Validate TV-compatible timeframe string.
+    """
+    Validate TV-compatible timeframe string.
     
     :param value: Timeframe string to validate
     :return: Validated timeframe string
