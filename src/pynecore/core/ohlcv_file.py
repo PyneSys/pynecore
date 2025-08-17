@@ -11,16 +11,24 @@ The file is a binary file with the following 24 bytes structure:
 
 The .ohlcv format cannot have gaps in it. All gaps are filled with the previous close price and -1 volume.
 """
+from typing import Iterator, cast
 
-from typing import Iterator
-import os
+import csv
+import json
+import math
 import mmap
+import os
 import struct
-from pathlib import Path
+from collections import Counter
+from collections.abc import Buffer
+from datetime import datetime, time, timedelta, timezone as dt_timezone, UTC
 from io import BufferedWriter, BufferedRandom
-from datetime import datetime, UTC
+from math import gcd as math_gcd
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from pynecore.types.ohlcv import OHLCV
+from ..core.syminfo import SymInfoInterval
 
 RECORD_SIZE = 24  # 6 * 4
 STRUCT_FORMAT = 'Ifffff'  # I: uint32, f: float32
@@ -38,16 +46,31 @@ class OHLCVWriter:
     Binary OHLCV data writer using direct file operations
     """
 
-    __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp')
+    __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp',
+                 '_price_changes', '_price_decimals', '_last_close', '_analyzed_tick_size',
+                 '_analyzed_price_scale', '_analyzed_min_move', '_confidence',
+                 '_trading_hours', '_analyzed_opening_hours', '_truncate')
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, truncate: bool = False):
         self.path: str = str(path)
         self._file: BufferedWriter | BufferedRandom | None = None
+        self._truncate: bool = truncate
         self._size: int = 0
         self._start_timestamp: int | None = None
         self._interval: int | None = None
         self._current_pos: int = 0
         self._last_timestamp: int | None = None
+        # Tick size analysis
+        self._price_changes: list[float] = []
+        self._price_decimals: set[int] = set()
+        self._last_close: float | None = None
+        self._analyzed_tick_size: float | None = None
+        self._analyzed_price_scale: int | None = None
+        self._analyzed_min_move: int | None = None
+        self._confidence: float = 0.0
+        # Trading hours analysis
+        self._trading_hours: dict[tuple[int, int], int] = {}  # (weekday, hour) -> count
+        self._analyzed_opening_hours: list | None = None
 
     def __enter__(self):
         self.open()
@@ -109,20 +132,72 @@ class OHLCVWriter:
         """
         return self._interval
 
+    @property
+    def analyzed_tick_size(self) -> float | None:
+        """
+        Automatically detected tick size from price data
+        """
+        if self._analyzed_tick_size is None and len(self._price_changes) >= 10:
+            self._analyze_tick_size()
+        return self._analyzed_tick_size
+
+    @property
+    def analyzed_price_scale(self) -> int | None:
+        """
+        Automatically detected price scale from price data
+        """
+        if self._analyzed_price_scale is None and len(self._price_changes) >= 10:
+            self._analyze_tick_size()
+        return self._analyzed_price_scale
+
+    @property
+    def analyzed_min_move(self) -> int | None:
+        """
+        Automatically detected min move (usually 1)
+        """
+        if self._analyzed_min_move is None and len(self._price_changes) >= 10:
+            self._analyze_tick_size()
+        return self._analyzed_min_move
+
+    @property
+    def tick_analysis_confidence(self) -> float:
+        """
+        Confidence of tick size analysis (0.0 to 1.0)
+        """
+        if self._confidence == 0.0 and len(self._price_changes) >= 10:
+            self._analyze_tick_size()
+        return self._confidence
+
+    @property
+    def analyzed_opening_hours(self) -> list | None:
+        """
+        Automatically detected opening hours from trading activity
+        Returns list of SymInfoInterval tuples or None if not enough data
+        """
+        if self._analyzed_opening_hours is None and self._has_enough_data_for_opening_hours():
+            self._analyze_opening_hours()
+        return self._analyzed_opening_hours
+
     def open(self) -> 'OHLCVWriter':
         """
         Open file for writing
         """
-        # Open in rb+ mode to allow both reading and writing
-        self._file = open(self.path, 'rb+') if os.path.exists(self.path) else open(self.path, 'wb+')
+        # If truncate is True, always open in write mode to clear existing data
+        if self._truncate:
+            self._file = open(self.path, 'wb+')
+        else:
+            # Open in rb+ mode to allow both reading and writing
+            self._file = open(self.path, 'rb+') if os.path.exists(self.path) else open(self.path, 'wb+')
         self._size = os.path.getsize(self.path) // RECORD_SIZE
 
         # Read initial metadata if file exists
         if self._size >= 2:
             self._file.seek(0)
-            first_timestamp = struct.unpack('I', self._file.read(4))[0]
+            data: Buffer = self._file.read(4)
+            first_timestamp = struct.unpack('I', data)[0]
             self._file.seek(RECORD_SIZE)
-            second_timestamp = struct.unpack('I', self._file.read(4))[0]
+            data: Buffer = self._file.read(4)
+            second_timestamp = struct.unpack('I', data)[0]
             self._start_timestamp = first_timestamp
             self._interval = second_timestamp - first_timestamp
             assert self._interval is not None
@@ -131,6 +206,10 @@ class OHLCVWriter:
         # Position at end for appending
         self._file.seek(0, os.SEEK_END)
         self._current_pos = self._size
+
+        # Collect trading hours from existing data for analysis
+        if self._size > 0 and not self._truncate:
+            self._collect_existing_trading_hours()
 
         return self
 
@@ -154,23 +233,22 @@ class OHLCVWriter:
             if self._interval <= 0:
                 raise ValueError(f"Invalid interval: {self._interval}")
         elif self._size >= 2:  # Changed from elif self._size == 2: to properly handle all cases
-            # For the second candle, validate interval
-            if self._size == 2:
-                assert self._last_timestamp is not None and self._interval is not None
-                current_interval = candle.timestamp - self._last_timestamp
-                if current_interval > self._interval * 2:
-                    # Truncate and restart
-                    self.truncate()
-                    self._start_timestamp = candle.timestamp
-                    self._interval = None
-                    self._last_timestamp = None
-                    self._current_pos = 0
-                    self._size = 0
-
             # Check chronological order
             if self._last_timestamp is not None and candle.timestamp <= self._last_timestamp:
                 raise ValueError(
                     f"Timestamps must be in chronological order. Got {candle.timestamp} after {self._last_timestamp}")
+
+            # Check if we found a smaller interval (indicates initial interval was wrong due to gap)
+            if self._interval is not None and self._last_timestamp is not None:
+                current_interval = candle.timestamp - self._last_timestamp
+
+                # If we find a smaller interval, the initial one was wrong (had a gap)
+                if 0 < current_interval < self._interval:
+                    # Rebuild file with correct interval
+                    self._rebuild_with_correct_interval(current_interval)
+                    # Now write the current candle with the corrected setup
+                    self.write(candle)
+                    return
 
             # Calculate expected timestamp and fill gaps
             if self._interval is not None and self._last_timestamp is not None:
@@ -180,14 +258,15 @@ class OHLCVWriter:
                 if candle.timestamp > expected_ts:
                     # Get previous candle's close price
                     self._file.seek((self._current_pos - 1) * RECORD_SIZE)
-                    prev_data = struct.unpack(STRUCT_FORMAT, self._file.read(RECORD_SIZE))
+                    data: Buffer = self._file.read(RECORD_SIZE)
+                    prev_data = struct.unpack(STRUCT_FORMAT, data)
                     prev_close = prev_data[4]  # 4th index is close price
 
                     # Fill gap with previous close and -1 volume (gap indicator)
                     while expected_ts < candle.timestamp:
-                        gap_data = struct.pack(STRUCT_FORMAT,
-                                               expected_ts, prev_close, prev_close,
-                                               prev_close, prev_close, -1.0)
+                        gap_data: Buffer = struct.pack(STRUCT_FORMAT,
+                                                       expected_ts, prev_close, prev_close,
+                                                       prev_close, prev_close, -1.0)
                         self._file.seek(self._current_pos * RECORD_SIZE)
                         self._file.write(gap_data)
                         self._current_pos += 1
@@ -196,11 +275,17 @@ class OHLCVWriter:
 
         # Write actual data
         self._file.seek(self._current_pos * RECORD_SIZE)
-        data = struct.pack(STRUCT_FORMAT,
-                           candle.timestamp, candle.open, candle.high,
-                           candle.low, candle.close, candle.volume)
+        data: Buffer = struct.pack(STRUCT_FORMAT,
+                                   candle.timestamp, candle.open, candle.high,
+                                   candle.low, candle.close, candle.volume)
         self._file.write(data)
         self._file.flush()
+
+        # Collect data for tick size analysis
+        self._collect_price_data(candle)
+
+        # Collect trading hours data
+        self._collect_trading_hours(candle)
 
         self._last_timestamp = candle.timestamp
         self._current_pos += 1
@@ -260,6 +345,535 @@ class OHLCVWriter:
             self._file.close()
             self._file = None
 
+    def _collect_price_data(self, candle: OHLCV) -> None:
+        """
+        Collect price data for tick size analysis during writing.
+        """
+        # Collect price changes
+        if self._last_close is not None:
+            change = abs(candle.close - self._last_close)
+            if change > 0 and len(self._price_changes) < 1000:  # Limit to 1000 samples
+                self._price_changes.append(change)
+
+        # Collect decimal places
+        for price in [candle.open, candle.high, candle.low, candle.close]:
+            if price != int(price):  # Has decimal component
+                price_str = f"{price:.15f}".rstrip('0').rstrip('.')
+                if '.' in price_str:
+                    decimals = len(price_str.split('.')[1])
+                    self._price_decimals.add(decimals)
+
+        self._last_close = candle.close
+
+    def _analyze_tick_size(self) -> None:
+        """
+        Analyze collected price data to determine tick size using multiple methods.
+        """
+        if not self._price_changes:
+            # No data, use defaults
+            self._analyzed_tick_size = 0.01
+            self._analyzed_price_scale = 100
+            self._analyzed_min_move = 1
+            self._confidence = 0.1
+            return
+
+        # Try histogram-based method first for better noise handling
+        histogram_tick = self._calculate_histogram_tick()
+
+        if histogram_tick[0] > 0 and histogram_tick[1] > 0.7:
+            # High confidence histogram result, use it directly
+            self._analyzed_tick_size = histogram_tick[0]
+            self._analyzed_price_scale = int(round(1.0 / histogram_tick[0]))
+            self._analyzed_min_move = 1
+            self._confidence = histogram_tick[1]
+            return
+
+        # Fall back to other methods
+        # Method 1: Most frequent small change
+        freq_tick = self._calculate_frequency_tick()
+
+        # Method 2: Decimal places analysis
+        decimal_tick = self._calculate_decimal_tick()
+
+        # Combine methods with weighted confidence (no GCD)
+        tick_size, confidence = self._combine_tick_estimates_no_gcd(freq_tick, decimal_tick)
+
+        # Calculate price scale and min move
+        if tick_size > 0:
+            self._analyzed_tick_size = tick_size
+            self._analyzed_price_scale = int(round(1.0 / tick_size))
+            self._analyzed_min_move = 1
+            self._confidence = confidence
+        else:
+            # Fallback to defaults
+            self._analyzed_tick_size = 0.01
+            self._analyzed_price_scale = 100
+            self._analyzed_min_move = 1
+            self._confidence = 0.1
+
+    def _calculate_frequency_tick(self) -> tuple[float, float]:
+        """
+        Calculate tick size based on most frequent small changes.
+        Returns (tick_size, confidence)
+        """
+        if len(self._price_changes) < 10:
+            return 0, 0
+
+        # Apply float32 filtering first
+        filtered_changes = []
+        for c in self._price_changes[:100]:
+            if c > 0:
+                # Convert to float32 and back
+                float32_val = struct.unpack('f', cast(Buffer, struct.pack('f', c)))[0]
+                # Round to reasonable precision for float32
+                rounded = round(float32_val, 6)
+                if rounded > 0:
+                    filtered_changes.append(rounded)
+
+        if len(filtered_changes) < 5:
+            return 0, 0
+
+        # Find most frequent changes
+        counter = Counter(filtered_changes)
+        most_common = counter.most_common(10)
+
+        if not most_common:
+            return 0, 0
+
+        # Find GCD of frequent changes to get base tick
+        frequent_changes = [change for change, count in most_common if count >= 2]
+        if len(frequent_changes) >= 2:
+            # Convert to integers for GCD
+            scale = 1000000  # 6 decimal places
+            int_changes = [int(round(c * scale)) for c in frequent_changes]
+
+            # Calculate GCD
+            result = int_changes[0]
+            for val in int_changes[1:]:
+                result = math_gcd(result, val)
+
+            tick_size = result / scale
+
+            # Confidence based on how many changes match this tick
+            matches = sum(1 for c in filtered_changes
+                          if abs(round(c / tick_size) * tick_size - c) < tick_size * 0.1)
+            confidence = min(matches / len(filtered_changes), 1.0)
+            return tick_size, confidence * 0.7  # Medium weight
+
+        return 0, 0
+
+    def _calculate_histogram_tick(self) -> tuple[float, float]:
+        """
+        Calculate tick size using histogram-based clustering approach.
+        This method is robust to float32 noise.
+        Returns (tick_size, confidence)
+        """
+        if len(self._price_changes) < 10:
+            return 0, 0
+
+        # Common tick sizes to test (from 1 to 0.00001)
+        candidate_ticks = [
+            1.0, 0.5, 0.25, 0.1, 0.05, 0.01, 0.005, 0.001,
+            0.0005, 0.0001, 0.00005, 0.00001, 0.000001
+        ]
+
+        best_tick = 0
+        best_score = 0
+
+        # Filter out zero changes and convert to float32 precision
+        changes = []
+        for change in self._price_changes[:200]:  # Use more samples for histogram
+            if change > 0:
+                # Round to float32 precision
+                float32_val = struct.unpack('f', cast(Buffer, struct.pack('f', change)))[0]
+                changes.append(float32_val)
+
+        if len(changes) < 5:
+            return 0, 0
+
+        # Get min non-zero change to establish scale
+        min_change = min(changes)
+        avg_change = sum(changes) / len(changes)
+
+        for tick in candidate_ticks:
+            # Skip ticks that are too small (less than 1/10 of smallest change)
+            if tick < min_change * 0.1:
+                continue
+
+            # Skip ticks that are way too large
+            if tick > avg_change * 10:
+                continue
+
+            # Round all changes to this tick size
+            rounded = [round(c / tick) * tick for c in changes]
+
+            # Calculate how well the rounding fits
+            errors = [abs(c - r) for c, r in zip(changes, rounded)]
+            max_error = max(errors)
+
+            # Key insight: if max error is less than tick/2, this tick captures the grid well
+            if max_error < tick * 0.5:
+                # Count how many changes are multiples of this tick (within tolerance)
+                tolerance = tick * 0.1
+                multiples = sum(1 for c in changes if abs(round(c / tick) * tick - c) < tolerance)
+                multiple_ratio = multiples / len(changes)
+
+                # Score based on how many values are clean multiples
+                if multiple_ratio > 0.7:  # Most values are clean multiples
+                    score = multiple_ratio
+
+                    # Prefer larger ticks (less precision) when scores are similar
+                    # This helps choose 0.00001 over 0.000001 when both fit
+                    score *= (1.0 + tick * 100)  # Small bonus for larger ticks
+
+                    if score > best_score:
+                        best_score = score
+                        best_tick = tick
+
+        # If no good tick found with strict criteria, fall back to simple analysis
+        if best_tick == 0:
+            # Find the most common order of magnitude in changes
+            magnitudes = []
+            for c in changes:
+                if c > 0:
+                    # Find order of magnitude
+                    mag = 10 ** math.floor(math.log10(c))
+                    magnitudes.append(mag)
+
+            if magnitudes:
+                # Most common magnitude
+                counter = Counter(magnitudes)
+                common_mag = counter.most_common(1)[0][0]
+                # Use tick as 1/10 of common magnitude
+                best_tick = common_mag / 10
+                best_score = 0.5
+
+        # Calculate confidence based on score
+        if best_score > 0.8:
+            confidence = 0.9
+        elif best_score > 0.6:
+            confidence = 0.7
+        else:
+            confidence = best_score
+
+        return best_tick, confidence
+
+    def _calculate_decimal_tick(self) -> tuple[float, float]:
+        """
+        Calculate tick size based on decimal places.
+        Returns (tick_size, confidence)
+        """
+        if not self._price_decimals:
+            # No decimals found, probably integer prices
+            return 1.0, 0.5
+
+        # Filter out noise from float representation
+        # If we have 15 decimals, it's likely float noise
+        valid_decimals = [d for d in self._price_decimals if d <= 10]
+
+        if not valid_decimals:
+            # All decimals are noise, assume 2 decimal places (cents)
+            return 0.01, 0.3
+
+        # Use most common valid decimal places
+        max_decimals = max(valid_decimals)
+        tick_size = 10 ** (-max_decimals)
+
+        # Lower confidence for decimal-only method
+        return tick_size, 0.5
+
+    @staticmethod
+    def _combine_tick_estimates_no_gcd(freq: tuple[float, float],
+                                       decimal: tuple[float, float]) -> tuple[float, float]:
+        """
+        Combine tick size estimates from frequency and decimal methods only.
+        Returns (tick_size, confidence)
+        """
+        estimates = []
+
+        if freq[0] > 0 and freq[1] > 0:
+            estimates.append(freq)
+        if decimal[0] > 0 and decimal[1] > 0:
+            estimates.append(decimal)
+
+        if not estimates:
+            return 0.01, 0.1  # Default fallback
+
+        # Use highest confidence estimate
+        best = max(estimates, key=lambda x: x[1])
+        return best
+
+    def _collect_trading_hours(self, candle: OHLCV) -> None:
+        """
+        Collect trading hours data from timestamps.
+        Only collect for candles with actual volume (not gaps).
+        """
+        if candle.volume <= 0:
+            return  # Skip gaps
+
+        # Convert timestamp to datetime
+        dt = datetime.fromtimestamp(candle.timestamp, tz=None)  # Local time
+
+        # Get weekday (1=Monday, 7=Sunday) and hour
+        weekday = dt.isoweekday()
+        hour = dt.hour
+
+        # Count occurrences
+        key = (weekday, hour)
+        self._trading_hours[key] = self._trading_hours.get(key, 0) + 1
+
+    def _collect_existing_trading_hours(self) -> None:
+        """
+        Collect trading hours data from existing file for opening hours analysis.
+        Only samples a subset of data for performance reasons.
+        """
+        if not self._file or self._size == 0:
+            return
+        
+        # Save current position
+        current_pos = self._file.tell()
+        
+        try:
+            # Sample data: read every Nth record for performance
+            # For large files, we don't need to read everything
+            sample_interval = max(1, self._size // 1000)  # Sample up to 1000 points
+            
+            for i in range(0, self._size, sample_interval):
+                self._file.seek(i * RECORD_SIZE)
+                data = self._file.read(RECORD_SIZE)
+                
+                if len(data) == RECORD_SIZE:
+                    # Unpack the record
+                    timestamp, open_val, high, low, close, volume = struct.unpack('Ifffff', data)
+                    
+                    # Only collect if volume > 0 (real trading)
+                    if volume > 0:
+                        dt = datetime.fromtimestamp(timestamp, tz=None)
+                        weekday = dt.isoweekday()
+                        hour = dt.hour
+                        key = (weekday, hour)
+                        self._trading_hours[key] = self._trading_hours.get(key, 0) + 1
+        
+        finally:
+            # Restore file position
+            self._file.seek(current_pos)
+    
+    def _has_enough_data_for_opening_hours(self) -> bool:
+        """
+        Check if we have enough data to analyze opening hours based on timeframe.
+        """
+        if not self._trading_hours or not self._interval:
+            return False
+        
+        # For daily or larger timeframes
+        if self._interval >= 86400:  # >= 1 day
+            # We need at least a few days to see a pattern
+            unique_days = len(set(day for day, hour in self._trading_hours.keys()))
+            return unique_days >= 3  # At least 3 different days
+        
+        # For intraday timeframes
+        # Check if we have at least some meaningful data
+        # We need enough to see a pattern
+        data_points = sum(self._trading_hours.values())
+        points_per_hour = 3600 / self._interval
+        hours_covered = data_points / points_per_hour
+        
+        # Need at least 2 hours of data to detect any pattern
+        # This allows even short sessions to be analyzed
+        return hours_covered >= 2
+
+    def _analyze_opening_hours(self) -> None:
+        """
+        Analyze collected trading hours to determine opening hours pattern.
+        Works for both intraday and daily timeframes.
+        """
+        if not self._trading_hours:
+            self._analyzed_opening_hours = None
+            return
+
+        # For daily or larger timeframes, analyze which days have trading
+        if self._interval and self._interval >= 86400:  # >= 1 day
+            self._analyzed_opening_hours = []
+            days_with_trading = set(day for day, hour in self._trading_hours.keys())
+            
+            # Check if it's 24/7 (all 7 days have trading)
+            if len(days_with_trading) == 7:
+                # 24/7 trading pattern
+                for day in range(1, 8):
+                    self._analyzed_opening_hours.append(SymInfoInterval(
+                        day=day,
+                        start=time(0, 0, 0),
+                        end=time(23, 59, 59)
+                    ))
+            elif days_with_trading <= {1, 2, 3, 4, 5}:  # Monday-Friday only
+                # Business days pattern (stock/forex)
+                for day in range(1, 6):
+                    self._analyzed_opening_hours.append(SymInfoInterval(
+                        day=day,
+                        start=time(9, 30, 0),  # Default to US market hours
+                        end=time(16, 0, 0)
+                    ))
+            else:
+                # Mixed pattern - include all days that have trading
+                for day in sorted(days_with_trading):
+                    self._analyzed_opening_hours.append(SymInfoInterval(
+                        day=day,
+                        start=time(0, 0, 0),  # Default to full day for daily data
+                        end=time(23, 59, 59)
+                    ))
+            return
+
+        # For intraday data, analyze hourly patterns
+        # Check if it's 24/7 trading (crypto pattern)
+        total_hours = len(self._trading_hours)
+        if total_hours >= 168 * 0.7:  # 70% of all hours in a week (lowered threshold)
+            # Check if all hours have similar activity
+            counts = list(self._trading_hours.values())
+            avg_count = sum(counts) / len(counts)
+            variance = sum((c - avg_count) ** 2 for c in counts) / len(counts)
+
+            # If low variance, it's likely 24/7
+            if variance < avg_count * 0.5:
+                self._analyzed_opening_hours = []
+                for day in range(1, 8):
+                    self._analyzed_opening_hours.append(SymInfoInterval(
+                        day=day,
+                        start=time(0, 0, 0),
+                        end=time(23, 59, 59)
+                    ))
+                return
+
+        # Analyze per-day patterns for intraday
+        self._analyzed_opening_hours = []
+
+        for day in range(1, 8):  # Monday to Sunday
+            # Get all hours for this day
+            day_hours = [(hour, count) for (d, hour), count in self._trading_hours.items() if d == day]
+
+            if not day_hours:
+                continue  # No trading on this day
+
+            # Sort by hour
+            day_hours.sort(key=lambda x: x[0])
+
+            # Find continuous trading periods
+            periods = []
+            current_start = None
+            current_end = None
+
+            # Threshold: consider an hour active if it has at least 20% of average activity
+            total_count = sum(count for _, count in day_hours)
+            if total_count == 0:
+                continue
+            avg_hour_count = total_count / len(day_hours)
+            threshold = avg_hour_count * 0.2
+
+            for hour, count in day_hours:
+                if count >= threshold:
+                    if current_start is None:
+                        current_start = hour
+                        current_end = hour
+                    else:
+                        current_end = hour
+                else:
+                    if current_start is not None:
+                        periods.append((current_start, current_end))
+                        current_start = None
+                        current_end = None
+
+            # Add last period if exists
+            if current_start is not None:
+                periods.append((current_start, current_end))
+
+            # Convert periods to SymInfoInterval
+            for start_hour, end_hour in periods:
+                self._analyzed_opening_hours.append(SymInfoInterval(
+                    day=day,
+                    start=time(start_hour, 0, 0),
+                    end=time(end_hour, 59, 59)
+                ))
+
+        # If no opening hours detected, default to business hours
+        if not self._analyzed_opening_hours:
+            for day in range(1, 6):  # Monday to Friday
+                self._analyzed_opening_hours.append(SymInfoInterval(
+                    day=day,
+                    start=time(9, 30, 0),
+                    end=time(16, 0, 0)
+                ))
+
+    def _rebuild_with_correct_interval(self, new_interval: int) -> None:
+        """
+        Rebuild the entire file with the correct interval when a smaller interval is detected.
+        This happens when initial interval was wrong due to gaps.
+
+        :param new_interval: The correct interval to use
+        """
+        import tempfile
+        import shutil
+        
+        if not self._file or self._size == 0:
+            return
+
+        # Save current file position and data
+        current_records = []
+
+        # Read all existing records
+        self._file.seek(0)
+        for i in range(self._size):
+            offset = i * RECORD_SIZE
+            self._file.seek(offset)
+            data = self._file.read(RECORD_SIZE)
+            if len(cast(bytes, data)) == RECORD_SIZE:
+                record = struct.unpack(STRUCT_FORMAT, cast(Buffer, data))
+                current_records.append(OHLCV(*record, extra_fields={}))
+
+        # Create temp file for rebuilding
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.ohlcv.tmp', dir=os.path.dirname(self.path))
+        try:
+            # Close temp file descriptor as we'll open it differently
+            os.close(temp_fd)
+
+            # Create new writer with temp file
+            with OHLCVWriter(temp_path) as temp_writer:
+                # Write all records with correct interval
+                # The writer will now properly handle gaps
+                for record in current_records:
+                    temp_writer.write(record)
+
+            # Close current file
+            self._file.close()
+
+            # Replace original with rebuilt file
+            shutil.move(temp_path, self.path)
+
+            # Reopen the file
+            self._file = open(self.path, 'rb+')
+            self._size = os.path.getsize(self.path) // RECORD_SIZE
+
+            # Reset interval to the correct one
+            self._interval = new_interval
+
+            # Position at end for appending
+            self._file.seek(0, os.SEEK_END)
+            self._current_pos = self._size
+
+            # Update last timestamp
+            if self._size > 0:
+                self._file.seek((self._size - 1) * RECORD_SIZE)
+                data: Buffer = self._file.read(4)
+                self._last_timestamp = struct.unpack('I', data)[0]
+                self._file.seek(0, os.SEEK_END)
+
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+            raise IOError(f"Failed to rebuild file with correct interval: {e}")
+
     def load_from_csv(self, path: str | Path,
                       timestamp_format: str | None = None,
                       timestamp_column: str | None = None,
@@ -276,9 +890,6 @@ class OHLCVWriter:
         :param time_column: When timestamp is split into date+time columns, time column name
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100') for timestamp conversion
         """
-        import csv
-        from zoneinfo import ZoneInfo
-
         # Parse timezone
         timezone = None
         if tz:
@@ -287,7 +898,6 @@ class OHLCVWriter:
                 sign = 1 if tz.startswith('+') else -1
                 hours = int(tz[1:3])
                 minutes = int(tz[3:]) if len(tz) > 3 else 0
-                from datetime import timezone as dt_timezone, timedelta
                 timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
             else:
                 # Handle named timezone (e.g. UTC, Europe/London)
@@ -348,7 +958,7 @@ class OHLCVWriter:
                     # Combine date and time
                     ts_str = f"{row[date_idx]} {row[time_idx]}"
                 else:
-                    ts_str = row[timestamp_idx]  # type: ignore
+                    ts_str = row[timestamp_idx]
 
                 # Convert timestamp
                 try:
@@ -416,10 +1026,6 @@ class OHLCVWriter:
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100')
         :param mapping: Optional field mapping, e.g. {'timestamp': 't', 'volume': 'vol'}
         """
-        import json
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
         # Parse timezone
         timezone = None
         if tz:
@@ -428,7 +1034,6 @@ class OHLCVWriter:
                 sign = 1 if tz.startswith('+') else -1
                 hours = int(tz[1:3])
                 minutes = int(tz[3:]) if len(tz) > 3 else 0
-                from datetime import timezone as dt_timezone, timedelta
                 timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
             else:
                 # Handle named timezone
@@ -640,8 +1245,8 @@ class OHLCVReader:
             self._size = os.path.getsize(self.path) // RECORD_SIZE
 
             if self._size >= 2:
-                self._start_timestamp = struct.unpack('I', self._mmap[0:4])[0]
-                second_timestamp = struct.unpack('I', self._mmap[RECORD_SIZE:RECORD_SIZE + 4])[0]
+                self._start_timestamp = struct.unpack('I', cast(Buffer, self._mmap[0:4]))[0]
+                second_timestamp = struct.unpack('I', cast(Buffer, self._mmap[RECORD_SIZE:RECORD_SIZE + 4]))[0]
                 self._interval = second_timestamp - self._start_timestamp
 
         return self
@@ -761,6 +1366,9 @@ class OHLCVReader:
             else:
                 f.write('timestamp,open,high,low,close,volume\n')
             for candle in self:
+                # Skip gaps (volume == -1)
+                if candle.volume == -1:
+                    continue
                 if as_datetime:
                     f.write(f"{datetime.fromtimestamp(candle.timestamp, UTC)},{format_float(candle.open)},"
                             f"{format_float(candle.high)},{format_float(candle.low)},{format_float(candle.close)},"
@@ -789,10 +1397,11 @@ class OHLCVReader:
         :param path: Path to save the JSON file
         :param as_datetime: If True, convert timestamps to ISO fmt datetime strings
         """
-        import json
-
         data = []
         for candle in self:
+            # Skip gaps (volume == -1)
+            if candle.volume == -1:
+                continue
             if as_datetime:
                 item = {
                     "time": datetime.fromtimestamp(candle.timestamp, UTC).isoformat(),

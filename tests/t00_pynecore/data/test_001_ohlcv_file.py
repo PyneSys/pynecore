@@ -413,3 +413,146 @@ def __test_ohlcv_gap_filling_and_skipping__(tmp_path):
         # Verify the records
         assert candles[0].timestamp == 1609459260
         assert candles[1].timestamp == 1609459380
+
+
+def __test_opening_hours_detection_intraday__(tmp_path):
+    """Test opening hours detection for intraday timeframes"""
+    from datetime import datetime
+    file_path = tmp_path / "test_opening_hours_intraday.ohlcv"
+    
+    with OHLCVWriter(file_path) as writer:
+        # Simulate stock market data: Monday-Friday 9:30-16:00
+        # Start from a Monday 9:30 AM EST (2024-01-08 09:30:00)
+        base_timestamp = int(datetime(2024, 1, 8, 9, 30).timestamp())
+        
+        # Write data for multiple days with 1-minute intervals
+        for day in range(5):  # Monday to Friday
+            day_offset = day * 86400  # Seconds in a day
+            
+            # Trading hours: 9:30 AM to 4:00 PM (6.5 hours = 390 minutes)
+            for minute in range(390):
+                timestamp = base_timestamp + day_offset + (minute * 60)
+                price = 100.0 + (minute * 0.01)  # Gradual price increase
+                writer.write(OHLCV(
+                    timestamp=timestamp,
+                    open=price,
+                    high=price + 0.5,
+                    low=price - 0.5,
+                    close=price + 0.1,
+                    volume=1000.0 + minute
+                ))
+    
+    # Check opening hours detection
+    with OHLCVWriter(file_path) as writer:
+        opening_hours = writer.analyzed_opening_hours
+        
+        # Should detect business hours pattern
+        assert opening_hours is not None, "Opening hours should be detected"
+        assert len(opening_hours) > 0, "Should have detected some opening hours"
+        
+        # Check that we have Monday-Friday entries
+        days_with_hours = {interval.day for interval in opening_hours}
+        assert 1 in days_with_hours  # Monday
+        assert 5 in days_with_hours  # Friday
+        assert 6 not in days_with_hours  # Saturday should not be present
+        assert 7 not in days_with_hours  # Sunday should not be present
+
+
+def __test_opening_hours_detection_crypto__(tmp_path):
+    """Test opening hours detection for crypto (24/7) markets"""
+    from datetime import datetime
+    file_path = tmp_path / "test_opening_hours_crypto.ohlcv"
+    
+    with OHLCVWriter(file_path) as writer:
+        # Simulate crypto data: 24/7 trading
+        # Start from a Monday 00:00 UTC (2024-01-08 00:00:00)
+        base_timestamp = int(datetime(2024, 1, 8, 0, 0).timestamp())
+        
+        # Write data for a full week with 5-minute intervals
+        for hour in range(168):  # 7 days * 24 hours
+            for five_min in range(12):  # 12 five-minute intervals per hour
+                timestamp = base_timestamp + (hour * 3600) + (five_min * 300)
+                price = 50000.0 + (hour * 10.0)  # BTC-like prices
+                writer.write(OHLCV(
+                    timestamp=timestamp,
+                    open=price,
+                    high=price + 50,
+                    low=price - 50,
+                    close=price + 10,
+                    volume=100.0 + five_min
+                ))
+    
+    # Check opening hours detection
+    with OHLCVWriter(file_path) as writer:
+        opening_hours = writer.analyzed_opening_hours
+        
+        # Should detect 24/7 pattern
+        assert opening_hours is not None, "Opening hours should be detected"
+        assert len(opening_hours) == 7, "Should have all 7 days for 24/7 trading"
+        
+        # Check that all days are 00:00-23:59
+        for interval in opening_hours:
+            assert interval.start.hour == 0 and interval.start.minute == 0
+            assert interval.end.hour == 23 and interval.end.minute == 59
+
+
+def __test_opening_hours_detection_daily__(tmp_path):
+    """Test opening hours detection for daily timeframes"""
+    from datetime import datetime
+    file_path = tmp_path / "test_opening_hours_daily.ohlcv"
+    
+    with OHLCVWriter(file_path) as writer:
+        # Simulate daily stock data: Monday-Friday only
+        # Start from a Monday (2024-01-08)
+        base_timestamp = int(datetime(2024, 1, 8, 16, 0).timestamp())  # Daily close at 4 PM
+        
+        # Write data for 3 weeks (15 business days)
+        for week in range(3):
+            for day in range(5):  # Monday to Friday only
+                timestamp = base_timestamp + (week * 7 * 86400) + (day * 86400)
+                price = 150.0 + (week * 5) + day
+                writer.write(OHLCV(
+                    timestamp=timestamp,
+                    open=price,
+                    high=price + 2,
+                    low=price - 2,
+                    close=price + 1,
+                    volume=1000000.0
+                ))
+    
+    # Check opening hours detection
+    with OHLCVWriter(file_path) as writer:
+        opening_hours = writer.analyzed_opening_hours
+        
+        # Should detect weekday-only pattern from daily data
+        assert opening_hours is not None, "Opening hours should be detected"
+        assert len(opening_hours) == 5, "Should have Monday-Friday for daily stock data"
+        
+        # Check that we only have weekdays (1-5)
+        days = {interval.day for interval in opening_hours}
+        assert days == {1, 2, 3, 4, 5}, "Should only have Monday-Friday"
+
+
+def __test_opening_hours_insufficient_data__(tmp_path):
+    """Test opening hours detection with insufficient data"""
+    file_path = tmp_path / "test_opening_hours_insufficient.ohlcv"
+    
+    with OHLCVWriter(file_path) as writer:
+        # Write only a few data points (less than required minimum)
+        base_timestamp = 1609459200
+        for i in range(5):  # Only 5 minutes of data
+            writer.write(OHLCV(
+                timestamp=base_timestamp + (i * 60),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=1000.0
+            ))
+    
+    # Check opening hours detection
+    with OHLCVWriter(file_path) as writer:
+        opening_hours = writer.analyzed_opening_hours
+        
+        # Should return None for insufficient data
+        assert opening_hours is None, "Should return None for insufficient data"

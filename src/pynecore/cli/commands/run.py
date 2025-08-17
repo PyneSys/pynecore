@@ -186,16 +186,11 @@ def run(
 
             # Check if conversion is needed
             if converter.is_conversion_required(data):
-                # Auto-detect symbol from filename using existing function
-                detected_symbol = DataConverter.auto_detect_symbol_from_filename(data)
+                # Auto-detect symbol and provider from filename
+                detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data)
+
                 if not detected_symbol:
-                    # Use filename without extension as default symbol
-                    default_symbol = data.stem.upper()
-                    secho(f"Warning: Could not detect symbol from filename '{data.name}'", fg="yellow", err=True)
-                    secho(f"Using default symbol: '{default_symbol}'", fg="yellow")
-                else:
-                    default_symbol = detected_symbol
-                default_timeframe = "AUTO"  # Auto-detect timeframe from data
+                    detected_symbol = data.stem.upper()
 
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
@@ -205,25 +200,20 @@ def run(
                     task = progress.add_task(f"Converting {data.suffix} to OHLCV format...", total=1)
 
                     # Perform conversion with smart defaults
-                    result = converter.convert_if_needed(
+                    converter.convert_to_ohlcv(
                         data,
-                        symbol=default_symbol,
-                        timeframe=default_timeframe
+                        provider=detected_provider,
+                        symbol=detected_symbol,
+                        force=True
                     )
 
-                    progress.update(task, completed=1)
+                    # After conversion, the OHLCV file has the same name but .ohlcv extension
+                    data = data.with_suffix(".ohlcv")
 
-                    if result.converted:
-                        console.print(f"[green]✓[/green] Converted {data} to {result.ohlcv_path}")
-                        data = result.ohlcv_path
-                    else:
-                        console.print(f"[blue]ℹ[/blue] Using existing OHLCV file: {result.ohlcv_path}")
-                        data = result.ohlcv_path
+                    progress.update(task, completed=1)
             else:
                 # File is already up-to-date, use existing OHLCV file
-                ohlcv_path = data.with_suffix(".ohlcv")
-                console.print(f"[blue]ℹ[/blue] Using existing OHLCV file: {ohlcv_path}")
-                data = ohlcv_path
+                data = data.with_suffix(".ohlcv")
 
         except (DataFormatError, ConversionError) as e:
             secho(f"Conversion failed: {e}", fg="red", err=True)
