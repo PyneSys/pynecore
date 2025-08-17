@@ -26,7 +26,7 @@ app.add_typer(app_data, name="data")
 AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
 
 # Available intervals (The same fmt as described in timeframe.period)
-TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W')})
+TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '120', '240', '1D', '1W')})
 
 # Trick to avoid type checking errors
 DateOrDays = datetime if TYPE_CHECKING else str

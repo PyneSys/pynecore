@@ -256,12 +256,20 @@ class CCXTProvider(Provider):
             pricescale *= 10
             minmove *= 10
 
+        try:
+            ticker = market_details['info']['symbol']
+        except KeyError:
+            try:
+                ticker = market_details['symbol']
+            except KeyError:
+                ticker = market_details['id']
+
         assert self._client.id
         return SymInfo(
             prefix=self._client.id.upper(),
             description=f"{market_details['base']} / {market_details['quote']} "
                         f"{add_space_before_uppercase(market_details['info'].get('contractType', 'Spot'))}",
-            ticker=market_details['info']['symbol'],
+            ticker=ticker,
             currency=market_details['quote'],
             basecurrency=market_details['base'],
             period=self.timeframe,
