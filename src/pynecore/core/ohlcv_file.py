@@ -629,22 +629,23 @@ class OHLCVWriter:
         """
         if not self._file or self._size == 0:
             return
-        
+
         # Save current position
         current_pos = self._file.tell()
-        
+
         try:
             # Sample data: read every Nth record for performance
             # For large files, we don't need to read everything
             sample_interval = max(1, self._size // 1000)  # Sample up to 1000 points
-            
+
             for i in range(0, self._size, sample_interval):
                 self._file.seek(i * RECORD_SIZE)
                 data = self._file.read(RECORD_SIZE)
-                
+
                 if len(data) == RECORD_SIZE:
                     # Unpack the record
-                    timestamp, open_val, high, low, close, volume = struct.unpack('Ifffff', data)
+                    timestamp, open_val, high, low, close, volume = \
+                        struct.unpack('Ifffff', cast(Buffer, data))
                     
                     # Only collect if volume > 0 (real trading)
                     if volume > 0:
@@ -653,31 +654,31 @@ class OHLCVWriter:
                         hour = dt.hour
                         key = (weekday, hour)
                         self._trading_hours[key] = self._trading_hours.get(key, 0) + 1
-        
+
         finally:
             # Restore file position
             self._file.seek(current_pos)
-    
+
     def _has_enough_data_for_opening_hours(self) -> bool:
         """
         Check if we have enough data to analyze opening hours based on timeframe.
         """
         if not self._trading_hours or not self._interval:
             return False
-        
+
         # For daily or larger timeframes
         if self._interval >= 86400:  # >= 1 day
             # We need at least a few days to see a pattern
             unique_days = len(set(day for day, hour in self._trading_hours.keys()))
             return unique_days >= 3  # At least 3 different days
-        
+
         # For intraday timeframes
         # Check if we have at least some meaningful data
         # We need enough to see a pattern
         data_points = sum(self._trading_hours.values())
         points_per_hour = 3600 / self._interval
         hours_covered = data_points / points_per_hour
-        
+
         # Need at least 2 hours of data to detect any pattern
         # This allows even short sessions to be analyzed
         return hours_covered >= 2
@@ -695,7 +696,7 @@ class OHLCVWriter:
         if self._interval and self._interval >= 86400:  # >= 1 day
             self._analyzed_opening_hours = []
             days_with_trading = set(day for day, hour in self._trading_hours.keys())
-            
+
             # Check if it's 24/7 (all 7 days have trading)
             if len(days_with_trading) == 7:
                 # 24/7 trading pattern
@@ -811,7 +812,7 @@ class OHLCVWriter:
         """
         import tempfile
         import shutil
-        
+
         if not self._file or self._size == 0:
             return
 
