@@ -82,7 +82,9 @@ class Order:
 
     __slots__ = (
         "order_id", "size", "sign", "order_type", "limit", "stop", "exit_id", "oca_name", "oca_type",
-        "comment", "alert_message"
+        "comment", "alert_message",
+        "trail_price", "trail_offset",
+        "trail_triggered",
     )
 
     def __init__(
@@ -97,7 +99,9 @@ class Order:
             oca_name: str | None = None,
             oca_type: _oca.Oca | None = None,
             comment: str | None = None,
-            alert_message: str | None = None
+            alert_message: str | None = None,
+            trail_price: float | None = None,
+            trail_offset: float | None = None
     ):
         self.order_id = order_id
         self.size = size
@@ -114,9 +118,15 @@ class Order:
         self.comment = comment
         self.alert_message = alert_message
 
+        self.trail_price = trail_price
+        self.trail_offset = trail_offset or 0  # in ticks
+        self.trail_triggered = False
+
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
-               f"limit={self.limit}; stop={self.stop}; oca_name={self.oca_name}; comment={self.comment})"
+               f"limit={self.limit}; stop={self.stop}; " \
+               f"trail_price={self.trail_price}; trail_offset={self.trail_offset}; " \
+               f"oca_name={self.oca_name}; comment={self.comment})"
 
 
 class Trade:
@@ -428,7 +438,7 @@ class Position:
                     else:
                         # If position has just closed
                         self.avg_price = 0.0
-                        self.openprofit = 0.0  # TODO: check compatibility with TradingView
+                        self.openprofit = 0.0
 
                     # Exit equity
                     closed_trade.exit_equity = self.equity
@@ -534,26 +544,26 @@ class Position:
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
         new_size = self.size + order.size
-        if math.isclose(new_size, 0.0, abs_tol=1 / syminfo._size_round_factor):  # Check for rounding errors
+        if new_size != 0.0 and not math.isclose(new_size, 0.0,
+                                                abs_tol=1 / syminfo._size_round_factor):  # Check for rounding errors
             new_size = 0.0
         new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
-        if self.size != 0.0 and new_sign != self.sign:
+        if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
             # Create a copy for closing existing position
             order1 = copy(order)
             order1.order_type = _order_type_close
             order1.size = -self.size
             # Set order_id to None so it will close any open trades
-            order1.exit_id = order.order_id
             order1.order_id = None
+            # Don't need to remove this order, because it is not in the orders list
+            order1.exit_id = None
             # Fill the closing order first
             self._fill_order(order1, price, h, l)
-            # Only open a new position if there's remaining size
-            if new_size != 0.0:
-                # Modify the original order to open a position in the new direction
-                order.size = new_size
-                assert order.order_id is not None
-                self.orders[order.order_id] = order
-                self._fill_order(order, price, h, l)
+            # Modify the original order to open a position in the new direction
+            order.size = new_size
+            assert order.order_id is not None
+            self.orders[order.order_id] = order
+            self._fill_order(order, price, h, l)
             return True
 
         # If position direction is not about to change, we can fill the order directly
@@ -562,8 +572,8 @@ class Position:
             return False
 
     def _check_high_stop(self, order: Order):
-        """ Check high stop """
-        if not order.stop:
+        """ Check high stop and trailing trigger """
+        if order.stop is None:
             return
         if ((order.order_type == _order_type_close and order.size > 0) or (
                 order.order_type == _order_type_entry and order.size > 0)) and order.stop <= self.h:
@@ -572,16 +582,25 @@ class Position:
 
     def _check_high(self, order: Order):
         """ Check high limit """
-        if not order.limit:
-            return
-        if ((order.order_type == _order_type_close and order.size < 0) or (
-                order.order_type == _order_type_entry and order.size < 0)) and order.limit <= self.h:
-            p = max(order.limit, self.o)
-            self.fill_order(order, p, p, self.l)
+        if order.limit is not None:
+            if ((order.order_type == _order_type_close and order.size < 0) or (
+                    order.order_type == _order_type_entry and order.size < 0)) and order.limit <= self.h:
+                p = max(order.limit, self.o)
+                self.fill_order(order, p, p, self.l)
+
+        # Update trailing stop
+        if order.trail_price is not None and order.sign < 0:
+            # Check if trailing price has been triggered
+            if not order.trail_triggered and self.h > order.trail_price:
+                order.trail_triggered = True
+            # Update stop if trailing price has been triggered
+            if order.trail_triggered:
+                offset_price = syminfo.mintick * order.trail_offset
+                order.stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
 
     def _check_low_stop(self, order: Order):
         """ Check low stop """
-        if not order.stop:
+        if order.stop is None:
             return
         if ((order.order_type == _order_type_close and order.size < 0) or (
                 order.order_type == _order_type_entry and order.size < 0)) and order.stop >= self.l:
@@ -590,12 +609,31 @@ class Position:
 
     def _check_low(self, order: Order):
         """ Check low limit """
-        if not order.limit:
-            return
-        if ((order.order_type == _order_type_close and order.size > 0) or (
-                order.order_type == _order_type_entry and order.size > 0)) and order.limit >= self.l:
-            p = min(self.o, order.limit)
-            self.fill_order(order, p, self.h, p)
+        if order.limit is not None:
+            if ((order.order_type == _order_type_close and order.size > 0) or (
+                    order.order_type == _order_type_entry and order.size > 0)) and order.limit >= self.l:
+                p = min(self.o, order.limit)
+                self.fill_order(order, p, self.h, p)
+
+        # Update trailing stop
+        if order.trail_price is not None and order.sign > 0:
+            # Check if trailing price has been triggered
+            if not order.trail_triggered and self.l < order.trail_price:
+                order.trail_triggered = True
+            # Update stop if trailing price has been triggered
+            if order.trail_triggered:
+                offset_price = syminfo.mintick * order.trail_offset
+                order.stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
+
+    def _check_close(self, order: Order, ohlcv: bool):
+        """ Check close price if trailing stop is triggered """
+        # open → high → low → close
+        if ohlcv and order.stop <= self.c:
+            self.fill_order(order, order.stop, order.stop, self.l)
+
+        # open → low → high → close
+        elif order.stop >= self.c:
+            self.fill_order(order, order.stop, self.h, order.stop)
 
     def process_orders(self):
         """ Process orders """
@@ -606,7 +644,8 @@ class Position:
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
 
-        ohlc = abs(self.h - self.o) < abs(self.l - self.o)  # checking order
+        # If the order is open → high → low → close or open → low → high → close
+        ohlc = abs(self.h - self.o) < abs(self.l - self.o)
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
@@ -614,13 +653,14 @@ class Position:
         # Process open orders
         for order in list(self.orders.values()):
             # Market orders
-            if not order.limit and not order.stop:
+            if order.limit is None and order.stop is None and order.trail_price is None:
                 # open → high → low → close
                 if ohlc:
                     self.fill_order(order, self.o, self.o, self.l)
                 # open → low → high → close
                 else:
                     self.fill_order(order, self.o, self.l, self.o)
+
             # Limit/Stop orders
             else:
                 # open → high → low → close
@@ -643,6 +683,9 @@ class Position:
             else:
                 self._check_high_stop(order)
                 self._check_high(order)
+
+            if order.trail_triggered and order.stop is not None:
+                self._check_close(order, ohlc)
 
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
@@ -684,6 +727,7 @@ class Position:
                 self.drawdown_summ += drawdown
                 self.runup_summ += runup
 
+        # Calculate max drawdown and runup
         if self.drawdown_summ or self.runup_summ:
             self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
             self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
@@ -742,7 +786,19 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
         return NA(float)
     mintick = syminfo.mintick
     ppmt = round(cast(float, price / mintick), 5)
-    return int(ppmt) * mintick if direction < 0 else (int(ppmt) + 1) * mintick
+    ppmt_int = int(ppmt)
+
+    if direction < 0:
+        # Round down
+        return ppmt_int * mintick
+    else:
+        # Round up only if ppmt is not already an integer
+        if ppmt == ppmt_int:
+            # Already an integer, no rounding needed
+            return ppmt_int * mintick
+        else:
+            # Not an integer, round up
+            return (ppmt_int + 1) * mintick
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
@@ -819,7 +875,11 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
 
     position.orders[exit_id] = order
     if immediately:
-        position.fill_order(order, lib.close, lib.high, lib.low)
+        round_to_mintick = lib.math.round_to_mintick
+        position.fill_order(order,
+                            round_to_mintick(lib.close),
+                            round_to_mintick(lib.high),
+                            round_to_mintick(lib.low))
 
 
 # noinspection PyProtectedMember
@@ -846,7 +906,11 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
 
     position.orders[exit_id] = order
     if immediately:
-        position.fill_order(order, lib.close, lib.high, lib.low)
+        round_to_mintick = lib.math.round_to_mintick
+        position.fill_order(order,
+                            round_to_mintick(lib.close),
+                            round_to_mintick(lib.high),
+                            round_to_mintick(lib.low))
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
@@ -989,9 +1053,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     script.position.orders[id] = order
 
 
-# TODO: implement trailing stop
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
-def exit(id: str, from_entry: str | NA[str] = NA(str),
+def exit(id: str, from_entry: str = "",
          qty: float | NA[float] = NA(float), qty_percent: float | NA[float] = NA(float),
          profit: float | NA[float] = NA(float), limit: float | NA[float] = NA(float),
          loss: float | NA[float] = NA(float), stop: float | NA[float] = NA(float),
@@ -1038,49 +1101,76 @@ def exit(id: str, from_entry: str | NA[str] = NA(str),
     if qty < 0.0:
         return
 
-    # Find direction
     direction = 0
     size = 0.0
-    entry_order = position.orders.get(from_entry, None)  # type: ignore
-    # Find open trade if no entry order found
-    if not entry_order:
-        for trade in position.open_trades:
-            if trade.entry_id == from_entry:
-                direction = trade.sign
-                size = trade.size
-                break
+
+    def _exit():
+        nonlocal limit, stop, trail_price, from_entry, direction, size
+
+        if isinstance(qty, NA):
+            size = -size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) else -size
+        else:
+            size = -direction * qty
+
+        size = _size_round(size)
+        if size == 0.0:
+            return
+
+        if isinstance(limit, NA) and not isinstance(profit, NA):
+            limit = lib.close + direction * syminfo.mintick * profit
+        if isinstance(stop, NA) and not isinstance(loss, NA):
+            stop = lib.close - direction * syminfo.mintick * loss
+        if isinstance(trail_price, NA) and not isinstance(trail_points, NA):
+            trail_price = lib.close + direction * syminfo.mintick * trail_points
+
+        # We need to have limit, stop or both
+        if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
+            return
+
+        if not isinstance(limit, NA):
+            limit = _price_round(limit, direction)
+        if not isinstance(stop, NA):
+            stop = _price_round(stop, -direction)
+        if not isinstance(trail_price, NA):
+            trail_price = _price_round(trail_price, direction)
+
+        position.orders[id] = Order(from_entry, size, exit_id=id, order_type=_order_type_close,
+                                    limit=limit, stop=stop,
+                                    trail_price=trail_price, trail_offset=trail_offset,
+                                    oca_name=oca_name, comment=comment, alert_message=alert_message)
+
+    # Find direction and size
+    if from_entry:
+        entry_order = position.orders.get(from_entry, None)
+
+        # Find open trade if no entry order found
+        if not entry_order:
+            for trade in position.open_trades:
+                if trade.entry_id == from_entry:
+                    direction = trade.sign
+                    size = trade.size
+                    _exit()
+
+        else:
+            direction = entry_order.sign
+            size = entry_order.size
+            _exit()
+
     else:
-        direction = entry_order.sign
-        size = entry_order.size
-    if not direction:
-        return
+        # If still no entry order found, we should exit all open trades and open orders
+        if not direction:
+            for order in list(position.orders.values()):
+                direction = order.sign
+                size = order.size
+                from_entry = order.order_id
+                _exit()
 
-    if isinstance(qty, NA):
-        size = -size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) else -size
-    else:
-        size = -direction * qty
-
-    size = _size_round(size)
-    if size == 0.0:
-        return
-
-    if isinstance(limit, NA) and not isinstance(profit, NA):
-        limit = lib.close - direction * syminfo.mintick * profit
-    if isinstance(stop, NA) and not isinstance(loss, NA):
-        stop = lib.close + direction * syminfo.mintick * loss
-
-    # We need to have limit, stop or both
-    if isinstance(limit, NA) and isinstance(stop, NA):
-        return
-
-    if not isinstance(limit, NA):
-        limit = _price_round(limit, direction)
-    if not isinstance(stop, NA):
-        stop = _price_round(stop, -direction)
-
-    order = Order(from_entry, size, exit_id=id, order_type=_order_type_close, limit=limit, stop=stop,
-                  oca_name=oca_name, comment=comment, alert_message=alert_message)
-    position.orders[id] = order
+            if not direction:
+                for trade in position.open_trades:
+                    direction = trade.sign
+                    size = trade.size
+                    from_entry = trade.entry_id
+                    _exit()
 
 
 #

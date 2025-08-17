@@ -1,6 +1,8 @@
 from typing import Any
 import os
 import logging
+from datetime import datetime
+from pathlib import Path
 
 from .string import format as _format
 from .. import lib
@@ -17,10 +19,75 @@ __all__ = 'info', 'warning', 'error', 'logger'
 if os.environ.get("PYNE_NO_COLOR_LOG", "") == "1":
     rich = None
 
+# Custom RichHandler that uses Pine Script time and timezone
+if rich:
+    class PineRichHandler(rich.logging.RichHandler):
+        """Custom RichHandler that formats time using syminfo.timezone"""
+
+        # noinspection PyProtectedMember
+        def render(self, *, record, traceback, message_renderable):
+            """Override render to use Pine Script time and timezone"""
+            from ..types import NA
+            from datetime import UTC
+
+            # Get the datetime in the correct timezone
+            if lib._time:
+                tz = lib.syminfo.timezone
+                if not tz or isinstance(tz, NA):
+                    # No timezone, use UTC
+                    log_time = datetime.fromtimestamp(lib._time / 1000, UTC)
+                else:
+                    # Use specified timezone
+                    log_time = lib._get_dt(lib._time, tz)
+            else:
+                # No Pine time, use current time
+                log_time = datetime.fromtimestamp(record.created)
+
+            # Call parent's _log_render with our log_time
+            path = Path(record.pathname).name
+            level = self.get_level_text(record)
+            time_format = None if self.formatter is None else self.formatter.datefmt
+
+            log_renderable = self._log_render(
+                self.console,
+                [message_renderable] if not traceback else [message_renderable, traceback],
+                log_time=log_time,
+                time_format=time_format,
+                level=level,
+                path=path,
+                line_no=record.lineno,
+                link_path=record.pathname if self.enable_link_path else None,
+            )
+            return log_renderable
+
 
 # noinspection PyProtectedMember
 class PineLogFormatter(logging.Formatter):
     """Custom formatter that mimics Pine Script log format"""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str = None) -> str:
+        """Format the time using syminfo.timezone"""
+        from datetime import UTC
+        from ..types import NA
+
+        # Get the appropriate datetime
+        if lib._time:
+            tz = lib.syminfo.timezone
+            if not tz or isinstance(tz, NA):
+                # No timezone, use UTC
+                dt = datetime.fromtimestamp(lib._time / 1000, UTC)
+            else:
+                # Use specified timezone
+                dt = lib._get_dt(lib._time, tz)
+        else:
+            # No Pine time, use record's time
+            dt = datetime.fromtimestamp(record.created)
+
+        # Format the datetime
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
     def format(self, record: logging.LogRecord) -> Any:
         """Format log record in Pine style: [timestamp]: message"""
@@ -31,7 +98,7 @@ class PineLogFormatter(logging.Formatter):
 
         record.args = ()
 
-        record.created = lib._time / 1000
+        record.created = lib._time / 1000 if lib._time else record.created
         if rich:
             return msg
 
@@ -47,9 +114,9 @@ if logger.hasHandlers():
 
 logger.setLevel(logging.INFO)
 if rich:
-    handler = rich.logging.RichHandler(
-        show_time=True,  # Disable rich's built-in time handling
-        show_level=True,  # Disable rich's built-in level handling
+    handler = PineRichHandler(  # noqa
+        show_time=True,
+        show_level=True,
         omit_repeated_times=False,
         markup=False,
         show_path=False,
