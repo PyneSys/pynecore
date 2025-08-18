@@ -128,10 +128,8 @@ class DataConverter:
                     ohlcv_writer.load_from_csv(file_path, tz=timezone)
                 elif detected_format == 'json':
                     ohlcv_writer.load_from_json(file_path, tz=timezone)
-                # TODO: Add support for TXT!
-                # elif detected_format == 'txt':
-                #     # Treat TXT files as CSV with different delimiters
-                #     ohlcv_writer.load_from_csv(file_path, tz=timezone)
+                elif detected_format == 'txt':
+                    ohlcv_writer.load_from_txt(file_path, tz=timezone)
                 else:
                     raise ConversionError(f"Unsupported format for conversion: {detected_format}")
 

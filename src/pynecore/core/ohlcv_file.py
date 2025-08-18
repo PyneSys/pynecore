@@ -350,20 +350,24 @@ class OHLCVWriter:
         Collect price data for tick size analysis during writing.
         """
         # Collect price changes
-        if self._last_close is not None:
+        if self._last_close is not None and isinstance(candle.close, (int, float)):
             change = abs(candle.close - self._last_close)
             if change > 0 and len(self._price_changes) < 1000:  # Limit to 1000 samples
                 self._price_changes.append(change)
 
         # Collect decimal places
         for price in [candle.open, candle.high, candle.low, candle.close]:
-            if price != int(price):  # Has decimal component
+            if isinstance(price, (int, float)) and price != int(price):  # Has decimal component
                 price_str = f"{price:.15f}".rstrip('0').rstrip('.')
                 if '.' in price_str:
                     decimals = len(price_str.split('.')[1])
                     self._price_decimals.add(decimals)
 
-        self._last_close = candle.close
+        # Store last close, handling both float and NA[float] types
+        if isinstance(candle.close, (int, float)):
+            self._last_close = float(candle.close)
+        else:
+            self._last_close = None
 
     def _analyze_tick_size(self) -> None:
         """
@@ -959,7 +963,7 @@ class OHLCVWriter:
                     # Combine date and time
                     ts_str = f"{row[date_idx]} {row[time_idx]}"
                 else:
-                    ts_str = row[timestamp_idx]
+                    ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
 
                 # Convert timestamp
                 try:
@@ -1008,6 +1012,177 @@ class OHLCVWriter:
                     ))
                 except (ValueError, IndexError) as e:
                     raise ValueError(f"Invalid data in row: {e}")
+
+    def load_from_txt(self, path: str | Path,
+                      timestamp_format: str | None = None,
+                      timestamp_column: str | None = None,
+                      date_column: str | None = None,
+                      time_column: str | None = None,
+                      tz: str | None = None) -> None:
+        """
+        Load OHLCV data from TXT file with auto-detected delimiter.
+        Supports tab, semicolon, and pipe delimited files.
+
+        :param path: Path to TXT file
+        :param timestamp_format: Optional datetime fmt for parsing
+        :param timestamp_column: Column name for timestamp (default tries: timestamp, time, date)
+        :param date_column: When timestamp is split into date+time columns, date column name
+        :param time_column: When timestamp is split into date+time columns, time column name
+        :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100') for timestamp conversion
+        :raises ValueError: If delimiter cannot be detected or file format is invalid
+        """
+        # Parse timezone
+        timezone = None
+        if tz:
+            if tz.startswith(('+', '-')):
+                # Handle UTC offset fmt (e.g. +0100, -0500)
+                sign = 1 if tz.startswith('+') else -1
+                hours = int(tz[1:3])
+                minutes = int(tz[3:]) if len(tz) > 3 else 0
+                timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
+            else:
+                # Handle named timezone (e.g. UTC, Europe/London)
+                try:
+                    timezone = ZoneInfo(tz)
+                except Exception as e:
+                    raise ValueError(f"Invalid timezone {tz}: {e}")
+
+        # Auto-detect delimiter
+        with open(path, 'r') as f:
+            first_line = f.readline().strip()
+            if not first_line:
+                raise ValueError("File is empty or first line is blank")
+            
+            # Check for common delimiters in order of preference
+            delimiters = ['\t', ';', '|']
+            delimiter_counts = {}
+            
+            for delim in delimiters:
+                count = first_line.count(delim)
+                if count > 0:
+                    delimiter_counts[delim] = count
+            
+            if not delimiter_counts:
+                raise ValueError("No supported delimiter found (tab, semicolon, or pipe)")
+            
+            # Use delimiter with highest count
+            delimiter = max(delimiter_counts, key=lambda x: delimiter_counts[x])
+
+        # Read TXT file with detected/specified delimiter
+        with open(path, 'r') as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            try:
+                headers = [h.lower().strip() for h in next(reader)]  # Case insensitive
+            except StopIteration:
+                raise ValueError("File has no headers")
+
+            if not headers:
+                raise ValueError("Header row is empty")
+
+            # Find timestamp column
+            timestamp_idx = None
+            date_idx = None
+            time_idx = None
+
+            if date_column and time_column:
+                try:
+                    date_idx = headers.index(date_column.lower())
+                    time_idx = headers.index(time_column.lower())
+                except ValueError:
+                    raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
+            else:
+                timestamp_col = timestamp_column.lower() if timestamp_column else None
+                if timestamp_col:
+                    try:
+                        timestamp_idx = headers.index(timestamp_col)
+                    except ValueError:
+                        raise ValueError(f"Timestamp column not found: {timestamp_col}")
+                else:
+                    # Try common names
+                    for col in ['timestamp', 'time', 'date']:
+                        try:
+                            timestamp_idx = headers.index(col)
+                            break
+                        except ValueError:
+                            continue
+
+                    if timestamp_idx is None:
+                        raise ValueError("Timestamp column not found!")
+
+            # Find OHLCV columns
+            try:
+                o_idx = headers.index('open')
+                h_idx = headers.index('high')
+                l_idx = headers.index('low')
+                c_idx = headers.index('close')
+                v_idx = headers.index('volume')
+            except ValueError as e:
+                raise ValueError(f"Missing required column: {str(e)}")
+
+            # Process data rows
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                if not row or len(row) != len(headers):
+                    raise ValueError(f"Row {row_count} has incorrect number of columns")
+                
+                # Strip whitespace from all fields
+                row = [field.strip() for field in row]
+                
+                # Handle timestamp
+                try:
+                    if date_idx is not None and time_idx is not None:
+                        # Combine date and time
+                        ts_str = f"{row[date_idx]} {row[time_idx]}"
+                    else:
+                        ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
+
+                    # Convert timestamp
+                    if ts_str.isdigit():
+                        timestamp = int(ts_str)
+                    else:
+                        if timestamp_format:
+                            dt = datetime.strptime(ts_str, timestamp_format)
+                        else:
+                            # Try common formats
+                            for fmt in [
+                                '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
+                                '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
+                                '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
+                                '%Y-%m-%d %H:%M:%S',
+                                '%Y/%m/%d %H:%M:%S',
+                                '%d.%m.%Y %H:%M:%S',
+                                '%Y-%m-%dT%H:%M:%S',
+                                '%Y-%m-%d %H:%M',
+                                '%Y%m%d %H:%M:%S'
+                            ]:
+                                try:
+                                    dt = datetime.strptime(ts_str, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            else:
+                                raise ValueError(f"Could not parse timestamp: {ts_str}")
+
+                        # Set timezone if specified and convert to timestamp
+                        if timezone:
+                            dt = dt.replace(tzinfo=timezone)
+                        timestamp = int(dt.timestamp())
+                except Exception as e:
+                    raise ValueError(f"Failed to parse timestamp '{ts_str}' in row {row_count}: {e}")
+
+                # Write OHLCV data
+                try:
+                    self.write(OHLCV(
+                        timestamp,
+                        float(row[o_idx]),
+                        float(row[h_idx]),
+                        float(row[l_idx]),
+                        float(row[c_idx]),
+                        float(row[v_idx])
+                    ))
+                except (ValueError, IndexError) as e:
+                    raise ValueError(f"Invalid OHLCV data in row {row_count}: {e}")
 
     def load_from_json(self, path: str | Path,
                        timestamp_format: str | None = None,
