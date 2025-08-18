@@ -385,8 +385,9 @@ class Position:
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
-                    # We realize later if it is cash per order
-                    if commission_type == _commission.cash_per_contract:
+                    # We realize later if it is cash per order or cash per contract
+                    if (commission_type == _commission.cash_per_contract or
+                            commission_type == _commission.cash_per_order):
                         closed_trade_size += abs(size)
                     else:
                         commission = abs(size) * commission_value
@@ -458,7 +459,8 @@ class Position:
             self.open_trades = open_trades
             if delete:
                 if order.exit_id is not None:
-                    self.orders.pop(order.exit_id, None)
+                    # Exit orders are stored with "exit_" prefix
+                    self.orders.pop("exit_" + order.exit_id, None)
 
                 if commission_type == _commission.cash_per_order:
                     # Realize commission
@@ -521,7 +523,13 @@ class Position:
             # Commission summ
             self.open_commission += commission
 
-            del self.orders[order.order_id]
+            # Remove the order using the actual key (which includes the prefix)
+            # The order_id in the Order object doesn't have the prefix,
+            # so we need to find and delete by iterating
+            for key, stored_order in list(self.orders.items()):
+                if stored_order is order:
+                    del self.orders[key]
+                    break
 
         # If position has just closed
         if not self.open_trades:
@@ -562,7 +570,11 @@ class Position:
             # Modify the original order to open a position in the new direction
             order.size = new_size
             assert order.order_id is not None
-            self.orders[order.order_id] = order
+            # Store with appropriate prefix based on order type
+            if order.order_type == _order_type_entry:
+                self.orders["entry_" + order.order_id] = order
+            else:
+                self.orders["exit_" + order.order_id] = order
             self._fill_order(order, price, h, l)
             return True
 
@@ -811,10 +823,17 @@ def cancel(id: str):
     if lib._lib_semaphore:
         return
 
+    assert lib._script is not None and lib._script.position is not None
+    # Try to cancel both entry and exit orders with the given ID
+    # since we don't know which type it is
+    # noinspection PyProtectedMember
     try:
-        assert lib._script is not None and lib._script.position is not None
-        # noinspection PyProtectedMember
-        del lib._script.position.orders[id]
+        del lib._script.position.orders["entry_" + id]
+    except KeyError:
+        pass
+    # noinspection PyProtectedMember
+    try:
+        del lib._script.position.orders["exit_" + id]
     except KeyError:
         pass
 
@@ -873,7 +892,8 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
 
-    position.orders[exit_id] = order
+    # Use "exit_" prefix to avoid ID collision with entry orders
+    position.orders["exit_" + exit_id] = order
     if immediately:
         round_to_mintick = lib.math.round_to_mintick
         position.fill_order(order,
@@ -904,7 +924,8 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
     order = Order(None, -position.size, exit_id=exit_id, order_type=_order_type_close,
                   comment=comment, alert_message=alert_message)
 
-    position.orders[exit_id] = order
+    # Use "exit_" prefix to avoid ID collision with entry orders
+    position.orders["exit_" + exit_id] = order
     if immediately:
         round_to_mintick = lib.math.round_to_mintick
         position.fill_order(order,
@@ -1050,7 +1071,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
-    script.position.orders[id] = order
+    # Use "entry_" prefix to avoid ID collision with exit orders
+    script.position.orders["entry_" + id] = order
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
@@ -1134,14 +1156,18 @@ def exit(id: str, from_entry: str = "",
         if not isinstance(trail_price, NA):
             trail_price = _price_round(trail_price, direction)
 
-        position.orders[id] = Order(from_entry, size, exit_id=id, order_type=_order_type_close,
-                                    limit=limit, stop=stop,
-                                    trail_price=trail_price, trail_offset=trail_offset,
-                                    oca_name=oca_name, comment=comment, alert_message=alert_message)
+        # Use "exit_" prefix to avoid ID collision with entry orders
+        position.orders["exit_" + id] = Order(
+            from_entry, size, exit_id=id, order_type=_order_type_close,
+            limit=limit, stop=stop,
+            trail_price=trail_price, trail_offset=trail_offset,
+            oca_name=oca_name, comment=comment, alert_message=alert_message
+        )
 
     # Find direction and size
     if from_entry:
-        entry_order = position.orders.get(from_entry, None)
+        # Entry orders are stored with "entry_" prefix
+        entry_order = position.orders.get("entry_" + from_entry, None)
 
         # Find open trade if no entry order found
         if not entry_order:
