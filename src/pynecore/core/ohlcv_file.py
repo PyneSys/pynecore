@@ -350,24 +350,20 @@ class OHLCVWriter:
         Collect price data for tick size analysis during writing.
         """
         # Collect price changes
-        if self._last_close is not None and isinstance(candle.close, (int, float)):
+        if self._last_close is not None:
             change = abs(candle.close - self._last_close)
             if change > 0 and len(self._price_changes) < 1000:  # Limit to 1000 samples
                 self._price_changes.append(change)
 
         # Collect decimal places
         for price in [candle.open, candle.high, candle.low, candle.close]:
-            if isinstance(price, (int, float)) and price != int(price):  # Has decimal component
+            if price != int(price):  # Has decimal component
                 price_str = f"{price:.15f}".rstrip('0').rstrip('.')
                 if '.' in price_str:
                     decimals = len(price_str.split('.')[1])
                     self._price_decimals.add(decimals)
 
-        # Store last close, handling both float and NA[float] types
-        if isinstance(candle.close, (int, float)):
-            self._last_close = float(candle.close)
-        else:
-            self._last_close = None
+        self._last_close = candle.close
 
     def _analyze_tick_size(self) -> None:
         """
@@ -963,7 +959,7 @@ class OHLCVWriter:
                     # Combine date and time
                     ts_str = f"{row[date_idx]} {row[time_idx]}"
                 else:
-                    ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
+                    ts_str = row[timestamp_idx]
 
                 # Convert timestamp
                 try:
