@@ -20,9 +20,12 @@ def t2():
 
 def main():
     global __scope_id__
-    a = isolate_function(t1, 'main|t1|0', __scope_id__, -1)()
+    __call_counter·main·t2·2__ = 0
+    __call_counter·main·t1·1__ = 0
+    __call_counter·main·t1·0__ = 0
+    a = isolate_function(t1, 'main·t1·0', __scope_id__, -1, (__call_counter·main·t1·0__ := (__call_counter·main·t1·0__ + 1)))()
     print(a)
-    b = isolate_function(t1, 'main|t1|1', __scope_id__, -1)()
+    b = isolate_function(t1, 'main·t1·1', __scope_id__, -1, (__call_counter·main·t1·1__ := (__call_counter·main·t1·1__ + 1)))()
     print(b)
-    c = isolate_function(t2, 'main|t2|2', __scope_id__, -1)()
+    c = isolate_function(t2, 'main·t2·2', __scope_id__, -1, (__call_counter·main·t2·2__ := (__call_counter·main·t2·2__ + 1)))()
     print(c)

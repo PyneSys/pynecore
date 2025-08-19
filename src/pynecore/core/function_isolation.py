@@ -1,34 +1,26 @@
-from typing import Callable, cast, Any
+from typing import Callable
 from types import FunctionType
 from dataclasses import is_dataclass, replace as dataclass_replace
 from copy import copy
 from .pine_export import Exported
 from .series import SeriesImpl
 
-__all__ = ['isolate_function', 'reset', 'reset_step']
+__all__ = ['isolate_function', 'reset']
 
 # Store all function instances
 _function_cache: dict[str | tuple, FunctionType] = {}
-_call_counters: dict[tuple[str, str], int] = {}
 
 
 def reset():
     """
-    Reset all function instances and call counters
+    Reset all function instances
     """
     _function_cache.clear()
-    _call_counters.clear()
-
-
-def reset_step():
-    """
-    Reset the call counters for the last bar index
-    """
-    _call_counters.clear()
 
 
 def isolate_function(
-        func: FunctionType | Callable, call_id: str | None, parent_scope: str, closure_argument_count=-1
+        func: FunctionType | Callable, call_id: str | None, parent_scope: str,
+        closure_argument_count: int = -1, call_counter: int = 0
 ) -> FunctionType | Callable:
     """
     Create a new function instance with isolated globals if the function has persistent or series globals.
@@ -37,11 +29,12 @@ def isolate_function(
     :param call_id: The unique call ID
     :param parent_scope: The parent scope ID
     :param closure_argument_count: Whether the function has closure arguments
+    :param call_counter: The current call counter value for this call_id
     :return: The new function instance if there are any persistent or series globals otherwise the original function
     """
     # If there is no call ID, return the function as is
     if call_id is None:
-        return cast(FunctionType, func)
+        return func  # type: ignore
 
     # If it is a type object, return it as is
     if isinstance(func, type):
@@ -49,7 +42,7 @@ def isolate_function(
 
     # If it is a classmethod (bound method where __self__ is a class), return it as is
     if hasattr(func, '__self__') and isinstance(func.__self__, type):
-        return cast(FunctionType, func)
+        return func  # type: ignore
 
     # Check if this is an Exported proxy and unwrap it
     if isinstance(func, Exported):
@@ -63,17 +56,8 @@ def isolate_function(
 
     # Create full call ID from parent scope and call ID
     if call_id and not is_overloaded:
-        # Increment counter for this call_id at current bar_index
-        cck = (parent_scope, call_id)
-        try:
-            cc = _call_counters[cck] + 1
-            _call_counters[cck] = cc
-        except KeyError:
-            cc = _call_counters[cck] = 1
-
-        # Append the call counter to the call ID
-        # call_id = f"{parent_scope}→{call_id}#{cc}"
-        call_id_key: str | tuple = (cck, cc)
+        # call_id_key = f"{parent_scope}→{call_id}#{call_counter}"
+        call_id_key: str | tuple = (parent_scope, call_id, call_counter)
     else:
         call_id_key = parent_scope
 
@@ -104,7 +88,7 @@ def isolate_function(
     try:
         new_globals = dict(func.__globals__)
     except AttributeError:  # This is a builtin function (it should be filtered in the transformer)
-        return cast(FunctionType, func)
+        return func  # type: ignore
 
     # The qualified name of the function, this name is used in the globals registry by transformer
     qualname = func.__qualname__.replace('<locals>.', '')
@@ -128,7 +112,7 @@ def isolate_function(
             if isinstance(old_value, (dict, list)):
                 new_globals[key] = old_value.copy()
             elif is_dataclass(old_value):
-                new_globals[key] = dataclass_replace(cast(Any, old_value))
+                new_globals[key] = dataclass_replace(old_value)  # type: ignore
             else:
                 new_globals[key] = copy(old_value)
     except KeyError:
@@ -149,7 +133,7 @@ def isolate_function(
                 if isinstance(old_value, (dict, list)):
                     new_globals[key] = old_value.copy()
                 elif is_dataclass(old_value):
-                    new_globals[key] = dataclass_replace(cast(Any, old_value))
+                    new_globals[key] = dataclass_replace(old_value)  # type: ignore
                 else:
                     new_globals[key] = copy(old_value)
             elif key.startswith('__series_') and not key.endswith('_vars__'):

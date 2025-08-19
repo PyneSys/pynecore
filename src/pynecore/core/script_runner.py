@@ -12,9 +12,9 @@ from pynecore.core.strategy_stats import calculate_strategy_statistics, write_st
 from pynecore.types import script_type
 
 if TYPE_CHECKING:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
-    from pynecore.lib.strategy import Trade
+    from pynecore.lib.strategy import Trade  # noqa
 
 __all__ = [
     'import_script',
@@ -295,9 +295,6 @@ class ScriptRunner:
 
                 # Update last price
                 self.last_price = lib.close  # type: ignore
-
-                # Reset function increments
-                function_isolation.reset_step()
 
                 # Process limit orders
                 if is_strat and position:
