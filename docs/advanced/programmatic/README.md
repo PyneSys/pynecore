@@ -1,26 +1,25 @@
 <!--
 ---
 weight: 10000
-title: "Programmatic Usage"
-description: "Using PyneCore programmatically in Python applications"
+title: "Programmatic API"
+description: "Using PyneCore programmatically with Python instead of CLI commands"
 icon: "code"
-date: "2025-08-11"
-lastmod: "2025-08-11"
+date: "2025-08-19"
+lastmod: "2025-08-19"
 draft: false
 toc: true
 categories: ["Advanced", "API"]
-tags: ["programmatic", "api", "python", "integration", "scripting"]
+tags: ["programmatic", "api", "python", "automation", "integration"]
 ---
 -->
 
-# Programmatic Usage
+# Programmatic API
 
-Using PyneCore programmatically in Python applications
+Using PyneCore programmatically with Python instead of CLI commands
 
 ## In this section
 
-- [Quick Start](./quick-start.md) - Fastest way to use PyneCore programmatically
-- [Basic Examples](./basic-examples.md) - Simple usage patterns and common tasks
-- [CSV Reader/Writer](../csv-reader-writer.md) - Work with CSV data sources and outputs
-- [OHLCV Reader/Writer](../ohlcv-reader-writer.md) - Binary OHLCV format, reading, writing, performance
-- [CLI Documentation](../../cli/README.md) - Command-line usage
+- [Quick Start](./quick-start.md) - Get started with PyneCore's programmatic Python API
+- [Basic Examples](./basic-examples.md) - Simple examples showing core functionality
+- [API Reference](./api-reference.md) - Complete technical reference for all classes and methods
+- [Practical Examples](./practical-examples.md) - Real-world automation and integration examples
