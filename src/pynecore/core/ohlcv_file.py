@@ -1135,13 +1135,12 @@ class OHLCVWriter:
             row = [field.strip() for field in row]
 
             # Handle timestamp
+            if date_idx is not None and time_idx is not None:
+                # Combine date and time
+                ts_str = f"{row[date_idx]} {row[time_idx]}"
+            else:
+                ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
             try:
-                if date_idx is not None and time_idx is not None:
-                    # Combine date and time
-                    ts_str = f"{row[date_idx]} {row[time_idx]}"
-                else:
-                    ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
-
                 # Convert timestamp
                 if ts_str.isdigit():
                     timestamp = int(ts_str)
@@ -1195,7 +1194,7 @@ class OHLCVWriter:
     def _parse_txt_line(line: str, delimiter: str) -> list[str]:
         """
         Parse a single TXT line with proper handling of quoted fields and escape characters.
-        
+
         :param line: Line to parse
         :param delimiter: Delimiter character
         :return: List of parsed fields
