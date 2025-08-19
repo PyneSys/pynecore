@@ -1593,7 +1593,8 @@ class OHLCVReader:
                             f"{_format_float(candle.volume)}\n")
                 else:
                     f.write(f"{candle.timestamp},{_format_float(candle.open)},{_format_float(candle.high)},"
-                            f"{_format_float(candle.low)},{_format_float(candle.close)},{_format_float(candle.volume)}\n")
+                            f"{_format_float(candle.low)},{_format_float(candle.close)},"
+                            f"{_format_float(candle.volume)}\n")
 
     def save_to_json(self, path: str, as_datetime: bool = False) -> None:
         """
