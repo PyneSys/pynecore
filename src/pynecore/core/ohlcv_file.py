@@ -36,9 +36,61 @@ STRUCT_FORMAT = 'Ifffff'  # I: uint32, f: float32
 __all__ = ['OHLCVWriter', 'OHLCVReader']
 
 
-def format_float(value: float) -> str:
+def _format_float(value: float) -> str:
     """Format float with max 8 decimal places, removing trailing zeros"""
     return f"{value:.8g}"
+
+
+def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=None) -> int:
+    """
+    Parse timestamp string to Unix timestamp.
+
+    :param ts_str: Timestamp string to parse
+    :param timestamp_format: Optional specific datetime format for parsing
+    :param timezone: Optional timezone to apply to the parsed datetime
+    :return: Unix timestamp as integer
+    :raises ValueError: If timestamp cannot be parsed
+    """
+    # Handle numeric timestamps
+    if ts_str.isdigit():
+        timestamp = int(ts_str)
+        # Handle millisecond timestamps (common in JSON APIs)
+        if timestamp > 253402300799:  # 9999-12-31 23:59:59
+            timestamp //= 1000
+        return timestamp
+
+    # Parse datetime string
+    dt = None
+    if timestamp_format:
+        dt = datetime.strptime(ts_str, timestamp_format)
+    else:
+        # Try common formats
+        for fmt in [
+            '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
+            '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
+            '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
+            '%Y-%m-%d %H:%M:%S',
+            '%Y/%m/%d %H:%M:%S',
+            '%d.%m.%Y %H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M:%SZ',  # ISO with Z
+            '%Y-%m-%d %H:%M',
+            '%Y%m%d %H:%M:%S'
+        ]:
+            try:
+                dt = datetime.strptime(ts_str, fmt)
+                break
+            except ValueError:
+                continue
+
+        if dt is None:
+            raise ValueError(f"Could not parse timestamp: {ts_str}")
+
+    # Apply timezone if specified and convert to timestamp
+    if timezone and dt is not None:
+        dt = dt.replace(tzinfo=timezone)
+
+    return int(dt.timestamp())
 
 
 class OHLCVWriter:
@@ -396,7 +448,7 @@ class OHLCVWriter:
         decimal_tick = self._calculate_decimal_tick()
 
         # Combine methods with weighted confidence (no GCD)
-        tick_size, confidence = self._combine_tick_estimates_no_gcd(freq_tick, decimal_tick)
+        tick_size, confidence = self._combine_tick_estimates(freq_tick, decimal_tick)
 
         # Calculate price scale and min move
         if tick_size > 0:
@@ -583,8 +635,8 @@ class OHLCVWriter:
         return tick_size, 0.5
 
     @staticmethod
-    def _combine_tick_estimates_no_gcd(freq: tuple[float, float],
-                                       decimal: tuple[float, float]) -> tuple[float, float]:
+    def _combine_tick_estimates(freq: tuple[float, float],
+                                decimal: tuple[float, float]) -> tuple[float, float]:
         """
         Combine tick size estimates from frequency and decimal methods only.
         Returns (tick_size, confidence)
@@ -963,36 +1015,7 @@ class OHLCVWriter:
 
                 # Convert timestamp
                 try:
-                    if ts_str.isdigit():
-                        timestamp = int(ts_str)
-                    else:
-                        if timestamp_format:
-                            dt = datetime.strptime(ts_str, timestamp_format)
-                        else:
-                            # Try common formats
-                            for fmt in [
-                                '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
-                                '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
-                                '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
-                                '%Y-%m-%d %H:%M:%S',
-                                '%Y/%m/%d %H:%M:%S',
-                                '%d.%m.%Y %H:%M:%S',
-                                '%Y-%m-%dT%H:%M:%S',
-                                '%Y-%m-%d %H:%M',
-                                '%Y%m%d %H:%M:%S'
-                            ]:
-                                try:
-                                    dt = datetime.strptime(ts_str, fmt)
-                                    break
-                                except ValueError:
-                                    continue
-                            else:
-                                raise ValueError(f"Could not parse timestamp: {ts_str}")
-
-                        # Set timezone if specified and convert to timestamp
-                        if timezone:
-                            dt = dt.replace(tzinfo=timezone)
-                        timestamp = int(dt.timestamp())
+                    timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
                 except Exception as e:
                     raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
 
@@ -1142,38 +1165,7 @@ class OHLCVWriter:
                 ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
             try:
                 # Convert timestamp
-                if ts_str.isdigit():
-                    timestamp = int(ts_str)
-                else:
-                    dt = None
-                    if timestamp_format:
-                        dt = datetime.strptime(ts_str, timestamp_format)
-                    else:
-                        # Try common formats
-                        for fmt in [
-                            '%Y-%m-%d %H:%M:%S%z',  # 2025-01-08 19:00:00+0000
-                            '%Y-%m-%d %H:%M:%S%Z',  # 2025-01-08 19:00:00UTC
-                            '%Y-%m-%dT%H:%M:%S%z',  # 2025-01-08T19:00:00+0000
-                            '%Y-%m-%d %H:%M:%S',
-                            '%Y/%m/%d %H:%M:%S',
-                            '%d.%m.%Y %H:%M:%S',
-                            '%Y-%m-%dT%H:%M:%S',
-                            '%Y-%m-%d %H:%M',
-                            '%Y%m%d %H:%M:%S'
-                        ]:
-                            try:
-                                dt = datetime.strptime(ts_str, fmt)
-                                break
-                            except ValueError:
-                                continue
-
-                        if dt is None:
-                            raise ValueError(f"Could not parse timestamp: {ts_str}")
-
-                    # Set timezone if specified and convert to timestamp
-                    if timezone and dt is not None:
-                        dt = dt.replace(tzinfo=timezone)
-                    timestamp = int(dt.timestamp())
+                timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
             except Exception as e:
                 raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
 
@@ -1356,42 +1348,7 @@ class OHLCVWriter:
                     ts_str = str(record[field_map['timestamp']])
 
                 # Convert timestamp
-                if ts_str.isdigit():
-                    # Handle millisecond timestamps
-                    ts = int(ts_str)
-                    if ts > 253402300799:  # 9999-12-31 23:59:59
-                        ts //= 1000
-                    timestamp = ts
-                else:
-                    dt = None
-                    # Parse datetime string
-                    if timestamp_format:
-                        dt = datetime.strptime(ts_str, timestamp_format)
-                    else:
-                        # Try common formats
-                        for fmt in [
-                            '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
-                            '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
-                            '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
-                            '%Y-%m-%d %H:%M:%S',
-                            '%Y/%m/%d %H:%M:%S',
-                            '%Y-%m-%dT%H:%M:%S',
-                            '%Y-%m-%dT%H:%M:%SZ',
-                            '%Y-%m-%d %H:%M',
-                            '%Y%m%d %H:%M:%S'
-                        ]:
-                            try:
-                                dt = datetime.strptime(ts_str, fmt)
-                                break
-                            except ValueError:
-                                continue
-                        else:
-                            raise ValueError(f"Could not parse timestamp: {ts_str}")
-
-                    # Set timezone and convert to timestamp
-                    if timezone:
-                        dt = dt.replace(tzinfo=timezone)
-                    timestamp = int(dt.timestamp())
+                timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
 
                 # Get OHLCV values
                 try:
@@ -1631,12 +1588,12 @@ class OHLCVReader:
                 if candle.volume == -1:
                     continue
                 if as_datetime:
-                    f.write(f"{datetime.fromtimestamp(candle.timestamp, UTC)},{format_float(candle.open)},"
-                            f"{format_float(candle.high)},{format_float(candle.low)},{format_float(candle.close)},"
-                            f"{format_float(candle.volume)}\n")
+                    f.write(f"{datetime.fromtimestamp(candle.timestamp, UTC)},{_format_float(candle.open)},"
+                            f"{_format_float(candle.high)},{_format_float(candle.low)},{_format_float(candle.close)},"
+                            f"{_format_float(candle.volume)}\n")
                 else:
-                    f.write(f"{candle.timestamp},{format_float(candle.open)},{format_float(candle.high)},"
-                            f"{format_float(candle.low)},{format_float(candle.close)},{format_float(candle.volume)}\n")
+                    f.write(f"{candle.timestamp},{_format_float(candle.open)},{_format_float(candle.high)},"
+                            f"{_format_float(candle.low)},{_format_float(candle.close)},{_format_float(candle.volume)}\n")
 
     def save_to_json(self, path: str, as_datetime: bool = False) -> None:
         """
@@ -1666,20 +1623,20 @@ class OHLCVReader:
             if as_datetime:
                 item = {
                     "time": datetime.fromtimestamp(candle.timestamp, UTC).isoformat(),
-                    "open": format_float(candle.open),
-                    "high": format_float(candle.high),
-                    "low": format_float(candle.low),
-                    "close": format_float(candle.close),
-                    "volume": format_float(candle.volume)
+                    "open": _format_float(candle.open),
+                    "high": _format_float(candle.high),
+                    "low": _format_float(candle.low),
+                    "close": _format_float(candle.close),
+                    "volume": _format_float(candle.volume)
                 }
             else:
                 item = {
                     "timestamp": candle.timestamp,
-                    "open": format_float(candle.open),
-                    "high": format_float(candle.high),
-                    "low": format_float(candle.low),
-                    "close": format_float(candle.close),
-                    "volume": format_float(candle.volume)
+                    "open": _format_float(candle.open),
+                    "high": _format_float(candle.high),
+                    "low": _format_float(candle.low),
+                    "close": _format_float(candle.close),
+                    "volume": _format_float(candle.volume)
                 }
             data.append(item)
 
