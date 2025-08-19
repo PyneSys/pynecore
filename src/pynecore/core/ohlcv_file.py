@@ -646,7 +646,7 @@ class OHLCVWriter:
                     # Unpack the record
                     timestamp, open_val, high, low, close, volume = \
                         struct.unpack('Ifffff', cast(Buffer, data))
-                    
+
                     # Only collect if volume > 0 (real trading)
                     if volume > 0:
                         dt = datetime.fromtimestamp(timestamp, tz=None)
@@ -1016,8 +1016,7 @@ class OHLCVWriter:
                       time_column: str | None = None,
                       tz: str | None = None) -> None:
         """
-        Load OHLCV data from TXT file with auto-detected delimiter.
-        Supports tab, semicolon, and pipe delimited files.
+        Load OHLCV data from TXT file using only builtin modules.
 
         :param path: Path to TXT file
         :param timestamp_format: Optional datetime fmt for parsing
@@ -1025,7 +1024,6 @@ class OHLCVWriter:
         :param date_column: When timestamp is split into date+time columns, date column name
         :param time_column: When timestamp is split into date+time columns, time column name
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100') for timestamp conversion
-        :raises ValueError: If delimiter cannot be detected or file format is invalid
         """
         # Parse timezone
         timezone = None
@@ -1048,137 +1046,229 @@ class OHLCVWriter:
             first_line = f.readline().strip()
             if not first_line:
                 raise ValueError("File is empty or first line is blank")
-            
+
             # Check for common delimiters in order of preference
             delimiters = ['\t', ';', '|']
             delimiter_counts = {}
-            
+
             for delim in delimiters:
                 count = first_line.count(delim)
                 if count > 0:
                     delimiter_counts[delim] = count
-            
+
             if not delimiter_counts:
                 raise ValueError("No supported delimiter found (tab, semicolon, or pipe)")
-            
+
             # Use delimiter with highest count
             delimiter = max(delimiter_counts, key=lambda x: delimiter_counts[x])
 
-        # Read TXT file with detected/specified delimiter
+        # Read TXT file with manual parsing for better control
         with open(path, 'r') as f:
-            reader = csv.reader(f, delimiter=delimiter)
+            lines = f.readlines()
+
+        if not lines:
+            raise ValueError("File is empty")
+
+        # Parse header line
+        header_line = lines[0].strip()
+        if not header_line:
+            raise ValueError("Header row is empty")
+
+        headers = self._parse_txt_line(header_line, delimiter)
+        headers = [h.lower().strip() for h in headers]  # Case insensitive
+
+        if not headers:
+            raise ValueError("No headers found")
+
+        # Find timestamp column
+        timestamp_idx = None
+        date_idx = None
+        time_idx = None
+
+        if date_column and time_column:
             try:
-                headers = [h.lower().strip() for h in next(reader)]  # Case insensitive
-            except StopIteration:
-                raise ValueError("File has no headers")
-
-            if not headers:
-                raise ValueError("Header row is empty")
-
-            # Find timestamp column
-            timestamp_idx = None
-            date_idx = None
-            time_idx = None
-
-            if date_column and time_column:
+                date_idx = headers.index(date_column.lower())
+                time_idx = headers.index(time_column.lower())
+            except ValueError:
+                raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
+        else:
+            timestamp_col = timestamp_column.lower() if timestamp_column else None
+            if timestamp_col:
                 try:
-                    date_idx = headers.index(date_column.lower())
-                    time_idx = headers.index(time_column.lower())
+                    timestamp_idx = headers.index(timestamp_col)
                 except ValueError:
-                    raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
+                    raise ValueError(f"Timestamp column not found: {timestamp_col}")
             else:
-                timestamp_col = timestamp_column.lower() if timestamp_column else None
-                if timestamp_col:
+                # Try common names
+                for col in ['timestamp', 'time', 'date']:
                     try:
-                        timestamp_idx = headers.index(timestamp_col)
+                        timestamp_idx = headers.index(col)
+                        break
                     except ValueError:
-                        raise ValueError(f"Timestamp column not found: {timestamp_col}")
-                else:
-                    # Try common names
-                    for col in ['timestamp', 'time', 'date']:
-                        try:
-                            timestamp_idx = headers.index(col)
-                            break
-                        except ValueError:
-                            continue
+                        continue
 
-                    if timestamp_idx is None:
-                        raise ValueError("Timestamp column not found!")
+                if timestamp_idx is None:
+                    raise ValueError("Timestamp column not found!")
 
-            # Find OHLCV columns
+        # Find OHLCV columns
+        try:
+            o_idx = headers.index('open')
+            h_idx = headers.index('high')
+            l_idx = headers.index('low')
+            c_idx = headers.index('close')
+            v_idx = headers.index('volume')
+        except ValueError as e:
+            raise ValueError(f"Missing required column: {str(e)}")
+
+        # Process data rows
+        for line in lines[1:]:  # Skip header
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+
+            row = self._parse_txt_line(line, delimiter)
+
+            if len(row) != len(headers):
+                raise ValueError(f"Row has {len(row)} columns, expected {len(headers)}")
+
+            # Strip whitespace from all fields
+            row = [field.strip() for field in row]
+
+            # Handle timestamp
             try:
-                o_idx = headers.index('open')
-                h_idx = headers.index('high')
-                l_idx = headers.index('low')
-                c_idx = headers.index('close')
-                v_idx = headers.index('volume')
-            except ValueError as e:
-                raise ValueError(f"Missing required column: {str(e)}")
+                if date_idx is not None and time_idx is not None:
+                    # Combine date and time
+                    ts_str = f"{row[date_idx]} {row[time_idx]}"
+                else:
+                    ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
 
-            # Process data rows
-            row_count = 0
-            for row in reader:
-                row_count += 1
-                if not row or len(row) != len(headers):
-                    raise ValueError(f"Row {row_count} has incorrect number of columns")
-                
-                # Strip whitespace from all fields
-                row = [field.strip() for field in row]
-                
-                # Handle timestamp
-                try:
-                    if date_idx is not None and time_idx is not None:
-                        # Combine date and time
-                        ts_str = f"{row[date_idx]} {row[time_idx]}"
+                # Convert timestamp
+                if ts_str.isdigit():
+                    timestamp = int(ts_str)
+                else:
+                    dt = None
+                    if timestamp_format:
+                        dt = datetime.strptime(ts_str, timestamp_format)
                     else:
-                        ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
+                        # Try common formats
+                        for fmt in [
+                            '%Y-%m-%d %H:%M:%S%z',  # 2025-01-08 19:00:00+0000
+                            '%Y-%m-%d %H:%M:%S%Z',  # 2025-01-08 19:00:00UTC
+                            '%Y-%m-%dT%H:%M:%S%z',  # 2025-01-08T19:00:00+0000
+                            '%Y-%m-%d %H:%M:%S',
+                            '%Y/%m/%d %H:%M:%S',
+                            '%d.%m.%Y %H:%M:%S',
+                            '%Y-%m-%dT%H:%M:%S',
+                            '%Y-%m-%d %H:%M',
+                            '%Y%m%d %H:%M:%S'
+                        ]:
+                            try:
+                                dt = datetime.strptime(ts_str, fmt)
+                                break
+                            except ValueError:
+                                continue
 
-                    # Convert timestamp
-                    if ts_str.isdigit():
-                        timestamp = int(ts_str)
+                        if dt is None:
+                            raise ValueError(f"Could not parse timestamp: {ts_str}")
+
+                    # Set timezone if specified and convert to timestamp
+                    if timezone and dt is not None:
+                        dt = dt.replace(tzinfo=timezone)
+                    timestamp = int(dt.timestamp())
+            except Exception as e:
+                raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
+
+            # Write OHLCV data
+            try:
+                self.write(OHLCV(
+                    timestamp,
+                    float(row[o_idx]),
+                    float(row[h_idx]),
+                    float(row[l_idx]),
+                    float(row[c_idx]),
+                    float(row[v_idx])
+                ))
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"Invalid data in row: {e}")
+
+    @staticmethod
+    def _parse_txt_line(line: str, delimiter: str) -> list[str]:
+        """
+        Parse a single TXT line with proper handling of quoted fields and escape characters.
+        
+        :param line: Line to parse
+        :param delimiter: Delimiter character
+        :return: List of parsed fields
+        :raises ValueError: If line format is invalid
+        """
+        if not line:
+            return []
+
+        fields = []
+        current_field = ""
+        in_quotes = False
+        quote_char = None
+        i = 0
+
+        while i < len(line):
+            char = line[i]
+
+            # Handle escape characters
+            if char == '\\' and i + 1 < len(line):
+                next_char = line[i + 1]
+                if next_char in ['"', "'", '\\', 'n', 't', 'r']:
+                    if next_char == 'n':
+                        current_field += '\n'
+                    elif next_char == 't':
+                        current_field += '\t'
+                    elif next_char == 'r':
+                        current_field += '\r'
                     else:
-                        if timestamp_format:
-                            dt = datetime.strptime(ts_str, timestamp_format)
-                        else:
-                            # Try common formats
-                            for fmt in [
-                                '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
-                                '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
-                                '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
-                                '%Y-%m-%d %H:%M:%S',
-                                '%Y/%m/%d %H:%M:%S',
-                                '%d.%m.%Y %H:%M:%S',
-                                '%Y-%m-%dT%H:%M:%S',
-                                '%Y-%m-%d %H:%M',
-                                '%Y%m%d %H:%M:%S'
-                            ]:
-                                try:
-                                    dt = datetime.strptime(ts_str, fmt)
-                                    break
-                                except ValueError:
-                                    continue
-                            else:
-                                raise ValueError(f"Could not parse timestamp: {ts_str}")
+                        current_field += next_char
+                    i += 2
+                    continue
+                else:
+                    current_field += char
+                    i += 1
+                    continue
 
-                        # Set timezone if specified and convert to timestamp
-                        if timezone:
-                            dt = dt.replace(tzinfo=timezone)
-                        timestamp = int(dt.timestamp())
-                except Exception as e:
-                    raise ValueError(f"Failed to parse timestamp '{ts_str}' in row {row_count}: {e}")
+            # Handle quotes
+            if char in ['"', "'"] and not in_quotes:
+                in_quotes = True
+                quote_char = char
+                i += 1
+                continue
+            elif char == quote_char and in_quotes:
+                # Check for escaped quote (double quote)
+                if i + 1 < len(line) and line[i + 1] == quote_char:
+                    current_field += char
+                    i += 2
+                    continue
+                else:
+                    in_quotes = False
+                    quote_char = None
+                    i += 1
+                    continue
 
-                # Write OHLCV data
-                try:
-                    self.write(OHLCV(
-                        timestamp,
-                        float(row[o_idx]),
-                        float(row[h_idx]),
-                        float(row[l_idx]),
-                        float(row[c_idx]),
-                        float(row[v_idx])
-                    ))
-                except (ValueError, IndexError) as e:
-                    raise ValueError(f"Invalid OHLCV data in row {row_count}: {e}")
+            # Handle delimiter
+            if char == delimiter and not in_quotes:
+                fields.append(current_field)
+                current_field = ""
+                i += 1
+                continue
+
+            # Regular character
+            current_field += char
+            i += 1
+
+        # Add the last field
+        fields.append(current_field)
+
+        # Validate that quotes are properly closed
+        if in_quotes:
+            raise ValueError(f"Unclosed quote in line: {line[:50]}...")
+
+        return fields
 
     def load_from_json(self, path: str | Path,
                        timestamp_format: str | None = None,
