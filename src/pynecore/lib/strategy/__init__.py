@@ -24,7 +24,7 @@ __all__ = [
     "long", "short", 'direction',
 
     'Trade', 'Order', 'Position',
-    "cancel", "cancel_all", "close", "close_all", "entry", "exit",
+    "cancel", "cancel_all", "close", "close_all", "entry", "exit", "order",
 
     "closedtrades", "opentrades",
 ]
@@ -225,7 +225,7 @@ class Position:
     exit_orders: dict[str, Order]
 
     open_trades: list[Trade]
-    closed_trades: deque[Trade]
+    closed_trades: list[Trade]
     new_closed_trades: list[Trade]
     closed_trades_count: int
 
@@ -266,7 +266,7 @@ class Position:
         self.exit_orders = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
 
         self.open_trades = []
-        self.closed_trades = deque(maxlen=9000)  # 9000 is the limit of TV
+        self.closed_trades = []
         self.closed_trades_count = 0
         self.new_closed_trades = []
 
@@ -1063,7 +1063,6 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         return
 
     script = lib._script
-    assert script is not None and script.position is not None
     position = script.position
 
     # Risk management: Check if trading is halted
@@ -1217,7 +1216,6 @@ def exit(id: str, from_entry: str = "",
         return
 
     script = lib._script
-    assert script is not None and script.position is not None
     position = script.position
 
     if qty < 0.0:
@@ -1295,6 +1293,155 @@ def exit(id: str, from_entry: str = "",
                     size = trade.size
                     from_entry = trade.entry_id
                     _exit()
+
+
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
+def order(id: str, direction: direction.Direction, qty: int | float | NA[float] = NA(float),
+          limit: int | float | None = None, stop: int | float | None = None,
+          oca_name: str | None = None, oca_type: _oca.Oca | None = None,
+          comment: str | None = None, alert_message: str | None = None,
+          disable_alert: bool = False):
+    """
+    Creates a new order to open, add to, or exit from a position. If an unfilled order with
+    the same id exists, a call to this command modifies that order.
+
+    Unlike strategy.entry, orders from this command are not affected by the pyramiding parameter
+    of the strategy declaration. Strategies can open any number of trades in the same direction
+    with calls to this function.
+
+    This command does not automatically reverse open positions. For example, if there is an open
+    long position of five shares, an order from this command with a qty of 5 and a direction
+    of strategy.short triggers the sale of five shares, which closes the position.
+
+    :param id: The identifier of the order
+    :param direction: The direction of the trade (strategy.long or strategy.short)
+    :param qty: The number of contracts/shares/lots/units to trade when the order fills
+    :param limit: The limit price of the order (creates limit or stop-limit order)
+    :param stop: The stop price of the order (creates stop or stop-limit order)
+    :param oca_name: The name of the One-Cancels-All (OCA) group
+    :param oca_type: Specifies how an unfilled order behaves when another order in the same OCA group executes
+    :param comment: Additional notes on the filled order
+    :param alert_message: Custom text for the alert that fires when an order fills
+    :param disable_alert: If true, the strategy does not trigger an alert when the order fills
+    """
+    if lib._lib_semaphore:
+        return
+
+    script = lib._script
+    position = script.position
+
+    # Risk management: Check if trading is halted
+    if position.risk_halt_trading:
+        return
+
+    # Get default qty by script parameters if no qty is specified
+    if isinstance(qty, NA):
+        default_qty_type = script.default_qty_type
+        if default_qty_type == fixed:
+            qty = script.default_qty_value
+
+        elif default_qty_type == percent_of_equity:
+            default_qty_value = script.default_qty_value
+            equity_percent = default_qty_value * 0.01
+            target_investment = script.position.equity * equity_percent
+
+            # Calculate the commission factor based on commission type
+            if script.commission_type == _commission.percent:
+                commission_multiplier = 1.0 + script.commission_value * 0.01
+                qty = target_investment / (lib.close * syminfo.pointvalue * commission_multiplier)
+
+            elif script.commission_type == _commission.cash_per_contract:
+                price_plus_commission = lib.close * syminfo.pointvalue + script.commission_value
+                qty = target_investment / price_plus_commission
+
+            elif script.commission_type == _commission.cash_per_order:
+                qty = (target_investment - script.commission_value) / (lib.close * syminfo.pointvalue)
+                qty = max(0.0, qty)  # Ensure non-negative
+
+            else:
+                # No commission
+                qty = target_investment / (lib.close * syminfo.pointvalue)
+
+        elif default_qty_type == cash:
+            default_qty_value = script.default_qty_value
+            qty = default_qty_value / (lib.close * syminfo.pointvalue)
+
+        else:
+            raise ValueError("Unknown default qty type: ", default_qty_type)
+
+    # qty must be greater than 0
+    if qty <= 0.0:
+        return
+
+    # We need a signed size instead of qty, the sign is the direction
+    direction_sign: float = (-1.0 if direction == short else 1.0)
+    size = qty * direction_sign
+    sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
+
+    # NOTE: Unlike strategy.entry, strategy.order is NOT affected by pyramiding limit
+    # This is a key difference - strategy.order can open unlimited trades in the same direction
+
+    # Determine order type based on current position
+    # If opening new position or adding to existing position in the same direction -> entry order
+    # If reducing or closing position -> exit order
+    order_type = _order_type_entry
+    exit_id = None
+
+    # Check if this is an exit order (opposite direction to current position)
+    if position.size != 0.0 and sign != position.sign:
+        # This order will reduce or close the position
+        order_type = _order_type_close
+        exit_id = id
+        # Limit the size to the current position size
+        if abs(size) > abs(position.size):
+            size = -position.size
+
+    # Risk management checks only apply to entry orders
+    if order_type == _order_type_entry:
+        # Risk management: Check allowed direction for new positions
+        if position.risk_allowed_direction is not None:
+            if (sign > 0 and position.risk_allowed_direction != long) or \
+                    (sign < 0 and position.risk_allowed_direction != short):
+                # Block new positions in restricted direction
+                return
+
+        # Risk management: Check max position size
+        if position.risk_max_position_size is not None:
+            new_position_size = abs(position.size + size)
+            if new_position_size > position.risk_max_position_size:
+                # Adjust size to not exceed max position size
+                max_allowed_size = position.risk_max_position_size - abs(position.size)
+                if max_allowed_size <= 0:
+                    return
+                size = max_allowed_size * sign
+
+        # Risk management: Check max intraday filled orders
+        if position.risk_max_intraday_filled_orders is not None:
+            if position.risk_intraday_filled_orders >= position.risk_max_intraday_filled_orders:
+                return
+
+    size = _size_round(size)
+    if size == 0.0:
+        return
+
+    if limit is not None:
+        limit = _price_round(limit, direction_sign)
+    if stop is not None:
+        stop = _price_round(stop, -direction_sign)
+
+    # Create the order
+    if order_type == _order_type_entry:
+        # Entry order - stores in entry_orders dict
+        order = Order(id, size, order_type=order_type, limit=limit, stop=stop,
+                      oca_name=oca_name, oca_type=oca_type, comment=comment,
+                      alert_message=alert_message)
+        position.entry_orders[id] = order
+    else:
+        # Exit order - stores in exit_orders dict
+        order = Order(None, size, order_type=order_type, exit_id=exit_id,
+                      limit=limit, stop=stop, oca_name=oca_name, oca_type=oca_type,
+                      comment=comment, alert_message=alert_message)
+        position.exit_orders[exit_id] = order
 
 
 #
