@@ -178,6 +178,191 @@ The OHLCV reader/writer is designed for maximum performance:
 
 For typical backtesting scenarios, the system can process millions of candles per second on modern hardware.
 
+## Extra Fields Support
+
+The OHLCV system supports storing additional data fields alongside the standard OHLCV values, providing a powerful way to include custom indicators, signals, and metadata in your market data files.
+
+### What Are Extra Fields?
+
+Extra fields allow you to store any additional data columns from CSV imports or programmatically created fields alongside your OHLCV data. These are custom fields that you define, not built-in PyneCore features. Examples include:
+
+- Custom technical indicators you calculated (RSI, MACD, Bollinger Bands)
+- Your own signals and trading conditions  
+- Volume-based analysis you computed (VWAP, Volume averages)
+- Boolean flags for your strategies (buy/sell signals, trend conditions)
+- String metadata you want to track (market state, signal types)
+- Any other numeric or text data relevant to your analysis
+
+### Storage Architecture
+
+Extra fields are stored separately from the main OHLCV binary file:
+
+- **Main file**: `data.ohlcv` contains the standard 24-byte OHLCV records
+- **Companion file**: `data.extra_fields.json` stores the additional fields as JSON
+
+This architecture maintains the high-performance binary format for core OHLCV data while providing flexible storage for additional fields.
+
+### Automatic CSV Import with Extra Fields
+
+When importing CSV files, any columns beyond the standard OHLCV fields are automatically detected and stored as extra fields:
+
+```python
+# Example CSV with your custom fields: 
+# timestamp,open,high,low,close,volume,my_rsi_14,vol_average,buy_signal
+from pynecore.core.ohlcv_file import OHLCVWriter
+from pathlib import Path
+
+with OHLCVWriter(Path("data_with_extras.ohlcv")) as writer:
+    writer.load_from_csv(Path("my_market_data.csv"))
+    # Your custom fields (my_rsi_14, vol_average, buy_signal) automatically preserved
+```
+
+The system handles various data types intelligently:
+- **Numeric values**: Stored as floats for calculations
+- **Boolean values**: `true`/`false` strings converted to Python booleans
+- **Text values**: Preserved as strings for metadata
+
+### Programmatic Extra Fields Creation
+
+You can also create extra fields programmatically when writing OHLCV data:
+
+```python
+from pynecore.types.ohlcv import OHLCV
+
+with OHLCVWriter(Path("custom_data.ohlcv")) as writer:
+    # Write candle with extra fields
+    writer.write(OHLCV(
+        timestamp=1609459200,
+        open=29000.0,
+        high=29500.0,
+        low=28800.0,
+        close=29200.0,
+        volume=1000.5,
+        extra_fields={
+            "my_rsi_14": 65.4,
+            "vol_average": 950.3,
+            "buy_signal": True,
+            "signal_type": "buy_entry",
+            "trend_direction": "upward"
+        }
+    ))
+```
+
+### Using Extra Fields in PyneCore Scripts
+
+Extra fields are accessible in your PyneCore trading scripts through the `extra_fields` dictionary:
+
+```python
+"""
+@pyne
+"""
+from pynecore.lib import extra_fields, close, plot, color, script
+
+@script.indicator(title="Custom Extra Fields Example")
+def main():
+    # Check what custom fields are available in your data
+    available_fields = list(extra_fields.keys())
+    print(f"My custom fields: {available_fields}")
+    
+    # Access your custom RSI indicator (that you imported from CSV)
+    if 'my_rsi_14' in extra_fields:
+        current_rsi = extra_fields['my_rsi_14'][0]  # Current bar
+        plot(current_rsi, title="My RSI 14", color=color.purple)
+    
+    # Access your custom volume analysis
+    if 'vol_average' in extra_fields:
+        current_vol_avg = extra_fields['vol_average'][0]  # Current bar
+        previous_vol_avg = extra_fields['vol_average'][1] if len(extra_fields['vol_average']) > 1 else None
+        
+        if previous_vol_avg:
+            vol_change = current_vol_avg - previous_vol_avg
+            plot(vol_change, title="Volume Average Change", color=color.orange)
+    
+    # Use your custom boolean signals
+    if 'buy_signal' in extra_fields:
+        buy_signal = extra_fields['buy_signal'][0]
+        signal_value = 1.0 if buy_signal else 0.0
+        plot(signal_value, title="My Buy Signal", color=color.green)
+    
+    # Combine multiple custom fields
+    if 'my_rsi_14' in extra_fields and 'vol_average' in extra_fields:
+        rsi = extra_fields['my_rsi_14'][0]
+        vol_avg = extra_fields['vol_average'][0]
+        
+        # Create your own composite indicator
+        composite = (rsi / 100.0) * (vol_avg / 1000.0)
+        plot(composite, title="My RSI-Volume Composite", color=color.blue)
+    
+    # Reference: plot standard price data
+    plot(close, title="Close Price", color=color.black)
+```
+
+### Extra Fields Data Types
+
+The system supports various data types with automatic type detection and preservation:
+
+```python
+# Example showing different data types you can use
+my_custom_fields_example = {
+    # Numeric types
+    "my_rsi_14": 65.42,           # Float
+    "vol_average": 1250,          # Integer (stored as float)
+    "signal_strength": 0.85,      # Decimal
+    
+    # Boolean types  
+    "buy_signal": True,           # Boolean
+    "above_ma": False,            # Boolean
+    
+    # String types
+    "trend_state": "uptrend",     # Text
+    "market_phase": "active",     # Status
+    "entry_type": "breakout",     # Category
+    
+    # Edge cases
+    "zero_threshold": 0.0,        # Zero
+    "sentiment_score": -123.45,   # Negative
+    "large_volume": 1e10,         # Scientific notation
+}
+```
+
+### Performance Considerations
+
+Extra fields are designed for efficiency:
+
+1. **Lazy Loading**: Extra fields JSON is only loaded when the OHLCV file is opened
+2. **Memory Efficient**: Extra fields don't impact the core OHLCV binary file size
+3. **Fast Access**: JSON parsing is done once per file open, then cached in memory
+4. **Graceful Degradation**: OHLCV files work normally even if extra fields JSON is missing or corrupted
+
+### Data Integrity and Error Handling
+
+The system handles various error conditions gracefully:
+
+- **Missing JSON File**: OHLCV data remains accessible, extra fields return empty
+- **Corrupted JSON**: Parsing errors are caught, core functionality preserved  
+- **Type Mismatches**: Automatic type coercion where possible
+- **Field Name Conflicts**: Non-standard field names are preserved (including Unicode)
+
+### Best Practices
+
+When working with extra fields:
+
+1. **Consistent Field Names**: Use descriptive, consistent naming (e.g., `my_rsi_14`, `vol_sma_50`)
+2. **Type Consistency**: Keep field types consistent across records when possible
+3. **Field Documentation**: Document custom fields for team collaboration
+4. **Performance Testing**: Test with realistic data sizes for your use case
+
+```python
+# Good field naming examples for your custom fields
+my_extra_fields = {
+    "my_rsi_14": 65.4,        # Clear custom indicator and period
+    "bb_upper_20": 31250.5,   # Your Bollinger Band calculation
+    "vol_sma_20": 1250.3,     # Your volume average with period
+    "breakout_signal": True,  # Clear boolean condition you defined
+    "trend_strength": 0.85,   # Your descriptive numeric analysis
+}
+```
+
 ## Import/Export Capabilities
 
 The system provides flexible import and export options for various formats:

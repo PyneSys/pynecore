@@ -46,6 +46,41 @@ from pynecore.lib import volume, bar_index
 
 These variables are automatically managed by the system, always filled with the current bar data during execution.
 
+## Extra Fields
+
+PyneCore supports access to additional data fields beyond the standard OHLCV values through the `extra_fields` dictionary. This feature allows you to access custom indicators, signals, and metadata that you import from CSV files or create programmatically.
+
+**Important**: Extra fields are not built into PyneCore - they are custom data columns that you provide through CSV imports or programmatic creation.
+
+```python
+"""
+@pyne
+"""
+from pynecore.lib import extra_fields, close, plot, color
+
+# Check what custom fields are available in your data
+available_fields = list(extra_fields.keys())
+print(f"My custom fields: {available_fields}")
+
+# Example: Access a custom RSI indicator you imported from CSV
+if 'my_rsi_14' in extra_fields:
+    current_rsi = extra_fields['my_rsi_14'][0]  # Current bar
+    plot(current_rsi, title="My Custom RSI", color=color.purple)
+
+# Example: Access custom volume analysis you calculated
+if 'vol_average' in extra_fields:
+    current_vol_avg = extra_fields['vol_average'][0]     # Current bar
+    previous_vol_avg = extra_fields['vol_average'][1]    # Previous bar (if available)
+
+# Example: Use custom boolean signals you defined
+if 'buy_signal' in extra_fields:
+    buy_signal = extra_fields['buy_signal'][0]
+    signal_value = 1.0 if buy_signal else 0.0
+    plot(signal_value, title="My Buy Signal", color=color.green)
+```
+
+Extra fields come from your own data sources - either imported from CSV files with additional columns, or created programmatically when writing OHLCV data. See the [OHLCV Reader/Writer documentation](advanced/ohlcv-reader-writer.md#extra-fields-support) for detailed information on creating and using extra fields.
+
 ## Module System
 
 The complete module system of the Pine Script API is available in PyneCore. The module names are almost identical to Pine Script names, with only one exception:

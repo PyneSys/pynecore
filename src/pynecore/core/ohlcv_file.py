@@ -37,7 +37,9 @@ __all__ = ['OHLCVWriter', 'OHLCVReader']
 
 
 def _format_float(value: float) -> str:
-    """Format float with max 8 decimal places, removing trailing zeros"""
+    """
+    Format float with max 8 decimal places, removing trailing zeros
+    """
     return f"{value:.8g}"
 
 
@@ -401,18 +403,18 @@ class OHLCVWriter:
         if self._file:
             self._file.close()
             self._file = None
-        
+
         # Save extra_fields to companion JSON file if any exist
         if self._extra_fields_data:
             self._save_extra_fields()
-    
+
     def _save_extra_fields(self) -> None:
         """
         Save extra_fields data to companion JSON file
         """
         import json
         from pathlib import Path
-        
+
         extra_fields_path = Path(self.path).with_suffix('.extra_fields.json')
         with open(extra_fields_path, 'w') as f:
             json.dump(self._extra_fields_data, f, indent=2)
@@ -1033,7 +1035,7 @@ class OHLCVWriter:
                 timestamp_columns.add(time_column.lower())
             if timestamp_column:
                 timestamp_columns.add(timestamp_column.lower())
-            
+
             extra_field_indices = {}
             for i, header in enumerate(headers):
                 if header not in standard_columns and header not in timestamp_columns:
@@ -1519,19 +1521,19 @@ class OHLCVReader:
                 self._start_timestamp = struct.unpack('I', cast(Buffer, self._mmap[0:4]))[0]
                 second_timestamp = struct.unpack('I', cast(Buffer, self._mmap[RECORD_SIZE:RECORD_SIZE + 4]))[0]
                 self._interval = second_timestamp - self._start_timestamp
-        
+
         # Load extra_fields from companion JSON file if it exists
         self._load_extra_fields()
 
         return self
-    
+
     def _load_extra_fields(self) -> None:
         """
         Load extra_fields data from companion JSON file
         """
         import json
         from pathlib import Path
-        
+
         extra_fields_path = Path(self.path).with_suffix('.extra_fields.json')
         if extra_fields_path.exists():
             try:
