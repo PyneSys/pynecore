@@ -58,7 +58,7 @@ class Provider(metaclass=ABCMeta):
         Get the output path of the OHLV data
         """
         return ohlv_dir / (f"{provider_name or cls.__name__.lower().replace('provider', '')}"
-                           f"_{symbol.replace('/', '_').replace(':', '_')}"
+                           f"_{symbol.replace('/', '_').replace(':', '_').upper()}"
                            f"_{timeframe}.ohlcv")
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,

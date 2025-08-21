@@ -135,7 +135,7 @@ class SeriesImpl(Generic[T]):
         """
         # Optimize attribute lookup by using local variable
         lib = SeriesImpl._lib
-        
+
         # Set data instead of adding a new one if the bar index is the same
         if self._last_bar_index == lib.bar_index:
             return self.set(value)
@@ -227,7 +227,7 @@ class SeriesImpl(Generic[T]):
                 stop
             )
 
-        raise TypeError("Series indices must be integers or slices")
+        raise TypeError("Series indices must be integers or slices")  # noqa
 
     def __len__(self) -> int:
         """
@@ -266,7 +266,7 @@ class ReadOnlySeriesView(Generic[T]):
     def __getitem__(self, idx: int) -> T | NA[T]:
         """Get item using Pine indexing"""
         if not isinstance(idx, int):
-            raise TypeError("Only integer indexing is supported")
+            raise TypeError("Only integer indexing is supported")  # noqa
         if idx < 0:
             raise IndexError("Negative indices not supported")
         if idx >= len(self):

@@ -592,6 +592,17 @@ def time(timeframe: str | None = None, session: str | None = None, timezone: str
 
 
 @module_property
+def timenow():
+    """
+    Current time in UNIX format. It is the number of milliseconds that have elapsed since 00:00:00 UTC, 1 January 1970.
+
+    :return: Current time in milliseconds
+    """
+    # Get current UTC time and convert to milliseconds since Unix epoch
+    return int(datetime.now(UTC).timestamp() * 1000)
+
+
+@module_property
 def time_close(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> int | NA[int]:
     """
     The time_close function returns the UNIX time of the current bar's close for the specified timeframe

@@ -11,5 +11,6 @@ __scope_id__ = ''
 
 def main():
     global __scope_id__
-    e = __series_main·e__.add(isolate_function(lib.ta.ema, 'main|lib.ta.ema|0', __scope_id__, -1)(lib.close, 9))
+    __call_counter·main·lib.ta.ema·0__ = 0
+    e = __series_main·e__.add(isolate_function(lib.ta.ema, 'main·lib.ta.ema·0', __scope_id__, -1, (__call_counter·main·lib.ta.ema·0__ := (__call_counter·main·lib.ta.ema·0__ + 1)))(lib.close, 9))
     print(__series_main·e__[1])

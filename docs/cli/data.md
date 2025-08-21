@@ -140,25 +140,33 @@ PyneCore uses a binary format (`.ohlcv`) for storing OHLCV data efficiently. How
 
 ### Converting to Other Formats
 
-The `convert-to` command converts PyneCore format to CSV or JSON:
+The `convert-to` command converts PyneCore OHLCV format to CSV or JSON:
 
 ```bash
-pyne data convert-to PROVIDER [OPTIONS]
+pyne data convert-to OHLCV_FILE [OPTIONS]
 ```
 
+Where `OHLCV_FILE` is the path to the OHLCV file to convert.
+
 Options:
-- `--symbol`, `-s`: Symbol to convert
-- `--timeframe`, `-tf`: Timeframe in TradingView format
-- `--format`, `-f`: Output format (csv, json)
+- `--format`, `-f`: Output format (csv or json, default: csv)
 - `--as-datetime`, `-dt`: Save timestamp as datetime instead of UNIX timestamp
+
+The command automatically:
+- Adds `.ohlcv` extension if not specified
+- Creates output file with the same name but different extension
+- Looks in `workdir/data/` if only filename is provided
 
 Example:
 ```bash
-# Convert Bitcoin data to CSV
-pyne data convert-to ccxt --symbol "BINANCE:BTC/USDT" --timeframe "1D" --format "csv"
+# Convert OHLCV file to CSV
+pyne data convert-to BTCUSDT_1D.ohlcv
 
-# Convert with human-readable dates
-pyne data convert-to ccxt --symbol "BINANCE:BTC/USDT" --timeframe "1D" --format "csv" --as-datetime
+# Convert to JSON with human-readable dates
+pyne data convert-to BTCUSDT_1D.ohlcv --format json --as-datetime
+
+# Short form (extension optional)
+pyne data convert-to BTCUSDT_1D -f csv -dt
 ```
 
 ### Converting from Other Formats
@@ -172,20 +180,43 @@ pyne data convert-from FILE_PATH [OPTIONS]
 Where `FILE_PATH` is the path to the CSV or JSON file to convert.
 
 Options:
-- `--provider`, `-p`: Data provider name (can be any name, defaults to "custom")
-- `--symbol`, `-s`: Symbol name
-- `--timeframe`, `-tf`: Timeframe in TradingView format
-- `--fmt`, `-f`: Input format (csv, json) - defaults to the file extension if not specified
+- `--provider`, `-p`: Data provider name (defaults to auto-detected from filename)
+- `--symbol`, `-s`: Symbol name (defaults to auto-detected from filename)
 - `--timezone`, `-tz`: Timezone of the timestamps (defaults to UTC)
+
+**Automatic Detection Features:**
+- **Symbol Detection**: The command automatically detects symbols from common filename patterns
+- **Provider Detection**: Recognizes provider names in filenames (BINANCE, BYBIT, CAPITALCOM, etc.)
+- **Format Support**: Supports CSV and JSON files, auto-detected from file extension
+
+**Filename Pattern Examples:**
+- `BTCUSDT.csv` → Symbol: BTC/USDT
+- `EUR_USD.csv` → Symbol: EUR/USD  
+- `ccxt_BYBIT_BTC_USDT.csv` → Symbol: BTC/USDT, Provider: bybit
+- `BINANCE_ETHUSDT_1h.csv` → Symbol: ETH/USDT, Provider: binance
+- `capitalcom_EURUSD.csv` → Symbol: EUR/USD, Provider: capitalcom
 
 Example:
 ```bash
-# Convert CSV to PyneCore format
-pyne data convert-from ./data/btcusd.csv --symbol "CUSTOM:BTC/USD" --timeframe "1D"
+# Convert CSV with automatic detection
+pyne data convert-from ./data/BTCUSDT.csv  # Auto-detects BTC/USDT
+
+# Override auto-detected values if needed
+pyne data convert-from ./data/btcusd.csv --symbol "BTC/USD" --provider "kraken"
 
 # Convert with timezone specification
-pyne data convert-from ./data/eurusd.csv --symbol "CUSTOM:EUR/USD" --timeframe "60" --timezone "Europe/London"
+pyne data convert-from ./data/eurusd.csv --timezone "Europe/London"
 ```
+
+**Generated TOML Configuration:**
+
+After conversion, a TOML configuration file is automatically generated with:
+- **Smart Symbol Type Detection**: Automatically identifies forex, crypto, or other asset types
+- **Tick Size Analysis**: Analyzes price data to determine the minimum price increment
+- **Opening Hours Detection**: Detects trading hours from actual trading activity
+- **Interval Detection**: Automatically determines the timeframe from timestamp intervals
+
+The generated TOML file includes all detected information and can be manually adjusted if needed.
 
 ## Data File Structure
 

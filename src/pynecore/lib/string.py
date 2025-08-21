@@ -543,7 +543,7 @@ def tostring(value: int | float | str | bool | NA, fmt: str | Format = '#.######
         if isinstance(fmt, Format):
             return _format_number(safe_convert.safe_float(value), fmt_type=fmt)
         return _format_number(safe_convert.safe_float(value), precision=fmt)
-    return str(value)
+    return str(value)  # noqa: it may be reachable if it is used with unsupported types
 
 
 def trim(source: str) -> str:
