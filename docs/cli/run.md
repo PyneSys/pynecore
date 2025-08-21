@@ -27,7 +27,7 @@ pyne run SCRIPT DATA [OPTIONS]
 
 Where:
 - `SCRIPT`: Path to the PyneCore script (.py) or Pine Script (.pine) file
-- `DATA`: Path to the OHLCV data (.ohlcv) file
+- `DATA`: Path to the data file (.ohlcv, .csv, .json, or .txt)
 - `OPTIONS`: Additional options to customize the execution
 
 ## Simple Example
@@ -81,15 +81,61 @@ Example with API key:
 pyne run my_strategy.pine eurusd_data.ohlcv --api-key "your-api-key"
 ```
 
+## Automatic Data Conversion
+
+The `run` command now supports automatic conversion of non-OHLCV data formats. When you provide a CSV, JSON, or TXT file, the system automatically:
+
+1. **Detects the file format** from the extension
+2. **Analyzes the filename** to extract symbol and provider information
+3. **Converts the data** to OHLCV format
+4. **Generates a TOML configuration** with detected parameters
+5. **Runs the script** with the converted data
+
+### Supported Formats and Detection
+
+The automatic conversion supports:
+- **CSV files**: Standard comma-separated values
+- **JSON files**: JSON formatted OHLCV data
+- **TXT files**: Tab, semicolon, or pipe-delimited data (coming soon)
+
+### Filename Pattern Detection
+
+The system recognizes common filename patterns:
+- `BTCUSDT.csv` → Symbol: BTC/USDT
+- `EUR_USD.json` → Symbol: EUR/USD
+- `ccxt_BYBIT_BTC_USDT.csv` → Symbol: BTC/USDT, Provider: bybit
+- `BINANCE_ETHUSDT_1h.csv` → Symbol: ETH/USDT, Provider: binance
+
+### Example with Automatic Conversion
+
+```bash
+# Run a script with CSV data (automatic conversion)
+pyne run my_strategy.py BTCUSDT.csv
+
+# The system will:
+# 1. Detect BTC/USDT as the symbol
+# 2. Convert CSV to OHLCV format
+# 3. Generate BTCUSDT.toml with symbol info
+# 4. Run the script with converted data
+```
+
+### Advanced Analysis During Conversion
+
+When converting data, the system performs advanced analysis:
+- **Tick Size Detection**: Analyzes price movements to determine minimum price increment
+- **Trading Hours Detection**: Identifies when the market is actively trading
+- **Interval Auto-Correction**: Detects and fixes incorrect timeframe settings
+- **Symbol Type Detection**: Identifies forex, crypto, or other asset types
+
 ## Command Arguments
 
 The `run` command has two required arguments:
 
 - `SCRIPT`: The script file to run. If only a filename is provided, it will be searched in the `workdir/scripts/` directory.
-- `DATA`: The OHLCV data file to use. If only a filename is provided, it will be searched in the `workdir/data/` directory.
+- `DATA`: The data file to use. Supports .ohlcv, .csv, .json formats. If only a filename is provided, it will be searched in the `workdir/data/` directory.
 
 <small>
-Note: you don't need to write the `.py` and `.ohlcv` extensions in the command.
+Note: you don't need to write the file extensions in the command.
 </small>
 
 ## Command Options

@@ -58,7 +58,6 @@ long = direction.long
 short = direction.short
 
 # Possible order types
-_order_type_normal = _OrderType()
 _order_type_entry = _OrderType()
 _order_type_close = _OrderType()
 
@@ -85,6 +84,8 @@ class Order:
         "comment", "alert_message",
         "trail_price", "trail_offset",
         "trail_triggered",
+        "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
+        "is_market_order",  # Flag to check if this is a market order
     )
 
     def __init__(
@@ -92,7 +93,7 @@ class Order:
             order_id: str | None,
             size: float,
             *,
-            order_type: _OrderType = _order_type_normal,
+            order_type: _OrderType,
             exit_id: str | None = None,
             limit: float | None = None,
             stop: float | None = None,
@@ -101,7 +102,10 @@ class Order:
             comment: str | None = None,
             alert_message: str | None = None,
             trail_price: float | None = None,
-            trail_offset: float | None = None
+            trail_offset: float | None = None,
+            profit_ticks: float | None = None,
+            loss_ticks: float | None = None,
+            trail_points_ticks: float | None = None
     ):
         self.order_id = order_id
         self.size = size
@@ -121,6 +125,13 @@ class Order:
         self.trail_price = trail_price
         self.trail_offset = trail_offset or 0  # in ticks
         self.trail_triggered = False
+
+        self.profit_ticks = profit_ticks
+        self.loss_ticks = loss_ticks
+        self.trail_points_ticks = trail_points_ticks
+
+        # Check if this is a market order (no limit, stop, or trail price)
+        self.is_market_order = self.limit is None and self.stop is None and self.trail_price is None
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -210,7 +221,8 @@ class Position:
     grossprofit: float | NA[float] = 0.0
     grossloss: float | NA[float] = 0.0
 
-    orders: dict[str, Order]
+    entry_orders: dict[str, Order]
+    exit_orders: dict[str, Order]
 
     open_trades: list[Trade]
     closed_trades: deque[Trade]
@@ -250,7 +262,8 @@ class Position:
     risk_halt_trading: bool = False
 
     def __init__(self):
-        self.orders = {}
+        self.entry_orders = {}  # Entry orders from strategy.entry()
+        self.exit_orders = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
 
         self.open_trades = []
         self.closed_trades = deque(maxlen=9000)  # 9000 is the limit of TV
@@ -276,7 +289,8 @@ class Position:
 
     def reset(self):
         """ Reset position variables """
-        self.orders.clear()
+        self.entry_orders.clear()
+        self.exit_orders.clear()
         self.open_trades.clear()
         self.closed_trades.clear()
         self.closed_trades_count = 0
@@ -385,8 +399,9 @@ class Position:
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
-                    # We realize later if it is cash per order
-                    if commission_type == _commission.cash_per_contract:
+                    # We realize later if it is cash per order or cash per contract
+                    if (commission_type == _commission.cash_per_contract or
+                            commission_type == _commission.cash_per_order):
                         closed_trade_size += abs(size)
                     else:
                         commission = abs(size) * commission_value
@@ -457,8 +472,8 @@ class Position:
 
             self.open_trades = open_trades
             if delete:
-                if order.exit_id is not None:
-                    self.orders.pop(order.exit_id, None)
+                # Remove from exit_orders dict
+                self.exit_orders.pop(order.exit_id, None)
 
                 if commission_type == _commission.cash_per_order:
                     # Realize commission
@@ -521,7 +536,11 @@ class Position:
             # Commission summ
             self.open_commission += commission
 
-            del self.orders[order.order_id]
+            # Remove the order from the appropriate dict
+            if order.order_type == _order_type_entry and order.order_id:
+                self.entry_orders.pop(order.order_id, None)
+            elif order.exit_id:
+                self.exit_orders.pop(order.exit_id, None)
 
         # If position has just closed
         if not self.open_trades:
@@ -549,20 +568,45 @@ class Position:
             new_size = 0.0
         new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
         if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
+            # Exit orders should never reverse position direction
+            # Only entry orders can open new positions or reverse direction
+            if order.order_type == _order_type_close:
+                # Limit the exit order size to just close the position
+                order.size = -self.size
+                self._fill_order(order, price, h, l)
+                return False
+
             # Create a copy for closing existing position
             order1 = copy(order)
             order1.order_type = _order_type_close
             order1.size = -self.size
             # Set order_id to None so it will close any open trades
             order1.order_id = None
-            # Don't need to remove this order, because it is not in the orders list
-            order1.exit_id = None
+            # The exit_id will be the order_id of the original order
+            order1.exit_id = order.order_id
             # Fill the closing order first
             self._fill_order(order1, price, h, l)
+
+            # Check if new direction is allowed by risk management
+            # According to Pine Script docs: "long exit trades will be made instead of reverse trades"
+            new_direction_sign = 1.0 if new_size > 0.0 else -1.0
+            if self.risk_allowed_direction is not None:
+                if (new_direction_sign > 0 and self.risk_allowed_direction != long) or \
+                        (new_direction_sign < 0 and self.risk_allowed_direction != short):
+                    # Direction not allowed - convert entry to exit only
+                    # Don't open new position in restricted direction
+                    return False
+
             # Modify the original order to open a position in the new direction
             order.size = new_size
-            assert order.order_id is not None
-            self.orders[order.order_id] = order
+            # Store in the appropriate dict based on order type
+            if order.order_type == _order_type_entry:
+                assert order.order_id is not None
+                self.entry_orders[order.order_id] = order
+            else:
+                # Exit orders use exit_id as the key
+                assert order.exit_id is not None
+                self.exit_orders[order.exit_id] = order
             self._fill_order(order, price, h, l)
             return True
 
@@ -644,22 +688,63 @@ class Position:
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
 
+        # Get script reference for slippage
+        script = lib._script
+
         # If the order is open → high → low → close or open → low → high → close
         ohlc = abs(self.h - self.o) < abs(self.l - self.o)
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
 
-        # Process open orders
-        for order in list(self.orders.values()):
+        # Process all orders: entry orders first, then exit orders (guaranteed order)
+        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
+            # For exit orders, calculate limit/stop from entry price if ticks are specified
+            if order.order_type == _order_type_close and order.order_id:
+                # Try to find the trade with matching entry_id
+                entry_price = None
+                for trade in self.open_trades:
+                    if trade.entry_id == order.order_id:
+                        entry_price = trade.entry_price
+                        break
+
+                # If we found the entry price and have tick values, calculate the actual prices
+                if entry_price is not None:
+                    # Determine direction from the order
+                    direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+
+                    # Calculate limit from profit_ticks if specified
+                    if order.profit_ticks is not None and order.limit is None:
+                        order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
+                        order.limit = _price_round(order.limit, direction)
+
+                    # Calculate stop from loss_ticks if specified
+                    if order.loss_ticks is not None and order.stop is None:
+                        order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
+                        order.stop = _price_round(order.stop, -direction)
+
+                    # Calculate trail_price from trail_points_ticks if specified
+                    if order.trail_points_ticks is not None and order.trail_price is None:
+                        order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
+                        order.trail_price = _price_round(order.trail_price, direction)
+
             # Market orders
-            if order.limit is None and order.stop is None and order.trail_price is None:
+            if order.is_market_order:
+                # Apply slippage to market orders
+                fill_price = self.o
+                if script.slippage > 0:
+                    # Slippage is in ticks, always adverse to trade direction
+                    # For long orders (buying), slippage increases the price
+                    # For short orders (selling), slippage decreases the price
+                    slippage_amount = syminfo.mintick * script.slippage * order.sign
+                    fill_price = self.o + slippage_amount
+
                 # open → high → low → close
                 if ohlc:
-                    self.fill_order(order, self.o, self.o, self.l)
+                    self.fill_order(order, fill_price, self.o, self.l)
                 # open → low → high → close
                 else:
-                    self.fill_order(order, self.o, self.l, self.o)
+                    self.fill_order(order, fill_price, self.l, self.o)
 
             # Limit/Stop orders
             else:
@@ -673,7 +758,39 @@ class Position:
                     self._check_low(order)
 
         # 2nd round of process open orders
-        for order in list(self.orders.values()):
+        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
+            # For exit orders, calculate limit/stop from entry price if not already done
+            if order.order_type == _order_type_close and order.order_id:
+                # Only recalculate if not already set in first round
+                if ((order.profit_ticks is not None or order.loss_ticks is not None
+                     or order.trail_points_ticks is not None) and order.limit is None and order.stop is None):
+                    # Try to find the trade with matching entry_id
+                    entry_price = None
+                    for trade in self.open_trades:
+                        if trade.entry_id == order.order_id:
+                            entry_price = trade.entry_price
+                            break
+
+                    # If we found the entry price and have tick values, calculate the actual prices
+                    if entry_price is not None:
+                        # Determine direction from the order
+                        direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+
+                        # Calculate limit from profit_ticks if specified
+                        if order.profit_ticks is not None and order.limit is None:
+                            order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
+                            order.limit = _price_round(order.limit, direction)
+
+                        # Calculate stop from loss_ticks if specified
+                        if order.loss_ticks is not None and order.stop is None:
+                            order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
+                            order.stop = _price_round(order.stop, -direction)
+
+                        # Calculate trail_price from trail_points_ticks if specified
+                        if order.trail_points_ticks is not None and order.trail_price is None:
+                            order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
+                            order.trail_price = _price_round(order.trail_price, direction)
+
             # Here all market orders should be gone
             # open → high → low → close
             if ohlc:
@@ -811,10 +928,17 @@ def cancel(id: str):
     if lib._lib_semaphore:
         return
 
+    assert lib._script is not None and lib._script.position is not None
+    # Try to cancel both entry and exit orders with the given ID
+    # since we don't know which type it is
+    # noinspection PyProtectedMember
     try:
-        assert lib._script is not None and lib._script.position is not None
-        # noinspection PyProtectedMember
-        del lib._script.position.orders[id]
+        del lib._script.position.entry_orders[id]
+    except KeyError:
+        pass
+    # noinspection PyProtectedMember
+    try:
+        del lib._script.position.exit_orders[id]
     except KeyError:
         pass
 
@@ -828,7 +952,8 @@ def cancel_all():
         return
 
     assert lib._script is not None and lib._script.position is not None
-    lib._script.position.orders.clear()
+    lib._script.position.entry_orders.clear()
+    lib._script.position.exit_orders.clear()
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins
@@ -873,7 +998,8 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
 
-    position.orders[exit_id] = order
+    # Store in exit_orders dict
+    position.exit_orders[exit_id] = order
     if immediately:
         round_to_mintick = lib.math.round_to_mintick
         position.fill_order(order,
@@ -904,7 +1030,8 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
     order = Order(None, -position.size, exit_id=exit_id, order_type=_order_type_close,
                   comment=comment, alert_message=alert_message)
 
-    position.orders[exit_id] = order
+    # Store in exit_orders dict
+    position.exit_orders[exit_id] = order
     if immediately:
         round_to_mintick = lib.math.round_to_mintick
         position.fill_order(order,
@@ -1001,28 +1128,22 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     size = qty * direction_sign
     sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
-    # Change direction
-    is_direction_change = False
+    # Check pyramiding limit (only for same direction trades)
     if position.size:
-        if position.sign != sign:
-            is_direction_change = True
-        else:
-            # Handle pyramiding
+        if position.sign == sign:
+            # Same direction - check pyramiding
             if script.pyramiding <= len(script.position.open_trades):
                 return
 
-    # Risk management: Check allowed direction (only for new positions, not direction changes)
+    # Risk management: Check allowed direction for new positions
+    # Direction changes are handled in fill_order() which will convert entry to exit if needed
     if position.risk_allowed_direction is not None:
         if (sign > 0 and position.risk_allowed_direction != long) or \
                 (sign < 0 and position.risk_allowed_direction != short):
-            if not is_direction_change:
-                return
-            else:
-                is_direction_change = False
-
-    # We need to adjust the size if we are changing direction
-    if is_direction_change:
-        size -= position.size
+            # Check if this would be a new position (not a direction change)
+            if not position.size or position.sign == sign:
+                return  # Block new positions in restricted direction
+            # For direction changes, let fill_order() handle the conversion to exit
 
     # Risk management: Check max position size
     if position.risk_max_position_size is not None:
@@ -1050,7 +1171,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
-    script.position.orders[id] = order
+    # Store in entry_orders dict
+    script.position.entry_orders[id] = order
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
@@ -1116,12 +1238,10 @@ def exit(id: str, from_entry: str = "",
         if size == 0.0:
             return
 
-        if isinstance(limit, NA) and not isinstance(profit, NA):
-            limit = lib.close + direction * syminfo.mintick * profit
-        if isinstance(stop, NA) and not isinstance(loss, NA):
-            stop = lib.close - direction * syminfo.mintick * loss
-        if isinstance(trail_price, NA) and not isinstance(trail_points, NA):
-            trail_price = lib.close + direction * syminfo.mintick * trail_points
+        # Store tick values for later calculation when entry price is known
+        profit_ticks = None if isinstance(profit, NA) else profit
+        loss_ticks = None if isinstance(loss, NA) else loss
+        trail_points_ticks = None if isinstance(trail_points, NA) else trail_points
 
         # We need to have limit, stop or both
         if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
@@ -1134,14 +1254,19 @@ def exit(id: str, from_entry: str = "",
         if not isinstance(trail_price, NA):
             trail_price = _price_round(trail_price, direction)
 
-        position.orders[id] = Order(from_entry, size, exit_id=id, order_type=_order_type_close,
-                                    limit=limit, stop=stop,
-                                    trail_price=trail_price, trail_offset=trail_offset,
-                                    oca_name=oca_name, comment=comment, alert_message=alert_message)
+        # Store in exit_orders dict
+        position.exit_orders[id] = Order(
+            from_entry, size, exit_id=id, order_type=_order_type_close,
+            limit=limit, stop=stop,
+            trail_price=trail_price, trail_offset=trail_offset,
+            profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
+            oca_name=oca_name, comment=comment, alert_message=alert_message
+        )
 
     # Find direction and size
     if from_entry:
-        entry_order = position.orders.get(from_entry, None)
+        # Get from entry_orders dict
+        entry_order = position.entry_orders.get(from_entry, None)
 
         # Find open trade if no entry order found
         if not entry_order:
@@ -1150,7 +1275,6 @@ def exit(id: str, from_entry: str = "",
                     direction = trade.sign
                     size = trade.size
                     _exit()
-
         else:
             direction = entry_order.sign
             size = entry_order.size
@@ -1159,7 +1283,7 @@ def exit(id: str, from_entry: str = "",
     else:
         # If still no entry order found, we should exit all open trades and open orders
         if not direction:
-            for order in list(position.orders.values()):
+            for order in list(position.entry_orders.values()):
                 direction = order.sign
                 size = order.size
                 from_entry = order.order_id

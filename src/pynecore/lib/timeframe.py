@@ -423,8 +423,8 @@ def from_seconds(seconds: int) -> str:
         return f"{seconds // (60 * 60 * 24 * 7)}W"
     if seconds % (60 * 60 * 24) == 0:
         return f"{seconds // (60 * 60 * 24)}D"
-    if seconds % (60 * 60) == 0:
-        return f"{seconds // (60 * 60)}"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}"
     return f"{seconds}S"
 
 

@@ -71,7 +71,10 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.color.rgb', 'lib.color.from_gradient',
 
     # Strategy functions
-    'lib.strategy.cancel', 'lib.strategy.cancel_all',
+    "lib.strategy.fixed", "lib.strategy.cash", "lib.strategy.percent_of_equity", "lib.strategy.long",
+    "lib.strategy.short", 'lib.strategy.direction', "lib.strategy.cancel", "lib.strategy.cancel_all",
+    "lib.strategy.close", "lib.strategy.close_all", "lib.strategy.entry", "lib.strategy.exit",
+    "lib.strategy.closedtrades", "lib.strategy.opentrades",
 
     # Other
     'lib.max_bars_back',
@@ -108,6 +111,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         # Track inner functions that shadow builtins per scope
         # Maps scope -> set of function names that shadow builtins
         self.shadowed_builtins_by_scope: dict[str, set[str]] = {}
+        # Track counter variables that need to be initialized per function
+        self.function_counters: dict[str, set[str]] = {}
 
     def _is_dataclass_constructor(self, func: ast.Name | ast.Attribute) -> bool:
         """
@@ -213,12 +218,13 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         parts.append(str(self._call_id_counter))
         self._call_id_counter += 1
 
-        # Join all parts with '|' separator
-        return '|'.join(parts)
+        # Join all parts with unicode middle dot separator
+        # This makes the ID directly usable as a Python variable name
+        return '·'.join(parts)
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         """Process module and add isolation import and scope_id"""
-        # First parse the entire AST to find all dataclass declarations
+        # Find all dataclass declarations
         self._find_dataclass_declarations(node)
 
         # Process the module normally
@@ -312,12 +318,19 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         # Store old state
         old_function = self.current_function
 
+        # Reset counter for each function to ensure synchronization with collector
+        self._call_id_counter = 0
+
         # Update function hierarchy - add current function to parent list if not None
         if self.current_function:
             self.parent_functions.append(self.current_function)
 
         # Set current function to this function's name
         self.current_function = node.name
+
+        # Initialize counter collection for this function
+        func_key = '.'.join(self.parent_functions + [node.name]) if self.parent_functions else node.name
+        self.function_counters[func_key] = set()
 
         # Check if this is an inner function that shadows a builtin
         # Inner functions should be isolated if they shadow builtins
@@ -354,7 +367,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         if node.body:
             node.body = [self.visit(cast(ast.AST, stmt)) for stmt in node.body]
 
-        # Add global scope_id declaration only if function uses isolation
+        # Add global scope_id declaration and counter initializations only if function uses isolation
         if needs_isolation:
             # Find the right position after docstring if exists
             insert_pos = 0
@@ -365,8 +378,20 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                     isinstance(cast(ast.Constant, cast(ast.Expr, node.body[0]).value).value, str)):
                 insert_pos = 1
 
+            # Add global scope_id declaration
             global_stmt = ast.Global(names=['__scope_id__'])
             node.body.insert(insert_pos, global_stmt)
+
+            # Add counter variable initializations
+            func_key = '.'.join(self.parent_functions + [node.name]) if self.parent_functions else node.name
+            if func_key in self.function_counters:
+                for counter_name in sorted(self.function_counters[func_key]):
+                    counter_init = ast.Assign(
+                        targets=[ast.Name(id=counter_name, ctx=ast.Store())],
+                        value=ast.Constant(value=0)
+                    )
+                    node.body.insert(insert_pos + 1, counter_init)
+
             self.has_call_usage = True
 
         # Restore function context
@@ -407,7 +432,27 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         # Check if this call has closure arguments (marked by ClosureArgumentsTransformer)
         closure_vars_count = getattr(node, '_closure_vars_count', -1)
 
-        # Create wrapper with scope_id and closure_argument_count
+        # Use the exact same call_id as the variable name (it's already a valid Python identifier)
+        counter_var_name = f"__call_counter·{call_id}__"
+
+        # Track this counter for initialization
+        func_key = ('.'.join(self.parent_functions + [self.current_function])
+                    if self.parent_functions else self.current_function)
+        if func_key in self.function_counters:
+            self.function_counters[func_key].add(counter_var_name)
+
+        # Create a walrus expression to increment the counter
+        # counter_var := counter_var + 1
+        counter_increment = ast.NamedExpr(
+            target=ast.Name(id=counter_var_name, ctx=ast.Store()),
+            value=ast.BinOp(
+                left=ast.Name(id=counter_var_name, ctx=ast.Load()),
+                op=ast.Add(),
+                right=ast.Constant(value=1)
+            )
+        )
+
+        # Create wrapper with scope_id, closure_argument_count, and the incremented counter value
         wrapped = ast.Call(
             func=ast.Call(
                 func=ast.Name(id='isolate_function', ctx=ast.Load()),
@@ -415,7 +460,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                     node.func,
                     ast.Constant(value=call_id),
                     ast.Name(id='__scope_id__', ctx=ast.Load()),
-                    ast.Constant(value=closure_vars_count)  # closure_argument_count
+                    ast.Constant(value=closure_vars_count),  # closure_argument_count (4th param)
+                    counter_increment  # Pass the incremented counter value (5th param)
                 ],
                 keywords=[]
             ),

@@ -258,8 +258,6 @@ def __test_time__(csv_reader, runner, dict_comparator, log):
     assert isinstance(hourly_time, int)
     assert isinstance(hourly_time_close, int)
     assert hourly_time_close > hourly_time
-    
-    log.info("time() and time_close() functions validated successfully")
 
 
 if __name__ == "__main__":
