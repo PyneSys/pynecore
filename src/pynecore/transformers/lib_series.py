@@ -133,6 +133,10 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
         if isinstance(node.value, ast.Attribute):
             attr_chain = get_attribute_chain(node.value)
             if attr_chain and attr_chain[0] == 'lib':
+                # Skip extra_fields since it's a dictionary, not a Series
+                # This handles both lib.extra_fields["key"] and lib.extra_fields["key"][0] cases
+                if len(attr_chain) >= 2 and attr_chain[1] == 'extra_fields':
+                    return self.generic_visit(node)
                 # Use the complete chain after 'lib'
                 local_name = self.process_series_usage('lib', attr_chain[1:])
                 # Replace lib.xxx.yyy[idx] with local_name[idx]

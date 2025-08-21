@@ -4,6 +4,7 @@ from typing import Dict, Set, List, Optional, cast
 NON_MODULE_ATTRS = {
     'input',  # class
     'script',  # class
+    'extra_fields',  # dictionary variable
 }
 
 
