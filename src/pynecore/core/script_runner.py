@@ -165,7 +165,7 @@ class ScriptRunner:
 
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
-                 'equity_curve', 'first_price', 'last_price')
+                 'equity_curve', 'first_price', 'last_price', 'prev_close_price')
 
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
@@ -210,6 +210,7 @@ class ScriptRunner:
         self.equity_curve: list[float] = []
         self.first_price: float | None = None
         self.last_price: float | None = None
+        self.prev_close_price: float | None = None
 
         self.plot_writer = CSVWriter(
             plot_path, float_fmt=f".8g"
@@ -382,6 +383,8 @@ class ScriptRunner:
 
                 # Update bar index
                 self.bar_index += 1
+                # Update prev_close_price
+                position.prev_c = self.prev_close_price = lib.close  # type: ignore
                 # It is no longer the first bar
                 barstate.isfirst = False
 

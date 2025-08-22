@@ -1,4 +1,4 @@
-from typing import cast, TYPE_CHECKING
+from typing import cast, TYPE_CHECKING, Any
 
 import math
 from datetime import datetime, UTC
@@ -236,6 +236,7 @@ class Position:
     size: float = 0.0
     sign: float = 0.0
     avg_price: float = 0.0
+    prev_c: float = 0.0
 
     cum_profit: float | NA[float] = 0.0
 
@@ -360,7 +361,11 @@ class Position:
                     if closed_trade.size != -size:
                         # Modify commission
                         trade.commission *= size_ratio
-                        closed_trade.commission *= (1 - size_ratio)
+                        if commission_type == _commission.percent:
+                            closed_trade.commission *= (1 - size_ratio) * commission_value * 0.01 * price
+                        else:
+                            closed_trade.commission *= (1 - size_ratio)
+
                         # Modify drawdown and runup
                         trade.max_drawdown *= size_ratio
                         trade.max_runup *= size_ratio
@@ -407,7 +412,7 @@ class Position:
                         commission = abs(size) * commission_value
 
                         if commission_type == _commission.percent:
-                            commission *= 0.01
+                            commission *= 0.01 * price
                         closed_trade.commission += commission
                         # Realize commission
                         self.netprofit -= commission
@@ -491,7 +496,7 @@ class Position:
                 if commission_type == _commission.cash_per_order:
                     commission = commission_value
                 elif commission_type == _commission.percent:
-                    commission = abs(order.size) * commission_value * 0.01
+                    commission = abs(order.size) * commission_value * 0.01 * price
                 elif commission_type == _commission.cash_per_contract:
                     commission = abs(order.size) * commission_value
                 else:  # Should not be here!
@@ -687,6 +692,7 @@ class Position:
         self.h = round_to_mintick(lib.high)
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
+        self.prev_c = round_to_mintick(self.prev_c)
 
         # Get script reference for slippage
         script = lib._script
@@ -714,30 +720,30 @@ class Position:
                     direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
 
                     # Calculate limit from profit_ticks if specified
-                    if order.profit_ticks is not None and order.limit is None:
+                    if order.profit_ticks is not None and _is_none(order.limit):
                         order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
                         order.limit = _price_round(order.limit, direction)
 
                     # Calculate stop from loss_ticks if specified
-                    if order.loss_ticks is not None and order.stop is None:
+                    if order.loss_ticks is not None and _is_none(order.stop):
                         order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
                         order.stop = _price_round(order.stop, -direction)
 
                     # Calculate trail_price from trail_points_ticks if specified
-                    if order.trail_points_ticks is not None and order.trail_price is None:
+                    if order.trail_points_ticks is not None and _is_none(order.trail_price):
                         order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
                         order.trail_price = _price_round(order.trail_price, direction)
 
             # Market orders
             if order.is_market_order:
                 # Apply slippage to market orders
-                fill_price = self.o
+                fill_price = self.prev_c
                 if script.slippage > 0:
                     # Slippage is in ticks, always adverse to trade direction
                     # For long orders (buying), slippage increases the price
                     # For short orders (selling), slippage decreases the price
                     slippage_amount = syminfo.mintick * script.slippage * order.sign
-                    fill_price = self.o + slippage_amount
+                    fill_price = self.prev_c + slippage_amount
 
                 # open → high → low → close
                 if ohlc:
@@ -763,7 +769,7 @@ class Position:
             if order.order_type == _order_type_close and order.order_id:
                 # Only recalculate if not already set in first round
                 if ((order.profit_ticks is not None or order.loss_ticks is not None
-                     or order.trail_points_ticks is not None) and order.limit is None and order.stop is None):
+                     or order.trail_points_ticks is not None) and _is_none(order.limit) and _is_none(order.stop)):
                     # Try to find the trade with matching entry_id
                     entry_price = None
                     for trade in self.open_trades:
@@ -777,17 +783,17 @@ class Position:
                         direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
 
                         # Calculate limit from profit_ticks if specified
-                        if order.profit_ticks is not None and order.limit is None:
+                        if order.profit_ticks is not None and _is_none(order.limit):
                             order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
                             order.limit = _price_round(order.limit, direction)
 
                         # Calculate stop from loss_ticks if specified
-                        if order.loss_ticks is not None and order.stop is None:
+                        if order.loss_ticks is not None and _is_none(order.stop):
                             order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
                             order.stop = _price_round(order.stop, -direction)
 
                         # Calculate trail_price from trail_points_ticks if specified
-                        if order.trail_points_ticks is not None and order.trail_price is None:
+                        if order.trail_points_ticks is not None and _is_none(order.trail_price):
                             order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
                             order.trail_price = _price_round(order.trail_price, direction)
 
@@ -917,6 +923,15 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
             # Not an integer, round up
             return (ppmt_int + 1) * mintick
 
+
+def _is_none(value: Any) -> bool:
+    """
+    Check if the value is None or NA
+
+    :param value: The value to check
+    :return: True if the value is None or NA, False otherwise
+    """
+    return isinstance(value, NA) or value is None
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def cancel(id: str):
@@ -1125,7 +1140,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
-    size = qty * direction_sign
+    margin: float = (script.margin_short if direction == short else script.margin_long)
+    size = qty * direction_sign / margin
     sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
     # Check pyramiding limit (only for same direction trades)
