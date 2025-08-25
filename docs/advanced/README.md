@@ -23,3 +23,4 @@ Advanced topics and features of PyneCore
 - [Function Isolation](./function-isolation.md) - Function isolation implementation
 - [OHLCV Reader/Writer](./ohlcv-reader-writer.md) - OHLCV data handling
 - [CSV Reader/Writer](./csv-reader-writer.md) - Fast CSV processing
+- [FreqTrade Integration](./freqtrade-integration.md) - Integrating PyneCore indicators with FreqTrade trading bot
