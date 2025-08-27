@@ -15,10 +15,9 @@ from ...providers import available_providers
 from ...providers.provider import Provider
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
-from ...core.ohlcv_file import OHLCVReader
 
 from ...utils.rich.date_column import DateColumn
-from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.core.aggregator import TimeframeAggregator
 
 __all__ = []
@@ -27,7 +26,9 @@ app_data = Typer(help="OHLCV related commands")
 app.add_typer(app_data, name="data")
 
 # Available intervals (The same fmt as described in timeframe.period)
-TimeframeEnum = Enum('Timeframe', {name: name for name in ('1', '5', '15', '30', '60', '240', '1D', '1W', '1M')})
+TimeframeEnum = Enum('Timeframe', {name: name for name in
+                                   ('1', '2', '3', '5', '15', '30', '60', '120', '180', '240', '360', '480', '720',
+                                    '1D', '1W', '1M')})
 
 # Trick to avoid type checking errors
 if TYPE_CHECKING:
@@ -361,7 +362,9 @@ def aggregate(
         source_file: Path = Argument(...,
                                      help="Source .ohlcv file (auto-searches in workdir/data/ if only filename given)"),
         target_timeframe: TimeframeEnum = Option(..., '--target-timeframe', '-tf',  # type: ignore
-                                                 help="Target timeframe: 1,5,15,30,60,240 (minutes), 1D (daily), 1W (weekly), 1M (monthly). Must be larger than source."),
+                                                 help="Target timeframe: 1,2,3,5,15,30,60,120,180,240,360,480,720"
+                                                      " (minutes), 1D (daily), 1W (weekly), 1M (monthly). Must be"
+                                                      " larger than source."),
         output: Path | None = Option(None, '--output', '-o',
                                      help="Custom output file path (auto-generated if not specified)"),
         truncate: bool = Option(False, '--truncate', '-tr',
@@ -385,7 +388,7 @@ def aggregate(
     • Volume: Sum of all volumes
     
     SUPPORTED TIMEFRAMES:
-    Minutes: 1, 5, 15, 30, 60, 240 (where 60=1hour, 240=4hours)
+    Minutes: 1,2,3,5,15,30,60,120,180,240,360,480,720 (where 60=1hour, 240=4hours)
     Daily: 1D | Weekly: 1W | Monthly: 1M
     
     IMPORTANT: Only upscaling supported (small → large timeframes).
