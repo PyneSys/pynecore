@@ -5,7 +5,7 @@ title: "API Reference"
 description: "Complete API reference for PyneCore's programmatic Python interface"
 icon: "api"
 date: "2025-08-19"
-lastmod: "2025-08-19"
+lastmod: "2025-08-27"
 draft: false
 toc: true
 categories: ["Advanced", "API"]
@@ -252,6 +252,8 @@ def seek(self, position: int) -> None
 ```
 
 Move write position for data insertion/overwriting.
+
+**Important:** When using `seek()` to overwrite data, timestamps must remain in chronological order. Writing a timestamp earlier than subsequent records will raise a `ValueError`.
 
 #### truncate()
 ```python
