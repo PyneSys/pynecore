@@ -2,10 +2,10 @@
 ---
 weight: 10000
 title: "Programmatic API"
-description: "Using PyneCore programmatically with Python instead of CLI commands"
+description: "Execute PyneCore scripts and manage data programmatically with Python"
 icon: "code"
 date: "2025-08-19"
-lastmod: "2025-08-19"
+lastmod: "2025-09-01"
 draft: false
 toc: true
 categories: ["Advanced", "API"]
@@ -15,11 +15,18 @@ tags: ["programmatic", "api", "python", "automation", "integration"]
 
 # Programmatic API
 
-Using PyneCore programmatically with Python instead of CLI commands
+Execute PyneCore scripts and manage data programmatically with Python. Every CLI command has a programmatic equivalent.
 
-## In this section
+## Key Features
 
-- [Quick Start](./quick-start.md) - Get started with PyneCore's programmatic Python API
-- [Basic Examples](./basic-examples.md) - Simple examples showing core functionality
-- [API Reference](./api-reference.md) - Complete technical reference for all classes and methods
-- [Practical Examples](./practical-examples.md) - Real-world automation and integration examples
+- **Script Execution**: Run PyneCore scripts with `ScriptRunner`
+- **Data Management**: Read/write OHLCV files using memory-mapped I/O
+- **Automatic Conversion**: Convert CSV/JSON/TXT to OHLCV format
+- **Market Data**: Download historical data from exchanges
+- **Pine Script**: Compile Pine Script to Python
+
+## Documentation
+
+- [**Quick Start**](./quick-start.md) - Essential examples to get started quickly
+- [**API Reference**](./api-reference.md) - Complete technical reference for all classes and methods
+- [**Practical Examples**](./practical-examples.md) - Advanced real-world use cases and automation

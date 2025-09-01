@@ -15,8 +15,7 @@ tags: ["api-reference", "classes", "methods", "ohlcv", "syminfo", "scriptrunner"
 
 # Programmatic API Reference
 
-This page provides a complete reference for PyneCore's programmatic Python API. Use this reference when building
-applications, automation systems, or integrations that need to execute PyneCore scripts programmatically.
+Complete API reference for PyneCore's programmatic Python interface.
 
 ## Core Classes Overview
 
@@ -34,7 +33,7 @@ applications, automation systems, or integrations that need to execute PyneCore 
 
 ## ScriptRunner
 
-Execute PyneCore scripts with OHLCV data and collect results.
+Executes PyneCore scripts with OHLCV data.
 
 ### Constructor
 
@@ -50,7 +49,7 @@ strat_path: Path | None = None,  # Save strategy statistics (CSV)
 trade_path: Path | None = None,  # Save trade results (CSV)
 
     # Advanced options
-update_syminfo_every_run: bool = False,  # For parallel execution
+update_syminfo_every_run: bool = False,  # Update syminfo on each run (for multiple scripts)
 last_bar_index: int = 0  # Index of final bar
 )
 ```
@@ -78,21 +77,12 @@ last_bar_index: int = 0  # Index of final bar
 def run(self, on_progress: Callable[[datetime], None] | None = None) -> None
 ```
 
-Execute the script on all data. Equivalent to CLI `pyne run script.py data.ohlcv`.
+Executes the script on all data.
 
 **Parameters:**
 
 - `on_progress`: Optional callback receiving current datetime on each bar
 
-**Example:**
-
-```python
-def progress_callback(current_dt: datetime):
-    print(f"Processing: {current_dt}")
-
-
-runner.run(on_progress=progress_callback)
-```
 
 #### run_iter()
 
@@ -101,7 +91,7 @@ def run_iter(self, on_progress: Callable[[datetime], None] | None = None)
         -> Iterator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list[Trade]]]
 ```
 
-Execute script and yield results for each bar. For strategies, also yields closed trades.
+Executes script and yields results for each bar.
 
 **Returns:** Iterator yielding `(ohlcv_data, plot_results)` or `(ohlcv_data, plot_results, closed_trades)`
 
@@ -109,7 +99,7 @@ Execute script and yield results for each bar. For strategies, also yields close
 
 ## OHLCVReader
 
-Fast memory-mapped reader for binary OHLCV data files.
+Memory-mapped reader for binary OHLCV data files using MMAP.
 
 ### Constructor
 
@@ -121,14 +111,6 @@ OHLCVReader(path: str | Path)
 
 - `path`: Path to `.ohlcv` binary file
 
-### Context Manager Usage
-
-```python
-with OHLCVReader(Path("data.ohlcv")) as reader:
-    # Use reader methods
-    for candle in reader:
-        print(candle)
-```
 
 ### Properties
 
@@ -160,7 +142,7 @@ def size(self) -> int  # Number of records
 def read(self, position: int) -> OHLCV
 ```
 
-Read single candle at specific position (0-indexed).
+Reads single candle at specific position.
 
 #### read_from()
 
@@ -173,7 +155,7 @@ def read_from(
 ) -> Iterator[OHLCV]
 ```
 
-Read candles in timestamp range. Most commonly used method.
+Reads candles in timestamp range.
 
 **Parameters:**
 
@@ -181,22 +163,6 @@ Read candles in timestamp range. Most commonly used method.
 - `end_timestamp`: Unix timestamp end (None = read to end)
 - `skip_gaps`: Skip gap-filled records (volume = -1)
 
-**Example:**
-
-```python
-from datetime import datetime, UTC
-
-start = datetime(2024, 1, 1, tzinfo=UTC)
-end = datetime(2024, 6, 30, tzinfo=UTC)
-
-with OHLCVReader(data_path) as reader:
-    data_iter = reader.read_from(
-        int(start.timestamp()),
-        int(end.timestamp())
-    )
-    runner = ScriptRunner(script_path, data_iter, syminfo)
-    runner.run()
-```
 
 #### get_size()
 
@@ -204,7 +170,7 @@ with OHLCVReader(data_path) as reader:
 def get_size(self, start_timestamp: int | None = None, end_timestamp: int | None = None) -> int
 ```
 
-Count records in timestamp range.
+Counts records in timestamp range.
 
 #### get_positions()
 
@@ -212,7 +178,7 @@ Count records in timestamp range.
 def get_positions(self, start_timestamp: int | None = None, end_timestamp: int | None = None) -> tuple[int, int]
 ```
 
-Get start and end positions for timestamp range.
+Gets start and end positions for timestamp range.
 
 #### Export Methods
 
@@ -223,13 +189,13 @@ def save_to_csv(self, path: str, as_datetime: bool = False) -> None
     def save_to_json(self, path: str, as_datetime: bool = False) -> None
 ```
 
-Export data to CSV or JSON format.
+Exports data to CSV or JSON format.
 
 ---
 
 ## OHLCVWriter
 
-Write OHLCV data to binary format with automatic gap filling.
+Writes OHLCV data to binary format with automatic gap filling.
 
 ### Constructor
 
@@ -242,12 +208,6 @@ OHLCVWriter(path: str | Path, truncate: bool = False)
 - `path`: Path to output `.ohlcv` file
 - `truncate`: If True, truncate existing file on open (default: False)
 
-### Context Manager Usage
-
-```python
-with OHLCVWriter(Path("output.ohlcv"), truncate=True) as writer:
-    writer.write(OHLCV(timestamp, open, high, low, close, volume))
-```
 
 ### Properties
 
@@ -283,7 +243,7 @@ def analyzed_tick_size(self) -> float | None  # Auto-detected minimum price move
 def write(self, candle: OHLCV) -> None
 ```
 
-Write single OHLCV candle. Automatically fills gaps with previous close price and -1 volume.
+Writes single OHLCV candle with automatic gap filling.
 
 #### seek_to_timestamp() / seek()
 
@@ -294,7 +254,7 @@ def seek_to_timestamp(self, timestamp: int) -> None
     def seek(self, position: int) -> None  
 ```
 
-Move write position for data insertion/overwriting.
+Moves write position for data insertion/overwriting.
 
 **Important:** When using `seek()` to overwrite data, timestamps must remain in chronological order. Writing a timestamp
 earlier than subsequent records will raise a `ValueError`.
@@ -305,7 +265,7 @@ earlier than subsequent records will raise a `ValueError`.
 def truncate(self) -> None
 ```
 
-Remove all data after current position.
+Removes all data after current position.
 
 #### Data Import Methods
 
@@ -344,13 +304,13 @@ def load_from_txt(
 ) -> None
 ```
 
-Import data from CSV, JSON, or TXT (tab/semicolon/pipe-delimited) files with flexible column/field mapping.
+Imports data from CSV, JSON, or TXT files.
 
 ---
 
 ## DataConverter
 
-Enhanced automatic data file conversion with smart analysis and TOML generation.
+Converts data files to OHLCV format with automatic analysis.
 
 ### Constructor
 
@@ -369,15 +329,11 @@ converter = DataConverter()
 def guess_symbol_from_filename(file_path: Path) -> tuple[str | None, str | None]
 ```
 
-Auto-detect symbol and provider from filename patterns.
+Auto-detects symbol and provider from filename.
 
 **Returns:** `(symbol, provider)` tuple
 
-**Examples:**
-
-- `BTCUSDT.csv` → `("BTC/USDT", None)`
-- `BYBIT_ETHUSDT_1h.csv` → `("ETH/USDT", "bybit")`
-- `ccxt_BINANCE_ADAUSDT.json` → `("ADA/USDT", "binance")`
+**Pattern Examples:** `BTCUSDT.csv` → `("BTC/USDT", None)`, `BYBIT_ETHUSDT_1h.csv` → `("ETH/USDT", "bybit")`
 
 #### is_conversion_required()
 
@@ -386,7 +342,7 @@ Auto-detect symbol and provider from filename patterns.
 def is_conversion_required(source_path: Path, ohlcv_path: Path | None = None) -> bool
 ```
 
-Check if conversion is needed based on file freshness.
+Checks if conversion is needed.
 
 ### Methods
 
@@ -404,7 +360,7 @@ def convert_to_ohlcv(
 ) -> None
 ```
 
-Convert CSV/JSON/TXT to OHLCV format with automatic TOML configuration generation.
+Converts CSV/JSON/TXT to OHLCV format.
 
 **Parameters:**
 
@@ -414,35 +370,13 @@ Convert CSV/JSON/TXT to OHLCV format with automatic TOML configuration generatio
 - `symbol`: Symbol name (auto-detected if None)
 - `timezone`: Timezone for timestamp conversion
 
-**Features:**
 
-- **Automatic symbol detection** from filename patterns
-- **Tick size analysis** during conversion
-- **Trading hours detection** from data patterns
-- **TOML configuration generation** with detected parameters
-- **Support for multiple formats**: CSV, JSON, TXT (tab/semicolon/pipe delimited)
-
-**Example:**
-
-```python
-converter = DataConverter()
-
-# Convert with automatic detection
-converter.convert_to_ohlcv(
-    file_path=Path("BTCUSDT_1h.csv"),
-    force=True
-)
-
-# Generates:
-# - BTCUSDT_1h.ohlcv (binary data)
-# - BTCUSDT_1h.toml (symbol configuration with detected parameters)
-```
 
 ---
 
 ## SymInfo
 
-Symbol metadata container loaded from TOML files or created programmatically.
+Symbol metadata container.
 
 ### Class Methods
 
@@ -453,11 +387,8 @@ Symbol metadata container loaded from TOML files or created programmatically.
 def load_toml(cls, path: Path) -> SymInfo
 ```
 
-Load symbol information from TOML file (recommended approach).
+Loads symbol information from TOML file.
 
-```python
-syminfo = SymInfo.load_toml(Path("BTCUSD_1D.toml"))
-```
 
 ### Constructor (Direct Creation)
 
@@ -482,7 +413,6 @@ timezone: str = 'UTC',
 )
 ```
 
-**Note:** Direct construction requires many parameters. Use `load_toml()` instead.
 
 ### Methods
 
@@ -492,7 +422,7 @@ timezone: str = 'UTC',
 def save_toml(self, path: Path) -> None
 ```
 
-Save symbol information to TOML file.
+Saves symbol information to TOML file.
 
 ### Key Attributes
 
@@ -506,7 +436,7 @@ Save symbol information to TOML file.
 
 ## PyneComp (Pine Script Compilation)
 
-Compile Pine Script files to Python for execution.
+Compiles Pine Script files to Python.
 
 ### Constructor
 
@@ -528,7 +458,7 @@ timeout: int = 30
 def compile(self, input_path: Path, output_path: Path) -> None
 ```
 
-Compile .pine file to .py file.
+Compiles .pine file to .py file.
 
 #### needs_compilation()
 
@@ -536,70 +466,19 @@ Compile .pine file to .py file.
 def needs_compilation(self, pine_path: Path, py_path: Path) -> bool
 ```
 
-Check if compilation is needed (Pine file newer than Python file).
+Checks if compilation is needed.
 
-**Example:**
-
-```python
-from pynecore.pynesys.compiler import PyneComp
-
-compiler = PyneComp(api_key="your-api-key")
-pine_file = Path("strategy.pine")
-py_file = Path("strategy.py")
-
-if compiler.needs_compilation(pine_file, py_file):
-    compiler.compile(pine_file, py_file)
-
-# Now use the compiled Python file
-with OHLCVReader(data_path) as reader:
-    runner = ScriptRunner(py_file, reader, syminfo)
-    runner.run()
-```
 
 ---
 
 ## Data Providers
 
-Download historical market data programmatically. Equivalent to `pyne data download`.
+Downloads historical market data.
 
 ### Available Providers
 
-```python
-from pynecore.providers.ccxt import CCXTProvider
-from pynecore.providers.capitalcom import CapitalComProvider
-```
-
-### CCXT Provider Example
-
-```python
-from pynecore.providers.ccxt import CCXTProvider
-from pynecore.core.ohlcv_file import OHLCVWriter
-from datetime import datetime, UTC
-from pathlib import Path
-
-# Initialize provider
-provider = CCXTProvider(
-    symbol="BYBIT:BTC/USDT:USDT",
-    config_dir=Path("./config")  # Directory containing ccxt.toml
-)
-
-# Set date range
-start_date = datetime(2024, 1, 1, tzinfo=UTC)
-end_date = datetime(2024, 12, 31, tzinfo=UTC)
-
-# Download and save data
-with OHLCVWriter(Path("BTCUSD_1D.ohlcv"), truncate=True) as writer:
-    for candle in provider.download_ohlcv(
-            timeframe="1D",
-            since=start_date,
-            until=end_date
-    ):
-        writer.write(candle)
-
-# Save symbol information
-syminfo = provider.get_syminfo(timeframe="1D")
-syminfo.save_toml(Path("BTCUSD_1D.toml"))
-```
+- `pynecore.providers.ccxt.CCXTProvider`
+- `pynecore.providers.capitalcom.CapitalComProvider`
 
 ### Provider Methods
 
@@ -617,32 +496,25 @@ def get_list_of_symbols(self) -> list[str]  # List available symbols
 
 ## OHLCV Data Type
 
-The core data structure for candlestick data.
+Core data structure for candlestick data.
 
 ```python
-from pynecore.types.ohlcv import OHLCV
-
-# Create OHLCV record
-candle = OHLCV(
-    timestamp=1609459200,  # Unix timestamp
-    open=29000.0,
-    high=29500.0,
-    low=28800.0,
-    close=29200.0,
-    volume=1250.5,
-    extra_fields={}  # Optional additional data
+OHLCV(
+    timestamp: int,  # Unix timestamp
+    open: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    extra_fields: dict = {}  # Optional
 )
-
-# Access fields
-print(f"Close: {candle.close}")
-print(f"Volume: {candle.volume}")
 ```
 
 ---
 
 ## Error Handling
 
-Common exceptions and their meanings:
+Common exceptions:
 
 ### ImportError
 
@@ -665,85 +537,6 @@ Common exceptions and their meanings:
 - Invalid PyneSys API key
 - Network/compilation errors
 
-**Example Error Handling:**
-
-```python
-try:
-    with OHLCVReader(data_path) as reader:
-        runner = ScriptRunner(script_path, reader, syminfo)
-        runner.run()
-except FileNotFoundError as e:
-    print(f"File not found: {e}")
-except ImportError as e:
-    print(f"Script error: {e}")
-except ValueError as e:
-    print(f"Data error: {e}")
-```
 
 ---
 
-## New Features Examples
-
-### Automatic Data Conversion (CLI-equivalent)
-
-```python
-from pynecore.core.data_converter import DataConverter
-from pynecore.core.script_runner import ScriptRunner
-from pynecore.core.syminfo import SymInfo
-from pynecore.core.ohlcv_file import OHLCVReader
-from pathlib import Path
-
-
-def run_script_with_any_format(script_path: Path, data_path: Path):
-    """
-    Programmatic equivalent of: pyne run script.py data.csv
-    Handles automatic conversion like the CLI does.
-    """
-    converter = DataConverter()
-
-    # Convert non-OHLCV files automatically
-    if data_path.suffix != ".ohlcv":
-        if converter.is_conversion_required(data_path):
-            print(f"Auto-converting {data_path.suffix} to OHLCV...")
-
-            converter.convert_to_ohlcv(
-                file_path=data_path,
-                force=True  # Ensure fresh conversion
-            )
-
-        # Point to converted file
-        data_path = data_path.with_suffix(".ohlcv")
-
-    # Load auto-generated or existing symbol info
-    syminfo = SymInfo.load_toml(data_path.with_suffix(".toml"))
-
-    # Run script normally
-    with OHLCVReader(data_path) as reader:
-        runner = ScriptRunner(script_path, reader, syminfo)
-        runner.run()
-
-
-# Usage
-run_script_with_any_format(
-    script_path=Path("my_strategy.py"),
-    data_path=Path("BTCUSDT_1h.csv")  # Automatic conversion
-)
-```
-
-### Advanced Data Analysis During Conversion
-
-```python
-from pynecore.core.ohlcv_file import OHLCVWriter
-from pathlib import Path
-
-# Convert with automatic tick size and trading hours analysis
-with OHLCVWriter(Path("analyzed_data.ohlcv"), truncate=True) as writer:
-    writer.load_from_csv(Path("market_data.csv"))
-
-    # Access analysis results
-    print(f"Detected tick size: {writer.analyzed_tick_size}")
-    print(f"Price scale: {writer.analyzed_price_scale}")
-    print(f"Min move: {writer.analyzed_min_move}")
-
-# Analysis results can be used to generate accurate TOML configurations
-```
