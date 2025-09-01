@@ -333,7 +333,7 @@ Auto-detects symbol and provider from filename.
 
 **Returns:** `(symbol, provider)` tuple
 
-**Pattern Examples:** `BTCUSDT.csv` → `("BTC/USDT", None)`, `BYBIT_ETHUSDT_1h.csv` → `("ETH/USDT", "bybit")`
+**Pattern Examples:** `BTCUSDT_1h.csv` → `("BTC/USDT", "ccxt")`, `BYBIT_ETHUSDT_1h.csv` → `("ETH/USDT", "bybit")`
 
 #### is_conversion_required()
 

@@ -168,7 +168,7 @@ from pynecore.core.data_converter import DataConverter
 converter = DataConverter()
 
 # Auto-detect symbol from filename
-# BTCUSDT_1h.csv → Symbol: BTC/USDT
+# BTCUSDT_1h.csv → Symbol: BTC/USDT, Provider: ccxt
 converter.convert_to_ohlcv(
     file_path=Path("BTCUSDT_1h.csv"),
     force=True  # Overwrite existing
