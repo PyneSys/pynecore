@@ -15,7 +15,8 @@ tags: ["programmatic", "api", "python", "automation", "integration"]
 
 # Programmatic API
 
-Execute PyneCore scripts and manage data programmatically with Python. Every CLI command has a programmatic equivalent.
+Execute PyneCore scripts and manage data programmatically with Python.
+
 
 ## Key Features
 
