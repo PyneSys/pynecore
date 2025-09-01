@@ -15,7 +15,7 @@ tags: ["api-reference", "classes", "methods", "ohlcv", "syminfo", "scriptrunner"
 
 # Programmatic API Reference
 
-Complete API reference for PyneCore's programmatic Python interface.
+API reference for PyneCore's programmatic Python interface.
 
 ## Core Classes Overview
 
@@ -27,7 +27,7 @@ Complete API reference for PyneCore's programmatic Python interface.
 | `DataConverter` | Convert CSV/JSON/TXT to OHLCV | `pyne data convert-from`      |
 | `SymInfo`       | Symbol metadata management    | TOML files in workdir         |
 | `PyneComp`      | Pine Script compilation       | `pyne compile`                |
-| Data Providers  | Download market data          | `pyne data download`          |
+| `DataProviders` | Download market data          | `pyne data download`          |
 
 ---
 
