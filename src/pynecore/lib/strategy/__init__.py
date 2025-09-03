@@ -1,6 +1,5 @@
 from typing import cast, TYPE_CHECKING
 
-import math
 from datetime import datetime, UTC
 from collections import deque
 from copy import copy
@@ -58,6 +57,7 @@ long = direction.long
 short = direction.short
 
 # Possible order types
+_order_type_normal = _OrderType()
 _order_type_entry = _OrderType()
 _order_type_close = _OrderType()
 
@@ -86,6 +86,7 @@ class Order:
         "trail_triggered",
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
         "is_market_order",  # Flag to check if this is a market order
+        "cancelled",  # Flag to mark order as cancelled by OCA
     )
 
     def __init__(
@@ -93,12 +94,12 @@ class Order:
             order_id: str | None,
             size: float,
             *,
-            order_type: _OrderType,
+            order_type: _OrderType = _order_type_normal,
             exit_id: str | None = None,
             limit: float | None = None,
             stop: float | None = None,
             oca_name: str | None = None,
-            oca_type: _oca.Oca | None = None,
+            oca_type: _oca.Oca = _oca.none,
             comment: str | None = None,
             alert_message: str | None = None,
             trail_price: float | None = None,
@@ -117,7 +118,7 @@ class Order:
         self.exit_id = exit_id
 
         self.oca_name = oca_name
-        self.oca_type = oca_type
+        self.oca_type = oca_type if oca_type is not None else _oca.none
 
         self.comment = comment
         self.alert_message = alert_message
@@ -131,7 +132,10 @@ class Order:
         self.trail_points_ticks = trail_points_ticks
 
         # Check if this is a market order (no limit, stop, or trail price)
-        self.is_market_order = self.limit is None and self.stop is None and self.trail_price is None
+        self.is_market_order = self.limit is None and self.stop is None
+
+        # Initialize cancelled flag
+        self.cancelled = False
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -225,7 +229,8 @@ class Position:
     exit_orders: dict[str, Order]
 
     open_trades: list[Trade]
-    closed_trades: list[Trade]
+
+    closed_trades: deque[Trade]
     new_closed_trades: list[Trade]
     closed_trades_count: int
 
@@ -238,6 +243,8 @@ class Position:
     avg_price: float = 0.0
 
     cum_profit: float | NA[float] = 0.0
+
+    had_reversal_in_this_bar: bool = False
 
     # Risk management settings
     risk_allowed_direction: direction.Direction | None = None
@@ -266,7 +273,7 @@ class Position:
         self.exit_orders = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
 
         self.open_trades = []
-        self.closed_trades = []
+        self.closed_trades = deque(maxlen=9000)  # 9000 is the limit of TV
         self.closed_trades_count = 0
         self.new_closed_trades = []
 
@@ -315,12 +322,56 @@ class Position:
         self.grossprofit = 0.0
         self.grossloss = 0.0
         self.cum_profit = 0.0
+        self.had_reversal_in_this_bar = False
 
     @property
     def equity(self) -> float | NA[float]:
         """ The current equity """
         assert lib._script is not None
         return lib._script.initial_capital + self.netprofit + self.openprofit
+
+    def _remove_order(self, order: Order):
+        """ Remove an order from the strategy """
+        if order.order_type == _order_type_entry:
+            self.entry_orders.pop(order.order_id, None)
+        elif order.order_type == _order_type_close:
+            self.exit_orders.pop(order.order_id, None)
+
+    def _cancel_oca_group(self, oca_name: str, executed_order: Order):
+        """Cancel all orders in the same OCA group except the executed one"""
+        # Cancel entry orders in the same OCA group
+        for order in self.entry_orders.values():
+            if order.oca_name == oca_name and order != executed_order:
+                order.cancelled = True
+
+        # Cancel exit orders in the same OCA group
+        for order in self.exit_orders.values():
+            if order.oca_name == oca_name and order != executed_order:
+                order.cancelled = True
+
+    def _reduce_oca_group(self, oca_name: str, filled_size: float):
+        """Reduce the size of all orders in the same OCA group"""
+        reduction = abs(filled_size)
+
+        # Reduce entry orders
+        for order in self.entry_orders.values():
+            if order.oca_name == oca_name and not order.cancelled:
+                new_size = abs(order.size) - reduction
+                if new_size <= 0:
+                    # Mark order as cancelled if size would be 0 or negative
+                    order.cancelled = True
+                else:
+                    # Keep original sign
+                    order.size = new_size * order.sign
+
+        # Reduce exit orders
+        for order in self.exit_orders.values():
+            if order.oca_name == oca_name and not order.cancelled:
+                new_size = abs(order.size) - reduction
+                if new_size <= 0:
+                    order.cancelled = True
+                else:
+                    order.size = new_size * order.sign
 
     def _fill_order(self, order: Order, price: float, h: float, l: float):
         """
@@ -331,6 +382,9 @@ class Position:
         :param h: The high price
         :param l: The low price
         """
+        # Save the original order size before any modifications
+        filled_size = abs(order.size)
+        
         script = lib._script
         assert script is not None
         commission_type = script.commission_type
@@ -344,7 +398,7 @@ class Position:
             delete = False
 
             # Check list of open trades
-            open_trades = []
+            new_open_trades = []
             for trade in self.open_trades:
                 # Only use if its order id is the same
                 if order.size != 0.0 and (trade.entry_id == order.order_id or order.order_id is None):
@@ -426,7 +480,7 @@ class Position:
                     # Modify sizes
                     self.size += size
                     # Handle too small sizes because of floating point inaccuracy and rounding
-                    if math.isclose(self.size, 0.0, abs_tol=1 / syminfo._size_round_factor):
+                    if _size_round(self.size) == 0.0:
                         size -= self.size
                         self.size = 0.0
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
@@ -468,9 +522,9 @@ class Position:
                         self.drawdown_summ += closed_trade.commission / 2
                         self.entry_equity += closed_trade.commission / 2
 
-                open_trades.append(trade)
+                new_open_trades.append(trade)
 
-            self.open_trades = open_trades
+            self.open_trades = new_open_trades
             if delete:
                 # Remove from exit_orders dict
                 self.exit_orders.pop(order.exit_id, None)
@@ -550,6 +604,15 @@ class Position:
             self.openprofit = 0.0
             self.open_commission = 0.0
 
+        # Handle OCA groups after order execution
+        # This is done here to avoid code duplication in fill_order()
+        if order.oca_name and order.oca_type:
+            if order.oca_type == _oca.cancel:
+                self._cancel_oca_group(order.oca_name, order)
+            elif order.oca_type == _oca.reduce:
+                # Use the saved original filled_size from the beginning of this method
+                self._reduce_oca_group(order.oca_name, filled_size)
+
     def fill_order(self, order: Order, price: float, h: float, l: float) -> bool:
         """
         Fill an order
@@ -560,11 +623,60 @@ class Position:
         :param l: The low price
         :return: True if the side of the position has changed
         """
+        size_addition = 0.0
+        if order.order_type == _order_type_entry:
+            # Risk management: Check max intraday filled orders
+            if self.risk_max_intraday_filled_orders is not None:
+                if self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders:
+                    # Max intraday filled orders reached - don't fill the entry order
+                    self._remove_order(order)
+                    return False
+
+            # Risk management: Check max position size
+            if self.risk_max_position_size is not None:
+                new_position_size = abs(self.size + order.size)
+                if new_position_size > self.risk_max_position_size:
+                    # Adjust order size to not exceed max position size
+                    max_allowed_size = self.risk_max_position_size - abs(self.size)
+                    if max_allowed_size <= 0:
+                        # Can't add to position - remove order
+                        self._remove_order(order)
+                        return False
+                    # Adjust the order size
+                    order.size = max_allowed_size * order.sign
+
+            # Check risk allowed direction for new positions (when no current position)
+            if self.size == 0.0 and self.risk_allowed_direction is not None:
+                if (order.sign > 0 and self.risk_allowed_direction != long) or \
+                        (order.sign < 0 and self.risk_allowed_direction != short):
+                    # Direction not allowed - don't fill the entry order
+                    self._remove_order(order)
+                    return False
+
+            # If we have an existing position
+            if self.size != 0.0:
+                # Check if the order has the same direction
+                if self.sign == order.sign:
+                    # Check pyramiding limit for entry orders adding to existing position
+                    if lib._script.pyramiding <= len(self.open_trades):
+                        # Pyramiding limit reached - don't fill the entry order
+                        self._remove_order(order)
+                        return False
+
+                # TradingView changes direction of the position
+                else:
+                    # We need to change direction
+                    size_addition = -self.size
+
+                    # It is TradingView's behavior to allow only 1 reversal per bar
+                    if self.had_reversal_in_this_bar:
+                        return False
+                    self.had_reversal_in_this_bar = True
+
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
-        new_size = self.size + order.size
-        if new_size != 0.0 and not math.isclose(new_size, 0.0,
-                                                abs_tol=1 / syminfo._size_round_factor):  # Check for rounding errors
+        new_size = self.size + order.size + size_addition
+        if _size_round(new_size) == 0.0:
             new_size = 0.0
         new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
         if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
@@ -595,18 +707,12 @@ class Position:
                         (new_direction_sign < 0 and self.risk_allowed_direction != short):
                     # Direction not allowed - convert entry to exit only
                     # Don't open new position in restricted direction
+                    self._remove_order(order)
                     return False
 
             # Modify the original order to open a position in the new direction
             order.size = new_size
-            # Store in the appropriate dict based on order type
-            if order.order_type == _order_type_entry:
-                assert order.order_id is not None
-                self.entry_orders[order.order_id] = order
-            else:
-                # Exit orders use exit_id as the key
-                assert order.exit_id is not None
-                self.exit_orders[order.exit_id] = order
+            # Fill the entry order
             self._fill_order(order, price, h, l)
             return True
 
@@ -697,8 +803,17 @@ class Position:
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
 
+        self.had_reversal_in_this_bar = False
+
         # Process all orders: entry orders first, then exit orders (guaranteed order)
-        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
+        # Create a list of orders to process before iteration
+        # This prevents issues when orders are removed during processing
+        orders_to_process = list(self.entry_orders.values()) + list(self.exit_orders.values())
+
+        for order in orders_to_process:
+            # Skip cancelled orders (cancelled by OCA)
+            if order.cancelled:
+                continue
             # For exit orders, calculate limit/stop from entry price if ticks are specified
             if order.order_type == _order_type_close and order.order_id:
                 # Try to find the trade with matching entry_id
@@ -758,7 +873,13 @@ class Position:
                     self._check_low(order)
 
         # 2nd round of process open orders
-        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
+        # Create a new list for the second round (orders might have been removed in first round)
+        orders_to_process = list(self.entry_orders.values()) + list(self.exit_orders.values())
+
+        for order in orders_to_process:
+            # Skip cancelled orders (cancelled by OCA)
+            if order.cancelled:
+                continue
             # For exit orders, calculate limit/stop from entry price if not already done
             if order.order_type == _order_type_close and order.order_id:
                 # Only recalculate if not already set in first round
@@ -956,7 +1077,7 @@ def cancel_all():
     lib._script.position.exit_orders.clear()
 
 
-# noinspection PyProtectedMember,PyShadowingBuiltins
+# noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
 def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA(float),
           qty_percent: float | NA[float] = NA(float), alert_message: str | NA[str] = NA(str),
           immediately: bool = False):
@@ -1001,14 +1122,10 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
     # Store in exit_orders dict
     position.exit_orders[exit_id] = order
     if immediately:
-        round_to_mintick = lib.math.round_to_mintick
-        position.fill_order(order,
-                            round_to_mintick(lib.close),
-                            round_to_mintick(lib.high),
-                            round_to_mintick(lib.low))
+        position.fill_order(order, position.c, position.h, position.l)
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyShadowingNames
 def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = NA(str), immediately: bool = False):
     """
     Creates an order to close an open position completely, regardless of the identifiers of the entry
@@ -1033,11 +1150,7 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
     # Store in exit_orders dict
     position.exit_orders[exit_id] = order
     if immediately:
-        round_to_mintick = lib.math.round_to_mintick
-        position.fill_order(order,
-                            round_to_mintick(lib.close),
-                            round_to_mintick(lib.high),
-                            round_to_mintick(lib.low))
+        position.fill_order(order, position.c, position.h, position.l)
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
@@ -1093,27 +1206,27 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
             if script.commission_type == _commission.percent:
                 # For percentage commission: qty * price * (1 + commission%)
                 commission_multiplier = 1.0 + script.commission_value * 0.01
-                qty = target_investment / (lib.close * syminfo.pointvalue * commission_multiplier)
+                qty = target_investment / (position.c * syminfo.pointvalue * commission_multiplier)
 
             elif script.commission_type == _commission.cash_per_contract:
                 # For cash per contract: qty * price + qty * commission_value
                 # qty * (price + commission_value) = target_investment
-                price_plus_commission = lib.close * syminfo.pointvalue + script.commission_value
+                price_plus_commission = position.c * syminfo.pointvalue + script.commission_value
                 qty = target_investment / price_plus_commission
 
             elif script.commission_type == _commission.cash_per_order:
                 # For cash per order: qty * price + commission_value = target_investment
                 # qty = (target_investment - commission_value) / price
-                qty = (target_investment - script.commission_value) / (lib.close * syminfo.pointvalue)
+                qty = (target_investment - script.commission_value) / (position.c * syminfo.pointvalue)
                 qty = max(0.0, qty)  # Ensure non-negative
 
             else:
                 # No commission
-                qty = target_investment / (lib.close * syminfo.pointvalue)
+                qty = target_investment / (position.c * syminfo.pointvalue)
 
         elif default_qty_type == cash:
             default_qty_value = script.default_qty_value
-            qty = default_qty_value / (lib.close * syminfo.pointvalue)
+            qty = default_qty_value / (position.c * syminfo.pointvalue)
 
         else:
             raise ValueError("Unknown default qty type: ", default_qty_type)
@@ -1125,48 +1238,25 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
     size = qty * direction_sign
-    sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
-
-    # Check pyramiding limit (only for same direction trades)
-    if position.size:
-        if position.sign == sign:
-            # Same direction - check pyramiding
-            if script.pyramiding <= len(script.position.open_trades):
-                return
-
-    # Risk management: Check allowed direction for new positions
-    # Direction changes are handled in fill_order() which will convert entry to exit if needed
-    if position.risk_allowed_direction is not None:
-        if (sign > 0 and position.risk_allowed_direction != long) or \
-                (sign < 0 and position.risk_allowed_direction != short):
-            # Check if this would be a new position (not a direction change)
-            if not position.size or position.sign == sign:
-                return  # Block new positions in restricted direction
-            # For direction changes, let fill_order() handle the conversion to exit
-
-    # Risk management: Check max position size
-    if position.risk_max_position_size is not None:
-        new_position_size = abs(position.size + size)
-        if new_position_size > position.risk_max_position_size:
-            # Adjust size to not exceed max position size
-            max_allowed_size = position.risk_max_position_size - abs(position.size)
-            if max_allowed_size <= 0:
-                return
-            size = max_allowed_size * sign
-
-    # Risk management: Check max intraday filled orders
-    if position.risk_max_intraday_filled_orders is not None:
-        if position.risk_intraday_filled_orders >= position.risk_max_intraday_filled_orders:
-            return
 
     size = _size_round(size)
     if size == 0.0:
         return
 
-    if limit is not None:
+    if isinstance(limit, NA):
+        limit = None
+    elif limit is not None:
         limit = _price_round(limit, direction_sign)
-    if stop is not None:
+    if isinstance(stop, NA):
+        stop = None
+    elif stop is not None:
         stop = _price_round(stop, -direction_sign)
+
+        # If it has an already filled stop, it must be a market order
+        if direction_sign == 1.0 and stop <= position.c:
+            stop = None
+        elif direction_sign == -1.0 and stop >= position.c:
+            stop = None
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
@@ -1181,7 +1271,7 @@ def exit(id: str, from_entry: str = "",
          loss: float | NA[float] = NA(float), stop: float | NA[float] = NA(float),
          trail_price: float | NA[float] = NA(float), trail_points: float | NA[float] = NA(float),
          trail_offset: float | NA[float] = NA(float),
-         oca_name: str | NA[str] = NA(str),
+         oca_name: str | NA[str] = NA(str), oca_type: _oca.Oca | None = None,
          comment: str | NA[str] = NA(str), comment_profit: str | NA[str] = NA(str),
          comment_loss: str | NA[str] = NA(str), comment_trailing: str | NA[str] = NA(str),
          alert_message: str | NA[str] = NA(str), alert_profit: str | NA[str] = NA(str),
@@ -1202,6 +1292,7 @@ def exit(id: str, from_entry: str = "",
     :param trail_points: The trailing stop activation distance, expressed in ticks
     :param trail_offset: The trailing stop offset
     :param oca_name: The name of the order cancel/replace group
+    :param oca_type: The type of the order cancel/replace group
     :param comment: Additional notes on the filled order
     :param comment_profit: Additional notes on the filled order
     :param comment_loss: Additional notes on the filled order
@@ -1225,7 +1316,7 @@ def exit(id: str, from_entry: str = "",
     size = 0.0
 
     def _exit():
-        nonlocal limit, stop, trail_price, from_entry, direction, size
+        nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
         if isinstance(qty, NA):
             size = -size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) else -size
@@ -1252,13 +1343,25 @@ def exit(id: str, from_entry: str = "",
         if not isinstance(trail_price, NA):
             trail_price = _price_round(trail_price, direction)
 
+        # Default OCA settings for strategy.exit() - matches TradingView behavior
+        # If no oca_name is specified, create a default OCA reduce group
+        if isinstance(oca_name, NA):
+            # Use a unique name based on the exit id and from_entry
+            oca_name = f"__exit_{id}_{from_entry}_oca__"
+            # Default to reduce type (TradingView behavior)
+            oca_type = _oca.reduce
+        else:
+            # If oca_name is provided but no type, default to reduce
+            if oca_type is None:
+                oca_type = _oca.reduce
+
         # Store in exit_orders dict
         position.exit_orders[id] = Order(
             from_entry, size, exit_id=id, order_type=_order_type_close,
             limit=limit, stop=stop,
             trail_price=trail_price, trail_offset=trail_offset,
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
-            oca_name=oca_name, comment=comment, alert_message=alert_message
+            oca_name=oca_name, oca_type=oca_type, comment=comment, alert_message=alert_message
         )
 
     # Find direction and size
@@ -1295,7 +1398,7 @@ def exit(id: str, from_entry: str = "",
                     _exit()
 
 
-# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal
 def order(id: str, direction: direction.Direction, qty: int | float | NA[float] = NA(float),
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
@@ -1396,30 +1499,6 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         if abs(size) > abs(position.size):
             size = -position.size
 
-    # Risk management checks only apply to entry orders
-    if order_type == _order_type_entry:
-        # Risk management: Check allowed direction for new positions
-        if position.risk_allowed_direction is not None:
-            if (sign > 0 and position.risk_allowed_direction != long) or \
-                    (sign < 0 and position.risk_allowed_direction != short):
-                # Block new positions in restricted direction
-                return
-
-        # Risk management: Check max position size
-        if position.risk_max_position_size is not None:
-            new_position_size = abs(position.size + size)
-            if new_position_size > position.risk_max_position_size:
-                # Adjust size to not exceed max position size
-                max_allowed_size = position.risk_max_position_size - abs(position.size)
-                if max_allowed_size <= 0:
-                    return
-                size = max_allowed_size * sign
-
-        # Risk management: Check max intraday filled orders
-        if position.risk_max_intraday_filled_orders is not None:
-            if position.risk_intraday_filled_orders >= position.risk_max_intraday_filled_orders:
-                return
-
     size = _size_round(size)
     if size == 0.0:
         return
@@ -1431,12 +1510,22 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     # Create the order
     if order_type == _order_type_entry:
+        # Check if order already exists and is cancelled - don't recreate cancelled orders
+        existing_order = position.entry_orders.get(id)
+        if existing_order and existing_order.cancelled:
+            return  # Don't recreate cancelled orders
+
         # Entry order - stores in entry_orders dict
         order = Order(id, size, order_type=order_type, limit=limit, stop=stop,
                       oca_name=oca_name, oca_type=oca_type, comment=comment,
                       alert_message=alert_message)
         position.entry_orders[id] = order
     else:
+        # Check if order already exists and is cancelled - don't recreate cancelled orders
+        existing_order = position.exit_orders.get(exit_id)
+        if existing_order and existing_order.cancelled:
+            return  # Don't recreate cancelled orders
+
         # Exit order - stores in exit_orders dict
         order = Order(None, size, order_type=order_type, exit_id=exit_id,
                       limit=limit, stop=stop, oca_name=oca_name, oca_type=oca_type,
