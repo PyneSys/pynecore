@@ -72,7 +72,7 @@ def _round_price(price: float, lib: ModuleType):
         from .. import lib
     syminfo = lib.syminfo
     scaled = round(price * syminfo.pricescale)
-    return scaled * syminfo.mintick
+    return scaled / syminfo.pricescale
 
 
 # noinspection PyShadowingNames

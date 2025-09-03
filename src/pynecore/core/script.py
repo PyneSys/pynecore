@@ -50,7 +50,7 @@ class InputData:
     display: _display.Display | None = None
 
 
-old_input_values: dict[str, Any] = {}
+_old_input_values: dict[str, Any] = {}
 inputs: dict[str | None, InputData] = {}
 
 
@@ -73,7 +73,7 @@ class Script:
     format: _format.Format = _format.inherit
     precision: int | None = None
     scale: _scale.Scale | None = None
-    pyramiding: int = 0
+    pyramiding: int = 1
     calc_on_order_fills: bool = False
     calc_on_every_tick: bool = False
     max_bars_back: int = 0
@@ -153,6 +153,9 @@ class Script:
 
         # Save inputs
         for arg_name, input_data in self.inputs.items():
+            # Skip None keys (can happen with some input configurations)
+            if arg_name is None:
+                continue
             lines.append(f"\n[inputs.{arg_name.removesuffix('__global__')}]")
             lines.append("# Input metadata, cannot be modified")
 
@@ -167,8 +170,8 @@ class Script:
             lines.append("# Change here to modify the input value")
 
             # Add the actual value
-            if input_data.defval is not None and arg_name in old_input_values:
-                lines.append(f"value = {_format_value(old_input_values[arg_name])}")
+            if input_data.defval is not None and arg_name in _old_input_values:
+                lines.append(f"value = {_format_value(_old_input_values[arg_name])}")
             else:
                 lines.append("#value =")
 
@@ -207,8 +210,8 @@ class Script:
         for arg_name, arg_data in data['inputs'].items():
             if 'value' not in arg_data:
                 continue
-            old_input_values[arg_name] = arg_data['value']
-            old_input_values[arg_name + '__global__'] = arg_data['value']  # For strict mode
+            _old_input_values[arg_name] = arg_data['value']
+            _old_input_values[arg_name + '__global__'] = arg_data['value']  # For strict mode
 
     #
     # decorators
@@ -223,6 +226,10 @@ class Script:
         if toml_path.exists():
             self.load(toml_path)
 
+        # Pyramiding must be at least 1
+        if self.pyramiding <= 0:
+            self.pyramiding = 1
+
         def decorator(func):
             # Save inputs to script instance then clear inputs (for next script)
             self.inputs = inputs.copy()  # type: ignore
@@ -236,7 +243,7 @@ class Script:
                 if os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules:
                     self.save(toml_path)
 
-            old_input_values.clear()
+            _old_input_values.clear()
             return func
 
         return decorator
@@ -523,7 +530,7 @@ class _Input:
             group=group,
             display=display,
         )
-        return defval if _id not in old_input_values else old_input_values[_id]
+        return defval if _id not in _old_input_values else _old_input_values[_id]
 
     @classmethod
     def _int(cls, defval: int, title: str | None = None, *,
@@ -564,7 +571,7 @@ class _Input:
             options=options,
             display=display,
         )
-        return defval if _id not in old_input_values else safe_convert.safe_int(old_input_values[_id])
+        return defval if _id not in _old_input_values else safe_convert.safe_int(_old_input_values[_id])
 
     @classmethod
     def _bool(cls, defval: bool, title: str | None = None, *,
@@ -596,7 +603,7 @@ class _Input:
             confirm=confirm,
             display=display,
         )
-        return defval if _id not in old_input_values else bool(old_input_values[_id])
+        return defval if _id not in _old_input_values else bool(_old_input_values[_id])
 
     @classmethod
     def _float(cls, defval: float, title: str | None = None, *,
@@ -637,7 +644,7 @@ class _Input:
             options=options,
             display=display,
         )
-        return defval if _id not in old_input_values else safe_convert.safe_float(old_input_values[_id])
+        return defval if _id not in _old_input_values else safe_convert.safe_float(_old_input_values[_id])
 
     @classmethod
     def string(cls, defval: str, title: str | None = None, *,
@@ -673,7 +680,7 @@ class _Input:
             display=display,
             options=options,
         )
-        return defval if _id not in old_input_values else str(old_input_values[_id])
+        return defval if _id not in _old_input_values else str(_old_input_values[_id])
 
     @classmethod
     def color(cls, defval: Color, title: str | None = None, *,
@@ -705,7 +712,7 @@ class _Input:
             confirm=confirm,
             display=display,
         )
-        return defval if _id not in old_input_values else Color(old_input_values[_id])
+        return defval if _id not in _old_input_values else Color(_old_input_values[_id])
 
     @classmethod
     def source(cls, defval: str | Source, title: str | None = None, *,
@@ -740,7 +747,7 @@ class _Input:
             display=display,
         )
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
-        return cast(Series[float], defval if _id not in old_input_values else old_input_values[_id])
+        return cast(Series[float], defval if _id not in _old_input_values else _old_input_values[_id])
 
     @classmethod
     def enum(cls, defval: TEnum, title: str | None = None, *,
@@ -776,11 +783,11 @@ class _Input:
             display=display,
             options=options,
         )
-        if _id not in old_input_values:
+        if _id not in _old_input_values:
             return defval
         else:
             # Convert string value back to the specific enum type
-            value = old_input_values[_id]
+            value = _old_input_values[_id]
             if isinstance(value, str):
                 try:
                     return defval.__class__(value)
