@@ -332,10 +332,11 @@ class Position:
 
     def _remove_order(self, order: Order):
         """ Remove an order from the strategy """
-        if order.order_type == _order_type_entry:
-            self.entry_orders.pop(order.order_id, None)
-        elif order.order_type == _order_type_close:
+        if order.order_type == _order_type_close:
             self.exit_orders.pop(order.order_id, None)
+        else:
+            # Both entry and normal orders are stored in entry_orders dict
+            self.entry_orders.pop(order.order_id, None)
 
     def _cancel_oca_group(self, oca_name: str, executed_order: Order):
         """Cancel all orders in the same OCA group except the executed one"""
@@ -384,7 +385,7 @@ class Position:
         """
         # Save the original order size before any modifications
         filled_size = abs(order.size)
-        
+
         script = lib._script
         assert script is not None
         commission_type = script.commission_type
@@ -393,7 +394,7 @@ class Position:
         new_closed_trades = []
         closed_trade_size = 0.0
 
-        # Close order
+        # Close order - if it is an exit order or a normal order
         if self.size and order.order_type != _order_type_entry and order.sign != self.sign:
             delete = False
 
@@ -401,7 +402,9 @@ class Position:
             new_open_trades = []
             for trade in self.open_trades:
                 # Only use if its order id is the same
-                if order.size != 0.0 and (trade.entry_id == order.order_id or order.order_id is None):
+                if order.size != 0.0 and (trade.entry_id == order.order_id
+                                          or order.order_type == _order_type_normal
+                                          or order.order_id is None):
                     delete = True
 
                     size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
@@ -432,10 +435,8 @@ class Position:
                     self.drawdown_summ += drawdown
                     self.runup_summ += runup
 
-                    assert order.exit_id is not None
-
                     closed_trade.size = -size
-                    closed_trade.exit_id = order.exit_id
+                    closed_trade.exit_id = order.exit_id if order.exit_id is not None else order.order_id
                     closed_trade.exit_bar_index = int(lib.bar_index)
                     closed_trade.exit_time = lib._time
                     closed_trade.exit_price = price
@@ -591,10 +592,10 @@ class Position:
             self.open_commission += commission
 
             # Remove the order from the appropriate dict
-            if order.order_type == _order_type_entry and order.order_id:
-                self.entry_orders.pop(order.order_id, None)
-            elif order.exit_id:
+            if order.exit_id:
                 self.exit_orders.pop(order.exit_id, None)
+            else:
+                self.entry_orders.pop(order.order_id, None)
 
         # If position has just closed
         if not self.open_trades:
@@ -624,7 +625,8 @@ class Position:
         :return: True if the side of the position has changed
         """
         size_addition = 0.0
-        if order.order_type == _order_type_entry:
+        # Apply risk management only to entry orders, not normal orders from strategy.order()
+        if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
             # Risk management: Check max intraday filled orders
             if self.risk_max_intraday_filled_orders is not None:
                 if self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders:
@@ -654,7 +656,7 @@ class Position:
                     return False
 
             # If we have an existing position
-            if self.size != 0.0:
+            if self.size != 0.0 and order.order_type == _order_type_entry:
                 # Check if the order has the same direction
                 if self.sign == order.sign:
                     # Check pyramiding limit for entry orders adding to existing position
@@ -672,6 +674,9 @@ class Position:
                     if self.had_reversal_in_this_bar:
                         return False
                     self.had_reversal_in_this_bar = True
+
+        # For normal orders (_order_type_normal), no special risk management or pyramiding limits apply
+        # They simply add to or subtract from the position as requested
 
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
@@ -725,16 +730,16 @@ class Position:
         """ Check high stop and trailing trigger """
         if order.stop is None:
             return
-        if ((order.order_type == _order_type_close and order.size > 0) or (
-                order.order_type == _order_type_entry and order.size > 0)) and order.stop <= self.h:
+        # Long stop order (size > 0) triggers when price rises to stop level
+        if order.size > 0 and order.stop <= self.h:
             p = max(order.stop, self.o)
             self.fill_order(order, p, p, self.l)
 
     def _check_high(self, order: Order):
         """ Check high limit """
         if order.limit is not None:
-            if ((order.order_type == _order_type_close and order.size < 0) or (
-                    order.order_type == _order_type_entry and order.size < 0)) and order.limit <= self.h:
+            # Short limit order (size < 0) triggers when price rises to limit level
+            if order.size < 0 and order.limit <= self.h:
                 p = max(order.limit, self.o)
                 self.fill_order(order, p, p, self.l)
 
@@ -752,16 +757,16 @@ class Position:
         """ Check low stop """
         if order.stop is None:
             return
-        if ((order.order_type == _order_type_close and order.size < 0) or (
-                order.order_type == _order_type_entry and order.size < 0)) and order.stop >= self.l:
+        # Short stop order (size < 0) triggers when price falls to stop level
+        if order.size < 0 and order.stop >= self.l:
             p = min(self.o, order.stop)
             self.fill_order(order, p, self.h, p)
 
     def _check_low(self, order: Order):
         """ Check low limit """
         if order.limit is not None:
-            if ((order.order_type == _order_type_close and order.size > 0) or (
-                    order.order_type == _order_type_entry and order.size > 0)) and order.limit >= self.l:
+            # Long limit order (size > 0) triggers when price falls to limit level
+            if order.size > 0 and order.limit >= self.l:
                 p = min(self.o, order.limit)
                 self.fill_order(order, p, self.h, p)
 
@@ -1336,11 +1341,17 @@ def exit(id: str, from_entry: str = "",
         if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
             return
 
-        if not isinstance(limit, NA):
+        if isinstance(limit, NA):
+            limit = None
+        elif not isinstance(limit, NA):
             limit = _price_round(limit, direction)
-        if not isinstance(stop, NA):
+        if isinstance(stop, NA):
+            stop = None
+        elif not isinstance(stop, NA):
             stop = _price_round(stop, -direction)
-        if not isinstance(trail_price, NA):
+        if isinstance(trail_price, NA):
+            trail_price = None
+        elif not isinstance(trail_price, NA):
             trail_price = _price_round(trail_price, direction)
 
         # Default OCA settings for strategy.exit() - matches TradingView behavior
@@ -1434,6 +1445,7 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     position = script.position
 
     # Risk management: Check if trading is halted
+    # TODO: investigate if it should be checked here
     if position.risk_halt_trading:
         return
 
@@ -1479,58 +1491,31 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
     size = qty * direction_sign
-    sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
     # NOTE: Unlike strategy.entry, strategy.order is NOT affected by pyramiding limit
     # This is a key difference - strategy.order can open unlimited trades in the same direction
-
-    # Determine order type based on current position
-    # If opening new position or adding to existing position in the same direction -> entry order
-    # If reducing or closing position -> exit order
-    order_type = _order_type_entry
-    exit_id = None
-
-    # Check if this is an exit order (opposite direction to current position)
-    if position.size != 0.0 and sign != position.sign:
-        # This order will reduce or close the position
-        order_type = _order_type_close
-        exit_id = id
-        # Limit the size to the current position size
-        if abs(size) > abs(position.size):
-            size = -position.size
+    # It uses _order_type_normal to distinguish it from entry/exit orders
 
     size = _size_round(size)
     if size == 0.0:
         return
 
-    if limit is not None:
+    if isinstance(limit, NA):
+        limit = None
+    elif limit is not None:
         limit = _price_round(limit, direction_sign)
-    if stop is not None:
+    if isinstance(stop, NA):
+        stop = None
+    elif stop is not None:
         stop = _price_round(stop, -direction_sign)
 
-    # Create the order
-    if order_type == _order_type_entry:
-        # Check if order already exists and is cancelled - don't recreate cancelled orders
-        existing_order = position.entry_orders.get(id)
-        if existing_order and existing_order.cancelled:
-            return  # Don't recreate cancelled orders
-
-        # Entry order - stores in entry_orders dict
-        order = Order(id, size, order_type=order_type, limit=limit, stop=stop,
-                      oca_name=oca_name, oca_type=oca_type, comment=comment,
-                      alert_message=alert_message)
-        position.entry_orders[id] = order
-    else:
-        # Check if order already exists and is cancelled - don't recreate cancelled orders
-        existing_order = position.exit_orders.get(exit_id)
-        if existing_order and existing_order.cancelled:
-            return  # Don't recreate cancelled orders
-
-        # Exit order - stores in exit_orders dict
-        order = Order(None, size, order_type=order_type, exit_id=exit_id,
-                      limit=limit, stop=stop, oca_name=oca_name, oca_type=oca_type,
-                      comment=comment, alert_message=alert_message)
-        position.exit_orders[exit_id] = order
+    # Create the order with _order_type_normal
+    # This is a "normal" order that simply adds to or subtracts from position
+    # It doesn't follow entry/exit rules and can freely modify positions
+    order = Order(id, size, order_type=_order_type_normal, limit=limit, stop=stop,
+                  oca_name=oca_name, oca_type=oca_type, comment=comment,
+                  alert_message=alert_message)
+    position.entry_orders[id] = order
 
 
 #
