@@ -254,7 +254,7 @@ def round_to_mintick(number: TFI | NA[TFI]) -> float | NA[float]:
     """
     Returns value rounded to symbol's mintick with ties rounding up.
     """
-    return int(number / syminfo.mintick + 0.5) * syminfo.mintick
+    return int(number * syminfo.pricescale + 0.5) / syminfo.pricescale
 
 
 def sign(number: TFI | NA[TFI]) -> float | NA[float]:
