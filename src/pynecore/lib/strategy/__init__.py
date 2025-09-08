@@ -1027,21 +1027,21 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
     """
     if isinstance(price, NA):
         return NA(float)
-    mintick = syminfo.mintick
-    ppmt = round(cast(float, price / mintick), 5)
-    ppmt_int = int(ppmt)
+    pricescale = syminfo.pricescale
+    pmp = round(cast(float, price * pricescale), 7)
+    pmp_int = int(pmp)
 
     if direction < 0:
         # Round down
-        return ppmt_int * mintick
+        return pmp_int / pricescale
     else:
-        # Round up only if ppmt is not already an integer
-        if ppmt == ppmt_int:
+        # Round up only if pmp is not already an integer
+        if pmp == pmp_int:
             # Already an integer, no rounding needed
-            return ppmt_int * mintick
+            return pmp_int / pricescale
         else:
             # Not an integer, round up
-            return (ppmt_int + 1) * mintick
+            return (pmp_int + 1) * pricescale
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
