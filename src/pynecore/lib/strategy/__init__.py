@@ -1,8 +1,9 @@
 from typing import cast, TYPE_CHECKING
 
 from datetime import datetime, UTC
-from collections import deque
+from collections import deque, defaultdict
 from copy import copy
+from bisect import insort, bisect_left
 
 from ...core.module_property import module_property
 from ... import lib
@@ -205,12 +206,153 @@ class Trade:
 
     def get(self, key: str, default=None):
         v = getattr(self, key, default)
-        assert v is not None
         if key in ('entry_time', 'exit_time'):
             v = datetime.fromtimestamp(v / 1000.0, tz=UTC)
         elif isinstance(v, float):
             v = round(v, 10)
         return v
+
+
+# noinspection PyShadowingNames
+class PriceOrderBook:
+    """
+    Price-based sorted order storage.
+    An order can appear multiple times at different prices.
+    """
+
+    __slots__ = ('price_levels', 'orders_at_price', 'order_prices')
+
+    def __init__(self):
+        self.price_levels = []  # Sorted list of prices
+        self.orders_at_price = defaultdict(list)  # price -> [Order]
+        self.order_prices = defaultdict(set)  # Order -> {prices}
+
+    def add_order(self, order: Order):
+        """Add order to all its relevant price levels"""
+        # Add to stop price if exists
+        if order.stop is not None:
+            price = order.stop
+            if price not in self.orders_at_price:
+                insort(self.price_levels, price)
+            self.orders_at_price[price].append(order)
+            self.order_prices[order].add(price)
+
+        # Add to limit price if exists
+        if order.limit is not None:
+            price = order.limit
+            if price not in self.orders_at_price:
+                insort(self.price_levels, price)
+            self.orders_at_price[price].append(order)
+            self.order_prices[order].add(price)
+
+        # Add to trail price if exists
+        if order.trail_price is not None:
+            price = order.trail_price
+            if price not in self.orders_at_price:
+                insort(self.price_levels, price)
+            self.orders_at_price[price].append(order)
+            self.order_prices[order].add(price)
+
+    def remove_order(self, order: Order):
+        """Remove order from all price levels"""
+        for price in list(self.order_prices[order]):
+            self.orders_at_price[price].remove(order)
+            if not self.orders_at_price[price]:
+                idx = bisect_left(self.price_levels, price)
+                if idx < len(self.price_levels) and self.price_levels[idx] == price:
+                    del self.price_levels[idx]
+                del self.orders_at_price[price]
+        del self.order_prices[order]
+
+    def update_order_stop(self, order: Order, new_stop: float):
+        """Update the stop price of an order in the order book"""
+        # Remove the order from the old stop price level if it exists
+        if order.stop is not None and order.stop in self.order_prices[order]:
+            old_stop = order.stop
+            self.orders_at_price[old_stop].remove(order)
+            self.order_prices[order].remove(old_stop)
+            if not self.orders_at_price[old_stop]:
+                idx = bisect_left(self.price_levels, old_stop)
+                if idx < len(self.price_levels) and self.price_levels[idx] == old_stop:
+                    del self.price_levels[idx]
+                del self.orders_at_price[old_stop]
+
+        # Update the order's stop price
+        order.stop = new_stop
+
+        # Add the order to the new stop price level
+        if new_stop not in self.orders_at_price:
+            insort(self.price_levels, new_stop)
+        self.orders_at_price[new_stop].append(order)
+        self.order_prices[order].add(new_stop)
+
+    def iter_orders(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
+        """
+        Iterate over orders within price range.
+
+        Examples:
+            iter_orders()  # All orders, ascending
+            iter_orders(desc=True)  # All orders, descending
+            iter_orders(min_price=50.0)  # 50, 51, 52, ... (ascending)
+            iter_orders(max_price=60.0)  # 60, 59, 58, ... (descending)
+            iter_orders(min_price=50.0, max_price=60.0)  # 50, 51, ..., 60 (ascending)
+
+        :param desc: If True, iterate in descending order, only if no min_price or max_price is set
+        :param min_price: If set, iterate from this price upward (ascending)
+        :param max_price: If set, iterate from this price downward (descending)
+        :return: Generator yielding Order objects
+        """
+        if min_price is not None and max_price is not None:
+            # Range query - ascending from min to max
+            min_idx = bisect_left(self.price_levels, min_price)
+            max_idx = bisect_left(self.price_levels, max_price)
+            # Include max_price if it matches exactly
+            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
+                max_idx += 1
+            # Create a copy of price levels to avoid iteration issues when levels are removed
+            for p in list(self.price_levels[min_idx:max_idx]):
+                # Create a copy to avoid iteration issues when orders are removed during iteration
+                yield from list(self.orders_at_price[p])
+
+        elif min_price is not None:
+            # Ascending from min_price
+            min_idx = bisect_left(self.price_levels, min_price)
+            # Create a copy of price levels to avoid iteration issues when levels are removed
+            for p in list(self.price_levels[min_idx:]):
+                # Create a copy to avoid iteration issues when orders are removed during iteration
+                yield from list(self.orders_at_price[p])
+
+        elif max_price is not None:
+            # Descending from max_price
+            max_idx = bisect_left(self.price_levels, max_price)
+            # Include max_price if it matches exactly
+            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
+                max_idx += 1
+            # Iterate in reverse order (high to low prices)
+            # Create a copy of price levels to avoid iteration issues when levels are removed
+            # Note: reversed() already creates an iterator over a copy of the slice
+            for p in reversed(list(self.price_levels[:max_idx])):
+                # Create a copy to avoid iteration issues when orders are removed during iteration
+                yield from list(self.orders_at_price[p])
+
+        elif desc:
+            # All orders, descending
+            # Create a copy of price levels to avoid iteration issues when levels are removed
+            for p in reversed(list(self.price_levels)):
+                # Create a copy to avoid iteration issues when orders are removed during iteration
+                yield from list(self.orders_at_price[p])
+        else:
+            # All orders, ascending
+            # Create a copy of price levels to avoid iteration issues when levels are removed
+            for p in list(self.price_levels):
+                # Create a copy to avoid iteration issues when orders are removed during iteration
+                yield from list(self.orders_at_price[p])
+
+    def clear(self):
+        """Clear all orders"""
+        self.price_levels.clear()
+        self.orders_at_price.clear()
+        self.order_prices.clear()
 
 
 # noinspection PyProtectedMember,PyShadowingNames
@@ -220,31 +362,48 @@ class Position:
 
     This is the main class for strategies
     """
+
+    h: float = 0.0
+    l: float = 0.0
+    c: float = 0.0
+    o: float = 0.0
+
     netprofit: float | NA[float] = 0.0
     openprofit: float | NA[float] = 0.0
     grossprofit: float | NA[float] = 0.0
     grossloss: float | NA[float] = 0.0
 
+    # Order book
     entry_orders: dict[str, Order]
     exit_orders: dict[str, Order]
+    market_orders: dict[str, Order]
+    orderbook: PriceOrderBook
 
+    # Open and closed trades
     open_trades: list[Trade]
-
     closed_trades: deque[Trade]
     new_closed_trades: list[Trade]
-    closed_trades_count: int
 
-    wintrades: int
-    eventrades: int
-    losstrades: int
-
+    # Trade stats
+    closed_trades_count: int = 0
+    wintrades: int = 0
+    eventrades: int = 0
+    losstrades: int = 0
     size: float = 0.0
     sign: float = 0.0
     avg_price: float = 0.0
-
     cum_profit: float | NA[float] = 0.0
+    entry_equity = 0.0
+    max_equity = -float("inf")
+    min_equity = float("inf")
+    drawdown_summ = 0.0
+    runup_summ = 0.0
+    max_drawdown = 0.0
+    max_runup = 0.0
+    entry_summ = 0.0
+    open_commission = 0.0
 
-    had_reversal_in_this_bar: bool = False
+    had_entry_in_this_bar: bool = False
 
     # Risk management settings
     risk_allowed_direction: direction.Direction | None = None
@@ -269,108 +428,104 @@ class Position:
     risk_halt_trading: bool = False
 
     def __init__(self):
+        self.market_orders = {}  # Market orders from strategy.market()
         self.entry_orders = {}  # Entry orders from strategy.entry()
         self.exit_orders = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
 
+        # Initialize price-based order books
+        self.orderbook = PriceOrderBook()
+
         self.open_trades = []
         self.closed_trades = deque(maxlen=9000)  # 9000 is the limit of TV
-        self.closed_trades_count = 0
         self.new_closed_trades = []
-
-        self.entry_equity = 0.0
-        self.max_equity = -float("inf")
-        self.min_equity = float("inf")
-        self.drawdown_summ = 0.0
-        self.runup_summ = 0.0
-        self.max_drawdown = 0.0
-        self.max_runup = 0.0
-
-        self.wintrades = 0
-        self.eventrades = 0
-        self.losstrades = 0
-
-        self.entry_summ = 0.0
-        self.open_commission = 0.0
-
-        self.o = self.h = self.l = self.c = 0.0
-
-    def reset(self):
-        """ Reset position variables """
-        self.entry_orders.clear()
-        self.exit_orders.clear()
-        self.open_trades.clear()
-        self.closed_trades.clear()
-        self.closed_trades_count = 0
-        self.new_closed_trades.clear()
-        self.entry_equity = 0.0
-        self.max_equity = -float("inf")
-        self.min_equity = float("inf")
-        self.drawdown_summ = 0.0
-        self.runup_summ = 0.0
-        self.max_drawdown = 0.0
-        self.max_runup = 0.0
-        self.wintrades = 0
-        self.eventrades = 0
-        self.losstrades = 0
-        self.entry_summ = 0.0
-        self.open_commission = 0.0
-        self.size = 0.0
-        self.sign = 0.0
-        self.avg_price = 0.0
-        self.netprofit = 0.0
-        self.openprofit = 0.0
-        self.grossprofit = 0.0
-        self.grossloss = 0.0
-        self.cum_profit = 0.0
-        self.had_reversal_in_this_bar = False
 
     @property
     def equity(self) -> float | NA[float]:
         """ The current equity """
-        assert lib._script is not None
         return lib._script.initial_capital + self.netprofit + self.openprofit
+
+    def _add_order(self, order: Order):
+        """ Add an order to the strategy """
+        # Add market order to market orders dict
+        if order.is_market_order:
+            self.market_orders[order.order_id] = order
+
+        # Check if an order with this ID already exists and remove it first
+        if order.order_type == _order_type_close:
+            existing_order = self.exit_orders.get(order.order_id)
+            self.exit_orders[order.order_id] = order
+        else:
+            # Both entry and normal orders are stored in entry_orders dict
+            existing_order = self.entry_orders.get(order.order_id)
+            self.entry_orders[order.order_id] = order
+
+        # Remove existing order from order book before adding new one
+        if existing_order is not None:
+            self.orderbook.remove_order(existing_order)
+
+        # Add order to order book (automatically adds to all relevant prices)
+        self.orderbook.add_order(order)
 
     def _remove_order(self, order: Order):
         """ Remove an order from the strategy """
+        order.cancelled = True
         if order.order_type == _order_type_close:
             self.exit_orders.pop(order.order_id, None)
         else:
             # Both entry and normal orders are stored in entry_orders dict
             self.entry_orders.pop(order.order_id, None)
+        # Remove market order from market orders dict
+        if order.is_market_order:
+            self.market_orders.pop(order.order_id, None)
+        # Remove order from order book
+        self.orderbook.remove_order(order)
+
+    def _remove_order_by_id(self, order_id: str):
+        """ Remove order by id """
+        # First check in exit orders
+        order = self.exit_orders.get(order_id)
+        if order:
+            self._remove_order(order)
+            return
+
+        # Then check in entry orders
+        order = self.entry_orders.get(order_id)
+        if order:
+            self._remove_order(order)
 
     def _cancel_oca_group(self, oca_name: str, executed_order: Order):
         """Cancel all orders in the same OCA group except the executed one"""
         # Cancel entry orders in the same OCA group
-        for order in self.entry_orders.values():
+        for order in list(self.entry_orders.values()):
             if order.oca_name == oca_name and order != executed_order:
-                order.cancelled = True
+                self._remove_order(order)
 
         # Cancel exit orders in the same OCA group
-        for order in self.exit_orders.values():
+        for order in list(self.exit_orders.values()):
             if order.oca_name == oca_name and order != executed_order:
-                order.cancelled = True
+                self._remove_order(order)
 
     def _reduce_oca_group(self, oca_name: str, filled_size: float):
         """Reduce the size of all orders in the same OCA group"""
         reduction = abs(filled_size)
 
         # Reduce entry orders
-        for order in self.entry_orders.values():
+        for order in list(self.entry_orders.values()):
             if order.oca_name == oca_name and not order.cancelled:
                 new_size = abs(order.size) - reduction
                 if new_size <= 0:
                     # Mark order as cancelled if size would be 0 or negative
-                    order.cancelled = True
+                    self._remove_order(order)
                 else:
                     # Keep original sign
                     order.size = new_size * order.sign
 
         # Reduce exit orders
-        for order in self.exit_orders.values():
+        for order in list(self.exit_orders.values()):
             if order.oca_name == oca_name and not order.cancelled:
                 new_size = abs(order.size) - reduction
                 if new_size <= 0:
-                    order.cancelled = True
+                    self._remove_order(order)
                 else:
                     order.size = new_size * order.sign
 
@@ -387,7 +542,6 @@ class Position:
         filled_size = abs(order.size)
 
         script = lib._script
-        assert script is not None
         commission_type = script.commission_type
         commission_value = script.commission_value
 
@@ -526,9 +680,9 @@ class Position:
                 new_open_trades.append(trade)
 
             self.open_trades = new_open_trades
+
             if delete:
-                # Remove from exit_orders dict
-                self.exit_orders.pop(order.exit_id, None)
+                self._remove_order(order)
 
                 if commission_type == _commission.cash_per_order:
                     # Realize commission
@@ -591,11 +745,8 @@ class Position:
             # Commission summ
             self.open_commission += commission
 
-            # Remove the order from the appropriate dict
-            if order.exit_id:
-                self.exit_orders.pop(order.exit_id, None)
-            else:
-                self.entry_orders.pop(order.order_id, None)
+            # Remove order
+            self._remove_order(order)
 
         # If position has just closed
         if not self.open_trades:
@@ -625,6 +776,7 @@ class Position:
         :return: True if the side of the position has changed
         """
         size_addition = 0.0
+        close_only = False
         # Apply risk management only to entry orders, not normal orders from strategy.order()
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
             # Risk management: Check max intraday filled orders
@@ -655,25 +807,34 @@ class Position:
                     self._remove_order(order)
                     return False
 
-            # If we have an existing position
-            if self.size != 0.0 and order.order_type == _order_type_entry:
-                # Check if the order has the same direction
-                if self.sign == order.sign:
-                    # Check pyramiding limit for entry orders adding to existing position
-                    if lib._script.pyramiding <= len(self.open_trades):
-                        # Pyramiding limit reached - don't fill the entry order
-                        self._remove_order(order)
-                        return False
+            if order.order_type == _order_type_entry:
+                # If we have an existing position
+                if self.size != 0.0:
+                    # Check if the order has the same direction
+                    if self.sign == order.sign:
+                        # Check pyramiding limit for entry orders adding to existing position
+                        if lib._script.pyramiding <= len(self.open_trades):
+                            # Pyramiding limit reached - don't fill the entry order
+                            self._remove_order(order)
+                            return False
 
-                # TradingView changes direction of the position
-                else:
                     # We need to change direction
-                    size_addition = -self.size
+                    # NOTE: It is TradingView's behavior to allow reversal on 1st entry order
+                    elif not self.had_entry_in_this_bar:
+                        size_addition = -self.size
 
-                    # It is TradingView's behavior to allow only 1 reversal per bar
-                    if self.had_reversal_in_this_bar:
+                # We don't allow reversal only as a 1st entry order
+                # TODO: check if this is really correct
+                if self.had_entry_in_this_bar:
+                    # We allow only closing order if pyramiding is enabled and the order has a different direction
+                    if self.sign != 0 and order.sign != self.sign and lib._script.pyramiding > 1:
+                        order.size = -self.size
+                        order.order_type = _order_type_normal
+                    else:
+                        # Direction not allowed - don't fill the entry order
                         return False
-                    self.had_reversal_in_this_bar = True
+                else:
+                    self.had_entry_in_this_bar = True
 
         # For normal orders (_order_type_normal), no special risk management or pyramiding limits apply
         # They simply add to or subtract from the position as requested
@@ -687,7 +848,7 @@ class Position:
         if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
             # Exit orders should never reverse position direction
             # Only entry orders can open new positions or reverse direction
-            if order.order_type == _order_type_close:
+            if order.order_type == _order_type_close or close_only:
                 # Limit the exit order size to just close the position
                 order.size = -self.size
                 self._fill_order(order, price, h, l)
@@ -726,23 +887,59 @@ class Position:
             self._fill_order(order, price, h, l)
             return False
 
-    def _check_high_stop(self, order: Order):
+    def _check_already_filled(self, order: Order) -> bool:
+        """
+        Check if a stop or limit order would be immediately fillable due to a gap.
+        This is called during process_orders when we have the current bar's OHLC values.
+
+        When there's a gap, orders that would normally wait for price movement
+        should execute immediately at the open price.
+
+        :param order: The order to check
+        :return: True if the order should be filled immediately at open price
+        """
+        # Check stop orders with gaps
+        if order.stop is not None:
+            # Long stop order (size > 0): triggers if open gaps above stop level
+            if order.size > 0 and self.o >= order.stop:
+                return True
+            # Short stop order (size < 0): triggers if open gaps below stop level
+            if order.size < 0 and self.o <= order.stop:
+                return True
+
+        # Check limit orders with gaps
+        if order.limit is not None:
+            # Long limit order (size > 0): triggers if open gaps below limit level
+            if order.size > 0 and self.o <= order.limit:
+                return True
+            # Short limit order (size < 0): triggers if open gaps above limit level
+            if order.size < 0 and self.o >= order.limit:
+                return True
+
+        return False
+
+    def _check_high_stop(self, order: Order) -> bool:
         """ Check high stop and trailing trigger """
         if order.stop is None:
-            return
+            return False
         # Long stop order (size > 0) triggers when price rises to stop level
         if order.size > 0 and order.stop <= self.h:
             p = max(order.stop, self.o)
             self.fill_order(order, p, p, self.l)
+            return True
+        return False
 
-    def _check_high(self, order: Order):
+    def _check_high(self, order: Order) -> bool:
         """ Check high limit """
         if order.limit is not None:
             # Short limit order (size < 0) triggers when price rises to limit level
             if order.size < 0 and order.limit <= self.h:
                 p = max(order.limit, self.o)
                 self.fill_order(order, p, p, self.l)
+                return True
+        return False
 
+    def _check_high_trailing(self, order: Order) -> bool:
         # Update trailing stop
         if order.trail_price is not None and order.sign < 0:
             # Check if trailing price has been triggered
@@ -751,25 +948,35 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
+                new_stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
+                if new_stop != order.stop:
+                    # Update the order in the orderbook with the new stop price
+                    self.orderbook.update_order_stop(order, new_stop)
+                return True
+        return False
 
-    def _check_low_stop(self, order: Order):
+    def _check_low_stop(self, order: Order) -> bool:
         """ Check low stop """
         if order.stop is None:
-            return
+            return False
         # Short stop order (size < 0) triggers when price falls to stop level
         if order.size < 0 and order.stop >= self.l:
             p = min(self.o, order.stop)
             self.fill_order(order, p, self.h, p)
+            return True
+        return False
 
-    def _check_low(self, order: Order):
+    def _check_low(self, order: Order) -> bool:
         """ Check low limit """
         if order.limit is not None:
             # Long limit order (size > 0) triggers when price falls to limit level
             if order.size > 0 and order.limit >= self.l:
                 p = min(self.o, order.limit)
                 self.fill_order(order, p, self.h, p)
+                return True
+        return False
 
+    def _check_low_trailing(self, order: Order) -> bool:
         # Update trailing stop
         if order.trail_price is not None and order.sign > 0:
             # Check if trailing price has been triggered
@@ -778,17 +985,26 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
+                new_stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
+                if new_stop != order.stop:
+                    # Update the order in the orderbook with the new stop price
+                    self.orderbook.update_order_stop(order, new_stop)
+                return True
+        return False
 
-    def _check_close(self, order: Order, ohlcv: bool):
+    def _check_close(self, order: Order, ohlc: bool) -> bool:
         """ Check close price if trailing stop is triggered """
+        if order.stop is None:
+            return False
         # open → high → low → close
-        if ohlcv and order.stop <= self.c:
+        if ohlc and order.stop <= self.c:
             self.fill_order(order, order.stop, order.stop, self.l)
-
+            return True
         # open → low → high → close
         elif order.stop >= self.c:
             self.fill_order(order, order.stop, self.h, order.stop)
+            return True
+        return False
 
     def process_orders(self):
         """ Process orders """
@@ -803,132 +1019,127 @@ class Position:
         script = lib._script
 
         # If the order is open → high → low → close or open → low → high → close
-        ohlc = abs(self.h - self.o) < abs(self.l - self.o)
+        ohlc = self.h - self.o < self.o - self.l
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
 
-        self.had_reversal_in_this_bar = False
+        self.had_entry_in_this_bar = False
 
-        # Process all orders: entry orders first, then exit orders (guaranteed order)
-        # Create a list of orders to process before iteration
-        # This prevents issues when orders are removed during processing
-        orders_to_process = list(self.entry_orders.values()) + list(self.exit_orders.values())
+        exit_orders = list(self.exit_orders.values())
 
-        for order in orders_to_process:
-            # Skip cancelled orders (cancelled by OCA)
+        # For exit orders, calculate limit/stop from entry price if ticks are specified
+        for order in exit_orders:
+            # Try to find the trade with matching entry_id
+            entry_price = None
+            for trade in self.open_trades:
+                if trade.entry_id == order.order_id:
+                    entry_price = trade.entry_price
+                    break
+
+            # If we found the entry price and have tick values, calculate the actual prices
+            if entry_price is not None:
+                # Determine direction from the order
+                direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+
+                # Calculate limit from profit_ticks if specified
+                if order.profit_ticks is not None and order.limit is None:
+                    order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
+                    order.limit = _price_round(order.limit, direction)
+
+                # Calculate stop from loss_ticks if specified
+                if order.loss_ticks is not None and order.stop is None:
+                    order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
+                    order.stop = _price_round(order.stop, -direction)
+
+                # Calculate trail_price from trail_points_ticks if specified
+                if order.trail_points_ticks is not None and order.trail_price is None:
+                    order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
+                    order.trail_price = _price_round(order.trail_price, direction)
+
+        # Check for stop/limit orders that should be converted to market orders due to gaps
+        # This must happen BEFORE processing market orders
+        for order in self.orderbook.iter_orders():
+            # Skip cancelled orders from OCA groups
             if order.cancelled:
                 continue
-            # For exit orders, calculate limit/stop from entry price if ticks are specified
-            if order.order_type == _order_type_close and order.order_id:
-                # Try to find the trade with matching entry_id
-                entry_price = None
-                for trade in self.open_trades:
-                    if trade.entry_id == order.order_id:
-                        entry_price = trade.entry_price
-                        break
+            # Check if the order would be filled immediately due to a gap
+            if self._check_already_filled(order):
+                # Convert to market order by removing stop/limit prices
+                # First remove from orderbook at old prices
+                self.orderbook.remove_order(order)
+                # Make it a market order
+                order.is_market_order = True
+                # Add to market orders dict
+                self.market_orders[order.order_id] = order
+                # No need to re-add to orderbook since it's now a market order
 
-                # If we found the entry price and have tick values, calculate the actual prices
-                if entry_price is not None:
-                    # Determine direction from the order
-                    direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+        # 1st pass: Process Market orders
+        market_orders = list(self.market_orders.values())
+        for order in market_orders:
+            # Apply slippage to market orders
+            fill_price = self.o
+            if script.slippage > 0:
+                # Slippage is in ticks, always adverse to trade direction
+                # For long orders (buying), slippage increases the price
+                # For short orders (selling), slippage decreases the price
+                slippage_amount = syminfo.mintick * script.slippage * order.sign
+                fill_price = self.o + slippage_amount
 
-                    # Calculate limit from profit_ticks if specified
-                    if order.profit_ticks is not None and order.limit is None:
-                        order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
-                        order.limit = _price_round(order.limit, direction)
-
-                    # Calculate stop from loss_ticks if specified
-                    if order.loss_ticks is not None and order.stop is None:
-                        order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
-                        order.stop = _price_round(order.stop, -direction)
-
-                    # Calculate trail_price from trail_points_ticks if specified
-                    if order.trail_points_ticks is not None and order.trail_price is None:
-                        order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
-                        order.trail_price = _price_round(order.trail_price, direction)
-
-            # Market orders
-            if order.is_market_order:
-                # Apply slippage to market orders
-                fill_price = self.o
-                if script.slippage > 0:
-                    # Slippage is in ticks, always adverse to trade direction
-                    # For long orders (buying), slippage increases the price
-                    # For short orders (selling), slippage decreases the price
-                    slippage_amount = syminfo.mintick * script.slippage * order.sign
-                    fill_price = self.o + slippage_amount
-
-                # open → high → low → close
-                if ohlc:
-                    self.fill_order(order, fill_price, self.o, self.l)
-                # open → low → high → close
-                else:
-                    self.fill_order(order, fill_price, self.l, self.o)
-
-            # Limit/Stop orders
-            else:
-                # open → high → low → close
-                if ohlc:
-                    self._check_high_stop(order)
-                    self._check_high(order)
-                # open → low → high → close
-                else:
-                    self._check_low_stop(order)
-                    self._check_low(order)
-
-        # 2nd round of process open orders
-        # Create a new list for the second round (orders might have been removed in first round)
-        orders_to_process = list(self.entry_orders.values()) + list(self.exit_orders.values())
-
-        for order in orders_to_process:
-            # Skip cancelled orders (cancelled by OCA)
-            if order.cancelled:
-                continue
-            # For exit orders, calculate limit/stop from entry price if not already done
-            if order.order_type == _order_type_close and order.order_id:
-                # Only recalculate if not already set in first round
-                if ((order.profit_ticks is not None or order.loss_ticks is not None
-                     or order.trail_points_ticks is not None) and order.limit is None and order.stop is None):
-                    # Try to find the trade with matching entry_id
-                    entry_price = None
-                    for trade in self.open_trades:
-                        if trade.entry_id == order.order_id:
-                            entry_price = trade.entry_price
-                            break
-
-                    # If we found the entry price and have tick values, calculate the actual prices
-                    if entry_price is not None:
-                        # Determine direction from the order
-                        direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
-
-                        # Calculate limit from profit_ticks if specified
-                        if order.profit_ticks is not None and order.limit is None:
-                            order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
-                            order.limit = _price_round(order.limit, direction)
-
-                        # Calculate stop from loss_ticks if specified
-                        if order.loss_ticks is not None and order.stop is None:
-                            order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
-                            order.stop = _price_round(order.stop, -direction)
-
-                        # Calculate trail_price from trail_points_ticks if specified
-                        if order.trail_points_ticks is not None and order.trail_price is None:
-                            order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
-                            order.trail_price = _price_round(order.trail_price, direction)
-
-            # Here all market orders should be gone
             # open → high → low → close
             if ohlc:
-                self._check_low_stop(order)
-                self._check_low(order)
+                self.fill_order(order, fill_price, self.o, self.l)
             # open → low → high → close
             else:
-                self._check_high_stop(order)
-                self._check_high(order)
+                self.fill_order(order, fill_price, self.l, self.o)
 
-            if order.trail_triggered and order.stop is not None:
-                self._check_close(order, ohlc)
+        # open → high → low → close
+        if ohlc:
+            # open -> high
+            for order in self.orderbook.iter_orders():
+                if self._check_high_stop(order):
+                    continue
+                if self._check_high(order):
+                    continue
+                if self._check_high_trailing(order):
+                    continue
+                if order.trail_triggered and order.stop is not None:
+                    self._check_close(order, ohlc)
+
+            # open -> low
+            for order in self.orderbook.iter_orders(desc=True):
+                if self._check_low_stop(order):
+                    continue
+                if self._check_low(order):
+                    continue
+                if self._check_low_trailing(order):
+                    continue
+                if order.trail_triggered and order.stop is not None:
+                    self._check_close(order, ohlc)
+
+        # open → low → high → close
+        else:
+            # open -> low
+            for order in self.orderbook.iter_orders(desc=True):
+                if self._check_low_stop(order):
+                    continue
+                if self._check_low(order):
+                    continue
+                if self._check_low_trailing(order):
+                    continue
+                if order.trail_triggered and order.stop is not None:
+                    self._check_close(order, ohlc)
+
+            # open -> high
+            for order in self.orderbook.iter_orders():
+                if self._check_high_stop(order):
+                    continue
+                if self._check_high(order):
+                    continue
+                if self._check_high_trailing(order):
+                    continue
+                if order.trail_triggered and order.stop is not None:
+                    self._check_close(order, ohlc)
 
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
@@ -977,7 +1188,6 @@ class Position:
 
         # Cumulative stats
         if self.new_closed_trades:
-            assert lib._script is not None
             initial_capital = lib._script.initial_capital
             for closed_trade in self.new_closed_trades:
                 previous_cum_profit = self.cum_profit - closed_trade.profit
@@ -1041,7 +1251,7 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
             return pmp_int / pricescale
         else:
             # Not an integer, round up
-            return (pmp_int + 1) * pricescale
+            return (pmp_int + 1) / pricescale
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
@@ -1054,19 +1264,8 @@ def cancel(id: str):
     if lib._lib_semaphore:
         return
 
-    assert lib._script is not None and lib._script.position is not None
-    # Try to cancel both entry and exit orders with the given ID
-    # since we don't know which type it is
-    # noinspection PyProtectedMember
-    try:
-        del lib._script.position.entry_orders[id]
-    except KeyError:
-        pass
-    # noinspection PyProtectedMember
-    try:
-        del lib._script.position.exit_orders[id]
-    except KeyError:
-        pass
+    position = lib._script.position
+    position._remove_order_by_id(id)
 
 
 # noinspection PyProtectedMember
@@ -1076,10 +1275,10 @@ def cancel_all():
     """
     if lib._lib_semaphore:
         return
-
-    assert lib._script is not None and lib._script.position is not None
-    lib._script.position.entry_orders.clear()
-    lib._script.position.exit_orders.clear()
+    position = lib._script.position
+    position.entry_orders.clear()
+    position.exit_orders.clear()
+    position.orderbook.clear()
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
@@ -1100,7 +1299,6 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
     if lib._lib_semaphore:
         return
 
-    assert lib._script is not None and lib._script.position is not None
     position = lib._script.position
 
     if qty <= 0.0:
@@ -1143,7 +1341,6 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
     if lib._lib_semaphore:
         return
 
-    assert lib._script is not None and lib._script.position is not None
     position = lib._script.position
     if position.size == 0.0:
         return
@@ -1255,18 +1452,12 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     if isinstance(stop, NA):
         stop = None
     elif stop is not None:
-        stop = _price_round(stop, -direction_sign)
-
-        # If it has an already filled stop, it must be a market order
-        if direction_sign == 1.0 and stop <= position.c:
-            stop = None
-        elif direction_sign == -1.0 and stop >= position.c:
-            stop = None
+        stop = _price_round(stop, direction_sign)
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
     # Store in entry_orders dict
-    script.position.entry_orders[id] = order
+    position._add_order(order)
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
@@ -1320,6 +1511,7 @@ def exit(id: str, from_entry: str = "",
     direction = 0
     size = 0.0
 
+    # noinspection PyProtectedMember,PyShadowingNames
     def _exit():
         nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
@@ -1348,7 +1540,7 @@ def exit(id: str, from_entry: str = "",
         if isinstance(stop, NA):
             stop = None
         elif not isinstance(stop, NA):
-            stop = _price_round(stop, -direction)
+            stop = _price_round(stop, direction)
         if isinstance(trail_price, NA):
             trail_price = None
         elif not isinstance(trail_price, NA):
@@ -1366,14 +1558,15 @@ def exit(id: str, from_entry: str = "",
             if oca_type is None:
                 oca_type = _oca.reduce
 
-        # Store in exit_orders dict
-        position.exit_orders[id] = Order(
+        # Add order
+        order = Order(
             from_entry, size, exit_id=id, order_type=_order_type_close,
             limit=limit, stop=stop,
             trail_price=trail_price, trail_offset=trail_offset,
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
             oca_name=oca_name, oca_type=oca_type, comment=comment, alert_message=alert_message
         )
+        position._add_order(order)
 
     # Find direction and size
     if from_entry:
@@ -1507,7 +1700,7 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     if isinstance(stop, NA):
         stop = None
     elif stop is not None:
-        stop = _price_round(stop, -direction_sign)
+        stop = _price_round(stop, direction_sign)
 
     # Create the order with _order_type_normal
     # This is a "normal" order that simply adds to or subtracts from position
@@ -1515,7 +1708,7 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     order = Order(id, size, order_type=_order_type_normal, limit=limit, stop=stop,
                   oca_name=oca_name, oca_type=oca_type, comment=comment,
                   alert_message=alert_message)
-    position.entry_orders[id] = order
+    position._add_order(order)
 
 
 #

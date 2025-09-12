@@ -30,7 +30,7 @@ _registered_libraries: list[tuple[str, Callable]] = []
 TEnum = TypeVar('TEnum', bound=StrEnum)
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, slots=True)
 class InputData:
     """
     Input dataclass
@@ -55,7 +55,7 @@ inputs: dict[str | None, InputData] = {}
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, slots=True)
 class Script:
     """
     Script parameters dataclass
@@ -137,7 +137,10 @@ class Script:
         ]
 
         # Save general settings
-        for key, value in self.__dict__.items():
+        from dataclasses import fields
+        for field in fields(self):
+            key = field.name
+            value = getattr(self, key)
             if key.startswith('_') or key in self._SKIP_FIELDS:
                 continue
             if value is None:
@@ -160,7 +163,10 @@ class Script:
             lines.append("# Input metadata, cannot be modified")
 
             # Add all metadata as comments
-            for key, value in input_data.__dict__.items():
+            from dataclasses import fields as input_fields
+            for field in input_fields(input_data):
+                key = field.name
+                value = getattr(input_data, key)
                 if key == 'id':
                     continue
                 if value is not None:

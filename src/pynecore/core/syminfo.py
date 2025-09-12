@@ -7,7 +7,7 @@ SymInfoInterval = NamedTuple("SymInfoInterval", [('day', int), ('start', time), 
 SymInfoSession = NamedTuple("SymInfoSession", [('day', int), ('time', time)])
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, slots=True)
 class SymInfo:
     """
     Symbol information dataclass
@@ -41,7 +41,7 @@ class SymInfo:
     avg_spread: float | None = None
     taker_fee: float | None = None
     maker_fee: float | None = None
-    
+
     # Analyst price target information (added 2025-07-08)
     target_price_average: float | None = None
     target_price_high: float | None = None

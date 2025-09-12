@@ -108,10 +108,11 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
     if TYPE_CHECKING:  # This is needed for the type checker to work
         from .. import lib
 
-    for key, value in syminfo.__dict__.items():
+    for slot_name in syminfo.__slots__:  # type: ignore
+        value = getattr(syminfo, slot_name)
         if value is not None:
             try:
-                setattr(lib.syminfo, key, value)
+                setattr(lib.syminfo, slot_name, value)
             except AttributeError:
                 pass
 

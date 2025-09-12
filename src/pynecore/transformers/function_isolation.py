@@ -23,9 +23,30 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.timestamp', 'lib.dayofmonth', 'lib.dayofweek', 'lib.hour', 'lib.minute', 'lib.month', 'lib.second',
     'lib.weekofyear', 'lib.year', 'lib.time', 'lib.is_na', 'lib.nz', 'lib.timestamp',
 
-    # Strategy orders
+    # Strategy
     'lib.strategy.entry', 'lib.strategy.order', 'lib.strategy.exit', 'lib.strategy.close',
     'lib.strategy.cancel', 'lib.strategy.cancel_all',
+    'lib.strategy.equity', 'lib.strategy.eventrades', 'lib.strategy.initial_capital',
+    'lib.strategy.grossloss', 'lib.strategy.grossprofit', 'lib.strategy.losstrades',
+    'lib.strategy.max_drawdown', 'lib.strategy.max_runup', 'lib.strategy.netprofit',
+    'lib.strategy.openprofit', 'lib.strategy.position_size', 'lib.strategy.position_avg_price',
+    'lib.strategy.wintrades',
+    'lib.strategy.closedtrades.commission', 'lib.strategy.closedtrades.entry_bar_index',
+    'lib.strategy.closedtrades.entry_comment', 'lib.strategy.closedtrades.entry_id',
+    'lib.strategy.closedtrades.entry_price', 'lib.strategy.closedtrades.entry_time',
+    'lib.strategy.closedtrades.exit_bar_index', 'lib.strategy.closedtrades.exit_comment',
+    'lib.strategy.closedtrades.exit_id', 'lib.strategy.closedtrades.exit_price',
+    'lib.strategy.closedtrades.exit_time', 'lib.strategy.closedtrades.max_drawdown',
+    'lib.strategy.closedtrades.max_drawdown_percent', 'lib.strategy.closedtrades.max_runup',
+    'lib.strategy.closedtrades.max_runup_percent', 'lib.strategy.closedtrades.profit',
+    'lib.strategy.closedtrades.profit_percent', 'lib.strategy.closedtrades.size',
+    'lib.strategy.opentrades.commission', 'lib.strategy.opentrades.entry_bar_index',
+    'lib.strategy.opentrades.entry_comment', 'lib.strategy.opentrades.entry_id',
+    'lib.strategy.opentrades.entry_price', 'lib.strategy.opentrades.entry_time',
+    'lib.strategy.opentrades.max_drawdown', 'lib.strategy.opentrades.max_drawdown_percent',
+    'lib.strategy.opentrades.max_runup', 'lib.strategy.opentrades.max_runup_percent',
+    'lib.strategy.opentrades.profit', 'lib.strategy.opentrades.profit_percent',
+    'lib.strategy.opentrades.size',
 
     # Input functions
     'lib.input', 'lib.input.int', 'lib.input.float', 'lib.input.bool', 'lib.input.string',
