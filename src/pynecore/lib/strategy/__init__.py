@@ -756,6 +756,11 @@ class Position:
             self.openprofit = 0.0
             self.open_commission = 0.0
 
+        # Increment intraday filled orders counter for ALL filled orders
+        # TradingView counts ALL filled orders (entry, exit, normal) toward the limit
+        # This is done after successful fill to match TradingView behavior
+        self.risk_intraday_filled_orders += 1
+
         # Handle OCA groups after order execution
         # This is done here to avoid code duplication in fill_order()
         if order.oca_name and order.oca_type:
@@ -885,6 +890,31 @@ class Position:
         # If position direction is not about to change, we can fill the order directly
         else:
             self._fill_order(order, price, h, l)
+            
+            # After filling, check if we need to close positions due to risk management
+            if (self.risk_max_intraday_filled_orders is not None and 
+                self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and
+                self.size != 0.0):
+                # Max intraday filled orders reached - close all positions immediately
+                # Cancel all pending orders first
+                self.entry_orders.clear()
+                self.exit_orders.clear()
+                self.orderbook.clear()
+                
+                # Create an immediate close order with special comment
+                close_comment = "Close Position (Max number of filled orders in one day)"
+                close_order = Order(
+                    None, -self.size, 
+                    exit_id='Risk management close',
+                    order_type=_order_type_close,
+                    comment=close_comment
+                )
+                # Fill the close order immediately at current price
+                self._fill_order(close_order, price, h, l)
+                
+                # Halt trading for the rest of the day
+                self.risk_halt_trading = True
+            
             return False
 
     def _check_already_filled(self, order: Order) -> bool:
@@ -1014,6 +1044,15 @@ class Position:
         self.h = round_to_mintick(lib.high)
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
+
+        # Check if we're in a new trading day for intraday risk management
+        # TradingView tracks intraday based on trading session, not calendar day
+        current_day = lib.dayofmonth()
+        if current_day != self.risk_last_day_index:
+            # New trading day - reset intraday counters
+            self.risk_last_day_index = current_day
+            self.risk_intraday_filled_orders = 0
+            # TODO: Also reset intraday loss tracking here when implemented
 
         # Get script reference for slippage
         script = lib._script
