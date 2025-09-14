@@ -588,9 +588,13 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max_index = 0
         for i in builtins.range(1, length):
             s = source[i]
-            if s >= last_max:
+            if s > last_max:
                 last_max = s
                 last_max_index = i
+            elif not _check_eq and s == last_max:
+                # For normal highest: update index for equal values
+                last_max_index = i
+            # For pivot detection (_check_eq=True): don't update index for equal values
 
     max_index = last_max_index
     last_max_index += 1
@@ -782,9 +786,13 @@ def lowest(source: Series[float], length: int,
         last_min_index = 0
         for i in builtins.range(1, length):
             s = source[i]
-            if s <= last_min:
+            if s < last_min:
                 last_min = s
                 last_min_index = i
+            elif not _check_eq and s == last_min:
+                # For normal lowest: update index for equal values
+                last_min_index = i
+            # For pivot detection (_check_eq=True): don't update index for equal values
 
     min_index = last_min_index
     last_min_index += 1
@@ -1120,7 +1128,7 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> float | NA[float]
     :param source: The source series
     :param leftbars: Left strength
     :param rightbars: Right strength.
-    :return: True if the source series is a pivot high
+    :return: Price of the pivot high point, or NaN if no pivot
     """
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
@@ -1144,7 +1152,7 @@ def pivothigh(leftbars: int, rightbars: int) -> float | NA[float]:
 
     :param leftbars: Left strength
     :param rightbars: Right strength.
-    :return: True if the source series is a pivot high
+    :return: Price of the pivot high point, or NaN if no pivot
     """
     try:
         return pivothigh(safe_convert.safe_float(high), leftbars, rightbars)  # type: ignore
@@ -1163,7 +1171,7 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> float | NA[float]:
     :param source: The source series
     :param leftbars: Left strength
     :param rightbars: Right strength.
-    :return: True if the source series is a pivot low
+    :return: Price of the pivot low point, or NaN if no pivot
     """
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
@@ -1186,7 +1194,7 @@ def pivotlow(leftbars: int, rightbars: int) -> float | NA[float]:
 
     :param leftbars: Left strength
     :param rightbars: Right strength.
-    :return: True if the source series is a pivot low
+    :return: Price of the pivot low point, or NaN if no pivot
     """
     try:
         return pivotlow(safe_convert.safe_float(low), leftbars, rightbars)  # type: ignore
@@ -1480,7 +1488,8 @@ def sma(source: Series[float], length: int) -> float | NA[float]:
     :param length: The length of the moving average
     :return: The Simple Moving Average (SMA)
     """
-    return lib_math.sum(source, length) / length
+    # Round is necessary to solve precision issues
+    return round(lib_math.sum(source, length) / length, 15)
 
 
 def stdev(source: float, length: int, biased=True) -> float | NA[float]:

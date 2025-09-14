@@ -64,6 +64,9 @@ class NA(Generic[T]):
     def __bool__(self) -> bool:
         return False
 
+    def __round__(self, n=None):
+        return NA(self.type)
+
     #
     # Arithmetic operations
     #

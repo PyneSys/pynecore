@@ -363,81 +363,91 @@ class Position:
     This is the main class for strategies
     """
 
-    h: float = 0.0
-    l: float = 0.0
-    c: float = 0.0
-    o: float = 0.0
-
-    netprofit: float | NA[float] = 0.0
-    openprofit: float | NA[float] = 0.0
-    grossprofit: float | NA[float] = 0.0
-    grossloss: float | NA[float] = 0.0
-
-    # Order book
-    entry_orders: dict[str, Order]
-    exit_orders: dict[str, Order]
-    market_orders: dict[str, Order]
-    orderbook: PriceOrderBook
-
-    # Open and closed trades
-    open_trades: list[Trade]
-    closed_trades: deque[Trade]
-    new_closed_trades: list[Trade]
-
-    # Trade stats
-    closed_trades_count: int = 0
-    wintrades: int = 0
-    eventrades: int = 0
-    losstrades: int = 0
-    size: float = 0.0
-    sign: float = 0.0
-    avg_price: float = 0.0
-    cum_profit: float | NA[float] = 0.0
-    entry_equity = 0.0
-    max_equity = -float("inf")
-    min_equity = float("inf")
-    drawdown_summ = 0.0
-    runup_summ = 0.0
-    max_drawdown = 0.0
-    max_runup = 0.0
-    entry_summ = 0.0
-    open_commission = 0.0
-
-    had_entry_in_this_bar: bool = False
-
-    # Risk management settings
-    risk_allowed_direction: direction.Direction | None = None
-    risk_max_cons_loss_days: int | None = None
-    risk_max_cons_loss_days_alert: str | None = None
-    risk_max_drawdown_value: float | None = None
-    risk_max_drawdown_type: QtyType | None = None
-    risk_max_drawdown_alert: str | None = None
-    risk_max_intraday_filled_orders: int | None = None
-    risk_max_intraday_filled_orders_alert: str | None = None
-    risk_max_intraday_loss_value: float | None = None
-    risk_max_intraday_loss_type: QtyType | None = None
-    risk_max_intraday_loss_alert: str | None = None
-    risk_max_position_size: float | None = None
-
-    # Risk management state tracking
-    risk_cons_loss_days: int = 0
-    risk_last_day_index: int = -1
-    risk_last_day_equity: float = 0.0
-    risk_intraday_filled_orders: int = 0
-    risk_intraday_start_equity: float = 0.0
-    risk_halt_trading: bool = False
+    __slots__ = (
+        'h', 'l', 'c', 'o',
+        'netprofit', 'openprofit', 'grossprofit', 'grossloss',
+        'entry_orders', 'exit_orders', 'market_orders', 'orderbook',
+        'open_trades', 'closed_trades', 'new_closed_trades',
+        'closed_trades_count', 'wintrades', 'eventrades', 'losstrades',
+        'size', 'sign', 'avg_price', 'cum_profit',
+        'entry_equity', 'max_equity', 'min_equity',
+        'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
+        'entry_summ', 'open_commission', 'had_entry_in_this_bar',
+        'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
+        'risk_max_drawdown_value', 'risk_max_drawdown_type', 'risk_max_drawdown_alert',
+        'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
+        'risk_max_intraday_loss_value', 'risk_max_intraday_loss_type', 'risk_max_intraday_loss_alert',
+        'risk_max_position_size',
+        'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
+        'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading'
+    )
 
     def __init__(self):
+        # OHLC values
+        self.h: float = 0.0
+        self.l: float = 0.0
+        self.c: float = 0.0
+        self.o: float = 0.0
+
+        # Profit/loss tracking
+        self.netprofit: float | NA[float] = 0.0
+        self.openprofit: float | NA[float] = 0.0
+        self.grossprofit: float | NA[float] = 0.0
+        self.grossloss: float | NA[float] = 0.0
+
+        # Order books
         self.market_orders = {}  # Market orders from strategy.market()
         self.entry_orders = {}  # Entry orders from strategy.entry()
         self.exit_orders = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
-
-        # Initialize price-based order books
         self.orderbook = PriceOrderBook()
 
+        # Trades
         self.open_trades = []
         self.closed_trades = deque(maxlen=9000)  # 9000 is the limit of TV
         self.new_closed_trades = []
+
+        # Trade statistics
+        self.closed_trades_count: int = 0
+        self.wintrades: int = 0
+        self.eventrades: int = 0
+        self.losstrades: int = 0
+        self.size: float = 0.0
+        self.sign: float = 0.0
+        self.avg_price: float = 0.0
+        self.cum_profit: float | NA[float] = 0.0
+        self.entry_equity: float = 0.0
+        self.max_equity: float = -float("inf")
+        self.min_equity: float = float("inf")
+        self.drawdown_summ: float = 0.0
+        self.runup_summ: float = 0.0
+        self.max_drawdown: float = 0.0
+        self.max_runup: float = 0.0
+        self.entry_summ: float = 0.0
+        self.open_commission: float = 0.0
+
+        self.had_entry_in_this_bar: bool = False
+
+        # Risk management settings
+        self.risk_allowed_direction: direction.Direction | None = None
+        self.risk_max_cons_loss_days: int | None = None
+        self.risk_max_cons_loss_days_alert: str | None = None
+        self.risk_max_drawdown_value: float | None = None
+        self.risk_max_drawdown_type: QtyType | None = None
+        self.risk_max_drawdown_alert: str | None = None
+        self.risk_max_intraday_filled_orders: int | None = None
+        self.risk_max_intraday_filled_orders_alert: str | None = None
+        self.risk_max_intraday_loss_value: float | None = None
+        self.risk_max_intraday_loss_type: QtyType | None = None
+        self.risk_max_intraday_loss_alert: str | None = None
+        self.risk_max_position_size: float | None = None
+
+        # Risk management state tracking
+        self.risk_cons_loss_days: int = 0
+        self.risk_last_day_index: int = -1
+        self.risk_last_day_equity: float = 0.0
+        self.risk_intraday_filled_orders: int = 0
+        self.risk_intraday_start_equity: float = 0.0
+        self.risk_halt_trading: bool = False
 
     @property
     def equity(self) -> float | NA[float]:
@@ -824,22 +834,22 @@ class Position:
                             return False
 
                     # We need to change direction
-                    # NOTE: It is TradingView's behavior to allow reversal on 1st entry order
-                    elif not self.had_entry_in_this_bar:
+                    # NOTE: this is tradingviews behavior maybe not correct
+                    elif (not order.stop and not order.limit) or not self.had_entry_in_this_bar:
                         size_addition = -self.size
 
                 # We don't allow reversal only as a 1st entry order
-                # TODO: check if this is really correct
-                if self.had_entry_in_this_bar:
+                # NOTE: this is tradingviews behavior maybe not correct
+                if (order.stop or order.limit) and self.had_entry_in_this_bar:
                     # We allow only closing order if pyramiding is enabled and the order has a different direction
                     if self.sign != 0 and order.sign != self.sign and lib._script.pyramiding > 1:
                         order.size = -self.size
                         order.order_type = _order_type_normal
                     else:
                         # Direction not allowed - don't fill the entry order
+                        self._remove_order(order)
                         return False
-                else:
-                    self.had_entry_in_this_bar = True
+                self.had_entry_in_this_bar = True
 
         # For normal orders (_order_type_normal), no special risk management or pyramiding limits apply
         # They simply add to or subtract from the position as requested
@@ -890,31 +900,30 @@ class Position:
         # If position direction is not about to change, we can fill the order directly
         else:
             self._fill_order(order, price, h, l)
-            
+
             # After filling, check if we need to close positions due to risk management
-            if (self.risk_max_intraday_filled_orders is not None and 
-                self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and
-                self.size != 0.0):
+            if (self.risk_max_intraday_filled_orders is not None and
+                    self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and self.size != 0.0):
                 # Max intraday filled orders reached - close all positions immediately
                 # Cancel all pending orders first
                 self.entry_orders.clear()
                 self.exit_orders.clear()
                 self.orderbook.clear()
-                
+
                 # Create an immediate close order with special comment
                 close_comment = "Close Position (Max number of filled orders in one day)"
                 close_order = Order(
-                    None, -self.size, 
+                    None, -self.size,
                     exit_id='Risk management close',
                     order_type=_order_type_close,
                     comment=close_comment
                 )
                 # Fill the close order immediately at current price
                 self._fill_order(close_order, price, h, l)
-                
+
                 # Halt trading for the rest of the day
                 self.risk_halt_trading = True
-            
+
             return False
 
     def _check_already_filled(self, order: Order) -> bool:
@@ -1099,9 +1108,6 @@ class Position:
         # Check for stop/limit orders that should be converted to market orders due to gaps
         # This must happen BEFORE processing market orders
         for order in self.orderbook.iter_orders():
-            # Skip cancelled orders from OCA groups
-            if order.cancelled:
-                continue
             # Check if the order would be filled immediately due to a gap
             if self._check_already_filled(order):
                 # Convert to market order by removing stop/limit prices
@@ -1113,9 +1119,8 @@ class Position:
                 self.market_orders[order.order_id] = order
                 # No need to re-add to orderbook since it's now a market order
 
-        # 1st pass: Process Market orders
-        market_orders = list(self.market_orders.values())
-        for order in market_orders:
+        # Process Market orders
+        for order in list(self.market_orders.values()):
             # Apply slippage to market orders
             fill_price = self.o
             if script.slippage > 0:
@@ -1132,10 +1137,10 @@ class Position:
             else:
                 self.fill_order(order, fill_price, self.l, self.o)
 
-        # open → high → low → close
+        # Process orders: open → high → low → close
         if ohlc:
             # open -> high
-            for order in self.orderbook.iter_orders():
+            for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
                 if self._check_high_stop(order):
                     continue
                 if self._check_high(order):
@@ -1146,7 +1151,7 @@ class Position:
                     self._check_close(order, ohlc)
 
             # open -> low
-            for order in self.orderbook.iter_orders(desc=True):
+            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
                 if self._check_low_stop(order):
                     continue
                 if self._check_low(order):
@@ -1156,10 +1161,10 @@ class Position:
                 if order.trail_triggered and order.stop is not None:
                     self._check_close(order, ohlc)
 
-        # open → low → high → close
+        # Process orders: open → low → high → close
         else:
             # open -> low
-            for order in self.orderbook.iter_orders(desc=True):
+            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
                 if self._check_low_stop(order):
                     continue
                 if self._check_low(order):
@@ -1170,7 +1175,7 @@ class Position:
                     self._check_close(order, ohlc)
 
             # open -> high
-            for order in self.orderbook.iter_orders():
+            for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
                 if self._check_high_stop(order):
                     continue
                 if self._check_high(order):
@@ -1237,9 +1242,9 @@ class Position:
                 closed_trade.cum_max_runup = self.max_runup
 
                 # Cumulative profit percent
-                denominator = initial_capital + previous_cum_profit
+                # TradingView calculates this as total return on initial capital
                 try:
-                    closed_trade.cum_profit_percent = (closed_trade.profit / denominator) * 100.0
+                    closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
                 except ZeroDivisionError:
                     closed_trade.cum_profit_percent = 0.0
 

@@ -141,7 +141,7 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
                 except TypeError:
                     continue
 
-            raise TypeError(f"No matching implementation found for {qualname}")
+            raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
 
         # Store implementation and dispatcher
         _registry[qualname].append(impl)
