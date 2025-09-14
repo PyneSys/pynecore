@@ -1345,7 +1345,7 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
 
     position = lib._script.position
 
-    if qty <= 0.0:
+    if not isinstance(qty, NA) and qty <= 0.0:
         return
 
     if position.size == 0.0:
@@ -1366,8 +1366,8 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
 
-    # Store in exit_orders dict
-    position.exit_orders[exit_id] = order
+    # Add order to position (this will handle orderbook and exit_orders)
+    position._add_order(order)
     if immediately:
         position.fill_order(order, position.c, position.h, position.l)
 
@@ -1393,8 +1393,8 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
     order = Order(None, -position.size, exit_id=exit_id, order_type=_order_type_close,
                   comment=comment, alert_message=alert_message)
 
-    # Store in exit_orders dict
-    position.exit_orders[exit_id] = order
+    # Add order to position (this will handle orderbook and exit_orders)
+    position._add_order(order)
     if immediately:
         position.fill_order(order, position.c, position.h, position.l)
 
