@@ -1234,8 +1234,6 @@ class Position:
         if self.new_closed_trades:
             initial_capital = lib._script.initial_capital
             for closed_trade in self.new_closed_trades:
-                previous_cum_profit = self.cum_profit - closed_trade.profit
-
                 self.cum_profit = self.equity - lib._script.initial_capital - self.openprofit
                 closed_trade.cum_profit = self.cum_profit
                 closed_trade.cum_max_drawdown = self.max_drawdown
@@ -1615,7 +1613,7 @@ def exit(id: str, from_entry: str = "",
     # Find direction and size
     if from_entry:
         # Get from entry_orders dict
-        entry_order = position.entry_orders.get(from_entry, None)
+        entry_order: Order | None = position.entry_orders.get(from_entry, None)
 
         # Find open trade if no entry order found
         if not entry_order:
