@@ -29,6 +29,8 @@ if rich:
             """Override render to use Pine Script time and timezone"""
             from ..types import NA
             from datetime import UTC
+            from rich.text import Text
+            from rich.table import Table
 
             # Get the datetime in the correct timezone
             if lib._time:
@@ -43,22 +45,49 @@ if rich:
                 # No Pine time, use current time
                 log_time = datetime.fromtimestamp(record.created)
 
-            # Call parent's _log_render with our log_time
+            # Format the time
             path = Path(record.pathname).name
             level = self.get_level_text(record)
             time_format = None if self.formatter is None else self.formatter.datefmt
 
-            log_renderable = self._log_render(
-                self.console,
-                [message_renderable] if not traceback else [message_renderable, traceback],
-                log_time=log_time,
-                time_format=time_format,
-                level=level,
-                path=path,
-                line_no=record.lineno,
-                link_path=record.pathname if self.enable_link_path else None,
-            )
-            return log_renderable
+            # Create custom log output with colored bar_index
+            if hasattr(lib, 'bar_index') and lib.bar_index is not None:
+                # Format the base time
+                time_str = log_time.strftime(time_format or "[%Y-%m-%d %H:%M:%S]")
+
+                # Create table for log output
+                output = Table.grid(padding=(0, 1))
+                output.expand = True
+
+                # Add columns - no style for first two columns to allow Text styling
+                output.add_column()  # Time column
+                output.add_column()  # Bar index column
+                output.add_column(style="log.level", width=8)  # Level column
+                output.add_column(ratio=1, style="log.message", overflow="fold")  # Message column
+
+                # Build row with styled Text objects
+                row = [
+                    Text(time_str, style="log.time"),
+                    Text(f"bar: {lib.bar_index:6}", style="cyan"),
+                    level,
+                    message_renderable,
+                ]
+
+                output.add_row(*row)
+                return output
+            else:
+                # Standard rendering without bar_index
+                log_renderable = self._log_render(
+                    self.console,
+                    [message_renderable] if not traceback else [message_renderable, traceback],
+                    log_time=log_time,
+                    time_format=time_format,
+                    level=level,
+                    path=path,
+                    line_no=record.lineno,
+                    link_path=record.pathname if self.enable_link_path else None,
+                )
+                return log_renderable
 
 
 # noinspection PyProtectedMember
@@ -85,9 +114,15 @@ class PineLogFormatter(logging.Formatter):
 
         # Format the datetime
         if datefmt:
-            return dt.strftime(datefmt)
+            time_str = dt.strftime(datefmt)
         else:
-            return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+            time_str = dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+        # Add bar_index to the time string
+        if hasattr(lib, 'bar_index') and lib.bar_index is not None:
+            time_str = f"{time_str} bar: {lib.bar_index:6}"
+
+        return time_str
 
     def format(self, record: logging.LogRecord) -> Any:
         """Format log record in Pine style: [timestamp]: message"""
