@@ -69,14 +69,14 @@ def main(
 
 
 # noinspection PyShadowingNames
-def __test_slippage_pyramiding__(csv_reader, runner):
+def __test_slippage_pyramiding__(csv_reader, runner, strat_equity_comparator):
     """ Slippage Test - Pyramiding """
-    with csv_reader('ohlcv.csv', subdir="data") as cr:
-        r = runner(cr, syminfo_override=dict(timezone="US/Eastern"))
-        for i, result in enumerate(r.run_iter()):
-            if len(result) == 3:  # Strategy
-                candle, plot, new_closed_trades = result
-            else:  # Indicator
-                candle, plot = result
-            # Basic validation test - just ensure it runs without errors
-            pass
+    with csv_reader('slippage_pyramiding_ohlcv.csv', subdir="data") as cr, \
+            csv_reader('slippage_pyramiding_trades.csv', subdir="data") as cr_equity:
+        r = runner(cr, syminfo_override=dict(timezone="US/Eastern", type="forex"))
+        equity_iter = iter(cr_equity)
+        for i, (candle, plot, new_closed_trades) in enumerate(r.run_iter()):
+            for trade in new_closed_trades:
+                good_entry = next(equity_iter)
+                good_exit = next(equity_iter)
+                strat_equity_comparator(trade, good_entry.extra_fields, good_exit.extra_fields)

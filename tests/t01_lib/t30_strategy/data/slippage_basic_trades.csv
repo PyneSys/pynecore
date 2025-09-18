@@ -1,0 +1,5 @@
+Trade #,Type,Date/Time,Signal,Price USD,Position size (qty),Position size (value),Net P&L USD,Net P&L %,Run-up USD,Run-up %,Drawdown USD,Drawdown %,Cumulative P&L USD,Cumulative P&L %
+1,Entry long,2022-01-03T04:00:00-0500,Long Entry,1.13476,1,1.13476,-0.01,-0.67,0.001,0.07,-0.01,-0.7,-0.01,0
+1,Exit long,2022-01-03T14:00:00-0500,Long Exit,1.1294,1,1.13476,-0.01,-0.67,0.001,0.07,-0.01,-0.7,-0.01,0
+2,Entry short,2022-01-04T10:00:00-0500,Short Entry,1.1284,1,1.1284,-0.002,-0.15,0,0,-0.005,-0.44,-0.01,0
+2,Exit short,2022-01-04T20:00:00-0500,Short Exit,1.12781,1,1.1284,-0.002,-0.15,0,0,-0.005,-0.44,-0.01,0

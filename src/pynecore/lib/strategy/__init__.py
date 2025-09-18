@@ -11,7 +11,7 @@ from .. import syminfo
 
 from ...types.strategy import QtyType
 from ...types.base import IntEnum
-from ...types.na import NA
+from ...types.na import NA, na_float, na_str
 
 from . import direction as direction
 from . import commission as _commission
@@ -177,7 +177,7 @@ class Trade:
         self.exit_time: int = -1
         self.exit_price: float = 0.0
         self.exit_comment: str = ''
-        self.exit_equity: float | NA = NA(float)
+        self.exit_equity: float | NA = na_float
 
         self.commission = commission
 
@@ -414,7 +414,7 @@ class Position:
         self.losstrades: int = 0
         self.size: float = 0.0
         self.sign: float = 0.0
-        self.avg_price: float | NA[float] = NA(float)
+        self.avg_price: float | NA[float] = na_float
         self.cum_profit: float | NA[float] = 0.0
         self.entry_equity: float = 0.0
         self.max_equity: float = -float("inf")
@@ -625,10 +625,14 @@ class Position:
                             commission_type == _commission.cash_per_order):
                         closed_trade_size += abs(size)
                     else:
-                        commission = abs(size) * commission_value
-
+                        # Calculate exit commission based on commission type
                         if commission_type == _commission.percent:
-                            commission *= 0.01
+                            # For percentage commission, multiply by exit price
+                            commission = abs(size) * price * commission_value * 0.01
+                        else:
+                            # For other types (shouldn't reach here normally)
+                            commission = abs(size) * commission_value
+
                         closed_trade.commission += commission
                         # Realize commission
                         self.netprofit -= commission
@@ -637,7 +641,8 @@ class Position:
                     # Profit percent
                     entry_value = abs(closed_trade.size) * closed_trade.entry_price
                     try:
-                        closed_trade.profit_percent = (pnl / entry_value) * 100.0
+                        # Use closed_trade.profit which includes commission, not pnl which doesn't
+                        closed_trade.profit_percent = (closed_trade.profit / entry_value) * 100.0
                     except ZeroDivisionError:
                         closed_trade.profit_percent = 0.0
 
@@ -684,7 +689,7 @@ class Position:
                         self.openprofit = self.size * (self.c - self.avg_price)
                     else:
                         # If position has just closed
-                        self.avg_price = NA(float)
+                        self.avg_price = na_float
                         self.openprofit = 0.0
 
                     # Exit equity
@@ -763,7 +768,7 @@ class Position:
             try:
                 self.avg_price = self.entry_summ / abs(self.size)
             except ZeroDivisionError:
-                self.avg_price = NA(float)
+                self.avg_price = na_float
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price)
             # Commission summ
@@ -776,7 +781,7 @@ class Position:
         if not self.open_trades:
             # Reset position variables
             self.entry_summ = 0.0
-            self.avg_price = NA(float)
+            self.avg_price = na_float
             self.openprofit = 0.0
             self.open_commission = 0.0
 
@@ -1294,7 +1299,7 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
     :return:
     """
     if isinstance(price, NA):
-        return NA(float)
+        return na_float
     pricescale = syminfo.pricescale
     pmp = round(cast(float, price * pricescale), 7)
     pmp_int = int(pmp)
@@ -1340,8 +1345,8 @@ def cancel_all():
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
-def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA(float),
-          qty_percent: float | NA[float] = NA(float), alert_message: str | NA[str] = NA(str),
+def close(id: str, comment: str | NA[str] = na_str, qty: float | NA[float] = na_float,
+          qty_percent: float | NA[float] = na_float, alert_message: str | NA[str] = na_str,
           immediately: bool = False):
     """
     Creates an order to exit from the part of a position opened by entry orders with a specific identifier.
@@ -1387,7 +1392,7 @@ def close(id: str, comment: str | NA[str] = NA(str), qty: float | NA[float] = NA
 
 
 # noinspection PyProtectedMember,PyShadowingNames
-def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = NA(str), immediately: bool = False):
+def close_all(comment: str | NA[str] = na_str, alert_message: str | NA[str] = na_str, immediately: bool = False):
     """
     Creates an order to close an open position completely, regardless of the identifiers of the entry
     orders that opened or added to it.
@@ -1414,7 +1419,7 @@ def close_all(comment: str | NA[str] = NA(str), alert_message: str | NA[str] = N
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
-def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] = NA(float),
+def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
           comment: str | None = None, alert_message: str | None = None):
@@ -1539,16 +1544,16 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
 def exit(id: str, from_entry: str = "",
-         qty: float | NA[float] = NA(float), qty_percent: float | NA[float] = NA(float),
-         profit: float | NA[float] = NA(float), limit: float | NA[float] = NA(float),
-         loss: float | NA[float] = NA(float), stop: float | NA[float] = NA(float),
-         trail_price: float | NA[float] = NA(float), trail_points: float | NA[float] = NA(float),
-         trail_offset: float | NA[float] = NA(float),
-         oca_name: str | NA[str] = NA(str), oca_type: _oca.Oca | None = None,
-         comment: str | NA[str] = NA(str), comment_profit: str | NA[str] = NA(str),
-         comment_loss: str | NA[str] = NA(str), comment_trailing: str | NA[str] = NA(str),
-         alert_message: str | NA[str] = NA(str), alert_profit: str | NA[str] = NA(str),
-         alert_loss: str | NA[str] = NA(str), alert_trailing: str | NA[str] = NA(str),
+         qty: float | NA[float] = na_float, qty_percent: float | NA[float] = na_float,
+         profit: float | NA[float] = na_float, limit: float | NA[float] = na_float,
+         loss: float | NA[float] = na_float, stop: float | NA[float] = na_float,
+         trail_price: float | NA[float] = na_float, trail_points: float | NA[float] = na_float,
+         trail_offset: float | NA[float] = na_float,
+         oca_name: str | NA[str] = na_str, oca_type: _oca.Oca | None = None,
+         comment: str | NA[str] = na_str, comment_profit: str | NA[str] = na_str,
+         comment_loss: str | NA[str] = na_str, comment_trailing: str | NA[str] = na_str,
+         alert_message: str | NA[str] = na_str, alert_profit: str | NA[str] = na_str,
+         alert_loss: str | NA[str] = na_str, alert_trailing: str | NA[str] = na_str,
          disable_alert: bool = False):
     """
     Creates an order to exit from a position. If an order with the same id already exists and is unfilled,
@@ -1684,7 +1689,7 @@ def exit(id: str, from_entry: str = "",
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal
-def order(id: str, direction: direction.Direction, qty: int | float | NA[float] = NA(float),
+def order(id: str, direction: direction.Direction, qty: int | float | NA[float] = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
           comment: str | None = None, alert_message: str | None = None,

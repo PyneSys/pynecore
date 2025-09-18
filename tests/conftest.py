@@ -432,6 +432,9 @@ def strat_equity_comparator() -> StratEquityComparatorProtocol:
     from datetime import datetime
 
     def _comparator(trade: 'Trade', good_entry: dict[str, Any], good_exit: dict[str, Any], **__):
+        # Skip trades where exit Signal is "Open" (TradingView backtest end artifact)
+        if good_exit.get('Signal') == 'Open':
+            return  # Skip validation for this trade
         # Field mapping: TradingView export names -> PyneCore field names
         tv_to_pynecore = {
             'P&L %': 'Profit %',
@@ -460,8 +463,12 @@ def strat_equity_comparator() -> StratEquityComparatorProtocol:
         assert ((trade.sign > 0 and good_entry['Type'] == 'Entry long')
                 or (trade.sign < 0 and good_entry['Type'] == 'Entry short'))
 
-        assert trade.entry_id == good_entry['Signal']
-        assert trade.exit_id == good_exit['Signal']
+        # TradingView exports comment as Signal, or ID if no comment exists
+        entry_signal = trade.entry_comment if trade.entry_comment else trade.entry_id
+        exit_signal = trade.exit_comment if trade.exit_comment else trade.exit_id
+
+        assert entry_signal == good_entry['Signal']
+        assert exit_signal == good_exit['Signal']
 
         # Compare timestamps instead of string representations
         # This handles different timezone formats properly

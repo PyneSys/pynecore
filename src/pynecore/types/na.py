@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any, TypeVar, Generic, Type
 
+__all__ = ['NA', 'na_float', 'na_int', 'na_bool', 'na_str']
+
 T = TypeVar('T')
 
 
@@ -178,3 +180,9 @@ class NA(Generic[T]):
 
     def __call__(self, *_, **__) -> NA[T]:
         return self
+
+
+na_float = NA(float)
+na_int = NA(int)
+na_str = NA(str)
+na_bool = NA(bool)

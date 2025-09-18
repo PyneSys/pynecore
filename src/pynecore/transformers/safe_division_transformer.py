@@ -1,3 +1,4 @@
+from _ast import Call, BinOp
 from typing import cast
 import ast
 
@@ -16,7 +17,7 @@ class SafeDivisionTransformer(ast.NodeTransformer):
         self.has_safe_convert_import = False
         self.has_division_operations = False  # Track if division is used
 
-    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+    def visit_BinOp(self, node: ast.BinOp) -> Call | BinOp:
         """
         Visit BinOp nodes and transform division operations
         """

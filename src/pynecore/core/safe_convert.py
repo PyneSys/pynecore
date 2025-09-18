@@ -1,7 +1,7 @@
 from ..types import NA
 
 
-def safe_div(a, b):
+def safe_div(a: float | NA[float], b: float | NA[float]):
     """
     Safe division that returns NA for division by zero.
     Mimics Pine Script behavior where division by zero returns NA.
@@ -20,7 +20,7 @@ def safe_div(a, b):
         return NA(float)
 
 
-def safe_float(value):
+def safe_float(value: float | NA[float]) -> float | NA[float]:
     """
     Safe float conversion that returns NA for NA inputs.
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.
@@ -35,7 +35,7 @@ def safe_float(value):
         return NA(float)
 
 
-def safe_int(value):
+def safe_int(value: int | NA[int]) -> int | NA[int]:
     """
     Safe int conversion that returns NA for NA inputs.
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.
