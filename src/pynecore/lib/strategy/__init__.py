@@ -414,7 +414,7 @@ class Position:
         self.losstrades: int = 0
         self.size: float = 0.0
         self.sign: float = 0.0
-        self.avg_price: float = 0.0
+        self.avg_price: float | NA[float] = NA(float)
         self.cum_profit: float | NA[float] = 0.0
         self.entry_equity: float = 0.0
         self.max_equity: float = -float("inf")
@@ -684,7 +684,7 @@ class Position:
                         self.openprofit = self.size * (self.c - self.avg_price)
                     else:
                         # If position has just closed
-                        self.avg_price = 0.0
+                        self.avg_price = NA(float)
                         self.openprofit = 0.0
 
                     # Exit equity
@@ -763,7 +763,7 @@ class Position:
             try:
                 self.avg_price = self.entry_summ / abs(self.size)
             except ZeroDivisionError:
-                self.avg_price = 0.0
+                self.avg_price = NA(float)
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price)
             # Commission summ
@@ -776,7 +776,7 @@ class Position:
         if not self.open_trades:
             # Reset position variables
             self.entry_summ = 0.0
-            self.avg_price = 0.0
+            self.avg_price = NA(float)
             self.openprofit = 0.0
             self.open_commission = 0.0
 
@@ -1115,19 +1115,28 @@ class Position:
         # Check for stop/limit orders that should be converted to market orders due to gaps
         # This must happen BEFORE processing market orders
         for order in self.orderbook.iter_orders():
-            # Check if the order would be filled immediately due to a gap
+            # Check if the order would be filled immediately (e.g. due to a gap)
             if self._check_already_filled(order):
-                # Convert to market order by removing stop/limit prices
-                # First remove from orderbook at old prices
-                self.orderbook.remove_order(order)
-                # Make it a market order
+                # Convert to market order
                 order.is_market_order = True
                 # Add to market orders dict
                 self.market_orders[order.order_id] = order
-                # No need to re-add to orderbook since it's now a market order
 
         # Process Market orders
         for order in list(self.market_orders.values()):
+            if order.limit is None and order.stop is None:
+                # We need to check pyramiding and flip quantity here for market orders :-/
+                # Check pyramiding limit for entry orders adding to existing position
+                if self.sign == order.sign:
+                    if lib._script.pyramiding <= len(self.open_trades):
+                        # Pyramiding limit reached - don't add the order
+                        self._remove_order(order)
+                        continue
+                elif self.size != 0.0:
+                    # TradingView calculates the flip quantity 1st order processing
+                    # then open a new one in the opposite direction.
+                    order.size -= self.size  # Subtract because position.size has opposite sign
+
             # Apply slippage to market orders
             fill_price = self.o
             if script.slippage > 0:
@@ -1494,21 +1503,6 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
     if size == 0.0:
         return
 
-    # Check if the order has the same direction
-    if position.sign == direction_sign:
-        # Check pyramiding limit for entry orders adding to existing position
-        if lib._script.pyramiding <= len(position.open_trades):
-            # Pyramiding limit reached - don't add the order
-            return
-
-    elif position.size != 0.0:
-        # TradingView calculates the flip quantity at order creation time,
-        # not at execution time. If we have an opposite direction position,
-        # we need to add the position size to the order size to flip it.
-        # This means the order will first close the existing position,
-        # then open a new one in the opposite direction.
-        size = size - position.size  # Subtract because position.size has opposite sign
-
     if isinstance(limit, NA):
         limit = None
     elif limit is not None:
@@ -1518,6 +1512,24 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         stop = None
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
+
+    # If it is not a market order, we should check pyramiding and flip conditions here
+    # Market orders are checked at the order processing time
+    if limit is not None or stop is not None:
+        # Check if the order has the same direction
+        if position.sign == direction_sign:
+            # Check pyramiding limit for entry orders adding to existing position
+            if lib._script.pyramiding <= len(position.open_trades):
+                # Pyramiding limit reached - don't add the order
+                return
+
+        elif position.size != 0.0:
+            # TradingView calculates the flip quantity at order creation time,
+            # not at execution time. If we have an opposite direction position,
+            # we need to add the position size to the order size to flip it.
+            # This means the order will first close the existing position,
+            # then open a new one in the opposite direction.
+            size -= position.size  # Subtract because position.size has opposite sign
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
@@ -1787,102 +1799,76 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 # noinspection PyProtectedMember
 @module_property
 def equity() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.equity
 
 
 # noinspection PyProtectedMember
 @module_property
 def eventrades() -> int | NA[int]:
-    if lib._script is None or lib._script.position is None:
-        return 0
     return lib._script.position.eventrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def initial_capital() -> float:
-    if lib._script is None or lib._script.initial_capital is None:
-        return 0.0
     return lib._script.initial_capital
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossloss() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None or lib._script.position.open_commission is None:
-        return 0.0
     return lib._script.position.grossloss + lib._script.position.open_commission
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossprofit() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.grossprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def losstrades() -> int:
-    if lib._script is None or lib._script.position is None:
-        return 0
     return lib._script.position.losstrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_drawdown() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.max_drawdown
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_runup() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.max_runup
 
 
 # noinspection PyProtectedMember
 @module_property
 def netprofit() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.netprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def openprofit() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.openprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_size() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.size
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_avg_price() -> float | NA[float]:
-    if lib._script is None or lib._script.position is None:
-        return 0.0
     return lib._script.position.avg_price
 
 
 # noinspection PyProtectedMember
 @module_property
 def wintrades() -> int | NA[int]:
-    if lib._script is None or lib._script.position is None:
-        return 0
     return lib._script.position.wintrades
