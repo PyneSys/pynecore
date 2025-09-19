@@ -6,7 +6,7 @@ from .base import IntEnum
 
 
 class LineEnum(IntEnum):
-    ...
+    __slots__ = ()
 
 
 @dataclass(slots=True)

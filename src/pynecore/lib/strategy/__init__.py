@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 class _OrderType(IntEnum):
     """ Order type """
+    __slots__ = ()
 
 
 #

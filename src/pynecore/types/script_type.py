@@ -7,7 +7,7 @@ __all__ = [
 
 
 class ScriptType(IntEnum):
-    ...
+    __slots__ = ()
 
 
 indicator = ScriptType()

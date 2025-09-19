@@ -6,7 +6,7 @@ from .base import IntEnum
 
 
 class LabelStyleEnum(IntEnum):
-    ...
+    __slots__ = ()
 
 
 @dataclass(slots=True)

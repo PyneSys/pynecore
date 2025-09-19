@@ -6,7 +6,7 @@ from ..lib import color as _color, display as _display
 
 
 class HLineEnum(IntEnum):
-    ...
+    __slots__ = ()
 
 
 @dataclass(slots=True)

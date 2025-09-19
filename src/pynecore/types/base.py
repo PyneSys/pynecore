@@ -3,6 +3,8 @@ class IntEnum(int):
     IntEnum class that auto-increments values.
     """
 
+    __slots__ = ()
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         cls._counter = 0  # Minden leszármazottnak külön számlálója lesz
@@ -18,3 +20,5 @@ class StrLiteral(str):
     """
     StrLiteral class to store string literals.
     """
+
+    __slots__ = ()

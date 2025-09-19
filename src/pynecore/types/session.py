@@ -32,4 +32,4 @@ class SessionInfo:
 
 
 class Session(IntEnum):
-    ...
+    __slots__ = ()
