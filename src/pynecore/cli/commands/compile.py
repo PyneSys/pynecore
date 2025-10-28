@@ -1,3 +1,4 @@
+import os
 import tomllib
 import time
 from pathlib import Path
@@ -143,6 +144,11 @@ def compile(
     # Override API key if provided
     if api_key:
         api_config['api_key'] = api_key
+
+    # Override API URL if provided via environment variable
+    api_url = os.getenv("PYNESYS_API_URL")
+    if api_url:
+        api_config['base_url'] = api_url
 
     # Create the compiler instance
     compiler = PyneComp(**api_config)

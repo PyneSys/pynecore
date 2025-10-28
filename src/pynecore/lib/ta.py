@@ -561,7 +561,7 @@ def falling(source: float, length: int) -> bool:
     return counter >= length
 
 
-# noinspection PyUnusedLocal
+# noinspection PyUnusedLocal,DuplicatedCode
 @overload
 def highest(source: Series[float], length: int, _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
         -> float | tuple[float | NA[float], float | NA[float]] | NA[float]:
@@ -758,7 +758,7 @@ def linreg(source: Series[float], length: int, offset: int) -> float | Series[fl
     return intercept + slope * ((window_size - 1) - offset)
 
 
-# noinspection PyUnusedLocal
+# noinspection PyUnusedLocal,DuplicatedCode
 @overload
 def lowest(source: Series[float], length: int,
            _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
@@ -987,7 +987,7 @@ def mode(source: Series[TFI], length: int) -> TFI | NA:
         return NA(float)
 
     # Find mode - sort values to handle equal frequencies
-    values.sort()  # Ensure we pick smallest value when frequencies are equal
+    values.sort()  # Ensure we pick the smallest value when frequencies are equal
     mode_val = values[0]
     current_val = values[0]
     max_freq = curr_freq = 1

@@ -1,3 +1,4 @@
+import os
 import queue
 import threading
 import time
@@ -141,6 +142,11 @@ def run(
         # Override API key if provided
         if api_key:
             api_config['api_key'] = api_key
+
+        # Override API URL if provided via environment variable
+        api_url = os.getenv("PYNESYS_API_URL")
+        if api_url:
+            api_config['base_url'] = api_url
 
         if api_config.get('api_key'):
             # Create the compiler instance

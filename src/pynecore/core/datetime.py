@@ -7,14 +7,14 @@ from ..lib import syminfo
 # Standard formats for non-ISO dates
 STANDARD_FORMATS = [
     "%d %b %Y %H:%M:%S %z",  # "20 Feb 2020 15:30:00 +0200"
-    "%d %b %Y %H:%M %z",      # "01 Jan 2018 00:00 +0000"
+    "%d %b %Y %H:%M %z",  # "01 Jan 2018 00:00 +0000"
 ]
 
 # Pine Script specific formats (without timezone)
 PINE_FORMATS = [
     "%b %d %Y %H:%M:%S",  # "Feb 01 2020 22:10:05"
     "%d %b %Y %H:%M:%S",  # "04 Dec 1995 00:12:00"
-    "%d %b %Y %H:%M",     # "01 Jan 2018 00:00"
+    "%d %b %Y %H:%M",  # "01 Jan 2018 00:00"
     "%b %d %Y",  # "Feb 01 2020"
     "%d %b %Y",  # "04 Dec 1995"
     "%Y-%m-%d"  # "2020-02-20"
@@ -38,7 +38,7 @@ def normalize_timezone(datestring: str) -> str:
 
 
 @lru_cache(maxsize=128)
-def parse_timezone(timezone: str) -> ZoneInfo:
+def parse_timezone(timezone: str | None) -> ZoneInfo:
     """
     Parse timezone string into ZoneInfo object. Supports:
     - IANA timezone names (e.g. "America/New_York")
@@ -104,7 +104,7 @@ def parse_datestring(datestring: str) -> datetime:
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Try parsing ISO 8601 style dates first (handles both T and space separator)
+    # Try parsing ISO 8601 style dates WITH TIME first (handles both T and space separator)
     iso_match = re.match(
         r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?)'  # datetime part
         r'([+-]\d{2}:\d{2})?$',  # timezone part
@@ -126,14 +126,25 @@ def parse_datestring(datestring: str) -> datetime:
                 dt = datetime.strptime(dt_part.replace(' ', 'T'), "%Y-%m-%dT%H:%M:%S")
             return dt.replace(tzinfo=UTC)
 
+    # Try parsing ISO 8601 DATE ONLY format (YYYY-MM-DD) before timezone extraction
+    # This prevents the timezone regex from incorrectly matching date parts like -09 in 2025-01-09
+    iso_date_match = re.match(r'^\d{4}-\d{2}-\d{2}$', datestring)
+    if iso_date_match:
+        dt = datetime.strptime(datestring, "%Y-%m-%d")
+        # Use exchange timezone (from syminfo) when no timezone is specified
+        default_tz = parse_timezone(None)  # This will return syminfo.timezone
+        return dt.replace(tzinfo=default_tz)
+
     # Extract timezone if present at the end for other formats
-    tz_match = re.search(r'\s*((?:UTC|GMT)?[+-]\d+(?::?\d{2})?)\s*$', datestring)
+    # The regex requires whitespace before timezone to avoid matching date parts
+    tz_match = re.search(r'\s+((?:UTC|GMT)?[+-]\d{1,2}(?::?\d{2})?)\s*$', datestring)
     if tz_match:
         tz = parse_timezone(
             f"UTC{tz_match.group(1)}" if not tz_match.group(1).startswith(('UTC', 'GMT')) else tz_match.group(1))
         datestring = datestring[:tz_match.start()].strip()
     else:
-        tz = UTC
+        # Use exchange timezone (from syminfo) when no timezone is specified
+        tz = parse_timezone(None)  # This will return syminfo.timezone
 
     # Try standard formats (with timezone)
     if tz_match:
