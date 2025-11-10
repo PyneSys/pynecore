@@ -23,6 +23,12 @@ __all__ = ['CCXTProvider']
 
 known_limits = {
     'binance': 1000,
+    'bitget': {  # Bitget has strict timeframe-dependent limits
+        '1w': 12,     # Weekly: max 12 bars (84 days)
+        '1d': 300,    # Daily: max 300 bars
+        '4h': 1000,   # 4-hour: max 1000 bars
+        'default': 200  # Safe default for other timeframes (1h, 1m, etc.)
+    },
     'bitmex': 500,
     'bybit': 200,
     'coinbase': 300,
@@ -289,21 +295,32 @@ class CCXTProvider(Provider):
 
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
-                       on_progress: Callable[[datetime], None] | None = None):
+                       on_progress: Callable[[datetime], None] | None = None,
+                       limit: int | None = None):
         """
         Download OHLV data
 
         :param time_from: The start time
         :param time_to:  The end time
         :param on_progress: Optional callback to call on progress
+        :param limit: Override the automatic chunk size (number of bars per API request)
         """
         # Shortcuts for the time_from and time_to
         tf: datetime = time_from.replace(tzinfo=None)
         tt: datetime = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
 
-        # Get the limit by exchange or use safe default
-        assert self._client.id
-        limit = known_limits.get(self._client.id, 100)
+        # Get the limit by exchange or use safe default (unless overridden by user)
+        if limit is None:
+            assert self._client.id
+            limit_config = known_limits.get(self._client.id, 100)
+
+            # Support both simple int limits and timeframe-specific dict limits
+            if isinstance(limit_config, dict):
+                # Timeframe-specific limits (e.g., bitget)
+                limit = limit_config.get(self.xchg_timeframe, limit_config.get('default', 100))
+            else:
+                # Simple int limit (backward compatible)
+                limit = limit_config
 
         try:
             # Loop through the time range

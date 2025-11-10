@@ -115,6 +115,11 @@ def download(
                                        help="Force save symbol info"),
         truncate: bool = Option(False, '--truncate', '-tr',
                                 help="Truncate file before downloading, all data will be lost"),
+        chunk_size: int | None = Option(None, '--chunk-size', '-cs',
+                                        help="Number of bars to download per API request. "
+                                             "Overrides automatic detection based on exchange limits. "
+                                             "Useful for exchanges with timeframe-specific limits (e.g., Bitget 1w: 12). "
+                                             "Lower values = slower but safer, higher values = faster but may hit API limits."),
 ):
     """
     Download historical OHLCV data
@@ -225,7 +230,7 @@ def download(
                     progress.update(task, completed=elapsed_seconds)
 
                 # Start downloading
-                provider_instance.download_ohlcv(time_from, time_to, on_progress=cb_progress)
+                provider_instance.download_ohlcv(time_from, time_to, on_progress=cb_progress, limit=chunk_size)
 
     except (ImportError, ValueError) as e:
         secho(str(e), err=True, fg=colors.RED)

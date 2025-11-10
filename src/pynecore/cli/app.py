@@ -30,6 +30,7 @@ class AppState:
         if self._workdir is None:
             self._workdir = self._find_workdir()
 
+    # noinspection DuplicatedCode
     @staticmethod
     def _find_workdir() -> Path:
         """

@@ -155,7 +155,8 @@ class Provider(metaclass=ABCMeta):
 
     @abstractmethod
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
-                       on_progress: Callable[[datetime], None] | None = None):
+                       on_progress: Callable[[datetime], None] | None = None,
+                       limit: int | None = None):
         """
         Download OHLV data
 
@@ -164,6 +165,7 @@ class Provider(metaclass=ABCMeta):
         :param time_from: The start time
         :param time_to: The end time
         :param on_progress: Optional callback to call on progress
+        :param limit: Override the automatic chunk size (number of bars per API request)
         """
 
     def load_ohlcv_data(self) -> OHLCVReader:
