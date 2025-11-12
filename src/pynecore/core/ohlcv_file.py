@@ -1421,7 +1421,16 @@ class OHLCVReader:
         """
         Timestamp of the last record
         """
-        return self._start_timestamp + self._interval * (self._size - 1) if self._interval else None
+        if self._size == 0:
+            return None
+
+        # Read the actual timestamp from the last record instead of calculating it
+        # This is necessary because gap filling may create non-uniform intervals
+        if self._mmap and self._size > 0:
+            last_record_offset = (self._size - 1) * RECORD_SIZE
+            return struct.unpack('I', cast(Buffer, self._mmap[last_record_offset:last_record_offset + 4]))[0]
+
+        return None
 
     @property
     def end_datetime(self) -> datetime:
