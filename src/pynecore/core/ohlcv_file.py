@@ -1564,8 +1564,14 @@ class OHLCVReader:
         if end_timestamp is None:
             end_pos = self._size
         else:
-            end_diff = end_timestamp - self._start_timestamp
-            end_pos = min(end_diff // self._interval + 1, self._size)
+            # If end_timestamp >= actual last record timestamp, use full size
+            # This handles gap-filled files where end_timestamp doesn't align with interval
+            actual_end_ts = self.end_timestamp
+            if actual_end_ts and end_timestamp >= actual_end_ts:
+                end_pos = self._size
+            else:
+                end_diff = end_timestamp - self._start_timestamp
+                end_pos = min(end_diff // self._interval + 1, self._size)
 
         return start_pos, end_pos
 
