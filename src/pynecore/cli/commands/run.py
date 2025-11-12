@@ -181,11 +181,29 @@ def run(
                 secho(f"Script file '{script}' not found!", fg="red", err=True)
                 raise Exit(1)
 
+    # Expand data path first - convert relative paths to absolute paths in workdir/data
+    if len(data.parts) == 1:
+        data = app_state.data_dir / data
+
+    # Store the original suffix to check what user provided
+    original_suffix = data.suffix
+
     # Check file format and extension
     if data.suffix == "":
-        # No extension, add .ohlcv
-        data = data.with_suffix(".ohlcv")
-    elif data.suffix != ".ohlcv":
+        # No extension provided - check if .ohlcv exists, otherwise look for .csv
+        ohlcv_path = data.with_suffix(".ohlcv")
+        csv_path = data.with_suffix(".csv")
+
+        if ohlcv_path.exists():
+            data = ohlcv_path
+        elif csv_path.exists():
+            data = csv_path
+        else:
+            # Default to .ohlcv for error message
+            data = ohlcv_path
+
+    # Now handle conversion if needed
+    if data.suffix != ".ohlcv":
         # Has extension but not .ohlcv - automatically convert
         try:
             converter = DataConverter()
@@ -227,12 +245,9 @@ def run(
             secho(f"pyne data convert-from {data}", fg="yellow")
             raise Exit(1)
 
-    # Expand data path
-    if len(data.parts) == 1:
-        data = app_state.data_dir / data
-    # Check if data exists
+    # Final check if data exists
     if not data.exists():
-        secho(f"Data file '{data}' not found!", fg="red", err=True)
+        secho(f"Data file not found: {data.name}", fg="red", err=True)
         raise Exit(1)
 
     # Ensure .csv extension for plot path
@@ -266,14 +281,21 @@ def run(
             time_from = reader.start_datetime
         if not time_to:
             time_to = reader.end_datetime
+
+        # Convert to UTC timestamps BEFORE removing timezone info
+        # This ensures we use the correct UTC timestamps for the OHLCV reader
+        time_from_ts = int(time_from.timestamp())
+        time_to_ts = int(time_to.timestamp())
+
+        # Now we can safely remove timezone for display purposes
         time_from = time_from.replace(tzinfo=None)
         time_to = time_to.replace(tzinfo=None)
 
         total_seconds = int((time_to - time_from).total_seconds())
 
-        # Get the iterator
-        size = reader.get_size(int(time_from.timestamp()), int(time_to.timestamp()))
-        ohlcv_iter = reader.read_from(int(time_from.timestamp()), int(time_to.timestamp()))
+        # Get the iterator using the correct UTC timestamps
+        size = reader.get_size(time_from_ts, time_to_ts)
+        ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
         # Add lib directory to Python path for library imports
         lib_dir = app_state.scripts_dir / "lib"
