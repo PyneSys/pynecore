@@ -188,6 +188,14 @@ class ScriptRunner:
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
         """
+        # Import lib module to set syminfo properties before script import
+        from .. import lib
+
+        # Set syminfo properties BEFORE importing the script
+        # This ensures that timestamp() calls in default parameters use the correct timezone
+        _set_lib_syminfo_properties(syminfo, lib)
+
+        # Now import the script (default parameters will use correct timezone)
         self.script_module = import_script(script_path)
 
         if not hasattr(self.script_module.main, 'script'):

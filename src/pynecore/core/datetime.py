@@ -55,7 +55,10 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
 
     # Try as IANA timezone first
     try:
-        return ZoneInfo(timezone)
+        try:
+            return ZoneInfo(timezone)
+        except TypeError:  # It should not be possible
+            return ZoneInfo('UTC')
     except KeyError:
         # Check if this is a timezone data issue with common timezones
         if timezone in ('UTC', 'GMT', 'EST', 'PST', 'CST', 'MST'):
