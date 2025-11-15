@@ -90,8 +90,9 @@ def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=
         if dt is None:
             raise ValueError(f"Could not parse timestamp: {ts_str}")
 
-    # Apply timezone if specified and convert to timestamp
-    if timezone and dt is not None:
+    # Apply timezone parameter only if the datetime doesn't already have timezone info
+    # This preserves timezone information from the timestamp string itself
+    if timezone and dt is not None and dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone)
 
     return int(dt.timestamp())
@@ -105,7 +106,8 @@ class OHLCVWriter:
     __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp',
                  '_price_changes', '_price_decimals', '_last_close', '_analyzed_tick_size',
                  '_analyzed_price_scale', '_analyzed_min_move', '_confidence',
-                 '_trading_hours', '_analyzed_opening_hours', '_truncate')
+                 '_trading_hours', '_analyzed_opening_hours', '_timestamp_offsets', '_analyzed_timezone',
+                 '_truncate')
 
     def __init__(self, path: str | Path, truncate: bool = False):
         self.path: str = str(path)

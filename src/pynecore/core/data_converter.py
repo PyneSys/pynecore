@@ -121,6 +121,28 @@ class DataConverter:
         analyzed_min_move = None
         detected_timeframe = None
 
+        # Check if TOML exists and load timezone from it
+        # This ensures user modifications to TOML are preserved
+        # Note: force parameter applies only to OHLCV regeneration, NOT to TOML
+        toml_path = file_path.with_suffix('.toml')
+        skip_toml_generation = False
+
+        if toml_path.exists():
+            # noinspection PyBroadException
+            try:
+                # Load existing TOML to preserve user modifications
+                existing_syminfo = SymInfo.load_toml(toml_path)
+                timezone = existing_syminfo.timezone  # Use TOML timezone for conversion
+                skip_toml_generation = True  # Don't regenerate TOML (user may have edited it)
+            except Exception:
+                # If TOML is corrupted, continue with provided/default timezone
+                pass
+        elif timezone == "UTC" and detected_format == 'csv':
+            # If no TOML exists and using default UTC, try to detect timezone from CSV
+            detected_tz = self._detect_timezone_from_csv(file_path)
+            if detected_tz:
+                timezone = detected_tz
+
         try:
             # Perform conversion directly to target file with truncate to clear existing data
             with OHLCVWriter(ohlcv_path, truncate=True) as ohlcv_writer:
@@ -150,11 +172,9 @@ class DataConverter:
             # Copy modification time from source to maintain freshness
             copy_mtime(file_path, ohlcv_path)
 
-            # Generate TOML symbol info file if needed
-            toml_path = file_path.with_suffix('.toml')
-
-            # Skip if TOML file exists and is newer than source (unless force is True)
-            if symbol and (force or not toml_path.exists() or is_updated(file_path, toml_path)):
+            # Generate TOML symbol info file if needed and not already loaded
+            # skip_toml_generation is set earlier if TOML already exists (line 129-134)
+            if symbol and not skip_toml_generation and (force or not toml_path.exists()):
                 # Use analyzed values from OHLCVWriter
                 if analyzed_tick_size:
                     mintick = analyzed_tick_size
@@ -710,3 +730,116 @@ class DataConverter:
             base_currency = None
 
         return symbol_type, currency, base_currency
+
+    @staticmethod
+    def _detect_timezone_from_csv(file_path: Path) -> str | None:
+        """
+        Detect timezone from CSV timestamps by analyzing all timezone offsets.
+
+        Examines ALL timestamps in the CSV to find timezone patterns.
+        If timestamps contain timezone info (e.g., +0000, -0500), attempts to map
+        to a canonical timezone name based on offset patterns.
+
+        :param file_path: Path to CSV file
+        :return: Detected timezone string or None if cannot detect
+        """
+        import csv
+        import re
+
+        # Mapping of DST patterns to timezone names
+        # Format: (offset1, offset2) -> timezone (alphabetically sorted as strings)
+        # Note: String sort differs from numeric! '-0400' < '-0500' (string sort)
+        dst_patterns = {
+            ('-0400', '-0500'): 'US/Eastern',  # EDT/EST (string sorted)
+            ('-0500', '-0600'): 'US/Central',  # CDT/CST (string sorted)
+            ('-0600', '-0700'): 'US/Mountain',  # MDT/MST (string sorted)
+            ('-0700', '-0800'): 'US/Pacific',  # PDT/PST (string sorted)
+            ('+0000', '+0100'): 'Europe/London',  # GMT/BST
+            ('+0100', '+0200'): 'Europe/Paris',  # CET/CEST (also Berlin, Rome, etc.)
+        }
+
+        # noinspection PyBroadException
+        try:
+            with open(file_path, 'r') as f:
+                reader = csv.reader(f)
+                headers = [h.lower() for h in next(reader)]
+
+                # Find timestamp column
+                timestamp_idx = None
+                for idx, header in enumerate(headers):
+                    if header in ['time', 'timestamp', 'date', 'datetime']:
+                        timestamp_idx = idx
+                        break
+
+                if timestamp_idx is None:
+                    return None
+
+                # Collect ALL unique offsets
+                unique_offsets = set()
+                offset_pattern = re.compile(r'([+-]\d{2}):?(\d{2})$')
+
+                for row in reader:
+                    if timestamp_idx >= len(row):
+                        continue
+
+                    timestamp_str = row[timestamp_idx]
+                    match = offset_pattern.search(timestamp_str)
+                    if match:
+                        # Normalize offset format to +0000 or -0500
+                        offset = f"{match.group(1)}{match.group(2)}"
+                        unique_offsets.add(offset)
+
+                if not unique_offsets:
+                    # No timezone info found in timestamps
+                    return None
+
+                # Convert to sorted list for deterministic behavior
+                unique_offsets_list = sorted(unique_offsets)
+
+                if len(unique_offsets_list) == 1:
+                    # Single offset throughout - either fixed timezone or data from one season
+                    offset = unique_offsets_list[0]
+
+                    # Map to common fixed or single-season timezones
+                    # Note: For single offset, we return the timezone that uses this offset
+                    # (could be winter-only or summer-only data)
+                    if offset == '+0000':
+                        return 'UTC'
+                    elif offset == '-0500':
+                        return 'US/Eastern'  # EST (winter) - could also be year-round EST
+                    elif offset == '-0400':
+                        return 'US/Eastern'  # EDT (summer) - could also be year-round Atlantic
+                    elif offset == '-0600':
+                        return 'US/Central'
+                    elif offset == '-0700':
+                        return 'US/Mountain'
+                    elif offset == '-0800':
+                        return 'US/Pacific'
+                    elif offset == '+0100':
+                        return 'Europe/Paris'  # CET (winter)
+                    elif offset == '+0200':
+                        return 'Europe/Paris'  # CEST (summer)
+                    else:
+                        # Unknown offset - return as-is (e.g., "+0530" for IST)
+                        return offset
+
+                elif len(unique_offsets_list) == 2:
+                    # Two offsets - DST transition detected
+                    sorted_offsets: tuple[str, str] = (unique_offsets_list[0], unique_offsets_list[1])
+
+                    # Try to match known DST pattern
+                    if sorted_offsets in dst_patterns:
+                        return dst_patterns[sorted_offsets]
+
+                    # Unknown DST pattern - return the first (smaller) offset
+                    # This gives consistent behavior: winter offset for northern hemisphere
+                    return sorted_offsets[0]
+
+                else:
+                    # More than 2 offsets - unusual (corrupted data or multi-timezone data)
+                    # Return the most negative offset (likely to be standard time)
+                    return unique_offsets_list[0]
+
+        except Exception:
+            # If detection fails, return None (will use default UTC)
+            return None
