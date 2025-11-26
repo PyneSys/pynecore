@@ -254,6 +254,7 @@ class Script:
 
         return decorator
 
+    # noinspection DuplicatedCode
     @classmethod
     def indicator(
             cls,
@@ -326,6 +327,7 @@ class Script:
 
         return script._decorate()
 
+    # noinspection DuplicatedCode
     @classmethod
     def strategy(
             cls,
@@ -351,8 +353,8 @@ class Script:
             commission_value: int | float = 0.0,
             process_orders_on_close=False,
             close_entries_rule='FIFO',
-            margin_long: int | float = 0.0,
-            margin_short: int | float = 0.0,
+            margin_long: int | float = 100.0,
+            margin_short: int | float = 100.0,
 
             explicit_plot_zorder=False,
             max_lines_count=50,
