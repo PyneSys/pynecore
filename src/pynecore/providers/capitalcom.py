@@ -342,13 +342,15 @@ class CapitalComProvider(Provider):
 
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
-                       on_progress: Callable[[datetime], None] | None = None):
+                       on_progress: Callable[[datetime], None] | None = None,
+                       limit: int | None = None):
         """
         Download OHLV data
 
         :param time_from: The start time
         :param time_to: The end time
         :param on_progress: Optional callback to call on progress
+        :param limit: Override the automatic chunk size (number of bars per API request)
         """
 
         # Shortcuts for the time_from and time_to
@@ -362,7 +364,7 @@ class CapitalComProvider(Provider):
                 if on_progress:
                     on_progress(tf)
 
-                res: dict = self.get_historical_prices(time_from=tf)
+                res: dict = self.get_historical_prices(time_from=tf, limit=limit or 1000)
                 if not res or not res['prices']:
                     break
                 ps = res['prices']
