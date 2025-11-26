@@ -183,7 +183,7 @@ def main(
             with OHLCVWriter(demo_file) as writer:
                 current_price = base_price
 
-                for i in range(20000):
+                for i in range(2000):
                     timestamp = int((start_time + timedelta(days=i)).timestamp())
 
                     # Random walk with slight upward bias
