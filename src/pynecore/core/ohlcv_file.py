@@ -45,6 +45,97 @@ def _format_float(value: float) -> str:
     return f"{value:.8g}"
 
 
+def _parse_timezone_param(tz: str | None) -> dt_timezone | ZoneInfo | None:
+    """
+    Parse timezone parameter into a timezone object.
+
+    :param tz: Timezone string (e.g. 'UTC', 'Europe/London', '+0100', '-0500')
+    :return: Timezone object or None if tz is None
+    :raises ValueError: If timezone format is invalid
+    """
+    if not tz:
+        return None
+
+    if tz.startswith(('+', '-')):
+        # Handle UTC offset format (e.g. +0100, -0500)
+        sign = 1 if tz.startswith('+') else -1
+        hours = int(tz[1:3])
+        minutes = int(tz[3:]) if len(tz) > 3 else 0
+        return dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
+    else:
+        # Handle named timezone (e.g. UTC, Europe/London)
+        try:
+            return ZoneInfo(tz)
+        except Exception as e:
+            raise ValueError(f"Invalid timezone {tz}: {e}")
+
+
+def _find_timestamp_columns(headers: list[str],
+                            timestamp_column: str | None = None,
+                            date_column: str | None = None,
+                            time_column: str | None = None) -> tuple[int | None, int | None, int | None]:
+    """
+    Find timestamp-related column indices in headers.
+
+    :param headers: List of column headers (already lowercased)
+    :param timestamp_column: Optional specific timestamp column name
+    :param date_column: Optional date column name (when split into date+time)
+    :param time_column: Optional time column name (when split into date+time)
+    :return: Tuple of (timestamp_idx, date_idx, time_idx)
+    :raises ValueError: If required columns are not found
+    """
+    timestamp_idx = None
+    date_idx = None
+    time_idx = None
+
+    if date_column and time_column:
+        try:
+            date_idx = headers.index(date_column.lower())
+            time_idx = headers.index(time_column.lower())
+        except ValueError:
+            raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
+    else:
+        timestamp_col = timestamp_column.lower() if timestamp_column else None
+        if timestamp_col:
+            try:
+                timestamp_idx = headers.index(timestamp_col)
+            except ValueError:
+                raise ValueError(f"Timestamp column not found: {timestamp_col}")
+        else:
+            # Try common names
+            for col in ['timestamp', 'time', 'date']:
+                try:
+                    timestamp_idx = headers.index(col)
+                    break
+                except ValueError:
+                    continue
+
+            if timestamp_idx is None:
+                raise ValueError("Timestamp column not found!")
+
+    return timestamp_idx, date_idx, time_idx
+
+
+def _find_ohlcv_columns(headers: list[str]) -> tuple[int, int, int, int, int]:
+    """
+    Find OHLCV column indices in headers.
+
+    :param headers: List of column headers (already lowercased)
+    :return: Tuple of (open_idx, high_idx, low_idx, close_idx, volume_idx)
+    :raises ValueError: If required columns are not found
+    """
+    try:
+        o_idx = headers.index('open')
+        h_idx = headers.index('high')
+        l_idx = headers.index('low')
+        c_idx = headers.index('close')
+        v_idx = headers.index('volume')
+    except ValueError as e:
+        raise ValueError(f"Missing required column: {str(e)}")
+
+    return o_idx, h_idx, l_idx, c_idx, v_idx
+
+
 def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=None) -> int:
     """
     Parse timestamp string to Unix timestamp.
@@ -933,6 +1024,43 @@ class OHLCVWriter:
                     pass
             raise IOError(f"Failed to rebuild file with correct interval: {e}")
 
+    def _parse_and_write_ohlcv_row(self, ts_str: str, row: list[str],
+                                    o_idx: int, h_idx: int, l_idx: int, c_idx: int, v_idx: int,
+                                    timestamp_format: str | None,
+                                    timezone: dt_timezone | ZoneInfo | None) -> None:
+        """
+        Parse timestamp and write OHLCV row with error handling.
+
+        :param ts_str: Timestamp string to parse
+        :param row: Data row containing OHLCV values
+        :param o_idx: Index of open price
+        :param h_idx: Index of high price
+        :param l_idx: Index of low price
+        :param c_idx: Index of close price
+        :param v_idx: Index of volume
+        :param timestamp_format: Optional timestamp format
+        :param timezone: Timezone object
+        :raises ValueError: If parsing or data conversion fails
+        """
+        # Parse timestamp
+        try:
+            timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
+        except Exception as e:
+            raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
+
+        # Write OHLCV data
+        try:
+            self.write(OHLCV(
+                timestamp,
+                float(row[o_idx]),
+                float(row[h_idx]),
+                float(row[l_idx]),
+                float(row[c_idx]),
+                float(row[v_idx])
+            ))
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Invalid data in row: {e}")
+
     def load_from_csv(self, path: str | Path,
                       timestamp_format: str | None = None,
                       timestamp_column: str | None = None,
@@ -949,66 +1077,16 @@ class OHLCVWriter:
         :param time_column: When timestamp is split into date+time columns, time column name
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100') for timestamp conversion
         """
-        # Parse timezone
-        timezone = None
-        if tz:
-            if tz.startswith(('+', '-')):
-                # Handle UTC offset fmt (e.g. +0100, -0500)
-                sign = 1 if tz.startswith('+') else -1
-                hours = int(tz[1:3])
-                minutes = int(tz[3:]) if len(tz) > 3 else 0
-                timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
-            else:
-                # Handle named timezone (e.g. UTC, Europe/London)
-                try:
-                    timezone = ZoneInfo(tz)
-                except Exception as e:
-                    raise ValueError(f"Invalid timezone {tz}: {e}")
+        timezone = _parse_timezone_param(tz)
 
         # Read CSV headers first
         with open(path, 'r') as f:
             reader = csv.reader(f)
             headers = [h.lower() for h in next(reader)]  # Case insensitive
 
-            # Find timestamp column
-            timestamp_idx = None
-            date_idx = None
-            time_idx = None
-
-            if date_column and time_column:
-                try:
-                    date_idx = headers.index(date_column.lower())
-                    time_idx = headers.index(time_column.lower())
-                except ValueError:
-                    raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
-            else:
-                timestamp_col = timestamp_column.lower() if timestamp_column else None
-                if timestamp_col:
-                    try:
-                        timestamp_idx = headers.index(timestamp_col)
-                    except ValueError:
-                        raise ValueError(f"Timestamp column not found: {timestamp_col}")
-                else:
-                    # Try common names
-                    for col in ['timestamp', 'time', 'date']:
-                        try:
-                            timestamp_idx = headers.index(col)
-                            break
-                        except ValueError:
-                            continue
-
-                    if timestamp_idx is None:
-                        raise ValueError("Timestamp column not found!")
-
-            # Find OHLCV columns
-            try:
-                o_idx = headers.index('open')
-                h_idx = headers.index('high')
-                l_idx = headers.index('low')
-                c_idx = headers.index('close')
-                v_idx = headers.index('volume')
-            except ValueError as e:
-                raise ValueError(f"Missing required column: {str(e)}")
+            # Find timestamp and OHLCV columns
+            timestamp_idx, date_idx, time_idx = _find_timestamp_columns(headers, timestamp_column, date_column, time_column)
+            o_idx, h_idx, l_idx, c_idx, v_idx = _find_ohlcv_columns(headers)
 
             # Process data rows
             for row in reader:
@@ -1019,24 +1097,9 @@ class OHLCVWriter:
                 else:
                     ts_str = row[timestamp_idx]
 
-                # Convert timestamp
-                try:
-                    timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
-                except Exception as e:
-                    raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
-
-                # Write OHLCV data
-                try:
-                    self.write(OHLCV(
-                        timestamp,
-                        float(row[o_idx]),
-                        float(row[h_idx]),
-                        float(row[l_idx]),
-                        float(row[c_idx]),
-                        float(row[v_idx])
-                    ))
-                except (ValueError, IndexError) as e:
-                    raise ValueError(f"Invalid data in row: {e}")
+                # Parse and write row
+                self._parse_and_write_ohlcv_row(ts_str, row, o_idx, h_idx, l_idx, c_idx, v_idx,
+                                                 timestamp_format, timezone)
 
     def load_from_txt(self, path: str | Path,
                       timestamp_format: str | None = None,
@@ -1054,21 +1117,7 @@ class OHLCVWriter:
         :param time_column: When timestamp is split into date+time columns, time column name
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100') for timestamp conversion
         """
-        # Parse timezone
-        timezone = None
-        if tz:
-            if tz.startswith(('+', '-')):
-                # Handle UTC offset fmt (e.g. +0100, -0500)
-                sign = 1 if tz.startswith('+') else -1
-                hours = int(tz[1:3])
-                minutes = int(tz[3:]) if len(tz) > 3 else 0
-                timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
-            else:
-                # Handle named timezone (e.g. UTC, Europe/London)
-                try:
-                    timezone = ZoneInfo(tz)
-                except Exception as e:
-                    raise ValueError(f"Invalid timezone {tz}: {e}")
+        timezone = _parse_timezone_param(tz)
 
         # Auto-detect delimiter
         with open(path, 'r') as f:
@@ -1109,45 +1158,9 @@ class OHLCVWriter:
         if not headers:
             raise ValueError("No headers found")
 
-        # Find timestamp column
-        timestamp_idx = None
-        date_idx = None
-        time_idx = None
-
-        if date_column and time_column:
-            try:
-                date_idx = headers.index(date_column.lower())
-                time_idx = headers.index(time_column.lower())
-            except ValueError:
-                raise ValueError(f"Date/time columns not found: {date_column}/{time_column}")
-        else:
-            timestamp_col = timestamp_column.lower() if timestamp_column else None
-            if timestamp_col:
-                try:
-                    timestamp_idx = headers.index(timestamp_col)
-                except ValueError:
-                    raise ValueError(f"Timestamp column not found: {timestamp_col}")
-            else:
-                # Try common names
-                for col in ['timestamp', 'time', 'date']:
-                    try:
-                        timestamp_idx = headers.index(col)
-                        break
-                    except ValueError:
-                        continue
-
-                if timestamp_idx is None:
-                    raise ValueError("Timestamp column not found!")
-
-        # Find OHLCV columns
-        try:
-            o_idx = headers.index('open')
-            h_idx = headers.index('high')
-            l_idx = headers.index('low')
-            c_idx = headers.index('close')
-            v_idx = headers.index('volume')
-        except ValueError as e:
-            raise ValueError(f"Missing required column: {str(e)}")
+        # Find timestamp and OHLCV columns
+        timestamp_idx, date_idx, time_idx = _find_timestamp_columns(headers, timestamp_column, date_column, time_column)
+        o_idx, h_idx, l_idx, c_idx, v_idx = _find_ohlcv_columns(headers)
 
         # Process data rows
         for line in lines[1:]:  # Skip header
@@ -1169,24 +1182,10 @@ class OHLCVWriter:
                 ts_str = f"{row[date_idx]} {row[time_idx]}"
             else:
                 ts_str = str(row[timestamp_idx]) if timestamp_idx is not None and timestamp_idx < len(row) else ""
-            try:
-                # Convert timestamp
-                timestamp = _parse_timestamp(ts_str, timestamp_format, timezone)
-            except Exception as e:
-                raise ValueError(f"Failed to parse timestamp '{ts_str}': {e}")
 
-            # Write OHLCV data
-            try:
-                self.write(OHLCV(
-                    timestamp,
-                    float(row[o_idx]),
-                    float(row[h_idx]),
-                    float(row[l_idx]),
-                    float(row[c_idx]),
-                    float(row[v_idx])
-                ))
-            except (ValueError, IndexError) as e:
-                raise ValueError(f"Invalid data in row: {e}")
+            # Parse and write row
+            self._parse_and_write_ohlcv_row(ts_str, row, o_idx, h_idx, l_idx, c_idx, v_idx,
+                                             timestamp_format, timezone)
 
     @staticmethod
     def _parse_txt_line(line: str, delimiter: str) -> list[str]:
@@ -1285,21 +1284,7 @@ class OHLCVWriter:
         :param tz: Timezone name (e.g. 'UTC', 'Europe/London', '+0100')
         :param mapping: Optional field mapping, e.g. {'timestamp': 't', 'volume': 'vol'}
         """
-        # Parse timezone
-        timezone = None
-        if tz:
-            if tz.startswith(('+', '-')):
-                # Handle UTC offset format
-                sign = 1 if tz.startswith('+') else -1
-                hours = int(tz[1:3])
-                minutes = int(tz[3:]) if len(tz) > 3 else 0
-                timezone = dt_timezone(sign * timedelta(hours=hours, minutes=minutes))
-            else:
-                # Handle named timezone
-                try:
-                    timezone = ZoneInfo(tz)
-                except Exception as e:
-                    raise ValueError(f"Invalid timezone {tz}: {e}")
+        timezone = _parse_timezone_param(tz)
 
         # Setup field mapping
         mapping = mapping or {}
