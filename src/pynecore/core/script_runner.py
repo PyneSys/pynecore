@@ -286,14 +286,21 @@ class ScriptRunner:
         position = self.script.position
 
         try:
-            for candle in self.ohlcv_iter:
+            # Peek-ahead pattern: look one step ahead to detect the last bar accurately
+            ohlcv_iterator = iter(self.ohlcv_iter)
+            next_candle = next(ohlcv_iterator, None)
+
+            while next_candle is not None:
+                candle = next_candle
+                next_candle = next(ohlcv_iterator, None)
+
                 # Update syminfo lib properties if needed, other ScriptRunner instances may have changed them
                 if self.update_syminfo_every_run:
                     _set_lib_syminfo_properties(self.syminfo, lib)
                     self.tz = _parse_timezone(lib.syminfo.timezone)
 
-                if self.bar_index == self.last_bar_index:
-                    barstate.islast = True
+                # Accurate last bar detection - no more estimation needed
+                barstate.islast = (next_candle is None)
 
                 # Update lib properties
                 _set_lib_properties(candle, self.bar_index, self.tz, lib)
