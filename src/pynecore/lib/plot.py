@@ -23,11 +23,8 @@ class PlotModule(CallableModule):
     style_line = PlotEnum()
     style_linebr = PlotEnum()
     style_stepline = PlotEnum()
+    style_steplinebr = PlotEnum()
     style_stepline_diamond = PlotEnum()
-
-    #
-    # Functions
-    #
 
 
 #

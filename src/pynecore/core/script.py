@@ -1,4 +1,4 @@
-from typing import cast, Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar
 import os
 import sys
 
@@ -54,7 +54,7 @@ _old_input_values: dict[str, Any] = {}
 inputs: dict[str | None, InputData] = {}
 
 
-# noinspection PyShadowingBuiltins,PyShadowingNames
+# noinspection PyShadowingBuiltins,PyShadowingNames,PyDunderSlots,PyUnresolvedReferences
 @dataclass(kw_only=True, slots=True)
 class Script:
     """
@@ -127,7 +127,9 @@ class Script:
             if isinstance(value, Color):
                 value = str(value)
             if isinstance(value, str):
-                return f'"{value}"'
+                # Escape newlines and backslashes for valid TOML
+                escaped = value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
+                return f'"{escaped}"'
             return str(value)
 
         lines = [
@@ -292,7 +294,7 @@ class Script:
                               referenced by Series objects
         :param timeframe: Adds multi-timeframe functionality to simple scripts
         :param timeframe_gaps: Specifies how the indicator's values are displayed on chart bars
-                               when the `timeframe` is higher than the chart's.
+                               when the `timeframe` is higher than the chart's timeframe.
         :param explicit_plot_zorder: Specifies the order in which the script's plots, fills, and hlines are rendered
         :param max_lines_count: The number of last line drawings displayed on the chart
         :param max_labels_count: The number of last label drawings displayed
@@ -755,7 +757,7 @@ class _Input:
             display=display,
         )
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
-        return cast(Series[float], defval if _id not in _old_input_values else _old_input_values[_id])
+        return defval if _id not in _old_input_values else _old_input_values[_id]
 
     @classmethod
     def enum(cls, defval: TEnum, title: str | None = None, *,
@@ -814,7 +816,7 @@ class _Input:
     session = string
     symbol = string
     timeframe = string
-    textarea = string
+    text_area = string
 
     # time() returns UNIX timestamp in milliseconds (int)
     time = _int

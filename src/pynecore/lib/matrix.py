@@ -9,15 +9,15 @@ _registry: list[Matrix] = []
 
 
 # noinspection PyShadowingNames
-def new(rows: int, columns: int, initial_value: Any = None) -> Matrix:
+def new(rows: int = 0, columns: int = 0, initial_value: Any = None) -> Matrix:
     """
     Create a new matrix object.
 
     A matrix is a two-dimensional data structure containing rows and columns.
     All elements in the matrix must be of the same type.
 
-    :param rows: Initial row count of the matrix.
-    :param columns: Initial column count of the matrix.
+    :param rows: Initial row count of the matrix. Optional, defaults to 0.
+    :param columns: Initial column count of the matrix. Optional, defaults to 0.
     :param initial_value: Initial value of all matrix elements. If None, uses NA.
     :return: The ID of the new matrix object.
     """
