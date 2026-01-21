@@ -13,6 +13,13 @@ from . import run, data, compile, benchmark
 
 __all__ = ['run', 'data', 'compile', 'benchmark']
 
+# Conditional import for private TradingView test command
+_tv_path = Path(__file__).parent / "tv.py"
+if _tv_path.exists() and _tv_path.is_symlink():
+    from . import tv
+
+    __all__.append('tv')
+
 
 @app.callback()
 def setup(
@@ -46,7 +53,7 @@ def setup(
     """
     if ctx.resilient_parsing:
         return
-    
+
     # If no subcommand is provided, show complete help like --help
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
