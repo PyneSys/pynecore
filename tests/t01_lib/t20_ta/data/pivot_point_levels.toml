@@ -1,0 +1,108 @@
+[symbol]
+prefix = "FX"
+description = "EUR/USD"
+ticker = "EURUSD"
+currency = "USD"
+basecurrency = "EUR"
+period = "30"
+type = "forex"
+mintick = 0.00001000
+pricescale = 100000
+minmove = 1.00000000
+pointvalue = 1
+timezone = "US/Eastern"
+volumetype = "base"
+avg_spread = 0.00007306
+
+# Opening hours - FX market (Sunday 17:00 to Friday 17:00 ET)
+[[opening_hours]]
+day = 0
+start = "00:00:00"
+end = "16:59:50"
+
+[[opening_hours]]
+day = 0
+start = "17:05:00"
+end = "00:00:00"
+
+[[opening_hours]]
+day = 1
+start = "00:00:00"
+end = "16:59:50"
+
+[[opening_hours]]
+day = 1
+start = "17:05:00"
+end = "00:00:00"
+
+[[opening_hours]]
+day = 2
+start = "00:00:00"
+end = "16:59:50"
+
+[[opening_hours]]
+day = 2
+start = "17:05:00"
+end = "00:00:00"
+
+[[opening_hours]]
+day = 3
+start = "00:00:00"
+end = "16:59:50"
+
+[[opening_hours]]
+day = 3
+start = "17:05:00"
+end = "00:00:00"
+
+[[opening_hours]]
+day = 4
+start = "00:00:00"
+end = "16:59:50"
+
+[[opening_hours]]
+day = 6
+start = "17:00:00"
+end = "00:00:00"
+
+# Session starts - Daily session starts at 17:00/17:05 ET (= 22:00 UTC)
+[[session_starts]]
+day = 0
+time = "17:05:00"
+
+[[session_starts]]
+day = 1
+time = "17:05:00"
+
+[[session_starts]]
+day = 2
+time = "17:05:00"
+
+[[session_starts]]
+day = 3
+time = "17:05:00"
+
+[[session_starts]]
+day = 6
+time = "17:00:00"
+
+# Session ends - Daily session ends at 16:59:50 ET
+[[session_ends]]
+day = 0
+time = "16:59:50"
+
+[[session_ends]]
+day = 1
+time = "16:59:50"
+
+[[session_ends]]
+day = 2
+time = "16:59:50"
+
+[[session_ends]]
+day = 3
+time = "16:59:50"
+
+[[session_ends]]
+day = 4
+time = "16:59:50"

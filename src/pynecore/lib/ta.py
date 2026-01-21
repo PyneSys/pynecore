@@ -62,6 +62,7 @@ __all__ = [
     "percentile_linear_interpolation",
     "percentile_nearest_rank",
     "percentrank",
+    "pivot_point_levels",
     "pivothigh",
     "pivotlow",
     "pvi",
@@ -1118,6 +1119,173 @@ def percentrank(source: Series[float], length: int) -> float | NA[float] | Serie
     length = int(length)
 
     return array.percentrank(source[:length + 1], 0)  # type: ignore
+
+
+# noinspection PyUnusedLocal
+def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> list[float | NA[float]]:
+    """
+    Calculate pivot point levels based on the specified calculation type.
+
+    Returns an array of 11 float values representing pivot point levels:
+    [P, R1, S1, R2, S2, R3, S3, R4, S4, R5, S5]
+
+    :param type: Pivot calculation type: "Traditional", "Fibonacci", "Woodie",
+                 "Classic", "DM", or "Camarilla"
+    :param anchor: Condition that triggers recalculation of pivot levels
+                   (e.g., timeframe.change("D"))
+    :param developing: If true, values recalculate on each bar using current OHLC;
+                      if false (default), values remain constant until the next anchor
+    :return: Array of 11 float values: [P, R1, S1, R2, S2, R3, S3, R4, S4, R5, S5]
+             Not all types support all levels - unsupported ones return NA(float)
+    """
+    # Persistent state for anchor-based calculation
+    # These store the COMPLETED previous period's values (used when developing=False)
+    prev_period_high: Persistent[float] = NA(float)
+    prev_period_low: Persistent[float] = NA(float)
+    prev_period_close: Persistent[float] = NA(float)
+    prev_period_open: Persistent[float] = NA(float)
+
+    # These accumulate values for the CURRENT period (will become prev_period on next anchor)
+    curr_period_high: Persistent[float] = NA(float)
+    curr_period_low: Persistent[float] = NA(float)
+    curr_period_open: Persistent[float] = NA(float)
+    is_first_bar_of_period: Persistent[bool] = True
+
+    levels: Persistent[list[float | NA[float]]] = [NA(float)] * 11
+    had_anchor: Persistent[bool] = False
+
+    # Normalize type to lowercase for case-insensitive comparison
+    type_lower = type.lower() if isinstance(type, str) else ""
+
+    # On anchor, finalize the previous period and start a new one
+    if anchor:
+        # Save the accumulated current period values as the previous period
+        prev_period_high = curr_period_high
+        prev_period_low = curr_period_low
+        prev_period_close = close[1] if bar_index > 0 else close  # Last close of prev period
+        prev_period_open = curr_period_open
+
+        # Reset current period accumulators for the new period
+        curr_period_high = high
+        curr_period_low = low
+        curr_period_open = open
+        is_first_bar_of_period = False
+        had_anchor = True
+    else:
+        # Accumulate OHLC extremes for current period
+        if is_first_bar_of_period or isinstance(curr_period_high, NA):
+            curr_period_high = high
+            curr_period_low = low
+            curr_period_open = open
+            is_first_bar_of_period = False
+        else:
+            if not isinstance(high, NA) and high > curr_period_high:
+                curr_period_high = high
+            if not isinstance(low, NA) and low < curr_period_low:
+                curr_period_low = low
+
+    # If no anchor has occurred yet, return all NA values
+    if not had_anchor:
+        return [NA(float)] * 11
+
+    # Determine which OHLC values to use
+    if developing:
+        # Use current accumulated values for developing mode
+        h = curr_period_high
+        l = curr_period_low
+        c = close  # Current close for developing
+        o = curr_period_open
+    else:
+        # Use previous period's OHLC (fixed after anchor)
+        h = prev_period_high
+        l = prev_period_low
+        c = prev_period_close
+        o = prev_period_open
+
+    # Check for NA values
+    if isinstance(h, NA) or isinstance(l, NA) or isinstance(c, NA):
+        return [NA(float)] * 11
+
+    # Calculate range
+    rng = h - l
+
+    # Calculate levels based on type
+    if type_lower in ("traditional", "classic"):
+        # Traditional/Classic Pivot Points
+        p = (h + l + c) / 3
+        r1 = 2 * p - l
+        s1 = 2 * p - h
+        r2 = p + rng
+        s2 = p - rng
+        r3 = r1 + rng
+        s3 = s1 - rng
+        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+
+    elif type_lower == "fibonacci":
+        # Fibonacci Pivot Points
+        p = (h + l + c) / 3
+        r1 = p + 0.382 * rng
+        s1 = p - 0.382 * rng
+        r2 = p + 0.618 * rng
+        s2 = p - 0.618 * rng
+        r3 = p + 1.000 * rng
+        s3 = p - 1.000 * rng
+        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+
+    elif type_lower == "woodie":
+        # Woodie Pivot Points
+        # Note: Woodie uses current period's OPEN (not prev period's close) for the "close" component
+        # This makes Woodie more responsive to current price action
+        woodie_c = curr_period_open if not developing else close
+        if isinstance(woodie_c, NA):
+            return [NA(float)] * 11
+        p = (h + l + 2 * woodie_c) / 4
+        r1 = 2 * p - l
+        s1 = 2 * p - h
+        r2 = p + rng
+        s2 = p - rng
+        r3 = r1 + rng
+        s3 = s1 - rng
+        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+
+    elif type_lower == "dm":
+        # DeMark Pivot Points
+        if isinstance(o, NA):
+            return [NA(float)] * 11
+
+        if c < o:
+            x = h + 2 * l + c
+        elif c > o:
+            x = 2 * h + l + c
+        else:  # c == o
+            x = h + l + 2 * c
+
+        p = x / 4
+        r1 = x / 2 - l
+        s1 = x / 2 - h
+        # DM only has P, R1, S1
+        levels = [p, r1, s1, NA(float), NA(float), NA(float), NA(float),
+                  NA(float), NA(float), NA(float), NA(float)]
+
+    elif type_lower == "camarilla":
+        # Camarilla Pivot Points
+        p = (h + l + c) / 3
+        r1 = c + rng * 1.1 / 12
+        s1 = c - rng * 1.1 / 12
+        r2 = c + rng * 1.1 / 6
+        s2 = c - rng * 1.1 / 6
+        r3 = c + rng * 1.1 / 4
+        s3 = c - rng * 1.1 / 4
+        r4 = c + rng * 1.1 / 2
+        s4 = c - rng * 1.1 / 2
+        # Camarilla has P, R1-R4, S1-S4 (no R5, S5)
+        levels = [p, r1, s1, r2, s2, r3, s3, r4, s4, NA(float), NA(float)]
+
+    else:
+        # Unknown type - return all NA
+        levels = [NA(float)] * 11
+
+    return levels
 
 
 @overload
