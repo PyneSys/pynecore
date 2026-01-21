@@ -5,18 +5,27 @@ from functools import lru_cache
 from ..lib import syminfo
 
 # Standard formats for non-ISO dates
+# %b = abbreviated month (Jan, Feb), %B = full month (January, February)
 STANDARD_FORMATS = [
     "%d %b %Y %H:%M:%S %z",  # "20 Feb 2020 15:30:00 +0200"
     "%d %b %Y %H:%M %z",  # "01 Jan 2018 00:00 +0000"
+    "%d %B %Y %H:%M:%S %z",  # "20 February 2020 15:30:00 +0200"
+    "%d %B %Y %H:%M %z",  # "1 January 2018 00:00 +0000"
 ]
 
 # Pine Script specific formats (without timezone)
+# %b = abbreviated month (Jan, Feb), %B = full month (January, February)
 PINE_FORMATS = [
     "%b %d %Y %H:%M:%S",  # "Feb 01 2020 22:10:05"
     "%d %b %Y %H:%M:%S",  # "04 Dec 1995 00:12:00"
     "%d %b %Y %H:%M",  # "01 Jan 2018 00:00"
     "%b %d %Y",  # "Feb 01 2020"
     "%d %b %Y",  # "04 Dec 1995"
+    "%B %d %Y %H:%M:%S",  # "February 01 2020 22:10:05"
+    "%d %B %Y %H:%M:%S",  # "04 December 1995 00:12:00"
+    "%d %B %Y %H:%M",  # "01 January 2018 00:00"
+    "%B %d %Y",  # "February 01 2020"
+    "%d %B %Y",  # "04 December 1995"
     "%Y-%m-%d"  # "2020-02-20"
 ]
 
@@ -171,6 +180,6 @@ def parse_datestring(datestring: str) -> datetime:
         "Supported formats:\n"
         "- ISO Style: '2020-02-20T15:30:00+02:00', '2025-01-01 01:23:45-05:00'\n"
         "- With fraction: '2024-08-01T04:38:47.731215+00:00'\n"
-        "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200'\n"
-        "- Simple Pine: 'Feb 01 2020 22:10:05', '2020-02-20'"
+        "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200', '1 January 2018 00:00 +0000'\n"
+        "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'"
     )
