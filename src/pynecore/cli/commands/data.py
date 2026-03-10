@@ -126,7 +126,10 @@ def download(
     """
     # Import provider module from
     provider_module = __import__(f"pynecore.providers.{provider.value}", fromlist=[''])
-    provider_class = getattr(provider_module, [p for p in dir(provider_module) if p.endswith('Provider')][0])
+    # Find the provider class (exclude base Provider class)
+    provider_class = getattr(provider_module, [
+        p for p in dir(provider_module) if p.endswith('Provider') and p != 'Provider'
+    ][0])
 
     try:
         # If list_symbols is True, we show the available symbols then exit
@@ -179,24 +182,27 @@ def download(
                     time_from = datetime.fromtimestamp(ohlcv_writer.end_timestamp, UTC)
                     # We need to add one interval to the start date to avoid downloading the same data
                     time_from += timedelta(seconds=ohlcv_writer.interval)
+                elif provider.value == 'tv':  # TV provider: fetch all available data
+                    time_from = None
                 else:  # No data, download one year as default
                     time_from = datetime.now(UTC) - timedelta(days=365)
 
             # We need to remove timezone info
-            time_from = time_from.replace(tzinfo=None)
+            if time_from is not None:
+                time_from = time_from.replace(tzinfo=None)
             time_to = time_to.replace(tzinfo=None)
 
             # We cannot download data from the future otherwise it would take very long
             if time_to > datetime.now(UTC).replace(tzinfo=None):
                 time_to = datetime.now(UTC).replace(tzinfo=None)
 
-            # Check time range
-            if time_to < time_from:
+            # Check time range (skip for TV provider when time_from is None)
+            if time_from is not None and time_to < time_from:
                 secho("Error: End date (to) must be greater than start date (from)!", err=True, fg=colors.RED)
                 raise Exit(1)
 
             # If the start date is before the start of the existing file, we truncate the file
-            if ohlcv_writer.start_timestamp:
+            if ohlcv_writer.start_timestamp and time_from is not None:
                 if time_from < ohlcv_writer.start_datetime.replace(tzinfo=None):
                     secho(f"The start date (from: {time_from}) is before the start of the "
                           f"existing file ({ohlcv_writer.start_datetime.replace(tzinfo=None)}).\n"
@@ -207,30 +213,44 @@ def download(
                     ohlcv_writer.seek(0)
                     ohlcv_writer.truncate()
 
-            total_seconds = int((time_to - time_from).total_seconds())
+            # TV provider with no time_from: use spinner-only progress (no time-based progress bar)
+            if time_from is None:
+                with Progress(
+                        SpinnerColumn(finished_text="[green]✓"),
+                        TextColumn("{task.description}"),
+                        TimeElapsedColumn(),
+                ) as progress:
+                    progress.add_task(
+                        description="Downloading all available OHLCV data...",
+                        total=None,
+                    )
+                    # Start downloading (no progress callback - TV provider shows its own progress)
+                    provider_instance.download_ohlcv(time_from, time_to, on_progress=None, limit=chunk_size)
+            else:
+                total_seconds = int((time_to - time_from).total_seconds())
 
-            # Get OHLCV data
-            with Progress(
-                    SpinnerColumn(finished_text="[green]✓"),
-                    TextColumn("{task.description}"),
-                    DateColumn(time_from),
-                    BarColumn(),
-                    TimeElapsedColumn(),
-                    "/",
-                    TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task(
-                    description="Downloading OHLCV data...",
-                    total=total_seconds,
-                )
+                # Get OHLCV data
+                with Progress(
+                        SpinnerColumn(finished_text="[green]✓"),
+                        TextColumn("{task.description}"),
+                        DateColumn(time_from),
+                        BarColumn(),
+                        TimeElapsedColumn(),
+                        "/",
+                        TimeRemainingColumn(),
+                ) as progress:
+                    task = progress.add_task(
+                        description="Downloading OHLCV data...",
+                        total=total_seconds,
+                    )
 
-                def cb_progress(current_time: datetime):
-                    """ Callback to update progress """
-                    elapsed_seconds = int((current_time - time_from).total_seconds())
-                    progress.update(task, completed=elapsed_seconds)
+                    def cb_progress(current_time: datetime):
+                        """ Callback to update progress """
+                        elapsed_seconds = int((current_time - time_from).total_seconds())
+                        progress.update(task, completed=elapsed_seconds)
 
-                # Start downloading
-                provider_instance.download_ohlcv(time_from, time_to, on_progress=cb_progress, limit=chunk_size)
+                    # Start downloading
+                    provider_instance.download_ohlcv(time_from, time_to, on_progress=cb_progress, limit=chunk_size)
 
     except (ImportError, ValueError) as e:
         secho(str(e), err=True, fg=colors.RED)

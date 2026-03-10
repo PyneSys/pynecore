@@ -18,7 +18,7 @@ class Matrix(Generic[T]):
     A matrix implementation in pure Python
     """
 
-    def __init__(self, rows: int, cols: int, initial_value: T = NA(T)):
+    def __init__(self, rows: int = 0, cols: int = 0, initial_value: T = NA(T)):
         self.rows = rows
         self.cols = cols
         self.data = [[initial_value for _ in range(cols)] for _ in range(rows)]
@@ -32,19 +32,20 @@ class Matrix(Generic[T]):
         :param row: The index where the new row will be inserted. If None, appends to the end.
         :param array_id: Array to use for providing values to the new row. If shorter than matrix
                         width, remaining cells are filled with NA. If longer, array is truncated.
+                        If matrix is empty, the array size determines the column count.
         :raises IndexError: If row index is out of bounds.
         """
-        # Ha row nincs megadva, akkor a végére adjuk hozzá
         if row is None:
             row = self.rows
 
-        # Határok ellenőrzése
         if row < 0 or row > self.rows:
             raise IndexError(f"Row index {row} out of bounds for matrix with {self.rows} rows")
 
-        # Új sor létrehozása
         if array_id is not None:
-            # Ha array van megadva, használjuk azt (csonkítva vagy kiegészítve NA-val)
+            # If matrix is empty (0 columns), use array size to set column count
+            if self.cols == 0 and len(array_id) > 0:
+                self.cols = len(array_id)
+
             new_row = []
             for i in range(self.cols):
                 if i < len(array_id):
@@ -52,10 +53,8 @@ class Matrix(Generic[T]):
                 else:
                     new_row.append(NA(T))
         else:
-            # Ha nincs array megadva, NA értékekkel töltjük fel
             new_row = [NA(T) for _ in range(self.cols)]
 
-        # Sor beszúrása a megadott pozícióba
         self.data.insert(row, new_row)
         self.rows += 1
 
@@ -979,6 +978,7 @@ class Matrix(Generic[T]):
 
         :param col: The index where the new column will be inserted. If None, appends to the end.
         :param array_id: Array to use for providing values to the new column.
+                        If matrix is empty, the array size determines the row count.
         :raises IndexError: If column index is out of bounds.
         """
         if col is None:
@@ -986,6 +986,11 @@ class Matrix(Generic[T]):
 
         if col < 0 or col > self.cols:
             raise IndexError(f"Column index {col} out of bounds")
+
+        # If matrix is empty (0 rows) and array provided, create rows first
+        if self.rows == 0 and array_id and len(array_id) > 0:
+            self.rows = len(array_id)
+            self.data = [[] for _ in range(self.rows)]
 
         for i in range(self.rows):
             if array_id and i < len(array_id):
