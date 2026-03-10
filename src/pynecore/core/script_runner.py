@@ -64,16 +64,22 @@ def import_script(script_path: Path) -> ModuleType:
     return module
 
 
-# noinspection PyUnusedLocal
 def _round_price(price: float, lib: ModuleType):
     """
-    Round price to the nearest tick
+    Round price to 6 significant digits to clean float32 storage artifacts
+    without destroying sub-mintick precision.
+
+    TradingView does NOT round OHLC data to syminfo.mintick — scripts see
+    the raw data (e.g. close=4.125 even when mintick=0.01). The float32
+    OHLCV format introduces small errors (e.g. 4.12 → 4.1199998856) that
+    this function cleans by rounding to 6 significant digits (float32 has ~7).
     """
-    if TYPE_CHECKING:  # This is needed for the type checker to work
-        from .. import lib
-    syminfo = lib.syminfo
-    scaled = round(price * syminfo.pricescale)
-    return scaled / syminfo.pricescale
+    if price == 0.0:
+        return 0.0
+    from math import log10, floor
+    magnitude = floor(log10(abs(price)))
+    precision = 5 - magnitude  # 6 significant digits
+    return round(price, precision)
 
 
 # noinspection PyShadowingNames,PyUnusedLocal
