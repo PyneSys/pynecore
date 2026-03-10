@@ -328,6 +328,10 @@ class ScriptRunner:
                 # Run the script
                 res = self.script_module.main()
 
+                # Process deferred margin calls (after script runs, before results)
+                if is_strat and position:
+                    position.process_deferred_margin_call()
+
                 # Update plot data with the results
                 if res is not None:
                     assert isinstance(res, dict), "The 'main' function must return a dictionary!"
