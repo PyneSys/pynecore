@@ -1310,10 +1310,18 @@ class Position:
         for order in self.orderbook.iter_orders():
             # Check if the order would be filled immediately (e.g. due to a gap)
             if self._check_already_filled(order):
-                # If the order is an exit order, we need to cancel all orders with the same exit_id
                 if order.exit_id is not None:
-                    self._remove_order_by_id(order.exit_id)
-                    continue
+                    # Exit order gaps through — check if it's for an open position
+                    has_open_trade = any(
+                        t.entry_id == order.order_id for t in self.open_trades
+                    )
+                    if not has_open_trade:
+                        # No open position for this exit — cancel exit and associated entry
+                        associated_entry = self.entry_orders.get(order.order_id)
+                        if associated_entry is not None:
+                            self._remove_order(associated_entry)
+                        self._remove_order(order)
+                        continue
 
                 # Convert to market order
                 order.is_market_order = True
