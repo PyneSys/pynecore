@@ -1353,6 +1353,32 @@ class Position:
                 slippage_amount = syminfo.mintick * script.slippage * order.sign
                 fill_price = self.o + slippage_amount
 
+            # Pre-fill margin check for entry orders (TradingView behavior)
+            # TV rejects entry orders BEFORE filling if the position would exceed margin
+            if order.order_type == _order_type_entry:
+                margin_percent = (script.margin_short if order.sign < 0
+                                  else script.margin_long)
+                if margin_percent > 0:
+                    margin_ratio = margin_percent / 100.0
+                    if self.size == 0.0:
+                        equity = script.initial_capital + self.netprofit
+                        margin_needed = abs(order.size) * fill_price * margin_ratio
+                        if margin_needed > equity:
+                            self._remove_order(order)
+                            continue
+                    elif self.sign == order.sign:
+                        new_qty = abs(self.size) + abs(order.size)
+                        money_spent = (abs(self.size) * self.avg_price
+                                       + abs(order.size) * fill_price)
+                        mvs = new_qty * fill_price
+                        open_profit = ((mvs - money_spent) if self.sign > 0
+                                       else (money_spent - mvs))
+                        equity = script.initial_capital + self.netprofit + open_profit
+                        margin_needed = mvs * margin_ratio
+                        if margin_needed > equity:
+                            self._remove_order(order)
+                            continue
+
             # open → high → low → close
             if ohlc:
                 self.fill_order(order, fill_price, self.o, self.l)
@@ -1753,6 +1779,20 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         stop = None
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
+
+    # Creation-time margin check for market entry orders (TradingView behavior)
+    # TV checks _size_round(qty) × (close + slippage) > equity at strategy.entry() call time
+    if limit is None and stop is None:
+        margin_percent = (script.margin_short if direction_sign < 0
+                          else script.margin_long)
+        if margin_percent > 0:
+            margin_ratio = margin_percent / 100.0
+            slippage_amount = script.slippage * syminfo.mintick
+            expected_price = position.c + slippage_amount * direction_sign
+            equity = script.initial_capital + position.netprofit + position.openprofit
+            margin_needed = abs(size) * expected_price * margin_ratio
+            if margin_needed > equity:
+                return
 
     # If it is not a market order, we should check pyramiding and flip conditions here
     # Market orders are checked at the order processing time
