@@ -93,6 +93,7 @@ class Order:
         "cancelled",  # Flag to mark order as cancelled by OCA
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
+        "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
     )
 
     def __init__(
@@ -155,6 +156,7 @@ class Order:
         self.cancelled = False
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
+        self.from_entry_na = False
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -570,6 +572,10 @@ class Position:
         :param h: The high price
         :param l: The low price
         """
+        # Close orders cannot fill when no position exists
+        if order.order_type == _order_type_close and self.size == 0.0:
+            return
+
         # Save the original order size before any modifications
         filled_size = abs(order.size)
 
@@ -1268,13 +1274,16 @@ class Position:
             # Remove all exit orders when position is flat
             for order in list(self.exit_orders.values()):
                 if not order.is_market_order:
-                    # Check if ther is an open market order with this ID
+                    # Check if there is an open market order with this ID
                     try:
                         entry_order = self.entry_orders[order.order_id]
                         if entry_order.is_market_order:
                             continue
                     except KeyError:
                         pass
+                    # Keep from_entry_na exits — they persist until filled or replaced
+                    if order.from_entry_na:
+                        continue
                     self._remove_order(order)
 
         # For exit orders, calculate limit/stop from entry price if ticks are specified
@@ -1319,6 +1328,9 @@ class Position:
                         associated_entry = self.entry_orders.get(order.order_id)
                         if associated_entry is not None:
                             # Pending entry exists — defer exit, will fill after entry
+                            continue
+                        # Keep from_entry_na exits — they persist until filled or replaced
+                        if order.from_entry_na:
                             continue
                         # Orphan exit with no pending entry — cancel
                         self._remove_order(order)
@@ -1386,6 +1398,73 @@ class Position:
             # open → low → high → close
             else:
                 self.fill_order(order, fill_price, self.l, self.o)
+
+        # Adapt orphaned exits from rejected entries to new position (TradingView behavior)
+        # When strategy.exit() is called without from_entry, TV keeps the exit even after
+        # its entry is rejected by margin. The exit adapts to close any new position that opens.
+        if self.open_trades:
+            for order in list(self.exit_orders.values()):
+                if order.is_market_order:
+                    continue
+                # Skip exits that match an open trade (they belong to the current position)
+                if any(t.entry_id == order.order_id for t in self.open_trades):
+                    continue
+                # Skip exits whose entry is still pending
+                if order.order_id in self.entry_orders:
+                    continue
+                # Orphan exit: entry was rejected but a new position exists.
+                # Flip direction to close the current position.
+                new_sign = -self.sign
+                self._remove_order(order)
+                adapted = Order(
+                    None, -self.size, exit_id=order.exit_id,
+                    order_type=_order_type_close,
+                    limit=order.limit, stop=order.stop,
+                    comment=order.comment,
+                    comment_profit=order.comment_profit,
+                    comment_loss=order.comment_loss,
+                    comment_trailing=order.comment_trailing,
+                    alert_message=order.alert_message,
+                    alert_profit=order.alert_profit,
+                    alert_loss=order.alert_loss,
+                    alert_trailing=order.alert_trailing,
+                )
+                adapted.bar_index = order.bar_index
+                # Check gap-through with the flipped direction
+                stop_gap = (adapted.stop is not None
+                            and ((new_sign > 0 and self.o >= adapted.stop)
+                                 or (new_sign < 0 and self.o <= adapted.stop)))
+                limit_gap = (adapted.limit is not None
+                             and ((new_sign > 0 and self.o <= adapted.limit)
+                                  or (new_sign < 0 and self.o >= adapted.limit)))
+                filled = False
+                if stop_gap:
+                    fill_price = self.o
+                    if script.slippage > 0:
+                        fill_price += syminfo.mintick * script.slippage * new_sign
+                    adapted.filled_by_type = 'loss'
+                    if ohlc:
+                        self.fill_order(adapted, fill_price, fill_price, self.l)
+                    else:
+                        self.fill_order(adapted, fill_price, self.l, fill_price)
+                    filled = True
+                elif limit_gap:
+                    adapted.filled_by_type = 'profit'
+                    if ohlc:
+                        self.fill_order(adapted, self.o, self.o, self.l)
+                    else:
+                        self.fill_order(adapted, self.o, self.l, self.o)
+                    filled = True
+                else:
+                    self._add_order(adapted)
+                # If the adapted exit closed the position, clean up remaining orphan exits
+                if filled and not self.open_trades:
+                    for remaining in list(self.exit_orders.values()):
+                        if not remaining.is_market_order:
+                            has_entry = remaining.order_id in self.entry_orders
+                            if not has_entry:
+                                self._remove_order(remaining)
+                    break
 
         # Fill gap-through exits whose entries just filled
         for order in list(self.exit_orders.values()):
@@ -1999,6 +2078,10 @@ def exit(id: str, from_entry: str = "",
                 size = order.size
                 from_entry = order.order_id
                 _exit()
+                # Mark as from_entry_na: exit applies to any position (TradingView behavior)
+                exit_order = position.exit_orders.get(from_entry)
+                if exit_order is not None:
+                    exit_order.from_entry_na = True
 
             if not direction:
                 for trade in position.open_trades:
