@@ -1316,10 +1316,11 @@ class Position:
                         t.entry_id == order.order_id for t in self.open_trades
                     )
                     if not has_open_trade:
-                        # No open position for this exit — cancel exit and associated entry
                         associated_entry = self.entry_orders.get(order.order_id)
                         if associated_entry is not None:
-                            self._remove_order(associated_entry)
+                            # Pending entry exists — defer exit, will fill after entry
+                            continue
+                        # Orphan exit with no pending entry — cancel
                         self._remove_order(order)
                         continue
 
@@ -1385,6 +1386,41 @@ class Position:
             # open → low → high → close
             else:
                 self.fill_order(order, fill_price, self.l, self.o)
+
+        # Fill gap-through exits whose entries just filled
+        for order in list(self.exit_orders.values()):
+            if order.is_market_order:
+                continue
+            has_open_trade = any(
+                t.entry_id == order.order_id for t in self.open_trades
+            )
+            if not has_open_trade:
+                continue
+            # Check limit gap-through
+            if order.limit is not None:
+                limit_gap = ((order.size > 0 and self.o <= order.limit)
+                             or (order.size < 0 and self.o >= order.limit))
+                if limit_gap:
+                    order.filled_by_type = 'profit'
+                    if ohlc:
+                        self.fill_order(order, self.o, self.o, self.l)
+                    else:
+                        self.fill_order(order, self.o, self.l, self.o)
+                    continue
+            # Check stop gap-through
+            if order.stop is not None:
+                stop_gap = ((order.size > 0 and self.o >= order.stop)
+                            or (order.size < 0 and self.o <= order.stop))
+                if stop_gap:
+                    fill_price = self.o
+                    if script.slippage > 0:
+                        fill_price += syminfo.mintick * script.slippage * order.sign
+                    order.filled_by_type = 'loss'
+                    if ohlc:
+                        self.fill_order(order, fill_price, fill_price, self.l)
+                    else:
+                        self.fill_order(order, fill_price, self.l, fill_price)
+                    continue
 
         # Margin call check at OPEN
         self._check_margin_call(self.o, for_short=True, at_open=True)
