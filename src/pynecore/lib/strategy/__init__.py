@@ -1069,19 +1069,25 @@ class Position:
         return False
 
     def _check_margin_call(self, check_price: float, *, for_short: bool,
-                           at_open: bool = False) -> bool:
+                           at_open: bool = False,
+                           can_defer: bool = True) -> bool:
         """
         Check and execute margin call using TradingView's 10-step algorithm.
 
         TradingView's 3-branch margin call logic:
         1. AF@O < 0: fire immediately at open price (at_open=True)
         2. mc_size > 1: fire immediately at worst-case price (H for shorts, L for longs)
-        3. mc_size == 1 AND AF@C < 0: defer MC to post-script, fire at close price
-        4. mc_size == 1 AND AF@C >= 0: fire immediately at worst-case price
+        3. mc_size == 1 AND can_defer AND AF@C < 0: defer MC to post-script at close price
+        4. mc_size == 1 AND (not can_defer OR AF@C >= 0): fire immediately at worst-case
+
+        Deferral is only allowed at the first OHLC extremum (where recovery is still
+        possible at the opposite extremum). At the second extremum only close remains,
+        so TV fires immediately.
 
         :param check_price: The price to check margin at
         :param for_short: If True, check short positions. If False, check long positions.
         :param at_open: If True, this is an open check — always fire immediately, never defer.
+        :param can_defer: If False, MC fires immediately even when mc_size==1 and AF@C<0.
         :return: True if MC was deferred (caller should stop OHLC processing)
         """
         if not self.open_trades:
@@ -1122,8 +1128,8 @@ class Position:
         if margin_call_size > quantity:
             margin_call_size = quantity
 
-        # Deferral check: mc_size==1 at H/L, check if AF@C<0 → defer to post-script
-        if not at_open and margin_call_size == 1:
+        # Deferral check: mc_size==1 at first OHLC extremum, check if AF@C<0
+        if not at_open and can_defer and margin_call_size == 1:
             c_mvs = quantity * self.c
             c_open_profit = c_mvs - money_spent
             if self.sign < 0:
@@ -1332,7 +1338,6 @@ class Position:
                         # Keep from_entry_na exits — they persist until filled or replaced
                         if order.from_entry_na:
                             continue
-                        # Orphan exit with no pending entry — cancel
                         self._remove_order(order)
                         continue
 
@@ -1412,8 +1417,6 @@ class Position:
                 # Skip exits whose entry is still pending
                 if order.order_id in self.entry_orders:
                     continue
-                # Orphan exit: entry was rejected but a new position exists.
-                # Flip direction to close the current position.
                 new_sign = -self.sign
                 self._remove_order(order)
                 adapted = Order(
@@ -1530,7 +1533,7 @@ class Position:
                     if order.trail_triggered and order.stop is not None:
                         self._check_close(order, ohlc)
 
-                self._check_margin_call(self.l, for_short=False)
+                self._check_margin_call(self.l, for_short=False, can_defer=False)
 
         # Process orders: open → low → high → close
         else:
@@ -1557,7 +1560,7 @@ class Position:
                     if order.trail_triggered and order.stop is not None:
                         self._check_close(order, ohlc)
 
-                self._check_margin_call(self.h, for_short=True)
+                self._check_margin_call(self.h, for_short=True, can_defer=False)
 
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
@@ -2077,11 +2080,13 @@ def exit(id: str, from_entry: str = "",
                 direction = order.sign
                 size = order.size
                 from_entry = order.order_id
+                # Only mark as from_entry_na on first creation (not replacement)
+                had_existing_exit = from_entry in position.exit_orders
                 _exit()
-                # Mark as from_entry_na: exit applies to any position (TradingView behavior)
-                exit_order = position.exit_orders.get(from_entry)
-                if exit_order is not None:
-                    exit_order.from_entry_na = True
+                if not had_existing_exit:
+                    exit_order = position.exit_orders.get(from_entry)
+                    if exit_order is not None:
+                        exit_order.from_entry_na = True
 
             if not direction:
                 for trade in position.open_trades:
