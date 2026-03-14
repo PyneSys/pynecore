@@ -1129,7 +1129,8 @@ class Position:
             margin_call_size = quantity
 
         # Deferral check: mc_size==1 at first OHLC extremum, check if AF@C<0
-        if not at_open and can_defer and margin_call_size == 1:
+        # Skip deferral when check_price == close: no recovery possible at same price
+        if not at_open and can_defer and margin_call_size == 1 and check_price != self.c:
             c_mvs = quantity * self.c
             c_open_profit = c_mvs - money_spent
             if self.sign < 0:
