@@ -150,8 +150,12 @@ class Order:
         self.loss_ticks = loss_ticks
         self.trail_points_ticks = trail_points_ticks
 
-        # Check if this is a market order (no limit, stop, or trail price)
-        self.is_market_order = self.limit is None and self.stop is None
+        # Check if this is a market order (no limit, stop, trail, or tick-based prices)
+        self.is_market_order = (self.limit is None and self.stop is None
+                                and self.trail_price is None
+                                and self.profit_ticks is None
+                                and self.loss_ticks is None
+                                and self.trail_points_ticks is None)
 
         self.cancelled = False
         self.bar_index = -1  # Will be set when order is added to position
@@ -842,9 +846,11 @@ class Position:
             self.open_commission = 0.0
 
             # Cancel all exit orders when position is closed (TradingView behavior)
-            # Exit orders without from_entry are canceled when position is flat
+            # Skip exits that have a pending entry (needed during position flips)
             exit_orders_to_remove = list(self.exit_orders.values())
             for exit_order in exit_orders_to_remove:
+                if exit_order.order_id in self.entry_orders:
+                    continue
                 self._remove_order(exit_order)
 
         # Increment intraday filled orders counter for ALL filled orders
@@ -1306,21 +1312,29 @@ class Position:
             if entry_price is not None:
                 # Determine direction from the order
                 direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+                changed = False
 
                 # Calculate limit from profit_ticks if specified
                 if order.profit_ticks is not None and order.limit is None:
                     order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
                     order.limit = _price_round(order.limit, direction)
+                    changed = True
 
                 # Calculate stop from loss_ticks if specified
                 if order.loss_ticks is not None and order.stop is None:
                     order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
                     order.stop = _price_round(order.stop, -direction)
+                    changed = True
 
                 # Calculate trail_price from trail_points_ticks if specified
                 if order.trail_points_ticks is not None and order.trail_price is None:
                     order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
                     order.trail_price = _price_round(order.trail_price, direction)
+                    changed = True
+
+                # Update orderbook only when prices were actually calculated
+                if changed:
+                    self.orderbook.add_order(order)
 
         # Check for stop/limit orders that should be converted to market orders
         for order in self.orderbook.iter_orders():
@@ -1404,6 +1418,31 @@ class Position:
             # open → low → high → close
             else:
                 self.fill_order(order, fill_price, self.l, self.o)
+
+        # Convert tick-based exit prices for entries that just filled this bar
+        for order in self.exit_orders.values():
+            entry_price = None
+            for trade in self.open_trades:
+                if trade.entry_id == order.order_id:
+                    entry_price = trade.entry_price
+                    break
+            if entry_price is not None:
+                direction = 1.0 if order.size < 0 else -1.0
+                changed = False
+                if order.profit_ticks is not None and order.limit is None:
+                    order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
+                    order.limit = _price_round(order.limit, direction)
+                    changed = True
+                if order.loss_ticks is not None and order.stop is None:
+                    order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
+                    order.stop = _price_round(order.stop, -direction)
+                    changed = True
+                if order.trail_points_ticks is not None and order.trail_price is None:
+                    order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
+                    order.trail_price = _price_round(order.trail_price, direction)
+                    changed = True
+                if changed:
+                    self.orderbook.add_order(order)
 
         # Adapt orphaned exits from rejected entries to new position (TradingView behavior)
         # When strategy.exit() is called without from_entry, TV keeps the exit even after

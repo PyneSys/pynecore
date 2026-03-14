@@ -64,7 +64,7 @@ def import_script(script_path: Path) -> ModuleType:
     return module
 
 
-def _round_price(price: float, lib: ModuleType):
+def _round_price(price: float):
     """
     Round price to 6 significant digits to clean float32 storage artifacts
     without destroying sub-mintick precision.
@@ -92,10 +92,10 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
 
     lib.bar_index = lib.last_bar_index = bar_index
 
-    lib.open = _round_price(ohlcv.open, lib)
-    lib.high = _round_price(ohlcv.high, lib)
-    lib.low = _round_price(ohlcv.low, lib)
-    lib.close = _round_price(ohlcv.close, lib)
+    lib.open = _round_price(ohlcv.open)
+    lib.high = _round_price(ohlcv.high)
+    lib.low = _round_price(ohlcv.low)
+    lib.close = _round_price(ohlcv.close)
 
     lib.volume = ohlcv.volume
 
