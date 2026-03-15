@@ -1791,12 +1791,13 @@ def close(id: str, comment: str | NA[str] = na_str, qty: float | NA[float] = na_
         return
 
     if isinstance(qty, NA):
-        size = -position.size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) \
-            else -position.size
+        if not isinstance(qty_percent, NA):
+            size = _size_round(-position.size * (qty_percent * 0.01))
+        else:
+            size = -position.size
     else:
-        size = -position.sign * qty
+        size = _size_round(-position.sign * qty)
 
-    size = _size_round(size)
     if size == 0.0:
         return
 
