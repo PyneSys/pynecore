@@ -93,6 +93,22 @@ pyne run simple_ma ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 This will run your script on every bar of the OHLCV data, and save the plots or returned values to the output folder of
 your working directory. This mechanism is the heart of PyneCore. You actually write a script that will run on every candle.
 
+### Direct Execution
+
+If you have a compiled script (from [PyneSys](https://pynesys.io) or [converted from Pine Script](./converting-from-pine.md)), you can run it directly with Python — no CLI or workdir needed:
+
+```bash
+python simple_ma.py my_data.csv
+```
+
+This works because compiled scripts include a built-in bootstrap that:
+- Accepts a CSV or OHLCV data file as argument
+- Auto-detects the symbol and timeframe from the filename and data
+- Outputs CSV files next to your script (plots, trades, strategy stats)
+
+> **Note:** Direct execution requires PyneCore to be installed (`pip install pynecore`).
+> For more control over execution (date ranges, custom output paths), use the `pyne run` CLI.
+
 ## Adding Parameters
 
 Let's enhance our script by adding user-configurable parameters:

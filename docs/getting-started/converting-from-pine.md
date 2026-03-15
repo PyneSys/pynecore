@@ -289,6 +289,7 @@ Benefits of using PyneComp:
 - Handles complex syntax and edge cases
 - Generates clean, readable Python code
 - Offers a "strict mode" for better variable scoping
+- Compiled scripts can be run directly with `python script.py data.csv` — no CLI or workdir needed
 
 ## Example: Complete Strategy Conversion
 
