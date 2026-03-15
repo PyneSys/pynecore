@@ -180,7 +180,8 @@ class ScriptRunner:
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
-                 update_syminfo_every_run: bool = False, last_bar_index=0):
+                 update_syminfo_every_run: bool = False, last_bar_index=0,
+                 inputs: dict[str, Any] | None = None):
         """
         Initialize the script runner
 
@@ -193,6 +194,8 @@ class ScriptRunner:
         :param update_syminfo_every_run: If it is needed to update the syminfo lib in every run,
                                          needed for parallel script executions
         :param last_bar_index: Last bar index, the index of the last bar of the historical data
+        :param inputs: Optional dictionary of input values to pass to the script,
+                       overrides values from .toml files
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -203,6 +206,11 @@ class ScriptRunner:
         # Set syminfo properties BEFORE importing the script
         # This ensures that timestamp() calls in default parameters use the correct timezone
         _set_lib_syminfo_properties(syminfo, lib)
+
+        # Set programmatic inputs before script import so they override .toml values
+        if inputs:
+            from .script import _programmatic_inputs
+            _programmatic_inputs.update(inputs)
 
         # Now import the script (default parameters will use correct timezone)
         self.script_module = import_script(script_path)

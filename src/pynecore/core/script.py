@@ -51,6 +51,7 @@ class InputData:
 
 
 _old_input_values: dict[str, Any] = {}
+_programmatic_inputs: dict[str, Any] = {}
 inputs: dict[str | None, InputData] = {}
 
 
@@ -233,6 +234,13 @@ class Script:
         # Load settings from toml file if exists
         if toml_path.exists():
             self.load(toml_path)
+
+        # Apply programmatic inputs (override .toml values)
+        if _programmatic_inputs:
+            for key, value in _programmatic_inputs.items():
+                _old_input_values[key] = value
+                _old_input_values[key + '__global__'] = value
+            _programmatic_inputs.clear()
 
         # Pyramiding must be at least 1
         if self.pyramiding <= 0:
