@@ -385,14 +385,14 @@ The Input transformer processes input parameters and adds necessary ID informati
 **Original code:**
 ```python
 @script.indicator
-def main(source=lib.input.source("Source", lib.close)):
+def main(source=lib.input.source(lib.close, "Source")):
     result = source * 2
 ```
 
 **Transformed code:**
 ```python
 @script.indicator
-def main(source=lib.input.source("Source", lib.close, _id="source")):
+def main(source=lib.input.source(lib.close, "Source", _id="source")):
     source = getattr(lib, source, lib.na)
     result = source * 2
 ```

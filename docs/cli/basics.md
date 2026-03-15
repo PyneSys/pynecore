@@ -91,7 +91,7 @@ pyne data download --help
 
 The PyneCore CLI uses a **working directory** (workdir) structure to organize files. This provides a consistent location for your scripts, data, and output files.
 
-You can read more about the working directory concept in the [Working Directory](../overview/working-directory.md) page.
+You can read more about the working directory concept in the [Configuration](../overview/configuration.md#working-directory-structure) page.
 
 ### Path Handling
 

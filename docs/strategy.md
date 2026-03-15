@@ -265,7 +265,13 @@ To run a backtest using PyneCore's CLI:
 pyne run mystrategy.py data/eurusd_daily.ohlcv
 ```
 
-This executes your strategy on the provided price data and generates backtest results in the output directory.
+This executes your strategy on the provided price data and generates the following output files in the `workdir/output/` directory:
+
+- **`<script_name>.csv`** - Plot data (values from `plot()` calls)
+- **`<script_name>_strat.csv`** - Strategy statistics (net profit, Sharpe ratio, drawdown, etc.)
+- **`<script_name>_trade.csv`** - Trade-by-trade data (entry/exit prices, P&L, cumulative metrics)
+
+For more details on output files and CLI options, see [Running Scripts](./cli/run.md).
 
 While PyneCore's backtesting capabilities are already powerful and Pine Script-compatible, future versions will offer
 enhanced analysis and visualization tools designed specifically for Python users.

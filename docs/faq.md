@@ -37,7 +37,7 @@ PyneCore requires Python 3.11 or newer. It is designed to work on Windows, macOS
 
 ### How do I report bugs or request features?
 
-You can report bugs and request features through the project's [GitHub repository issue tracker](https://github.com/PyneSys/pynecore.org/issues). Please include detailed information about the issue, steps to reproduce it, and your system environment.
+You can report bugs and request features through the project's [GitHub repository issue tracker](https://github.com/PyneSys/pynecore/issues). Please include detailed information about the issue, steps to reproduce it, and your system environment.
 
 ## Installation & Setup
 

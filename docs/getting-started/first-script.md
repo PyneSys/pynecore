@@ -72,11 +72,11 @@ def main():
     plot(sma, "SMA")
 ```
 
-Save this code to a file named `simple_ma.py` in your working directory`s scripts/` folder.
+Save this code to a file named `simple_ma.py` in your working directory's scripts/` folder.
 
 ## Download some data
 
-This will download the OHLCV data for the BTC/USDT pair from Bybit and save it as `ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv` in your working directory`s data/` folder:
+This will download the OHLCV data for the BTC/USDT pair from Bybit and save it as `ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv` in your working directory's data/` folder:
 
 ```bash
 pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT"
@@ -107,9 +107,9 @@ from pynecore.lib import script, close, ta, plot, color, input
 @script.indicator("Customizable Moving Average", overlay=True)
 def main():
     # Input parameters
-    length = input.int("Period", 20, minval=1)
-    ma_type = input.string("Type", "SMA", options=["SMA", "EMA", "WMA"])
-    line_color = input.color("Line Color", color.blue)
+    length = input.int(20, "Period", minval=1)
+    ma_type = input.string("SMA", "Type", options=["SMA", "EMA", "WMA"])
+    line_color = input.color(color.blue, "Line Color")
 
     # Calculate the selected moving average
     ma: Series[float] = None
@@ -265,5 +265,5 @@ Now that you've created your first PyneCore script, you can:
 
 1. Learn how to [convert existing Pine Script code](./converting-from-pine.md) to PyneCore
 2. Explore the [core concepts](../overview/core-concepts.md) of PyneCore in depth
-3. Check out the [library documentation](../library/) for available functions and indicators
+3. Check out the [library documentation](../lib.md) for available functions and indicators
 4. Dive into [advanced topics](../advanced/) for more technical details

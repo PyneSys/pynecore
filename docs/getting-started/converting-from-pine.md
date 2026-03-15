@@ -333,9 +333,9 @@ from pynecore.lib import script, close, ta, strategy, input, hline, color
 @script.strategy("RSI Strategy", overlay=True)
 def main():
     # Input parameters
-    length = input.int("RSI Length", 14)
-    overbought = input.int("Overbought", 70)
-    oversold = input.int("Oversold", 30)
+    length = input.int(14, "RSI Length")
+    overbought = input.int(70, "Overbought")
+    oversold = input.int(30, "Oversold")
 
     # Calculate RSI
     rsiValue: Series[float] = ta.rsi(close, length)
