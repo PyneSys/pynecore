@@ -104,10 +104,8 @@ The goal of the PyneCore library is to provide full compatibility with the Pine 
 
 Since the library is fully compatible with the Pine Script API, the TradingView official Pine Script documentation is an excellent reference for function usage. You can find information about PyneCore-specific aspects in the documentation of the respective module.
 
-The [Pine Script documentation](https://www.tradingview.com/pine-script-reference/) is available at:
-- Technical indicators: [Pine Script ta module](https://www.tradingview.com/pine-script-reference/v5/#lib_ta)
-- Mathematical functions: [Pine Script math module](https://www.tradingview.com/pine-script-reference/v5/#lib_math)
-- Array operations: [Pine Script array module](https://www.tradingview.com/pine-script-reference/v5/#lib_array)
+- [Pine Script Language Reference](https://www.tradingview.com/pine-script-reference/v6/) - Complete function reference
+- [Pine Script User Manual](https://www.tradingview.com/pine-script-docs/welcome/) - Concepts, examples and guides
 
 ## Usage Examples
 

@@ -86,7 +86,7 @@ prev_close = close[1]     # Access the previous bar's close
 
 Behind the scenes, series are implemented as global circular buffers that maintain historical values.
 
-More about Series variables in the [Core Concepts](../overview/core-concepts.md#3-series-variables) documentation.
+More about Series variables in the [Core Concepts](./core-concepts.md#3-series-variables) documentation.
 
 ### 2. Persistent Variables
 
@@ -97,7 +97,7 @@ p: Persistent[int] = 0  # Initialize a persistent counter
 p += 1                 # Increments with each bar
 ```
 
-Learn more about Persistent variables in the [Core Concepts](../overview/core-concepts.md#2-persistent-variables) documentation.
+Learn more about Persistent variables in the [Core Concepts](./core-concepts.md#2-persistent-variables) documentation.
 
 ### 3. Function Isolation
 
@@ -112,7 +112,7 @@ def my_indicator(input_series, length):
     return sum / length
 ```
 
-More details about Function Isolation in the [Core Concepts](../overview/core-concepts.md#4-function-isolation) and [Function Isolation](../advanced/function-isolation.md) documentation.
+More details about Function Isolation in the [Core Concepts](./core-concepts.md#4-function-isolation) and [Function Isolation](../advanced/function-isolation.md) documentation.
 
 ### 4. NA (Not Available) System
 
@@ -123,7 +123,7 @@ if na(value):  # Check if a value is NA
     value = default
 ```
 
-Learn more about the NA system in the [Core Concepts](../overview/core-concepts.md#5-na-not-available-system) documentation.
+Learn more about the NA system in the [Core Concepts](./core-concepts.md#5-na-not-available-system) documentation.
 
 ## Why Choose PyneCore?
 

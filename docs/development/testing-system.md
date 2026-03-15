@@ -193,4 +193,3 @@ def runner(script_path, module_key, syminfo):
 
 This allows tests to execute scripts bar-by-bar, just as they would run in a real trading environment.
 
-## For more details on the visualization aspects of the testing system, see [Test Visualization](./test-visualization.md).

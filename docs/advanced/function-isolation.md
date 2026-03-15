@@ -36,7 +36,7 @@ Function isolation solves several critical requirements for Pine Script compatib
 Consider the following Pine Script example:
 
 ```pine
-//@version=5
+//@version=6
 indicator("Function Call State Example")
 
 myFunc() =>

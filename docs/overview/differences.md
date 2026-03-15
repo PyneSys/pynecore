@@ -103,7 +103,7 @@ def main(
 
     # This is the Pyne way:
     return {
-        "EMA": ema,  # Title: vale
+        "EMA": ema,  # Title: value
     }
 ```
 
@@ -219,7 +219,7 @@ Both `x` and `y` will be `2` in this case.
 
 ## Library differences from Pine
 
-### Different modul names
+### Different module names
 
 | Pine | PyneCore | Why?                                                 |
 |------|----------|------------------------------------------------------|
@@ -333,5 +333,5 @@ you can use the `map` module too, like in Pine, but it is just a wrapper around 
 
 Pine Script uses dedicated series objects. Which is created on declaration. In Pyne we designed the system
 to use the "primitive" type everywhere. If you mark a variable as a series, it will create a series
-object, but every osage of them will be that basic type. This way the implementation could be much simpler.
+object, but every usage of them will be that basic type. This way the implementation could be much simpler.
 We don't need to handle everything differently because it is a series or not.

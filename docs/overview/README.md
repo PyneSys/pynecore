@@ -22,7 +22,7 @@ PyneCore overview and main concepts
 - [What is PyneCore](./what-is-pynecore.md) - Introduction to PyneCore
 - [Ecosystem](./ecosystem.md) - Pyne ecosystem components
 - [Core Concepts](./core-concepts.md) - Fundamental concepts and mechanisms
-- [Pine Script Compatibility](./pine-script-compatibility.md) - Compatibility with Pine Script
-- [Differences](./differences.md) - Key differences from Pine Script
+- [Differences](./differences.md) - Key differences from Pine Script and compatibility notes
 - [Project Structure](./project-structure.md) - Project structure overview
 - [Configuration](./configuration.md) - System configuration
+- [Versioning](./versioning.md) - Versioning policy

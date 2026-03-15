@@ -99,7 +99,7 @@ You can use your IDE's debugger with PyneCore scripts, but be aware of AST trans
 
 ### AST Transformations
 
-Before execution, PyneCore applies AST transformations (see [AST Transformations](./ast-transformations.md) for
+Before execution, PyneCore applies AST transformations (see [AST Transformations](./advanced/ast-transformations.md) for
 details). This affects debugging:
 
 - **Series variables**: May be stored in `globals()` dictionary
