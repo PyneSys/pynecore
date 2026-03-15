@@ -1,4 +1,4 @@
-from typing import cast, TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal
 
 import math
 from datetime import datetime, UTC
@@ -764,7 +764,7 @@ class Position:
                 entry_id = order.exit_id
                 overshoot_trade = Trade(
                     size=order.size,
-                    entry_id=entry_id, entry_bar_index=cast(int, lib.bar_index),
+                    entry_id=entry_id, entry_bar_index=lib.bar_index,
                     entry_time=lib._time, entry_price=price,
                     commission=0.0, entry_comment=order.comment,
                     entry_equity=self.equity
@@ -813,7 +813,7 @@ class Position:
 
             trade = Trade(
                 size=order.size,
-                entry_id=entry_id, entry_bar_index=cast(int, lib.bar_index),
+                entry_id=entry_id, entry_bar_index=lib.bar_index,
                 entry_time=lib._time, entry_price=price,
                 commission=commission, entry_comment=order.comment,  # type: ignore
                 entry_equity=before_equity
@@ -1188,7 +1188,7 @@ class Position:
             closed_trade.cum_profit = self.cum_profit
             try:
                 closed_trade.cum_profit_percent = (
-                    closed_trade.cum_profit / initial_capital) * 100.0
+                                                          closed_trade.cum_profit / initial_capital) * 100.0
             except ZeroDivisionError:
                 closed_trade.cum_profit_percent = 0.0
             self.entry_equity += closed_trade.profit
@@ -1689,52 +1689,33 @@ def _size_round(qty: float) -> float:
 
 def _margin_call_round(qty: float) -> float:
     """
-    Special rounding for margin call liquidation
+    Ceil rounding for margin call liquidation (minimum 1 unit)
 
     :param qty: Quantity to round (can be negative for short)
     :return: Rounded quantity (minimum 1 in absolute value)
     """
     rfactor = syminfo._size_round_factor  # noqa
+    qrf = math.ceil(abs(qty) * rfactor * 10.0) * 0.1
     sign = 1 if qty > 0 else -1
-
-    # Step 1: Multiply by rfactor and 10
-    qrf = abs(qty) * rfactor * 10.0
-    # Step 2: Ceil and divide by 10
-    qrf_rounded = math.ceil(qrf) * 0.1
-    # Step 3: Integer part
-    result = int(qrf_rounded)
-    # Step 4: Apply sign and ensure minimum 1
-    final = sign * max(1, result) / rfactor
-
-    return final
+    return sign * max(1, int(qrf)) / rfactor
 
 
 # noinspection PyShadowingNames
 def _price_round(price: float | NA[float], direction: int | float) -> float | NA[float]:
     """
-    Round price to the nearest tick
+    Round price to the nearest tick (floor if direction < 0, ceil otherwise)
 
     :param price: The price to round
     :param direction: The direction of the price
-    :return:
+    :return: The rounded price
     """
     if isinstance(price, NA):
         return na_float
     pricescale = syminfo.pricescale
-    pmp = round(cast(float, price * pricescale), 7)
-    pmp_int = int(pmp)
-
+    pmp = round(price * pricescale, 7)
     if direction < 0:
-        # Round down
-        return pmp_int / pricescale
-    else:
-        # Round up only if pmp is not already an integer
-        if pmp == pmp_int:
-            # Already an integer, no rounding needed
-            return pmp_int / pricescale
-        else:
-            # Not an integer, round up
-            return (pmp_int + 1) / pricescale
+        return int(pmp) / pricescale
+    return math.ceil(pmp) / pricescale
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
