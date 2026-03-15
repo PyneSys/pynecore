@@ -7,6 +7,11 @@ BUILTIN_PRICE_SERIES = frozenset({
     'hl2', 'hlc3', 'ohlc4', 'hlcc4'
 })
 
+# Lib attributes that are NOT Series — subscript access on these should not be transformed
+NON_SERIES_LIB_ATTRS = frozenset({
+    'extra_fields',
+})
+
 
 class LibrarySeriesTransformer(ast.NodeTransformer):
     """
@@ -167,6 +172,10 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
         if isinstance(node.value, ast.Attribute):
             attr_chain = get_attribute_chain(node.value)
             if attr_chain and attr_chain[0] == 'lib':
+                # Skip non-Series lib attributes (e.g., extra_fields is a dict, not a Series)
+                if len(attr_chain) >= 2 and attr_chain[1] in NON_SERIES_LIB_ATTRS:
+                    return self.generic_visit(node)
+
                 # Use the complete chain after 'lib'
                 local_name = self.process_series_usage('lib', attr_chain[1:])
 

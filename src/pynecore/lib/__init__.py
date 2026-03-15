@@ -95,6 +95,9 @@ _script: script | None = None
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
 
+# Extra fields from CSV data (beyond OHLCV), populated each bar by ScriptRunner
+extra_fields: dict[str, Any] = {}
+
 # Lib semaphore - to prevent lib`s main function to do things it must not (plot, strategy things, etc.)
 _lib_semaphore = False
 

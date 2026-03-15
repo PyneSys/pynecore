@@ -6,6 +6,7 @@ to OHLCV format when needed, eliminating the manual step of running pyne data co
 """
 from __future__ import annotations
 
+import csv
 import json
 from enum import Enum
 from datetime import time
@@ -172,6 +173,14 @@ class DataConverter:
             # Copy modification time from source to maintain freshness
             copy_mtime(file_path, ohlcv_path)
 
+            # Generate extra fields sidecar CSV if source has extra columns
+            extra_csv_path = file_path.with_suffix('.extra.csv')
+            if detected_format in ('csv', 'txt'):
+                self._generate_extra_csv(file_path, ohlcv_path, extra_csv_path,
+                                         detected_format == 'txt')
+                if extra_csv_path.exists():
+                    copy_mtime(file_path, extra_csv_path)
+
             # Generate TOML symbol info file if needed and not already loaded
             # skip_toml_generation is set earlier if TOML already exists (line 129-134)
             if symbol and not skip_toml_generation and (force or not toml_path.exists()):
@@ -239,13 +248,98 @@ class DataConverter:
                     pass
 
         except Exception as e:
-            # Clean up output file on error
-            if ohlcv_path.exists():
-                try:
-                    ohlcv_path.unlink()
-                except OSError:
-                    pass
+            # Clean up output files on error
+            for cleanup_path in (ohlcv_path, file_path.with_suffix('.extra.csv')):
+                if cleanup_path.exists():
+                    try:
+                        cleanup_path.unlink()
+                    except OSError:
+                        pass
             raise ConversionError(f"Failed to convert {file_path}: {e}") from e
+
+    # Column names that are part of standard OHLCV data (not extra fields)
+    _OHLCV_COLUMNS = {
+        'timestamp', 'time', 'date', 'datetime',
+        'open', 'high', 'low', 'close', 'volume',
+    }
+
+    def _generate_extra_csv(
+            self,
+            source_path: Path,
+            ohlcv_path: Path,
+            extra_csv_path: Path,
+            is_txt: bool = False
+    ) -> None:
+        """
+        Generate a sidecar .extra.csv file with non-OHLCV columns from the source data.
+        The sidecar is position-aligned with the binary OHLCV file (including gap-filled rows).
+
+        :param source_path: Path to the original CSV/TXT file
+        :param ohlcv_path: Path to the generated binary OHLCV file
+        :param extra_csv_path: Path for the output sidecar CSV
+        :param is_txt: True if source is TXT format (auto-detect delimiter)
+        """
+        # Detect delimiter for TXT files
+        delimiter = ','
+        if is_txt:
+            with open(source_path, 'r') as f:
+                first_line = f.readline().strip()
+                for delim in ['\t', ';', '|']:
+                    if delim in first_line:
+                        delimiter = delim
+                        break
+
+        # Read source headers and identify extra columns
+        with open(source_path, 'r', newline='') as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            raw_headers = next(reader, None)
+            if not raw_headers:
+                return
+
+            headers_lower = [h.lower().strip() for h in raw_headers]
+            extra_indices = [
+                i for i, h in enumerate(headers_lower)
+                if h not in self._OHLCV_COLUMNS
+            ]
+
+            if not extra_indices:
+                return
+
+            extra_headers = [raw_headers[i].strip() for i in extra_indices]
+
+            # Collect extra values from all source rows (in order)
+            source_extra_rows: list[list[str]] = []
+            for row in reader:
+                if is_txt:
+                    row = [field.strip() for field in row]
+                extra_row = [row[i] if i < len(row) else '' for i in extra_indices]
+                source_extra_rows.append(extra_row)
+
+        if not source_extra_rows:
+            return
+
+        # Align with OHLCV binary (which may have gap-filled rows)
+        with OHLCVReader(ohlcv_path) as ohlcv_reader:
+            total_positions = ohlcv_reader.size
+            empty_row = [''] * len(extra_headers)
+            source_idx = 0
+
+            with open(extra_csv_path, 'w', newline='') as out_f:
+                writer = csv.writer(out_f)
+                writer.writerow(extra_headers)
+
+                for pos in range(total_positions):
+                    ohlcv = ohlcv_reader.read(pos)
+                    if ohlcv.volume < 0:
+                        # Gap-filled row — write empty values
+                        writer.writerow(empty_row)
+                    else:
+                        # Real data row — consume next source row
+                        if source_idx < len(source_extra_rows):
+                            writer.writerow(source_extra_rows[source_idx])
+                            source_idx += 1
+                        else:
+                            writer.writerow(empty_row)
 
     @staticmethod
     def detect_format(file_path: Path) -> Literal['csv', 'txt', 'json', 'ohlcv', 'unknown']:

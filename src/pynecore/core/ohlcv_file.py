@@ -1365,7 +1365,8 @@ class OHLCVReader:
     Very fast OHLCV data reader using memory mapping.
     """
 
-    __slots__ = ('path', '_file', '_mmap', '_size', '_start_timestamp', '_interval')
+    __slots__ = ('path', '_file', '_mmap', '_size', '_start_timestamp', '_interval',
+                 '_extra_data', '_extra_headers')
 
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -1374,6 +1375,8 @@ class OHLCVReader:
         self._size = 0
         self._start_timestamp = None
         self._interval = None
+        self._extra_data: list[dict[str, int | float | str]] | None = None
+        self._extra_headers: list[str] | None = None
 
     def __enter__(self):
         self.open()
@@ -1467,7 +1470,58 @@ class OHLCVReader:
                 second_timestamp = struct.unpack('I', cast(Buffer, self._mmap[RECORD_SIZE:RECORD_SIZE + 4]))[0]
                 self._interval = second_timestamp - self._start_timestamp
 
+        self._load_extra_csv()
+
         return self
+
+    def _load_extra_csv(self) -> None:
+        """
+        Load extra fields from sidecar .extra.csv file if it exists.
+        The sidecar is position-aligned with the binary OHLCV file.
+        """
+        extra_path = Path(self.path).with_suffix('.extra.csv')
+        if not extra_path.exists():
+            return
+
+        with open(extra_path, 'r', newline='') as f:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if not headers:
+                return
+
+            self._extra_headers = headers
+
+            # Detect column types from first non-empty data row
+            rows_raw: list[list[str]] = []
+            col_is_numeric: list[bool | None] = [None] * len(headers)
+
+            for row in reader:
+                rows_raw.append(row)
+                for i, val in enumerate(row):
+                    if col_is_numeric[i] is None and val and val.lower() not in ('', 'nan', 'na'):
+                        try:
+                            float(val)
+                            col_is_numeric[i] = True
+                        except ValueError:
+                            col_is_numeric[i] = False
+
+            # Default undetected columns to string
+            col_is_numeric = [v if v is not None else False for v in col_is_numeric]
+
+            # Parse all rows with detected types
+            self._extra_data = []
+            for row in rows_raw:
+                parsed: dict[str, int | float | str] = {}
+                for i, header in enumerate(headers):
+                    val = row[i] if i < len(row) else ''
+                    if col_is_numeric[i]:
+                        if not val or val.lower() in ('nan', 'na', ''):
+                            parsed[header] = float('nan')
+                        else:
+                            parsed[header] = float(val)
+                    else:
+                        parsed[header] = val
+                self._extra_data.append(parsed)
 
     def __iter__(self) -> Iterator[OHLCV]:
         """
@@ -1487,7 +1541,12 @@ class OHLCVReader:
 
         offset = position * RECORD_SIZE
         data = struct.unpack(STRUCT_FORMAT, self._mmap[offset:offset + RECORD_SIZE])
-        return OHLCV(*data, extra_fields={})
+
+        extra = {}
+        if self._extra_data is not None and position < len(self._extra_data):
+            extra = self._extra_data[position]
+
+        return OHLCV(*data, extra_fields=extra)
 
     def read_from(self, start_timestamp: int, end_timestamp: int | None = None, skip_gaps: bool = True) \
             -> Iterator[OHLCV]:
@@ -1524,6 +1583,8 @@ class OHLCVReader:
         if self._file:
             self._file.close()
             self._file = None
+        self._extra_data = None
+        self._extra_headers = None
 
     def get_positions(self, start_timestamp: int | None = None, end_timestamp: int | None = None) -> tuple[int, int]:
         """

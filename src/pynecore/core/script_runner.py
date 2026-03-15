@@ -98,6 +98,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.close = _round_price(ohlcv.close)
 
     lib.volume = ohlcv.volume
+    lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
     lib.hl2 = (lib.high + lib.low) / 2.0
     lib.hlc3 = (lib.high + lib.low + lib.close) / 3.0
@@ -162,6 +163,7 @@ def _reset_lib_vars(lib: ModuleType):
     lib._time = 0
     lib._datetime = datetime.fromtimestamp(0, UTC)
 
+    lib.extra_fields = {}
     lib._lib_semaphore = False
 
     lib.barstate.isfirst = True

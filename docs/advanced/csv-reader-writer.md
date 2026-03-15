@@ -252,7 +252,7 @@ When working with financial data in PyneCore, you have two main options:
   - Data interchange with other systems
   - Human inspection and editing
   - Flexible schema requirements
-  - When additional fields beyond OHLCV are needed
+  - When additional fields beyond OHLCV are needed (see [Extra Fields](./extra-fields.md))
 
 Both systems are designed for performance while maintaining pure Python implementation, aligning with the PyneCore project vision.
 
