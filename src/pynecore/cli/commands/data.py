@@ -16,6 +16,8 @@ from ...providers.provider import Provider
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
 from ...core.ohlcv_file import OHLCVReader
+from ...core.aggregator import validate_aggregation, aggregate_ohlcv
+from ...core.syminfo import SymInfo
 
 from ...utils.rich.date_column import DateColumn
 
@@ -374,3 +376,109 @@ def convert_from(
     secho(f'Data file converted successfully to "{file_path}".')
     secho(f'A configuration file was automatically generated for you at "{file_path.with_suffix(".toml")}". '
           f'Please check it and adjust it to match your needs.')
+
+
+@app_data.command()
+def aggregate(
+        source: Path = Argument(..., help="Source .ohlcv file (searches in workdir/data/ if only name given)"),
+        timeframe: str = Option(..., '--timeframe', '-tf', callback=validate_timeframe,
+                                help="Target timeframe in TradingView format (e.g., '60', '1D', '1W')"),
+        output: Path | None = Option(None, '--output', '-o',
+                                     help="Custom output path (auto-generated if not specified)"),
+):
+    """
+    Aggregate OHLCV data from a lower timeframe to a higher one.
+
+    Combines multiple smaller candles into larger timeframe candles.
+    For example: daily candles → weekly candles, or 5-minute → 1-hour.
+
+    The source timeframe is read from the .toml metadata file.
+    Only upscaling is supported (small → large timeframe).
+    """
+    # Resolve source path
+    if len(source.parts) == 1:
+        source = app_state.data_dir / source
+    if source.suffix == "":
+        source = source.with_suffix(".ohlcv")
+
+    if not source.exists():
+        secho(f"Error: Source file not found: {source}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    if source.suffix != '.ohlcv':
+        secho(f"Error: Source must be .ohlcv format, got: {source.suffix}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    # Read source timeframe from TOML
+    toml_path = source.with_suffix('.toml')
+    if not toml_path.exists():
+        secho(f"Error: Metadata file not found: {toml_path}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    try:
+        syminfo = SymInfo.load_toml(toml_path)
+    except Exception as e:
+        secho(f"Error reading metadata: {e}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    source_tf = syminfo.period
+
+    # Validate timeframe compatibility
+    try:
+        validate_aggregation(source_tf, timeframe)
+    except ValueError as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    # Generate output path if not specified
+    if output is None:
+        # Replace the timeframe suffix in the filename: symbol_1D.ohlcv → symbol_1W.ohlcv
+        stem = source.stem
+        # If the stem ends with the source timeframe, replace it
+        if stem.endswith(f"_{source_tf}"):
+            new_stem = stem[:-len(source_tf)] + timeframe
+        else:
+            new_stem = f"{stem}_{timeframe}"
+        output = source.parent / f"{new_stem}.ohlcv"
+
+    if len(output.parts) == 1:
+        output = app_state.data_dir / output
+
+    if output.suffix == "":
+        output = output.with_suffix(".ohlcv")
+
+    # Confirm before overwriting existing file
+    if output.exists():
+        secho(f"Target file already exists: {output.name}", fg=colors.YELLOW)
+        confirm("Overwrite?", abort=True)
+
+    # Perform aggregation
+    with Progress(
+            SpinnerColumn(finished_text="[green]✓"),
+            TextColumn("{task.description}"),
+    ) as progress:
+        progress.add_task(
+            description=f"Aggregating {source_tf} → {timeframe}...",
+            total=None,
+        )
+
+        try:
+            # Use data timezone from TOML for correct day/week/month boundaries
+            from zoneinfo import ZoneInfo
+            data_tz = ZoneInfo(syminfo.timezone) if syminfo.timezone else None
+            source_count, target_count = aggregate_ohlcv(
+                source, output, timeframe, tz=data_tz)
+        except Exception as e:
+            secho(f"Error during aggregation: {e}", err=True, fg=colors.RED)
+            raise Exit(1)
+
+    # Copy and update TOML for the target file
+    target_toml = output.with_suffix('.toml')
+    try:
+        syminfo.period = timeframe
+        syminfo.save_toml(target_toml)
+    except Exception as e:
+        secho(f"Warning: Could not write metadata: {e}", fg=colors.YELLOW)
+
+    secho(f"Aggregated {source_count:,} → {target_count:,} candles ({source_tf} → {timeframe})")
+    secho(f'Output: "{output}"')
