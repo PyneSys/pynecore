@@ -1,5 +1,5 @@
-from .base import IntEnum
+from .base import StrLiteral
 
 
-class Position(IntEnum):
+class Position(StrLiteral):
     ...

@@ -24,8 +24,8 @@ __all__ = [
 # Constants
 #
 
-regular = Session()
-extended = Session()
+regular = Session('regular')
+extended = Session('extended')
 
 
 #

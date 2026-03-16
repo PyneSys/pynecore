@@ -1,5 +1,5 @@
-from .base import IntEnum
+from .base import StrLiteral
 
 
-class AlertEnum(IntEnum):
+class AlertEnum(StrLiteral):
     ...

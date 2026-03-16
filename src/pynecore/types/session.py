@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import time
 from typing import Set
 
-from ..types.base import IntEnum
+from ..types.base import StrLiteral
 
 
 @dataclass(frozen=True)
@@ -31,5 +31,5 @@ class SessionInfo:
                 raise ValueError(f"Invalid day: {day}. Days must be between 1 (Sunday) and 7 (Saturday)")
 
 
-class Session(IntEnum):
+class Session(StrLiteral):
     ...

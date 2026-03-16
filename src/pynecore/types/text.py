@@ -1,13 +1,13 @@
-from .base import IntEnum
+from .base import StrLiteral
 
 
-class AlignEnum(IntEnum):
+class AlignEnum(StrLiteral):
     ...
 
 
-class FormatEnum(IntEnum):
+class FormatEnum(StrLiteral):
     ...
 
 
-class WrapEnum(IntEnum):
+class WrapEnum(StrLiteral):
     ...

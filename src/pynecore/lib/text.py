@@ -1,17 +1,17 @@
 from ..types.text import AlignEnum, FormatEnum, WrapEnum
 
 # Text alignment constants
-align_left = AlignEnum()
-align_center = AlignEnum()
-align_right = AlignEnum()
-align_top = AlignEnum()
-align_bottom = AlignEnum()
+align_left = AlignEnum('left')
+align_center = AlignEnum('center')
+align_right = AlignEnum('right')
+align_top = AlignEnum('top')
+align_bottom = AlignEnum('bottom')
 
 # Text format constants
-format_bold = FormatEnum()
-format_italic = FormatEnum()
-format_none = FormatEnum()
+format_bold = FormatEnum('bold')
+format_italic = FormatEnum('italic')
+format_none = FormatEnum('none')
 
 # Text wrap constants
-wrap_auto = WrapEnum()
-wrap_none = WrapEnum()
+wrap_auto = WrapEnum('auto')
+wrap_none = WrapEnum('none')

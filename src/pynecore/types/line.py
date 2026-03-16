@@ -2,10 +2,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..lib import color as _color, extend as _extend, xloc as _xloc
-from .base import IntEnum
+from .base import StrLiteral
 
 
-class LineEnum(IntEnum):
+class LineEnum(StrLiteral):
     ...
 
 

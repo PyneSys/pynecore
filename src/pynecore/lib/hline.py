@@ -20,9 +20,9 @@ class HLineModule(CallableModule):
     # Constants
     #
 
-    style_solid = HLineEnum()
-    style_dotted = HLineEnum()
-    style_dashed = HLineEnum()
+    style_solid = HLineEnum('style_solid')
+    style_dotted = HLineEnum('style_dotted')
+    style_dashed = HLineEnum('style_dashed')
 
 
 #

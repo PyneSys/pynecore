@@ -5,6 +5,7 @@ from collections import defaultdict
 from types import FunctionType
 
 from .function_isolation import isolate_function
+from ..types.base import StrLiteral
 from ..types.na import NA
 
 __all__ = ['overload']
@@ -41,6 +42,10 @@ def _check_type(value: Any, expected_type: Type) -> bool:
 
     # Pine Script-like int to float conversion
     if expected_type is float and isinstance(value, int):
+        return True
+
+    # Pine Script allows plain str where StrLiteral subtypes are expected (e.g. size, xloc)
+    if isinstance(value, str) and isinstance(expected_type, type) and issubclass(expected_type, StrLiteral):
         return True
 
     # Handle NA values - Pine Script allows NA for any basic type

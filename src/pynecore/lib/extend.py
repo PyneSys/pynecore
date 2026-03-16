@@ -1,6 +1,6 @@
 from ..types.extend import Extend
 
-both: Extend = Extend()
-left: Extend = Extend()
-none: Extend = Extend()
-right: Extend = Extend()
+both: Extend = Extend('b')
+left: Extend = Extend('l')
+none: Extend = Extend('n')
+right: Extend = Extend('r')

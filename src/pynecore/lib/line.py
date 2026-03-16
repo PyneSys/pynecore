@@ -9,12 +9,12 @@ from ..lib import xloc as _xloc, extend as _extend, color as _color
 
 _registry: list[Line] = []
 
-style_arrow_both = LineEnum()
-style_arrow_left = LineEnum()
-style_arrow_right = LineEnum()
-style_dashed = LineEnum()
-style_dotted = LineEnum()
-style_solid = LineEnum()
+style_arrow_both = LineEnum('ab')
+style_arrow_left = LineEnum('al')
+style_arrow_right = LineEnum('ar')
+style_dashed = LineEnum('dsh')
+style_dotted = LineEnum('dot')
+style_solid = LineEnum('sol')
 
 
 @overload

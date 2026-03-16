@@ -1,5 +1,5 @@
-from ..types.base import IntEnum
+from ..types.base import StrLiteral
 
 
-class FontFamilyEnum(IntEnum):
+class FontFamilyEnum(StrLiteral):
     ...

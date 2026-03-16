@@ -18,9 +18,9 @@ class AlertModule(CallableModule):
     # Constants
     #
 
-    freq_all = AlertEnum()
-    freq_once_per_bar = AlertEnum()
-    freq_once_per_bar_close = AlertEnum()
+    freq_all = AlertEnum('all')
+    freq_once_per_bar = AlertEnum('once_per_bar')
+    freq_once_per_bar_close = AlertEnum('once_per_bar_close')
 
 
 #

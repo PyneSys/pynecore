@@ -4,5 +4,5 @@ from ..types.order import Order
 # Constants
 #
 
-descending = Order()
-ascending = Order()
+descending = Order('descending')
+ascending = Order('ascending')

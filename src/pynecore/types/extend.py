@@ -1,5 +1,5 @@
-from .base import IntEnum
+from .base import StrLiteral
 
 
-class Extend(IntEnum):
+class Extend(StrLiteral):
     ...
