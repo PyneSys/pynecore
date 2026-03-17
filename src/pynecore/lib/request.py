@@ -1,6 +1,7 @@
 from ..types.footprint import Footprint
 
 
+# noinspection PyUnusedLocal
 def security(*args, **kwargs):
     """
     Request data from another symbol/timeframe.
@@ -10,6 +11,7 @@ def security(*args, **kwargs):
     raise NotImplementedError("request.security() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def security_lower_tf(*args, **kwargs):
     """
     Request intrabar data from a lower timeframe.
@@ -19,6 +21,7 @@ def security_lower_tf(*args, **kwargs):
     raise NotImplementedError("request.security_lower_tf() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def currency_rate(*args, **kwargs) -> float:
     """
     Get the currency conversion rate.
@@ -28,6 +31,7 @@ def currency_rate(*args, **kwargs) -> float:
     raise NotImplementedError("request.currency_rate() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def dividends(*args, **kwargs) -> float:
     """
     Request dividend data for a symbol.
@@ -37,6 +41,7 @@ def dividends(*args, **kwargs) -> float:
     raise NotImplementedError("request.dividends() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def splits(*args, **kwargs) -> float:
     """
     Request stock split data for a symbol.
@@ -46,6 +51,7 @@ def splits(*args, **kwargs) -> float:
     raise NotImplementedError("request.splits() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def earnings(*args, **kwargs) -> float:
     """
     Request earnings data for a symbol.
@@ -55,6 +61,7 @@ def earnings(*args, **kwargs) -> float:
     raise NotImplementedError("request.earnings() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def financial(*args, **kwargs) -> float:
     """
     Request financial data from FactSet.
@@ -64,6 +71,7 @@ def financial(*args, **kwargs) -> float:
     raise NotImplementedError("request.financial() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def economic(*args, **kwargs) -> float:
     """
     Request economic data.
@@ -73,6 +81,7 @@ def economic(*args, **kwargs) -> float:
     raise NotImplementedError("request.economic() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def quandl(*args, **kwargs) -> float:
     """
     Request data from Quandl/Nasdaq.
@@ -82,6 +91,7 @@ def quandl(*args, **kwargs) -> float:
     raise NotImplementedError("request.quandl() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def seed(*args, **kwargs):
     """
     Request data from user-maintained GitHub repositories.
@@ -91,6 +101,7 @@ def seed(*args, **kwargs):
     raise NotImplementedError("request.seed() is not yet implemented in PyneCore")
 
 
+# noinspection PyUnusedLocal
 def footprint(ticks_per_row: int, va_percent: int) -> Footprint:
     """
     Request volume footprint data for the current bar.
