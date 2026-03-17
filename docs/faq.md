@@ -183,13 +183,17 @@ if na(value):
     # Handle NA case
 ```
 
-You can also create NA values with specific types:
+NA values behave safely in all contexts — no special handling needed in most cases:
+
+- **Comparisons** return `False`: `NA < 30`, `NA > 70`, `NA == x`
+- **Arithmetic** propagates: `NA + 1` → `NA`, `NA * 2.0` → `NA`
+- **Format strings** work: `f"{na_value:.2f}"` → `"NaN"`
+- **bool()** returns `False`
 
 ```python
-from pynecore.lib import na
-
-na_int = na(int)
-na_float = na(float)
+rsi = plot_data.get("RSI")
+if rsi > 70:                    # False when rsi is NA — no crash
+    print(f"Overbought: {rsi:.2f}")  # NA prints as "NaN"
 ```
 
 ### How do Series variables work in PyneCore?
@@ -221,6 +225,34 @@ result = safe_convert.safe_div(numerator, denominator)
 This function returns `NA(float)` instead of raising a `ZeroDivisionError` when the denominator is zero or NA, which matches how Pine Script handles division by zero. This transformation only applies to dynamic divisions (not literal values like `1/2`), ensuring both Pine Script compatibility and optimal performance.
 
 This is part of PyneCore's "it just works" philosophy - your Pine Script logic will behave exactly as expected without requiring explicit error handling for common edge cases.
+
+## Programmatic Usage
+
+### Can I use PyneCore from Python code, not just the CLI?
+
+Yes! PyneCore scripts can be run programmatically using the `ScriptRunner` class. This lets you
+embed indicators and strategies into trading bots, custom backtesting frameworks, data pipelines,
+or web services.
+
+```python
+from pathlib import Path
+from pynecore.core.script_runner import ScriptRunner
+
+runner = ScriptRunner(
+    script_path=Path("my_indicator.py"),
+    ohlcv_iter=candles,     # any iterable of OHLCV objects
+    syminfo=syminfo,        # symbol metadata
+)
+
+for candle, plot_data in runner.run_iter():
+    rsi = plot_data.get("RSI")
+    if rsi < 30:
+        print("Oversold!")
+```
+
+See the [Programmatic Usage](./programmatic/README.md) guide for full documentation, and the
+[pynecore-examples](https://github.com/PyneSys/pynecore-examples) repository for runnable examples
+covering CSV data, custom data sources, live exchange feeds, and FreqTrade integration.
 
 ## Troubleshooting
 

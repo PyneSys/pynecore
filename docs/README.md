@@ -25,6 +25,7 @@ PyneCore - TradingView Pine Script Environment in Python
 - [Library](./lib.md) - PyneCore library reference
 - [Scripting with PyneCore](./scripting.md) - Writing effective and idiomatic Pyne scripts
 - [Strategy Development](./strategy.md) - Creating and testing trading strategies with PyneCore
+- [Programmatic Usage](./programmatic/README.md) - Using PyneCore from Python code (ScriptRunner, integrations)
 - [Debugging](./debugging.md) - Debugging techniques for PyneCore scripts
 - [Advanced](./advanced/README.md) - Advanced topics and features of PyneCore
 - [Development](./development/README.md) - Documentation for PyneCore developers

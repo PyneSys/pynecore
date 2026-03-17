@@ -49,6 +49,9 @@ class NA(Generic[T]):
         """
         return ""
 
+    def __format__(self, format_spec: str) -> str:
+        return "NaN"
+
     def __hash__(self) -> int:
         """
         Return a hash value for the NA value.
