@@ -131,6 +131,8 @@ def max_bars_back(var: Any, num: int) -> None:
 # noinspection PyShadowingNames
 def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime:
     """ Get datetime object from time and timezone """
+    if isinstance(time, NA):
+        return time
     dt = _datetime if time is None else datetime.fromtimestamp(time / 1000, UTC)
     assert dt is not None
     return dt.astimezone(_parse_timezone(timezone))
