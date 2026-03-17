@@ -3,7 +3,7 @@ from .na import NA
 
 
 class OHLCV(NamedTuple):
-    timestamp: int  # Unix timestamp in milliseconds
+    timestamp: int  # Unix timestamp in seconds
     open: float | NA[float]
     high: float | NA[float]
     low: float | NA[float]
