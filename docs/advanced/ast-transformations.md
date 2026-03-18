@@ -5,7 +5,7 @@ title: "AST Transformation"
 description: "How PyneCore uses AST transformation to implement Pine Script behavior"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2025-07-05"
+lastmod: "2026-03-18"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
@@ -39,12 +39,12 @@ PyneCore applies several key transformations to Python code to make it behave li
 7. **Function Isolation Transformer** - Ensures separate state for each function call
 8. **Unused Series Detector** - Removes unnecessary Series annotations for performance
 9. **Series Transformer** - Handles Series variables
-10. **Persistent Transformer** - Manages persistent variables
+10. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
 11. **Input Transformer** - Processes input parameters
 12. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
 13. **Safe Division Transformer** - Protects against division by zero
 
-This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations
+This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations.
 
 Each transformation step modifies the Python AST to implement Pine Script behavior while maintaining Python syntax and readability.
 
@@ -178,6 +178,28 @@ This ensures that hierarchical module names cannot collide with underscore-separ
 
 If you import a variable from a library, it does not know if it is a series or not. But if you use indexing (subscription) on it, it should initialize it as a series. This is needed, because the AST transformer does not know anything about the other files just the one it is currently transforming.
 
+### Module Property Transformer
+
+The Module Property transformer handles attributes that should be called as functions based on configuration.
+
+**Original code:**
+```python
+bar_index = lib.bar_index
+time = lib.time
+```
+
+**Transformed code:**
+```python
+bar_index = lib.bar_index()
+time = lib.time
+```
+
+Key aspects:
+- Uses configuration to determine which attributes are properties
+- Automatically adds parentheses for property calls
+- Preserves normal attributes as is
+- Handles dynamic cases with runtime checks
+
 ### Closure Arguments Transformer
 
 The Closure Arguments transformer converts closure variables in inner functions to explicit function arguments, enabling proper function isolation.
@@ -290,28 +312,6 @@ Key aspects:
 
 **Performance Impact**: This optimization can dramatically reduce memory usage and improve execution speed by eliminating unnecessary Series object creation for variables that are only used for simple arithmetic operations.
 
-### Module Property Transformer
-
-The Module Property transformer handles attributes that should be called as functions based on configuration.
-
-**Original code:**
-```python
-bar_index = lib.bar_index
-time = lib.time
-```
-
-**Transformed code:**
-```python
-bar_index = lib.bar_index()
-time = lib.time
-```
-
-Key aspects:
-- Uses configuration to determine which attributes are properties
-- Automatically adds parentheses for property calls
-- Preserves normal attributes as is
-- Handles dynamic cases with runtime checks
-
 ### Series Transformer
 
 The Series transformer converts Series annotated variables in Python code into a global SeriesImpl instance with add() and set() operations.
@@ -371,6 +371,8 @@ Key aspects:
 - Uses `·` (middle dot, U+00B7) as scope separator in variable names to avoid conflicts with underscores in function names
 
 This is the fastest possible way to implement persistent variables.
+
+**Kahan Summation**: The `+=` operator on Persistent float variables is automatically transformed into Kahan summation by the AST transformer. This eliminates accumulated floating-point errors in running sums. To bypass Kahan summation, use `x = x + val` instead of `x += val`.
 
 **Important Note**: The Persistent and Series transformers use the Unicode character `·` (middle dot, U+00B7) as the internal scope separator. This prevents conflicts when function names contain underscores. For example:
 - Function `f_f` in scope `main` creates variables like `__persistent_main·f_f·a__`
