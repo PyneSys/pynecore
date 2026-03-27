@@ -59,6 +59,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # Transform AST - lazy import transformers only when needed
             from pynecore.transformers.import_lifter import ImportLifterTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+            from pynecore.transformers.security import SecurityTransformer
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
             from pynecore.transformers.lib_series import LibrarySeriesTransformer
             from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
@@ -73,6 +74,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
 
             transformed = ImportLifterTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
+            transformed = SecurityTransformer().visit(transformed)
             transformed = PersistentSeriesTransformer().visit(transformed)
             transformed = LibrarySeriesTransformer().visit(transformed)
             transformed = ModulePropertyTransformer().visit(transformed)

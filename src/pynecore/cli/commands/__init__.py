@@ -9,9 +9,9 @@ from ..utils.error_hook import setup_global_error_logging
 from ...providers import available_providers
 
 # Import commands
-from . import run, data, compile, benchmark
+from . import run, data, compile, benchmark, debug
 
-__all__ = ['run', 'data', 'compile', 'benchmark']
+__all__ = ['run', 'data', 'compile', 'benchmark', 'debug']
 
 # Conditional import for private TradingView test command
 _tv_path = Path(__file__).parent / "tv.py"

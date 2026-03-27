@@ -177,13 +177,15 @@ class ScriptRunner:
 
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
-                 'equity_curve', 'first_price', 'last_price')
+                 'equity_curve', 'first_price', 'last_price',
+                 '_script_path', '_security_data')
 
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
-                 inputs: dict[str, Any] | None = None):
+                 inputs: dict[str, Any] | None = None,
+                 security_data: dict[str, str | Path] | None = None):
         """
         Initialize the script runner
 
@@ -198,10 +200,17 @@ class ScriptRunner:
         :param last_bar_index: Last bar index, the index of the last bar of the historical data
         :param inputs: Optional dictionary of input values to pass to the script,
                        overrides values from .toml files
+        :param security_data: Optional dict mapping ``"[SYMBOL:]TIMEFRAME"`` keys to
+                              OHLCV file paths for request.security() contexts.
+                              Examples: ``{"1D": "path/to/daily.ohlcv"}`` or
+                              ``{"AAPL:1H": "path/to/aapl_1h.ohlcv"}``
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
         """
+        self._script_path = script_path
+        self._security_data = security_data or {}
+
         # Import lib module to set syminfo properties before script import
         from .. import lib
 
@@ -303,6 +312,95 @@ class ScriptRunner:
 
         # Position shortcut
         position = self.script.position
+
+        # --- Security contexts setup ---
+        sec_contexts = getattr(self.script_module, '__security_contexts__', None)
+        sec_processes: list = []
+        sec_cleanup_fn = None
+        sec_states = None
+        sec_sync_block = None
+        sec_result_blocks = None
+
+        if sec_contexts:
+            from .security import (
+                setup_security_states, create_chart_protocol,
+                inject_protocol, cleanup_shared_memory,
+            )
+            from .security_process import security_process_main
+            from multiprocessing import Process
+
+            # Separate static (symbol known) and deferred (symbol=None) contexts
+            static_contexts = {}
+            deferred_sec_ids: set[str] = set()
+            for sec_id, ctx in sec_contexts.items():
+                if ctx.get('symbol') is not None:
+                    static_contexts[sec_id] = ctx
+                else:
+                    deferred_sec_ids.add(sec_id)
+
+            # Resolve OHLCV paths for static contexts only
+            sec_ohlcv_paths = self._resolve_security_data(static_contexts) if static_contexts else {}
+
+            sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
+                sec_contexts, str(lib.syminfo.period), self.tz,
+            )
+
+            all_sec_ids = list(sec_contexts.keys())
+            script_path_str = str(self._script_path.resolve())
+
+            def _spawn_security_process(sid: str, ohlcv_path: str):
+                state = sec_states[sid]
+                p = Process(
+                    target=security_process_main,
+                    args=(
+                        sid,
+                        script_path_str,
+                        ohlcv_path,
+                        sec_sync_block.name,
+                        all_sec_ids,
+                        state.data_ready,
+                        state.advance_event,
+                        state.done_event,
+                        state.stop_event,
+                    ),
+                    daemon=True,
+                )
+                p.start()
+                sec_processes.append(p)
+
+            # Callback for lazy resolution of deferred security contexts
+            def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
+                if sid not in deferred_sec_ids:
+                    return
+                deferred_sec_ids.discard(sid)
+                # Resolve actual timeframe
+                chart_tf = str(lib.syminfo.period)
+                tf = timeframe if timeframe else chart_tf
+                # Update SecurityState with correct timeframe info
+                state = sec_states[sid]
+                state.timeframe = tf
+                same_tf = (tf == chart_tf)
+                state.same_timeframe = same_tf
+                if same_tf:
+                    state.resampler = None
+                elif state.resampler is None:
+                    from .resampler import Resampler
+                    state.resampler = Resampler.get_resampler(tf)
+                # Resolve OHLCV path and spawn process
+                ctx = {'symbol': symbol, 'timeframe': tf}
+                resolved = self._resolve_security_data({sid: ctx})
+                sec_ohlcv_paths[sid] = resolved[sid]
+                _spawn_security_process(sid, resolved[sid])
+
+            signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
+                sec_states, sec_sync_block,
+                deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
+            )
+            inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn)
+
+            # Spawn processes for static contexts immediately
+            for sec_id in static_contexts:
+                _spawn_security_process(sec_id, sec_ohlcv_paths[sec_id])
 
         try:
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
@@ -514,10 +612,75 @@ class ScriptRunner:
             if self.trades_writer:
                 self.trades_writer.close()
 
+            # Shutdown security processes
+            if sec_processes:
+                for state in sec_states.values():
+                    state.stop_event.set()
+                    state.advance_event.set()  # wake up if waiting
+                for p in sec_processes:
+                    p.join(timeout=5)
+                    if p.is_alive():
+                        p.terminate()
+                if sec_cleanup_fn:
+                    sec_cleanup_fn()
+                if sec_sync_block and sec_result_blocks:
+                    from .security import cleanup_shared_memory
+                    cleanup_shared_memory(sec_sync_block, sec_result_blocks)
+
             # Reset library variables
             _reset_lib_vars(lib)
             # Reset function isolation
             function_isolation.reset()
+
+    def _resolve_security_data(self, contexts: dict) -> dict[str, str]:
+        """
+        Resolve OHLCV file paths for each security context.
+
+        Matches each context's (symbol, timeframe) to the user-provided
+        ``security_data`` dictionary using ``"SYMBOL:TF"`` or ``"TF"`` keys.
+
+        :param contexts: The ``__security_contexts__`` dict from the script module
+        :return: Dict mapping sec_id to resolved OHLCV file path
+        :raises ValueError: If no data found for a context
+        """
+        result: dict[str, str] = {}
+        for sec_id, ctx in contexts.items():
+            symbol = str(ctx.get('symbol', ''))
+            timeframe = str(ctx.get('timeframe', ''))
+
+            # Try exact "SYMBOL:TF" match
+            key = f"{symbol}:{timeframe}"
+            if key in self._security_data:
+                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[key])
+                continue
+
+            # Try symbol-only match (without timeframe)
+            if symbol in self._security_data:
+                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[symbol])
+                continue
+
+            # Try timeframe-only match
+            if timeframe in self._security_data:
+                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[timeframe])
+                continue
+
+            raise ValueError(
+                f"No OHLCV data found for security context "
+                f"(symbol={symbol!r}, timeframe={timeframe!r}). "
+                f"Provide data via the security_data parameter, e.g.: "
+                f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
+            )
+        return result
+
+    @staticmethod
+    def _ensure_ohlcv_ext(path: str | Path) -> str:
+        """Add .ohlcv extension if not present."""
+        p = Path(path)
+        if p.suffix != '.ohlcv':
+            ohlcv_path = p.with_suffix('.ohlcv')
+            if ohlcv_path.exists():
+                return str(ohlcv_path)
+        return str(path)
 
     def run(self, on_progress: Callable[[datetime], None] | None = None):
         """

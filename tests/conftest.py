@@ -37,7 +37,8 @@ INDENT = 4
 
 class RunnerProtocol(Protocol):
     def __call__(self, ohlcv_iter: Iterable[OHLCV], syminfo_override: dict[str, Any] | None = None, *,
-                 syminfo_path: Path | None = None) -> ScriptRunner:
+                 syminfo_path: Path | None = None,
+                 security_data: dict[str, str | Path] | None = None) -> ScriptRunner:
         ...
 
 
@@ -292,7 +293,8 @@ def runner(script_path, module_key, syminfo) -> RunnerProtocol:
     del sys.modules[module_key]
 
     def _runner(ohlcv_iter: Iterable[OHLCV], syminfo_override: dict[str, Any] | None = None, *,
-                syminfo_path: Path | None = None) -> ScriptRunner:
+                syminfo_path: Path | None = None,
+                security_data: dict[str, str | Path] | None = None) -> ScriptRunner:
         nonlocal syminfo
 
         if syminfo_path is not None:
@@ -301,7 +303,7 @@ def runner(script_path, module_key, syminfo) -> RunnerProtocol:
             for key, value in syminfo_override.items():
                 setattr(syminfo, key, value)
 
-        r = ScriptRunner(script_path, ohlcv_iter, syminfo)
+        r = ScriptRunner(script_path, ohlcv_iter, syminfo, security_data=security_data)
 
         return r
 

@@ -1,0 +1,89 @@
+[symbol]
+prefix = "USI"
+description = "NYSE DECLINING"
+ticker = "DECL.NY"
+currency = "USD"
+#basecurrency =
+period = "1D"
+type = "index"
+mintick = 0.00100000
+pricescale = 1000
+minmove = 1
+pointvalue = 1.00000000
+timezone = "America/New_York"
+volumetype = "n/a"
+#avg_spread =
+#taker_fee =
+#maker_fee =
+#target_price_average =
+#target_price_high =
+#target_price_low =
+#target_price_date =
+
+# Opening hours
+[[opening_hours]]
+day = 0
+start = "09:30:00"
+end = "16:00:00"
+
+[[opening_hours]]
+day = 1
+start = "09:30:00"
+end = "16:00:00"
+
+[[opening_hours]]
+day = 2
+start = "09:30:00"
+end = "16:00:00"
+
+[[opening_hours]]
+day = 3
+start = "09:30:00"
+end = "16:00:00"
+
+[[opening_hours]]
+day = 4
+start = "09:30:00"
+end = "16:00:00"
+
+# Session starts
+[[session_starts]]
+day = 0
+time = "09:30:00"
+
+[[session_starts]]
+day = 1
+time = "09:30:00"
+
+[[session_starts]]
+day = 2
+time = "09:30:00"
+
+[[session_starts]]
+day = 3
+time = "09:30:00"
+
+[[session_starts]]
+day = 4
+time = "09:30:00"
+
+# Session ends
+[[session_ends]]
+day = 0
+time = "16:00:00"
+
+[[session_ends]]
+day = 1
+time = "16:00:00"
+
+[[session_ends]]
+day = 2
+time = "16:00:00"
+
+[[session_ends]]
+day = 3
+time = "16:00:00"
+
+[[session_ends]]
+day = 4
+time = "16:00:00"
