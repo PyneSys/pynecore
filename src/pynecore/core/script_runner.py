@@ -322,6 +322,15 @@ class ScriptRunner:
         sec_result_blocks = None
 
         if sec_contexts:
+            import os
+            max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
+            if len(sec_contexts) > max_security:
+                raise RuntimeError(
+                    f"Script requests too many securities: {len(sec_contexts)} "
+                    f"(limit: {max_security}). "
+                    f"Set PYNESYS_MAX_SECURITY_CONTEXTS to change the limit."
+                )
+
             from .security import (
                 setup_security_states, create_chart_protocol,
                 inject_protocol, cleanup_shared_memory,
