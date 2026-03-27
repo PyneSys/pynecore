@@ -43,6 +43,9 @@ class SecurityState:
     done_event: Event = field(default_factory=Event)
     stop_event: Event = field(default_factory=Event)
 
+    # LTF mode (lower timeframe → array return)
+    is_ltf: bool = False
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     prev_chart_time: int | None = None
@@ -131,18 +134,26 @@ def create_chart_protocol(
 
         chart_time = lib._time
 
-        target_time = _get_confirmed_time(state, chart_time)
-        state.prev_chart_time = chart_time
-
-        if target_time > state.last_confirmed:
-            state.last_confirmed = target_time
+        if state.is_ltf:
+            # LTF: every chart bar needs intrabar data — always signal
             state.new_period = True
             state.data_ready.clear()
-            sync_block.set_target_time(sec_id, target_time)
+            sync_block.set_target_time(sec_id, chart_time)
             state.advance_event.set()
             state.needs_wait = True
         else:
-            state.new_period = False
+            target_time = _get_confirmed_time(state, chart_time)
+            state.prev_chart_time = chart_time
+
+            if target_time > state.last_confirmed:
+                state.last_confirmed = target_time
+                state.new_period = True
+                state.data_ready.clear()
+                sync_block.set_target_time(sec_id, target_time)
+                state.advance_event.set()
+                state.needs_wait = True
+            else:
+                state.new_period = False
 
     def __sec_write__(sec_id: str, value, scope_id=None):
         if sec_id in same_context_ids and result_blocks is not None:
@@ -153,7 +164,7 @@ def create_chart_protocol(
         state = states[sec_id]
         state.data_ready.wait()
 
-        if state.gaps_on and not state.new_period:
+        if not state.is_ltf and state.gaps_on and not state.new_period:
             return default
 
         return readers[sec_id].read(sync_block, default)
@@ -177,6 +188,7 @@ def create_security_protocol(
     sync_block: SyncBlock,
     result_block: ResultBlock,
     all_sec_ids: list[str],
+    is_ltf: bool = False,
 ) -> tuple:
     """
     Create protocol functions for a **security** process.
@@ -185,7 +197,13 @@ def create_security_protocol(
     AST ``if __active_security__ is None`` checks). __sec_write__ writes to shared
     memory. __sec_read__ reads immediately without waiting (no deadlock).
 
-    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup)
+    When ``is_ltf=True``, __sec_write__ appends to an internal buffer instead of
+    writing to shared memory. The caller must invoke ``flush()`` at the end of
+    each round to write the accumulated array.
+
+    :param is_ltf: If True, enable LTF accumulation mode.
+    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush)
+             flush is None when is_ltf=False.
     """
     readers: dict[str, ResultReader] = {
         sid: ResultReader(sid) for sid in all_sec_ids
@@ -194,8 +212,20 @@ def create_security_protocol(
     def __sec_signal__(sid: str, symbol=None, timeframe=None, scope_id=None):
         pass
 
-    def __sec_write__(sid: str, value, scope_id=None):
-        write_result(result_block, sync_block, value)
+    if is_ltf:
+        _buffer: list = []
+
+        def __sec_write__(sid: str, value, scope_id=None):
+            _buffer.append(value)
+
+        def flush():
+            write_result(result_block, sync_block, _buffer.copy())
+            _buffer.clear()
+    else:
+        def __sec_write__(sid: str, value, scope_id=None):
+            write_result(result_block, sync_block, value)
+
+        flush = None
 
     def __sec_read__(sid: str, default=None, scope_id=None):
         return readers[sid].read(sync_block, default)
@@ -207,7 +237,7 @@ def create_security_protocol(
         for r in readers.values():
             r.close()
 
-    return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup
+    return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup, flush
 
 
 def setup_security_states(
@@ -234,12 +264,17 @@ def setup_security_states(
 
     for sec_id, ctx in contexts.items():
         timeframe = str(ctx.get('timeframe', chart_timeframe))
-        gaps_val = ctx.get('gaps', barmerge.gaps_off)
-        is_gaps_on = gaps_val is barmerge.gaps_on
+        is_ltf = bool(ctx.get('is_ltf', False))
 
-        same_tf = (timeframe == chart_timeframe)
-
-        resampler = None if same_tf else Resampler.get_resampler(timeframe)
+        if is_ltf:
+            is_gaps_on = False
+            same_tf = False
+            resampler = None  # chart-side resampler not needed for LTF
+        else:
+            gaps_val = ctx.get('gaps', barmerge.gaps_off)
+            is_gaps_on = gaps_val is barmerge.gaps_on
+            same_tf = (timeframe == chart_timeframe)
+            resampler = None if same_tf else Resampler.get_resampler(timeframe)
 
         state = SecurityState(
             sec_id=sec_id,
@@ -248,6 +283,7 @@ def setup_security_states(
             same_timeframe=same_tf,
             resampler=resampler,
             tz=tz,
+            is_ltf=is_ltf,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()

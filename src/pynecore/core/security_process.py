@@ -31,6 +31,7 @@ def security_process_main(
     advance_event,
     done_event,
     stop_event,
+    is_ltf: bool = False,
 ):
     """
     Entry point for a security process (multiprocessing.Process target).
@@ -47,6 +48,7 @@ def security_process_main(
     :param advance_event: Event signaling this process should advance
     :param done_event: Event signaling this process finished its current round
     :param stop_event: Event signaling this process should shut down
+    :param is_ltf: If True, accumulate expression values into array per round
     """
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
@@ -56,8 +58,8 @@ def security_process_main(
     result_block = ResultBlock(sec_id, create=False, version=0)
 
     # Create protocol functions for security context
-    signal_fn, write_fn, read_fn, wait_fn, cleanup = create_security_protocol(
-        sec_id, sync_block, result_block, all_sec_ids,
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
+        sec_id, sync_block, result_block, all_sec_ids, is_ltf=is_ltf,
     )
 
     # Load OHLCV data
@@ -141,8 +143,11 @@ def security_process_main(
                 current_bar += 1
                 bars_run = True
 
-            if not bars_run:
-                # No bars for this time period (session gap)
+            if is_ltf:
+                # LTF: flush accumulated array (empty list if no bars)
+                flush_fn()
+            elif not bars_run:
+                # HTF: no bars for this time period (session gap)
                 # Write na so chart reader doesn't deadlock
                 write_na(result_block, sync_block)
 

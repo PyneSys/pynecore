@@ -168,7 +168,7 @@ def __test_security_protocol_write_read__(log):
     rb_a = ResultBlock("sec_a", create=True, version=0)
     rb_b = ResultBlock("sec_b", create=True, version=0)
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_security_protocol(
         "sec_a", sb, rb_a, sec_ids,
     )
 
@@ -234,6 +234,7 @@ def __test_setup_security_states__(log):
         assert s0.same_timeframe is False
         assert s0.resampler is not None
         assert s0.data_ready.is_set()
+        assert s0.is_ltf is False
 
         # sec_1: same TF as chart
         s1 = states["sec_1"]
@@ -242,6 +243,127 @@ def __test_setup_security_states__(log):
         assert s1.same_timeframe is True
         assert s1.resampler is None
         assert s1.data_ready.is_set()
+        assert s1.is_ltf is False
+    finally:
+        for rb in result_blocks.values():
+            rb.close()
+            rb.unlink()
+        sync_block.close()
+        sync_block.unlink()
+
+
+def __test_ltf_protocol_accumulation__(log):
+    """LTF security protocol accumulates values into array via flush"""
+    sec_ids = ["sec_ltf"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_ltf", create=True, version=0)
+
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
+        "sec_ltf", sb, rb, sec_ids, is_ltf=True,
+    )
+
+    try:
+        assert flush_fn is not None
+
+        # Simulate 3 LTF bars writing values
+        write_fn("sec_ltf", 1.1050)
+        write_fn("sec_ltf", 1.1052)
+        write_fn("sec_ltf", 1.1048)
+
+        # Before flush: shared memory has no data yet
+        version, result_size = sb.get_result_meta("sec_ltf")
+        assert result_size == 0
+
+        # Flush writes accumulated array
+        flush_fn()
+
+        # Read the array
+        result = read_fn("sec_ltf", default=[])
+        assert result == [1.1050, 1.1052, 1.1048]
+
+        # Buffer is cleared after flush — another flush writes empty list
+        flush_fn()
+        result = read_fn("sec_ltf", default="SHOULD_NOT_USE")
+        assert result == []
+    finally:
+        cleanup()
+        rb.close()
+        rb.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_ltf_protocol_empty_flush__(log):
+    """LTF flush with no writes produces empty array (not na)"""
+    sec_ids = ["sec_ltf2"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_ltf2", create=True, version=0)
+
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
+        "sec_ltf2", sb, rb, sec_ids, is_ltf=True,
+    )
+
+    try:
+        # Flush immediately — no writes
+        flush_fn()
+
+        result = read_fn("sec_ltf2", default="NA")
+        assert result == []
+        assert isinstance(result, list)
+    finally:
+        cleanup()
+        rb.close()
+        rb.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_ltf_htf_protocol_no_flush__(log):
+    """Non-LTF protocol returns flush=None"""
+    sec_ids = ["sec_htf"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_htf", create=True, version=0)
+
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
+        "sec_htf", sb, rb, sec_ids, is_ltf=False,
+    )
+
+    try:
+        assert flush_fn is None
+
+        # HTF write goes directly to shared memory
+        write_fn("sec_htf", 42.0)
+        result = read_fn("sec_htf", default=None)
+        assert result == 42.0
+    finally:
+        cleanup()
+        rb.close()
+        rb.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_setup_security_states_ltf__(log):
+    """setup_security_states handles LTF context correctly"""
+    contexts = {
+        "sec_ltf": {
+            "symbol": "AAPL",
+            "timeframe": "1",
+            "is_ltf": True,
+        },
+    }
+
+    states, sync_block, result_blocks = setup_security_states(
+        contexts, chart_timeframe="5", tz=ZoneInfo("UTC"),
+    )
+
+    try:
+        s = states["sec_ltf"]
+        assert s.is_ltf is True
+        assert s.gaps_on is False
+        assert s.same_timeframe is False
+        assert s.resampler is None
+        assert s.data_ready.is_set()
     finally:
         for rb in result_blocks.values():
             rb.close()

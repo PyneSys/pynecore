@@ -33,6 +33,7 @@ class SecurityTransformer(ast.NodeTransformer):
         self._all_contexts: dict[str, dict[str, ast.expr]] = {}
         self._signal_args: dict[str, tuple[ast.expr | None, ast.expr | None]] = {}
         self._needs_barmerge = False
+        self._ltf_sec_ids: set[str] = set()
 
     def _gen_id(self) -> str:
         sec_id = f"sec\xb7{self._counter}"
@@ -48,6 +49,34 @@ class SecurityTransformer(ast.NodeTransformer):
                 and node.func.value.attr == 'request'
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == 'lib')
+
+    @staticmethod
+    def _is_security_lower_tf_call(node: ast.Call) -> bool:
+        """Check if node is lib.request.security_lower_tf(...)."""
+        return (isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'security_lower_tf'
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == 'request'
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == 'lib')
+
+    @staticmethod
+    def _extract_ltf_args(call: ast.Call) -> tuple[
+        ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None
+    ]:
+        """Extract (symbol, timeframe, expression, ignore_invalid_symbol)
+        from request.security_lower_tf() call.
+
+        Note: no gaps parameter (LTF has no gaps/lookahead).
+        """
+        args = list(call.args)
+        kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+        return (
+            kwargs.get('symbol', args[0] if len(args) > 0 else None),
+            kwargs.get('timeframe', args[1] if len(args) > 1 else None),
+            kwargs.get('expression', args[2] if len(args) > 2 else None),
+            kwargs.get('ignore_invalid_symbol', args[3] if len(args) > 3 else None),
+        )
 
     @staticmethod
     def _extract_args(call: ast.Call) -> tuple[
@@ -231,22 +260,40 @@ class SecurityTransformer(ast.NodeTransformer):
             self._scope_id_ref()
         )
 
+    def _sec_read_call_ltf(self, sec_id: str) -> ast.Call:
+        """Build: __sec_read__("sec_id", [], __scope_id__)"""
+        return self._func_call(
+            '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load()),
+            self._scope_id_ref()
+        )
+
     # --- Collection ---
 
-    def _collect_calls(self, body: list[ast.stmt]) -> list[tuple[ast.Call, str]]:
+    def _collect_calls(
+        self, body: list[ast.stmt]
+    ) -> list[tuple[ast.Call, str, bool]]:
         """
-        Find all request.security() calls in function body, skipping nested functions.
-        Marks each call node with _sec_id attribute.
+        Find all request.security() and request.security_lower_tf() calls in
+        function body, skipping nested functions. Marks each call node with
+        _sec_id attribute.
+
+        :return: List of (call_node, sec_id, is_ltf) tuples
         """
         calls = []
         for stmt in body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for node in self._walk_skip_funcs(stmt):
-                if isinstance(node, ast.Call) and self._is_security_call(node):
-                    sec_id = self._gen_id()
-                    node._sec_id = sec_id  # type: ignore[attr-defined]
-                    calls.append((node, sec_id))
+                if isinstance(node, ast.Call):
+                    if self._is_security_call(node):
+                        sec_id = self._gen_id()
+                        node._sec_id = sec_id  # type: ignore[attr-defined]
+                        calls.append((node, sec_id, False))
+                    elif self._is_security_lower_tf_call(node):
+                        sec_id = self._gen_id()
+                        node._sec_id = sec_id  # type: ignore[attr-defined]
+                        self._ltf_sec_ids.add(sec_id)
+                        calls.append((node, sec_id, True))
         return calls
 
     # --- Body transformation ---
@@ -332,7 +379,7 @@ class SecurityTransformer(ast.NodeTransformer):
     # --- Function & module visitors ---
 
     def _process_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
-        """Transform a function containing request.security() calls."""
+        """Transform a function containing request.security() / security_lower_tf() calls."""
         calls = self._collect_calls(node.body)
 
         if not calls:
@@ -341,8 +388,17 @@ class SecurityTransformer(ast.NodeTransformer):
         call_exprs: dict[str, ast.expr] = {}
         sec_ids: list[str] = []
 
-        for call, sec_id in calls:
-            symbol, timeframe, expression, gaps, ignore_invalid = self._extract_args(call)
+        for call, sec_id, is_ltf in calls:
+            if is_ltf:
+                symbol, timeframe, expression, ignore_invalid = (
+                    self._extract_ltf_args(call)
+                )
+                gaps = None
+            else:
+                symbol, timeframe, expression, gaps, ignore_invalid = (
+                    self._extract_args(call)
+                )
+
             call_exprs[sec_id] = expression if expression is not None else self._lib_na()
 
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
@@ -365,19 +421,25 @@ class SecurityTransformer(ast.NodeTransformer):
                 else:
                     ctx['timeframe'] = ast.Constant(value=None)
 
-            gaps_expr = copy.deepcopy(gaps) if gaps is not None else self._default_gaps()
-            ctx['gaps'] = gaps_expr
+            if is_ltf:
+                ctx['is_ltf'] = ast.Constant(value=True)
+            else:
+                gaps_expr = (
+                    copy.deepcopy(gaps) if gaps is not None else self._default_gaps()
+                )
+                ctx['gaps'] = gaps_expr
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
 
-            # Track if barmerge is used
-            if gaps is None:
-                self._needs_barmerge = True
-            elif isinstance(gaps, ast.Attribute) and hasattr(gaps, 'value'):
-                v = gaps.value
-                if isinstance(v, ast.Attribute) and v.attr == 'barmerge':
+            # Track if barmerge is used (only for non-LTF)
+            if not is_ltf:
+                if gaps is None:
                     self._needs_barmerge = True
+                elif isinstance(gaps, ast.Attribute) and hasattr(gaps, 'value'):
+                    v = gaps.value
+                    if isinstance(v, ast.Attribute) and v.attr == 'barmerge':
+                        self._needs_barmerge = True
 
             self._all_contexts[sec_id] = ctx
             sec_ids.append(sec_id)
@@ -450,5 +512,8 @@ class _CallReplacer(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.AST:
         node = self.generic_visit(node)
         if hasattr(node, '_sec_id'):
-            return self._parent._sec_read_call(node._sec_id)  # type: ignore[attr-defined]
+            sec_id = node._sec_id  # type: ignore[attr-defined]
+            if sec_id in self._parent._ltf_sec_ids:
+                return self._parent._sec_read_call_ltf(sec_id)
+            return self._parent._sec_read_call(sec_id)
         return node

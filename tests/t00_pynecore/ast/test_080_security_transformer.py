@@ -346,3 +346,108 @@ def main():
     ctx1_keys = [k.value for k in ctx1.keys]
     gaps_idx = ctx1_keys.index('gaps')
     assert ctx1.values[gaps_idx].attr == 'gaps_on'
+
+
+def __test_ltf_simple__(log):
+    """Simple request.security_lower_tf() call"""
+    source = """
+def main():
+    intrabars = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.close)
+    lib.plot(intrabars.size())
+"""
+    result = _transform(source)
+
+    assert 'lib.request.security_lower_tf' not in result
+    assert '__sec_signal__' in result
+    assert '__sec_write__' in result
+    assert '__sec_read__' in result
+    assert '__sec_wait__' in result
+    assert '__security_contexts__' in result
+
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+
+    # Read call should use [] as default (not lib.na)
+    read_assign = func.body[2]
+    assert isinstance(read_assign, ast.Assign)
+    read_call = read_assign.value
+    assert read_call.func.id == '__sec_read__'
+    default_arg = read_call.args[1]
+    assert isinstance(default_arg, ast.List)
+    assert default_arg.elts == []
+
+
+def __test_ltf_context_metadata__(log):
+    """security_lower_tf context has is_ltf=True and no gaps key"""
+    source = """
+def main():
+    intrabars = lib.request.security_lower_tf("AAPL", "1", lib.close)
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+
+    assert 'is_ltf' in ctx_keys
+    assert 'gaps' not in ctx_keys
+
+    ltf_idx = ctx_keys.index('is_ltf')
+    assert ctx_dict.values[ltf_idx].value is True
+
+
+def __test_ltf_mixed_with_htf__(log):
+    """Both request.security() and request.security_lower_tf() in same function"""
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    intrabars = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.close)
+    lib.plot(daily)
+"""
+    tree = _transform_tree(source)
+
+    # Two contexts total
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value
+    assert len(ctx_dict.keys) == 2
+
+    # First context (HTF): has gaps, no is_ltf
+    ctx0_keys = [k.value for k in ctx_dict.values[0].keys]
+    assert 'gaps' in ctx0_keys
+    assert 'is_ltf' not in ctx0_keys
+
+    # Second context (LTF): has is_ltf, no gaps
+    ctx1_keys = [k.value for k in ctx_dict.values[1].keys]
+    assert 'is_ltf' in ctx1_keys
+    assert 'gaps' not in ctx1_keys
+
+    func = _find_func(tree)
+
+    # Signal block at top should have 2 signals
+    signal_if = func.body[0]
+    assert len(signal_if.body) == 2
+
+    # Find both read calls — first should use lib.na, second should use []
+    read_calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == '__sec_read__':
+                read_calls.append(node)
+    assert len(read_calls) == 2
+
+    # HTF read: default is lib.na (ast.Attribute)
+    assert isinstance(read_calls[0].args[1], ast.Attribute)
+    assert read_calls[0].args[1].attr == 'na'
+
+    # LTF read: default is [] (ast.List)
+    assert isinstance(read_calls[1].args[1], ast.List)
+
+
+def __test_ltf_no_barmerge_import__(log):
+    """security_lower_tf alone should not trigger barmerge import"""
+    source = """
+def main():
+    intrabars = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.close)
+"""
+    result = _transform(source)
+
+    assert 'pynecore.lib.barmerge' not in result

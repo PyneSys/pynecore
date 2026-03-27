@@ -12,10 +12,26 @@ def security(*args, **kwargs):
 
 
 # noinspection PyUnusedLocal
-def security_lower_tf(*args, **kwargs):
+def security_lower_tf(
+    symbol, timeframe, expression,
+    ignore_invalid_symbol=False, currency=None,
+    ignore_invalid_timeframe=False, calc_bars_count=None,
+):
     """
     Request intrabar data from a lower timeframe.
 
+    Returns an array of values, one per intrabar within each chart bar.
+    This stub is never called in production — the SecurityTransformer
+    rewrites calls into the signal/write/read protocol.
+
+    :param symbol: Symbol to request data from
+    :param timeframe: Lower timeframe string (must be <= chart timeframe)
+    :param expression: Expression to evaluate in the lower timeframe context
+    :param ignore_invalid_symbol: If True, return empty array for invalid symbols
+    :param currency: Currency for conversion (not yet supported)
+    :param ignore_invalid_timeframe: If True, ignore invalid timeframe
+    :param calc_bars_count: Number of bars to calculate (not yet supported)
+    :return: array of expression values per intrabar
     :raises NotImplementedError: Not yet implemented in PyneCore
     """
     raise NotImplementedError("request.security_lower_tf() is not yet implemented in PyneCore")

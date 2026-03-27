@@ -396,6 +396,7 @@ class ScriptRunner:
                             state.advance_event,
                             state.done_event,
                             state.stop_event,
+                            state.is_ltf,
                         ),
                         daemon=True,
                     )
