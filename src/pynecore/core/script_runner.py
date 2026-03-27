@@ -321,97 +321,99 @@ class ScriptRunner:
         sec_sync_block = None
         sec_result_blocks = None
 
-        if sec_contexts:
-            import os
-            max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
-            if len(sec_contexts) > max_security:
-                raise RuntimeError(
-                    f"Script requests too many securities: {len(sec_contexts)} "
-                    f"(limit: {max_security}). "
-                    f"Set PYNESYS_MAX_SECURITY_CONTEXTS to change the limit."
-                )
-
-            from .security import (
-                setup_security_states, create_chart_protocol,
-                inject_protocol, cleanup_shared_memory,
-            )
-            from .security_process import security_process_main
-            from multiprocessing import Process
-
-            # Separate static (symbol known) and deferred (symbol=None) contexts
-            static_contexts = {}
-            deferred_sec_ids: set[str] = set()
-            for sec_id, ctx in sec_contexts.items():
-                if ctx.get('symbol') is not None:
-                    static_contexts[sec_id] = ctx
-                else:
-                    deferred_sec_ids.add(sec_id)
-
-            # Resolve OHLCV paths for static contexts only
-            sec_ohlcv_paths = self._resolve_security_data(static_contexts) if static_contexts else {}
-
-            sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
-                sec_contexts, str(lib.syminfo.period), self.tz,
-            )
-
-            all_sec_ids = list(sec_contexts.keys())
-            script_path_str = str(self._script_path.resolve())
-
-            def _spawn_security_process(sid: str, ohlcv_path: str):
-                state = sec_states[sid]
-                p = Process(
-                    target=security_process_main,
-                    args=(
-                        sid,
-                        script_path_str,
-                        ohlcv_path,
-                        sec_sync_block.name,
-                        all_sec_ids,
-                        state.data_ready,
-                        state.advance_event,
-                        state.done_event,
-                        state.stop_event,
-                    ),
-                    daemon=True,
-                )
-                p.start()
-                sec_processes.append(p)
-
-            # Callback for lazy resolution of deferred security contexts
-            def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
-                if sid not in deferred_sec_ids:
-                    return
-                deferred_sec_ids.discard(sid)
-                # Resolve actual timeframe
-                chart_tf = str(lib.syminfo.period)
-                tf = timeframe if timeframe else chart_tf
-                # Update SecurityState with correct timeframe info
-                state = sec_states[sid]
-                state.timeframe = tf
-                same_tf = (tf == chart_tf)
-                state.same_timeframe = same_tf
-                if same_tf:
-                    state.resampler = None
-                elif state.resampler is None:
-                    from .resampler import Resampler
-                    state.resampler = Resampler.get_resampler(tf)
-                # Resolve OHLCV path and spawn process
-                ctx = {'symbol': symbol, 'timeframe': tf}
-                resolved = self._resolve_security_data({sid: ctx})
-                sec_ohlcv_paths[sid] = resolved[sid]
-                _spawn_security_process(sid, resolved[sid])
-
-            signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
-                sec_states, sec_sync_block,
-                deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
-            )
-            inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn)
-
-            # Spawn processes for static contexts immediately
-            for sec_id in static_contexts:
-                _spawn_security_process(sec_id, sec_ohlcv_paths[sec_id])
-
         try:
+            if sec_contexts:
+                import os
+                max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
+                if len(sec_contexts) > max_security:
+                    raise RuntimeError(
+                        f"Script requests too many securities: {len(sec_contexts)} "
+                        f"(limit: {max_security}). "
+                        f"Set PYNESYS_MAX_SECURITY_CONTEXTS to change the limit."
+                    )
+
+                from .security import (
+                    setup_security_states, create_chart_protocol,
+                    inject_protocol, cleanup_shared_memory,
+                )
+                from .security_process import security_process_main
+                from multiprocessing import Process
+
+                # Separate static (symbol known) and deferred (symbol=None) contexts
+                static_contexts = {}
+                deferred_sec_ids: set[str] = set()
+                for sec_id, ctx in sec_contexts.items():
+                    if ctx.get('symbol') is not None:
+                        static_contexts[sec_id] = ctx
+                    else:
+                        deferred_sec_ids.add(sec_id)
+
+                # Resolve OHLCV paths for static contexts only
+                sec_ohlcv_paths = (
+                    self._resolve_security_data(static_contexts) if static_contexts else {}
+                )
+
+                sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
+                    sec_contexts, str(lib.syminfo.period), self.tz,
+                )
+
+                all_sec_ids = list(sec_contexts.keys())
+                script_path_str = str(self._script_path.resolve())
+
+                def _spawn_security_process(sid: str, ohlcv_path: str):
+                    state = sec_states[sid]
+                    p = Process(
+                        target=security_process_main,
+                        args=(
+                            sid,
+                            script_path_str,
+                            ohlcv_path,
+                            sec_sync_block.name,
+                            all_sec_ids,
+                            state.data_ready,
+                            state.advance_event,
+                            state.done_event,
+                            state.stop_event,
+                        ),
+                        daemon=True,
+                    )
+                    p.start()
+                    sec_processes.append(p)
+
+                # Callback for lazy resolution of deferred security contexts
+                def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
+                    if sid not in deferred_sec_ids:
+                        return
+                    deferred_sec_ids.discard(sid)
+                    # Resolve actual timeframe
+                    chart_tf = str(lib.syminfo.period)
+                    tf = timeframe if timeframe else chart_tf
+                    # Update SecurityState with correct timeframe info
+                    state = sec_states[sid]
+                    state.timeframe = tf
+                    same_tf = (tf == chart_tf)
+                    state.same_timeframe = same_tf
+                    if same_tf:
+                        state.resampler = None
+                    elif state.resampler is None:
+                        from .resampler import Resampler
+                        state.resampler = Resampler.get_resampler(tf)
+                    # Resolve OHLCV path and spawn process
+                    ctx = {'symbol': symbol, 'timeframe': tf}
+                    resolved = self._resolve_security_data({sid: ctx})
+                    sec_ohlcv_paths[sid] = resolved[sid]
+                    _spawn_security_process(sid, resolved[sid])
+
+                signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
+                    sec_states, sec_sync_block,
+                    deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
+                )
+                inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn)
+
+                # Spawn processes for static contexts immediately
+                for sec_id in static_contexts:
+                    _spawn_security_process(sec_id, sec_ohlcv_paths[sec_id])
+
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_candle = next(ohlcv_iterator, None)

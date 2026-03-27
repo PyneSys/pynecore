@@ -142,7 +142,14 @@ class ResultBlock:
         name = self._make_name(sec_id, version)
 
         if create:
-            self._shm = SharedMemory(name=name, create=True, size=size)
+            try:
+                self._shm = SharedMemory(name=name, create=True, size=size)
+            except FileExistsError:
+                # Clean up stale shared memory from a previous run that crashed
+                stale = SharedMemory(name=name, create=False)
+                stale.close()
+                stale.unlink()
+                self._shm = SharedMemory(name=name, create=True, size=size)
         else:
             self._shm = SharedMemory(name=name, create=False)
 

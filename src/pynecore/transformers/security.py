@@ -142,6 +142,10 @@ class SecurityTransformer(ast.NodeTransformer):
         Passes actual symbol and timeframe expressions to __sec_signal__
         so that runtime values (e.g., function parameters) are available.
         Also passes __scope_id__ for call_id-based context disambiguation.
+
+        Only includes sec_ids whose symbol/timeframe are module-level
+        expressions (constants or lib.* refs). Runtime-dependent signals
+        are emitted inline before their write blocks by _transform_body.
         """
         body = []
         for s in sec_ids:
@@ -156,6 +160,21 @@ class SecurityTransformer(ast.NodeTransformer):
         return ast.If(
             test=self._is_none_check(),
             body=body,
+            orelse=[]
+        )
+
+    def _inline_signal(self, sec_id: str) -> ast.If:
+        """Build a single inline signal for runtime-dependent symbol/timeframe."""
+        args: list[ast.expr] = [ast.Constant(value=sec_id)]
+        sym_expr, tf_expr = self._signal_args[sec_id]
+        args.append(copy.deepcopy(sym_expr) if sym_expr is not None
+                    else ast.Constant(value=None))
+        args.append(copy.deepcopy(tf_expr) if tf_expr is not None
+                    else ast.Constant(value=None))
+        args.append(self._scope_id_ref())
+        return ast.If(
+            test=self._is_none_check(),
+            body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
             orelse=[]
         )
 
@@ -213,18 +232,25 @@ class SecurityTransformer(ast.NodeTransformer):
     # --- Body transformation ---
 
     def _transform_body(
-        self, body: list[ast.stmt], call_exprs: dict[str, ast.expr]
+        self, body: list[ast.stmt], call_exprs: dict[str, ast.expr],
+        runtime_sec_ids: set[str] | None = None
     ) -> list[ast.stmt]:
         """
         Recursively transform a body list: insert write blocks before statements
         containing security calls, and replace calls with __sec_read__.
 
+        For runtime-dependent sec_ids (those in ``runtime_sec_ids``), also
+        emits an inline signal just before the write block, so the signal
+        runs after the symbol/timeframe variables are defined.
+
         Algorithm:
         1. For each statement, first recurse into compound sub-bodies
            (this replaces calls there and removes their _sec_id markers)
         2. Then walk the full statement — only expression-level calls remain
-        3. Insert write blocks and replace those calls
+        3. Insert inline signals (if runtime) + write blocks, replace calls
         """
+        if runtime_sec_ids is None:
+            runtime_sec_ids = set()
         new_body: list[ast.stmt] = []
         replacer = _CallReplacer(self)
 
@@ -233,7 +259,7 @@ class SecurityTransformer(ast.NodeTransformer):
                 new_body.append(stmt)
                 continue
 
-            self._recurse_subbodies(stmt, call_exprs)
+            self._recurse_subbodies(stmt, call_exprs, runtime_sec_ids)
 
             sec_ids_here = [
                 n._sec_id  # type: ignore[attr-defined]
@@ -243,6 +269,8 @@ class SecurityTransformer(ast.NodeTransformer):
 
             if sec_ids_here:
                 for sid in sec_ids_here:
+                    if sid in runtime_sec_ids:
+                        new_body.append(self._inline_signal(sid))
                     expr = copy.deepcopy(call_exprs[sid])
                     expr = replacer.visit(expr)
                     new_body.append(self._write_block(sid, expr))
@@ -252,31 +280,34 @@ class SecurityTransformer(ast.NodeTransformer):
 
         return new_body
 
-    def _recurse_subbodies(self, stmt: ast.stmt, call_exprs: dict[str, ast.expr]):
+    def _recurse_subbodies(
+        self, stmt: ast.stmt, call_exprs: dict[str, ast.expr],
+        runtime_sec_ids: set[str]
+    ):
         """Recurse into sub-bodies of compound statements."""
         if isinstance(stmt, ast.If):
-            stmt.body = self._transform_body(stmt.body, call_exprs)
-            stmt.orelse = self._transform_body(stmt.orelse, call_exprs)
+            stmt.body = self._transform_body(stmt.body, call_exprs, runtime_sec_ids)
+            stmt.orelse = self._transform_body(stmt.orelse, call_exprs, runtime_sec_ids)
         elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-            stmt.body = self._transform_body(stmt.body, call_exprs)
-            stmt.orelse = self._transform_body(stmt.orelse, call_exprs)
+            stmt.body = self._transform_body(stmt.body, call_exprs, runtime_sec_ids)
+            stmt.orelse = self._transform_body(stmt.orelse, call_exprs, runtime_sec_ids)
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            stmt.body = self._transform_body(stmt.body, call_exprs)
+            stmt.body = self._transform_body(stmt.body, call_exprs, runtime_sec_ids)
         elif isinstance(stmt, ast.Try):
-            stmt.body = self._transform_body(stmt.body, call_exprs)
+            stmt.body = self._transform_body(stmt.body, call_exprs, runtime_sec_ids)
             for handler in stmt.handlers:
-                handler.body = self._transform_body(handler.body, call_exprs)
-            stmt.orelse = self._transform_body(stmt.orelse, call_exprs)
-            stmt.finalbody = self._transform_body(stmt.finalbody, call_exprs)
+                handler.body = self._transform_body(handler.body, call_exprs, runtime_sec_ids)
+            stmt.orelse = self._transform_body(stmt.orelse, call_exprs, runtime_sec_ids)
+            stmt.finalbody = self._transform_body(stmt.finalbody, call_exprs, runtime_sec_ids)
         elif hasattr(ast, 'TryStar') and isinstance(stmt, ast.TryStar):
-            stmt.body = self._transform_body(stmt.body, call_exprs)
+            stmt.body = self._transform_body(stmt.body, call_exprs, runtime_sec_ids)
             for handler in stmt.handlers:
-                handler.body = self._transform_body(handler.body, call_exprs)
-            stmt.orelse = self._transform_body(stmt.orelse, call_exprs)
-            stmt.finalbody = self._transform_body(stmt.finalbody, call_exprs)
+                handler.body = self._transform_body(handler.body, call_exprs, runtime_sec_ids)
+            stmt.orelse = self._transform_body(stmt.orelse, call_exprs, runtime_sec_ids)
+            stmt.finalbody = self._transform_body(stmt.finalbody, call_exprs, runtime_sec_ids)
         elif hasattr(ast, 'Match') and isinstance(stmt, ast.Match):
             for case in stmt.cases:
-                case.body = self._transform_body(case.body, call_exprs)
+                case.body = self._transform_body(case.body, call_exprs, runtime_sec_ids)
 
     # --- Function & module visitors ---
 
@@ -328,10 +359,26 @@ class SecurityTransformer(ast.NodeTransformer):
             self._all_contexts[sec_id] = ctx
             sec_ids.append(sec_id)
 
+        # Separate module-level (constant) signals from runtime-dependent ones.
+        # Module-level signals can be emitted at function start for maximum
+        # parallelism. Runtime signals must be emitted inline, after the
+        # variables they reference have been assigned.
+        top_sec_ids = []
+        runtime_sec_ids: set[str] = set()
+        for sid in sec_ids:
+            sym_expr, tf_expr = self._signal_args[sid]
+            sym_ok = sym_expr is None or self._is_module_level_expr(sym_expr)
+            tf_ok = tf_expr is None or self._is_module_level_expr(tf_expr)
+            if sym_ok and tf_ok:
+                top_sec_ids.append(sid)
+            else:
+                runtime_sec_ids.add(sid)
+
         original_body = node.body
+        top_block = [self._signal_block(top_sec_ids)] if top_sec_ids else []
         node.body = (
-            [self._signal_block(sec_ids)]
-            + self._transform_body(original_body, call_exprs)
+            top_block
+            + self._transform_body(original_body, call_exprs, runtime_sec_ids)
             + [self._wait_block(sec_ids)]
         )
 
