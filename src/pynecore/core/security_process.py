@@ -133,6 +133,7 @@ def security_process_main(
                 # Set barstate
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = (current_bar == total_bars - 1)
+                barstate.isconfirmed = True
 
                 # Run the script
                 script_module.main()

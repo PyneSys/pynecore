@@ -71,10 +71,13 @@ def main():
     # Statement 2: original sma assignment (unchanged)
     assert isinstance(func.body[1], ast.Assign)
 
-    # Statement 3: write block (if __active_security__ == sec_id)
+    # Statement 3: write block (if __active_security__ == sec_id or sec_id in __same_context__)
     write_if = func.body[2]
     assert isinstance(write_if, ast.If)
-    assert isinstance(write_if.test.ops[0], ast.Eq)
+    assert isinstance(write_if.test, ast.BoolOp)
+    assert isinstance(write_if.test.op, ast.Or)
+    assert isinstance(write_if.test.values[0].ops[0], ast.Eq)
+    assert isinstance(write_if.test.values[1].ops[0], ast.In)
     write_call = write_if.body[0].value
     assert write_call.func.id == '__sec_write__'
 

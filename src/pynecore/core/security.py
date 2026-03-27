@@ -84,12 +84,23 @@ def create_chart_protocol(
     states: dict[str, SecurityState],
     sync_block: SyncBlock,
     deferred_resolve_fn: 'Callable[[str, str, str | None], None] | None' = None,
+    lazy_spawn_fn: 'Callable[[str], None] | None' = None,
+    same_context_ids: frozenset[str] = frozenset(),
+    no_process_ids: frozenset[str] = frozenset(),
+    result_blocks: dict[str, ResultBlock] | None = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
 
     :param deferred_resolve_fn: Optional callback for resolving deferred security contexts.
                                 Called with (sec_id, symbol, timeframe) on first __sec_signal__.
+    :param lazy_spawn_fn: Optional callback for lazy-spawning static security processes.
+                          Called with sec_id on first __sec_signal__ for static contexts.
+    :param same_context_ids: Security IDs that share the chart's symbol+timeframe.
+                             These are handled directly by the chart (no separate process).
+    :param no_process_ids: Security IDs that have no process (same-context + ignored).
+                           Signal/wait are skipped for these.
+    :param result_blocks: Result blocks for writing same-context values to shared memory.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup)
     """
     readers: dict[str, ResultReader] = {
@@ -104,10 +115,19 @@ def create_chart_protocol(
         state = states[sec_id]
 
         # Resolve deferred symbol/timeframe on first call
-        if sec_id not in resolved and deferred_resolve_fn is not None:
+        if sec_id not in resolved:
             resolved.add(sec_id)
-            if symbol is not None:
+            if deferred_resolve_fn is not None and symbol is not None:
                 deferred_resolve_fn(sec_id, symbol, timeframe)
+            elif lazy_spawn_fn is not None:
+                lazy_spawn_fn(sec_id)
+
+        # No-process contexts (same-context, ignored): skip advance/wait
+        if sec_id in no_process_ids:
+            if sec_id in same_context_ids:
+                state.new_period = True
+                state.data_ready.clear()
+            return
 
         chart_time = lib._time
 
@@ -125,7 +145,9 @@ def create_chart_protocol(
             state.new_period = False
 
     def __sec_write__(sec_id: str, value, scope_id=None):
-        pass
+        if sec_id in same_context_ids and result_blocks is not None:
+            write_result(result_blocks[sec_id], sync_block, value)
+            states[sec_id].data_ready.set()
 
     def __sec_read__(sec_id: str, default=None, scope_id=None):
         state = states[sec_id]
@@ -238,7 +260,8 @@ def setup_security_states(
     return states, sync_block, result_blocks
 
 
-def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn, active_security=None):
+def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn,
+                    active_security=None, same_context: frozenset[str] = frozenset()):
     """
     Inject protocol functions and __active_security__ into a script module's globals.
 
@@ -248,12 +271,14 @@ def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn, active_securi
     :param read_fn: __sec_read__ implementation
     :param wait_fn: __sec_wait__ implementation
     :param active_security: None for chart context, sec_id for security context
+    :param same_context: Frozenset of sec_ids sharing the chart's symbol+timeframe
     """
     module.__sec_signal__ = signal_fn
     module.__sec_write__ = write_fn
     module.__sec_read__ = read_fn
     module.__sec_wait__ = wait_fn
     module.__active_security__ = active_security
+    module.__same_context__ = same_context
 
 
 def cleanup_shared_memory(

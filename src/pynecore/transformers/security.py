@@ -51,9 +51,11 @@ class SecurityTransformer(ast.NodeTransformer):
 
     @staticmethod
     def _extract_args(call: ast.Call) -> tuple[
-        ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None
+        ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None,
+        ast.expr | None
     ]:
-        """Extract (symbol, timeframe, expression, gaps) from request.security() call."""
+        """Extract (symbol, timeframe, expression, gaps, ignore_invalid_symbol)
+        from request.security() call."""
         args = list(call.args)
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
         return (
@@ -61,6 +63,7 @@ class SecurityTransformer(ast.NodeTransformer):
             kwargs.get('timeframe', args[1] if len(args) > 1 else None),
             kwargs.get('expression', args[2] if len(args) > 2 else None),
             kwargs.get('gaps', args[3] if len(args) > 3 else None),
+            kwargs.get('ignore_invalid_symbol', args[4] if len(args) > 4 else None),
         )
 
     @staticmethod
@@ -191,10 +194,27 @@ class SecurityTransformer(ast.NodeTransformer):
             orelse=[]
         )
 
+    @staticmethod
+    def _in_same_context(sec_id: str) -> ast.Compare:
+        """Build: sec_id in __same_context__"""
+        return ast.Compare(
+            left=ast.Constant(value=sec_id),
+            ops=[ast.In()],
+            comparators=[ast.Name(id='__same_context__', ctx=ast.Load())]
+        )
+
     def _write_block(self, sec_id: str, expression: ast.expr) -> ast.If:
-        """Build security-context write block."""
+        """Build security-context write block.
+
+        The condition fires in two cases:
+        1. This IS the security process for sec_id (__active_security__ == sec_id)
+        2. This is the chart process and sec_id is same-context (sec_id in __same_context__)
+        """
         return ast.If(
-            test=self._eq_check(sec_id),
+            test=ast.BoolOp(
+                op=ast.Or(),
+                values=[self._eq_check(sec_id), self._in_same_context(sec_id)]
+            ),
             body=[
                 ast.Expr(value=self._func_call(
                     '__sec_write__', ast.Constant(value=sec_id), expression,
@@ -322,7 +342,7 @@ class SecurityTransformer(ast.NodeTransformer):
         sec_ids: list[str] = []
 
         for call, sec_id in calls:
-            symbol, timeframe, expression, gaps = self._extract_args(call)
+            symbol, timeframe, expression, gaps, ignore_invalid = self._extract_args(call)
             call_exprs[sec_id] = expression if expression is not None else self._lib_na()
 
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
@@ -347,6 +367,9 @@ class SecurityTransformer(ast.NodeTransformer):
 
             gaps_expr = copy.deepcopy(gaps) if gaps is not None else self._default_gaps()
             ctx['gaps'] = gaps_expr
+
+            if ignore_invalid is not None:
+                ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
 
             # Track if barmerge is used
             if gaps is None:

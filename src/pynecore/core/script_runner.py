@@ -339,10 +339,23 @@ class ScriptRunner:
                 from .security_process import security_process_main
                 from multiprocessing import Process
 
+                # Detect same-context: symbol+TF identical to chart
+                chart_ticker = str(lib.syminfo.ticker)
+                chart_tf = str(lib.syminfo.period)
+                same_context_ids: set[str] = set()
+                for sec_id, ctx in sec_contexts.items():
+                    sym = ctx.get('symbol')
+                    tf = str(ctx.get('timeframe', chart_tf))
+                    if sym is not None and str(sym) == chart_ticker and tf == chart_tf:
+                        same_context_ids.add(sec_id)
+
                 # Separate static (symbol known) and deferred (symbol=None) contexts
+                # Same-context ids are excluded from both (no process needed)
                 static_contexts = {}
                 deferred_sec_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
+                    if sec_id in same_context_ids:
+                        continue
                     if ctx.get('symbol') is not None:
                         static_contexts[sec_id] = ctx
                     else:
@@ -353,8 +366,17 @@ class ScriptRunner:
                     self._resolve_security_data(static_contexts) if static_contexts else {}
                 )
 
+                # Track ignored sec_ids (ignore_invalid_symbol=True, no data)
+                ignored_sec_ids: set[str] = set()
+                for sec_id, path in sec_ohlcv_paths.items():
+                    if path is None:
+                        ignored_sec_ids.add(sec_id)
+
+                # No-process IDs: both same-context and ignored
+                no_process_ids = frozenset(same_context_ids | ignored_sec_ids)
+
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
-                    sec_contexts, str(lib.syminfo.period), self.tz,
+                    sec_contexts, chart_tf, self.tz,
                 )
 
                 all_sec_ids = list(sec_contexts.keys())
@@ -404,15 +426,22 @@ class ScriptRunner:
                     sec_ohlcv_paths[sid] = resolved[sid]
                     _spawn_security_process(sid, resolved[sid])
 
+                # Lazy spawn callback for static contexts
+                def _lazy_spawn(sid: str):
+                    if sid in sec_ohlcv_paths and sid not in no_process_ids:
+                        _spawn_security_process(sid, sec_ohlcv_paths[sid])
+
+                frozen_same_ctx = frozenset(same_context_ids)
                 signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
                     sec_states, sec_sync_block,
                     deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
+                    lazy_spawn_fn=_lazy_spawn if static_contexts else None,
+                    same_context_ids=frozen_same_ctx,
+                    no_process_ids=no_process_ids,
+                    result_blocks=sec_result_blocks if same_context_ids else None,
                 )
-                inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn)
-
-                # Spawn processes for static contexts immediately
-                for sec_id in static_contexts:
-                    _spawn_security_process(sec_id, sec_ohlcv_paths[sec_id])
+                inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
+                                same_context=frozen_same_ctx)
 
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
@@ -643,7 +672,7 @@ class ScriptRunner:
             # Reset function isolation
             function_isolation.reset()
 
-    def _resolve_security_data(self, contexts: dict) -> dict[str, str]:
+    def _resolve_security_data(self, contexts: dict) -> dict[str, str | None]:
         """
         Resolve OHLCV file paths for each security context.
 
@@ -651,10 +680,10 @@ class ScriptRunner:
         ``security_data`` dictionary using ``"SYMBOL:TF"`` or ``"TF"`` keys.
 
         :param contexts: The ``__security_contexts__`` dict from the script module
-        :return: Dict mapping sec_id to resolved OHLCV file path
-        :raises ValueError: If no data found for a context
+        :return: Dict mapping sec_id to resolved OHLCV file path (None if ignored)
+        :raises ValueError: If no data found and ignore_invalid_symbol is not True
         """
-        result: dict[str, str] = {}
+        result: dict[str, str | None] = {}
         for sec_id, ctx in contexts.items():
             symbol = str(ctx.get('symbol', ''))
             timeframe = str(ctx.get('timeframe', ''))
@@ -673,6 +702,11 @@ class ScriptRunner:
             # Try timeframe-only match
             if timeframe in self._security_data:
                 result[sec_id] = self._ensure_ohlcv_ext(self._security_data[timeframe])
+                continue
+
+            # No data found — check if ignore_invalid_symbol is set
+            if ctx.get('ignore_invalid_symbol'):
+                result[sec_id] = None
                 continue
 
             raise ValueError(
