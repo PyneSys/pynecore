@@ -32,17 +32,19 @@ PyneCore applies several key transformations to Python code to make it behave li
 
 1. **Import Lifter** - Moves function-level imports to module level
 2. **Import Normalizer** - Standardizes import statements
-3. **PersistentSeries Transformer** - Manages the hybrid PersistentSeries type
-4. **Library Series Transformer** - Prepares library Series variables
-5. **Module Property Transformer** - Handles module properties
-6. **Closure Arguments Transformer** - Converts closure variables to function arguments
-7. **Function Isolation Transformer** - Ensures separate state for each function call
-8. **Unused Series Detector** - Removes unnecessary Series annotations for performance
-9. **Series Transformer** - Handles Series variables
-10. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
-11. **Input Transformer** - Processes input parameters
-12. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
-13. **Safe Division Transformer** - Protects against division by zero
+3. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
+   (see [request.security()](./request-security.md))
+4. **PersistentSeries Transformer** - Manages the hybrid PersistentSeries type
+5. **Library Series Transformer** - Prepares library Series variables
+6. **Module Property Transformer** - Handles module properties
+7. **Closure Arguments Transformer** - Converts closure variables to function arguments
+8. **Function Isolation Transformer** - Ensures separate state for each function call
+9. **Unused Series Detector** - Removes unnecessary Series annotations for performance
+10. **Series Transformer** - Handles Series variables
+11. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
+12. **Input Transformer** - Processes input parameters
+13. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
+14. **Safe Division Transformer** - Protects against division by zero
 
 This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations.
 

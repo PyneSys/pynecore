@@ -169,6 +169,29 @@ Example:
 pyne run my_strategy.py eurusd_data.ohlcv --plot custom_plot.csv --strat custom_stats.csv --trade custom_trades.csv
 ```
 
+### Security Data Options
+
+If your script uses `request.security()` to access data from other symbols or timeframes,
+provide the OHLCV data for each context using `--security`:
+
+- `--security`, `-sec`: Security data mapping in `"KEY=data_name"` format. Can be specified
+  multiple times. **KEY** is `"TIMEFRAME"` (e.g., `"1D"`) or `"SYMBOL:TIMEFRAME"` (e.g.,
+  `"AAPL:1H"`). **data_name** is the OHLCV data name in `workdir/data/` (without extension).
+
+Example:
+```bash
+# Daily data for a multi-timeframe indicator
+pyne run mtf_indicator.py EURUSD_5m --security "1D=EURUSD_1D"
+
+# Multiple symbols for an advance/decline indicator
+pyne run advance_decline.py SPX_1D \
+  --security "USI:ADVN.NY=USI_ADVN_NY" \
+  --security "USI:DECL.NY=USI_DECL_NY"
+```
+
+Each security data name must have a corresponding `.ohlcv` and `.toml` file pair in the data
+directory.
+
 ## Symbol Information
 
 When running a script, PyneCore needs symbol information to provide the script with details about the financial instrument being analyzed. This information is stored in a TOML file with the same name as the OHLCV file but with a `.toml` extension.

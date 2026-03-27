@@ -24,3 +24,4 @@ Advanced topics and features of PyneCore
 - [OHLCV Reader/Writer](./ohlcv-reader-writer.md) - OHLCV data handling
 - [CSV Reader/Writer](./csv-reader-writer.md) - Fast CSV processing
 - [Extra Fields](./extra-fields.md) - Custom CSV columns beyond OHLCV in scripts
+- [request.security()](./request-security.md) - Multiprocessing architecture for cross-symbol/timeframe data

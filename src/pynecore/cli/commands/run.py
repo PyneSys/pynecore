@@ -87,6 +87,10 @@ def run(
                                      help="PyneSys API key for compilation (overrides configuration file)",
                                      envvar="PYNESYS_API_KEY",
                                      rich_help_panel="Compilation Options"),
+        security: list[str] | None = Option(None, "--security", "-sec",
+                                            help='Security data: "TIMEFRAME=data_name" or '
+                                                 '"SYMBOL:TIMEFRAME=data_name"',
+                                            rich_help_panel="Security Options"),
 
 ):
     """
@@ -297,6 +301,33 @@ def run(
         size = reader.get_size(time_from_ts, time_to_ts)
         ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
+        # Parse security data mappings
+        security_data: dict[str, str | Path] | None = None
+        if security:
+            security_data = {}
+            for entry in security:
+                if '=' not in entry:
+                    secho(
+                        f"Invalid --security format: '{entry}'. "
+                        f"Expected 'TIMEFRAME=data_name' or 'SYMBOL:TIMEFRAME=data_name'",
+                        fg="red", err=True,
+                    )
+                    raise Exit(1)
+                key, value = entry.split('=', 1)
+                sec_path = Path(value)
+                if len(sec_path.parts) == 1:
+                    sec_path = app_state.data_dir / sec_path
+                if sec_path.suffix:
+                    sec_path = sec_path.with_suffix('')
+                ohlcv_check = sec_path.with_suffix('.ohlcv')
+                if not ohlcv_check.exists():
+                    secho(
+                        f"Security data not found: {ohlcv_check}",
+                        fg="red", err=True,
+                    )
+                    raise Exit(1)
+                security_data[key] = str(sec_path)
+
         # Add lib directory to Python path for library imports
         lib_dir = app_state.scripts_dir / "lib"
         lib_path_added = False
@@ -314,7 +345,8 @@ def run(
             try:
                 # Create script runner (this is where the import happens)
                 runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                                      plot_path=plot_path, strat_path=strat_path, trade_path=trade_path)
+                                      plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
+                                      security_data=security_data)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:
