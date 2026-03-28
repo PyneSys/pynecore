@@ -343,6 +343,119 @@ def __test_ltf_htf_protocol_no_flush__(log):
         sb.unlink()
 
 
+def __test_chart_protocol_currency_conversion__(log):
+    """Chart protocol: currency_conversions multiplies read result by exchange rate"""
+    import struct
+    import tempfile
+    from pathlib import Path
+    from pynecore.core.currency import CurrencyRateProvider
+    from pynecore.core.ohlcv_file import RECORD_SIZE
+
+    sec_ids = ["sec_cur"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_cur", create=True, version=0)
+
+    state = _make_state(sec_id="sec_cur", timeframe="5", same_timeframe=True)
+    states = {"sec_cur": state}
+
+    # Set up currency conversion: EUR → USD at rate 1.085
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        ohlcv_path = tmpdir / "EURUSD.ohlcv"
+        toml_path = tmpdir / "EURUSD.toml"
+
+        # Write OHLCV with close=1.085 at timestamp matching lib._time
+        with open(ohlcv_path, 'wb') as f:
+            f.write(struct.pack('Ifffff', 1000, 1.085, 1.09, 1.08, 1.085, 100.0))
+
+        toml_path.write_text(
+            '[symbol]\nprefix = "TEST"\ndescription = "EURUSD"\nticker = "EURUSD"\n'
+            'currency = "USD"\nbasecurrency = "EUR"\nperiod = "1D"\ntype = "forex"\n'
+            'mintick = 0.00001\npricescale = 100000\npointvalue = 1.0\ntimezone = "UTC"\n'
+            '[[opening_hours]]\nday = 1\nstart = "00:00:00"\nend = "23:59:59"\n'
+            '[[session_starts]]\nday = 1\ntime = "00:00:00"\n'
+            '[[session_ends]]\nday = 1\ntime = "23:59:59"\n'
+        )
+
+        # Set up CurrencyRateProvider
+        from pynecore.lib import request
+        provider = CurrencyRateProvider({"fx": str(tmpdir / "EURUSD")})
+        request._currency_provider = provider
+
+        # Set lib._datetime so currency_rate can resolve timestamp
+        from pynecore import lib
+        from datetime import datetime, timezone
+        lib._datetime = datetime.fromtimestamp(1000, timezone.utc)
+
+        try:
+            # Conversion: security result is in EUR, convert to USD
+            currency_conversions = {"sec_cur": ("EUR", "USD")}
+
+            signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(
+                states, sb, currency_conversions=currency_conversions,
+            )
+
+            # Write a value in EUR
+            write_result(rb, sb, 100.0)
+
+            # Read should return 100.0 * 1.085 ≈ 108.5
+            result = read_fn("sec_cur", default=None)
+            assert abs(result - 108.5) < 0.5, f"Expected ~108.5, got {result}"
+
+            # Test with tuple result
+            write_result(rb, sb, (50.0, "label", 25.0))
+            result = read_fn("sec_cur", default=None)
+            assert isinstance(result, tuple)
+            assert abs(result[0] - 54.25) < 0.5, f"Expected ~54.25, got {result[0]}"
+            assert result[1] == "label"  # non-numeric untouched
+            assert abs(result[2] - 27.125) < 0.5, f"Expected ~27.125, got {result[2]}"
+        finally:
+            cleanup()
+            rb.close()
+            rb.unlink()
+            sb.close()
+            sb.unlink()
+            request._reset_request_state()
+
+
+def __test_chart_protocol_currency_no_data__(log):
+    """Chart protocol: currency conversion with no rate data returns unconverted result"""
+    sec_ids = ["sec_nodata"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_nodata", create=True, version=0)
+
+    state = _make_state(sec_id="sec_nodata", timeframe="5", same_timeframe=True)
+    states = {"sec_nodata": state}
+
+    # No CurrencyRateProvider set → currency_rate returns nan → no conversion
+    from pynecore.lib import request
+    request._currency_provider = None
+
+    from pynecore import lib
+    from datetime import datetime, timezone
+    lib._datetime = datetime.fromtimestamp(1000, timezone.utc)
+
+    try:
+        currency_conversions = {"sec_nodata": ("EUR", "USD")}
+
+        signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(
+            states, sb, currency_conversions=currency_conversions,
+        )
+
+        write_result(rb, sb, 100.0)
+
+        # No provider → rate is nan → result should stay unconverted
+        result = read_fn("sec_nodata", default=None)
+        assert result == 100.0, f"Expected 100.0 (unconverted), got {result}"
+    finally:
+        cleanup()
+        rb.close()
+        rb.unlink()
+        sb.close()
+        sb.unlink()
+        request._reset_request_state()
+
+
 def __test_setup_security_states_ltf__(log):
     """setup_security_states handles LTF context correctly"""
     contexts = {

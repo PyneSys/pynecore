@@ -81,9 +81,9 @@ class SecurityTransformer(ast.NodeTransformer):
     @staticmethod
     def _extract_args(call: ast.Call) -> tuple[
         ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None,
-        ast.expr | None
+        ast.expr | None, ast.expr | None
     ]:
-        """Extract (symbol, timeframe, expression, gaps, ignore_invalid_symbol)
+        """Extract (symbol, timeframe, expression, gaps, ignore_invalid_symbol, currency)
         from request.security() call."""
         args = list(call.args)
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
@@ -93,6 +93,7 @@ class SecurityTransformer(ast.NodeTransformer):
             kwargs.get('expression', args[2] if len(args) > 2 else None),
             kwargs.get('gaps', args[3] if len(args) > 3 else None),
             kwargs.get('ignore_invalid_symbol', args[4] if len(args) > 4 else None),
+            kwargs.get('currency', args[6] if len(args) > 6 else None),
         )
 
     @staticmethod
@@ -395,7 +396,7 @@ class SecurityTransformer(ast.NodeTransformer):
                 )
                 gaps = None
             else:
-                symbol, timeframe, expression, gaps, ignore_invalid = (
+                symbol, timeframe, expression, gaps, ignore_invalid, currency = (
                     self._extract_args(call)
                 )
 
@@ -431,6 +432,9 @@ class SecurityTransformer(ast.NodeTransformer):
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
+
+            if not is_ltf and currency is not None:
+                ctx['currency'] = copy.deepcopy(currency)
 
             # Track if barmerge is used (only for non-LTF)
             if not is_ltf:

@@ -91,6 +91,7 @@ def create_chart_protocol(
     same_context_ids: frozenset[str] = frozenset(),
     no_process_ids: frozenset[str] = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
+    currency_conversions: dict[str, tuple[str, str]] | None = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -104,6 +105,7 @@ def create_chart_protocol(
     :param no_process_ids: Security IDs that have no process (same-context + ignored).
                            Signal/wait are skipped for these.
     :param result_blocks: Result blocks for writing same-context values to shared memory.
+    :param currency_conversions: Maps sec_id → (from_currency, to_currency) for auto-conversion.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup)
     """
     readers: dict[str, ResultReader] = {
@@ -167,7 +169,22 @@ def create_chart_protocol(
         if not state.is_ltf and state.gaps_on and not state.new_period:
             return default
 
-        return readers[sec_id].read(sync_block, default)
+        result = readers[sec_id].read(sync_block, default)
+
+        if currency_conversions and sec_id in currency_conversions and result is not default:
+            from ..lib import request
+            from math import isnan
+            from_cur, to_cur = currency_conversions[sec_id]
+            rate = request.currency_rate(from_cur, to_cur)
+            if not isnan(rate):
+                if isinstance(result, (int, float)):
+                    result = result * rate
+                elif isinstance(result, tuple):
+                    result = tuple(
+                        v * rate if isinstance(v, (int, float)) else v for v in result
+                    )
+
+        return result
 
     def __sec_wait__(sec_id: str, scope_id=None):
         state = states[sec_id]

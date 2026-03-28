@@ -1,10 +1,23 @@
+from __future__ import annotations
+
+from math import nan
+from typing import TYPE_CHECKING
+
 from ..types.footprint import Footprint
+
+if TYPE_CHECKING:
+    from ..core.currency import CurrencyRateProvider
+
+_currency_provider: CurrencyRateProvider | None = None
 
 
 # noinspection PyUnusedLocal
 def security(*args, **kwargs):
     """
     Request data from another symbol/timeframe.
+
+    This stub is never called in production — the SecurityTransformer
+    rewrites calls into the signal/write/read protocol.
 
     :raises NotImplementedError: Not yet implemented in PyneCore
     """
@@ -37,43 +50,85 @@ def security_lower_tf(
     raise NotImplementedError("request.security_lower_tf() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
-def currency_rate(*args, **kwargs) -> float:
+def currency_rate(from_currency: str, to_currency: str) -> float:
     """
-    Get the currency conversion rate.
+    Get the currency conversion rate between two currencies.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    Returns the exchange rate to convert from ``from_currency`` to ``to_currency``
+    at the current bar's timestamp. The rate is looked up from OHLCV data files
+    whose TOML metadata matches the requested currency pair.
+
+    :param from_currency: Source currency code (e.g. ``"EUR"``, ``currency.EUR``)
+    :param to_currency: Target currency code (e.g. ``"USD"``, ``currency.USD``)
+    :return: Exchange rate as float, or ``na`` if no data is available
     """
-    raise NotImplementedError("request.currency_rate() is not yet implemented in PyneCore")
+    if _currency_provider is None:
+        return nan
+    from .. import lib
+    timestamp = int(lib._datetime.timestamp())
+    return _currency_provider.get_rate(str(from_currency), str(to_currency), timestamp)
 
 
 # noinspection PyUnusedLocal
-def dividends(*args, **kwargs) -> float:
+def dividends(
+    ticker=None, field=None, gaps=None, lookahead=None,
+    ignore_invalid_symbol=False,
+) -> float:
     """
     Request dividend data for a symbol.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :param ticker: Symbol ticker
+    :param field: Dividend field (dividends.gross, dividends.net)
+    :param gaps: Gap handling mode (barmerge.gaps_on/off)
+    :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
+    :param ignore_invalid_symbol: If True, return na instead of raising
+    :return: Dividend value or na
+    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
+    if ignore_invalid_symbol:
+        return nan
     raise NotImplementedError("request.dividends() is not yet implemented in PyneCore")
 
 
 # noinspection PyUnusedLocal
-def splits(*args, **kwargs) -> float:
+def splits(
+    ticker=None, field=None, gaps=None, lookahead=None,
+    ignore_invalid_symbol=False,
+) -> float:
     """
     Request stock split data for a symbol.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :param ticker: Symbol ticker
+    :param field: Split field (splits.numerator, splits.denominator)
+    :param gaps: Gap handling mode (barmerge.gaps_on/off)
+    :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
+    :param ignore_invalid_symbol: If True, return na instead of raising
+    :return: Split value or na
+    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
+    if ignore_invalid_symbol:
+        return nan
     raise NotImplementedError("request.splits() is not yet implemented in PyneCore")
 
 
 # noinspection PyUnusedLocal
-def earnings(*args, **kwargs) -> float:
+def earnings(
+    ticker=None, field=None, gaps=None, lookahead=None,
+    ignore_invalid_symbol=False,
+) -> float:
     """
     Request earnings data for a symbol.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :param ticker: Symbol ticker
+    :param field: Earnings field (earnings.actual, earnings.estimate, earnings.standardized)
+    :param gaps: Gap handling mode (barmerge.gaps_on/off)
+    :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
+    :param ignore_invalid_symbol: If True, return na instead of raising
+    :return: Earnings value or na
+    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
+    if ignore_invalid_symbol:
+        return nan
     raise NotImplementedError("request.earnings() is not yet implemented in PyneCore")
 
 
@@ -128,3 +183,9 @@ def footprint(ticks_per_row: int, va_percent: int) -> Footprint:
     :raises NotImplementedError: Not yet implemented in PyneCore
     """
     raise NotImplementedError("request.footprint() is not yet implemented in PyneCore")
+
+
+def _reset_request_state() -> None:
+    """Reset request module state between script runs."""
+    global _currency_provider
+    _currency_provider = None

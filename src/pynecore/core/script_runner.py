@@ -169,6 +169,9 @@ def _reset_lib_vars(lib: ModuleType):
     lib.barstate.isfirst = True
     lib.barstate.islast = False
 
+    from ..lib import request
+    request._reset_request_state()
+
 
 class ScriptRunner:
     """
@@ -313,6 +316,18 @@ class ScriptRunner:
         # Position shortcut
         position = self.script.position
 
+        # --- Currency rate provider setup ---
+        from .currency import CurrencyRateProvider
+        from ..lib import request
+        if self._security_data:
+            request._currency_provider = CurrencyRateProvider(
+                self._security_data, chart_syminfo=self.syminfo,
+            )
+        else:
+            request._currency_provider = CurrencyRateProvider(
+                {}, chart_syminfo=self.syminfo,
+            )
+
         # --- Security contexts setup ---
         sec_contexts = getattr(self.script_module, '__security_contexts__', None)
         sec_processes: list = []
@@ -432,6 +447,22 @@ class ScriptRunner:
                     if sid in sec_ohlcv_paths and sid not in no_process_ids:
                         _spawn_security_process(sid, sec_ohlcv_paths[sid])
 
+                # Build currency conversion map from security contexts
+                currency_conversions: dict[str, tuple[str, str]] = {}
+                for sec_id, ctx in sec_contexts.items():
+                    target_cur = ctx.get('currency')
+                    if target_cur is not None:
+                        target_cur_str = str(target_cur)
+                        if target_cur_str and target_cur_str.lower() not in ('', 'na', 'nan'):
+                            ohlcv_path = sec_ohlcv_paths.get(sec_id)
+                            if ohlcv_path:
+                                sec_toml = Path(ohlcv_path).with_suffix('.toml')
+                                if sec_toml.exists():
+                                    sec_si = SymInfo.load_toml(sec_toml)
+                                    currency_conversions[sec_id] = (
+                                        sec_si.currency, target_cur_str
+                                    )
+
                 frozen_same_ctx = frozenset(same_context_ids)
                 signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
                     sec_states, sec_sync_block,
@@ -440,6 +471,7 @@ class ScriptRunner:
                     same_context_ids=frozen_same_ctx,
                     no_process_ids=no_process_ids,
                     result_blocks=sec_result_blocks if same_context_ids else None,
+                    currency_conversions=currency_conversions or None,
                 )
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)

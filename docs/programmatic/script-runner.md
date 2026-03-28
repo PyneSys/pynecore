@@ -144,7 +144,7 @@ both `<path>.ohlcv` (binary data) and `<path>.toml` (symbol info) to exist.
 
 > **Note:** Security contexts spawn separate OS processes. Each process re-imports the script,
 > loads its own OHLCV data, and builds Series history from bar 0. For technical details, see
-> [request.security() Implementation](../advanced/request-security.md).
+> [request.security() Internals](../advanced/request-security-internals.md).
 
 ## run_iter() — Processing Bars
 
