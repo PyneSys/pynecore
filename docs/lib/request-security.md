@@ -161,20 +161,20 @@ security_data = {
 
 ## Supported Features
 
-| Feature                 | Status        | Notes                                               |
-|-------------------------|---------------|-----------------------------------------------------|
-| Different timeframe     | supported     | HTF (1D, 1W, 1M, etc.) from lower TF chart          |
-| Different symbol        | supported     | Any symbol with available OHLCV data                |
-| Lower timeframe (LTF)   | supported     | `request.security_lower_tf()` returns arrays        |
-| Multiple security calls | supported     | Each gets its own process                           |
-| Conditional calls       | supported     | Inside `if`/`for`/`while` blocks                    |
-| Nested security calls   | supported     | `security(... security(...) ...)`                   |
-| `barmerge.gaps_off`     | supported     | Forward-fills last value (default)                  |
-| `barmerge.gaps_on`      | supported     | Returns `na` between periods                        |
-| `lookahead_off`         | supported     | Confirmed previous period (default)                 |
-| `ignore_invalid_symbol` | supported     | Returns `na` for missing symbols                    |
-| `lookahead_on`          | not supported | Deliberate safety-first decision                    |
-| `currency` parameter    | supported     | Auto-converts result using `CurrencyRateProvider`   |
+| Feature                 | Status        | Notes                                             |
+|-------------------------|---------------|---------------------------------------------------|
+| Different timeframe     | supported     | HTF (1D, 1W, 1M, etc.) from lower TF chart        |
+| Different symbol        | supported     | Any symbol with available OHLCV data              |
+| Lower timeframe (LTF)   | supported     | `request.security_lower_tf()` returns arrays      |
+| Multiple security calls | supported     | Each gets its own process                         |
+| Conditional calls       | supported     | Inside `if`/`for`/`while` blocks                  |
+| Nested security calls   | supported     | `security(... security(...) ...)`                 |
+| `barmerge.gaps_off`     | supported     | Forward-fills last value (default)                |
+| `barmerge.gaps_on`      | supported     | Returns `na` between periods                      |
+| `lookahead_off`         | supported     | Confirmed previous period (default)               |
+| `ignore_invalid_symbol` | supported     | Returns `na` for missing symbols                  |
+| `lookahead_on`          | not supported | Deliberate safety-first decision                  |
+| `currency` parameter    | supported     | Auto-converts result using `CurrencyRateProvider` |
 
 ## How It Works
 
@@ -210,12 +210,26 @@ For same-timeframe contexts (different symbol), values are confirmed on every ba
 
 ## Limitations
 
-- **lookahead_on** — not supported. Only `lookahead_off` (confirmed previous period). Deliberate
-  safety-first decision.
-- **Early return** — if a function has an early `return`, the `__sec_wait__` block at function end
-  is skipped. The security process still completes, but results may not be read on that bar.
+- **lookahead_on** — not supported. Only `lookahead_off` (confirmed previous period) semantics are
+  available. `lookahead_on` gives the script access to the *current* (unconfirmed) higher-timeframe
+  value before the period closes. This has legitimate uses in **retrospective market analysis** —
+  for example, examining how intraday price action related to the final daily close. However, in
+  backtesting it effectively leaks future data into past decisions, producing inflated results that
+  cannot be replicated in live trading. Since PyneCore is designed primarily for **backtesting and
+  forward-looking strategy evaluation** rather than retrospective charting, supporting `lookahead_on`
+  would undermine the reliability of its results.
 - **Standalone mode** — `python script.py data.csv` does not support `--security` yet.
   Use `pyne run` or the ScriptRunner API.
+
+## Known Differences from TradingView
+
+On markets with **shortened trading sessions** (e.g., half-day sessions before holidays), minor
+differences may occur when the chart symbol and the security symbol follow different session
+calendars — one closes early while the other trades a full day. This can cause period boundary
+alignment to differ slightly from TradingView. In practice, this is rare and only affects a handful
+of bars on specific calendar dates. PyneCore's handling of these cases appears to produce more
+consistent results, though TradingView's behavior on irregular sessions may follow internal calendar
+rules that are not publicly documented.
 
 > For technical implementation details (AST transformation, shared memory layout, process lifecycle),
 > see the [request.security() Internals](../advanced/request-security-internals.md) page.
