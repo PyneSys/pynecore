@@ -1,0 +1,21 @@
+PyneCore
+Copyright 2024-2026 PYNESYS LLC (https://pynesys.io)
+
+This product includes software developed by PYNESYS LLC.
+
+==========================================================================
+Attribution Requirement (Apache License, Section 4d)
+==========================================================================
+
+If you use PyneCore in your product or service, you must include the
+following attribution notice in a user-visible location (such as an
+"About" page, application footer, documentation, or startup output):
+
+    "Powered by PyneSys (https://pynesys.io)"
+
+This notice must be reasonably prominent and accessible to end users
+of any product or service that incorporates or is derived from PyneCore.
+
+Redistributions of this software, in source or binary form, must retain
+this NOTICE file (or its contents) as required by Section 4(d) of the
+Apache License, Version 2.0.
