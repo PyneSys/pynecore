@@ -208,7 +208,7 @@ Love PyneCore and want to see it grow? Consider a **Seed subscription or higher*
 
 ## License
 
-PyneCore is licensed under the [Apache License 2.0](LICENSE.txt).
+PyneCore is licensed under the [Apache License 2.0](LICENSE).
 
 ## Disclaimer
 
