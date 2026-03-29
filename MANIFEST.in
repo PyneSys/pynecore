@@ -1,1 +1,3 @@
 include src/pynecore/transformers/module_properties.json
+include NOTICE
+include LICENSE
