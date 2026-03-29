@@ -295,5 +295,4 @@ log.error("Error message")
 
 - [Core Concepts](/docs/overview/core-concepts/) - Detailed explanation of PyneCore's fundamental concepts
 - [Differences from Pine Script](/docs/overview/differences/) - Key differences to be aware of
-- [Library Reference](https://www.tradingview.com/pine-script-reference) - Complete reference for Pine Script library functions
-- [Pine Script Documentation](https://www.tradingview.com/pine-script-docs/welcome/) - Since PyneCore aims to be compatible with Pine Script, the official Pine documentation is also a valuable reference
+- [PyneCore Reference](/docs/reference/) - Complete reference for all library functions, types, and language features

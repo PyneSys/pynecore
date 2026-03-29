@@ -129,9 +129,8 @@ strategy.close_all()
 strategy.exit("Exit", "Long", profit=100, loss=50)
 ```
 
-For more detailed information on entries and exits, refer
-to [Pine Script strategy.entry](https://www.tradingview.com/pine-script-reference/v6/#fun_strategy{dot}entry)
-and [strategy.exit](https://www.tradingview.com/pine-script-reference/v6/#fun_strategy{dot}exit).
+For more detailed information on entries and exits, see the
+[strategy reference](/docs/reference/lib/strategy/).
 
 ## Position Sizing
 
@@ -310,8 +309,8 @@ Begin with simpler strategies before adding complexity:
 ## Further Resources
 
 - [PyneCore Core Concepts](/docs/overview/core-concepts/)
-- [Pine Script Strategy Documentation](https://www.tradingview.com/pine-script-docs/concepts/strategies/)
-- [Pine Script Library Reference](https://www.tradingview.com/pine-script-reference/v6/)
+- [Strategy Reference](/docs/reference/lib/strategy/) - Complete strategy function reference
+- [Strategy Risk Management](/docs/reference/lib/strategy_risk/) - Risk management functions
 
 As PyneCore continues to evolve, additional strategy development features and backtesting capabilities will be added.
 The project welcomes community contributions to enhance these capabilities further while maintaining full compatibility

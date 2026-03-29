@@ -111,12 +111,11 @@ Pine Script.
 
 ### Documentation
 
-Since the library is fully compatible with the Pine Script API, the TradingView official Pine Script documentation is an
-excellent reference for function usage. You can find information about PyneCore-specific aspects in the documentation of
-the respective module.
+PyneCore has its own complete reference documentation covering all library functions, variables,
+and constants with PyneCore-specific examples and compatibility notes.
 
-- [Pine Script Language Reference](https://www.tradingview.com/pine-script-reference/v6/) - Complete function reference
-- [Pine Script User Manual](https://www.tradingview.com/pine-script-docs/welcome/) - Concepts, examples and guides
+- [PyneCore Reference](/docs/reference/) - Complete reference for all namespaces
+- [PyneCore Reference — Library](/docs/reference/lib/) - Function reference by namespace
 
 ## Usage Examples
 

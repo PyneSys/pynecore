@@ -272,7 +272,8 @@ By contributing to PyneCore, you agree that your contributions will be licensed 
 - [Project Structure](../overview/project-structure.md)
 - [Testing System Overview](./testing-system.md)
 - [AST Module Documentation](https://docs.python.org/3/library/ast.html)
-- [TradingView Pine Script Documentation](https://www.tradingview.com/pine-script-docs/welcome/)
+- [PyneCore Reference](/docs/reference/) - Complete function and type reference
+- [TradingView Pine Script Documentation](https://www.tradingview.com/pine-script-docs/welcome/) - The original Pine Script language documentation
 
 ## Getting Help
 
