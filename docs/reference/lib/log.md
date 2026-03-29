@@ -86,6 +86,24 @@ Logs an error message to the console.
 log.error("Calculation error: {0}", error_value)
 ```
 
+## Behavior in Security Contexts
+
+Log calls inside `request.security()` processes are **suppressed by default**, matching TradingView
+behavior. To redirect security process logs to a file, set the `PYNE_SECURITY_LOG` environment
+variable:
+
+```bash
+PYNE_SECURITY_LOG=security.log pyne run script.py data --security "1D=data_1D"
+```
+
+Each log line in the file is prefixed with the context identifier (`[SYMBOL TIMEFRAME]`):
+
+```
+[AAPL 1D] [2025-07-05 14:30:00-0400] bar:    42 INFO    SMA value: 150.25
+```
+
+See [Debugging Security Contexts](../../debugging.md#debugging-security-contexts) for details.
+
 ## Compatibility
 
 All logging functions are fully implemented. Format strings use 0-indexed placeholders (`{0}`, `{1}`, etc.) similar to Python's `str.format()` method. Timestamps are adjusted to match the script's timezone, and the current bar index is automatically included in log output for easier debugging during backtests.

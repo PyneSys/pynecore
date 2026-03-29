@@ -14,7 +14,9 @@ try:
 except ImportError:
     rich = None
 
-__all__ = 'info', 'warning', 'error', 'logger'
+__all__ = 'info', 'warning', 'error', 'logger', 'setup_security_file_log'
+
+_security_logger: logging.Logger | None = None
 
 if os.environ.get("PYNE_NO_COLOR_LOG", "") == "1":
     rich = None
@@ -165,6 +167,60 @@ handler.setFormatter(PineLogFormatter(
 logger.addHandler(handler)
 
 
+def setup_security_file_log(log_path: str, context_label: str) -> None:
+    """
+    Set up file-based logging for a security process.
+
+    Called from security_process_main when PYNE_SECURITY_LOG is set.
+    The context_label (e.g. "AAPL 1D") is prepended to each log line.
+
+    :param log_path: Path to the log file
+    :param context_label: Security context identifier (symbol + timeframe)
+    """
+    global _security_logger
+    _security_logger = logging.getLogger(f"pyne_security_{context_label}")
+    _security_logger.setLevel(logging.DEBUG)
+    _security_logger.propagate = False
+    if _security_logger.hasHandlers():
+        _security_logger.handlers.clear()
+    fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+    fh.setFormatter(SecurityFileFormatter(context_label))
+    _security_logger.addHandler(fh)
+
+
+# noinspection PyProtectedMember
+class SecurityFileFormatter(logging.Formatter):
+    """Formatter for security process file logs with context label and Pine time."""
+
+    def __init__(self, context_label: str):
+        super().__init__()
+        self.context_label = context_label
+
+    def format(self, record: logging.LogRecord) -> str:
+        from datetime import UTC
+        from ..types import NA
+
+        if record.args:
+            msg = _format(record.msg, *record.args)
+            record.args = ()
+        else:
+            msg = str(record.msg)
+
+        if lib._time:
+            tz = lib.syminfo.timezone
+            if not tz or isinstance(tz, NA):
+                dt = datetime.fromtimestamp(lib._time / 1000, UTC)
+            else:
+                dt = lib._get_dt(lib._time, tz)
+        else:
+            dt = datetime.fromtimestamp(record.created)
+
+        time_str = dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        bar_str = f" bar: {lib.bar_index:6}" if hasattr(lib, 'bar_index') and lib.bar_index is not None else ""
+
+        return f"[{self.context_label}] [{time_str}]{bar_str} {record.levelname:<7} {msg}"
+
+
 # noinspection PyPep8Naming,PyUnusedLocal
 def info(formatString: str, *args: Any, **kwargs: Any) -> None:
     """
@@ -174,6 +230,10 @@ def info(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    if lib._lib_semaphore:
+        if _security_logger:
+            _security_logger.info(formatString, *args)
+        return
     logger.info(formatString, *args)
 
 
@@ -186,6 +246,10 @@ def warning(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    if lib._lib_semaphore:
+        if _security_logger:
+            _security_logger.warning(formatString, *args)
+        return
     logger.warning(formatString, *args)
 
 
@@ -198,4 +262,8 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    if lib._lib_semaphore:
+        if _security_logger:
+            _security_logger.error(formatString, *args)
+        return
     logger.error(formatString, *args)

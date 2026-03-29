@@ -9,6 +9,7 @@ Communication with the chart process uses shared memory + Events (see security.p
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -98,6 +99,13 @@ def security_process_main(
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
+
+    # Set up file-based logging if PYNE_SECURITY_LOG is set
+    security_log_path = os.environ.get("PYNE_SECURITY_LOG")
+    if security_log_path:
+        context_label = f"{syminfo.ticker} {syminfo.period}"
+        from pynecore.lib.log import setup_security_file_log
+        setup_security_file_log(security_log_path, context_label)
 
     try:
         current_bar = 0

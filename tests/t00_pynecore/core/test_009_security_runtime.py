@@ -456,6 +456,94 @@ def __test_chart_protocol_currency_no_data__(log):
         request._reset_request_state()
 
 
+def __test_log_suppressed_in_security_context__(log):
+    """log.info/warning/error are suppressed when _lib_semaphore is True"""
+    import logging
+    from pynecore import lib
+    from pynecore.lib import log as pine_log
+
+    original = lib._lib_semaphore
+    handler = logging.handlers = []
+
+    # Capture console logger output
+    captured = []
+    test_handler = logging.Handler()
+    test_handler.emit = lambda record: captured.append(record.msg)
+    pine_log.logger.addHandler(test_handler)
+
+    try:
+        # Normal mode: log should appear
+        lib._lib_semaphore = False
+        pine_log.info("visible message")
+        assert len(captured) == 1
+        assert captured[0] == "visible message"
+
+        # Security context: log should be suppressed
+        lib._lib_semaphore = True
+        pine_log.info("suppressed message")
+        pine_log.warning("suppressed warning")
+        pine_log.error("suppressed error")
+        assert len(captured) == 1  # still only the first message
+    finally:
+        lib._lib_semaphore = original
+        pine_log.logger.removeHandler(test_handler)
+
+
+def __test_security_file_log__(log):
+    """PYNE_SECURITY_LOG redirects security process logs to a file"""
+    import logging
+    import tempfile
+    from pathlib import Path
+    from pynecore import lib
+    from pynecore.lib import log as pine_log
+    from pynecore.lib.log import setup_security_file_log
+
+    original_semaphore = lib._lib_semaphore
+    original_security_logger = pine_log._security_logger
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        log_path = f.name
+
+    try:
+        # Set up security file logging
+        setup_security_file_log(log_path, "AAPL 1D")
+
+        # Simulate security context
+        lib._lib_semaphore = True
+
+        # These should go to the file, not console
+        pine_log.info("test info from security")
+        pine_log.warning("test warning from security")
+        pine_log.error("test error from security")
+
+        # Flush handlers
+        for h in pine_log._security_logger.handlers:
+            h.flush()
+
+        # Verify file content
+        content = Path(log_path).read_text()
+        lines = [l for l in content.strip().split('\n') if l]
+        assert len(lines) == 3, f"Expected 3 lines, got {len(lines)}: {content}"
+
+        # Check context label is in each line
+        for line in lines:
+            assert "[AAPL 1D]" in line, f"Missing context label in: {line}"
+
+        # Check levels
+        assert "INFO" in lines[0]
+        assert "WARNING" in lines[1]
+        assert "ERROR" in lines[2]
+
+        # Check messages
+        assert "test info from security" in lines[0]
+        assert "test warning from security" in lines[1]
+        assert "test error from security" in lines[2]
+    finally:
+        lib._lib_semaphore = original_semaphore
+        pine_log._security_logger = original_security_logger
+        Path(log_path).unlink(missing_ok=True)
+
+
 def __test_setup_security_states_ltf__(log):
     """setup_security_states handles LTF context correctly"""
     contexts = {

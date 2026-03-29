@@ -114,6 +114,30 @@ When using the debugger:
 2. **Persistent variables**: Check for renamed versions with `__persistent_` prefix
 3. **Function parameters**: May include additional isolation parameters
 
+## Debugging Security Contexts
+
+By default, `log.info()`, `log.warning()`, and `log.error()` calls inside `request.security()`
+contexts are **suppressed** (matching TradingView behavior, where security context logs don't appear
+in the log panel).
+
+To debug security processes, set the `PYNE_SECURITY_LOG` environment variable to a file path:
+
+```bash
+PYNE_SECURITY_LOG=security.log pyne run my_script.py my_data --security "1D=my_data_1D"
+```
+
+All security process log output is redirected to the specified file. Each line is prefixed with
+the security context identifier (symbol + timeframe) for easy identification:
+
+```
+[AAPL 1D] [2025-07-05 14:30:00-0400] bar:    42 INFO    SMA value: 150.25
+[AAPL 1D] [2025-07-05 14:30:00-0400] bar:    42 WARNING Unusual volume spike
+[EURUSD 1H] [2025-07-05 14:00:00+0000] bar:   100 INFO    RSI: 72.5
+```
+
+When multiple security processes run simultaneously, all write to the same file with their context
+labels, making it easy to trace cross-context behavior.
+
 ## Best Practices
 
 1. **Use Pine Script logging**: Prefer `log.info()`, `log.warning()`, and `log.error()` over `print()`

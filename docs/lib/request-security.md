@@ -221,6 +221,25 @@ For same-timeframe contexts (different symbol), values are confirmed on every ba
 - **Standalone mode** — `python script.py data.csv` does not support `--security` yet.
   Use `pyne run` or the ScriptRunner API.
 
+## Debugging Security Contexts
+
+`log.info()`, `log.warning()`, and `log.error()` calls inside security processes are suppressed by
+default (matching TradingView behavior). To enable logging for debugging, set the
+`PYNE_SECURITY_LOG` environment variable:
+
+```bash
+PYNE_SECURITY_LOG=security.log pyne run my_script.py my_data --security "1D=my_data_1D"
+```
+
+Each line is prefixed with the security context identifier:
+
+```
+[AAPL 1D] [2025-07-05 14:30:00-0400] bar:    42 INFO    Daily SMA: 150.25
+[EURUSD 1H] [2025-07-05 14:00:00+0000] bar:   100 INFO    RSI: 72.5
+```
+
+> See [Debugging](../debugging.md#debugging-security-contexts) for more details.
+
 ## Known Differences from TradingView
 
 On markets with **shortened trading sessions** (e.g., half-day sessions before holidays), minor
