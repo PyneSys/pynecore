@@ -16,12 +16,16 @@ def security(*args, **kwargs):
     """
     Request data from another symbol/timeframe.
 
-    This stub is never called in production — the SecurityTransformer
-    rewrites calls into the signal/write/read protocol.
+    This function exists for IDE support only. In compiled scripts, the
+    SecurityTransformer rewrites all calls into the signal/write/read protocol
+    at AST level — this function is never called at runtime.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    Only ``barmerge.lookahead_off`` is supported (deliberate safety decision).
     """
-    raise NotImplementedError("request.security() is not yet implemented in PyneCore")
+    raise RuntimeError(
+        "request.security() should not be called directly. "
+        "It is rewritten by SecurityTransformer during compilation."
+    )
 
 
 # noinspection PyUnusedLocal
@@ -34,8 +38,9 @@ def security_lower_tf(
     Request intrabar data from a lower timeframe.
 
     Returns an array of values, one per intrabar within each chart bar.
-    This stub is never called in production — the SecurityTransformer
-    rewrites calls into the signal/write/read protocol.
+    This function exists for IDE support only. In compiled scripts, the
+    SecurityTransformer rewrites all calls into the LTF signal/write/read
+    protocol at AST level — this function is never called at runtime.
 
     :param symbol: Symbol to request data from
     :param timeframe: Lower timeframe string (must be <= chart timeframe)
@@ -45,9 +50,11 @@ def security_lower_tf(
     :param ignore_invalid_timeframe: If True, ignore invalid timeframe
     :param calc_bars_count: Number of bars to calculate (not yet supported)
     :return: array of expression values per intrabar
-    :raises NotImplementedError: Not yet implemented in PyneCore
     """
-    raise NotImplementedError("request.security_lower_tf() is not yet implemented in PyneCore")
+    raise RuntimeError(
+        "request.security_lower_tf() should not be called directly. "
+        "It is rewritten by SecurityTransformer during compilation."
+    )
 
 
 def currency_rate(from_currency: str, to_currency: str) -> float:
