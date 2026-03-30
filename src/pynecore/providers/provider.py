@@ -6,7 +6,7 @@ from datetime import datetime
 from ..types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
-from pynecore.core.plugin_base import Plugin
+from pynecore.core.plugin import Plugin
 
 
 class Provider(Plugin, metaclass=ABCMeta):

@@ -1,9 +1,18 @@
 """
-Plugin discovery and loading via Python entry points.
+Plugin base class, discovery, and loading via Python entry points.
 
 All PyneCore plugins register under a single entry point group
 (``pyne.plugin``) in their ``pyproject.toml``.  The plugin class hierarchy
-determines capabilities (Provider, Extension, etc.).
+determines capabilities (Provider, Extension, etc.):
+
+- ``Provider(Plugin)`` — offline OHLCV data provider
+- ``Extension(Plugin)`` — hook-based script extension
+- ``LiveProvider(Plugin)`` — WebSocket/streaming data
+- ``Plugin`` directly — CLI-only plugin
+
+CLI methods (``cli()``, ``cli_params()``) are optional with sensible defaults.
+Plugin metadata (name, version) comes from the package's ``pyproject.toml``
+via :mod:`importlib.metadata`, not from class attributes.
 
 Example ``pyproject.toml`` for a provider plugin::
 
@@ -14,17 +23,53 @@ Discovery::
 
     plugins = discover_plugins()
     cls = load_plugin("capitalcom")
-
-Metadata (name, version, description) is read from the package's
-``pyproject.toml`` via :mod:`importlib.metadata`, not from class attributes.
 """
 
+from __future__ import annotations
+
 import re
+from typing import TYPE_CHECKING
 
 # noinspection PyProtectedMember
 from importlib.metadata import entry_points, EntryPoint
 
+if TYPE_CHECKING:
+    import click
+    import typer
+
 PLUGIN_GROUP = 'pyne.plugin'
+
+
+class Plugin:
+    """Base class for all PyneCore plugins."""
+
+    Config: type | None = None
+    """Override with a ``@dataclass`` for plugin configuration."""
+
+    plugin_name: str = ""
+    """Optional display name override.  If empty, the entry point name is used."""
+
+    @staticmethod
+    def cli() -> typer.Typer | None:
+        """
+        Return a Typer app for plugin subcommands.
+
+        Override to add commands like ``pyne <plugin_name> <subcommand>``.
+        Return ``None`` (default) if the plugin has no CLI commands.
+        """
+        return None
+
+    @staticmethod
+    def cli_params(command_name: str) -> list[click.Parameter]:
+        """
+        Return extra parameters for an existing command.
+
+        Override to inject flags/options into commands like ``pyne run``.
+        Return ``[]`` (default) if the plugin has no parameter hooks.
+
+        :param command_name: The command to extend (e.g. ``"run"``).
+        """
+        return []
 
 
 class PluginNotFoundError(ImportError):

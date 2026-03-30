@@ -9,7 +9,7 @@ from pynecore.core.plugin import (
     get_plugin_metadata,
     PluginNotFoundError,
 )
-from pynecore.core.plugin_base import Plugin
+from pynecore.core.plugin import Plugin
 from pynecore.providers.provider import Provider
 
 
