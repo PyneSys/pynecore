@@ -14,6 +14,15 @@ from pynecore.core.config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_ensured_cache():
+    """Clear cached config instances between tests."""
+    yield
+    for cls in list(globals().values()):
+        if isinstance(cls, type) and hasattr(cls, '_ensured'):
+            del cls._ensured
+
+
 @dataclass
 class SampleConfig:
     """Sample configuration"""
@@ -113,6 +122,7 @@ def __test_user_values_preserved__(tmp_path: Path):
     content = content.replace('#api_key = ""', 'api_key = "my_key"')
     content = content.replace("#enabled = false", "enabled = true")
     cfg_path.write_text(content)
+    del SampleConfig._ensured
 
     result = ensure_config(SampleConfig, cfg_path)
 
@@ -138,6 +148,7 @@ def __test_new_field_appears__(tmp_path: Path):
     assert '#name = "default"' in content
 
     cfg_path.write_text('name = "custom"\n')
+    del MinimalConfig._ensured
 
     result = ensure_config(SampleConfig, cfg_path)
 
@@ -156,6 +167,7 @@ def __test_removed_field_disappears__(tmp_path: Path):
     content = cfg_path.read_text()
     content = content.replace("#timeout = 30", "timeout = 60")
     cfg_path.write_text(content)
+    del SampleConfig._ensured
 
     result = ensure_config(MinimalConfig, cfg_path)
 
@@ -224,6 +236,7 @@ def __test_extra_sections_preserved__(tmp_path: Path):
     content = cfg_path.read_text()
     content += '\n[binance]\napiKey = "binance_key"\nsecret = "binance_secret"\n'
     cfg_path.write_text(content)
+    del SampleConfig._ensured
 
     result = ensure_config(SampleConfig, cfg_path)
 

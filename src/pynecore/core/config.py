@@ -157,6 +157,9 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     2. If it exists, read user values, regenerate from the dataclass, write back.
     3. Return a populated dataclass instance with user values over defaults.
 
+    The result is cached on ``config_cls._ensured``, so repeated calls
+    return the same instance without file I/O.
+
     TOML table sections (e.g. ``[binance]``) not managed by the dataclass
     are preserved verbatim at the end of the file.
 
@@ -164,6 +167,9 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     :param config_path: Path to the TOML file.
     :return: A populated config dataclass instance.
     """
+    if hasattr(config_cls, '_ensured'):
+        return config_cls._ensured
+
     user_values = None
     extra_content = ""
 
@@ -180,7 +186,9 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(toml_content, encoding='utf-8')
 
-    return _create_instance(config_cls, user_values)
+    instance = _create_instance(config_cls, user_values)
+    config_cls._ensured = instance
+    return instance
 
 
 def _parse_existing(config_path: Path, config_cls: type) -> tuple[dict, str]:

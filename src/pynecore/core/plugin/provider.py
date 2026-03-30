@@ -7,10 +7,10 @@ from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 
-from . import Plugin
+from . import Plugin, ConfigT
 
 
-class ProviderPlugin(Plugin, metaclass=ABCMeta):
+class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     """
     Base class for all data providers.
 
@@ -70,7 +70,7 @@ class ProviderPlugin(Plugin, metaclass=ABCMeta):
                            f"_{timeframe}.ohlcv")
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlv_dir: Path | None = None, config: object | None = None):
+                 ohlv_dir: Path | None = None, config: ConfigT | None = None):
         """
         :param symbol: The symbol to get data for.
         :param timeframe: The timeframe to get data for in TradingView format.
@@ -82,7 +82,7 @@ class ProviderPlugin(Plugin, metaclass=ABCMeta):
         self.xchg_timeframe = self.to_exchange_timeframe(timeframe) if timeframe else None
         self.ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlv_dir) if ohlv_dir else None
         self.ohlcv_file = OHLCVWriter(self.ohlcv_path) if self.ohlcv_path else None
-        self.config = config
+        self.config: ConfigT | None = config
 
     def __enter__(self) -> OHLCVWriter:
         assert self.ohlcv_file is not None

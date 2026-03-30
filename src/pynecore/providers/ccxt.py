@@ -1,18 +1,11 @@
 from typing import Callable
 from dataclasses import dataclass
-import sys
-
-if sys.version_info >= (3, 12):
-    from typing import override
-else:
-    def override(func):
-        return func
 import re
 from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from pynecore.core.plugin import ProviderPlugin
+from pynecore.core.plugin import ProviderPlugin, override
 
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
@@ -55,7 +48,7 @@ class CCXTConfig:
     """Default API password (required by some exchanges like KuCoin)"""
 
 
-class CCXTProvider(ProviderPlugin):
+class CCXTProvider(ProviderPlugin[CCXTConfig]):
     """
     CCXT provider
     """

@@ -258,3 +258,59 @@ timeout = 30
 
     # Setup global error logging
     setup_global_error_logging(workdir / "output" / "logs" / "error.log")
+
+
+# ---------------------------------------------------------------------------
+# CLIPlugin loading: subcommands and parameter hooks
+# ---------------------------------------------------------------------------
+_BUILTIN_COMMANDS = {'run', 'data', 'compile', 'benchmark', 'debug', 'plugin'}
+_PLUGGABLE_COMMANDS = {'run': run}
+
+
+def _register_cli_plugins():
+    """Load CLIPlugin subcommands and parameter hooks from installed plugins."""
+    from ...core.plugin import discover_plugins, CLIPlugin
+    from ..pluggable import PluggableCommand
+
+    for name, ep in discover_plugins().items():
+        try:
+            plugin_cls = ep.load()
+
+            if not (isinstance(plugin_cls, type) and issubclass(plugin_cls, CLIPlugin)):
+                continue
+
+            # 1. CLI subcommand registration
+            cli_app = plugin_cls.cli()
+            if cli_app is not None:
+                if name in _BUILTIN_COMMANDS:
+                    typer.secho(
+                        f"Warning: plugin '{name}' CLI name conflicts with "
+                        f"built-in command, skipping",
+                        fg="yellow", err=True,
+                    )
+                else:
+                    app.add_typer(cli_app, name=name)
+
+            # 2. Parameter hook registration
+            for cmd_name, cmd_func in _PLUGGABLE_COMMANDS.items():
+                params = plugin_cls.cli_params(cmd_name)
+                if not params:
+                    continue
+
+                click_cmd = typer.main.get_command(app).commands.get(cmd_name)
+                if not isinstance(click_cmd, PluggableCommand):
+                    continue
+
+                for param in params:
+                    if not click_cmd.register_plugin_param(param):
+                        typer.secho(
+                            f"Warning: plugin '{name}' param '{param.name}' "
+                            f"conflicts on '{cmd_name}'",
+                            fg="yellow", err=True,
+                        )
+
+        except Exception:
+            pass
+
+
+_register_cli_plugins()

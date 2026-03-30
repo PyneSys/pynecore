@@ -15,6 +15,7 @@ from rich.text import Text
 from rich.console import Console
 
 from ..app import app, app_state
+from ..pluggable import PluggableCommand
 
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
@@ -60,7 +61,7 @@ class CustomTimeRemainingColumn(ProgressColumn):
         return Text(f"{minutes:02d}:{seconds:06.3f}", style="cyan")
 
 
-@app.command()
+@app.command(cls=PluggableCommand)
 def run(
         script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
         data: Path = Argument(..., dir_okay=False, file_okay=True,

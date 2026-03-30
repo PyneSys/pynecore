@@ -32,64 +32,44 @@ Discovery::
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+import sys
+from typing import TypeVar, Generic
 
 # noinspection PyProtectedMember
 from importlib.metadata import entry_points, EntryPoint
 
-if TYPE_CHECKING:
-    import click
-    import typer
+if sys.version_info >= (3, 12):
+    # noinspection PyUnusedImports
+    from typing import override
+else:
+    def override(func):
+        """Marks a method as overriding a base class method (polyfill for <3.12)."""
+        return func
 
 PLUGIN_GROUP = 'pyne.plugin'
 
+ConfigT = TypeVar('ConfigT')
 
-class Plugin:
+
+class Plugin(Generic[ConfigT]):
     """
     Minimal base class for all PyneCore plugins.
 
-    Used for ``isinstance`` checks.  Plugin authors should inherit from a
-    concrete subclass: :class:`ProviderPlugin`, :class:`ExtensionPlugin`,
+    Generic over the config dataclass type.  Plugin authors should inherit
+    from a concrete subclass: :class:`ProviderPlugin`, :class:`ExtensionPlugin`,
     :class:`CLIPlugin`, or a combination via multiple inheritance.
+
+    Example::
+
+        class MyProvider(ProviderPlugin[MyConfig]):
+            Config = MyConfig
     """
 
-    Config: type | None = None
+    Config: type[ConfigT] | None = None
     """Override with a ``@dataclass`` for plugin configuration."""
 
     plugin_name: str = ""
     """Optional display name override.  If empty, the entry point name is used."""
-
-
-class CLIPlugin(Plugin):
-    """
-    Plugin that provides CLI commands and/or parameter hooks.
-
-    Override :meth:`cli` to add subcommands (``pyne <name> ...``).
-    Override :meth:`cli_params` to inject flags into existing commands.
-    """
-
-    @staticmethod
-    def cli() -> typer.Typer | None:
-        """
-        Return a Typer app for plugin subcommands.
-
-        Override to add commands like ``pyne <plugin_name> <subcommand>``.
-
-        :return: A Typer app, or ``None`` if the plugin has no CLI commands.
-        """
-        return None
-
-    @staticmethod
-    def cli_params(command_name: str) -> list[click.Parameter]:
-        """
-        Return extra parameters for an existing command.
-
-        Override to inject flags/options into commands like ``pyne run``.
-
-        :param command_name: The command to extend (e.g. ``"run"``).
-        :return: List of Click parameters, or ``[]`` if no hooks for this command.
-        """
-        return []
 
 
 class PluginNotFoundError(ImportError):
@@ -171,3 +151,4 @@ def _parse_min_pynecore(ep: EntryPoint) -> str:
 
 # Plugin type subclasses — import after Plugin is defined to avoid circular imports
 from .provider import ProviderPlugin
+from .cli import CLIPlugin
