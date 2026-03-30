@@ -53,7 +53,8 @@ def load_plugin(group: str, name: str) -> type:
         short_group = group.replace("pyne.", "")
         raise PluginNotFoundError(
             f"Plugin '{name}' not found for group '{group}'. "
-            f"Install it with: pip install pynecore-{name}\n"
+            f"Install it with: pip install pynesys-pynecore-{name}  (official) "
+            f"or: pip install pynecore-{name}  (3rd party)\n"
             f"Available {short_group} plugins: {', '.join(sorted(eps)) or '(none)'}"
         )
     return eps[name].load()

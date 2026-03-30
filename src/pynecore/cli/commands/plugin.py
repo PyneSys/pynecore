@@ -95,5 +95,6 @@ def plugin_info(
             return
 
     secho(f"Plugin '{name}' not found.", fg=colors.RED, err=True)
-    secho(f"Install it with: pip install pynecore-{name}", fg=colors.YELLOW, err=True)
+    secho(f"Install it with: pip install pynesys-pynecore-{name}  (official)", fg=colors.YELLOW, err=True)
+    secho(f"             or: pip install pynecore-{name}  (3rd party)", fg=colors.YELLOW, err=True)
     raise Exit(1)
