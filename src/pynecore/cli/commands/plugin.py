@@ -86,7 +86,7 @@ def plugin_info(
                 import dataclasses
                 fields = dataclasses.fields(config_cls)
                 if fields:
-                    secho(f"\n  Config fields:")
+                    secho(f"\n  Config fields (defaults):")
                     for f in fields:
                         default = f"= {f.default!r}" if f.default is not dataclasses.MISSING else "(required)"
                         secho(f"    {f.name:20s} {default}")
