@@ -12,7 +12,7 @@ from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from .provider import Provider
+from pynecore.core.plugin import ProviderPlugin
 
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
@@ -55,7 +55,7 @@ class CCXTConfig:
     """Default API password (required by some exchanges like KuCoin)"""
 
 
-class CCXTProvider(Provider):
+class CCXTProvider(ProviderPlugin):
     """
     CCXT provider
     """

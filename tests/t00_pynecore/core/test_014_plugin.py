@@ -3,14 +3,15 @@ Tests for the plugin discovery and loading system.
 """
 
 from pynecore.core.plugin import (
+    Plugin,
+    ProviderPlugin,
+    CLIPlugin,
     discover_plugins,
     load_plugin,
     get_available_plugin_names,
     get_plugin_metadata,
     PluginNotFoundError,
 )
-from pynecore.core.plugin import Plugin
-from pynecore.providers.provider import Provider
 
 
 def __test_discover_plugins_returns_dict__():
@@ -59,7 +60,7 @@ def __test_ccxt_is_provider__():
     """CCXTProvider inherits from Plugin and Provider"""
     cls = load_plugin("ccxt")
     assert issubclass(cls, Plugin)
-    assert issubclass(cls, Provider)
+    assert issubclass(cls, ProviderPlugin)
 
 
 def __test_plugin_metadata__():
@@ -73,7 +74,8 @@ def __test_plugin_metadata__():
 
 
 def __test_plugin_base_defaults__():
-    """Plugin base class has sensible defaults for CLI methods"""
-    assert Plugin.cli() is None
-    assert Plugin.cli_params('run') == []
+    """Plugin base class has minimal attributes, CLIPlugin has CLI defaults"""
     assert Plugin.Config is None
+    assert Plugin.plugin_name == ""
+    assert CLIPlugin.cli() is None
+    assert CLIPlugin.cli_params('run') == []

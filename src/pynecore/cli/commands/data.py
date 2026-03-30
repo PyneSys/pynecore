@@ -12,7 +12,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
 
 from ..app import app, app_state
 from ...core.plugin import discover_plugins, load_plugin
-from ...providers.provider import Provider
+from ...core.plugin import ProviderPlugin
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
 from ...core.ohlcv_file import OHLCVReader
@@ -43,7 +43,7 @@ else:
     for _name, _ep in discover_plugins().items():
         try:
             _cls = _ep.load()
-            if isinstance(_cls, type) and issubclass(_cls, Provider):
+            if isinstance(_cls, type) and issubclass(_cls, ProviderPlugin):
                 _provider_names.append(_name)
         except Exception:
             pass
@@ -149,7 +149,7 @@ def download(
                                        app_state.config_dir / 'plugins' / f'{provider.value}.toml')
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
                 progress.add_task(description="Fetching market data...", total=None)
-                provider_instance: Provider = provider_class(symbol=symbol, config=config)
+                provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
                 symbols = provider_instance.get_list_of_symbols()
             with (console := Console()).pager():
                 for s in symbols:
@@ -166,7 +166,7 @@ def download(
         if hasattr(provider_class, 'Config') and provider_class.Config is not None:
             config = ensure_config(provider_class.Config,
                                    app_state.config_dir / 'plugins' / f'{provider.value}.toml')
-        provider_instance: Provider = provider_class(symbol=symbol, timeframe=timeframe,
+        provider_instance: ProviderPlugin = provider_class(symbol=symbol, timeframe=timeframe,
                                                      ohlv_dir=app_state.data_dir, config=config)
 
         # Download symbol info if not exists

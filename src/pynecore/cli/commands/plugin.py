@@ -10,16 +10,14 @@ app.add_typer(app_plugin, name="plugin")
 
 def _get_capabilities(cls: type) -> list[str]:
     """Determine plugin capabilities from its class hierarchy."""
-    from ...providers.provider import Provider
+    from ...core.plugin import ProviderPlugin, CLIPlugin
 
     caps = []
-    if isinstance(cls, type) and issubclass(cls, Provider):
+    if isinstance(cls, type) and issubclass(cls, ProviderPlugin):
         caps.append('provider')
-    # Future: Extension, LiveProvider checks will go here
-    if cls.cli() is not None:
+    # Future: ExtensionPlugin, LiveProviderPlugin checks will go here
+    if isinstance(cls, type) and issubclass(cls, CLIPlugin):
         caps.append('cli')
-    if cls.cli_params('run'):
-        caps.append('params')
     return caps
 
 

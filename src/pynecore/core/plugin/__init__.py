@@ -3,18 +3,22 @@ Plugin base class, discovery, and loading via Python entry points.
 
 All PyneCore plugins register under a single entry point group
 (``pyne.plugin``) in their ``pyproject.toml``.  The plugin class hierarchy
-determines capabilities (Provider, Extension, etc.):
+determines capabilities:
 
-- ``Provider(Plugin)`` — offline OHLCV data provider
-- ``Extension(Plugin)`` — hook-based script extension
-- ``LiveProvider(Plugin)`` — WebSocket/streaming data
-- ``Plugin`` directly — CLI-only plugin
+- ``ProviderPlugin(Plugin)`` — offline OHLCV data provider
+- ``ExtensionPlugin(Plugin)`` — hook-based script extension
+- ``LiveProviderPlugin(Plugin)`` — WebSocket/streaming data
+- ``CLIPlugin(Plugin)`` — CLI commands and parameter hooks
 
-CLI methods (``cli()``, ``cli_params()``) are optional with sensible defaults.
+Multiple inheritance combines capabilities::
+
+    class BinancePlugin(ProviderPlugin, CLIPlugin): ...
+    class PlotPlugin(ExtensionPlugin, CLIPlugin): ...
+
 Plugin metadata (name, version) comes from the package's ``pyproject.toml``
 via :mod:`importlib.metadata`, not from class attributes.
 
-Example ``pyproject.toml`` for a provider plugin::
+Example ``pyproject.toml``::
 
     [project.entry-points."pyne.plugin"]
     myexchange = "mypackage:MyExchangeProvider"
@@ -41,7 +45,13 @@ PLUGIN_GROUP = 'pyne.plugin'
 
 
 class Plugin:
-    """Base class for all PyneCore plugins."""
+    """
+    Minimal base class for all PyneCore plugins.
+
+    Used for ``isinstance`` checks.  Plugin authors should inherit from a
+    concrete subclass: :class:`ProviderPlugin`, :class:`ExtensionPlugin`,
+    :class:`CLIPlugin`, or a combination via multiple inheritance.
+    """
 
     Config: type | None = None
     """Override with a ``@dataclass`` for plugin configuration."""
@@ -49,13 +59,23 @@ class Plugin:
     plugin_name: str = ""
     """Optional display name override.  If empty, the entry point name is used."""
 
+
+class CLIPlugin(Plugin):
+    """
+    Plugin that provides CLI commands and/or parameter hooks.
+
+    Override :meth:`cli` to add subcommands (``pyne <name> ...``).
+    Override :meth:`cli_params` to inject flags into existing commands.
+    """
+
     @staticmethod
     def cli() -> typer.Typer | None:
         """
         Return a Typer app for plugin subcommands.
 
         Override to add commands like ``pyne <plugin_name> <subcommand>``.
-        Return ``None`` (default) if the plugin has no CLI commands.
+
+        :return: A Typer app, or ``None`` if the plugin has no CLI commands.
         """
         return None
 
@@ -65,9 +85,9 @@ class Plugin:
         Return extra parameters for an existing command.
 
         Override to inject flags/options into commands like ``pyne run``.
-        Return ``[]`` (default) if the plugin has no parameter hooks.
 
         :param command_name: The command to extend (e.g. ``"run"``).
+        :return: List of Click parameters, or ``[]`` if no hooks for this command.
         """
         return []
 
@@ -147,3 +167,7 @@ def _parse_min_pynecore(ep: EntryPoint) -> str:
         if m:
             return m.group(1)
     return ''
+
+
+# Plugin type subclasses — import after Plugin is defined to avoid circular imports
+from .provider import ProviderPlugin

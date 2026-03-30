@@ -3,13 +3,14 @@ from abc import abstractmethod, ABCMeta
 from pathlib import Path
 from datetime import datetime
 
-from ..types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
-from pynecore.core.plugin import Plugin
+
+from . import Plugin
 
 
-class Provider(Plugin, metaclass=ABCMeta):
+class ProviderPlugin(Plugin, metaclass=ABCMeta):
     """
     Base class for all data providers.
 
