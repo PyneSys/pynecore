@@ -1,17 +1,15 @@
 from typing import Callable
+from dataclasses import dataclass
 import sys
 
-# Python 3.12+
 if sys.version_info >= (3, 12):
     from typing import override
 else:
-    # Python 3.11
     def override(func):
         return func
 import re
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
-from datetime import time
 import tomllib
 
 from .provider import Provider
@@ -23,11 +21,11 @@ __all__ = ['CCXTProvider']
 
 known_limits = {
     'binance': 1000,
-    'bitget': {  # Bitget has strict timeframe-dependent limits
-        '1w': 12,     # Weekly: max 12 bars (84 days)
-        '1d': 300,    # Daily: max 300 bars
-        '4h': 1000,   # 4-hour: max 1000 bars
-        'default': 200  # Safe default for other timeframes (1h, 1m, etc.)
+    'bitget': {
+        '1w': 12,
+        '1d': 300,
+        '4h': 1000,
+        'default': 200
     },
     'bitmex': 500,
     'bybit': 200,
@@ -40,8 +38,21 @@ known_limits = {
 
 
 def add_space_before_uppercase(s):
-    # Use regex to add a space before each uppercase letter
     return re.sub(r'(?<!^)([A-Z])', r' \1', s)
+
+
+@dataclass
+class CCXTConfig:
+    """CCXT provider configuration"""
+
+    apiKey: str = ""
+    """Default API key for all exchanges"""
+
+    secret: str = ""
+    """Default API secret for all exchanges"""
+
+    password: str = ""
+    """Default API password (required by some exchanges like KuCoin)"""
 
 
 class CCXTProvider(Provider):
@@ -49,29 +60,9 @@ class CCXTProvider(Provider):
     CCXT provider
     """
 
-    config_keys = {
-        '# Default settings for all exchanges if not specified': '',
-        'apiKey': '',
-        'secret': '',
-        'password': '',
-        '# ...anything else your exchange needs': '',
-        '# Exchange specific configuration examples:': '',
-        '# To set exchange specific configurations use sections like:': '',
-        '# [ccxt.binance]': '',
-        '# apiKey = "your_binance_api_key"': '',
-        '# secret = "your_binance_secret"': '',
-        '# ': '',  # noqa
-        '# [ccxt.kucoin]': '',
-        '# apiKey = "your_kucoin_api_key"': '',
-        '# secret = "your_kucoin_secret"': '',
-        '# password = "your_kucoin_password"': '',
-        '# ': '',  # noqa
-        '# [ccxt.okex]': '',
-        '# apiKey = "your_okex_api_key"': '',
-        '# secret = "your_okex_secret"': '',
-        '# password = "your_okex_password"': '',
-        '# isTestnet = true    # Add any custom parameter required by the exchange': ''
-    }
+    plugin_name = "CCXT"
+    plugin_version = "1.0.0"
+    Config = CCXTConfig
 
     @classmethod
     @override
@@ -80,17 +71,7 @@ class CCXTProvider(Provider):
         Convert CCXT timeframe fmt to TradingView fmt.
 
         :param timeframe: Timeframe in CCXT fmt (e.g. "1m", "5m", "1h", "1d", "1w", "1M")
-        :type timeframe: str
         :return: Timeframe in TradingView fmt (e.g. "1", "5", "60", "1D", "1W", "1M")
-        :rtype: str
-
-        :Examples:
-
-        >>> Provider.to_tradingview_timeframe("1m")  # "1"
-        >>> Provider.to_tradingview_timeframe("5m")  # "5"
-        >>> Provider.to_tradingview_timeframe("1h")  # "60"
-        >>> Provider.to_tradingview_timeframe("1d")  # "1D"
-
         :raises ValueError: If timeframe fmt is invalid
         """
         if len(timeframe) < 2:
@@ -99,7 +80,6 @@ class CCXTProvider(Provider):
         unit = timeframe[-1]
         value = timeframe[:-1]
 
-        # Verify that value is a valid number
         if not value.isdigit() or int(value) <= 0:
             raise ValueError(f"Invalid timeframe value: {value}")
 
@@ -123,17 +103,7 @@ class CCXTProvider(Provider):
         Convert TradingView timeframe fmt to CCXT fmt.
 
         :param timeframe: Timeframe in TradingView fmt (e.g. "1", "5", "60", "1D", "1W", "1M")
-        :type timeframe: str
         :return: Timeframe in CCXT fmt (e.g. "1m", "5m", "1h", "1d", "1w", "1M")
-        :rtype: str
-
-        :Examples:
-
-        >>> Provider.to_exchange_timeframe("1")   # "1m"
-        >>> Provider.to_exchange_timeframe("5")   # "5m"
-        >>> Provider.to_exchange_timeframe("60")  # "1h"
-        >>> Provider.to_exchange_timeframe("1D")  # "1d"
-
         :raises ValueError: If timeframe fmt is invalid
         """
         if timeframe.isdigit():
@@ -150,7 +120,6 @@ class CCXTProvider(Provider):
         unit = timeframe[-1].upper()
         value = timeframe[:-1]
 
-        # Verify that value is a valid number
         if not value.isdigit() or int(value) <= 0:
             raise ValueError(f"Invalid timeframe value: {value}")
 
@@ -165,19 +134,19 @@ class CCXTProvider(Provider):
 
     @override
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlv_dir: Path | None = None, config_dir: Path | None = None):
+                 ohlv_dir: Path | None = None, config: object | None = None):
         """
-        :param symbol: The symbol to get data for
+        :param symbol: The symbol to get data for (e.g. "binance:BTC/USDT")
         :param timeframe: The timeframe to get data for in TradingView fmt
-        :param ohlv_dir: The directory to save OHLV data
-        :param config_dir: The directory to read the config file from
+        :param ohlv_dir: The directory to save OHLCV data
+        :param config: Pre-loaded CCXTConfig instance
         """
         try:
             import ccxt
         except ImportError:
             raise ImportError("CCXT is not installed. Please install it using `pip install ccxt`.")
 
-        super().__init__(symbol=symbol, timeframe=timeframe, ohlv_dir=ohlv_dir, config_dir=config_dir)
+        super().__init__(symbol=symbol, timeframe=timeframe, ohlv_dir=ohlv_dir, config=config)
 
         # Check symbol fmt
         try:
@@ -190,25 +159,32 @@ class CCXTProvider(Provider):
 
         if not xchg:
             raise ValueError("Error: Exchange name not provided! Use 'exchange:symbol' fmt! "
-                             "(or symple exchange, if you want to list symbols)")
+                             "(or simple exchange, if you want to list symbols)")
 
         self.symbol = symbol
         exchange_name = xchg.lower()
 
-        # Check if there's an exchange-specific configuration
+        # Build exchange config from the Config dataclass + optional exchange-specific TOML sections
         exchange_config = {}
+        if self.config:
+            # Base config from dataclass fields
+            exchange_config = {
+                k: v for k, v in vars(self.config).items() if v
+            }
 
-        # Load configuration from providers.toml
-        with open(self.config_dir / 'providers.toml', 'rb') as f:
-            data = tomllib.load(f)
-
-            # Look for exchange-specific config
-            exchange_section = f'ccxt.{exchange_name}'
-            if exchange_section in data:
-                exchange_config = data[exchange_section]
+            # Check for exchange-specific override in the raw TOML
+            if self.ohlcv_path:
+                config_dir = self.ohlcv_path.parent.parent / 'config'
             else:
-                # Use the default ccxt config
-                exchange_config = self.config
+                config_dir = None
+
+            if config_dir:
+                toml_path = config_dir / 'ccxt.toml'
+                if toml_path.exists():
+                    with open(toml_path, 'rb') as f:
+                        raw_toml = tomllib.load(f)
+                    if exchange_name in raw_toml and isinstance(raw_toml[exchange_name], dict):
+                        exchange_config = raw_toml[exchange_name]
 
         # Create the CCXT client
         self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
@@ -220,41 +196,43 @@ class CCXTProvider(Provider):
     @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
         """
-        Get list of symbols
+        Get list of symbols.
         """
         self._client.load_markets()
         return self._client.symbols or []
 
-    @classmethod
-    def get_opening_hours_and_sessions(cls) \
-            -> tuple[list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]]:
+    @staticmethod
+    def _create_24_7_sessions() -> tuple[
+        list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]
+    ]:
         """
-        Process opening hours information
+        Create 24/7 opening hours and sessions for crypto markets.
+
+        :return: Tuple of (opening_hours, session_starts, session_ends).
         """
         opening_hours = []
         session_starts = []
         session_ends = []
         for i in range(7):
             opening_hours.append(
-                SymInfoInterval(day=i, start=time(hour=0, minute=0), end=time(hour=23, minute=59, second=59)))
+                SymInfoInterval(day=i, start=time(hour=0, minute=0),
+                                end=time(hour=23, minute=59, second=59)))
             session_starts.append(SymInfoSession(day=i, time=time(hour=0, minute=0)))
             session_ends.append(SymInfoSession(day=i, time=time(hour=23, minute=59, second=59)))
-
         return opening_hours, session_starts, session_ends
 
     @override
     def update_symbol_info(self) -> SymInfo:
         """
-        Update symbol info from the exchange
+        Update symbol info from the exchange.
         """
         self._client.load_markets()
         assert self._client.markets
         market_details = self._client.markets[self.symbol]
 
-        # Get opening hours and sessions
-        opening_hours, session_starts, session_ends = self.get_opening_hours_and_sessions()
+        opening_hours, session_starts, session_ends = self._create_24_7_sessions()
 
-        # Calculate minmove and pricescale from mintick  # syminfo.minmove / syminfo.pricescale = syminfo.mintick
+        # Calculate minmove and pricescale from mintick
         mintick = market_details['precision']['price']
         minmove = mintick
         pricescale = 1
@@ -279,7 +257,7 @@ class CCXTProvider(Provider):
             currency=market_details['quote'],
             basecurrency=market_details['base'],
             period=self.timeframe,
-            type="crypto",  # it could be better, but TV just call everything "crypto"
+            type="crypto",
             mintick=mintick,
             pricescale=pricescale,
             minmove=minmove,
@@ -288,7 +266,6 @@ class CCXTProvider(Provider):
             opening_hours=opening_hours,
             session_starts=session_starts,
             session_ends=session_ends,
-            # This is not found on TV, but it could be useful
             taker_fee=market_details.get('taker'),
             maker_fee=market_details.get('maker'),
         )
@@ -298,37 +275,30 @@ class CCXTProvider(Provider):
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
         """
-        Download OHLV data
+        Download OHLCV data.
 
-        :param time_from: The start time
-        :param time_to:  The end time
-        :param on_progress: Optional callback to call on progress
-        :param limit: Override the automatic chunk size (number of bars per API request)
+        :param time_from: The start time.
+        :param time_to: The end time.
+        :param on_progress: Optional callback to call on progress.
+        :param limit: Override the automatic chunk size.
         """
-        # Shortcuts for the time_from and time_to
         tf: datetime = time_from.replace(tzinfo=None)
         tt: datetime = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
 
-        # Get the limit by exchange or use safe default (unless overridden by user)
         if limit is None:
             assert self._client.id
             limit_config = known_limits.get(self._client.id, 100)
 
-            # Support both simple int limits and timeframe-specific dict limits
             if isinstance(limit_config, dict):
-                # Timeframe-specific limits (e.g., bitget)
                 limit = limit_config.get(self.xchg_timeframe, limit_config.get('default', 100))
             else:
-                # Simple int limit (backward compatible)
                 limit = limit_config
 
         try:
-            # Loop through the time range
             while tf < tt:
                 if on_progress:
                     on_progress(tf)
 
-                # Fetch a part of data
                 res: list = self._client.fetch_ohlcv(
                     symbol=self.symbol,
                     limit=limit,
@@ -336,11 +306,9 @@ class CCXTProvider(Provider):
                     since=self._client.parse8601(tf.isoformat())
                 )
 
-                # If no data, skip to the next day, maybe the symbol was not yet traded that day
                 if not res:
                     tf += timedelta(days=1)
 
-                # Process the data
                 for r in res:
                     t = int(r[0] / 1000)
                     dt = datetime.fromtimestamp(t, UTC).replace(tzinfo=None)
@@ -357,7 +325,7 @@ class CCXTProvider(Provider):
                     )
 
                     self.save_ohlcv_data(ohlcv)
-                    tf = dt + timedelta(minutes=1)  # Move to next time step + 1 minute
+                    tf = dt + timedelta(minutes=1)
 
         except StopIteration:
             pass

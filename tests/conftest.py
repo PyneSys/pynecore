@@ -245,9 +245,12 @@ def ast_transform(script_path, test_name, module_key, request) -> Callable[[], s
 
 @pytest.fixture(scope="function")
 def syminfo() -> SymInfo:
-    # Get 0-24/7 opening hours
-    from pynecore.providers.ccxt import CCXTProvider
-    opening_hours, session_starts, session_ends = CCXTProvider.get_opening_hours_and_sessions()
+    # 24/7 opening hours for crypto testing
+    from datetime import time
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+    opening_hours = [SymInfoInterval(day=i, start=time(0, 0), end=time(23, 59, 59)) for i in range(7)]
+    session_starts = [SymInfoSession(day=i, time=time(0, 0)) for i in range(7)]
+    session_ends = [SymInfoSession(day=i, time=time(23, 59, 59)) for i in range(7)]
 
     return SymInfo(
         prefix="PYTEST",

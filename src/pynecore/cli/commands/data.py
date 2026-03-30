@@ -11,7 +11,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
 from ..app import app, app_state
-from ...providers import available_providers
+from ...core.plugin import get_available_plugin_names, load_plugin
 from ...providers.provider import Provider
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
@@ -38,8 +38,10 @@ else:
     # DateOrDays is either a datetime or a number of days
     DateOrDays = str
 
-    # Create an enum from available providers
-    AvailableProvidersEnum = Enum('Provider', {name.upper(): name.lower() for name in available_providers})
+    # Create an enum from available providers (discovered via entry_points)
+    AvailableProvidersEnum = Enum('Provider', {
+        name.upper(): name.lower() for name in get_available_plugin_names('pyne.provider')
+    })
 
 
 # Available output formats
@@ -126,19 +128,20 @@ def download(
     """
     Download historical OHLCV data
     """
-    # Import provider module from
-    provider_module = __import__(f"pynecore.providers.{provider.value}", fromlist=[''])
-    # Find the provider class (exclude base Provider class)
-    provider_class = getattr(provider_module, [
-        p for p in dir(provider_module) if p.endswith('Provider') and p != 'Provider'
-    ][0])
+    # Load provider class via plugin system
+    provider_class = load_plugin('pyne.provider', provider.value)
 
     try:
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:
+            from ...core.config import ensure_config
+            config = None
+            if hasattr(provider_class, 'Config') and provider_class.Config is not None:
+                config = ensure_config(provider_class.Config,
+                                       app_state.config_dir / f'{provider.value}.toml')
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
                 progress.add_task(description="Fetching market data...", total=None)
-                provider_instance: Provider = provider_class(symbol=symbol, config_dir=app_state.config_dir)
+                provider_instance: Provider = provider_class(symbol=symbol, config=config)
                 symbols = provider_instance.get_list_of_symbols()
             with (console := Console()).pager():
                 for s in symbols:
@@ -149,9 +152,14 @@ def download(
             secho("Error: Symbol is required!", err=True, fg=colors.RED)
             raise Exit(1)
 
-        # Create provider instance
+        # Create provider instance with config
+        from ...core.config import ensure_config
+        config = None
+        if hasattr(provider_class, 'Config') and provider_class.Config is not None:
+            config = ensure_config(provider_class.Config,
+                                   app_state.config_dir / f'{provider.value}.toml')
         provider_instance: Provider = provider_class(symbol=symbol, timeframe=timeframe,
-                                                     ohlv_dir=app_state.data_dir)
+                                                     ohlv_dir=app_state.data_dir, config=config)
 
         # Download symbol info if not exists
         if force_save_info or not provider_instance.is_symbol_info_exists():

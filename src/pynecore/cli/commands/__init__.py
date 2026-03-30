@@ -6,8 +6,6 @@ import typer
 from ..app import app, app_state
 from ..utils.error_hook import setup_global_error_logging
 
-from ...providers import available_providers
-
 # Import commands
 from . import run, data, compile, benchmark, debug
 
@@ -229,30 +227,19 @@ def main(
     config_dir = Path(workdir) / 'config'
     config_dir.mkdir(exist_ok=True)
 
-    # Create providers.toml file for all supported providers (if not exists)
-    providers_file = config_dir / 'providers.toml'
-    if not providers_file.exists() or recreate_provider_config:
-        with providers_file.open('w') as f:
-            for provider in available_providers:
-                f.write(f"[{provider}]\n")
-                provider_module = __import__(f"pynecore.providers.{provider}", fromlist=[''])
-                provider_class = getattr(
-                    provider_module,
-                    [p for p in dir(provider_module) if p.endswith('Provider')][0]
-                )
-                for key, value in provider_class.config_keys.items():
-                    if key.startswith('#'):  # Comments
-                        f.write(f'{key}\n')
-                    else:
-                        if isinstance(value, str):
-                            f.write(f'{key} = "{value}"\n')
-                        elif isinstance(value, bool):
-                            f.write(f'{key} = {str(value).lower()}\n')
-                        elif isinstance(value, int) or isinstance(value, float):
-                            f.write(f'{key} = {value}\n')
-                        else:
-                            raise ValueError(f"Unsupported type for {key}: {type(value)}")
-                f.write("\n")
+    # Generate per-plugin config files for all installed providers
+    from ...core.plugin import discover_plugins
+    from ...core.config import ensure_config
+
+    for name, ep in discover_plugins('pyne.provider').items():
+        config_path = config_dir / f'{name}.toml'
+        if not config_path.exists() or recreate_provider_config:
+            try:
+                provider_cls = ep.load()
+                if hasattr(provider_cls, 'Config') and provider_cls.Config is not None:
+                    ensure_config(provider_cls.Config, config_path)
+            except Exception:
+                pass  # Don't crash CLI if a plugin is broken
 
     # Create api.toml file for PyneSys API (if not exists)
     api_file = config_dir / 'api.toml'

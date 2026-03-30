@@ -54,7 +54,7 @@ def __test_ccxt_provider_path_handling__(tmp_path):
 
 def __test_ccxt_session_hours__():
     """Test session hours creation for CCXT provider"""
-    opening_hours, session_starts, session_ends = CCXTProvider.get_opening_hours_and_sessions()
+    opening_hours, session_starts, session_ends = CCXTProvider._create_24_7_sessions()
 
     # Check that we have entries for all days
     assert len(opening_hours) == 7
@@ -108,19 +108,11 @@ def __test_ccxt_real_data_download__(tmp_path):
     if not config_dir.exists() or not config_dir.is_dir():
         pytest.skip("No config directory found in workdir")
 
-    # Check if providers.toml exists
+    # Check if ccxt config exists (new per-plugin config or legacy providers.toml)
+    ccxt_toml = config_dir / "ccxt.toml"
     providers_toml = config_dir / "providers.toml"
-    if not providers_toml.exists() or not providers_toml.is_file():
-        pytest.skip("No providers.toml found in config directory")
-
-    # Check if ccxt section exists in providers.toml
-    try:
-        with open(providers_toml, 'rb') as f:
-            config = tomllib.load(f)
-            if 'ccxt' not in config:
-                pytest.skip("No ccxt section found in providers.toml")
-    except Exception as e:
-        pytest.skip(f"Error reading providers.toml: {str(e)}")
+    if not ccxt_toml.exists() and not providers_toml.exists():
+        pytest.skip("No ccxt.toml or providers.toml found in config directory")
 
     # Create temporary data directory for the test
     data_dir = tmp_path / "data"
@@ -154,12 +146,17 @@ def __test_ccxt_real_data_download__(tmp_path):
             print(f"Could not load reference data: {e}")
             expected_data = None
 
+    # Load config via plugin config system
+    from pynecore.core.config import ensure_config
+    from pynecore.providers.ccxt import CCXTConfig
+    config = ensure_config(CCXTConfig, config_dir / 'ccxt.toml')
+
     # Create provider instance
     provider = CCXTProvider(
         symbol=symbol,
         timeframe=timeframe,
         ohlv_dir=data_dir,
-        config_dir=config_dir
+        config=config
     )
 
     # Define a function to download data
