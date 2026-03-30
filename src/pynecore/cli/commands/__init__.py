@@ -227,20 +227,20 @@ def main(
     config_dir = Path(workdir) / 'config'
     config_dir.mkdir(exist_ok=True)
 
-    # Generate per-plugin config files for all installed providers
+    # Generate per-plugin config files for all installed plugins
     from ...core.plugin import discover_plugins
     from ...core.config import ensure_config
 
     plugins_dir = config_dir / 'plugins'
     plugins_dir.mkdir(exist_ok=True)
 
-    for name, ep in discover_plugins('pyne.provider').items():
+    for name, ep in discover_plugins().items():
         config_path = plugins_dir / f'{name}.toml'
         if not config_path.exists() or recreate_provider_config:
             try:
-                provider_cls = ep.load()
-                if hasattr(provider_cls, 'Config') and provider_cls.Config is not None:
-                    ensure_config(provider_cls.Config, config_path)
+                plugin_cls = ep.load()
+                if hasattr(plugin_cls, 'Config') and plugin_cls.Config is not None:
+                    ensure_config(plugin_cls.Config, config_path)
             except Exception:
                 pass  # Don't crash CLI if a plugin is broken
 

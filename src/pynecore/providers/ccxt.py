@@ -61,8 +61,6 @@ class CCXTProvider(Provider):
     """
 
     plugin_name = "CCXT"
-    plugin_version = "1.0.0"
-    min_pynecore_version = "6.5"
     Config = CCXTConfig
 
     @classmethod

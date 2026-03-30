@@ -62,7 +62,7 @@ optional-dependencies.capitalcom = ["httpx", "pycryptodome"]
 
 scripts.pyne = "pynecore.cli:app"
 
-[project.entry-points."pyne.provider"]
+[project.entry-points."pyne.plugin"]
 ccxt = "pynecore.providers.ccxt:CCXTProvider"
 
 

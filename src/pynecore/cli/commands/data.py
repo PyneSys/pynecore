@@ -11,7 +11,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
 from ..app import app, app_state
-from ...core.plugin import get_available_plugin_names, load_plugin
+from ...core.plugin import discover_plugins, load_plugin
 from ...providers.provider import Provider
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
@@ -38,9 +38,17 @@ else:
     # DateOrDays is either a datetime or a number of days
     DateOrDays = str
 
-    # Create an enum from available providers (discovered via entry_points)
+    # Create an enum from plugins that are Provider subclasses
+    _provider_names = []
+    for _name, _ep in discover_plugins().items():
+        try:
+            _cls = _ep.load()
+            if isinstance(_cls, type) and issubclass(_cls, Provider):
+                _provider_names.append(_name)
+        except Exception:
+            pass
     AvailableProvidersEnum = Enum('Provider', {
-        name.upper(): name.lower() for name in get_available_plugin_names('pyne.provider')
+        name.upper(): name.lower() for name in sorted(_provider_names)
     })
 
 
@@ -129,7 +137,7 @@ def download(
     Download historical OHLCV data
     """
     # Load provider class via plugin system
-    provider_class = load_plugin('pyne.provider', provider.value)
+    provider_class = load_plugin(provider.value)
 
     try:
         # If list_symbols is True, we show the available symbols then exit

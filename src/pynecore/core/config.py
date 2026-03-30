@@ -18,6 +18,7 @@ import inspect
 import textwrap
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
 
 def format_value(value: str | int | float | bool) -> str:
@@ -115,7 +116,7 @@ def generate_toml(
             stripped = doc_line.strip()
             lines.append(f"# {stripped}" if stripped else "#")
 
-    for f in dataclasses.fields(config_cls):
+    for f in dataclasses.fields(cast(Any, config_cls)):
         name = f.name
         default = f.default
 
@@ -194,7 +195,7 @@ def _parse_existing(config_path: Path, config_cls: type) -> tuple[dict, str]:
 
     parsed = tomllib.loads(content)
 
-    field_names = {f.name for f in dataclasses.fields(config_cls)}
+    field_names = {f.name for f in dataclasses.fields(cast(Any, config_cls))}
 
     user_values: dict = {}
     for key, value in parsed.items():
@@ -237,7 +238,7 @@ def _create_instance(config_cls: type, user_values: dict | None):
         return config_cls()
 
     kwargs: dict = {}
-    for f in dataclasses.fields(config_cls):
+    for f in dataclasses.fields(cast(Any, config_cls)):
         if f.name not in user_values:
             continue
         value = user_values[f.name]

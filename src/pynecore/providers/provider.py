@@ -6,27 +6,16 @@ from datetime import datetime
 from ..types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
+from pynecore.core.plugin_base import Plugin
 
 
-class Provider(metaclass=ABCMeta):
+class Provider(Plugin, metaclass=ABCMeta):
     """
     Base class for all data providers.
 
     Subclasses must implement the abstract methods and define a ``Config``
     dataclass for configuration (used by :func:`pynecore.core.config.ensure_config`).
     """
-
-    plugin_name: str = ""
-    """Display name of the provider (e.g. "Capital.com", "Binance")."""
-
-    plugin_version: str = "0.0.0"
-    """Provider plugin version."""
-
-    min_pynecore_version: str = ""
-    """Minimum compatible PyneCore version."""
-
-    Config: type | None = None
-    """Override in subclass with a ``@dataclass`` for provider configuration."""
 
     timezone: str = 'UTC'
     """Default timezone of the provider."""

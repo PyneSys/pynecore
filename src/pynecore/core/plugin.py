@@ -1,70 +1,104 @@
 """
 Plugin discovery and loading via Python entry points.
 
-All PyneCore plugins (providers, extensions, CLI commands) are discovered
-through :pep:`631` entry points declared in ``pyproject.toml``.  This module
-provides a thin, general-purpose API over :mod:`importlib.metadata`.
+All PyneCore plugins register under a single entry point group
+(``pyne.plugin``) in their ``pyproject.toml``.  The plugin class hierarchy
+determines capabilities (Provider, Extension, etc.).
 
 Example ``pyproject.toml`` for a provider plugin::
 
-    [project.entry-points."pyne.provider"]
+    [project.entry-points."pyne.plugin"]
     myexchange = "mypackage:MyExchangeProvider"
 
-Discovery example::
+Discovery::
 
-    plugins = discover_plugins("pyne.provider")
-    # {"ccxt": <EntryPoint ...>, "myexchange": <EntryPoint ...>}
+    plugins = discover_plugins()
+    cls = load_plugin("capitalcom")
 
-    cls = load_plugin("pyne.provider", "ccxt")
-    # <class 'pynecore.providers.ccxt.CCXTProvider'>
+Metadata (name, version, description) is read from the package's
+``pyproject.toml`` via :mod:`importlib.metadata`, not from class attributes.
 """
+
+import re
 
 # noinspection PyProtectedMember
 from importlib.metadata import entry_points, EntryPoint
+
+PLUGIN_GROUP = 'pyne.plugin'
 
 
 class PluginNotFoundError(ImportError):
     """Raised when a requested plugin is not installed."""
 
 
-def discover_plugins(group: str) -> dict[str, EntryPoint]:
+def discover_plugins() -> dict[str, EntryPoint]:
     """
-    Return all installed entry points for a plugin group.
+    Return all installed plugins.
 
-    :param group: Entry point group name (e.g. ``"pyne.provider"``).
     :return: Mapping of plugin name to its :class:`EntryPoint`.
     """
-    return {ep.name: ep for ep in entry_points(group=group)}
+    return {ep.name: ep for ep in entry_points(group=PLUGIN_GROUP)}
 
 
-def load_plugin(group: str, name: str) -> type:
+def load_plugin(name: str) -> type:
     """
     Load and return a plugin class by name.
 
-    The actual import happens lazily — only when this function is called.
-
-    :param group: Entry point group name (e.g. ``"pyne.provider"``).
     :param name: Plugin name as declared in the entry point.
     :return: The plugin class.
     :raises PluginNotFoundError: If no plugin with the given name is installed.
     """
-    eps = discover_plugins(group)
+    eps = discover_plugins()
     if name not in eps:
-        short_group = group.replace("pyne.", "")
         raise PluginNotFoundError(
-            f"Plugin '{name}' not found for group '{group}'. "
+            f"Plugin '{name}' not found. "
             f"Install it with: pip install pynesys-pynecore-{name}  (official) "
             f"or: pip install pynecore-{name}  (3rd party)\n"
-            f"Available {short_group} plugins: {', '.join(sorted(eps)) or '(none)'}"
+            f"Available plugins: {', '.join(sorted(eps)) or '(none)'}"
         )
     return eps[name].load()
 
 
-def get_available_plugin_names(group: str) -> list[str]:
+def get_available_plugin_names() -> list[str]:
     """
-    Return a sorted list of all available plugin names for a group.
+    Return a sorted list of all available plugin names.
 
-    :param group: Entry point group name (e.g. ``"pyne.provider"``).
     :return: Sorted list of plugin names.
     """
-    return sorted(discover_plugins(group))
+    return sorted(discover_plugins())
+
+
+def get_plugin_metadata(ep: EntryPoint) -> dict[str, str]:
+    """
+    Extract plugin metadata from its package distribution.
+
+    :param ep: The entry point of the plugin.
+    :return: Dict with ``name``, ``version``, ``description``, ``min_pynecore``.
+    """
+    meta = ep.dist.metadata
+    return {
+        'name': ep.name,
+        'package': meta['Name'] or '',
+        'version': meta['Version'] or '',
+        'description': meta['Summary'] or '',
+        'min_pynecore': _parse_min_pynecore(ep),
+    }
+
+
+def _parse_min_pynecore(ep: EntryPoint) -> str:
+    """
+    Extract the minimum PyneCore version from the package dependencies.
+
+    Parses ``pynesys-pynecore>=X.Y`` from the ``Requires-Dist`` list.
+
+    :param ep: The entry point of the plugin.
+    :return: Version string (e.g. ``"6.5"``) or ``""`` if not found.
+    """
+    requires = ep.dist.requires
+    if not requires:
+        return ''
+    for req in requires:
+        m = re.match(r'pynesys-pynecore(?:\[.*?])?>=([.\d]+)', req)
+        if m:
+            return m.group(1)
+    return ''
