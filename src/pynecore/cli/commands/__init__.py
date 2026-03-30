@@ -231,8 +231,11 @@ def main(
     from ...core.plugin import discover_plugins
     from ...core.config import ensure_config
 
+    plugins_dir = config_dir / 'plugins'
+    plugins_dir.mkdir(exist_ok=True)
+
     for name, ep in discover_plugins('pyne.provider').items():
-        config_path = config_dir / f'{name}.toml'
+        config_path = plugins_dir / f'{name}.toml'
         if not config_path.exists() or recreate_provider_config:
             try:
                 provider_cls = ep.load()

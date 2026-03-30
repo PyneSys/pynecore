@@ -179,7 +179,7 @@ class CCXTProvider(Provider):
                 config_dir = None
 
             if config_dir:
-                toml_path = config_dir / 'ccxt.toml'
+                toml_path = config_dir / 'plugins' / 'ccxt.toml'
                 if toml_path.exists():
                     with open(toml_path, 'rb') as f:
                         raw_toml = tomllib.load(f)

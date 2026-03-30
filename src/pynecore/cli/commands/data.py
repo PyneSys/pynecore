@@ -138,7 +138,7 @@ def download(
             config = None
             if hasattr(provider_class, 'Config') and provider_class.Config is not None:
                 config = ensure_config(provider_class.Config,
-                                       app_state.config_dir / f'{provider.value}.toml')
+                                       app_state.config_dir / 'plugins' / f'{provider.value}.toml')
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
                 progress.add_task(description="Fetching market data...", total=None)
                 provider_instance: Provider = provider_class(symbol=symbol, config=config)
@@ -157,7 +157,7 @@ def download(
         config = None
         if hasattr(provider_class, 'Config') and provider_class.Config is not None:
             config = ensure_config(provider_class.Config,
-                                   app_state.config_dir / f'{provider.value}.toml')
+                                   app_state.config_dir / 'plugins' / f'{provider.value}.toml')
         provider_instance: Provider = provider_class(symbol=symbol, timeframe=timeframe,
                                                      ohlv_dir=app_state.data_dir, config=config)
 
