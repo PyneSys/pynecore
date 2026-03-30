@@ -19,5 +19,6 @@ Documentation for PyneCore developers
 
 ## In this section
 
+- [Plugin System](./plugin-system.md) - How to create plugins for PyneCore
 - [Testing System](./testing-system.md) - Overview of the comprehensive testing system
 - [Contributing](./contributing.md) - Guide for contributing to PyneCore

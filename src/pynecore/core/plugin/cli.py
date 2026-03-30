@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from . import Plugin
+from . import Plugin, ConfigT
 
 if TYPE_CHECKING:
     import click
     import typer
 
 
-class CLIPlugin(Plugin):
+class CLIPlugin(Plugin[ConfigT]):
     """
     Plugin that provides CLI commands and/or parameter hooks.
 
