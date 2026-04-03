@@ -20,7 +20,10 @@ __all__ = ['live_ohlcv_generator']
 
 logger = logging.getLogger(__name__)
 
-_SENTINEL = object()
+class _Sentinel(BaseException):
+    """Marker signaling end of the live stream."""
+
+_SENTINEL = _Sentinel()
 
 
 def live_ohlcv_generator(
@@ -74,7 +77,7 @@ def live_ohlcv_generator(
 
         try:
             await provider.disconnect()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
 
     async def _async_loop():
