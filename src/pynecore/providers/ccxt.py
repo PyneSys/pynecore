@@ -5,7 +5,8 @@ from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from pynecore.core.plugin import ProviderPlugin, override
+from pynecore.core.plugin import LiveProviderPlugin, override
+from pynecore.core.plugin.live_provider import BarUpdate
 
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
@@ -48,7 +49,7 @@ class CCXTConfig:
     """Default API password (required by some exchanges like KuCoin)"""
 
 
-class CCXTProvider(ProviderPlugin[CCXTConfig]):
+class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     """
     CCXT provider
     """
@@ -178,6 +179,10 @@ class CCXTProvider(ProviderPlugin[CCXTConfig]):
                     if exchange_name in raw_toml and isinstance(raw_toml[exchange_name], dict):
                         exchange_config = raw_toml[exchange_name]
 
+        self._async_client = None
+        self._last_bar_timestamp: int | None = None
+        self._last_bar_ohlcv: OHLCV | None = None
+
         # Create the CCXT client
         self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
             'enableRateLimit': True,
@@ -222,6 +227,7 @@ class CCXTProvider(ProviderPlugin[CCXTConfig]):
         assert self._client.markets
         market_details = self._client.markets[self.symbol]
 
+        assert self.timeframe is not None
         opening_hours, session_starts, session_ends = self._create_24_7_sessions()
 
         # Calculate minmove and pricescale from mintick
@@ -274,6 +280,9 @@ class CCXTProvider(ProviderPlugin[CCXTConfig]):
         :param on_progress: Optional callback to call on progress.
         :param limit: Override the automatic chunk size.
         """
+        assert self.symbol is not None
+        assert self.xchg_timeframe is not None
+
         tf: datetime = time_from.replace(tzinfo=None)
         tt: datetime = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
 
@@ -324,3 +333,78 @@ class CCXTProvider(ProviderPlugin[CCXTConfig]):
 
         if on_progress:
             on_progress(tt)
+
+    # --- LiveProviderPlugin methods ---
+
+    @override
+    async def connect(self) -> None:
+        """Establish async CCXT connection for live data streaming."""
+        try:
+            import ccxt.pro as ccxtpro
+        except ImportError:
+            raise ImportError(
+                "CCXT Pro is required for live data. Install it with: pip install ccxt"
+            )
+
+        exchange_name = self._client.id
+
+        exchange_config = {
+            'enableRateLimit': True,
+        }
+        if self.config:
+            exchange_config.update({k: v for k, v in vars(self.config).items() if v})
+
+        self._async_client = getattr(ccxtpro, exchange_name)(exchange_config)
+
+    @override
+    async def disconnect(self) -> None:
+        """Close the async CCXT connection."""
+        if hasattr(self, '_async_client') and self._async_client:
+            await self._async_client.close()
+            self._async_client = None
+
+    @property
+    @override
+    def is_connected(self) -> bool:
+        """Whether the async CCXT connection is active."""
+        return hasattr(self, '_async_client') and self._async_client is not None
+
+    @override
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+        """
+        Wait for the next OHLCV update from the exchange websocket.
+
+        Detects bar closure by tracking timestamp changes: when a new bar
+        timestamp appears, the previous bar is returned as closed. Intra-bar
+        updates (same timestamp) are returned with ``is_closed=False``.
+
+        :param symbol: Symbol in CCXT format (e.g. "BTC/USDT:USDT").
+        :param timeframe: Timeframe in TradingView format (e.g. "1D", "1", "4H").
+        :return: BarUpdate with OHLCV data and closed/open status.
+        """
+        xchg_tf = self.to_exchange_timeframe(timeframe)
+
+        while True:
+            candles = await self._async_client.watch_ohlcv(symbol, xchg_tf)
+            last = candles[-1]
+            timestamp = int(last[0] / 1000)
+
+            current_ohlcv = OHLCV(
+                timestamp=timestamp,
+                open=float(last[1]),
+                high=float(last[2]),
+                low=float(last[3]),
+                close=float(last[4]),
+                volume=float(last[5]),
+            )
+
+            if (self._last_bar_timestamp is not None
+                    and timestamp != self._last_bar_timestamp):
+                closed_bar = self._last_bar_ohlcv
+                self._last_bar_timestamp = timestamp
+                self._last_bar_ohlcv = current_ohlcv
+                return BarUpdate(ohlcv=closed_bar, is_closed=True)
+
+            self._last_bar_timestamp = timestamp
+            self._last_bar_ohlcv = current_ohlcv
+            return BarUpdate(ohlcv=current_ohlcv, is_closed=False)

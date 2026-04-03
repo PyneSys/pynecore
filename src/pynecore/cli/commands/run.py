@@ -25,6 +25,7 @@ from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import is_provider_string, parse_provider_string
+from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
@@ -101,13 +102,24 @@ def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetim
         raise Exit(1)
 
 
-def _download_provider_data(provider_str: str, time_from_str: str | None) -> tuple[Path, SymInfo]:
+class _ProviderData:
+    """Result of provider data download, including the provider instance for live mode."""
+
+    def __init__(self, ohlcv_path: Path, syminfo: 'SymInfo', provider_instance=None,
+                 parsed_string=None):
+        self.ohlcv_path = ohlcv_path
+        self.syminfo = syminfo
+        self.provider_instance = provider_instance
+        self.parsed_string = parsed_string
+
+
+def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
     """
-    Download historical data from a provider and return the OHLCV path and SymInfo.
+    Download historical data from a provider and return the result.
 
     :param provider_str: Provider string (e.g. "ccxt:BYBIT:BTC/USDT:USDT@1D").
     :param time_from_str: The --from parameter value (date, days, or -bars).
-    :return: Tuple of (ohlcv_path, syminfo).
+    :return: _ProviderData with ohlcv_path, syminfo, and provider instance.
     """
     from pynecore.core.plugin import load_plugin, ProviderPlugin
     from pynecore.core.config import ensure_config
@@ -184,7 +196,12 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> tup
 
             provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
 
-    return provider_instance.ohlcv_path, syminfo
+    return _ProviderData(
+        ohlcv_path=provider_instance.ohlcv_path,
+        syminfo=syminfo,
+        provider_instance=provider_instance,
+        parsed_string=ps,
+    )
 
 
 @app.command(cls=PluggableCommand)
@@ -214,6 +231,13 @@ def run(
                                      help="PyneSys API key for compilation (overrides configuration file)",
                                      envvar="PYNESYS_API_KEY",
                                      rich_help_panel="Compilation Options"),
+        live: bool = Option(False, "--live", "-l",
+                            help="Continue with live data after historical phase "
+                                 "(provider mode only)"),
+        shutdown_timeout: float = Option(120.0, "--shutdown-timeout",
+                                         help="Max seconds to wait for graceful shutdown "
+                                              "(0 = wait forever)",
+                                         rich_help_panel="Live Options"),
         security: list[str] | None = Option(None, "--security", "-sec",
                                             help='Security data: "TIMEFRAME=data_name" or '
                                                  '"SYMBOL:TIMEFRAME=data_name"',
@@ -321,10 +345,16 @@ def run(
 
     # --- Data resolution: provider string or file path ---
     provider_mode = is_provider_string(data)
+    provider_data = None
+
+    if live and not provider_mode:
+        secho("Error: --live is only available in provider mode.", err=True, fg=colors.RED)
+        raise Exit(1)
 
     if provider_mode:
         # Provider mode: download historical data, get syminfo
-        data_path, syminfo = _download_provider_data(data, time_from)
+        provider_data = _download_provider_data(data, time_from)
+        data_path, syminfo = provider_data.ohlcv_path, provider_data.syminfo
     else:
         # File mode: resolve path, convert if needed
         data_path = Path(data)
@@ -419,6 +449,26 @@ def run(
         size = reader.get_size(time_from_ts, time_to_ts)
         ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
+        # Chain live iterator after historical if --live
+        if live and provider_data:
+            import itertools
+            from pynecore.core.plugin.live_provider import LiveProviderPlugin
+
+            if not isinstance(provider_data.provider_instance, LiveProviderPlugin):
+                secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
+                      err=True, fg=colors.RED)
+                raise Exit(1)
+
+            live_iter = live_ohlcv_generator(
+                provider=provider_data.provider_instance,
+                symbol=provider_data.parsed_string.symbol,
+                timeframe=provider_data.parsed_string.timeframe,
+                last_historical_timestamp=time_to_ts,
+                shutdown_timeout=shutdown_timeout,
+            )
+            ohlcv_iter = itertools.chain(ohlcv_iter, live_iter)
+            size = 0
+
         # Parse security data mappings
         security_data: dict[str, str | Path] | None = None
         if security:
@@ -473,77 +523,90 @@ def run(
             # Mark as completed
             loading_progress.update(loading_task, completed=1)
 
-        # Now run with the main progress bar
-        with Progress(
-                SpinnerColumn(finished_text="[green]✓"),
-                TextColumn("{task.description}"),
-                DateColumn(time_from_display),
-                BarColumn(),
-                CustomTimeElapsedColumn(),
-                "/",
-                CustomTimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(
-                description="Running script...",
-                total=total_seconds,
-            )
+        if live:
+            # Live mode: spinner instead of progress bar (no known end time)
+            with Progress(
+                    SpinnerColumn(),
+                    TextColumn("{task.description}"),
+                    CustomTimeElapsedColumn(),
+            ) as progress:
+                task = progress.add_task(description="Live streaming...", total=None)
 
-            # Create queue for progress updates
-            progress_queue = queue.Queue()
-            stop_event = threading.Event()
+                def cb_progress_live(current_time: datetime | None):
+                    if current_time:
+                        progress.update(task, description=f"Live — {current_time:%Y-%m-%d %H:%M}")
 
-            def progress_worker():
-                """Worker thread that updates progress bar at 60Hz"""
-                last_update = 0
-                while not stop_event.is_set():
-                    try:
-                        # Drain all pending updates
-                        current_time = None
-                        while True:
-                            try:
-                                current_time = progress_queue.get_nowait()
-                            except queue.Empty:
-                                break
-
-                        # Update progress if we have new data
-                        if current_time is not None:
-                            if current_time == datetime.max:
-                                current_time = time_to_display
-                            elapsed_seconds = int((current_time - time_from_display).total_seconds())
-                            # Only update if time changed (to avoid redundant updates)
-                            if elapsed_seconds != last_update:
-                                progress.update(task, completed=elapsed_seconds)
-                                last_update = elapsed_seconds
-                    except Exception:  # noqa
-                        pass  # Ignore any errors in worker thread
-
-                    # Wait ~33.33ms (30Hz refresh rate)
-                    time.sleep(1 / 30)
-
-            # Start worker thread
-            worker = threading.Thread(target=progress_worker, daemon=True)
-            worker.start()
-
-            def cb_progress(current_time: datetime | None):
-                """Callback that just puts timestamp in queue - near zero overhead"""
                 try:
-                    progress_queue.put_nowait(current_time)
-                except queue.Full:
-                    pass  # If queue is full, skip this update
+                    runner.run(on_progress=cb_progress_live)
+                except KeyboardInterrupt:
+                    secho("\nLive streaming stopped.", fg=colors.YELLOW)
 
-            try:
-                # Run the script
-                runner.run(on_progress=cb_progress)
+        else:
+            # Batch mode: progress bar with time range
+            with Progress(
+                    SpinnerColumn(finished_text="[green]✓"),
+                    TextColumn("{task.description}"),
+                    DateColumn(time_from_display),
+                    BarColumn(),
+                    CustomTimeElapsedColumn(),
+                    "/",
+                    CustomTimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(
+                    description="Running script...",
+                    total=total_seconds,
+                )
 
-                # Ensure final progress update
-                progress_queue.put(time_to_display)
-                time.sleep(0.05)  # Give worker thread time to process final update
+                # Create queue for progress updates
+                progress_queue = queue.Queue()
+                stop_event = threading.Event()
 
-                progress.update(task, completed=total_seconds)
-            finally:
-                # Stop worker thread
-                stop_event.set()
-                worker.join(timeout=0.1)  # Wait max 100ms for thread to finish
+                def progress_worker():
+                    """Worker thread that updates progress bar at 30Hz"""
+                    last_update = 0
+                    while not stop_event.is_set():
+                        try:
+                            # Drain all pending updates
+                            current_time = None
+                            while True:
+                                try:
+                                    current_time = progress_queue.get_nowait()
+                                except queue.Empty:
+                                    break
 
-                # Final update to ensure completion
-                progress.refresh()
+                            # Update progress if we have new data
+                            if current_time is not None:
+                                if current_time == datetime.max:
+                                    current_time = time_to_display
+                                elapsed_seconds = int(
+                                    (current_time - time_from_display).total_seconds())
+                                if elapsed_seconds != last_update:
+                                    progress.update(task, completed=elapsed_seconds)
+                                    last_update = elapsed_seconds
+                        except Exception:  # noqa
+                            pass
+
+                        time.sleep(1 / 30)
+
+                # Start worker thread
+                worker = threading.Thread(target=progress_worker, daemon=True)
+                worker.start()
+
+                def cb_progress(current_time: datetime | None):
+                    """Callback that just puts timestamp in queue"""
+                    try:
+                        progress_queue.put_nowait(current_time)
+                    except queue.Full:
+                        pass
+
+                try:
+                    runner.run(on_progress=cb_progress)
+
+                    progress_queue.put(time_to_display)
+                    time.sleep(0.05)
+
+                    progress.update(task, completed=total_seconds)
+                finally:
+                    stop_event.set()
+                    worker.join(timeout=0.1)
+                    progress.refresh()

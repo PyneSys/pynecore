@@ -75,3 +75,17 @@ class LiveProviderPlugin(ProviderPlugin[ConfigT], metaclass=ABCMeta):
 
     async def on_reconnect(self) -> None:
         """Called after a successful reconnection."""
+
+    # --- Shutdown hooks ---
+
+    async def can_shutdown(self) -> bool:
+        """
+        Whether the provider is ready to shut down.
+
+        Override to delay shutdown while cleanup is in progress
+        (e.g. waiting for open orders to fill or positions to close).
+        Called every second during the graceful shutdown phase.
+
+        :return: True if ready to shut down, False to keep waiting.
+        """
+        return True
