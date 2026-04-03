@@ -6,11 +6,11 @@ import sys
 import tomllib
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, UTC
 
-from typer import Option, Argument, secho, Exit
+from typer import Option, Argument, secho, Exit, colors
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
-                           ProgressColumn, Task)
+                           ProgressColumn, Task, TimeElapsedColumn, TimeRemainingColumn)
 from rich.text import Text
 from rich.console import Console
 
@@ -24,6 +24,7 @@ from pynecore.core.data_converter import DataConverter, DataFormatError, Convers
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
+from pynecore.core.provider_string import is_provider_string, parse_provider_string
 from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
@@ -61,19 +62,144 @@ class CustomTimeRemainingColumn(ProgressColumn):
         return Text(f"{minutes:02d}:{seconds:06.3f}", style="cyan")
 
 
+def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime | int | None:
+    """
+    Parse a --from or --to parameter value.
+
+    :param value: The raw string value.
+    :param allow_bars: If True, allow negative numbers as bar counts.
+    :return: A datetime, a negative int (bar count), or None.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+
+    # Negative number = bar count (only for --from in provider mode)
+    if allow_bars and value.startswith('-'):
+        try:
+            bars = int(value)
+            return bars
+        except ValueError:
+            pass
+
+    # Positive number = days back
+    try:
+        days = int(value)
+        if days < 0:
+            secho("Error: Days cannot be negative (use negative numbers only with provider mode for bar count)",
+                  err=True, fg=colors.RED)
+            raise Exit(1)
+        return (datetime.now(UTC) - timedelta(days=days)).replace(second=0, microsecond=0)
+    except ValueError:
+        pass
+
+    # Date string
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        secho(f"Error: Invalid date or number: '{value}'", err=True, fg=colors.RED)
+        raise Exit(1)
+
+
+def _download_provider_data(provider_str: str, time_from_str: str | None) -> tuple[Path, SymInfo]:
+    """
+    Download historical data from a provider and return the OHLCV path and SymInfo.
+
+    :param provider_str: Provider string (e.g. "ccxt:BYBIT:BTC/USDT:USDT@1D").
+    :param time_from_str: The --from parameter value (date, days, or -bars).
+    :return: Tuple of (ohlcv_path, syminfo).
+    """
+    from pynecore.core.plugin import load_plugin, ProviderPlugin
+    from pynecore.core.config import ensure_config
+    from pynecore.lib.timeframe import in_seconds
+
+    ps = parse_provider_string(provider_str, require_timeframe=True)
+
+    # Load provider plugin
+    provider_class = load_plugin(ps.provider)
+    if not issubclass(provider_class, ProviderPlugin):
+        secho(f"Plugin '{ps.provider}' is not a data provider.", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    # Parse --from (required in provider mode)
+    if not time_from_str:
+        secho("Error: --from / -f is required in provider mode.\n"
+              "  Examples: -f 30 (30 days back), -f -500 (500 bars back), -f 2025-01-01",
+              err=True, fg=colors.RED)
+        raise Exit(1)
+
+    time_from_value = _parse_time_value(time_from_str, allow_bars=True)
+    time_to_dt = datetime.now(UTC).replace(second=0, microsecond=0)
+
+    # Convert bar count to time range
+    if isinstance(time_from_value, int) and time_from_value < 0:
+        bar_count = abs(time_from_value)
+        tf_seconds = in_seconds(ps.timeframe)
+        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * bar_count)
+    else:
+        time_from_dt = time_from_value
+
+    # Load config
+    config = None
+    if hasattr(provider_class, 'Config') and provider_class.Config is not None:
+        config = ensure_config(provider_class.Config,
+                               app_state.config_dir / 'plugins' / f'{ps.provider}.toml')
+
+    # Create provider instance
+    provider_instance: ProviderPlugin = provider_class(
+        symbol=ps.symbol, timeframe=ps.timeframe,
+        ohlv_dir=app_state.data_dir, config=config
+    )
+
+    # Fetch symbol info
+    with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
+        task = progress.add_task("Fetching symbol info...", total=1)
+        syminfo = provider_instance.get_symbol_info(force_update=not provider_instance.is_symbol_info_exists())
+        progress.update(task, completed=1)
+
+    # Download OHLCV data (always fresh in provider mode)
+    with provider_instance as ohlcv_writer:
+        ohlcv_writer.seek(0)
+        ohlcv_writer.truncate()
+
+        time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
+        time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
+
+        total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+
+        with Progress(
+                SpinnerColumn(finished_text="[green]✓"),
+                TextColumn("{task.description}"),
+                DateColumn(time_from_dl),
+                BarColumn(),
+                TimeElapsedColumn(),
+                "/",
+                TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task("Downloading OHLCV data...", total=total_seconds)
+
+            def cb_progress(current_time: datetime):
+                elapsed_seconds = int((current_time - time_from_dl).total_seconds())
+                progress.update(task, completed=elapsed_seconds)
+
+            provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+
+    return provider_instance.ohlcv_path, syminfo
+
+
 @app.command(cls=PluggableCommand)
 def run(
         script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
-        data: Path = Argument(..., dir_okay=False, file_okay=True,
-                              help="Data file to use (*.ohlcv)"),
-        time_from: datetime | None = Option(None, '--from', '-f',
-                                            formats=["%Y-%m-%d", "%Y-%m-%d %H:%M:%S"],
-                                            help="Start date (UTC), if not specified, will use the "
-                                                 "first date in the data"),
-        time_to: datetime | None = Option(None, '--to', '-t',
-                                          formats=["%Y-%m-%d", "%Y-%m-%d %H:%M:%S"],
-                                          help="End date (UTC), if not specified, will use the last "
-                                               "date in the data"),
+        data: str = Argument(...,
+                             help="Data file (*.ohlcv, *.csv) or provider string "
+                                  "(e.g. ccxt:BYBIT:BTC/USDT:USDT@1D)"),
+        time_from: str | None = Option(None, '--from', '-f',
+                                       metavar="[DATE|DAYS|-BARS]",
+                                       help="Start: date (2025-01-01), days back (30), "
+                                            "or -N bars back (-500). Required in provider mode."),
+        time_to: str | None = Option(None, '--to', '-t',
+                                     metavar="[DATE|DAYS]",
+                                     help="End: date or days from start (default: end of data or now)"),
         plot_path: Path | None = Option(None, "--plot", "-pp",
                                         help="Path to save the plot data",
                                         rich_help_panel="Out Path Options"),
@@ -104,15 +230,22 @@ def run(
     Similarly, if [bold]data[/] path is a name without full path, it will be searched in the [italic]"workdir/data"[/] directory.
     The [bold]plot_path[/], [bold]strat_path[/], and [bold]trade_path[/] work the same way - if they are names without full paths,
     they will be saved in the [italic]"workdir/output"[/] directory.
-    
+
+    [bold]Data Source:[/bold]
+    The [bold]data[/] argument accepts either a file path or a provider string:
+    \b
+      File mode:     pyne run script.py data.csv
+      Provider mode: pyne run script.py ccxt:BYBIT:BTC/USDT:USDT@1D -f -500
+
+    In provider mode, historical data is downloaded automatically. The --from/-f parameter
+    is required and accepts: date (2025-01-01), days back (30), or -N bars back (-500).
+
     [bold]Pine Script Support:[/bold]
-    Also Pine Script (.pine) files could be automatically compiled to Python (.py) before execution, if the 
-    file is newer than the [italic]py[/] file or if the [italic].py[/] file doesn't exist. The compiled [italic].py[/] file will be saved 
-    into the same folder as the original [italic].pine[/] file.
-    A valid [bold]PyneSys API[/bold] key is required for Pine Script compilation. You can get one at [blue]https://pynesys.io[/blue].
-    
-    [bold]Data Support:[/bold]
-    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted. Symbol is auto-detected from filename.
+    Pine Script (.pine) files are automatically compiled to Python (.py) before execution.
+    A valid [bold]PyneSys API[/bold] key is required. Get one at [blue]https://pynesys.io[/blue].
+
+    [bold]Data Formats:[/bold]
+    Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted.
     """  # noqa
 
     # Expand script path
@@ -186,117 +319,101 @@ def run(
                 secho(f"Script file '{script}' not found!", fg="red", err=True)
                 raise Exit(1)
 
-    # Expand data path first - convert relative paths to absolute paths in workdir/data
-    if len(data.parts) == 1:
-        data = app_state.data_dir / data
+    # --- Data resolution: provider string or file path ---
+    provider_mode = is_provider_string(data)
 
-    # Store the original suffix to check what user provided
-    original_suffix = data.suffix
+    if provider_mode:
+        # Provider mode: download historical data, get syminfo
+        data_path, syminfo = _download_provider_data(data, time_from)
+    else:
+        # File mode: resolve path, convert if needed
+        data_path = Path(data)
 
-    # Check file format and extension
-    if data.suffix == "":
-        # No extension provided - check if .ohlcv exists, otherwise look for .csv
-        ohlcv_path = data.with_suffix(".ohlcv")
-        csv_path = data.with_suffix(".csv")
+        if len(data_path.parts) == 1:
+            data_path = app_state.data_dir / data_path
 
-        if ohlcv_path.exists():
-            data = ohlcv_path
-        elif csv_path.exists():
-            data = csv_path
-        else:
-            # Default to .ohlcv for error message
-            data = ohlcv_path
-
-    # Now handle conversion if needed
-    if data.suffix != ".ohlcv":
-        # Has extension but not .ohlcv - automatically convert
-        try:
-            converter = DataConverter()
-
-            # Check if conversion is needed
-            if converter.is_conversion_required(data):
-                # Auto-detect symbol and provider from filename
-                detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data)
-
-                if not detected_symbol:
-                    detected_symbol = data.stem.upper()
-
-                with Progress(
-                        SpinnerColumn(finished_text="[green]✓"),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console
-                ) as progress:
-                    task = progress.add_task(f"Converting {data.suffix} to OHLCV format...", total=1)
-
-                    # Perform conversion with smart defaults
-                    converter.convert_to_ohlcv(
-                        data,
-                        provider=detected_provider,
-                        symbol=detected_symbol,
-                        force=True
-                    )
-
-                    # After conversion, the OHLCV file has the same name but .ohlcv extension
-                    data = data.with_suffix(".ohlcv")
-
-                    progress.update(task, completed=1)
+        if data_path.suffix == "":
+            ohlcv_path = data_path.with_suffix(".ohlcv")
+            csv_path = data_path.with_suffix(".csv")
+            if ohlcv_path.exists():
+                data_path = ohlcv_path
+            elif csv_path.exists():
+                data_path = csv_path
             else:
-                # File is already up-to-date, use existing OHLCV file
-                data = data.with_suffix(".ohlcv")
+                data_path = ohlcv_path
 
-        except (DataFormatError, ConversionError) as e:
-            secho(f"Conversion failed: {e}", fg="red", err=True)
-            secho("Please convert the file manually:", fg="red")
-            secho(f"pyne data convert-from {data}", fg="yellow")
+        if data_path.suffix != ".ohlcv":
+            try:
+                converter = DataConverter()
+                if converter.is_conversion_required(data_path):
+                    detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data_path)
+                    if not detected_symbol:
+                        detected_symbol = data_path.stem.upper()
+                    with Progress(
+                            SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=console
+                    ) as progress:
+                        task = progress.add_task(f"Converting {data_path.suffix} to OHLCV format...", total=1)
+                        converter.convert_to_ohlcv(
+                            data_path, provider=detected_provider,
+                            symbol=detected_symbol, force=True
+                        )
+                        data_path = data_path.with_suffix(".ohlcv")
+                        progress.update(task, completed=1)
+                else:
+                    data_path = data_path.with_suffix(".ohlcv")
+            except (DataFormatError, ConversionError) as e:
+                secho(f"Conversion failed: {e}", fg="red", err=True)
+                secho("Please convert the file manually:", fg="red")
+                secho(f"pyne data convert-from {data_path}", fg="yellow")
+                raise Exit(1)
+
+        if not data_path.exists():
+            secho(f"Data file not found: {data_path.name}", fg="red", err=True)
             raise Exit(1)
 
-    # Final check if data exists
-    if not data.exists():
-        secho(f"Data file not found: {data.name}", fg="red", err=True)
-        raise Exit(1)
+        try:
+            syminfo = SymInfo.load_toml(data_path.with_suffix(".toml"))
+        except FileNotFoundError:
+            secho(f"Symbol info file '{data_path.with_suffix('.toml')}' not found!", fg="red", err=True)
+            raise Exit(1)
 
-    # Ensure .csv extension for plot path
+    # --- Output paths ---
     if plot_path and plot_path.suffix != ".csv":
         plot_path = plot_path.with_suffix(".csv")
     if not plot_path:
         plot_path = app_state.output_dir / f"{script.stem}.csv"
 
-    # Ensure .csv extension for strategy path
     if strat_path and strat_path.suffix != ".csv":
         strat_path = strat_path.with_suffix(".csv")
     if not strat_path:
         strat_path = app_state.output_dir / f"{script.stem}_strat.csv"
 
-    # Ensure .csv extension for trade path
     if trade_path and trade_path.suffix != ".csv":
         trade_path = trade_path.with_suffix(".csv")
     if not trade_path:
         trade_path = app_state.output_dir / f"{script.stem}_trade.csv"
 
-    # Get symbol info for the data
-    try:
-        syminfo = SymInfo.load_toml(data.with_suffix(".toml"))
-    except FileNotFoundError:
-        secho(f"Symbol info file '{data.with_suffix('.toml')}' not found!", fg="red", err=True)
-        raise Exit(1)
+    # --- Open data and run ---
+    with OHLCVReader(data_path) as reader:
+        # Parse time range
+        time_from_dt = _parse_time_value(time_from) if time_from and not provider_mode else None
+        time_to_dt = _parse_time_value(time_to) if time_to else None
 
-    # Open data file
-    with OHLCVReader(data) as reader:
-        if not time_from:
-            time_from = reader.start_datetime
-        if not time_to:
-            time_to = reader.end_datetime
+        if not time_from_dt:
+            time_from_dt = reader.start_datetime
+        if not time_to_dt:
+            time_to_dt = reader.end_datetime
 
-        # Convert to UTC timestamps BEFORE removing timezone info
-        # This ensures we use the correct UTC timestamps for the OHLCV reader
-        time_from_ts = int(time_from.timestamp())
-        time_to_ts = int(time_to.timestamp())
+        time_from_ts = int(time_from_dt.timestamp())
+        time_to_ts = int(time_to_dt.timestamp())
 
-        # Now we can safely remove timezone for display purposes
-        time_from = time_from.replace(tzinfo=None)
-        time_to = time_to.replace(tzinfo=None)
+        # Remove timezone for display purposes
+        time_from_display = time_from_dt.replace(tzinfo=None)
+        time_to_display = time_to_dt.replace(tzinfo=None)
 
-        total_seconds = int((time_to - time_from).total_seconds())
+        total_seconds = int((time_to_display - time_from_display).total_seconds())
 
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
@@ -360,7 +477,7 @@ def run(
         with Progress(
                 SpinnerColumn(finished_text="[green]✓"),
                 TextColumn("{task.description}"),
-                DateColumn(time_from),
+                DateColumn(time_from_display),
                 BarColumn(),
                 CustomTimeElapsedColumn(),
                 "/",
@@ -391,8 +508,8 @@ def run(
                         # Update progress if we have new data
                         if current_time is not None:
                             if current_time == datetime.max:
-                                current_time = time_to
-                            elapsed_seconds = int((current_time - time_from).total_seconds())
+                                current_time = time_to_display
+                            elapsed_seconds = int((current_time - time_from_display).total_seconds())
                             # Only update if time changed (to avoid redundant updates)
                             if elapsed_seconds != last_update:
                                 progress.update(task, completed=elapsed_seconds)
@@ -419,7 +536,7 @@ def run(
                 runner.run(on_progress=cb_progress)
 
                 # Ensure final progress update
-                progress_queue.put(time_to)
+                progress_queue.put(time_to_display)
                 time.sleep(0.05)  # Give worker thread time to process final update
 
                 progress.update(task, completed=total_seconds)
