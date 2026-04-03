@@ -6,14 +6,13 @@ All PyneCore plugins register under a single entry point group
 determines capabilities:
 
 - ``ProviderPlugin(Plugin)`` — offline OHLCV data provider
-- ``ExtensionPlugin(Plugin)`` — hook-based script extension
-- ``LiveProviderPlugin(Plugin)`` — WebSocket/streaming data
+- ``LiveProviderPlugin(ProviderPlugin)`` — offline + WebSocket/streaming data
 - ``CLIPlugin(Plugin)`` — CLI commands and parameter hooks
 
 Multiple inheritance combines capabilities::
 
-    class BinancePlugin(ProviderPlugin, CLIPlugin): ...
-    class PlotPlugin(ExtensionPlugin, CLIPlugin): ...
+    class YahooPlugin(ProviderPlugin, CLIPlugin): ...          # offline only
+    class BinancePlugin(LiveProviderPlugin, CLIPlugin): ...    # offline + live
 
 Plugin metadata (name, version) comes from the package's ``pyproject.toml``
 via :mod:`importlib.metadata`, not from class attributes.
@@ -151,4 +150,5 @@ def _parse_min_pynecore(ep: EntryPoint) -> str:
 
 # Plugin type subclasses — import after Plugin is defined to avoid circular imports
 from .provider import ProviderPlugin
+from .live_provider import LiveProviderPlugin
 from .cli import CLIPlugin
