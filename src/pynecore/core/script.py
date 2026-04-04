@@ -102,7 +102,7 @@ class Script:
     margin_long: int | float = 100.0  # Defaulted to 100.0 in Pine Script v6
     margin_short: int | float = 100.0  # Defaulted to 100.0 in Pine Script v6
     risk_free_rate: float = 2.0
-    use_bar_magnifier: bool = False
+    use_bar_magnifier: bool = True
     fill_orders_on_standard_ohlc: bool = False
 
     position: _strategy.Position = None  # type: ignore[assignment]
@@ -373,7 +373,7 @@ class Script:
             calc_bars_count=0,
 
             risk_free_rate=2.0,
-            use_bar_magnifier=False,
+            use_bar_magnifier=True,
             fill_orders_on_standard_ohlc=False,
 
             max_polylines_count=50,
