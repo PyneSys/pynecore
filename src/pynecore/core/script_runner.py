@@ -181,14 +181,15 @@ class ScriptRunner:
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
-                 '_script_path', '_security_data')
+                 '_script_path', '_security_data', '_magnifier_iter')
 
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  inputs: dict[str, Any] | None = None,
-                 security_data: dict[str, str | Path] | None = None):
+                 security_data: dict[str, str | Path] | None = None,
+                 magnifier_iter: Iterable[OHLCV] | None = None):
         """
         Initialize the script runner
 
@@ -207,12 +208,16 @@ class ScriptRunner:
                               OHLCV file paths for request.security() contexts.
                               Examples: ``{"1D": "path/to/daily.ohlcv"}`` or
                               ``{"AAPL:1H": "path/to/aapl_1h.ohlcv"}``
+        :param magnifier_iter: Optional sub-timeframe OHLCV iterator for bar magnifier mode.
+                               When provided with use_bar_magnifier=true, order fills are checked
+                               against each sub-bar for more accurate backtesting.
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
         """
         self._script_path = script_path
         self._security_data = security_data or {}
+        self._magnifier_iter = magnifier_iter
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -476,6 +481,21 @@ class ScriptRunner:
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)
 
+            # --timeframe mode: magnifier_iter provides sub-TF data
+            if self._magnifier_iter is not None:
+                if is_strat and self.script.use_bar_magnifier:
+                    # Bar magnifier: accurate order fills at sub-bar resolution
+                    yield from self._run_iter_magnified(
+                        lib, barstate, position, script, is_strat, on_progress, string
+                    )
+                    return
+                else:
+                    # On-the-fly aggregation: aggregate sub-TF to chart TF
+                    from .bar_magnifier import BarMagnifier
+                    chart_tf = str(lib.syminfo.period)
+                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+                    self.ohlcv_iter = (w.aggregated for w in magnifier)
+
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_candle = next(ohlcv_iterator, None)
@@ -704,6 +724,126 @@ class ScriptRunner:
             _reset_lib_vars(lib)
             # Reset function isolation
             function_isolation.reset()
+
+    def _run_iter_magnified(self, lib, barstate, position, script, is_strat, on_progress, string):
+        """
+        Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
+        resolution, execute script once per chart bar.
+        """
+        from .bar_magnifier import BarMagnifier
+
+        chart_tf = str(lib.syminfo.period)
+        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+
+        trade_num = 0
+
+        for window in magnifier:
+            barstate.islast = window.is_last_window
+
+            # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib)
+
+            # Store first price for buy & hold calculation
+            if self.first_price is None:
+                self.first_price = lib.close  # type: ignore
+
+            # Update last price
+            self.last_price = lib.close  # type: ignore
+
+            # Process orders against each sub-bar for accurate fills
+            if position:
+                position.process_orders_magnified(window.sub_bars, window.aggregated)
+
+            # Execute registered library main functions before main script
+            lib._lib_semaphore = True
+            for library_title, main_func in script._registered_libraries:
+                main_func()
+            lib._lib_semaphore = False
+
+            # Run the script
+            res = self.script_module.main()
+
+            # Process deferred margin calls (after script runs, before results)
+            if position:
+                position.process_deferred_margin_call()
+
+            # Update plot data with the results
+            if res is not None:
+                assert isinstance(res, dict), "The 'main' function must return a dictionary!"
+                lib._plot_data.update(res)
+
+            # Write plot data to CSV if we have a writer
+            if self.plot_writer and lib._plot_data:
+                extra_fields = {} if window.aggregated.extra_fields is None \
+                    else dict(window.aggregated.extra_fields)
+                extra_fields.update(lib._plot_data)
+                updated_candle = window.aggregated._replace(extra_fields=extra_fields)
+                self.plot_writer.write_ohlcv(updated_candle)
+
+            # Yield results
+            if not is_strat:
+                yield window.aggregated, lib._plot_data
+            elif position:
+                yield window.aggregated, lib._plot_data, position.new_closed_trades
+
+            # Save trade data
+            if is_strat and self.trades_writer and position:
+                for trade in position.new_closed_trades:
+                    trade_num += 1
+                    self.trades_writer.write(
+                        trade_num,
+                        trade.entry_bar_index,
+                        "Entry long" if trade.size > 0 else "Entry short",
+                        trade.entry_comment if trade.entry_comment else trade.entry_id,
+                        string.format_time(trade.entry_time),  # type: ignore
+                        trade.entry_price,
+                        abs(trade.size),
+                        trade.profit,
+                        f"{trade.profit_percent:.2f}",
+                        trade.cum_profit,
+                        f"{trade.cum_profit_percent:.2f}",
+                        trade.max_runup,
+                        f"{trade.max_runup_percent:.2f}",
+                        trade.max_drawdown,
+                        f"{trade.max_drawdown_percent:.2f}",
+                    )
+                    self.trades_writer.write(
+                        trade_num,
+                        trade.exit_bar_index,
+                        "Exit long" if trade.size > 0 else "Exit short",
+                        trade.exit_comment if trade.exit_comment else trade.exit_id,
+                        string.format_time(trade.exit_time),  # type: ignore
+                        trade.exit_price,
+                        abs(trade.size),
+                        trade.profit,
+                        f"{trade.profit_percent:.2f}",
+                        trade.cum_profit,
+                        f"{trade.cum_profit_percent:.2f}",
+                        trade.max_runup,
+                        f"{trade.max_runup_percent:.2f}",
+                        trade.max_drawdown,
+                        f"{trade.max_drawdown_percent:.2f}",
+                    )
+
+            # Clear plot data
+            lib._plot_data.clear()
+
+            # Track equity curve for strategies
+            if is_strat and position:
+                current_equity = float(position.equity) if position.equity else self.script.initial_capital
+                self.equity_curve.append(current_equity)
+
+            # Call the progress callback
+            if on_progress and lib._datetime is not None:
+                on_progress(lib._datetime.replace(tzinfo=None))
+
+            # Update bar index
+            self.bar_index += 1
+            # It is no longer the first bar
+            barstate.isfirst = False
+
+        if on_progress:
+            on_progress(datetime.max)
 
     def _resolve_security_data(self, contexts: dict) -> dict[str, str | None]:
         """

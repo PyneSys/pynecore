@@ -34,6 +34,8 @@ __all__ = [
 # Callable modules
 #
 
+from ...types.ohlcv import OHLCV
+
 if TYPE_CHECKING:
     from closedtrades import closedtrades
     from opentrades import opentrades
@@ -99,16 +101,16 @@ class Order:
     def __init__(
             self,
             order_id: str | None,
-            size: float,
+            size: float | NA[float],
             *,
             order_type: _OrderType = _order_type_normal,
             exit_id: str | None = None,
             limit: float | None = None,
             stop: float | None = None,
             oca_name: str | None = None,
-            oca_type: _oca.Oca = _oca.none,
-            comment: str | None = None,
-            alert_message: str | None = None,
+            oca_type: _oca.Oca | None = _oca.none,
+            comment: str | NA[str] | None = None,
+            alert_message: str | NA[str] | None = None,
             comment_profit: str | None = None,
             comment_loss: str | None = None,
             comment_trailing: str | None = None,
@@ -183,23 +185,25 @@ class Trade:
     )
 
     # noinspection PyShadowingNames
-    def __init__(self, *, size: float, entry_id: str, entry_bar_index: int, entry_time: int, entry_price: float,
-                 commission: float, entry_comment: str, entry_equity: float):
-        self.size: float = size
+    def __init__(self, *, size: float | NA[float], entry_id: str | None, entry_bar_index: int, entry_time: int,
+                 entry_price: float | NA[float],
+                 commission: float | NA[float], entry_comment: str | NA[str] | None = None,
+                 entry_equity: float | NA[float] = 0.0):
+        self.size: float | NA[float] = size
         self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
-        self.entry_id: str = entry_id
+        self.entry_id: str | None = entry_id
         self.entry_bar_index: int = entry_bar_index
         self.entry_time: int = entry_time
-        self.entry_price: float = entry_price
-        self.entry_equity: float = entry_equity
-        self.entry_comment: str = entry_comment
+        self.entry_price: float | NA[float] = entry_price
+        self.entry_equity: float | NA[float] = entry_equity
+        self.entry_comment: str | NA[str] | None = entry_comment
 
-        self.exit_id: str = ""
+        self.exit_id: str | None = ""
         self.exit_bar_index: int = -1
         self.exit_time: int = -1
-        self.exit_price: float = 0.0
-        self.exit_comment: str = ''
+        self.exit_price: float | NA[float] = 0.0
+        self.exit_comment: str | NA[str] = ''
         self.exit_equity: float | NA = na_float
 
         self.commission = commission
@@ -230,7 +234,7 @@ class Trade:
 
     def get(self, key: str, default=None):
         v = getattr(self, key, default)
-        if key in ('entry_time', 'exit_time'):
+        if key in ('entry_time', 'exit_time') and isinstance(v, (int, float)):
             v = datetime.fromtimestamp(v / 1000.0, tz=UTC)
         elif isinstance(v, float):
             v = round(v, 10)
@@ -288,7 +292,7 @@ class PriceOrderBook:
                 del self.orders_at_price[price]
         del self.order_prices[order]
 
-    def update_order_stop(self, order: Order, new_stop: float):
+    def update_order_stop(self, order: Order, new_stop: float | NA[float] | None):
         """Update the stop price of an order in the order book"""
         # Remove the order from the old stop price level if it exists
         if order.stop is not None and order.stop in self.order_prices[order]:
@@ -421,9 +425,9 @@ class Position:
         self.grossloss: float | NA[float] = 0.0
 
         # Order books
-        self.market_orders: dict[tuple[_OrderType, str], Order] = {}  # Market orders from strategy.market()
-        self.entry_orders: dict[str, Order] = {}  # Entry orders from strategy.entry()
-        self.exit_orders: dict[str, Order] = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
+        self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
+        self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
+        self.exit_orders: dict[str | None, Order] = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
         self.orderbook = PriceOrderBook()
 
         # Trades
@@ -440,14 +444,14 @@ class Position:
         self.sign: float = 0.0
         self.avg_price: float | NA[float] = na_float
         self.cum_profit: float | NA[float] = 0.0
-        self.entry_equity: float = 0.0
-        self.max_equity: float = -float("inf")
-        self.min_equity: float = float("inf")
+        self.entry_equity: float | NA[float] = 0.0
+        self.max_equity: float | NA[float] = -float("inf")
+        self.min_equity: float | NA[float] = float("inf")
         self.drawdown_summ: float = 0.0
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
-        self.entry_summ: float = 0.0
+        self.entry_summ: float | NA[float] = 0.0
         self.open_commission: float = 0.0
 
         # Risk management settings
@@ -543,7 +547,7 @@ class Position:
             if order.oca_name == oca_name and order != executed_order:
                 self._remove_order(order)
 
-    def _reduce_oca_group(self, oca_name: str, filled_size: float):
+    def _reduce_oca_group(self, oca_name: str, filled_size: float | NA[float]):
         """Reduce the size of all orders in the same OCA group"""
         reduction = abs(filled_size)
 
@@ -567,7 +571,7 @@ class Position:
                 else:
                     order.size = new_size * order.sign
 
-    def _fill_order(self, order: Order, price: float, h: float, l: float):
+    def _fill_order(self, order: Order, price: float | NA[float], h: float | NA[float], l: float | NA[float]):
         """
         Fill an order (actually)
 
@@ -764,7 +768,7 @@ class Position:
                 entry_id = order.exit_id
                 overshoot_trade = Trade(
                     size=order.size,
-                    entry_id=entry_id, entry_bar_index=lib.bar_index,
+                    entry_id=entry_id, entry_bar_index=int(lib.bar_index),
                     entry_time=lib._time, entry_price=price,
                     commission=0.0, entry_comment=order.comment,
                     entry_equity=self.equity
@@ -813,9 +817,9 @@ class Position:
 
             trade = Trade(
                 size=order.size,
-                entry_id=entry_id, entry_bar_index=lib.bar_index,
+                entry_id=entry_id, entry_bar_index=int(lib.bar_index),
                 entry_time=lib._time, entry_price=price,
-                commission=commission, entry_comment=order.comment,  # type: ignore
+                commission=commission, entry_comment=order.comment,
                 entry_equity=before_equity
             )
 
@@ -1128,7 +1132,7 @@ class Position:
             return False
 
         loss = available_funds / margin_ratio
-        cover_amount = int(loss / check_price)
+        cover_amount = loss / check_price
         margin_call_size = max(1, abs(cover_amount) * 4)
 
         if margin_call_size > quantity:
@@ -1264,6 +1268,18 @@ class Position:
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
 
+        # If the order is open → high → low → close or open → low → high → close
+        ohlc = self.h - self.o < self.o - self.l
+
+        self.drawdown_summ = self.runup_summ = 0.0
+        self.new_closed_trades.clear()
+
+        self._process_at_bar_open(ohlc)
+        self._process_limit_stop_orders(ohlc)
+        self._finalize_bar_pnl()
+
+    def _process_at_bar_open(self, ohlc: bool):
+        """Phase 1: Process orders at bar open — gap detection, market fills, margin."""
         # Check if we're in a new trading day for intraday risk management
         # TradingView tracks intraday based on trading session, not calendar day
         current_day = lib.dayofmonth()
@@ -1271,16 +1287,9 @@ class Position:
             # New trading day - reset intraday counters
             self.risk_last_day_index = current_day
             self.risk_intraday_filled_orders = 0
-            # TODO: Also reset intraday loss tracking here when implemented
 
         # Get script reference for slippage
         script = lib._script
-
-        # If the order is open → high → low → close or open → low → high → close
-        ohlc = self.h - self.o < self.o - self.l
-
-        self.drawdown_summ = self.runup_summ = 0.0
-        self.new_closed_trades.clear()
 
         # Skip market exit order processing if there's no open position (TradingView behavior)
         if not self.open_trades:
@@ -1548,6 +1557,8 @@ class Position:
         self._check_margin_call(self.o, for_short=True, at_open=True)
         self._check_margin_call(self.o, for_short=False, at_open=True)
 
+    def _process_limit_stop_orders(self, ohlc: bool):
+        """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
         # Process orders: open → high → low → close
         if ohlc:
             # open -> high
@@ -1602,6 +1613,8 @@ class Position:
 
                 self._check_margin_call(self.h, for_short=True, can_defer=False)
 
+    def _finalize_bar_pnl(self):
+        """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
             # Unrealized P&L
@@ -1623,7 +1636,6 @@ class Position:
                 trade.max_runup = max(runup, trade.max_runup)
 
                 # Calculate percentage values for drawdown and runup
-                # This part is missing in the original code
                 trade_value = abs(trade.size) * trade.entry_price
                 if trade_value > 0:
                     # Calculate drawdown percentage
@@ -1652,14 +1664,12 @@ class Position:
             initial_capital = lib._script.initial_capital
             for closed_trade in self.new_closed_trades:
                 # Incrementally add each trade's profit to cumulative total
-                # (can't use equity because it already contains ALL trades' profits)
                 self.cum_profit += closed_trade.profit
                 closed_trade.cum_profit = self.cum_profit
                 closed_trade.cum_max_drawdown = self.max_drawdown
                 closed_trade.cum_max_runup = self.max_runup
 
                 # Cumulative profit percent
-                # TradingView calculates this as total return on initial capital
                 try:
                     closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
                 except ZeroDivisionError:
@@ -1668,19 +1678,59 @@ class Position:
                 # Modify entry equity, for max drawdown and runup
                 self.entry_equity += closed_trade.profit
 
+    def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV):
+        """
+        Process orders using bar magnifier — check fills against each sub-bar's OHLC.
+
+        Phase 1 (at-open) runs once using first sub-bar.
+        Phase 2 (limit/stop) runs on each sub-bar sequentially.
+        Phase 3 (P&L) runs once using aggregated bar values.
+        """
+        round_to_mintick = lib.math.round_to_mintick
+        # Setup from first sub-bar (= chart bar open)
+        first = sub_bars[0]
+        self.o = round_to_mintick(first.open)
+        self.h = round_to_mintick(first.high)
+        self.l = round_to_mintick(first.low)
+        # Use aggregated close for margin deferral checks
+        self.c = round_to_mintick(aggregated.close)
+        self.drawdown_summ = self.runup_summ = 0.0
+        self.new_closed_trades.clear()
+
+        # Phase 1: at-open processing (gap detection, market orders, margin at open)
+        ohlc = self.h - self.o < self.o - self.l
+        self._process_at_bar_open(ohlc)
+
+        # Phase 2: process limit/stop orders on each sub-bar
+        for sub_bar in sub_bars:
+            self.o = round_to_mintick(sub_bar.open)
+            self.h = round_to_mintick(sub_bar.high)
+            self.l = round_to_mintick(sub_bar.low)
+            self.c = round_to_mintick(sub_bar.close)
+            ohlc = self.h - self.o < self.o - self.l
+            self._process_limit_stop_orders(ohlc)
+
+        # Phase 3: P&L update using aggregated bar values
+        self.h = round_to_mintick(aggregated.high)
+        self.l = round_to_mintick(aggregated.low)
+        self.c = round_to_mintick(aggregated.close)
+        self._finalize_bar_pnl()
+
 
 #
 # Functions
 #
 
 # noinspection PyProtectedMember
-def _size_round(qty: float) -> float:
+def _size_round(qty: float | NA[float]) -> float | NA[float]:
     """
     Round size to the nearest possible value
 
     :param qty: The quantity to round
     :return: The rounded quantity
     """
+    if isinstance(qty, NA):
+        return na_float
     rfactor = syminfo._size_round_factor  # noqa
     qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
     sign = 1 if qty > 0 else -1

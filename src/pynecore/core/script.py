@@ -105,7 +105,7 @@ class Script:
     use_bar_magnifier: bool = False
     fill_orders_on_standard_ohlc: bool = False
 
-    position: _strategy.Position | None = None
+    position: _strategy.Position = None  # type: ignore[assignment]
 
     _modified: set[str] = field(default_factory=set)
 

@@ -19,6 +19,8 @@ from ..app import app, app_state
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
+from pynecore.core.aggregator import validate_aggregation
+from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
@@ -91,6 +93,11 @@ def run(
                                             help='Security data: "TIMEFRAME=data_name" or '
                                                  '"SYMBOL:TIMEFRAME=data_name"',
                                             rich_help_panel="Security Options"),
+        timeframe: str | None = Option(None, "--timeframe", "-tf",
+                                       help="Chart timeframe (TradingView format, e.g. '60', '1D'). "
+                                            "When larger than data timeframe: aggregates on-the-fly, "
+                                            "or activates bar magnifier if strategy uses "
+                                            "use_bar_magnifier=true."),
 
 ):
     """
@@ -279,6 +286,28 @@ def run(
         secho(f"Symbol info file '{data.with_suffix('.toml')}' not found!", fg="red", err=True)
         raise Exit(1)
 
+    # Validate and process --timeframe option
+    magnifier_mode = False
+    if timeframe:
+        timeframe = timeframe.upper()
+        try:
+            in_seconds(timeframe)
+        except (ValueError, AssertionError):
+            secho(f"Invalid timeframe: {timeframe}. Must be a valid TradingView format "
+                  f"(e.g. '1', '5', '60', '1D', '1W', '1M').", fg="red", err=True)
+            raise Exit(1)
+
+        data_tf = syminfo.period
+        if timeframe != data_tf:
+            try:
+                validate_aggregation(data_tf, timeframe)
+            except ValueError as e:
+                secho(str(e), fg="red", err=True)
+                raise Exit(1)
+            # Override syminfo period to the chart timeframe
+            syminfo.period = timeframe
+            magnifier_mode = True  # Will be checked against script.use_bar_magnifier later
+
     # Open data file
     with OHLCVReader(data) as reader:
         if not time_from:
@@ -299,7 +328,13 @@ def run(
 
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
-        ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
+        magnifier_iter = None
+        if magnifier_mode:
+            # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)
+            magnifier_iter = reader.read_from(time_from_ts, time_to_ts)
+            ohlcv_iter = iter([])
+        else:
+            ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
         # Parse security data mappings
         security_data: dict[str, str | Path] | None = None
@@ -346,7 +381,8 @@ def run(
                 # Create script runner (this is where the import happens)
                 runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                       plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
-                                      security_data=security_data)
+                                      security_data=security_data,
+                                      magnifier_iter=magnifier_iter)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:

@@ -90,7 +90,7 @@ last_bar_time: int = 0
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
 
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
-_script: script | None = None
+_script: script = None  # type: ignore[assignment]
 
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
@@ -129,7 +129,7 @@ def max_bars_back(var: Any, num: int) -> None:
 ### Date / Time ###
 
 # noinspection PyShadowingNames
-def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime:
+def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime | NA[datetime]:
     """ Get datetime object from time and timezone """
     if isinstance(time, NA):
         return time
