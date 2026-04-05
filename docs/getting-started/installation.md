@@ -170,7 +170,7 @@ pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT" --timeframe 1D --from 202
 You can also convert your existing CSV or JSON containing OHLCV data to the PyneCore's `.ohlcv` format:
 
 ```bash
-pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT" --timeframe 1D
+pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT"
 ```
 
 ## Running Your First Script

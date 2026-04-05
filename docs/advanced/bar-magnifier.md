@@ -170,10 +170,48 @@ pyne run my_indicator.py EURUSD_1m.ohlcv --timeframe 60
 
 This is useful for quick testing without pre-aggregating data files.
 
+## calc_on_order_fills
+
+When `calc_on_order_fills=True` is set on a strategy, the script **re-executes** after each order
+fill within a bar. This works with both the standard path and the bar magnifier path.
+
+### Execution Model
+
+```
+for each bar:
+    committed = snapshot(var globals)
+    process_orders()                        # fills from previous bar's orders
+
+    while new fills detected:
+        restore var globals to committed    # rollback (varip excluded)
+        main()                              # re-execution
+        process_orders()                    # process new orders from re-execution
+
+    restore var globals to committed        # final rollback
+    main()                                  # definitive bar-close execution
+```
+
+### Persistent vs IBPersistent
+
+On historical bars, a script normally executes once per bar — no rollback occurs, so `Persistent`
+and `IBPersistent` behave identically. With `calc_on_order_fills`, the script can execute
+**multiple times on the same bar**, and the difference appears:
+
+- `Persistent` (TradingView `var`): **rolled back** to the previous bar's committed state before
+  each re-execution. Every execution starts from the same baseline.
+- `IBPersistent` (TradingView `varip`): **not rolled back** — retains its value across all
+  executions on the same bar.
+
+```python
+var_count: Persistent[int] = 0       # rolled back before each re-execution
+varip_count: IBPersistent[int] = 0   # persists across re-executions
+
+var_count += 1    # always bar_index+1 (rollback ensures no extra increments)
+varip_count += 1  # bar_index+1 + number of re-executions on fill bars
+```
+
 ## Limitations
 
-- **No script re-execution on fills**: the script runs once per chart bar, even when an order fills
-  on a sub-bar. The `calc_on_order_fills` parameter is not yet supported with the magnifier.
 - **Sub-bar data must align**: the LTF data must divide evenly into the chart TF (e.g., 10m into
   60m, not 7m into 60m). PyneCore validates this at startup.
 - **Data availability**: you need to source and store the LTF data yourself — PyneCore does not

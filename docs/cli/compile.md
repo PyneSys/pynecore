@@ -56,7 +56,7 @@ The API key can be provided in several ways:
 Create a file at `workdir/config/api.toml` with your API key:
 
 ```toml
-[pynesys]
+[api]
 api_key = "your-api-key-here"
 ```
 

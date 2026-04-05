@@ -126,7 +126,8 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
                 pass
 
     lib.syminfo.root = syminfo.ticker
-    lib.syminfo.ticker = syminfo.prefix + ':' + syminfo.ticker
+    lib.syminfo.tickerid = syminfo.prefix + ':' + syminfo.ticker
+    lib.syminfo.ticker = lib.syminfo.tickerid
 
     lib.syminfo._opening_hours = syminfo.opening_hours
     lib.syminfo._session_starts = syminfo.session_starts

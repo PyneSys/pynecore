@@ -59,16 +59,17 @@ for candle, plot_data in runner.run_iter():
 ```python
 ScriptRunner(
     script_path: Path,
-ohlcv_iter: Iterable[OHLCV],
-syminfo: SymInfo,
-*,
-plot_path: Path | None = None,
-strat_path: Path | None = None,
-trade_path: Path | None = None,
-update_syminfo_every_run: bool = False,
-last_bar_index: int = 0,
-inputs: dict[str, Any] | None = None,
-security_data: dict[str, str | Path] | None = None,
+    ohlcv_iter: Iterable[OHLCV],
+    syminfo: SymInfo,
+    *,
+    plot_path: Path | None = None,
+    strat_path: Path | None = None,
+    trade_path: Path | None = None,
+    update_syminfo_every_run: bool = False,
+    last_bar_index: int = 0,
+    inputs: dict[str, Any] | None = None,
+    security_data: dict[str, str | Path] | None = None,
+    magnifier_iter: Iterable[OHLCV] | None = None,
 )
 ```
 
@@ -86,6 +87,7 @@ security_data: dict[str, str | Path] | None = None,
 | `last_bar_index`           | `int`             | Override last bar index (for multi-script setups)              |
 | `inputs`                   | `dict \| None`    | Override script `input()` defaults at runtime                  |
 | `security_data`            | `dict \| None`    | OHLCV paths for `request.security()` contexts (see below)      |
+| `magnifier_iter`           | `Iterable \| None` | LTF OHLCV bars for bar magnifier mode (intrabar simulation)    |
 
 ### Overriding Inputs
 
@@ -159,7 +161,7 @@ for candle, plot_data in runner.run_iter():
     # candle: the OHLCV object for this bar
     # plot_data: dict of values from plot() calls in the script
 
-    rsi = plot_data.get("RSI")  # float, or None during warmup
+    rsi = plot_data.get("RSI")  # float, or NA during warmup
     basis = plot_data.get("Basis")  # keys match plot() title parameter
 ```
 

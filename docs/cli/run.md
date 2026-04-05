@@ -96,7 +96,7 @@ The `run` command now supports automatic conversion of non-OHLCV data formats. W
 The automatic conversion supports:
 - **CSV files**: Standard comma-separated values
 - **JSON files**: JSON formatted OHLCV data
-- **TXT files**: Tab, semicolon, or pipe-delimited data (coming soon)
+- **TXT files**: Tab, semicolon, or pipe-delimited data
 
 ### Filename Pattern Detection
 
