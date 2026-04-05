@@ -195,7 +195,7 @@ Requests volume footprint data for the current bar.
 
 **Returns:** Footprint object with volume data.
 
-**Note:** Not yet implemented in PyneCore. Raises `NotImplementedError`.
+**Note:** Not planned for PyneCore core. Footprint data requires Level 2 / tick-by-tick market data feeds that are not available from standard OHLCV sources. May be supported via provider plugins in the future. Raises `NotImplementedError`.
 
 ## Compatibility Notes
 

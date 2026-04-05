@@ -64,3 +64,6 @@ constants. Each page covers one namespace and includes compatibility status.
 | [adjustment](adjustment.md) | Dividend adjustment constants         |
 | [dividends](dividends.md)| Dividend data field constants            |
 | [earnings](earnings.md)  | Earnings data field constants            |
+| [xloc](xloc.md)          | X-axis location constants                |
+| [yloc](yloc.md)          | Y-axis location constants                |
+| [pivotpointtype](pivotpointtype.md) | Pivot point calculation types  |
