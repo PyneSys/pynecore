@@ -1135,7 +1135,7 @@ class Position:
             return False
 
         loss = available_funds / margin_ratio
-        cover_amount = loss / check_price
+        cover_amount = int(loss / check_price)
         margin_call_size = max(1, abs(cover_amount) * 4)
 
         if margin_call_size > quantity:
