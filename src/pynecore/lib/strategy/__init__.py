@@ -408,7 +408,7 @@ class Position:
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
-        '_deferred_margin_call'
+        '_deferred_margin_call', '_fill_counter'
     )
 
     def __init__(self):
@@ -478,6 +478,7 @@ class Position:
 
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
+        self._fill_counter: int = 0
 
     @property
     def equity(self) -> float | NA[float]:
@@ -583,6 +584,8 @@ class Position:
         # Close orders cannot fill when no position exists
         if order.order_type == _order_type_close and self.size == 0.0:
             return
+
+        self._fill_counter += 1
 
         # Save the original order size before any modifications
         filled_size = abs(order.size)

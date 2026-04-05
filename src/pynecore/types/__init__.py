@@ -1,4 +1,5 @@
 from .persistent import Persistent
+from .ib_persistent import IBPersistent, IBPersistentSeries
 from .series import Series, PersistentSeries
 from .na import NA
 

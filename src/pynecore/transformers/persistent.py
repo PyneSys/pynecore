@@ -9,6 +9,7 @@ class PersistentTransformer(ast.NodeTransformer):
 
     def __init__(self):
         self.persistent_vars: dict[str, dict[str, str]] = {}  # scope -> var_name -> global_name
+        self.varip_vars: dict[str, dict[str, str]] = {}  # scope -> var_name -> global_name (varip only)
         self.scope_stack: list[str] = []
         self.current_scope: str = ""
         self.module_level_assigns: list[ast.Assign] = []
@@ -125,6 +126,41 @@ class PersistentTransformer(ast.NodeTransformer):
                 )
             )
             self.module_level_assigns.append(function_vars_assign)
+
+        # Create varip function variables dictionary (subset of persistent vars excluded from rollback)
+        if self.varip_vars:
+            varip_vars_dict: dict[str, list[str]] = {}
+            for scope, vars_dict in self.varip_vars.items():
+                function_name = scope.replace('·', '.') if scope else "main"
+                varip_func_vars: list[str] = []
+                for var_name, global_name in vars_dict.items():
+                    varip_func_vars.append(global_name)
+                    kahan_compensation = f"{global_name}_kahan_c__"
+                    if kahan_compensation in self.modified_vars.get(scope, set()):
+                        varip_func_vars.append(kahan_compensation)
+                if scope in self.initialized_flags:
+                    for init_flag in self.initialized_flags[scope]:
+                        varip_global = init_flag.replace('_initialized__', '__')
+                        if any(varip_global.startswith(g) for g in
+                               [gn for gn in vars_dict.values()]):
+                            varip_func_vars.append(init_flag)
+                if varip_func_vars:
+                    varip_vars_dict[function_name] = varip_func_vars
+            if varip_vars_dict:
+                varip_vars_assign = ast.Assign(
+                    targets=[ast.Name(id='__varip_function_vars__', ctx=ast.Store())],
+                    value=ast.Dict(
+                        keys=[ast.Constant(value=k) for k in varip_vars_dict],
+                        values=[
+                            ast.Tuple(
+                                elts=[ast.Constant(value=var) for var in vars],
+                                ctx=ast.Load()
+                            )
+                            for vars in varip_vars_dict.values()
+                        ]
+                    )
+                )
+                self.module_level_assigns.append(varip_vars_assign)
 
         # Find position of first function or assignment
         insert_index = 0
@@ -336,17 +372,26 @@ class PersistentTransformer(ast.NodeTransformer):
 
     @staticmethod
     def _is_persistent_type(annotation: ast.expr) -> bool:
-        """Check if the annotation is any form of Persistent type"""
+        """Check if the annotation is any form of Persistent or IBPersistent type"""
         if isinstance(annotation, ast.Name):
-            # Simple case: Persistent
-            return annotation.id == 'Persistent'
+            return annotation.id in ('Persistent', 'IBPersistent', 'IBPersistentSeries')
         elif isinstance(annotation, ast.Subscript):
-            # Persistent[T] case
             if isinstance(annotation.value, ast.Name):
-                return annotation.value.id == 'Persistent'
+                return annotation.value.id in ('Persistent', 'IBPersistent', 'IBPersistentSeries')
         elif isinstance(annotation, ast.Attribute):
-            # module.Persistent case
-            return annotation.attr == 'Persistent'
+            return annotation.attr in ('Persistent', 'IBPersistent', 'IBPersistentSeries')
+        return False
+
+    @staticmethod
+    def _is_varip_type(annotation: ast.expr) -> bool:
+        """Check if the annotation is an IBPersistent type (not regular Persistent)"""
+        if isinstance(annotation, ast.Name):
+            return annotation.id in ('IBPersistent', 'IBPersistentSeries')
+        elif isinstance(annotation, ast.Subscript):
+            if isinstance(annotation.value, ast.Name):
+                return annotation.value.id in ('IBPersistent', 'IBPersistentSeries')
+        elif isinstance(annotation, ast.Attribute):
+            return annotation.attr in ('IBPersistent', 'IBPersistentSeries')
         return False
 
     @staticmethod
@@ -421,6 +466,12 @@ class PersistentTransformer(ast.NodeTransformer):
 
             # Store the mapping
             self.persistent_vars[self.current_scope][var_name] = global_name
+
+            # Track varip variables separately
+            if self._is_varip_type(node.annotation):
+                if self.current_scope not in self.varip_vars:
+                    self.varip_vars[self.current_scope] = {}
+                self.varip_vars[self.current_scope][var_name] = global_name
 
             # Track this variable in current scope
             if self.current_scope:

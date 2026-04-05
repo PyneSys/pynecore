@@ -496,6 +496,12 @@ class ScriptRunner:
                     magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
+            # Initialize calc_on_order_fills snapshot (only for strategies with COOF)
+            var_snapshot = None
+            if is_strat and self.script.calc_on_order_fills:
+                from .var_snapshot import VarSnapshot
+                var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
+
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_candle = next(ohlcv_iterator, None)
@@ -522,9 +528,34 @@ class ScriptRunner:
                 # Update last price
                 self.last_price = lib.close  # type: ignore
 
-                # Process limit orders
-                if is_strat and position:
+                # calc_on_order_fills path: snapshot, process, re-execute on fills
+                if var_snapshot and position:
+                    if var_snapshot.has_vars:
+                        var_snapshot.save()
+
+                    old_fills = position._fill_counter
                     position.process_orders()
+                    new_fills = position._fill_counter
+
+                    while new_fills > old_fills:
+                        if var_snapshot.has_vars:
+                            var_snapshot.restore()
+                        function_isolation.reset()
+                        lib._lib_semaphore = True
+                        for library_title, main_func in script._registered_libraries:
+                            main_func()
+                        lib._lib_semaphore = False
+                        self.script_module.main()
+                        old_fills = new_fills
+                        position.process_orders()
+                        new_fills = position._fill_counter
+
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                else:
+                    # Standard path (no COOF)
+                    if is_strat and position:
+                        position.process_orders()
 
                 # Execute registered library main functions before main script
                 lib._lib_semaphore = True
@@ -737,6 +768,12 @@ class ScriptRunner:
 
         trade_num = 0
 
+        # Initialize calc_on_order_fills snapshot for magnified path
+        var_snapshot = None
+        if is_strat and self.script.calc_on_order_fills:
+            from .var_snapshot import VarSnapshot
+            var_snapshot = VarSnapshot(self.script_module, self.script._registered_libraries)
+
         for window in magnifier:
             barstate.islast = window.is_last_window
 
@@ -751,7 +788,30 @@ class ScriptRunner:
             self.last_price = lib.close  # type: ignore
 
             # Process orders against each sub-bar for accurate fills
-            if position:
+            if var_snapshot and position:
+                if var_snapshot.has_vars:
+                    var_snapshot.save()
+
+                old_fills = position._fill_counter
+                position.process_orders_magnified(window.sub_bars, window.aggregated)
+                new_fills = position._fill_counter
+
+                while new_fills > old_fills:
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                    function_isolation.reset()
+                    lib._lib_semaphore = True
+                    for library_title, main_func in script._registered_libraries:
+                        main_func()
+                    lib._lib_semaphore = False
+                    self.script_module.main()
+                    old_fills = new_fills
+                    position.process_orders_magnified(window.sub_bars, window.aggregated)
+                    new_fills = position._fill_counter
+
+                if var_snapshot.has_vars:
+                    var_snapshot.restore()
+            elif position:
                 position.process_orders_magnified(window.sub_bars, window.aggregated)
 
             # Execute registered library main functions before main script
