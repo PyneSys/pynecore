@@ -5,7 +5,7 @@ title: "Script Format"
 description: "Structure and anatomy of a PyneCore script file"
 icon: "description"
 date: "2026-04-05"
-lastmod: "2026-04-05"Å
+lastmod: "2026-04-05"
 draft: false
 toc: true
 categories: ["Reference"]
