@@ -137,9 +137,10 @@ Inverse lookups are automatic: if you only have EUR/USD data but request
 
 ### Relationship to request.security() currency Parameter
 
-The `currency` parameter in `request.security()` (which auto-converts results to a target currency)
-is not yet implemented. `request.currency_rate()` provides the foundation for this: once available,
-the security currency parameter will use the same `CurrencyRateProvider` internally.
+The `currency` parameter in `request.security()` auto-converts results to a target currency using
+the same `CurrencyRateProvider`. When a `currency` argument is provided, the security runtime
+reads the source currency from the security context's TOML metadata, fetches the exchange rate
+via `request.currency_rate()`, and multiplies the result automatically.
 
 ### File Reference
 

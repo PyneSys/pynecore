@@ -49,10 +49,10 @@ Evaluates an expression from a specified symbol and timeframe.
 | symbol | str | Symbol to request (e.g., "BTCUSD", "SPY") |
 | timeframe | str | Timeframe as string (e.g., "60", "D", "W") |
 | expression | any | Expression to evaluate in the target context |
-| gaps | barmerge | Gap handling mode (only `barmerge.gaps_off` supported) |
+| gaps | barmerge | Gap handling mode (`barmerge.gaps_off` or `barmerge.gaps_on`) |
 | lookahead | barmerge | Lookahead mode (only `barmerge.lookahead_off` supported) |
 | ignore_invalid_symbol | bool | Return `na` for invalid symbols instead of raising an error |
-| currency | str | Currency for conversion (not yet used) |
+| currency | str | Target currency — auto-converts result using `CurrencyRateProvider` |
 | calc_bars_count | int | Number of bars to calculate (not yet used) |
 
 **Returns:** The result of the expression evaluated in the target context. Type matches the expression type.
@@ -75,7 +75,7 @@ Requests intrabar values from a lower timeframe, returning an array of values pe
 | timeframe | str | Lower timeframe (must be ≤ chart timeframe) |
 | expression | any | Expression to evaluate per intrabar |
 | ignore_invalid_symbol | bool | Return empty array for invalid symbols |
-| currency | str | Currency for conversion (not yet used) |
+| currency | str | Target currency — auto-converts result using `CurrencyRateProvider` |
 | ignore_invalid_timeframe | bool | Ignore invalid timeframe errors |
 | calc_bars_count | int | Number of bars to calculate (not yet used) |
 
@@ -202,5 +202,7 @@ Requests volume footprint data for the current bar.
 - **Fully implemented**: `request.security()`, `request.security_lower_tf()`, `request.currency_rate()`
 - **Partial support**: `request.dividends()`, `request.earnings()`, `request.splits()` — return `na` when `ignore_invalid_symbol=True`, raise `NotImplementedError` otherwise
 - **Not available**: `request.economic()`, `request.financial()`, `request.footprint()`, `request.quandl()`, `request.seed()`
+- **Gap handling**: Both `barmerge.gaps_off` (forward-fill, default) and `barmerge.gaps_on` (return `na` between periods) are supported
+- **Currency conversion**: The `currency` parameter auto-converts results using `CurrencyRateProvider` when OHLCV metadata for the currency pair is available
 - **Safety constraint**: Only `barmerge.lookahead_off` is supported for `request.security()` — lookahead is deliberately disabled for production safety
 - **Data sources**: `request.security()` and `request.security_lower_tf()` require separate OHLCV data files per symbol/timeframe. `request.currency_rate()` uses OHLCV metadata to auto-detect currency pairs.

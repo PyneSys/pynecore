@@ -91,7 +91,7 @@ is_session_end: bool = session.islastbar  # True at session close
 
 ### ismarket
 
-Returns `True` if the current bar is within regular market hours, `False` otherwise. Always `False` on daily or longer timeframes.
+Returns `True` if the current bar is within regular market hours, `False` otherwise. On daily or longer timeframes, the result depends on whether the bar's time range overlaps with session hours — typically `True` for trading days.
 
 **Type:** `bool`
 
@@ -137,4 +137,4 @@ after_hours: bool = session.ispostmarket  # Always False
 
 - **Extended session modes**: The `session.extended` constant is defined but extended session detection is not fully implemented. `isfirstbar` and `islastbar` currently behave identically to `isfirstbar_regular` and `islastbar_regular`.
 - **Pre/post-market detection**: `ispremarket` and `ispostmarket` are not yet implemented and always return `False`.
-- **Daily+ charts**: All session variables return `False` on daily, weekly, or monthly charts, as sessions apply only to intraday timeframes.
+- **Daily+ charts**: On daily or longer timeframes, session variables still evaluate using normal session overlap logic. Results depend on whether the bar's time range overlaps with configured session hours. This may differ from TradingView, which returns `False` for all session variables on daily+ charts.

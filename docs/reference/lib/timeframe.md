@@ -48,7 +48,7 @@ Detects if the current bar is the first bar of a new timeframe.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| timeframe | str | The timeframe to check (e.g., "D", "W", "60", "4H") |
+| timeframe | str | The timeframe to check (e.g., "D", "W", "60", "240") |
 
 **Returns:** `bool`
 
@@ -81,11 +81,11 @@ Converts a timeframe string into the equivalent number of seconds.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| timeframe | str | Timeframe string (e.g., "D", "W", "60", "4H") |
+| timeframe | str | Timeframe string (e.g., "D", "W", "60", "240") |
 
 **Returns:** `int`
 
-Parses timeframe strings and returns the total seconds. Handles minute values ("5", "60"), hours ("H", "4H"), days ("D"), weeks ("W"), and months ("M").
+Parses timeframe strings and returns the total seconds. Handles minute values ("5", "60", "240"), seconds ("5S"), days ("D"), weeks ("W"), and months ("M"). There is no "H" suffix — hours are expressed in minutes (e.g., "240" for 4 hours).
 
 ```python
 seconds: int = timeframe.in_seconds("D")  # 86400
@@ -167,7 +167,7 @@ The multiplier component of the current timeframe resolution.
 
 **Type:** `int`
 
-Represents the numeric multiplier of the timeframe unit. For example: 60 on a "60-minute" chart, 4 on a "4-hour" chart, 1 on a "D" (daily) chart.
+Represents the numeric multiplier of the timeframe unit. For example: 60 on a "60" (60-minute) chart, 240 on a "240" (4-hour) chart, 1 on a "D" (daily) chart.
 
 ```python
 mult: int = timeframe.multiplier
