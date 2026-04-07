@@ -33,6 +33,9 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     ohlcv_path: Path | None = None
     """Path to the OHLCV data file."""
 
+    fetch_all_by_default: bool = False
+    """If True, fetch all available data when no start date is given (instead of 1 year)."""
+
     @classmethod
     @abstractmethod
     def to_tradingview_timeframe(cls, timeframe: str) -> str:
@@ -65,7 +68,7 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         :param provider_name: Override provider name in filename.
         :return: Path to the OHLCV file.
         """
-        return ohlv_dir / (f"{provider_name or cls.__name__.lower().replace('provider', '')}"
+        return ohlv_dir / (f"{provider_name or cls.__name__.lower().replace('provider', '').replace('plugin', '')}"
                            f"_{symbol.replace('/', '_').replace(':', '_').upper()}"
                            f"_{timeframe}.ohlcv")
 

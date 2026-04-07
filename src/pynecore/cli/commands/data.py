@@ -203,7 +203,7 @@ def download(
                     resolved_from = datetime.fromtimestamp(end_ts, UTC)
                     # We need to add one interval to the start date to avoid downloading the same data
                     resolved_from += timedelta(seconds=interval)
-                elif provider.value == 'tv':  # TV provider: fetch all available data
+                elif getattr(provider_class, 'fetch_all_by_default', False):
                     resolved_from = None
                 else:  # No data, download one year as default
                     resolved_from = datetime.now(UTC) - timedelta(days=365)
