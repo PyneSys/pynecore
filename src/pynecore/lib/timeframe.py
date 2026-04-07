@@ -1,3 +1,8 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pynecore.types.type_checker import *
+
 from functools import lru_cache
 from datetime import datetime, timedelta, UTC
 
@@ -5,6 +10,7 @@ from ..core.module_property import module_property
 
 from .. import lib
 from . import syminfo as _syminfo
+
 from pynecore.core.datetime import parse_timezone as _parse_timezone
 
 __all__ = [
@@ -82,6 +88,8 @@ def _get_first_session_start_in_day(dt: datetime) -> datetime | None:
     :param dt: The datetime to check (in UTC)
     :return: First session start time in UTC
     """
+    if not isinstance(_syminfo.timezone, str):
+        return None
     local_dt = dt.astimezone(_parse_timezone(_syminfo.timezone))
     weekday = local_dt.weekday()
 
@@ -125,7 +133,7 @@ def _get_new_year_session(dt: datetime) -> datetime | None:
             nydt_utc += timedelta(days=1)
             continue
         # Found the next new year session, which will be the next anchor
-        return ss.astimezone(_parse_timezone(_syminfo.timezone))
+        return ss.astimezone(_parse_timezone(str(_syminfo.timezone)))
 
 
 # noinspection PyProtectedMember
@@ -139,9 +147,9 @@ def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_se
     :return: True if this is the first candle of a new session
     """
     if tf_sec is None:
-        tf_sec = in_seconds(_syminfo.period)
+        tf_sec: int = in_seconds(_syminfo.period)
     if prev_dt is None:
-        prev_dt = current_dt - timedelta(seconds=tf_sec)
+        prev_dt: datetime = current_dt - timedelta(seconds=tf_sec)
 
     current_weekday = current_dt.weekday()
     prev_weekday = prev_dt.weekday()
@@ -437,7 +445,7 @@ def in_seconds(timeframe: str | None = None) -> int:
     :raises ValueError: If the timeframe is invalid
     """
     if timeframe is None:
-        timeframe = str(_syminfo.period)
+        timeframe: str = str(_syminfo.period)
     _modifier, _multiplier = _process_tf(timeframe)
     if _modifier == 'S':
         return _multiplier

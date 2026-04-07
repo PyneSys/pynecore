@@ -170,7 +170,7 @@ def diff(id1: Matrix | NA, id2: Matrix | int | float | NA) -> Matrix | NA:
     :param id2: Matrix object or scalar value to be subtracted.
     :return: A new matrix containing the difference.
     """
-    if isinstance(id1, NA):
+    if isinstance(id1, NA) or isinstance(id2, NA):
         return NA(Matrix)
     return id1.diff(id2)
 
@@ -465,7 +465,7 @@ def mult(id1: Matrix | NA, id2: Matrix | list[Any] | int | float | NA) -> Matrix
     :param id2: Second matrix object, array, or scalar value.
     :return: A new matrix or array containing the product.
     """
-    if isinstance(id1, NA):
+    if isinstance(id1, NA) or isinstance(id2, NA):
         return NA(Matrix)
     return id1.mult(id2)
 
@@ -647,7 +647,7 @@ def sum(id1: Matrix | NA, id2: Matrix | int | float | NA) -> Matrix | NA:
     :param id2: Second matrix object or scalar value.
     :return: A new matrix containing the sum.
     """
-    if isinstance(id1, NA):
+    if isinstance(id1, NA) or isinstance(id2, NA):
         return NA(Matrix)
     return id1.sum(id2)
 

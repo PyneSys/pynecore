@@ -21,8 +21,8 @@ class PersistentTransformer(ast.NodeTransformer):
         # Track variables defined as Persistent in each scope
         self.persistent_declarations: dict[str, set[str]] = {}  # scope -> set(persistent_var_names)
 
-        self.all_persistent_vars = {}
-        self.all_local_vars = {}
+        self.all_persistent_vars: dict[tuple[str, str], str] = {}
+        self.all_local_vars: dict[str, set[str]] = {}
         self.current_verifying_scope = None  # Track scope during verification
 
     def _get_scope_persistents(self, var_name: str) -> str | None:
@@ -153,10 +153,10 @@ class PersistentTransformer(ast.NodeTransformer):
                         keys=[ast.Constant(value=k) for k in varip_vars_dict],
                         values=[
                             ast.Tuple(
-                                elts=[ast.Constant(value=var) for var in vars],
+                                elts=[ast.Constant(value=var) for var in var_names],
                                 ctx=ast.Load()
                             )
-                            for vars in varip_vars_dict.values()
+                            for var_names in varip_vars_dict.values()
                         ]
                     )
                 )
@@ -195,7 +195,7 @@ class PersistentTransformer(ast.NodeTransformer):
                 self.current_verifying_scope = f"{self.current_verifying_scope}·{node.name}"
 
             # Process function and update scope back when done
-            result = self._process_verify_node(cast(ast.FunctionDef, node))
+            result = self._process_verify_node(node)
             self.current_verifying_scope = old_scope
             return result
 
@@ -334,12 +334,13 @@ class PersistentTransformer(ast.NodeTransformer):
                     if init_flag in self.initialized_flags.get(self.current_scope, set()):
                         globals_to_declare.add(init_flag)
 
-        # Csak akkor adjuk hozzá a globális deklarációt, ha van mit deklarálni
+        # Only add global declaration if there are globals to declare
         if globals_to_declare:
             insert_pos = 0
-            if (node.body and isinstance(node.body[0], ast.Expr) and
-                    isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant) and
-                    isinstance(cast(ast.Constant, cast(ast.Expr, node.body[0]).value).value, str)):
+            first_stmt = node.body[0] if node.body else None
+            if (isinstance(first_stmt, ast.Expr) and
+                    isinstance(first_stmt.value, ast.Constant) and
+                    isinstance(first_stmt.value.value, str)):
                 insert_pos = 1
 
             node.body.insert(insert_pos, ast.Global(names=sorted(globals_to_declare)))
@@ -616,9 +617,10 @@ class PersistentTransformer(ast.NodeTransformer):
                     compensation_var = f"{global_name}_kahan_c__"
 
                     # Add compensation variable to module level if not already there
-                    if compensation_var not in [assign.targets[0].id for assign in self.module_level_assigns
+                    if compensation_var not in [t.id
+                                                for assign in self.module_level_assigns
                                                 if isinstance(assign, ast.Assign) and len(assign.targets) == 1
-                                                   and isinstance(assign.targets[0], ast.Name)]:
+                                                for t in assign.targets if isinstance(t, ast.Name)]:
                         self.module_level_assigns.append(
                             ast.Assign(
                                 targets=[ast.Name(id=compensation_var, ctx=ast.Store())],

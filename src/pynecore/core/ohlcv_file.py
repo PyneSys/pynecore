@@ -11,7 +11,7 @@ The file is a binary file with the following 24 bytes structure:
 
 The .ohlcv format cannot have gaps in it. All gaps are filled with the previous close price and -1 volume.
 """
-from typing import Iterator, cast
+from typing import Iterator
 
 import csv
 import json
@@ -20,11 +20,6 @@ import mmap
 import os
 import struct
 from collections import Counter
-try:
-    from collections.abc import Buffer
-except ImportError:
-    # Python < 3.12 compatibility: Buffer was added in 3.12
-    Buffer = bytes  # type: ignore
 from datetime import datetime, time, timedelta, timezone as dt_timezone, UTC
 from io import BufferedWriter, BufferedRandom
 from math import gcd as math_gcd
@@ -37,7 +32,7 @@ from ..core.syminfo import SymInfoInterval
 RECORD_SIZE = 24  # 6 * 4
 STRUCT_FORMAT = 'Ifffff'  # I: uint32, f: float32
 
-__all__ = ['OHLCVWriter', 'OHLCVReader']
+__all__ = ['OHLCVWriter', 'OHLCVReader', 'RECORD_SIZE', 'STRUCT_FORMAT']
 
 
 def _format_float(value: float) -> str:
@@ -186,6 +181,7 @@ def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=
     if timezone and dt is not None and dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone)
 
+    assert dt is not None
     return int(dt.timestamp())
 
 
@@ -254,6 +250,7 @@ class OHLCVWriter:
         """
         Datetime of the first record
         """
+        assert self._start_timestamp is not None
         return datetime.fromtimestamp(self._start_timestamp, UTC)
 
     @property
@@ -270,9 +267,10 @@ class OHLCVWriter:
         """
         Datetime of the last record
         """
-        if self.end_timestamp is None:
+        ts = self.end_timestamp
+        if ts is None:
             return None
-        return datetime.fromtimestamp(self.end_timestamp, UTC)
+        return datetime.fromtimestamp(ts, UTC)
 
     @property
     def interval(self) -> int | None:
@@ -340,12 +338,13 @@ class OHLCVWriter:
         self._size = os.path.getsize(self.path) // RECORD_SIZE
 
         # Read initial metadata if file exists
+        assert self._file is not None
         if self._size >= 2:
             self._file.seek(0)
-            data: Buffer = self._file.read(4)
+            data = self._file.read(4)
             first_timestamp = struct.unpack('I', data)[0]
             self._file.seek(RECORD_SIZE)
-            data: Buffer = self._file.read(4)
+            data = self._file.read(4)
             second_timestamp = struct.unpack('I', data)[0]
             self._start_timestamp = first_timestamp
             self._interval = second_timestamp - first_timestamp
@@ -378,8 +377,9 @@ class OHLCVWriter:
         elif self._size == 1:
             # First interval detection
             assert self._start_timestamp is not None
-            self._interval = candle.timestamp - self._start_timestamp
-            if self._interval <= 0:
+            interval = candle.timestamp - self._start_timestamp
+            self._interval = interval
+            if interval <= 0:
                 raise ValueError(f"Invalid interval: {self._interval}")
         elif self._size >= 2:  # Changed from elif self._size == 2: to properly handle all cases
             # Check chronological order
@@ -407,13 +407,13 @@ class OHLCVWriter:
                 if candle.timestamp > expected_ts:
                     # Get previous candle's close price
                     self._file.seek((self._current_pos - 1) * RECORD_SIZE)
-                    data: Buffer = self._file.read(RECORD_SIZE)
-                    prev_data = struct.unpack(STRUCT_FORMAT, data)
+                    prev_record = self._file.read(RECORD_SIZE)
+                    prev_data = struct.unpack(STRUCT_FORMAT, prev_record)
                     prev_close = prev_data[4]  # 4th index is close price
 
                     # Fill gap with previous close and -1 volume (gap indicator)
                     while expected_ts < candle.timestamp:
-                        gap_data: Buffer = struct.pack(STRUCT_FORMAT,
+                        gap_data = struct.pack(STRUCT_FORMAT,
                                                        expected_ts, prev_close, prev_close,
                                                        prev_close, prev_close, -1.0)
                         self._file.seek(self._current_pos * RECORD_SIZE)
@@ -424,9 +424,9 @@ class OHLCVWriter:
 
         # Write actual data
         self._file.seek(self._current_pos * RECORD_SIZE)
-        data: Buffer = struct.pack(STRUCT_FORMAT,
-                                   candle.timestamp, candle.open, candle.high,
-                                   candle.low, candle.close, candle.volume)
+        data = struct.pack(STRUCT_FORMAT,
+                           candle.timestamp, candle.open, candle.high,
+                           candle.low, candle.close, candle.volume)
         self._file.write(data)
         self._file.flush()
 
@@ -573,7 +573,7 @@ class OHLCVWriter:
         for c in self._price_changes[:100]:
             if c > 0:
                 # Convert to float32 and back
-                float32_val = struct.unpack('f', cast(Buffer, struct.pack('f', c)))[0]
+                float32_val = struct.unpack('f', struct.pack('f', c))[0]
                 # Round to reasonable precision for float32
                 rounded = round(float32_val, 6)
                 if rounded > 0:
@@ -634,7 +634,7 @@ class OHLCVWriter:
         for change in self._price_changes[:200]:  # Use more samples for histogram
             if change > 0:
                 # Round to float32 precision
-                float32_val = struct.unpack('f', cast(Buffer, struct.pack('f', change)))[0]
+                float32_val = struct.unpack('f', struct.pack('f', change))[0]
                 changes.append(float32_val)
 
         if len(changes) < 5:
@@ -794,7 +794,7 @@ class OHLCVWriter:
                 if len(data) == RECORD_SIZE:
                     # Unpack the record
                     timestamp, open_val, high, low, close, volume = \
-                        struct.unpack('Ifffff', cast(Buffer, data))
+                        struct.unpack('Ifffff', data)
 
                     # Only collect if volume > 0 (real trading)
                     if volume > 0:
@@ -843,14 +843,14 @@ class OHLCVWriter:
 
         # For daily or larger timeframes, analyze which days have trading
         if self._interval and self._interval >= 86400:  # >= 1 day
-            self._analyzed_opening_hours = []
+            hours: list = []
             days_with_trading = set(day for day, hour in self._trading_hours.keys())
 
             # Check if it's 24/7 (all 7 days have trading)
             if len(days_with_trading) == 7:
                 # 24/7 trading pattern
                 for day in range(1, 8):
-                    self._analyzed_opening_hours.append(SymInfoInterval(
+                    hours.append(SymInfoInterval(
                         day=day,
                         start=time(0, 0, 0),
                         end=time(23, 59, 59)
@@ -858,7 +858,7 @@ class OHLCVWriter:
             elif days_with_trading <= {1, 2, 3, 4, 5}:  # Monday-Friday only
                 # Business days pattern (stock/forex)
                 for day in range(1, 6):
-                    self._analyzed_opening_hours.append(SymInfoInterval(
+                    hours.append(SymInfoInterval(
                         day=day,
                         start=time(9, 30, 0),  # Default to US market hours
                         end=time(16, 0, 0)
@@ -866,11 +866,12 @@ class OHLCVWriter:
             else:
                 # Mixed pattern - include all days that have trading
                 for day in sorted(days_with_trading):
-                    self._analyzed_opening_hours.append(SymInfoInterval(
+                    hours.append(SymInfoInterval(
                         day=day,
                         start=time(0, 0, 0),  # Default to full day for daily data
                         end=time(23, 59, 59)
                     ))
+            self._analyzed_opening_hours = hours
             return
 
         # For intraday data, analyze hourly patterns
@@ -884,17 +885,18 @@ class OHLCVWriter:
 
             # If low variance, it's likely 24/7
             if variance < avg_count * 0.5:
-                self._analyzed_opening_hours = []
+                hours = []
                 for day in range(1, 8):
-                    self._analyzed_opening_hours.append(SymInfoInterval(
+                    hours.append(SymInfoInterval(
                         day=day,
                         start=time(0, 0, 0),
                         end=time(23, 59, 59)
                     ))
+                self._analyzed_opening_hours = hours
                 return
 
         # Analyze per-day patterns for intraday
-        self._analyzed_opening_hours = []
+        hours = []
 
         for day in range(1, 8):  # Monday to Sunday
             # Get all hours for this day
@@ -937,20 +939,22 @@ class OHLCVWriter:
 
             # Convert periods to SymInfoInterval
             for start_hour, end_hour in periods:
-                self._analyzed_opening_hours.append(SymInfoInterval(
+                hours.append(SymInfoInterval(
                     day=day,
                     start=time(start_hour, 0, 0),
                     end=time(end_hour, 59, 59)
                 ))
 
         # If no opening hours detected, default to business hours
-        if not self._analyzed_opening_hours:
+        if not hours:
             for day in range(1, 6):  # Monday to Friday
-                self._analyzed_opening_hours.append(SymInfoInterval(
+                hours.append(SymInfoInterval(
                     day=day,
                     start=time(9, 30, 0),
                     end=time(16, 0, 0)
                 ))
+
+        self._analyzed_opening_hours = hours
 
     def _rebuild_with_correct_interval(self, new_interval: int) -> None:
         """
@@ -974,8 +978,8 @@ class OHLCVWriter:
             offset = i * RECORD_SIZE
             self._file.seek(offset)
             data = self._file.read(RECORD_SIZE)
-            if len(cast(bytes, data)) == RECORD_SIZE:
-                record = struct.unpack(STRUCT_FORMAT, cast(Buffer, data))
+            if len(data) == RECORD_SIZE:
+                record = struct.unpack(STRUCT_FORMAT, data)
                 current_records.append(OHLCV(*record, extra_fields={}))
 
         # Create temp file for rebuilding
@@ -998,22 +1002,23 @@ class OHLCVWriter:
             shutil.move(temp_path, self.path)
 
             # Reopen the file
-            self._file = open(self.path, 'rb+')
+            f = open(self.path, 'rb+')
+            self._file = f
             self._size = os.path.getsize(self.path) // RECORD_SIZE
 
             # Reset interval to the correct one
             self._interval = new_interval
 
             # Position at end for appending
-            self._file.seek(0, os.SEEK_END)
+            f.seek(0, os.SEEK_END)
             self._current_pos = self._size
 
             # Update last timestamp
             if self._size > 0:
-                self._file.seek((self._size - 1) * RECORD_SIZE)
-                data: Buffer = self._file.read(4)
+                f.seek((self._size - 1) * RECORD_SIZE)
+                data = f.read(4)
                 self._last_timestamp = struct.unpack('I', data)[0]
-                self._file.seek(0, os.SEEK_END)
+                f.seek(0, os.SEEK_END)
 
         except Exception as e:
             # Clean up temp file on error
@@ -1025,9 +1030,9 @@ class OHLCVWriter:
             raise IOError(f"Failed to rebuild file with correct interval: {e}")
 
     def _parse_and_write_ohlcv_row(self, ts_str: str, row: list[str],
-                                    o_idx: int, h_idx: int, l_idx: int, c_idx: int, v_idx: int,
-                                    timestamp_format: str | None,
-                                    timezone: dt_timezone | ZoneInfo | None) -> None:
+                                   o_idx: int, h_idx: int, l_idx: int, c_idx: int, v_idx: int,
+                                   timestamp_format: str | None,
+                                   timezone: dt_timezone | ZoneInfo | None) -> None:
         """
         Parse timestamp and write OHLCV row with error handling.
 
@@ -1085,7 +1090,8 @@ class OHLCVWriter:
             headers = [h.lower() for h in next(reader)]  # Case insensitive
 
             # Find timestamp and OHLCV columns
-            timestamp_idx, date_idx, time_idx = _find_timestamp_columns(headers, timestamp_column, date_column, time_column)
+            timestamp_idx, date_idx, time_idx = _find_timestamp_columns(headers, timestamp_column, date_column,
+                                                                        time_column)
             o_idx, h_idx, l_idx, c_idx, v_idx = _find_ohlcv_columns(headers)
 
             # Process data rows
@@ -1095,11 +1101,12 @@ class OHLCVWriter:
                     # Combine date and time
                     ts_str = f"{row[date_idx]} {row[time_idx]}"
                 else:
+                    assert timestamp_idx is not None
                     ts_str = row[timestamp_idx]
 
                 # Parse and write row
                 self._parse_and_write_ohlcv_row(ts_str, row, o_idx, h_idx, l_idx, c_idx, v_idx,
-                                                 timestamp_format, timezone)
+                                                timestamp_format, timezone)
 
     def load_from_txt(self, path: str | Path,
                       timestamp_format: str | None = None,
@@ -1185,7 +1192,7 @@ class OHLCVWriter:
 
             # Parse and write row
             self._parse_and_write_ohlcv_row(ts_str, row, o_idx, h_idx, l_idx, c_idx, v_idx,
-                                             timestamp_format, timezone)
+                                            timestamp_format, timezone)
 
     @staticmethod
     def _parse_txt_line(line: str, delimiter: str) -> list[str]:
@@ -1287,14 +1294,14 @@ class OHLCVWriter:
         timezone = _parse_timezone_param(tz)
 
         # Setup field mapping
-        mapping = mapping or {}
+        field_mapping: dict[str, str] = mapping or {}
         field_map = {
-            'timestamp': mapping.get('timestamp', timestamp_field),
-            'open': mapping.get('open', 'open'),
-            'high': mapping.get('high', 'high'),
-            'low': mapping.get('low', 'low'),
-            'close': mapping.get('close', 'close'),
-            'volume': mapping.get('volume', 'volume')
+            'timestamp': field_mapping.get('timestamp', timestamp_field),
+            'open': field_mapping.get('open', 'open'),
+            'high': field_mapping.get('high', 'high'),
+            'low': field_mapping.get('low', 'low'),
+            'close': field_mapping.get('close', 'close'),
+            'volume': field_mapping.get('volume', 'volume')
         }
 
         # Load JSON file
@@ -1404,6 +1411,7 @@ class OHLCVReader:
         """
         Datetime of the first record
         """
+        assert self._start_timestamp is not None
         return datetime.fromtimestamp(self._start_timestamp, UTC)
 
     @property
@@ -1418,7 +1426,7 @@ class OHLCVReader:
         # This is necessary because gap filling may create non-uniform intervals
         if self._mmap and self._size > 0:
             last_record_offset = (self._size - 1) * RECORD_SIZE
-            return struct.unpack('I', cast(Buffer, self._mmap[last_record_offset:last_record_offset + 4]))[0]
+            return struct.unpack('I', self._mmap[last_record_offset:last_record_offset + 4])[0]
 
         return None
 
@@ -1427,7 +1435,9 @@ class OHLCVReader:
         """
         Datetime of the last record
         """
-        return datetime.fromtimestamp(self.end_timestamp, UTC)
+        ts = self.end_timestamp
+        assert ts is not None
+        return datetime.fromtimestamp(ts, UTC)
 
     @property
     def interval(self) -> int | None:
@@ -1466,8 +1476,8 @@ class OHLCVReader:
             self._size = os.path.getsize(self.path) // RECORD_SIZE
 
             if self._size >= 2:
-                self._start_timestamp = struct.unpack('I', cast(Buffer, self._mmap[0:4]))[0]
-                second_timestamp = struct.unpack('I', cast(Buffer, self._mmap[RECORD_SIZE:RECORD_SIZE + 4]))[0]
+                self._start_timestamp = struct.unpack('I', self._mmap[0:4])[0]
+                second_timestamp = struct.unpack('I', self._mmap[RECORD_SIZE:RECORD_SIZE + 4])[0]
                 self._interval = second_timestamp - self._start_timestamp
 
         self._load_extra_csv()
@@ -1509,7 +1519,7 @@ class OHLCVReader:
             col_is_numeric = [v if v is not None else False for v in col_is_numeric]
 
             # Parse all rows with detected types
-            self._extra_data = []
+            extra_data: list[dict[str, int | float | str]] = []
             for row in rows_raw:
                 parsed: dict[str, int | float | str] = {}
                 for i, header in enumerate(headers):
@@ -1521,7 +1531,8 @@ class OHLCVReader:
                             parsed[header] = float(val)
                     else:
                         parsed[header] = val
-                self._extra_data.append(parsed)
+                extra_data.append(parsed)
+            self._extra_data = extra_data
 
     def __iter__(self) -> Iterator[OHLCV]:
         """

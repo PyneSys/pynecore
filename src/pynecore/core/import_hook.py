@@ -7,6 +7,12 @@ import re
 from pathlib import Path
 
 
+def _cache_from_source(source_path: Path) -> Path:
+    """Return the __pycache__/*.pyc path for a given .py source path."""
+    tag = sys.implementation.cache_tag
+    return source_path.parent / "__pycache__" / f"{source_path.stem}.{tag}.pyc"
+
+
 class PyneLoader(importlib.machinery.SourceFileLoader):
     """Loader that handles AST transformation"""
 
@@ -18,7 +24,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # Create marker file for pynecore site-packages to indicate we processed this file
         if (os.path.sep + 'site-packages' + os.path.sep in str(path).lower()
                 and os.path.sep + 'pynecore' + os.path.sep in str(path).lower()):
-            pyc_path = Path(importlib.util.cache_from_source(str(path)))
+            pyc_path = _cache_from_source(path)
             cache_dir = pyc_path.parent
             marker_path = pyc_path.parent / f'{pyc_path.name}.pyne'
             try:
@@ -58,6 +64,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
 
             # Transform AST - lazy import transformers only when needed
             from pynecore.transformers.import_lifter import ImportLifterTransformer
+            from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
             from pynecore.transformers.security import SecurityTransformer
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
@@ -73,6 +80,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
 
             transformed = ImportLifterTransformer().visit(transformed)
+            transformed = TypeCheckingStripperTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
             transformed = SecurityTransformer().visit(transformed)
             transformed = PersistentSeriesTransformer().visit(transformed)
@@ -144,7 +152,7 @@ class PyneImportHook:
                     # Check if pynecore site-packages bytecode needs recompilation
                     if (os.path.sep + 'site-packages' + os.path.sep in str(py_path).lower() and
                             os.path.sep + 'pynecore' + os.path.sep in str(py_path).lower()):
-                        pyc_path = Path(importlib.util.cache_from_source(str(py_path)))
+                        pyc_path = _cache_from_source(py_path)
                         marker_path = pyc_path.parent / f'{pyc_path.name}.pyne'
 
                         need_recompile = False

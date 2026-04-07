@@ -18,6 +18,7 @@ def reset():
     _function_cache.clear()
 
 
+# noinspection PyUnresolvedReferences
 def isolate_function(
         func: FunctionType | Callable, call_id: str | None, parent_scope: str,
         closure_argument_count: int = -1, call_counter: int = 0
@@ -46,7 +47,7 @@ def isolate_function(
 
     # Check if this is an Exported proxy and unwrap it
     if isinstance(func, Exported):
-        unwrapped_func = func.__fn__
+        unwrapped_func: FunctionType = func.__fn__  # type: ignore
         if unwrapped_func is None:
             raise ValueError("Exported proxy has not been initialized with a function yet")
         func = unwrapped_func

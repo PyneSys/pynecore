@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, Iterator, cast
+from typing import TypeVar, Generic, Iterator, cast, overload
 
 from types import ModuleType
 
@@ -168,13 +168,21 @@ class SeriesImpl(Generic[T]):
         :return: The value that was set, or na if buffer is empty.
         """
         if self._size == 0:
-            return cast(NA[T], NA())
+            return NA(T)
 
         pos = self._write_pos - 1
         if pos < 0:
             pos += self._capacity
         self._buffer[pos] = value
         return value
+
+    @overload
+    def __getitem__(self, key: int) -> T | NA[T]:
+        ...
+
+    @overload
+    def __getitem__(self, key: slice) -> ReadOnlySeriesView[T]:
+        ...
 
     def __getitem__(self, key: int | slice) -> T | NA[T] | ReadOnlySeriesView[T]:
         """
@@ -193,12 +201,12 @@ class SeriesImpl(Generic[T]):
             if key < 0:
                 raise IndexError("Negative indices not supported!")
             if key >= self._size:
-                return cast(NA[T], NA())
+                return NA(T)
             pos = self._write_pos - 1 - key
             if pos < 0:
                 pos += self._capacity
             result = self._buffer[pos]
-            return cast(T | NA[T], result)
+            return result
 
         elif isinstance(key, slice):
             # Handle slice notation
@@ -219,7 +227,7 @@ class SeriesImpl(Generic[T]):
                 start = stop
 
             return ReadOnlySeriesView[T](
-                cast(list[T | NA[T] | None], self._buffer),
+                self._buffer,
                 self._capacity,
                 self._write_pos,
                 self._size,

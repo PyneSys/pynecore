@@ -12,9 +12,7 @@ class APIErrorHandler:
     """Context manager that provides centralized API error handling."""
 
     def __init__(self, console: Console | None = None):
-        if not console:
-            console = Console()
-        self.console = console
+        self.console: Console = console or Console()
 
     def __enter__(self):
         return self

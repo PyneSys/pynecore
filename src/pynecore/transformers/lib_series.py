@@ -1,5 +1,5 @@
 import ast
-from typing import Dict, Set, cast
+from typing import cast
 
 # Builtin price series that are always global (declared in main, not nested functions)
 BUILTIN_PRICE_SERIES = frozenset({
@@ -21,10 +21,10 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
     """
 
     def __init__(self):
-        self.lib_series_vars: Dict[
-            str, Dict[str, tuple[str, ast.AST]]] = {}  # module -> {attr -> (local_name, type_annotation)}
-        self.used_series: Set[tuple[str, str, str]] = set()  # (module, attr, function) tuples that are used as Series
-        self.declarations_to_insert: Dict[str, list[ast.AnnAssign]] = {}  # function_name -> declarations
+        self.lib_series_vars: dict[
+            str, dict[str, tuple[str, ast.AST | None]]] = {}  # module -> {attr -> (local_name, type_annotation)}
+        self.used_series: set[tuple[str, str, str]] = set()  # (module, attr, function) tuples that are used as Series
+        self.declarations_to_insert: dict[str, list[ast.AnnAssign]] = {}  # function_name -> declarations
         self.current_function: str | None = None
         self.parent_functions: list[str] = []  # Stack of parent function names for nested function tracking
         self.module_level_declarations: list[ast.AnnAssign] = []  # Declarations for module level (main function)
@@ -182,7 +182,6 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
                 # Determine if this is a builtin price series in a nested function
                 # In that case, we need to use the global series name directly
                 # because the local variable is a scalar (from .add() return value)
-                attr_key = '·'.join(attr_chain[1:])
                 is_builtin_price = len(attr_chain) == 2 and attr_chain[1] in BUILTIN_PRICE_SERIES
 
                 if is_builtin_price and self.parent_functions:

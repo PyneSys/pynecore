@@ -140,8 +140,9 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
                     bound = impl.sig.bind(*args, **kwargs)
                     bound.apply_defaults()
 
-                    if all(_check_type(value, impl.type_hints.get(name, Any))
-                           for name, value in bound.arguments.items()):
+                    if all(_check_type(value, impl.type_hints[name])
+                           for name, value in bound.arguments.items()
+                           if name in impl.type_hints):
                         return isolate_function(impl.func, '__overloaded__', __scope_id__)(*args, **kwargs)
                 except TypeError:
                     continue

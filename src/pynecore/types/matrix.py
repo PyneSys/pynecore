@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypeVar, Generic, Any, Self
+from typing import TypeVar, Generic, Any, cast
 import copy
 from collections import Counter
 from .na import NA
@@ -8,20 +8,25 @@ from .na import NA
 T = TypeVar('T')
 
 
-def _is_na(val: Any) -> bool:
-    """Check if value is NA."""
-    return isinstance(val, NA)
-
-
 class Matrix(Generic[T]):
     """
     A matrix implementation in pure Python
     """
+    data: list[list[Any]]
 
     def __init__(self, rows: int = 0, cols: int = 0, initial_value: T = NA(T)):
         self.rows = rows
         self.cols = cols
         self.data = [[initial_value for _ in range(cols)] for _ in range(rows)]
+
+    @property
+    def rows(self) -> int:
+        """Return the number of rows in the matrix."""
+        return self._rows
+
+    @rows.setter
+    def rows(self, value: int) -> None:
+        self._rows = value
 
     def add_row(self, row: int | None = None, array_id: list[Any] | None = None) -> None:
         """
@@ -35,11 +40,10 @@ class Matrix(Generic[T]):
                         If matrix is empty, the array size determines the column count.
         :raises IndexError: If row index is out of bounds.
         """
-        if row is None:
-            row = self.rows
+        row_idx: int = self.rows if row is None else row
 
-        if row < 0 or row > self.rows:
-            raise IndexError(f"Row index {row} out of bounds for matrix with {self.rows} rows")
+        if row_idx < 0 or row_idx > self.rows:
+            raise IndexError(f"Row index {row_idx} out of bounds for matrix with {self.rows} rows")
 
         if array_id is not None:
             # If matrix is empty (0 columns), use array size to set column count
@@ -55,7 +59,7 @@ class Matrix(Generic[T]):
         else:
             new_row = [NA(T) for _ in range(self.cols)]
 
-        self.data.insert(row, new_row)
+        self.data.insert(row_idx, new_row)
         self.rows += 1
 
     def avg(self) -> float | int | NA[float]:
@@ -69,7 +73,7 @@ class Matrix(Generic[T]):
         count = 0
         for row in self.data:
             for val in row:
-                if not _is_na(val):
+                if not isinstance(val, NA):
                     total += val
                     count += 1
         return total / count if count > 0 else NA(float)
@@ -94,7 +98,7 @@ class Matrix(Generic[T]):
         """
         return self.cols
 
-    def concat(self, other: Self) -> Self:
+    def concat(self, other: Matrix) -> Matrix:
         """
         Append another matrix to this matrix.
 
@@ -111,7 +115,7 @@ class Matrix(Generic[T]):
         self.rows += other.rows
         return self
 
-    def copy(self) -> Self:
+    def copy(self) -> Matrix:
         """
         Create a new matrix which is a copy of the original.
 
@@ -141,7 +145,7 @@ class Matrix(Generic[T]):
         # For larger matrices, use LU decomposition
         return self._lu_determinant()
 
-    def diff(self, other: Self | int | float) -> Self:
+    def diff(self, other: Matrix | int | float) -> Matrix:
         """
         Return a new matrix resulting from subtraction.
 
@@ -184,13 +188,11 @@ class Matrix(Generic[T]):
         :param from_column: Column index from which the fill will begin (inclusive).
         :param to_column: Column index where the fill will end (exclusive). If None, fills to end.
         """
-        if to_row is None:
-            to_row = self.rows
-        if to_column is None:
-            to_column = self.cols
+        _to_row: int = self.rows if to_row is None else to_row
+        _to_col: int = self.cols if to_column is None else to_column
 
-        for i in range(from_row, to_row):
-            for j in range(from_column, to_column):
+        for i in range(from_row, _to_row):
+            for j in range(from_column, _to_col):
                 if 0 <= i < self.rows and 0 <= j < self.cols:
                     self.data[i][j] = value
 
@@ -226,10 +228,10 @@ class Matrix(Generic[T]):
 
         :return: The maximum value from the matrix.
         """
-        max_val = None
+        max_val: float | int | None = None
         for row in self.data:
             for val in row:
-                if not _is_na(val):
+                if not isinstance(val, NA):
                     if max_val is None or val > max_val:
                         max_val = val
         return max_val if max_val is not None else NA(float)
@@ -240,10 +242,10 @@ class Matrix(Generic[T]):
 
         :return: The minimum value from the matrix.
         """
-        min_val = None
+        min_val: float | int | None = None
         for row in self.data:
             for val in row:
-                if not _is_na(val):
+                if not isinstance(val, NA):
                     if min_val is None or val < min_val:
                         min_val = val
         return min_val if min_val is not None else NA(float)
@@ -257,7 +259,7 @@ class Matrix(Generic[T]):
         values = []
         for row in self.data:
             for val in row:
-                if not _is_na(val):
+                if not isinstance(val, NA):
                     values.append(val)
 
         if not values:
@@ -282,7 +284,7 @@ class Matrix(Generic[T]):
         values = []
         for row in self.data:
             for val in row:
-                if not _is_na(val):
+                if not isinstance(val, NA):
                     values.append(val)
 
         if not values:
@@ -299,7 +301,7 @@ class Matrix(Generic[T]):
         # Return smallest if multiple modes
         return min(modes)
 
-    def mult(self, other: Self | list[T] | int | float) -> Self | list[T]:
+    def mult(self, other: Matrix | list[T] | int | float) -> Matrix | list[T]:
         """
         Return the product of matrices, matrix and vector, or matrix and scalar.
 
@@ -350,15 +352,14 @@ class Matrix(Generic[T]):
         :return: An array containing the removed column's values.
         :raises IndexError: If column index is out of bounds.
         """
-        if column is None:
-            column = self.cols - 1
+        col_idx: int = (self.cols - 1) if column is None else column
 
-        if column < 0 or column >= self.cols:
-            raise IndexError(f"Column index {column} out of bounds")
+        if col_idx < 0 or col_idx >= self.cols:
+            raise IndexError(f"Column index {col_idx} out of bounds")
 
         removed = []
         for row in self.data:
-            removed.append(row.pop(column))
+            removed.append(row.pop(col_idx))
         self.cols -= 1
         return removed
 
@@ -370,13 +371,12 @@ class Matrix(Generic[T]):
         :return: An array containing the removed row's values.
         :raises IndexError: If row index is out of bounds.
         """
-        if row is None:
-            row = self.rows - 1
+        row_idx: int = (self.rows - 1) if row is None else row
 
-        if row < 0 or row >= self.rows:
-            raise IndexError(f"Row index {row} out of bounds")
+        if row_idx < 0 or row_idx >= self.rows:
+            raise IndexError(f"Row index {row_idx} out of bounds")
 
-        removed = self.data.pop(row)
+        removed = self.data.pop(row_idx)
         self.rows -= 1
         return removed
 
@@ -428,14 +428,6 @@ class Matrix(Generic[T]):
             raise IndexError(f"Row index {row} out of bounds")
         return self.data[row][:]
 
-    def rows(self) -> int:
-        """
-        Return the number of rows in the matrix.
-
-        :return: The number of rows.
-        """
-        return self.rows
-
     def sort(self, column: int = 0, order: str = 'ascending') -> None:
         """
         Rearrange rows following the sorted order of values in the specified column.
@@ -451,7 +443,7 @@ class Matrix(Generic[T]):
         self.data.sort(key=lambda row: row[column], reverse=reverse)
 
     def submatrix(self, from_row: int = 0, to_row: int | None = None,
-                  from_column: int = 0, to_column: int | None = None) -> Self:
+                  from_column: int = 0, to_column: int | None = None) -> Matrix:
         """
         Extract a submatrix within the specified indices.
 
@@ -461,20 +453,18 @@ class Matrix(Generic[T]):
         :param to_column: Column index where extraction ends (exclusive). If None, extracts to end.
         :return: A new matrix containing the submatrix.
         """
-        if to_row is None:
-            to_row = self.rows
-        if to_column is None:
-            to_column = self.cols
+        _to_row: int = self.rows if to_row is None else to_row
+        _to_col: int = self.cols if to_column is None else to_column
 
-        result = Matrix(to_row - from_row, to_column - from_column)
-        for i in range(from_row, to_row):
-            for j in range(from_column, to_column):
+        result = Matrix(_to_row - from_row, _to_col - from_column)
+        for i in range(from_row, _to_row):
+            for j in range(from_column, _to_col):
                 if 0 <= i < self.rows and 0 <= j < self.cols:
                     result.data[i - from_row][j - from_column] = self.data[i][j]
 
         return result
 
-    def sum(self, other: Self | int | float) -> Self:
+    def sum(self, other: Matrix | int | float) -> Matrix:
         """
         Return a new matrix resulting from addition.
 
@@ -540,7 +530,7 @@ class Matrix(Generic[T]):
             trace_sum += self.data[i][i]
         return trace_sum
 
-    def transpose(self) -> Self:
+    def transpose(self) -> Matrix:
         """
         Create a new transposed version of the matrix.
 
@@ -637,7 +627,7 @@ class Matrix(Generic[T]):
         """
         for row in self.data:
             for val in row:
-                if not _is_na(val) and val != 0 and val != 1:
+                if not isinstance(val, NA) and val != 0 and val != 1:
                     return False
         return True
 
@@ -695,7 +685,7 @@ class Matrix(Generic[T]):
         :return: True if matrix is stochastic, False otherwise.
         """
         for row in self.data:
-            row_sum = sum(val for val in row if not _is_na(val))
+            row_sum = sum(val for val in row if not isinstance(val, NA))
             if abs(row_sum - 1.0) > 1e-10:
                 return False
         return True
@@ -758,12 +748,12 @@ class Matrix(Generic[T]):
         """
         for row in self.data:
             for val in row:
-                if not _is_na(val) and val != 0:
+                if not isinstance(val, NA) and val != 0:
                     return False
         return True
 
     # Additional methods
-    def kron(self, other: Self) -> Self:
+    def kron(self, other: Matrix) -> Matrix:
         """
         Return the Kronecker product of two matrices.
 
@@ -783,7 +773,7 @@ class Matrix(Generic[T]):
 
         return result
 
-    def pow(self, power: int) -> Self:
+    def pow(self, power: int) -> Matrix:
         """
         Calculate the product of the matrix by itself power times.
 
@@ -803,7 +793,7 @@ class Matrix(Generic[T]):
 
         result = self.copy()
         for _ in range(power - 1):
-            result = result.mult(self)
+            result = cast(Matrix, result.mult(self))
 
         return result
 
@@ -843,7 +833,7 @@ class Matrix(Generic[T]):
 
         return rank
 
-    def inv(self) -> Self:
+    def inv(self) -> Matrix:
         """
         Return the inverse of a square matrix.
 
@@ -893,7 +883,7 @@ class Matrix(Generic[T]):
 
         return result
 
-    def pinv(self) -> Self:
+    def pinv(self) -> Matrix:
         """
         Return the pseudoinverse of a matrix.
 
@@ -915,12 +905,12 @@ class Matrix(Generic[T]):
 
         if self.rows >= self.cols:
             # Overdetermined
-            ata = at.mult(self)
-            return ata.inv().mult(at)
+            ata = cast(Matrix, at.mult(self))
+            return cast(Matrix, ata.inv().mult(at))
         else:
             # Underdetermined
-            aat = self.mult(at)
-            return at.mult(aat.inv())
+            aat = cast(Matrix, self.mult(at))
+            return cast(Matrix, at.mult(aat.inv()))
 
     def eigenvalues(self) -> list[float | int]:
         """
@@ -952,7 +942,7 @@ class Matrix(Generic[T]):
         # For now, return empty list
         return []
 
-    def eigenvectors(self) -> Self:
+    def eigenvectors(self) -> Matrix:
         """
         Return a matrix of eigenvectors.
 
@@ -981,11 +971,10 @@ class Matrix(Generic[T]):
                         If matrix is empty, the array size determines the row count.
         :raises IndexError: If column index is out of bounds.
         """
-        if col is None:
-            col = self.cols
+        col_idx: int = self.cols if col is None else col
 
-        if col < 0 or col > self.cols:
-            raise IndexError(f"Column index {col} out of bounds")
+        if col_idx < 0 or col_idx > self.cols:
+            raise IndexError(f"Column index {col_idx} out of bounds")
 
         # If matrix is empty (0 rows) and array provided, create rows first
         if self.rows == 0 and array_id and len(array_id) > 0:
@@ -994,8 +983,8 @@ class Matrix(Generic[T]):
 
         for i in range(self.rows):
             if array_id and i < len(array_id):
-                self.data[i].insert(col, array_id[i])
+                self.data[i].insert(col_idx, array_id[i])
             else:
-                self.data[i].insert(col, NA(T))
+                self.data[i].insert(col_idx, NA(T))
 
         self.cols += 1

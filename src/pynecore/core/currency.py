@@ -36,9 +36,9 @@ class CurrencyRateProvider:
     __slots__ = ('_pair_map', '_rate_cache', '_chart_pair')
 
     def __init__(
-        self,
-        security_data: dict[str, str | Path],
-        chart_syminfo: SymInfo | None = None,
+            self,
+            security_data: dict[str, str | Path],
+            chart_syminfo: SymInfo | None = None,
     ):
         """
         :param security_data: Maps user keys to OHLCV file paths
@@ -52,9 +52,9 @@ class CurrencyRateProvider:
         self._build_pair_map(security_data, chart_syminfo)
 
     def _build_pair_map(
-        self,
-        security_data: dict[str, str | Path],
-        chart_syminfo: SymInfo | None,
+            self,
+            security_data: dict[str, str | Path],
+            chart_syminfo: SymInfo | None,
     ) -> None:
         """
         Scan TOML files and build (basecurrency, currency) → ohlcv_path mapping.

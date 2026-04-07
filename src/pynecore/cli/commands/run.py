@@ -196,9 +196,6 @@ def run(
     if len(data.parts) == 1:
         data = app_state.data_dir / data
 
-    # Store the original suffix to check what user provided
-    original_suffix = data.suffix
-
     # Check file format and extension
     if data.suffix == "":
         # No extension provided - check if .ohlcv exists, otherwise look for .csv
@@ -289,42 +286,41 @@ def run(
     # Validate and process --timeframe option
     magnifier_mode = False
     if timeframe:
-        timeframe = timeframe.upper()
+        chart_tf: str = timeframe.upper()
         try:
-            in_seconds(timeframe)
+            in_seconds(chart_tf)
         except (ValueError, AssertionError):
-            secho(f"Invalid timeframe: {timeframe}. Must be a valid TradingView format "
+            secho(f"Invalid timeframe: {chart_tf}. Must be a valid TradingView format "
                   f"(e.g. '1', '5', '60', '1D', '1W', '1M').", fg="red", err=True)
             raise Exit(1)
 
         data_tf = syminfo.period
-        if timeframe != data_tf:
+        if chart_tf != data_tf:
             try:
-                validate_aggregation(data_tf, timeframe)
+                validate_aggregation(data_tf, chart_tf)
             except ValueError as e:
                 secho(str(e), fg="red", err=True)
                 raise Exit(1)
             # Override syminfo period to the chart timeframe
-            syminfo.period = timeframe
+            syminfo.period = chart_tf
             magnifier_mode = True  # Will be checked against script.use_bar_magnifier later
 
     # Open data file
     with OHLCVReader(data) as reader:
-        if not time_from:
-            time_from = reader.start_datetime
-        if not time_to:
-            time_to = reader.end_datetime
+        start_dt = time_from if time_from else reader.start_datetime
+        end_dt = time_to if time_to else reader.end_datetime
+        assert start_dt is not None and end_dt is not None, "Data file has no timestamps"
 
         # Convert to UTC timestamps BEFORE removing timezone info
         # This ensures we use the correct UTC timestamps for the OHLCV reader
-        time_from_ts = int(time_from.timestamp())
-        time_to_ts = int(time_to.timestamp())
+        time_from_ts = int(start_dt.timestamp())
+        time_to_ts = int(end_dt.timestamp())
 
         # Now we can safely remove timezone for display purposes
-        time_from = time_from.replace(tzinfo=None)
-        time_to = time_to.replace(tzinfo=None)
+        start_dt = start_dt.replace(tzinfo=None)
+        end_dt = end_dt.replace(tzinfo=None)
 
-        total_seconds = int((time_to - time_from).total_seconds())
+        total_seconds = int((end_dt - start_dt).total_seconds())
 
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
@@ -339,7 +335,7 @@ def run(
         # Parse security data mappings
         security_data: dict[str, str | Path] | None = None
         if security:
-            security_data = {}
+            sec_map: dict[str, str | Path] = {}
             for entry in security:
                 if '=' not in entry:
                     secho(
@@ -361,7 +357,8 @@ def run(
                         fg="red", err=True,
                     )
                     raise Exit(1)
-                security_data[key] = str(sec_path)
+                sec_map[key] = str(sec_path)
+            security_data = sec_map
 
         # Add lib directory to Python path for library imports
         lib_dir = app_state.scripts_dir / "lib"
@@ -395,7 +392,7 @@ def run(
         with Progress(
                 SpinnerColumn(finished_text="[green]✓"),
                 TextColumn("{task.description}"),
-                DateColumn(time_from),
+                DateColumn(start_dt),
                 BarColumn(),
                 CustomTimeElapsedColumn(),
                 "/",
@@ -426,8 +423,8 @@ def run(
                         # Update progress if we have new data
                         if current_time is not None:
                             if current_time == datetime.max:
-                                current_time = time_to
-                            elapsed_seconds = int((current_time - time_from).total_seconds())
+                                current_time = end_dt
+                            elapsed_seconds = int((current_time - start_dt).total_seconds())
                             # Only update if time changed (to avoid redundant updates)
                             if elapsed_seconds != last_update:
                                 progress.update(task, completed=elapsed_seconds)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, TypeVar, Generic, Type
+from typing import Any, TypeVar, Generic, Type, Self
 
 __all__ = ['NA', 'na_float', 'na_int', 'na_bool', 'na_str']
 
@@ -15,12 +15,12 @@ class NA(Generic[T]):
     _type_cache: dict[Type, NA] = {}
 
     # noinspection PyShadowingBuiltins
-    def __new__(cls, type: Type[T] | T | None = int) -> NA[T]:
+    def __new__(cls, type: Type[T] | T | None = int) -> Self:
         if type is None:
             return super().__new__(cls)
         try:
             # Use the cached instance if it exists
-            return cls._type_cache[type]
+            return cls._type_cache[type]  # type: ignore[reportReturnType]
         except KeyError:
             # Create a new instance and store it in the cache
             na = super().__new__(cls)
@@ -70,84 +70,84 @@ class NA(Generic[T]):
         return False
 
     def __round__(self, n=None):
-        return NA(self.type)
+        return self
 
     #
     # Arithmetic operations
     #
 
-    def __neg__(self) -> NA[T]:
-        return NA(self.type)
+    def __neg__(self) -> Self:
+        return self
 
-    def __add__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __add__(self, _: Any) -> Self:
+        return self
 
-    def __radd__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __radd__(self, _: Any) -> Self:
+        return self
 
-    def __sub__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __sub__(self, _: Any) -> Self:
+        return self
 
-    def __rsub__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rsub__(self, _: Any) -> Self:
+        return self
 
-    def __mul__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __mul__(self, _: Any) -> Self:
+        return self
 
-    def __rmul__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rmul__(self, _: Any) -> Self:
+        return self
 
-    def __truediv__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __truediv__(self, _: Any) -> Self:
+        return self
 
-    def __rtruediv__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rtruediv__(self, _: Any) -> Self:
+        return self
 
-    def __mod__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __mod__(self, _: Any) -> Self:
+        return self
 
-    def __rmod__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rmod__(self, _: Any) -> Self:
+        return self
 
-    def __abs__(self) -> NA[T]:
-        return NA(self.type)
+    def __abs__(self) -> Self:
+        return self
 
     #
     # Bitwise operations
     #
 
-    def __and__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __and__(self, _: Any) -> Self:
+        return self
 
-    def __rand__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rand__(self, _: Any) -> Self:
+        return self
 
-    def __or__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __or__(self, _: Any) -> Self:
+        return self
 
-    def __ror__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __ror__(self, _: Any) -> Self:
+        return self
 
-    def __xor__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __xor__(self, _: Any) -> Self:
+        return self
 
-    def __rxor__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rxor__(self, _: Any) -> Self:
+        return self
 
-    def __lshift__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __lshift__(self, _: Any) -> Self:
+        return self
 
-    def __rlshift__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rlshift__(self, _: Any) -> Self:
+        return self
 
-    def __rshift__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rshift__(self, _: Any) -> Self:
+        return self
 
-    def __rrshift__(self, _: Any) -> NA[T]:
-        return NA(self.type)
+    def __rrshift__(self, _: Any) -> Self:
+        return self
 
-    def __invert__(self) -> NA[T]:
-        return NA(self.type)
+    def __invert__(self) -> Self:
+        return self
 
     #
     # All comparisons should be false
@@ -172,16 +172,16 @@ class NA(Generic[T]):
     # In contexts
     #
 
-    def __getattr__(self, name: str) -> NA[T]:
+    def __getattr__(self, name: str) -> Self:
         # Don't return self for special attributes
         if name.startswith('__'):
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
         return self
 
-    def __getitem__(self, _: Any) -> NA[T]:
+    def __getitem__(self, _: Any) -> Self:
         return self
 
-    def __call__(self, *_, **__) -> NA[T]:
+    def __call__(self, *_, **__) -> Self:
         return self
 
 

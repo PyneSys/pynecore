@@ -154,7 +154,7 @@ class Provider(metaclass=ABCMeta):
                 self.ohlcv_file.write(candle)
 
     @abstractmethod
-    def download_ohlcv(self, time_from: datetime, time_to: datetime,
+    def download_ohlcv(self, time_from: datetime | None, time_to: datetime | None,
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
         """
@@ -162,8 +162,8 @@ class Provider(metaclass=ABCMeta):
 
         In the user code you can call `self.save_ohlcv_data()` to save the data into the data file
 
-        :param time_from: The start time
-        :param time_to: The end time
+        :param time_from: The start time (None to fetch all available data)
+        :param time_to: The end time (None to fetch up to the latest)
         :param on_progress: Optional callback to call on progress
         :param limit: Override the automatic chunk size (number of bars per API request)
         """

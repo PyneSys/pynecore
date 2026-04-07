@@ -294,7 +294,7 @@ class CCXTProvider(Provider):
         )
 
     @override
-    def download_ohlcv(self, time_from: datetime, time_to: datetime,
+    def download_ohlcv(self, time_from: datetime | None, time_to: datetime | None,
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
         """

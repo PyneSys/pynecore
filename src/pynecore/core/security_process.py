@@ -21,18 +21,19 @@ from .security import (
 )
 
 
+# noinspection PyProtectedMember
 def security_process_main(
-    sec_id: str,
-    script_path: str,
-    ohlcv_path: str,
-    sync_block_name: str,
-    all_sec_ids: list[str],
-    # Events (multiprocessing.Event — picklable across spawn)
-    data_ready_event,
-    advance_event,
-    done_event,
-    stop_event,
-    is_ltf: bool = False,
+        sec_id: str,
+        script_path: str,
+        ohlcv_path: str,
+        sync_block_name: str,
+        all_sec_ids: list[str],
+        # Events (multiprocessing.Event — picklable across spawn)
+        data_ready_event,
+        advance_event,
+        done_event,
+        stop_event,
+        is_ltf: bool = False,
 ):
     """
     Entry point for a security process (multiprocessing.Process target).

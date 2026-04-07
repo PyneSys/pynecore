@@ -1,4 +1,5 @@
 from ...types.na import NA
+from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
 from ...core.module_property import module_property
@@ -16,7 +17,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def commission(trade_num: int) -> float | NA[float]:
+    def commission(trade_num: int) -> PyneFloat:
         """
         Returns the sum of entry and exit fees paid in the open trade, expressed in strategy.account_currency
 
@@ -34,7 +35,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_bar_index(trade_num: int) -> int | NA[int]:
+    def entry_bar_index(trade_num: int) -> PyneInt:
         """
         Returns the bar_index of the open trade's entry
 
@@ -52,7 +53,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_comment(trade_num: int) -> str | NA[str]:
+    def entry_comment(trade_num: int) -> PyneStr:
         """
         Returns the comment message of the open trade's entry
 
@@ -64,13 +65,14 @@ class OpenTradesModule(CallableModule):
         try:
             assert lib._script is not None
             assert lib._script.position is not None
-            return lib._script.position.open_trades[trade_num].entry_comment
+            comment = lib._script.position.open_trades[trade_num].entry_comment
+            return comment if comment is not None else NA(str)
         except (IndexError, AssertionError):
             return NA(str)
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_id(trade_num: int) -> str | NA[str]:
+    def entry_id(trade_num: int) -> PyneStr:
         """
         Returns the id of the open trade's entry
 
@@ -82,13 +84,14 @@ class OpenTradesModule(CallableModule):
         try:
             assert lib._script is not None
             assert lib._script.position is not None
-            return lib._script.position.open_trades[trade_num].entry_id
+            entry_id = lib._script.position.open_trades[trade_num].entry_id
+            return entry_id if entry_id is not None else NA(str)
         except (IndexError, AssertionError):
             return NA(str)
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_price(trade_num: int) -> float | NA[float]:
+    def entry_price(trade_num: int) -> PyneFloat:
         """
         Returns the price of the open trade's entry
 
@@ -106,7 +109,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_time(trade_num: int) -> int | NA[int]:
+    def entry_time(trade_num: int) -> PyneInt:
         """
         Returns the time of the open trade's entry (UNIX)
 
@@ -124,7 +127,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_drawdown(trade_num: int) -> float | NA[float]:
+    def max_drawdown(trade_num: int) -> PyneFloat:
         """
         Returns the maximum drawdown of the open trade
 
@@ -142,7 +145,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_drawdown_percent(trade_num: int) -> float | NA:
+    def max_drawdown_percent(trade_num: int) -> PyneFloat:
         """
         Returns the maximum drawdown percentage of the open trade
 
@@ -160,7 +163,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_runup(trade_num: int) -> float | NA:
+    def max_runup(trade_num: int) -> PyneFloat:
         """
         Returns the maximum runup of the open trade
 
@@ -178,7 +181,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_runup_percent(trade_num: int) -> float | NA:
+    def max_runup_percent(trade_num: int) -> PyneFloat:
         """
         Returns the maximum runup percentage of the open trade
 
@@ -196,7 +199,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def profit(trade_num: int) -> float | NA:
+    def profit(trade_num: int) -> PyneFloat:
         """
         Returns the profit of the open trade expressed in strategy.account_currency
         :param trade_num: The trade number of the open trade. The number of the first trade is zero
@@ -213,7 +216,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def profit_percent(trade_num: int) -> float | NA:
+    def profit_percent(trade_num: int) -> PyneFloat:
         """
         Returns the profit percentage of the open trade
         :param trade_num: The trade number of the open trade. The number of the first trade is zero
@@ -230,7 +233,7 @@ class OpenTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def size(trade_num: int) -> float | NA[float]:
+    def size(trade_num: int) -> PyneFloat:
         """
         Returns the size and direction (<0 short >0 long) of the open trade
 

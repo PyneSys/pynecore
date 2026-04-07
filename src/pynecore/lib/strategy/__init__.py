@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, overload
 
 import math
 from datetime import datetime, UTC
@@ -13,6 +13,7 @@ from .. import syminfo
 from ...types.strategy import QtyType
 from ...types.base import IntEnum
 from ...types.na import NA, na_float, na_str
+from ...types import PyneFloat, PyneInt, PyneStr
 
 from . import direction as direction
 from . import commission as _commission
@@ -75,6 +76,23 @@ if True:
 
 
 #
+# Helpers
+#
+
+@overload
+def _na_to_none(value: PyneFloat) -> float | None: ...
+
+
+@overload
+def _na_to_none(value: PyneStr) -> str | None: ...
+
+
+def _na_to_none(value):  # type: ignore[misc]
+    """Convert NA to None, pass through everything else."""
+    return None if isinstance(value, NA) else value
+
+
+#
 # Classes
 #
 
@@ -101,7 +119,7 @@ class Order:
     def __init__(
             self,
             order_id: str | None,
-            size: float | NA[float],
+            size: PyneFloat,
             *,
             order_type: _OrderType = _order_type_normal,
             exit_id: str | None = None,
@@ -109,8 +127,8 @@ class Order:
             stop: float | None = None,
             oca_name: str | None = None,
             oca_type: _oca.Oca | None = _oca.none,
-            comment: str | NA[str] | None = None,
-            alert_message: str | NA[str] | None = None,
+            comment: PyneStr | None = None,
+            alert_message: PyneStr | None = None,
             comment_profit: str | None = None,
             comment_loss: str | None = None,
             comment_trailing: str | None = None,
@@ -185,40 +203,40 @@ class Trade:
     )
 
     # noinspection PyShadowingNames
-    def __init__(self, *, size: float | NA[float], entry_id: str | None, entry_bar_index: int, entry_time: int,
-                 entry_price: float | NA[float],
-                 commission: float | NA[float], entry_comment: str | NA[str] | None = None,
-                 entry_equity: float | NA[float] = 0.0):
-        self.size: float | NA[float] = size
+    def __init__(self, *, size: PyneFloat, entry_id: str | None, entry_bar_index: int, entry_time: int,
+                 entry_price: PyneFloat,
+                 commission: PyneFloat, entry_comment: PyneStr | None = None,
+                 entry_equity: PyneFloat = 0.0):
+        self.size: PyneFloat = size
         self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
         self.entry_id: str | None = entry_id
         self.entry_bar_index: int = entry_bar_index
         self.entry_time: int = entry_time
-        self.entry_price: float | NA[float] = entry_price
-        self.entry_equity: float | NA[float] = entry_equity
-        self.entry_comment: str | NA[str] | None = entry_comment
+        self.entry_price: PyneFloat = entry_price
+        self.entry_equity: PyneFloat = entry_equity
+        self.entry_comment: PyneStr | None = entry_comment
 
         self.exit_id: str | None = ""
         self.exit_bar_index: int = -1
         self.exit_time: int = -1
-        self.exit_price: float | NA[float] = 0.0
-        self.exit_comment: str | NA[str] = ''
-        self.exit_equity: float | NA = na_float
+        self.exit_price: PyneFloat = 0.0
+        self.exit_comment: PyneStr = ''
+        self.exit_equity: PyneFloat = na_float
 
         self.commission = commission
 
-        self.max_drawdown: float | NA[float] = 0.0
-        self.max_drawdown_percent: float | NA[float] = 0.0
-        self.max_runup: float | NA[float] = 0.0
-        self.max_runup_percent: float | NA[float] = 0.0
-        self.profit: float | NA[float] = 0.0
-        self.profit_percent: float | NA[float] = 0.0
+        self.max_drawdown: PyneFloat = 0.0
+        self.max_drawdown_percent: PyneFloat = 0.0
+        self.max_runup: PyneFloat = 0.0
+        self.max_runup_percent: PyneFloat = 0.0
+        self.profit: PyneFloat = 0.0
+        self.profit_percent: PyneFloat = 0.0
 
-        self.cum_profit: float | NA[float] = 0.0
-        self.cum_profit_percent: float | NA[float] = 0.0
-        self.cum_max_drawdown: float | NA[float] = 0.0
-        self.cum_max_runup: float | NA[float] = 0.0
+        self.cum_profit: PyneFloat = 0.0
+        self.cum_profit_percent: PyneFloat = 0.0
+        self.cum_max_drawdown: PyneFloat = 0.0
+        self.cum_max_runup: PyneFloat = 0.0
 
     def __repr__(self):
         return f"Trade(entry_id={self.entry_id}; size={self.size}; entry_bar_index: {self.entry_bar_index}; " \
@@ -292,7 +310,7 @@ class PriceOrderBook:
                 del self.orders_at_price[price]
         del self.order_prices[order]
 
-    def update_order_stop(self, order: Order, new_stop: float | NA[float] | None):
+    def update_order_stop(self, order: Order, new_stop: float | None):
         """Update the stop price of an order in the order book"""
         # Remove the order from the old stop price level if it exists
         if order.stop is not None and order.stop in self.order_prices[order]:
@@ -419,10 +437,10 @@ class Position:
         self.o: float = 0.0
 
         # Profit/loss tracking
-        self.netprofit: float | NA[float] = 0.0
-        self.openprofit: float | NA[float] = 0.0
-        self.grossprofit: float | NA[float] = 0.0
-        self.grossloss: float | NA[float] = 0.0
+        self.netprofit: PyneFloat = 0.0
+        self.openprofit: PyneFloat = 0.0
+        self.grossprofit: PyneFloat = 0.0
+        self.grossloss: PyneFloat = 0.0
 
         # Order books
         self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
@@ -442,16 +460,16 @@ class Position:
         self.losstrades: int = 0
         self.size: float = 0.0
         self.sign: float = 0.0
-        self.avg_price: float | NA[float] = na_float
-        self.cum_profit: float | NA[float] = 0.0
-        self.entry_equity: float | NA[float] = 0.0
-        self.max_equity: float | NA[float] = -float("inf")
-        self.min_equity: float | NA[float] = float("inf")
+        self.avg_price: PyneFloat = na_float
+        self.cum_profit: PyneFloat = 0.0
+        self.entry_equity: PyneFloat = 0.0
+        self.max_equity: PyneFloat = -float("inf")
+        self.min_equity: PyneFloat = float("inf")
         self.drawdown_summ: float = 0.0
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
-        self.entry_summ: float | NA[float] = 0.0
+        self.entry_summ: PyneFloat = 0.0
         self.open_commission: float = 0.0
 
         # Risk management settings
@@ -481,14 +499,14 @@ class Position:
         self._fill_counter: int = 0
 
     @property
-    def equity(self) -> float | NA[float]:
+    def equity(self) -> PyneFloat:
         """ The current equity """
         return lib._script.initial_capital + self.netprofit + self.openprofit
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
         # Set the bar_index when the order is placed
-        order.bar_index = lib.bar_index
+        order.bar_index = int(lib.bar_index)
 
         # Add market order to market orders dict
         if order.is_market_order:
@@ -548,7 +566,7 @@ class Position:
             if order.oca_name == oca_name and order != executed_order:
                 self._remove_order(order)
 
-    def _reduce_oca_group(self, oca_name: str, filled_size: float | NA[float]):
+    def _reduce_oca_group(self, oca_name: str, filled_size: PyneFloat):
         """Reduce the size of all orders in the same OCA group"""
         reduction = abs(filled_size)
 
@@ -572,7 +590,7 @@ class Position:
                 else:
                     order.size = new_size * order.sign
 
-    def _fill_order(self, order: Order, price: float | NA[float], h: float | NA[float], l: float | NA[float]):
+    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat):
         """
         Fill an order (actually)
 
@@ -1074,7 +1092,8 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                new_stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
+                assert order.stop is not None
+                new_stop: float = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)
                 if new_stop != order.stop:
                     # Update the order in the orderbook with the new stop price
                     self.orderbook.update_order_stop(order, new_stop)
@@ -1235,7 +1254,7 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                new_stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
+                new_stop: float = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
                 if new_stop != order.stop:
                     # Update the order in the orderbook with the new stop price
                     self.orderbook.update_order_stop(order, new_stop)
@@ -1314,7 +1333,7 @@ class Position:
         # For exit orders, calculate limit/stop from entry price if ticks are specified
         for order in self.exit_orders.values():
             # Try to find the trade with matching entry_id
-            entry_price = None
+            entry_price: float | None = None
             for trade in self.open_trades:
                 if trade.entry_id == order.order_id:
                     entry_price = trade.entry_price
@@ -1725,7 +1744,7 @@ class Position:
 #
 
 # noinspection PyProtectedMember
-def _size_round(qty: float | NA[float]) -> float | NA[float]:
+def _size_round(qty: PyneFloat) -> PyneFloat:
     """
     Round size to the nearest possible value
 
@@ -1754,7 +1773,17 @@ def _margin_call_round(qty: float) -> float:
 
 
 # noinspection PyShadowingNames
-def _price_round(price: float | NA[float], direction: int | float) -> float | NA[float]:
+@overload
+def _price_round(price: float, direction: int | float) -> float: ...
+
+
+# noinspection PyShadowingNames
+@overload
+def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat: ...
+
+
+# noinspection PyShadowingNames
+def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     """
     Round price to the nearest tick (floor if direction < 0, ceil otherwise)
 
@@ -1799,8 +1828,8 @@ def cancel_all():
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
-def close(id: str, comment: str | NA[str] = na_str, qty: float | NA[float] = na_float,
-          qty_percent: float | NA[float] = na_float, alert_message: str | NA[str] = na_str,
+def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
+          qty_percent: PyneFloat = na_float, alert_message: PyneStr = na_str,
           immediately: bool = False):
     """
     Creates an order to exit from the part of a position opened by entry orders with a specific identifier.
@@ -1847,7 +1876,7 @@ def close(id: str, comment: str | NA[str] = na_str, qty: float | NA[float] = na_
 
 
 # noinspection PyProtectedMember,PyShadowingNames
-def close_all(comment: str | NA[str] = na_str, alert_message: str | NA[str] = na_str, immediately: bool = False):
+def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immediately: bool = False):
     """
     Creates an order to close an open position completely, regardless of the identifiers of the entry
     orders that opened or added to it.
@@ -1874,7 +1903,7 @@ def close_all(comment: str | NA[str] = na_str, alert_message: str | NA[str] = na
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,DuplicatedCode
-def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] = na_float,
+def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
           comment: str | None = None, alert_message: str | None = None):
@@ -2013,16 +2042,16 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
 def exit(id: str, from_entry: str = "",
-         qty: float | NA[float] = na_float, qty_percent: float | NA[float] = na_float,
-         profit: float | NA[float] = na_float, limit: float | NA[float] = na_float,
-         loss: float | NA[float] = na_float, stop: float | NA[float] = na_float,
-         trail_price: float | NA[float] = na_float, trail_points: float | NA[float] = na_float,
-         trail_offset: float | NA[float] = na_float,
-         oca_name: str | NA[str] = na_str, oca_type: _oca.Oca | None = None,
-         comment: str | NA[str] = na_str, comment_profit: str | NA[str] = na_str,
-         comment_loss: str | NA[str] = na_str, comment_trailing: str | NA[str] = na_str,
-         alert_message: str | NA[str] = na_str, alert_profit: str | NA[str] = na_str,
-         alert_loss: str | NA[str] = na_str, alert_trailing: str | NA[str] = na_str,
+         qty: PyneFloat = na_float, qty_percent: PyneFloat = na_float,
+         profit: PyneFloat = na_float, limit: PyneFloat = na_float,
+         loss: PyneFloat = na_float, stop: PyneFloat = na_float,
+         trail_price: PyneFloat = na_float, trail_points: PyneFloat = na_float,
+         trail_offset: PyneFloat = na_float,
+         oca_name: PyneStr = na_str, oca_type: _oca.Oca | None = None,
+         comment: PyneStr = na_str, comment_profit: PyneStr = na_str,
+         comment_loss: PyneStr = na_str, comment_trailing: PyneStr = na_str,
+         alert_message: PyneStr = na_str, alert_profit: PyneStr = na_str,
+         alert_loss: PyneStr = na_str, alert_trailing: PyneStr = na_str,
          disable_alert: bool = False):
     """
     Creates an order to exit from a position. If an order with the same id already exists and is unfilled,
@@ -2076,26 +2105,23 @@ def exit(id: str, from_entry: str = "",
             return
 
         # Store tick values for later calculation when entry price is known
-        profit_ticks = None if isinstance(profit, NA) else profit
-        loss_ticks = None if isinstance(loss, NA) else loss
-        trail_points_ticks = None if isinstance(trail_points, NA) else trail_points
+        profit_ticks: float | None = _na_to_none(profit)
+        loss_ticks: float | None = _na_to_none(loss)
+        trail_points_ticks: float | None = _na_to_none(trail_points)
 
         # We need to have limit, stop or both
         if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
             return
 
-        if isinstance(limit, NA):
-            limit = None
-        elif limit is not None:
-            limit = _price_round(limit, direction)
-        if isinstance(stop, NA):
-            stop = None
-        elif stop is not None:
-            stop = _price_round(stop, -direction)  # TODO: test this if the direction here is correct
-        if isinstance(trail_price, NA):
-            trail_price = None
-        elif trail_price is not None:
-            trail_price = _price_round(trail_price, -direction)
+        _limit = _na_to_none(limit)
+        if _limit is not None:
+            _limit = _price_round(_limit, direction)
+        _stop = _na_to_none(stop)
+        if _stop is not None:
+            _stop = _price_round(_stop, -direction)
+        _trail_price = _na_to_none(trail_price)
+        if _trail_price is not None:
+            _trail_price = _price_round(_trail_price, -direction)
 
         # Default OCA settings for strategy.exit() - matches TradingView behavior
         # If no oca_name is specified, create a default OCA reduce group
@@ -2112,18 +2138,18 @@ def exit(id: str, from_entry: str = "",
         # Add order
         order = Order(
             from_entry, size, exit_id=id, order_type=_order_type_close,
-            limit=limit, stop=stop,
-            trail_price=trail_price, trail_offset=trail_offset,
+            limit=_limit, stop=_stop,
+            trail_price=_trail_price, trail_offset=_na_to_none(trail_offset),
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
-            oca_name=oca_name, oca_type=oca_type,
-            comment=None if isinstance(comment, NA) else comment,
-            alert_message=None if isinstance(alert_message, NA) else alert_message,
-            comment_profit=None if isinstance(comment_profit, NA) else comment_profit,
-            comment_loss=None if isinstance(comment_loss, NA) else comment_loss,
-            comment_trailing=None if isinstance(comment_trailing, NA) else comment_trailing,
-            alert_profit=None if isinstance(alert_profit, NA) else alert_profit,
-            alert_loss=None if isinstance(alert_loss, NA) else alert_loss,
-            alert_trailing=None if isinstance(alert_trailing, NA) else alert_trailing
+            oca_name=_na_to_none(oca_name), oca_type=oca_type,
+            comment=_na_to_none(comment),
+            alert_message=_na_to_none(alert_message),
+            comment_profit=_na_to_none(comment_profit),
+            comment_loss=_na_to_none(comment_loss),
+            comment_trailing=_na_to_none(comment_trailing),
+            alert_profit=_na_to_none(alert_profit),
+            alert_loss=_na_to_none(alert_loss),
+            alert_trailing=_na_to_none(alert_trailing)
         )
         position._add_order(order)
 
@@ -2154,7 +2180,7 @@ def exit(id: str, from_entry: str = "",
             for order in list(position.entry_orders.values()):
                 direction = order.sign
                 size = order.size
-                from_entry = order.order_id
+                from_entry = order.order_id or ""
                 # Only mark as from_entry_na on first creation (not replacement)
                 had_existing_exit = from_entry in position.exit_orders
                 _exit()
@@ -2167,12 +2193,12 @@ def exit(id: str, from_entry: str = "",
                 for trade in position.open_trades:
                     direction = trade.sign
                     size = trade.size
-                    from_entry = trade.entry_id
+                    from_entry = trade.entry_id or ""
                     _exit()
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode
-def order(id: str, direction: direction.Direction, qty: int | float | NA[float] = na_float,
+def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
           comment: str | None = None, alert_message: str | None = None,
@@ -2286,13 +2312,13 @@ def order(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
 # noinspection PyProtectedMember
 @module_property
-def equity() -> float | NA[float]:
+def equity() -> PyneFloat:
     return lib._script.position.equity
 
 
 # noinspection PyProtectedMember
 @module_property
-def eventrades() -> int | NA[int]:
+def eventrades() -> PyneInt:
     return lib._script.position.eventrades
 
 
@@ -2304,13 +2330,13 @@ def initial_capital() -> float:
 
 # noinspection PyProtectedMember
 @module_property
-def grossloss() -> float | NA[float]:
+def grossloss() -> PyneFloat:
     return lib._script.position.grossloss + lib._script.position.open_commission
 
 
 # noinspection PyProtectedMember
 @module_property
-def grossprofit() -> float | NA[float]:
+def grossprofit() -> PyneFloat:
     return lib._script.position.grossprofit
 
 
@@ -2322,41 +2348,41 @@ def losstrades() -> int:
 
 # noinspection PyProtectedMember
 @module_property
-def max_drawdown() -> float | NA[float]:
+def max_drawdown() -> PyneFloat:
     return lib._script.position.max_drawdown
 
 
 # noinspection PyProtectedMember
 @module_property
-def max_runup() -> float | NA[float]:
+def max_runup() -> PyneFloat:
     return lib._script.position.max_runup
 
 
 # noinspection PyProtectedMember
 @module_property
-def netprofit() -> float | NA[float]:
+def netprofit() -> PyneFloat:
     return lib._script.position.netprofit
 
 
 # noinspection PyProtectedMember
 @module_property
-def openprofit() -> float | NA[float]:
+def openprofit() -> PyneFloat:
     return lib._script.position.openprofit
 
 
 # noinspection PyProtectedMember
 @module_property
-def position_size() -> float | NA[float]:
+def position_size() -> PyneFloat:
     return lib._script.position.size
 
 
 # noinspection PyProtectedMember
 @module_property
-def position_avg_price() -> float | NA[float]:
+def position_avg_price() -> PyneFloat:
     return lib._script.position.avg_price
 
 
 # noinspection PyProtectedMember
 @module_property
-def wintrades() -> int | NA[int]:
+def wintrades() -> PyneInt:
     return lib._script.position.wintrades

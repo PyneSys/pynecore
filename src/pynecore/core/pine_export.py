@@ -59,6 +59,7 @@ def export(
 
     def decorator(f: Callable) -> Callable:
         func_name = f.__name__
+        assert func_globals is not None
 
         # Check if there's already something with the same name in globals
         if func_name in func_globals:

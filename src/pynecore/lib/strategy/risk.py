@@ -1,4 +1,5 @@
 from ...types.na import NA
+from ...types import PyneStr
 from .. import strategy
 
 from ... import lib
@@ -8,7 +9,7 @@ from ... import lib
 def max_drawdown(
         value: float | int,
         type: strategy.QtyType = strategy.percent_of_equity,
-        alert_message: str | NA[str] = NA(str)
+        alert_message: PyneStr = NA(str)
 ) -> None:
     """
     The purpose of this rule is to determine maximum drawdown. The rule affects the whole strategy.
@@ -24,7 +25,7 @@ def max_drawdown(
 
     lib._script.position.risk_max_drawdown_value = value
     lib._script.position.risk_max_drawdown_type = type
-    lib._script.position.risk_max_drawdown_alert = None if isinstance(alert_message, NA) else alert_message
+    lib._script.position.risk_max_drawdown_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
 # noinspection PyProtectedMember
@@ -42,7 +43,7 @@ def allow_entry_in(value: strategy.direction.Direction) -> None:
 
 
 # noinspection PyProtectedMember
-def max_cons_loss_days(count: int, alert_message: str | NA[str] = NA(str)) -> None:
+def max_cons_loss_days(count: int, alert_message: PyneStr = NA(str)) -> None:
     """
     The purpose of this rule is to determine the maximum number of consecutive losing days.
     Once the maximum number of consecutive losing days is reached, all pending orders are cancelled,
@@ -55,11 +56,11 @@ def max_cons_loss_days(count: int, alert_message: str | NA[str] = NA(str)) -> No
         return
 
     lib._script.position.risk_max_cons_loss_days = count
-    lib._script.position.risk_max_cons_loss_days_alert = None if isinstance(alert_message, NA) else alert_message
+    lib._script.position.risk_max_cons_loss_days_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
 # noinspection PyProtectedMember
-def max_intraday_filled_orders(count: int, alert_message: str | NA[str] = NA(str)) -> None:
+def max_intraday_filled_orders(count: int, alert_message: PyneStr = NA(str)) -> None:
     """
     The purpose of this rule is to determine the maximum number of intraday filled orders
 
@@ -71,13 +72,13 @@ def max_intraday_filled_orders(count: int, alert_message: str | NA[str] = NA(str
 
     lib._script.position.risk_max_intraday_filled_orders = count
     lib._script.position.risk_max_intraday_filled_orders_alert = (
-        None if isinstance(alert_message, NA) else alert_message
+        None if isinstance(alert_message, NA) else str(alert_message)
     )
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.percent_of_equity,
-                      alert_message: str | NA[str] = NA(str)) -> None:
+                      alert_message: PyneStr = NA(str)) -> None:
     """
     The purpose of this rule is to determine the maximum intraday loss. The rule affects the whole strategy.
     Once the maximum intraday loss value is reached, all pending orders are cancelled, all open positions
@@ -92,7 +93,7 @@ def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.perc
 
     lib._script.position.risk_max_intraday_loss_value = value
     lib._script.position.risk_max_intraday_loss_type = type
-    lib._script.position.risk_max_intraday_loss_alert = None if isinstance(alert_message, NA) else alert_message
+    lib._script.position.risk_max_intraday_loss_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
 # noinspection PyProtectedMember

@@ -18,10 +18,11 @@ from typing import TYPE_CHECKING
 
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
-    write_result, write_na,
+    write_result,
 )
 
 if TYPE_CHECKING:
+    from multiprocessing.synchronize import Event as EventType
     from typing import Callable
     from zoneinfo import ZoneInfo
     from .resampler import Resampler
@@ -38,10 +39,10 @@ class SecurityState:
     tz: ZoneInfo
 
     # Multiprocessing events (shared between chart and security processes)
-    data_ready: Event = field(default_factory=Event)
-    advance_event: Event = field(default_factory=Event)
-    done_event: Event = field(default_factory=Event)
-    stop_event: Event = field(default_factory=Event)
+    data_ready: EventType = field(default_factory=Event)
+    advance_event: EventType = field(default_factory=Event)
+    done_event: EventType = field(default_factory=Event)
+    stop_event: EventType = field(default_factory=Event)
 
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
@@ -73,6 +74,7 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         return state.last_confirmed
 
     resampler = state.resampler
+    assert resampler is not None
     current_period = resampler.get_bar_time(chart_time, state.tz)
     prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
 
@@ -96,6 +98,8 @@ def create_chart_protocol(
     """
     Create protocol functions for the **chart** process.
 
+    :param states: Per-security-context runtime states
+    :param sync_block: Shared memory sync block
     :param deferred_resolve_fn: Optional callback for resolving deferred security contexts.
                                 Called with (sec_id, symbol, timeframe) on first __sec_signal__.
     :param lazy_spawn_fn: Optional callback for lazy-spawning static security processes.
@@ -115,7 +119,7 @@ def create_chart_protocol(
     resolved: set[str] = set()
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
-                       timeframe: str | None = None, scope_id=None):
+                       timeframe: str | None = None, _scope_id=None):
         from pynecore import lib
         state = states[sec_id]
 
@@ -134,6 +138,7 @@ def create_chart_protocol(
                 state.data_ready.clear()
             return
 
+        # noinspection PyProtectedMember
         chart_time = lib._time
 
         if state.is_ltf:
@@ -157,12 +162,12 @@ def create_chart_protocol(
             else:
                 state.new_period = False
 
-    def __sec_write__(sec_id: str, value, scope_id=None):
+    def __sec_write__(sec_id: str, value, _scope_id=None):
         if sec_id in same_context_ids and result_blocks is not None:
             write_result(result_blocks[sec_id], sync_block, value)
             states[sec_id].data_ready.set()
 
-    def __sec_read__(sec_id: str, default=None, scope_id=None):
+    def __sec_read__(sec_id: str, default=None, _scope_id=None):
         state = states[sec_id]
         state.data_ready.wait()
 
@@ -186,7 +191,7 @@ def create_chart_protocol(
 
         return result
 
-    def __sec_wait__(sec_id: str, scope_id=None):
+    def __sec_wait__(sec_id: str, _scope_id=None):
         state = states[sec_id]
         if state.needs_wait:
             state.done_event.wait()
@@ -201,7 +206,7 @@ def create_chart_protocol(
 
 
 def create_security_protocol(
-    sec_id: str,
+    _sec_id: str,
     sync_block: SyncBlock,
     result_block: ResultBlock,
     all_sec_ids: list[str],
@@ -218,6 +223,10 @@ def create_security_protocol(
     writing to shared memory. The caller must invoke ``flush()`` at the end of
     each round to write the accumulated array.
 
+    :param _sec_id: Security context ID (unused, kept for API symmetry with chart protocol)
+    :param sync_block: Shared memory sync block
+    :param result_block: Shared memory result block for writing
+    :param all_sec_ids: All security context IDs (for cross-context reads)
     :param is_ltf: If True, enable LTF accumulation mode.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush)
              flush is None when is_ltf=False.
@@ -226,28 +235,28 @@ def create_security_protocol(
         sid: ResultReader(sid) for sid in all_sec_ids
     }
 
-    def __sec_signal__(sid: str, symbol=None, timeframe=None, scope_id=None):
+    def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _scope_id=None):
         pass
 
     if is_ltf:
         _buffer: list = []
 
-        def __sec_write__(sid: str, value, scope_id=None):
+        def __sec_write__(_sid: str, value, _scope_id=None):
             _buffer.append(value)
 
         def flush():
             write_result(result_block, sync_block, _buffer.copy())
             _buffer.clear()
     else:
-        def __sec_write__(sid: str, value, scope_id=None):
+        def __sec_write__(_sid: str, value, _scope_id=None):
             write_result(result_block, sync_block, value)
 
         flush = None
 
-    def __sec_read__(sid: str, default=None, scope_id=None):
+    def __sec_read__(sid: str, default=None, _scope_id=None):
         return readers[sid].read(sync_block, default)
 
-    def __sec_wait__(sid: str, scope_id=None):
+    def __sec_wait__(_sid: str, _scope_id=None):
         pass
 
     def cleanup():

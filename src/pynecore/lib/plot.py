@@ -51,11 +51,10 @@ def plot(series: Any, title: str | None = None, *_, **__):
             raise RuntimeError("The plot function can only be called from the main function!")
 
     # Ensure unique title
-    if title is None:
-        title = 'Plot'
+    title: str = 'Plot' if title is None else title
     # Handle duplicate titles
     c = 0
-    t = title
+    t: str = title
     while t in lib._plot_data:
         t = title + ' ' + str(c)
         c += 1

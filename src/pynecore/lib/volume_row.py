@@ -1,6 +1,7 @@
 from ..types.volume_row import VolumeRow
 
 
+# noinspection PyShadowingBuiltins
 def up_price(id: VolumeRow) -> float:
     """
     Upper price boundary of the row.
@@ -11,6 +12,7 @@ def up_price(id: VolumeRow) -> float:
     return id.up_price()
 
 
+# noinspection PyShadowingBuiltins
 def down_price(id: VolumeRow) -> float:
     """
     Lower price boundary of the row.
@@ -21,6 +23,7 @@ def down_price(id: VolumeRow) -> float:
     return id.down_price()
 
 
+# noinspection PyShadowingBuiltins
 def buy_volume(id: VolumeRow) -> float:
     """
     Buy volume for this row.
@@ -31,6 +34,7 @@ def buy_volume(id: VolumeRow) -> float:
     return id.buy_volume()
 
 
+# noinspection PyShadowingBuiltins
 def sell_volume(id: VolumeRow) -> float:
     """
     Sell volume for this row.
@@ -41,6 +45,7 @@ def sell_volume(id: VolumeRow) -> float:
     return id.sell_volume()
 
 
+# noinspection PyShadowingBuiltins
 def delta(id: VolumeRow) -> float:
     """
     Volume delta (buy - sell) for this row.
@@ -51,6 +56,7 @@ def delta(id: VolumeRow) -> float:
     return id.delta()
 
 
+# noinspection PyShadowingBuiltins
 def total_volume(id: VolumeRow) -> float:
     """
     Total volume for this row.

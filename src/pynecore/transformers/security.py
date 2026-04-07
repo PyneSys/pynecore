@@ -150,14 +150,16 @@ class SecurityTransformer(ast.NodeTransformer):
             args=list(args), keywords=[]
         )
 
-    def _is_none_check(self) -> ast.Compare:
+    @staticmethod
+    def _is_none_check() -> ast.Compare:
         """Build: __active_security__ is None"""
         return ast.Compare(
             left=ast.Name(id='__active_security__', ctx=ast.Load()),
             ops=[ast.Is()], comparators=[ast.Constant(value=None)]
         )
 
-    def _eq_check(self, sec_id: str) -> ast.Compare:
+    @staticmethod
+    def _eq_check(sec_id: str) -> ast.Compare:
         """Build: __active_security__ == sec_id"""
         return ast.Compare(
             left=ast.Name(id='__active_security__', ctx=ast.Load()),
@@ -271,7 +273,7 @@ class SecurityTransformer(ast.NodeTransformer):
     # --- Collection ---
 
     def _collect_calls(
-        self, body: list[ast.stmt]
+            self, body: list[ast.stmt]
     ) -> list[tuple[ast.Call, str, bool]]:
         """
         Find all request.security() and request.security_lower_tf() calls in
@@ -300,8 +302,8 @@ class SecurityTransformer(ast.NodeTransformer):
     # --- Body transformation ---
 
     def _transform_body(
-        self, body: list[ast.stmt], call_exprs: dict[str, ast.expr],
-        runtime_sec_ids: set[str] | None = None
+            self, body: list[ast.stmt], call_exprs: dict[str, ast.expr],
+            runtime_sec_ids: set[str]
     ) -> list[ast.stmt]:
         """
         Recursively transform a body list: insert write blocks before statements
@@ -317,8 +319,6 @@ class SecurityTransformer(ast.NodeTransformer):
         2. Then walk the full statement — only expression-level calls remain
         3. Insert inline signals (if runtime) + write blocks, replace calls
         """
-        if runtime_sec_ids is None:
-            runtime_sec_ids = set()
         new_body: list[ast.stmt] = []
         replacer = _CallReplacer(self)
 
@@ -330,7 +330,7 @@ class SecurityTransformer(ast.NodeTransformer):
             self._recurse_subbodies(stmt, call_exprs, runtime_sec_ids)
 
             sec_ids_here = [
-                n._sec_id  # type: ignore[attr-defined]
+                getattr(n, '_sec_id')
                 for n in self._walk_skip_funcs(stmt)
                 if isinstance(n, ast.Call) and hasattr(n, '_sec_id')
             ]
@@ -349,8 +349,8 @@ class SecurityTransformer(ast.NodeTransformer):
         return new_body
 
     def _recurse_subbodies(
-        self, stmt: ast.stmt, call_exprs: dict[str, ast.expr],
-        runtime_sec_ids: set[str]
+            self, stmt: ast.stmt, call_exprs: dict[str, ast.expr],
+            runtime_sec_ids: set[str]
     ):
         """Recurse into sub-bodies of compound statements."""
         if isinstance(stmt, ast.If):
@@ -390,6 +390,7 @@ class SecurityTransformer(ast.NodeTransformer):
         sec_ids: list[str] = []
 
         for call, sec_id, is_ltf in calls:
+            currency = None
             if is_ltf:
                 symbol, timeframe, expression, ignore_invalid = (
                     self._extract_ltf_args(call)
@@ -466,21 +467,21 @@ class SecurityTransformer(ast.NodeTransformer):
         original_body = node.body
         top_block = [self._signal_block(top_sec_ids)] if top_sec_ids else []
         node.body = (
-            top_block
-            + self._transform_body(original_body, call_exprs, runtime_sec_ids)
-            + [self._wait_block(sec_ids)]
+                top_block
+                + self._transform_body(original_body, call_exprs, runtime_sec_ids)
+                + [self._wait_block(sec_ids)]
         )
 
         return self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        return self._process_func(node)
+        return self._process_func(node)  # type: ignore[return-value]
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
-        return self._process_func(node)
+        return self._process_func(node)  # type: ignore[return-value]
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        node = self.generic_visit(node)
+        node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
@@ -513,10 +514,11 @@ class _CallReplacer(ast.NodeTransformer):
     def __init__(self, parent: SecurityTransformer):
         self._parent = parent
 
+    # noinspection PyProtectedMember
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        node = self.generic_visit(node)
+        node = self.generic_visit(node)  # type: ignore[assignment]
         if hasattr(node, '_sec_id'):
-            sec_id = node._sec_id  # type: ignore[attr-defined]
+            sec_id = getattr(node, '_sec_id')
             if sec_id in self._parent._ltf_sec_ids:
                 return self._parent._sec_read_call_ltf(sec_id)
             return self._parent._sec_read_call(sec_id)
