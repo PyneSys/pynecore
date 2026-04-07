@@ -51,7 +51,7 @@ def _make_syminfo(period: str = '5'):
     """Create a minimal SymInfo for testing."""
     from pynecore.core.syminfo import SymInfo
     from pynecore.providers.ccxt import CCXTProvider
-    opening_hours, session_starts, session_ends = CCXTProvider.get_opening_hours_and_sessions()
+    opening_hours, session_starts, session_ends = CCXTProvider._create_24_7_sessions()
     return SymInfo(
         prefix="TEST", description="Test", ticker="TEST", currency="USD",
         period=period, type="crypto", mintick=0.01, pricescale=100,
