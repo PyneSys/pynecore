@@ -245,7 +245,7 @@ def calculate_strategy_statistics(
     # Calculate trade statistics
     if closed_trades:
         # Commission
-        stats.commission_paid = sum(trade.commission for trade in closed_trades)
+        stats.commission_paid = float(sum(trade.commission for trade in closed_trades))
 
         # Average calculations
         stats.avg_trade = stats.net_profit / len(closed_trades)
