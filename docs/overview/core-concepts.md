@@ -40,10 +40,12 @@ More details in the [AST Transformations](../advanced/ast-transformations.md) pa
 
 ## 2. Persistent Variables
 
-`Persistent` variables maintain their state across different bar executions. This is crucial for calculations that accumulate values or track conditions over time.
+`Persistent` corresponds to TradingView's `var` keyword. These variables maintain their state
+across different bar executions. This is crucial for calculations that accumulate values or track
+conditions over time.
 
 - **Declaration**: Use the `Persistent[type]` type hint, but use a simple value for initialization.
-- **Behavior**: The variable retains its value from the end of the previous bar's execution to the start of the current bar's execution.
+- **Behavior**: The variable retains its value from the end of the previous bar's execution to the start of the current bar's execution. When a script executes multiple times on the same bar (e.g. with `calc_on_order_fills`), `Persistent` variables are **rolled back** to the previous bar's committed state before each re-execution.
 
 ```python
 from pynecore import Persistent
@@ -65,6 +67,30 @@ The implementation of Persistent variables in PyneCore is especially clever:
 3. Every function that uses persistent variables gets global statements for those variables.
 
 This approach allows PyneCore to maintain state between bar executions without relying on complex object-oriented designs. Makes it really fast.
+
+### IBPersistent Variables
+
+`IBPersistent` (IntraBar Persistent) corresponds to TradingView's `varip` keyword. Like
+`Persistent`, it maintains its value across bars. The difference: when a script executes
+**multiple times on the same bar**, `Persistent` variables are rolled back to the bar's opening
+state before each re-execution, while `IBPersistent` variables are not — they retain their
+accumulated value.
+
+On historical bars, a script normally executes only once per bar, so there is no rollback and
+the two types behave identically. Multiple executions per bar occur in two cases:
+
+- **Strategies with `calc_on_order_fills=True`**: re-execution after each order fill
+- **Live / real-time bars**: execution on every new tick
+
+```python
+from pynecore.types import Persistent, IBPersistent
+
+var_count: Persistent[int] = 0       # rolled back on re-execution
+varip_count: IBPersistent[int] = 0   # NOT rolled back
+
+var_count += 1    # always increments by 1 per bar
+varip_count += 1  # increments by 1 per execution (including re-executions)
+```
 
 ## 3. Series Variables
 

@@ -29,7 +29,7 @@ class AlertModule(CallableModule):
 
 def alert(
         message: str,
-        freq: AlertEnum = AlertModule.freq_once_per_bar
+        freq: AlertEnum = AlertModule.freq_once_per_bar  # noqa
 ) -> None:
     """
     Display alert message. Uses rich formatting if available, falls back to print.
@@ -44,7 +44,7 @@ def alert(
     except ImportError:
         # Fallback to simple print
         print(f"🚨 ALERT: {message}")
-    
+
 
 #
 # Module initialization

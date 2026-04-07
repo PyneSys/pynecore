@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, TypeAlias, Any, Callable
 from types import GenericAlias
 
 if TYPE_CHECKING:
+    from pynecore.types.type_checker import *
     from ..types.session import SessionInfo
 
 import sys
@@ -17,8 +18,8 @@ from pynecore.types.source import Source
 from ..core.module_property import module_property
 from ..core.script import script, input
 
-from ..types.series import Series
 from ..types.na import NA
+from ..types import Series, PyneInt
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert
 from . import timeframe as timeframe_module
@@ -71,16 +72,16 @@ DateStr: TypeAlias = str  # e.g. "2020-02-20", "20 Feb 2020"
 bar_index: Series[int] = 0
 last_bar_index: Series[int] = 0  # This always points to the bar_index
 
-open: Series[float] | NA[float] = Source("open")  # noqa (shadowing built-in name (open) intentionally)
-high: Series[float] | NA[float] = Source("high")
-low: Series[float] | NA[float] = Source("low")
-close: Series[float] | NA[float] = Source("close")
-volume: Series[float] | NA[float] = Source("volume")
+open: float = Source("open")  # noqa (shadowing built-in name (open) intentionally)
+high: float = Source("high")
+low: float = Source("low")
+close: float = Source("close")
+volume: float = Source("volume")
 
-hl2: Series[float] | NA[float] = Source("hl2")
-hlc3: Series[float] | NA[float] = Source("hlc3")
-ohlc4: Series[float] | NA[float] = Source("ohlc4")
-hlcc4: Series[float] | NA[float] = Source("hlcc4")
+hl2: float = Source("hl2")
+hlc3: float = Source("hlc3")
+ohlc4: float = Source("ohlc4")
+hlcc4: float = Source("hlcc4")
 
 # Store time as integer as in Pine Scripts timestamp format
 _time: int = 0
@@ -90,7 +91,7 @@ last_bar_time: int = 0
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
 
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
-_script: script | None = None
+_script: script = None  # type: ignore[assignment]
 
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
@@ -129,7 +130,7 @@ def max_bars_back(var: Any, num: int) -> None:
 ### Date / Time ###
 
 # noinspection PyShadowingNames
-def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime:
+def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime | NA[datetime]:
     """ Get datetime object from time and timezone """
     if isinstance(time, NA):
         return time
@@ -541,7 +542,7 @@ def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe:
 
 
 @module_property
-def time(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> int | NA[int]:
+def time(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> PyneInt:
     """
     The time function returns the UNIX time of the current bar for the specified timeframe
     and session or NA if the time point is out of session.
@@ -608,7 +609,7 @@ def timenow():
 
 
 @module_property
-def time_close(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> int | NA[int]:
+def time_close(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> PyneInt:
     """
     The time_close function returns the UNIX time of the current bar's close for the specified timeframe
     and session or NA if the time point is outside the session.

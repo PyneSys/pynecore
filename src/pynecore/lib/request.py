@@ -30,9 +30,9 @@ def security(*args, **kwargs):
 
 # noinspection PyUnusedLocal
 def security_lower_tf(
-    symbol, timeframe, expression,
-    ignore_invalid_symbol=False, currency=None,
-    ignore_invalid_timeframe=False, calc_bars_count=None,
+        symbol, timeframe, expression,
+        ignore_invalid_symbol=False, currency=None,
+        ignore_invalid_timeframe=False, calc_bars_count=None,
 ):
     """
     Request intrabar data from a lower timeframe.
@@ -72,14 +72,15 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
     if _currency_provider is None:
         return nan
     from .. import lib
+    # noinspection PyProtectedMember
     timestamp = int(lib._datetime.timestamp())
     return _currency_provider.get_rate(str(from_currency), str(to_currency), timestamp)
 
 
 # noinspection PyUnusedLocal
 def dividends(
-    ticker=None, field=None, gaps=None, lookahead=None,
-    ignore_invalid_symbol=False,
+        ticker=None, field=None, gaps=None, lookahead=None,
+        ignore_invalid_symbol=False,
 ) -> float:
     """
     Request dividend data for a symbol.
@@ -99,8 +100,8 @@ def dividends(
 
 # noinspection PyUnusedLocal
 def splits(
-    ticker=None, field=None, gaps=None, lookahead=None,
-    ignore_invalid_symbol=False,
+        ticker=None, field=None, gaps=None, lookahead=None,
+        ignore_invalid_symbol=False,
 ) -> float:
     """
     Request stock split data for a symbol.
@@ -120,8 +121,8 @@ def splits(
 
 # noinspection PyUnusedLocal
 def earnings(
-    ticker=None, field=None, gaps=None, lookahead=None,
-    ignore_invalid_symbol=False,
+        ticker=None, field=None, gaps=None, lookahead=None,
+        ignore_invalid_symbol=False,
 ) -> float:
     """
     Request earnings data for a symbol.

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Iterator, Optional, Literal, Any
+from typing import Iterator, Optional, Literal
 import io
 import mmap
 import csv
@@ -190,12 +190,13 @@ class CSVWriter:
                 return self
 
             # Open file for writing
-            self._file = open(self.path, 'w', buffering=self._buffer_size)
+            file = open(self.path, 'w', buffering=self._buffer_size)
+            self._file = file
             self._is_open = True
 
             # Write headers if provided
             if self._headers:
-                writer = csv.writer(self._file, dialect=self._dialect)
+                writer = csv.writer(file, dialect=self._dialect)
                 writer.writerow(self._headers)
 
             # Start the worker thread
@@ -225,7 +226,7 @@ class CSVWriter:
         except queue.Full:
             return False
 
-    def write(self, *data: int | float | str, timeout: Optional[float] = None) -> bool:
+    def write(self, *data: object, timeout: Optional[float] = None) -> bool:
         """
         Write raw data
 
@@ -311,9 +312,9 @@ class CSVReader:
         self.path: Path = path
         self._file: io.BufferedReader | None = None
         self._headers: list[str] | None = None
-        self._dialect: csv.Dialect | None = None
+        self._dialect: type[csv.Dialect] | None = None
         self._has_headers: bool = True
-        self._field_indices: dict[str, Any] | None = None
+        self._field_indices: dict[str, int] | None = None
         self._extra_fields: dict[str, int] | None = None
         self._mmap: mmap.mmap | None = None
         self._is_valid_ohlcv: bool = False
@@ -328,14 +329,17 @@ class CSVReader:
     def open(self) -> CSVReader:
         """Open the CSV file"""
         # Open file in binary mode for memory mapping
-        self._file = open(self.path, 'rb')
-        self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        file = open(self.path, 'rb')
+        self._file = file
+        mm = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+        self._mmap = mm
 
         # Read first line to detect CSV format and headers
-        first_line = self._mmap.readline().decode('utf-8')
+        first_line = mm.readline().decode('utf-8')
 
         # Detect dialect
-        self._dialect = csv.Sniffer().sniff(first_line)  # type: ignore
+        dialect = csv.Sniffer().sniff(first_line)  # type: ignore
+        self._dialect = dialect
 
         # Check if we have headers
         self._has_headers = csv.Sniffer().has_header(first_line)
@@ -343,24 +347,25 @@ class CSVReader:
         _is_tv = False
         if self._has_headers:
             # Parse headers
-            self._headers = next(csv.reader([first_line], dialect=self._dialect))
-            _is_tv = (self._headers[0] == 'time' and self._headers[1] == 'open' and self._headers[2] == 'high'
-                      and self._headers[3] == 'low' and self._headers[4] == 'close')
+            headers = next(csv.reader([first_line], dialect=dialect))
+            _is_tv = (headers[0] == 'time' and headers[1] == 'open' and headers[2] == 'high'
+                      and headers[3] == 'low' and headers[4] == 'close')
         else:
             # Default headers for standard OHLCV
-            self._headers = ['time', 'open', 'high', 'low', 'close', 'volume']
+            headers = ['time', 'open', 'high', 'low', 'close', 'volume']
+        self._headers = headers
 
         # Reopen file to reset position
-        self._file.seek(0)
+        file.seek(0)
 
         # Create case-insensitive header mapping
-        header_map = {h.lower(): i for i, h in enumerate(self._headers) if not _is_tv or i < 6 or h == "Volume"}
+        header_map = {h.lower(): i for i, h in enumerate(headers) if not _is_tv or i < 6 or h == "Volume"}
 
         # Get field indices for OHLCV data with case-insensitive matching
         try:
-            self._field_indices = {
+            fi: dict[str, int] = {
                 # support both 'time' and 'timestamp'
-                'time': header_map.get('time', header_map.get('timestamp')),
+                'time': header_map['time'] if 'time' in header_map else header_map['timestamp'],
                 # OHLCV fields
                 'open': header_map['open'],
                 'high': header_map['high'],
@@ -370,14 +375,15 @@ class CSVReader:
             }
             self._is_valid_ohlcv = True
         except KeyError:
-            self._field_indices = {
+            fi = {
                 'time': header_map.get('data/time', 0),
             }
+        self._field_indices = fi
 
         # Get extra field indices
         self._extra_fields = {
-            name: idx for idx, name in enumerate(self._headers)
-            if idx not in self._field_indices.values()
+            name: idx for idx, name in enumerate(headers)
+            if idx not in fi.values()
         }
 
         return self
@@ -418,13 +424,16 @@ class CSVReader:
             raise RuntimeError("File not opened!")
         assert self._mmap is not None
         assert self._field_indices is not None
+        assert self._dialect is not None
+        fi = self._field_indices
+        dialect = self._dialect
 
         # Reset position
         self._mmap.seek(0)
 
         # Create a text IO wrapper for the mmap object
         text_io = io.TextIOWrapper(io.BytesIO(self._mmap))
-        reader = csv.reader(text_io, dialect=self._dialect)
+        reader = csv.reader(text_io, dialect=dialect)
 
         # Skip header if needed
         if self._has_headers:
@@ -439,7 +448,7 @@ class CSVReader:
                 continue
 
             # Parse timestamp
-            time_field = row[self._field_indices['time']]
+            time_field = row[fi['time']]
             if time_field.isdigit():
                 timestamp = int(time_field)
             else:
@@ -454,21 +463,21 @@ class CSVReader:
                 if self._is_valid_ohlcv:
                     candle = OHLCV(
                         timestamp=timestamp,
-                        open=float(row[self._field_indices['open']]),
-                        high=float(row[self._field_indices['high']]),
-                        low=float(row[self._field_indices['low']]),
-                        close=float(row[self._field_indices['close']]),
-                        volume=float(row[self._field_indices['volume']]),
+                        open=float(row[fi['open']]),
+                        high=float(row[fi['high']]),
+                        low=float(row[fi['low']]),
+                        close=float(row[fi['close']]),
+                        volume=float(row[fi['volume']]),
                         extra_fields=self._parse_extra_fields(row)
                     )
                 else:
                     candle = OHLCV(
                         timestamp=timestamp,
-                        open=NA(float),
-                        high=NA(float),
-                        low=NA(float),
-                        close=NA(float),
-                        volume=NA(float),
+                        open=float('nan'),
+                        high=float('nan'),
+                        low=float('nan'),
+                        close=float('nan'),
+                        volume=float('nan'),
                         extra_fields=self._parse_extra_fields(row)
                     )
 

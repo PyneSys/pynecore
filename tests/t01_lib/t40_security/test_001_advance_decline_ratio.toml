@@ -32,7 +32,7 @@
 #margin_long = 100.0
 #margin_short = 100.0
 #risk_free_rate = 2.0
-#use_bar_magnifier = false
+#use_bar_magnifier = true
 #fill_orders_on_standard_ohlc = false
 
 # Input Settings

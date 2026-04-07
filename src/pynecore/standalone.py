@@ -77,8 +77,10 @@ def run(script_file: str) -> None:
 
         # Run using the standard ScriptRunner
         with OHLCVReader(ohlcv_path) as reader:
-            size = reader.get_size(reader.start_timestamp, reader.end_timestamp)
-            ohlcv_iter = reader.read_from(reader.start_timestamp, reader.end_timestamp)
+            start_ts: int = reader.start_timestamp  # type: ignore[assignment]
+            end_ts: int = reader.end_timestamp  # type: ignore[assignment]
+            size = reader.get_size(start_ts, end_ts)
+            ohlcv_iter = reader.read_from(start_ts, end_ts)
             print(
                 f"Running {script_path.name} on {data_path.stem} ({size} bars)...",
                 file=sys.stderr

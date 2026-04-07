@@ -13,5 +13,9 @@
    "reportUnknownMemberType": "none",
    "reportAssignmentType": "none",
    "reportRedeclaration": "none",
-   "reportArgumentType": "none"
+   "reportArgumentType": "none",
+   "useLibraryCodeForTypes": true,
+   "defineConstant": {
+      "TYPECHECKER": "pyright"
+   }
 }

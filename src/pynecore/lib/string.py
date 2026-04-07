@@ -25,7 +25,7 @@ __all__ = ['contains', 'endswith', 'format', 'format_time', 'length', 'lower', '
 #
 
 # noinspection PyProtectedMember
-def _format_number(value: float, fmt_type: str = '', precision: str = '#.###') -> str:
+def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###') -> str:
     """
     Format a number according to Pine rules.
 
@@ -360,8 +360,7 @@ def format_time(time: int, fmt: str | None = None, tz: str | None = None) -> str
     :return: Formatted time string
     """
     # Default format
-    if not fmt:
-        fmt = "yyyy-MM-ddTHH:mm:ssZ"
+    fmt: str = fmt if fmt else "yyyy-MM-ddTHH:mm:ssZ"
 
     # Convert timestamp to datetime
     dt = datetime.fromtimestamp(time / 1000, UTC)

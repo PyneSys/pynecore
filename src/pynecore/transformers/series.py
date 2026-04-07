@@ -46,14 +46,13 @@ class SeriesTransformer(ast.NodeTransformer):
         Returns:
             str: The generated global instance name
         """
-        if scope is None:
-            scope = self._get_current_scope()
+        resolved_scope: str = scope if scope is not None else self._get_current_scope()
 
-        series_name = f'__series_{scope}·{var_name}__'
+        series_name = f'__series_{resolved_scope}·{var_name}__'
 
-        if scope not in self.series_vars:
-            self.series_vars[scope] = {}
-        self.series_vars[scope][var_name] = series_name
+        if resolved_scope not in self.series_vars:
+            self.series_vars[resolved_scope] = {}
+        self.series_vars[resolved_scope][var_name] = series_name
         self.collected_series.add(series_name)
 
         return series_name
@@ -243,9 +242,10 @@ class SeriesTransformer(ast.NodeTransformer):
 
         # Find the right position to insert initializations after docstring if exists
         insert_pos = 0
-        if (node.body and isinstance(node.body[0], ast.Expr) and
-                isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant) and
-                isinstance(cast(ast.Constant, cast(ast.Expr, node.body[0]).value).value, str)):
+        first_stmt = node.body[0] if node.body else None
+        if (isinstance(first_stmt, ast.Expr) and
+                isinstance(first_stmt.value, ast.Constant) and
+                isinstance(first_stmt.value.value, str)):
             insert_pos = 1
 
         # Insert series initializations after docstring

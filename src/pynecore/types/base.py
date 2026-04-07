@@ -5,12 +5,13 @@ class IntEnum(int):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        cls._counter = 0  # Minden leszármazottnak külön számlálója lesz
+        cls._counter = 0  # Each subclass gets its own counter
 
     def __new__(cls):
-        # Az új objektum létrehozása a számláló aktuális értékével
+        # Create new object with the current counter value
         value = cls._counter
         cls._counter += 1
+        # noinspection PyTypeChecker
         return super().__new__(cls, value)
 
 

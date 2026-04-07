@@ -1,7 +1,10 @@
 """
 @pyne
 """
-from typing import TypeVar, cast
+from typing import TypeVar, cast, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pynecore.types.type_checker import *
 
 import builtins
 import math
@@ -9,7 +12,7 @@ import heapq
 
 from collections import deque
 
-from ..types import Series, Persistent, NA
+from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool
 from ..core.module_property import module_property
 from pynecore.core.overload import overload
 
@@ -126,7 +129,7 @@ def _avgrank(values: list[float], val_to_compare: float) -> float:
 #
 
 @module_property
-def accdist() -> float | NA[float]:
+def accdist() -> PyneFloat:
     """
     Accumulation/Distribution index
     A/D = ((Close - Low) - (High - Close)) / (High - Low) * Volume + Previous A/D
@@ -144,7 +147,7 @@ def accdist() -> float | NA[float]:
 
 
 def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float = 6.0, floor=False) \
-        -> float | Series[float] | NA[float]:
+        -> PyneFloat:
     """
     Calculate the Arnaud Legoux Moving Average (ALMA) of the source series with the given length.
 
@@ -171,6 +174,9 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     weights: Persistent[list[float]] = []
     norm: Persistent[float] = 0.0
 
+    if TYPE_CHECKING:
+        weights: list[float] = cast(list[float], weights)
+
     # Calculate weights only once
     if not weights:
         m = offset * (length - 1) if not floor else math.floor(offset * (length - 1))
@@ -186,7 +192,7 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     return summ / norm
 
 
-def atr(length: int) -> float | NA[float]:
+def atr(length: int) -> PyneFloat:
     """
     Calculate Average True Range (ATR) of the source series with the given length.
 
@@ -197,7 +203,7 @@ def atr(length: int) -> float | NA[float]:
     return rma(tr(True), length)
 
 
-def barssince(condition: bool) -> int | NA[int]:
+def barssince(condition: bool) -> PyneInt:
     """
     Calculate the number of bars since the condition was true.
 
@@ -214,7 +220,7 @@ def barssince(condition: bool) -> int | NA[int]:
     return counter
 
 
-def bb(source: float, length: int, mult: float | int) -> tuple[float | NA[float], float | NA[float], float | NA[float]]:
+def bb(source: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Calculate the Bollinger Bands (BB) of the source series with the given length and multiplier.
 
@@ -236,7 +242,7 @@ def bb(source: float, length: int, mult: float | int) -> tuple[float | NA[float]
     return middle, middle + std_dev, middle - std_dev
 
 
-def bbw(source: float, length: int, mult: float | int) -> float | NA[float]:
+def bbw(source: float, length: int, mult: float | int) -> PyneFloat:
     """
     Calculate the Bollinger Bands Width (BBW) of the source series with the given length and multiplier.
 
@@ -251,7 +257,7 @@ def bbw(source: float, length: int, mult: float | int) -> float | NA[float]:
     return ((h - l) / b) * 100
 
 
-def cci(source: float, length: int) -> float | NA[float]:
+def cci(source: float, length: int) -> PyneFloat:
     """
     Calculate the Commodity Channel Index (CCI) of the source series with the given length.
 
@@ -283,14 +289,15 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB | NA[TFIB]:
     prev_val = source[length]
 
     if isinstance(source, NA) or isinstance(prev_val, NA):
-        return NA(cast(type[TFIB], type(source)))  # type: ignore
-    if isinstance(source, (float, int)):
-        diff = round(source - prev_val, 14)
-        return cast(TFIB, diff)
+        return NA(cast(type[TFIB], type(source)))
+    if isinstance(source, float):
+        return cast(TFIB, round(source - prev_val, 14))  # noqa
+    if isinstance(source, int):
+        return cast(TFIB, source - prev_val)  # noqa
     return source != prev_val
 
 
-def cmo(source: float, length: int) -> float | NA[float]:
+def cmo(source: float, length: int) -> PyneFloat:
     """
     Calculate the Chande Momentum Oscillator (CMO) of the source series with the given length.
 
@@ -307,7 +314,7 @@ def cmo(source: float, length: int) -> float | NA[float]:
 
 
 # noinspection PyUnusedLocal,PyShadowingBuiltins
-def cog(source: Series[float], length: int) -> float | NA[float]:
+def cog(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the Center of Gravity (COG) of the source series with the given length.
 
@@ -392,7 +399,7 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
         return NA(float)
 
 
-def cross(source1: float, source2: float) -> bool | NA[bool]:
+def cross(source1: float, source2: float) -> PyneBool:
     """
     Check if the source series crossed over or under the given series.
 
@@ -404,7 +411,7 @@ def cross(source1: float, source2: float) -> bool | NA[bool]:
 
 
 # noinspection PyUnusedLocal
-def crossover(source1: float, source2: float) -> bool | NA[bool]:
+def crossover(source1: float, source2: float) -> PyneBool:
     """
     Check if the source series crossed over the given series.
 
@@ -419,7 +426,7 @@ def crossover(source1: float, source2: float) -> bool | NA[bool]:
 
 
 # noinspection PyUnusedLocal
-def crossunder(source1: float, source2: float) -> bool | NA[bool]:
+def crossunder(source1: float, source2: float) -> PyneBool:
     """
     Check if the source series crossed under the given series.
 
@@ -433,7 +440,7 @@ def crossunder(source1: float, source2: float) -> bool | NA[bool]:
     return res
 
 
-def cum(source: Series[float | int]) -> float | NA:
+def cum(source: Series[float | int]) -> PyneFloat:
     """
     Calculate the cumulative sum of the source series.
 
@@ -447,7 +454,7 @@ def cum(source: Series[float | int]) -> float | NA:
     return var
 
 
-def dev(source: Series[float], length: int, _mean: float | None = None) -> float | NA:
+def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> float | NA:
     """
     Calculate the Mean Absolute Deviation (MAD) of the source series with the given length.
 
@@ -504,7 +511,7 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[float | NA, float | NA, float
     return p, m, adx
 
 
-def ema(source: float, length: int, _alpha: float | None = None) -> float | NA[float]:
+def ema(source: PyneFloat, length: int, _alpha: float | None = None) -> PyneFloat:
     """
     Calculate the Exponential Moving Average (EMA) of the source series with the given length.
 
@@ -522,7 +529,7 @@ def ema(source: float, length: int, _alpha: float | None = None) -> float | NA[f
         return NA(float)
 
     alpha: Persistent[float] = _alpha or (2 / (length + 1))
-    last_val: Persistent[float | NA] = NA(float)
+    last_val: Persistent[float] = NA(float)
 
     # Use SMA at warming stage
     if isinstance(last_val, NA):
@@ -546,7 +553,7 @@ def falling(source: float, length: int) -> bool:
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
-    last_val: Persistent[float | NA[float]] = NA(float)
+    last_val: Persistent[float] = NA(float)
     counter: Persistent[int] = 0
 
     if isinstance(last_val, NA):
@@ -565,7 +572,7 @@ def falling(source: float, length: int) -> bool:
 # noinspection PyUnusedLocal,DuplicatedCode
 @overload
 def highest(source: Series[float], length: int, _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
-        -> float | tuple[float | NA[float], float | NA[float]] | NA[float]:
+        -> PyneFloat:
     """
     Calculate the highest value of the source series with the given length.
 
@@ -577,7 +584,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     :param _check_eq: If true, check for equality too, internal use only
     :return: The highest value of the source series
     """
-    last_max: Persistent[float | NA] = NA(float)
+    last_max: Persistent[float] = NA(float)
     last_max_index: Persistent[int] = 0
 
     if last_max < source or isinstance(last_max, NA) or (_check_eq and last_max == source):
@@ -601,23 +608,23 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     last_max_index += 1
 
     if bar_index < length - 1:
-        return NA(float) if not _tuple else (NA(float), NA(float))
+        return NA(float) if not _tuple else (NA(float), NA(float))  # type: ignore[return-value]
 
     if _bars:
         return -max_index
     if _tuple:
-        return cast(float | tuple[float | NA[float], float | NA[float]], (last_max, -max_index))
+        return last_max, -max_index  # type: ignore[return-value]
     return last_max
 
 
 @overload
-def highest(length: int) -> float | NA[float]:
+def highest(length: int) -> PyneFloat:
     return highest(high, length)
 
 
 # noinspection PyUnusedLocal
 @overload
-def highestbars(source: Series[float], length: int) -> float | NA[float]:
+def highestbars(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the number of bars since the highest value of the source series with the given length.
 
@@ -629,11 +636,11 @@ def highestbars(source: Series[float], length: int) -> float | NA[float]:
 
 
 @overload
-def highestbars(length: int) -> float | NA[float]:
+def highestbars(length: int) -> PyneFloat:
     return highest(high, length, _bars=True)
 
 
-def hma(source: float, length: int) -> float | NA[float]:
+def hma(source: float, length: int) -> PyneFloat:
     """
     Calculate the Hull Moving Average (HMA) of the source series with the given length.
 
@@ -654,7 +661,7 @@ def hma(source: float, length: int) -> float | NA[float]:
 
 
 @module_property
-def iii() -> float | Series[float] | NA[float]:
+def iii() -> PyneFloat:
     """
     Intraday Intensity Index.
 
@@ -665,7 +672,7 @@ def iii() -> float | Series[float] | NA[float]:
 
 # noinspection PyPep8Naming
 def kc(series: float, length: int, mult: float | int, useTrueRange: bool = True) \
-        -> tuple[float | NA[float], float | NA[float], float | NA[float]]:
+        -> tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Calculate the Keltner Channels (KC) of the source series with the given length and multiplier.
 
@@ -690,7 +697,7 @@ def kc(series: float, length: int, mult: float | int, useTrueRange: bool = True)
 
 
 # noinspection PyPep8Naming
-def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True) -> float | NA[float]:
+def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True) -> PyneFloat:
     """
     Calculate the Keltner Channels Width (KCW) of the source series with the given length and multiplier.
 
@@ -706,7 +713,7 @@ def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True
     return (h - l) / b
 
 
-def linreg(source: Series[float], length: int, offset: int) -> float | Series[float] | NA[float]:
+def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     """
     Computes the linear regression value of the source series over a given period.
 
@@ -763,7 +770,7 @@ def linreg(source: Series[float], length: int, offset: int) -> float | Series[fl
 @overload
 def lowest(source: Series[float], length: int,
            _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
-        -> float | tuple[float | NA[float], float | NA[float]] | NA[float]:
+        -> PyneFloat:
     """
     Calculate the lowest value of the source series with the given length.
 
@@ -775,7 +782,7 @@ def lowest(source: Series[float], length: int,
     :param _check_eq: If true, check for equality too, internal use only
     :return: The lowest value of the source series
     """
-    last_min: Persistent[float | NA[float]] = NA(float)
+    last_min: Persistent[float] = NA(float)
     last_min_index: Persistent[int] = 0
 
     if last_min > source or isinstance(last_min, NA) or (_check_eq and last_min == source):
@@ -799,23 +806,23 @@ def lowest(source: Series[float], length: int,
     last_min_index += 1
 
     if bar_index < length - 1:
-        return NA(float) if not _tuple else (NA(float), NA(int))
+        return NA(float) if not _tuple else (NA(float), NA(int))  # type: ignore[return-value]
 
     if _bars:
         return -min_index
     if _tuple:
-        return cast(float | tuple[float | NA[float], float | NA[float]], (last_min, -min_index))
+        return last_min, -min_index  # type: ignore[return-value]
     return last_min
 
 
 @overload
-def lowest(length: int) -> float | NA:
+def lowest(length: int) -> PyneFloat:
     return lowest(low, length)
 
 
 # noinspection PyUnusedLocal
 @overload
-def lowestbars(source: Series[float], length: int) -> float | NA[float]:
+def lowestbars(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the number of bars since the lowest value of the source series with the given length.
 
@@ -827,12 +834,12 @@ def lowestbars(source: Series[float], length: int) -> float | NA[float]:
 
 
 @overload
-def lowestbars(length: int) -> float | NA[float]:
+def lowestbars(length: int) -> PyneFloat:
     return lowest(low, length, _bars=True)
 
 
 def macd(source: float, fastlen: int, slowlen: int, siglen: int) \
-        -> tuple[float | NA[float], float | NA[float], float | NA[float]]:
+        -> tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Calculate the Moving Average Convergence Divergence (MACD) of the source series with the given
     fast, slow, and signal lengths.
@@ -861,14 +868,14 @@ def macd(source: float, fastlen: int, slowlen: int, siglen: int) \
 
 
 # noinspection PyShadowingBuiltins
-def max(source: Series[float]) -> float | NA[float]:
+def max(source: Series[float]) -> PyneFloat:
     """
     Calculate the maximum value of the source series.
 
     :param source: The source series
     :return: The maximum value of the source series
     """
-    max_val: Persistent[float | NA] = NA(float)
+    max_val: Persistent[float] = NA(float)
     if max_val < source or isinstance(max_val, NA):
         max_val = source
     return max_val
@@ -888,12 +895,18 @@ def median(source: Series[TFI], length: int) -> TFI | NA[TFI] | Series[TFI]:
     length = int(length)
 
     if isinstance(source, NA):
-        return NA(cast(type[TFI], type(source)))  # type: ignore
+        return NA(cast(type[TFI], type(source)))
 
     # Store heaps and window
     heap_low: Persistent[list[TFI]] = []  # Max heap (negative values)
     heap_high: Persistent[list[TFI]] = []  # Min heap
     window: Persistent[list[TFI]] = []  # Recent values for removal
+
+    if TYPE_CHECKING:
+        heap_low: list[TFI] = cast(list[TFI], heap_low)
+        heap_high: list[TFI] = cast(list[TFI], heap_high)
+        window: list[TFI] = cast(list[TFI], window)
+        source: TFI = cast(TFI, source)
 
     # Add new value and balance heaps
     value = source
@@ -932,7 +945,7 @@ def median(source: Series[TFI], length: int) -> TFI | NA[TFI] | Series[TFI]:
     return -heap_low[0] if isinstance(source, int) else (-heap_low[0] + heap_high[0]) / 2  # type: ignore
 
 
-def mfi(source: float, length: int) -> float | NA[float]:
+def mfi(source: float, length: int) -> PyneFloat:
     """
     Calculate the Money Flow Index (MFI) of the source series with the given length.
 
@@ -954,14 +967,14 @@ def mfi(source: float, length: int) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins
-def min(source: Series[float]) -> float | NA:
+def min(source: Series[float]) -> PyneFloat:
     """
     Calculate the minimum value of the source series.
 
     :param source: The source series
     :return: The minimum value of the source series
     """
-    min_val: Persistent[float | NA] = NA(float)
+    min_val: Persistent[float] = NA(float)
     if min_val > source or isinstance(min_val, NA):
         min_val = source
     return min_val
@@ -1021,7 +1034,7 @@ def mom(source: float, length: int) -> float | NA:
 
 # noinspection PyUnusedLocal
 @module_property
-def nvi() -> float | NA[float] | Series[float]:
+def nvi() -> PyneFloat:
     """
     Negative Volume Index.
 
@@ -1044,7 +1057,7 @@ def nvi() -> float | NA[float] | Series[float]:
 
 
 @module_property
-def obv() -> float | NA[float]:
+def obv() -> PyneFloat:
     """
     On Balance Volume.
 
@@ -1063,7 +1076,7 @@ def obv() -> float | NA[float]:
 
 
 def percentile_linear_interpolation(source: Series[float], length: int, percentage: int | float) \
-        -> float | NA[float] | Series[float]:
+        -> PyneFloat:
     """
     Calculates percentile using method of linear interpolation between the two nearest ranks.
 
@@ -1084,7 +1097,7 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
 
 
 def percentile_nearest_rank(source: Series[float], length: int, percentage: int | float) \
-        -> float | NA[float] | Series[float]:
+        -> PyneFloat:
     """
     Calculates percentile using the nearest rank method.
 
@@ -1104,7 +1117,7 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     return array.percentile_nearest_rank(source[:length], percentage)  # type: ignore
 
 
-def percentrank(source: Series[float], length: int) -> float | NA[float] | Series[float]:
+def percentrank(source: Series[float], length: int) -> PyneFloat:
     """
     Percent rank is the percents of how many previous values was less than or equal to the current
     value of given series.
@@ -1122,7 +1135,7 @@ def percentrank(source: Series[float], length: int) -> float | NA[float] | Serie
 
 
 # noinspection PyUnusedLocal,PyShadowingBuiltins
-def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> list[float | NA[float]]:
+def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> list[PyneFloat]:
     """
     Calculate pivot point levels based on the specified calculation type.
 
@@ -1151,8 +1164,11 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
     curr_period_open: Persistent[float] = NA(float)
     is_first_bar_of_period: Persistent[bool] = True
 
-    levels: Persistent[list[float | NA[float]]] = [NA(float)] * 11
+    levels: Persistent[list[PyneFloat]] = [NA(float)] * 11
     had_anchor: Persistent[bool] = False
+
+    if TYPE_CHECKING:
+        levels: list[PyneFloat] = cast(list[PyneFloat], levels)
 
     # Normalize type to lowercase for case-insensitive comparison
     type_lower = type.lower() if isinstance(type, str) else ""
@@ -1289,7 +1305,7 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
 
 
 @overload
-def pivothigh(source: float, leftbars: int, rightbars: int) -> float | NA[float]:
+def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     """
     This function returns price of the pivot high point. It returns 'NaN', if there was no pivot high point.
 
@@ -1314,7 +1330,7 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> float | NA[float]
 
 
 @overload
-def pivothigh(leftbars: int, rightbars: int) -> float | NA[float]:
+def pivothigh(leftbars: int, rightbars: int) -> PyneFloat:
     """
     This function returns price of the pivot high point. It returns 'NaN', if there was no pivot high point.
 
@@ -1332,7 +1348,7 @@ def pivothigh(leftbars: int, rightbars: int) -> float | NA[float]:
 
 
 @overload
-def pivotlow(source: float, leftbars: int, rightbars: int) -> float | NA[float]:
+def pivotlow(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     """
     This function returns price of the pivot low point. It returns 'NaN', if there was no pivot low point.
 
@@ -1356,7 +1372,7 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> float | NA[float]:
 
 
 @overload
-def pivotlow(leftbars: int, rightbars: int) -> float | NA[float]:
+def pivotlow(leftbars: int, rightbars: int) -> PyneFloat:
     """
     This function returns price of the pivot low point. It returns 'NaN', if there was no pivot low point.
 
@@ -1375,7 +1391,7 @@ def pivotlow(leftbars: int, rightbars: int) -> float | NA[float]:
 
 # noinspection PyUnusedLocal
 @module_property
-def pvi() -> float | NA[float] | Series[float]:
+def pvi() -> PyneFloat:
     """
     Positive Volume Index.
 
@@ -1398,7 +1414,7 @@ def pvi() -> float | NA[float] | Series[float]:
 
 # noinspection PyUnusedLocal
 @module_property
-def pvt() -> float | NA[float]:
+def pvt() -> PyneFloat:
     """
     Price Volume Trend.
 
@@ -1412,7 +1428,7 @@ def pvt() -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins
-def range(source: Series[float], length: int) -> float | NA[float]:
+def range(source: Series[float], length: int) -> PyneFloat:
     """
     Returns the difference between the max and min values in a series.
 
@@ -1428,7 +1444,7 @@ def range(source: Series[float], length: int) -> float | NA[float]:
     return highest(source, length) - lowest(source, length)
 
 
-def rci(source: Series[float], length: int) -> float | NA[float]:
+def rci(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate Rank Correlation Index (RCI).
 
@@ -1481,7 +1497,7 @@ def rising(source: float, length: int) -> bool:
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
-    last_val: Persistent[float | NA] = NA(float)
+    last_val: Persistent[float] = NA(float)
     counter: Persistent[int] = 0
 
     if isinstance(last_val, NA):
@@ -1497,7 +1513,7 @@ def rising(source: float, length: int) -> bool:
     return counter >= length
 
 
-def rma(source: float, length: int) -> float | NA[float]:
+def rma(source: PyneFloat, length: int) -> PyneFloat:
     """
     Calculate the RMA (Running Moving Average) of the source series with the given length.
 
@@ -1508,7 +1524,7 @@ def rma(source: float, length: int) -> float | NA[float]:
     return ema(source, length, 1 / length)
 
 
-def roc(source: Series[float], length: int) -> float | NA[float]:
+def roc(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the Rate of Change (ROC) of the source series with the given length.
 
@@ -1531,7 +1547,7 @@ def roc(source: Series[float], length: int) -> float | NA[float]:
 
 
 # noinspection PyUnusedLocal
-def rsi(source: float, length: int) -> float | NA[float]:
+def rsi(source: float, length: int) -> PyneFloat:
     """
     Calculate the Relative Strength Index (RSI) of the source series with the given length.
 
@@ -1543,7 +1559,7 @@ def rsi(source: float, length: int) -> float | NA[float]:
     if isinstance(source, NA):
         return NA(float)
 
-    prev_src: Persistent[float | NA[float]] = NA(float)
+    prev_src: Persistent[float] = NA(float)
     if isinstance(prev_src, NA):
         prev_src = source
         return NA(float)
@@ -1556,7 +1572,7 @@ def rsi(source: float, length: int) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins,PyUnusedLocal,PyShadowingNames
-def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> float | NA[float]:
+def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     """
     Parabolic SAR (Stop and Reverse) - method devised by J. Welles Wilder, Jr.,
     to find potential reversals in the market price direction of traded goods.
@@ -1648,7 +1664,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> float | NA[
     return sar_val
 
 
-def sma(source: Series[float], length: int) -> float | NA[float]:
+def sma(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate Simple Moving Average (SMA)
 
@@ -1660,7 +1676,7 @@ def sma(source: Series[float], length: int) -> float | NA[float]:
     return round(lib_math.sum(source, length) / length, 15)
 
 
-def stdev(source: float, length: int, biased=True) -> float | NA[float]:
+def stdev(source: float, length: int, biased=True) -> PyneFloat:
     """
     Calculate the standard deviation of the source series with the given length.
 
@@ -1677,7 +1693,7 @@ def stdev(source: float, length: int, biased=True) -> float | NA[float]:
 
 # noinspection PyShadowingNames
 def stoch(source: float | Series[float], high: float | Series[float], low: float | Series[float],
-          length: int) -> float | NA[float]:
+          length: int) -> PyneFloat:
     """
     Calculate the Stochastic Oscillator of the source series with the given length.
 
@@ -1711,7 +1727,7 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
-def supertrend(factor: float | int, atr_period: int) -> tuple[float | NA, int | NA]:
+def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt]:
     """
     Calculate Supertrend indicator.
 
@@ -1722,11 +1738,11 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[float | NA, int | 
     assert atr_period > 0, "Invalid ATR period, must be greater than 0!"
 
     # Store persistent state
-    prev_lower: Persistent[float | NA[float]] = NA(float)
-    prev_upper: Persistent[float | NA[float]] = NA(float)
-    prev_close: Persistent[float | NA[float]] = NA(float)
-    prev_direction: Persistent[int | NA[int]] = NA(int)
-    prev_supertrend: Persistent[float | NA[float]] = NA(float)
+    prev_lower: Persistent[float] = NA(float)
+    prev_upper: Persistent[float] = NA(float)
+    prev_close: Persistent[float] = NA(float)
+    prev_direction: Persistent[int] = NA(int)
+    prev_supertrend: Persistent[float] = NA(float)
 
     # Calculate base values
     src = hl2
@@ -1784,7 +1800,7 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[float | NA, int | 
     return supertrend, direction
 
 
-def swma(source: Series[float]) -> float | NA[float] | Series[float]:
+def swma(source: Series[float]) -> PyneFloat:
     """
     Symmetrically weighted moving average with fixed length: 4. Weights: [1/6, 2/6, 2/6, 1/6].
 
@@ -1799,7 +1815,7 @@ def swma(source: Series[float]) -> float | NA[float] | Series[float]:
 
 # noinspection PyUnusedLocal
 @module_property
-def tr(handle_na: bool = False) -> float | NA[float] | Series[float]:
+def tr(handle_na: bool = False) -> PyneFloat:
     """
     Calculate True Range (TR)
 
@@ -1807,7 +1823,7 @@ def tr(handle_na: bool = False) -> float | NA[float] | Series[float]:
                       current day high-low. Otherwise (if false) tr would return NaN in such cases
     :return: True Range (TR)
     """
-    prev_close: Persistent[float | NA[float]] = NA(float)
+    prev_close: Persistent[float] = NA(float)
 
     if isinstance(prev_close, NA):
         val = (high - low) if handle_na else NA(float)
@@ -1818,7 +1834,7 @@ def tr(handle_na: bool = False) -> float | NA[float] | Series[float]:
     return val  # type: ignore
 
 
-def tsi(source: Series[float], short_length: int, long_length: int) -> float | NA[float]:
+def tsi(source: Series[float], short_length: int, long_length: int) -> PyneFloat:
     """
     True strength index. It uses moving averages of the underlying momentum
     of a financial instrument.
@@ -1857,7 +1873,7 @@ def tsi(source: Series[float], short_length: int, long_length: int) -> float | N
 
 def variance(source: Series[float],
              length: int,
-             biased: bool = True) -> float | NA[float]:
+             biased: bool = True) -> PyneFloat:
     """
     Calculate the rolling variance of the source series.
 
@@ -1929,7 +1945,7 @@ def variance(source: Series[float],
     return var
 
 
-def valuewhen(condition: bool, source: float, occurrence: int) -> float | NA[float]:
+def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     """
     Returns the value of the source series when the condition is true for the given occurrence.
 
@@ -1943,6 +1959,8 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> float | NA[flo
         return NA(float)
 
     values: Persistent[deque[float]] = deque(maxlen=occurrence + 1)
+    if TYPE_CHECKING:
+        values: deque[float] = cast(deque[float], values)
 
     if condition:
         values.append(source)
@@ -1954,7 +1972,7 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> float | NA[flo
 
 # noinspection PyUnusedLocal
 def vwap(source: Series[float], anchor: bool | None = None, stdev_mult: float | None = None) -> \
-        float | NA | tuple[float | NA, float | NA, float | NA]:
+        PyneFloat | tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Volume weighted average price.
 
@@ -2004,19 +2022,19 @@ def vwap(source: Series[float], anchor: bool | None = None, stdev_mult: float | 
     return vwap_value
 
 
-def vwma(source: float, length: int) -> float | NA[float]:
+def vwma(source: float, length: int) -> PyneFloat:
     return sma(source * volume, length) / sma(volume, length)
 
 
 # noinspection PyUnusedLocal
 @module_property
-def wad() -> float | NA[float]:
+def wad() -> PyneFloat:
     """
     Williams Accumulation/Distribution.
 
     :return: Williams Accumulation/Distribution
     """
-    prev_close: Persistent[float | NA[float]] = NA(float)
+    prev_close: Persistent[float] = NA(float)
     true_high = builtins.max(high, prev_close)
     true_low = builtins.min(low, prev_close)
     momentum = close - prev_close
@@ -2025,7 +2043,7 @@ def wad() -> float | NA[float]:
     return cum(gain)
 
 
-def wma(source: Series[float], length: int) -> float | NA[float]:
+def wma(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the Weighted Moving Average (WMA) of the source series with the given length.
 
@@ -2065,7 +2083,7 @@ def wma(source: Series[float], length: int) -> float | NA[float]:
     return val  # type: ignore
 
 
-def wpr(length: int) -> float | NA[float] | Series[float]:
+def wpr(length: int) -> PyneFloat:
     """
     Williams %R indicator.
 
@@ -2085,7 +2103,7 @@ def wpr(length: int) -> float | NA[float] | Series[float]:
 
 
 @module_property
-def wvad() -> float | NA[float] | Series[float]:
+def wvad() -> PyneFloat:
     """
     Weighted Volume Accumulation/Distribution.
 

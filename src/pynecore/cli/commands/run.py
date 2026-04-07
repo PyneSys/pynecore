@@ -20,6 +20,8 @@ from ..pluggable import PluggableCommand
 from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
+from pynecore.core.aggregator import validate_aggregation
+from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
@@ -242,6 +244,11 @@ def run(
                                             help='Security data: "TIMEFRAME=data_name" or '
                                                  '"SYMBOL:TIMEFRAME=data_name"',
                                             rich_help_panel="Security Options"),
+        timeframe: str | None = Option(None, "--timeframe", "-tf",
+                                       help="Chart timeframe (TradingView format, e.g. '60', '1D'). "
+                                            "When larger than data timeframe: aggregates on-the-fly, "
+                                            "or activates bar magnifier if strategy uses "
+                                            "use_bar_magnifier=true."),
 
 ):
     """
@@ -425,6 +432,28 @@ def run(
     if not trade_path:
         trade_path = app_state.output_dir / f"{script.stem}_trade.csv"
 
+    # Validate and process --timeframe option
+    magnifier_mode = False
+    if timeframe:
+        chart_tf: str = timeframe.upper()
+        try:
+            in_seconds(chart_tf)
+        except (ValueError, AssertionError):
+            secho(f"Invalid timeframe: {chart_tf}. Must be a valid TradingView format "
+                  f"(e.g. '1', '5', '60', '1D', '1W', '1M').", fg="red", err=True)
+            raise Exit(1)
+
+        data_tf = syminfo.period
+        if chart_tf != data_tf:
+            try:
+                validate_aggregation(data_tf, chart_tf)
+            except ValueError as e:
+                secho(str(e), fg="red", err=True)
+                raise Exit(1)
+            # Override syminfo period to the chart timeframe
+            syminfo.period = chart_tf
+            magnifier_mode = True
+
     # --- Open data and run ---
     with OHLCVReader(data_path) as reader:
         # Parse time range
@@ -447,7 +476,13 @@ def run(
 
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
-        ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
+        magnifier_iter = None
+        if magnifier_mode:
+            # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)
+            magnifier_iter = reader.read_from(time_from_ts, time_to_ts)
+            ohlcv_iter = iter([])
+        else:
+            ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
         # Chain live iterator after historical if --live
         if live and provider_data:
@@ -472,7 +507,7 @@ def run(
         # Parse security data mappings
         security_data: dict[str, str | Path] | None = None
         if security:
-            security_data = {}
+            sec_map: dict[str, str | Path] = {}
             for entry in security:
                 if '=' not in entry:
                     secho(
@@ -494,7 +529,8 @@ def run(
                         fg="red", err=True,
                     )
                     raise Exit(1)
-                security_data[key] = str(sec_path)
+                sec_map[key] = str(sec_path)
+            security_data = sec_map
 
         # Add lib directory to Python path for library imports
         lib_dir = app_state.scripts_dir / "lib"
@@ -514,7 +550,8 @@ def run(
                 # Create script runner (this is where the import happens)
                 runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                       plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
-                                      security_data=security_data)
+                                      security_data=security_data,
+                                      magnifier_iter=magnifier_iter)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:

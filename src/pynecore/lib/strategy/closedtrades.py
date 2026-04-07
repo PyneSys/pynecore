@@ -1,4 +1,5 @@
 from ...types.na import NA
+from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
 from ...core.module_property import module_property
@@ -16,7 +17,7 @@ class ClosedTradesModule(CallableModule):
     #
     # noinspection PyProtectedMember
     @staticmethod
-    def commission(trade_num: int) -> float | NA[float]:
+    def commission(trade_num: int) -> PyneFloat:
         """
         Returns the sum of entry and exit fees paid in the closed trade, expressed in strategy.account_currency
 
@@ -34,7 +35,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_bar_index(trade_num: int) -> int | NA[int]:
+    def entry_bar_index(trade_num: int) -> PyneInt:
         """
         Returns the bar_index of the closed trade's entry
 
@@ -52,7 +53,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_comment(trade_num: int) -> str | NA[str]:
+    def entry_comment(trade_num: int) -> PyneStr:
         """
         Returns the comment message of the closed trade's entry
 
@@ -64,13 +65,14 @@ class ClosedTradesModule(CallableModule):
         try:
             assert lib._script is not None
             assert lib._script.position is not None
-            return lib._script.position.closed_trades[trade_num].entry_comment
+            comment = lib._script.position.closed_trades[trade_num].entry_comment
+            return comment if comment is not None else NA(str)
         except (IndexError, AssertionError):
             return NA(str)
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_id(trade_num: int) -> str | NA[str]:
+    def entry_id(trade_num: int) -> PyneStr:
         """
         Returns the id of the closed trade's entry
 
@@ -82,13 +84,14 @@ class ClosedTradesModule(CallableModule):
         try:
             assert lib._script is not None
             assert lib._script.position is not None
-            return lib._script.position.closed_trades[trade_num].entry_id
+            entry_id = lib._script.position.closed_trades[trade_num].entry_id
+            return entry_id if entry_id is not None else NA(str)
         except (IndexError, AssertionError):
             return NA(str)
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_price(trade_num: int) -> float | NA[float]:
+    def entry_price(trade_num: int) -> PyneFloat:
         """
         Returns the price of the closed trade's entry
 
@@ -106,7 +109,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def entry_time(trade_num: int) -> int | NA[int]:
+    def entry_time(trade_num: int) -> PyneInt:
         """
         Returns the time of the closed trade's entry (UNIX)
 
@@ -124,7 +127,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def exit_bar_index(trade_num: int) -> int | NA[int]:
+    def exit_bar_index(trade_num: int) -> PyneInt:
         """
         Returns the bar_index of the closed trade's exit
 
@@ -142,7 +145,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def exit_comment(trade_num: int) -> str | NA[str]:
+    def exit_comment(trade_num: int) -> PyneStr:
         """
         Returns the comment message of the closed trade's exit
 
@@ -160,7 +163,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def exit_id(trade_num: int) -> str | NA[str]:
+    def exit_id(trade_num: int) -> PyneStr:
         """
         Returns the id of the closed trade's exit
 
@@ -172,13 +175,14 @@ class ClosedTradesModule(CallableModule):
         try:
             assert lib._script is not None
             assert lib._script.position is not None
-            return lib._script.position.closed_trades[trade_num].exit_id
+            exit_id = lib._script.position.closed_trades[trade_num].exit_id
+            return exit_id if exit_id is not None else NA(str)
         except (IndexError, AssertionError):
             return NA(str)
 
     # noinspection PyProtectedMember
     @staticmethod
-    def exit_price(trade_num: int) -> float | NA[float]:
+    def exit_price(trade_num: int) -> PyneFloat:
         """
         Returns the price of the closed trade's exit
 
@@ -196,7 +200,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def exit_time(trade_num: int) -> int | NA[int]:
+    def exit_time(trade_num: int) -> PyneInt:
         """
         Returns the time of the closed trade's exit (UNIX)
         :param trade_num: The trade number of the closed trade. The number of the first trade is zero
@@ -213,7 +217,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_drawdown(trade_num: int) -> float | NA[float]:
+    def max_drawdown(trade_num: int) -> PyneFloat:
         """
         Returns the maximum drawdown of the closed trade
 
@@ -231,7 +235,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_drawdown_percent(trade_num: int) -> float | NA[float]:
+    def max_drawdown_percent(trade_num: int) -> PyneFloat:
         """
         Returns the maximum drawdown percent of the closed trade
 
@@ -249,7 +253,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_runup(trade_num: int) -> float | NA[float]:
+    def max_runup(trade_num: int) -> PyneFloat:
         """
         Returns the maximum runup of the closed trade
 
@@ -267,7 +271,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def max_runup_percent(trade_num: int) -> float | NA[float]:
+    def max_runup_percent(trade_num: int) -> PyneFloat:
         """
         Returns the maximum runup percent of the closed trade
 
@@ -285,7 +289,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def profit(trade_num: int) -> float | NA[float]:
+    def profit(trade_num: int) -> PyneFloat:
         """
         Returns the profit of the closed trade
 
@@ -303,7 +307,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def profit_percent(trade_num: int) -> float | NA[float]:
+    def profit_percent(trade_num: int) -> PyneFloat:
         """
         Returns the profit percent of the closed trade
 
@@ -321,7 +325,7 @@ class ClosedTradesModule(CallableModule):
 
     # noinspection PyProtectedMember
     @staticmethod
-    def size(trade_num: int) -> float:
+    def size(trade_num: int) -> PyneFloat:
         if trade_num < 0:
             return 0.0
         try:

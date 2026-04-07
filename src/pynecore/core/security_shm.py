@@ -26,11 +26,17 @@ SLOT_SIZE = 32  # padded
 SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 25 bytes
 
 # Flag bits
-FLAG_HAS_DATA = 0x01       # result block contains valid data
-FLAG_SAME_CONTEXT = 0x02   # same symbol + TF as chart (no process needed)
+FLAG_HAS_DATA = 0x01  # result block contains valid data
+FLAG_SAME_CONTEXT = 0x02  # same symbol + TF as chart (no process needed)
 
 # Initial result block size
 INITIAL_RESULT_SIZE = 4096
+
+
+def _result_block_name(sec_id: str, version: int) -> str:
+    """Generate SharedMemory name for a result block."""
+    safe_id = sec_id.replace('\xb7', '_')
+    return f"pyne_{safe_id}_v{version}"
 
 
 class SyncBlock:
@@ -49,10 +55,15 @@ class SyncBlock:
             self._shm = SharedMemory(
                 name=name, create=True, size=total_size
             )
-            # Zero-initialize
-            self._shm.buf[:total_size] = b'\x00' * total_size
         else:
             self._shm = SharedMemory(name=name, create=False)
+
+        buf = self._shm.buf
+        assert buf is not None
+        self._buf: memoryview = buf
+
+        if create:
+            self._buf[:total_size] = b'\x00' * total_size
 
     @property
     def name(self) -> str:
@@ -68,32 +79,32 @@ class SyncBlock:
         :return: (last_timestamp, version, result_size, target_time, flags)
         """
         off = self._offset(sec_id)
-        return struct.unpack_from(SLOT_FORMAT, self._shm.buf, off)
+        return struct.unpack_from(SLOT_FORMAT, self._buf, off)
 
     def set_target_time(self, sec_id: str, target_time: int):
         """Set the target_time field for a slot."""
         off = self._offset(sec_id)
-        struct.pack_into('<q', self._shm.buf, off + 16, target_time)
+        struct.pack_into('<q', self._buf, off + 16, target_time)
 
     def get_target_time(self, sec_id: str) -> int:
         """Read the target_time field for a slot."""
         off = self._offset(sec_id)
-        return struct.unpack_from('<q', self._shm.buf, off + 16)[0]
+        return struct.unpack_from('<q', self._buf, off + 16)[0]
 
     def set_timestamp(self, sec_id: str, timestamp: int):
         """Set the last_timestamp field."""
         off = self._offset(sec_id)
-        struct.pack_into('<q', self._shm.buf, off, timestamp)
+        struct.pack_into('<q', self._buf, off, timestamp)
 
     def get_timestamp(self, sec_id: str) -> int:
         """Read the last_timestamp field."""
         off = self._offset(sec_id)
-        return struct.unpack_from('<q', self._shm.buf, off)[0]
+        return struct.unpack_from('<q', self._buf, off)[0]
 
     def set_result_meta(self, sec_id: str, version: int, result_size: int):
         """Set version and result_size fields."""
         off = self._offset(sec_id)
-        struct.pack_into('<II', self._shm.buf, off + 8, version, result_size)
+        struct.pack_into('<II', self._buf, off + 8, version, result_size)
 
     def get_result_meta(self, sec_id: str) -> tuple[int, int]:
         """
@@ -102,17 +113,17 @@ class SyncBlock:
         :return: (version, result_size)
         """
         off = self._offset(sec_id)
-        return struct.unpack_from('<II', self._shm.buf, off + 8)
+        return struct.unpack_from('<II', self._buf, off + 8)
 
     def set_flags(self, sec_id: str, flags: int):
         """Set the flags byte."""
         off = self._offset(sec_id)
-        struct.pack_into('<B', self._shm.buf, off + 24, flags)
+        struct.pack_into('<B', self._buf, off + 24, flags)
 
     def get_flags(self, sec_id: str) -> int:
         """Read the flags byte."""
         off = self._offset(sec_id)
-        return struct.unpack_from('<B', self._shm.buf, off + 24)[0]
+        return struct.unpack_from('<B', self._buf, off + 24)[0]
 
     def close(self):
         """Close the shared memory (does not unlink)."""
@@ -139,13 +150,12 @@ class ResultBlock:
                  version: int = 0, size: int = INITIAL_RESULT_SIZE):
         self._sec_id = sec_id
         self._version = version
-        name = self._make_name(sec_id, version)
+        name = _result_block_name(sec_id, version)
 
         if create:
             try:
                 self._shm = SharedMemory(name=name, create=True, size=size)
             except FileExistsError:
-                # Clean up stale shared memory from a previous run that crashed
                 stale = SharedMemory(name=name, create=False)
                 stale.close()
                 stale.unlink()
@@ -153,12 +163,13 @@ class ResultBlock:
         else:
             self._shm = SharedMemory(name=name, create=False)
 
-    @staticmethod
-    def _make_name(sec_id: str, version: int) -> str:
-        """Generate SharedMemory name from sec_id and version."""
-        # SharedMemory names can't contain special chars on all platforms
-        safe_id = sec_id.replace('\xb7', '_')
-        return f"pyne_{safe_id}_v{version}"
+        buf = self._shm.buf
+        assert buf is not None
+        self._buf: memoryview = buf
+
+    @property
+    def sec_id(self) -> str:
+        return self._sec_id
 
     @property
     def version(self) -> int:
@@ -177,17 +188,18 @@ class ResultBlock:
         :return: New version number
         """
         if len(data) > self._shm.size:
-            # Reallocate: create new block with doubled size
             new_size = max(len(data) * 2, INITIAL_RESULT_SIZE)
             new_version = self._version + 1
-            new_name = self._make_name(self._sec_id, new_version)
+            new_name = _result_block_name(self._sec_id, new_version)
 
             new_shm = SharedMemory(name=new_name, create=True, size=new_size)
-            new_shm.buf[:len(data)] = data
+            new_buf = new_shm.buf
+            assert new_buf is not None
+            new_buf[:len(data)] = data
 
-            # Close and unlink old block
             old_shm = self._shm
             self._shm = new_shm
+            self._buf = new_buf
             self._version = new_version
 
             old_shm.close()
@@ -196,9 +208,8 @@ class ResultBlock:
             except FileNotFoundError:
                 pass
         else:
-            self._shm.buf[:len(data)] = data
+            self._buf[:len(data)] = data
 
-        # Update sync block metadata
         sync_block.set_result_meta(self._sec_id, self._version, len(data))
         return self._version
 
@@ -209,7 +220,7 @@ class ResultBlock:
         :param size: Number of bytes to read
         :return: Raw bytes
         """
-        return bytes(self._shm.buf[:size])
+        return bytes(self._buf[:size])
 
     def close(self):
         """Close the shared memory (does not unlink)."""
@@ -252,11 +263,15 @@ class ResultReader:
         if version != self._version:
             if self._shm is not None:
                 self._shm.close()
-            name = ResultBlock._make_name(self._sec_id, version)
+            name = _result_block_name(self._sec_id, version)
             self._shm = SharedMemory(name=name, create=False)
             self._version = version
 
-        return pickle.loads(self._shm.buf[:result_size])
+        shm = self._shm
+        assert shm is not None
+        buf = shm.buf
+        assert buf is not None
+        return pickle.loads(buf[:result_size])
 
     def close(self):
         """Close the reader's shared memory handle."""
@@ -287,7 +302,7 @@ def write_na(result_block: ResultBlock, sync_block: SyncBlock) -> int:
     :return: Current version number
     """
     sync_block.set_result_meta(
-        result_block._sec_id,
+        result_block.sec_id,
         result_block.version,
         0  # zero size = no data = na
     )

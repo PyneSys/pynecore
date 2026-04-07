@@ -85,12 +85,12 @@ def main():
 
 **chart.left_visible_bar_time**
 - Type: `int`
-- The timestamp (in milliseconds since epoch) of the leftmost bar currently visible in the chart viewport. Updates as the user scrolls.
+- The timestamp (in milliseconds since epoch) of the leftmost "visible" bar. In PyneCore this is a heuristic: `current_bar_time - 20 × timeframe_seconds`. There is no real viewport — the value approximates a 20-bar visible window ending at the current bar.
 
 **chart.right_visible_bar_time**
 - Type: `int`
-- The timestamp (in milliseconds since epoch) of the rightmost bar currently visible in the chart viewport. Typically the current bar when viewing live data.
+- The timestamp (in milliseconds since epoch) of the rightmost "visible" bar. In PyneCore this is always the current bar's timestamp.
 
 ## Compatibility
 
-All `chart` properties are fully supported in PyneCore. They provide read-only access to chart state; chart properties cannot be modified from scripts.
+Chart type properties (`is_standard`, `is_renko`, etc.) are fully supported. Visible range properties (`left_visible_bar_time`, `right_visible_bar_time`) use a static heuristic (20-bar window at the current bar) since PyneCore has no graphical viewport. Scripts that rely on precise visible range detection may behave differently than on TradingView.

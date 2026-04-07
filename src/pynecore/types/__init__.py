@@ -1,6 +1,8 @@
 from .persistent import Persistent
+from .ib_persistent import IBPersistent, IBPersistentSeries
 from .series import Series, PersistentSeries
 from .na import NA
+from .pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from .box import Box
 from .chart import ChartPoint

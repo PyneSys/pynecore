@@ -178,14 +178,15 @@ def setup_security_file_log(log_path: str, context_label: str) -> None:
     :param context_label: Security context identifier (symbol + timeframe)
     """
     global _security_logger
-    _security_logger = logging.getLogger(f"pyne_security_{context_label}")
-    _security_logger.setLevel(logging.DEBUG)
-    _security_logger.propagate = False
-    if _security_logger.hasHandlers():
-        _security_logger.handlers.clear()
+    sec_logger = logging.getLogger(f"pyne_security_{context_label}")
+    sec_logger.setLevel(logging.DEBUG)
+    sec_logger.propagate = False
+    if sec_logger.hasHandlers():
+        sec_logger.handlers.clear()
     fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
     fh.setFormatter(SecurityFileFormatter(context_label))
-    _security_logger.addHandler(fh)
+    sec_logger.addHandler(fh)
+    _security_logger = sec_logger
 
 
 # noinspection PyProtectedMember
@@ -230,6 +231,7 @@ def info(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
             _security_logger.info(formatString, *args)
@@ -246,6 +248,7 @@ def warning(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
             _security_logger.warning(formatString, *args)
@@ -262,6 +265,7 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
     """
+    # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
             _security_logger.error(formatString, *args)

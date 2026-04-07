@@ -1,7 +1,6 @@
 from typing import Optional
 from dataclasses import dataclass
 
-from .chart import ChartPoint
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
 

@@ -106,7 +106,7 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                         annotation = self._extract_inner_type(annotation)
 
                     # Add closure vars at the beginning with processed annotation
-                    new_args.append(ast.arg(arg=var, annotation=annotation))
+                    new_args.append(ast.arg(arg=var, annotation=cast(ast.expr, annotation)))
                 # Add original args after closure vars
                 new_args.extend(node.args.args)
                 node.args.args = new_args
@@ -310,15 +310,15 @@ class ClosureVariableCollector(ast.NodeVisitor):
             parent_scope = '.'.join(self.function_stack[:-1])
 
             # Find variables used in this scope but defined in parent scope
-            closure_vars = set()
+            found_vars: Set[str] = set()
             for var in self.scope_uses.get(scope_key, set()):
                 if var not in self.scope_variables.get(scope_key, set()):
                     # Check if variable is defined in parent scope
                     if var in self.scope_variables.get(parent_scope, set()):
-                        closure_vars.add(var)
+                        found_vars.add(var)
 
-            if closure_vars:
-                self.closure_vars[scope_key] = closure_vars
+            if found_vars:
+                self.closure_vars[scope_key] = found_vars
 
         # Restore state
         self.current_function = old_function

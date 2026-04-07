@@ -5,11 +5,10 @@ import builtins
 import math
 import statistics
 
-from typing_extensions import SupportsIndex
-
 from ..utils.sequence_view import SequenceView
 
 from ..types.na import NA
+from ..types import PyneFloat, PyneInt, PyneStr, PyneBool
 from ..types.color import Color
 from ..types.box import Box
 from ..types.line import Line, LineEnum
@@ -295,7 +294,7 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     :param index: Index of the element to return
     :return: Element at the specified index in the array
     """
-    return cast(T, id[index])
+    return cast(T, id[index])  # noqa
 
 
 # noinspection PyShadowingBuiltins
@@ -714,7 +713,7 @@ def new(size: int = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]:
 
 
 # noinspection PyShadowingNames
-def new_bool(size: int = 0, initial_value: bool | NA = NA(bool)) -> list[bool | NA[bool]]:
+def new_bool(size: int = 0, initial_value: bool | NA = NA(bool)) -> list[PyneBool]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -742,7 +741,7 @@ def new_color(size: int = 0, initial_value: Color | NA = NA(Color)) -> list[Colo
 
 
 # noinspection PyShadowingNames
-def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> list[float | NA[float]]:
+def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> list[PyneFloat]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -758,7 +757,7 @@ def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> lis
 
 
 # noinspection PyShadowingNames
-def new_int(size: int = 0, initial_value: int | NA = NA(int)) -> list[int | NA[int]]:
+def new_int(size: int = 0, initial_value: int | NA = NA(int)) -> list[PyneInt]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -772,7 +771,7 @@ def new_int(size: int = 0, initial_value: int | NA = NA(int)) -> list[int | NA[i
 
 
 # noinspection PyShadowingNames
-def new_string(size: int = 0, initial_value: str | NA = NA(str)) -> list[str | NA[str]]:
+def new_string(size: int = 0, initial_value: str | NA = NA(str)) -> list[PyneStr]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -908,7 +907,7 @@ def range(id: list[Number]) -> Number:
     :param id: Input array
     :return: Range of the elements in the array
     """
-    return cast(Number, max(id) - min(id))
+    return cast(Number, max(id) - min(id))  # noqa
 
 
 # noinspection PyShadowingBuiltins
@@ -1004,7 +1003,7 @@ def sort(id: list[int | float | str], order: _order.Order = _order.ascending) ->
 
 
 # noinspection PyShadowingBuiltins
-def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[SupportsIndex]:
+def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[int]:
     """
     Returns an array of indices which, when used to index the original array, will access its elements
     in their sorted order. It does not modify the original array.
@@ -1013,7 +1012,7 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[Su
     :param order: Order to sort the elements in
     :return: Array of indices to access the elements in their sorted order
     """
-    indices = sorted(builtins.range(len(id)), key=id.__getitem__)  # type: ignore
+    indices: list[int] = sorted(builtins.range(len(id)), key=id.__getitem__)  # type: ignore
     if order == _order.descending:
         indices.reverse()
     return indices

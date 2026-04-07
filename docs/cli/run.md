@@ -96,7 +96,7 @@ The `run` command now supports automatic conversion of non-OHLCV data formats. W
 The automatic conversion supports:
 - **CSV files**: Standard comma-separated values
 - **JSON files**: JSON formatted OHLCV data
-- **TXT files**: Tab, semicolon, or pipe-delimited data (coming soon)
+- **TXT files**: Tab, semicolon, or pipe-delimited data
 
 ### Filename Pattern Detection
 
@@ -167,6 +167,26 @@ Example:
 ```bash
 # Specify custom output paths
 pyne run my_strategy.py eurusd_data.ohlcv --plot custom_plot.csv --strat custom_stats.csv --trade custom_trades.csv
+```
+
+### Timeframe Option
+
+- `--timeframe`, `-tf`: Chart timeframe in TradingView format (e.g. `5`, `60`, `1D`, `1W`). Must
+  be larger than or equal to the data file's timeframe.
+
+When the data timeframe is smaller than the chart timeframe:
+- **Strategy with `use_bar_magnifier=True`**: activates bar magnifier mode — the script sees
+  aggregated chart-TF bars, but order fills are checked against each sub-bar for higher accuracy.
+  See [Bar Magnifier](../advanced/bar-magnifier.md) for details.
+- **Otherwise**: aggregates data on-the-fly to the chart timeframe (equivalent to
+  `pyne data aggregate` but without creating a file).
+
+```bash
+# Bar magnifier: 10-minute data, 1-hour chart (strategy must have use_bar_magnifier=True)
+pyne run my_strategy.py EURUSD_10m.ohlcv --timeframe 60
+
+# On-the-fly aggregation: 1-minute data aggregated to 5-minute bars
+pyne run my_indicator.py BTCUSDT_1m.ohlcv --timeframe 5
 ```
 
 ### Security Data Options

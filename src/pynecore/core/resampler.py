@@ -3,7 +3,6 @@ from typing import ClassVar
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-from .datetime import parse_timezone
 from ..lib import timeframe as tf_module
 
 
@@ -68,6 +67,7 @@ class Resampler:
         tf_seconds = tf_module.in_seconds(self.timeframe)
 
         # Calculate bar opening time based on timeframe type
+        # noinspection PyProtectedMember
         modifier, multiplier = tf_module._process_tf(self.timeframe)
 
         if modifier == 'S':  # Seconds
@@ -113,9 +113,9 @@ class Resampler:
                 # For multi-month timeframes, align to the start of the period
                 if multiplier > 1:
                     months_since_reference = (
-                        (bar_start_dt.year - 1970) * 12 + (bar_start_dt.month - 1))
+                            (bar_start_dt.year - 1970) * 12 + (bar_start_dt.month - 1))
                     aligned_months = (
-                        (months_since_reference // multiplier) * multiplier)
+                            (months_since_reference // multiplier) * multiplier)
                     target_year = 1970 + aligned_months // 12
                     target_month = (aligned_months % 12) + 1
                     bar_start_dt = bar_start_dt.replace(

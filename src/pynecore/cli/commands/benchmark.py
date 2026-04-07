@@ -1,7 +1,6 @@
 import time
 import gc
 from pathlib import Path
-from typing import Optional
 import statistics
 
 from typer import Option, Argument, secho, Exit
@@ -19,8 +18,8 @@ __all__ = []
 
 @app.command(name="benchmark")
 def benchmark(
-        script: Optional[Path] = Argument("demo", help="Script to benchmark"),
-        data: Optional[Path] = Argument("demo", help="Data file to use"),
+        script: Path = Argument("demo", help="Script to benchmark"),
+        data: Path = Argument("demo", help="Data file to use"),
         iterations: int = Option(10, "--iterations", "-i", help="Number of iterations to run"),
         candles: int = Option(5000, "--candles", "-c", help="Number of candles to process"),
         warmup: int = Option(2, "--warmup", "-w", help="Number of warmup iterations"),
@@ -32,8 +31,6 @@ def benchmark(
     This command runs a script multiple times to measure performance.
     By default, it uses demo.py and demo.ohlcv files from the workdir.
     """
-    assert script is not None
-    assert data is not None
 
     console = Console()
 
@@ -113,10 +110,12 @@ def benchmark(
 
             # Open data file and get iterator
             with OHLCVReader(data) as reader:
+                start_ts = reader.start_timestamp
+                assert start_ts is not None
                 # Get only the requested number of candles
                 ohlcv_list = []
                 # Use read_from to get all data from the beginning
-                for idx, ohlcv in enumerate(reader.read_from(reader.start_timestamp, reader.end_timestamp)):
+                for idx, ohlcv in enumerate(reader.read_from(start_ts, reader.end_timestamp)):
                     if idx >= candles:
                         break
                     ohlcv_list.append(ohlcv)

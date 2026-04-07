@@ -166,11 +166,10 @@ def compile(
         script = app_state.scripts_dir / script
 
     # Determine output path
-    if output is None:
-        output = script.with_suffix('.py')
+    out_path: Path = output if output is not None else script.with_suffix('.py')
 
     # Check if compilation is needed (smart compilation)
-    if not compiler.needs_compilation(script, output) and not force:
+    if not compiler.needs_compilation(script, out_path) and not force:
         console.print(f"[green]✓[/green] Output file is up-to-date: {output}")
         console.print("[dim]Use --force to recompile anyway[/dim]")
         return
@@ -185,12 +184,12 @@ def compile(
             task = progress.add_task("Compiling Pine Script...", total=1)
 
             # Compile the .pine file to .py
-            out_path = compiler.compile(script, output, force=force, strict=strict)
+            out_path = compiler.compile(script, out_path, force=force, strict=strict)
 
             progress.update(task, completed=1)
 
         # Preserve modification time from source file
-        copy_mtime(script, output)
+        copy_mtime(script, out_path)
 
         console.print(f"The compiled script is located at: [cyan]{out_path}[/cyan]")
 

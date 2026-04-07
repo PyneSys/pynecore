@@ -126,7 +126,8 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
                 pass
 
     lib.syminfo.root = syminfo.ticker
-    lib.syminfo.ticker = syminfo.prefix + ':' + syminfo.ticker
+    lib.syminfo.tickerid = syminfo.prefix + ':' + syminfo.ticker
+    lib.syminfo.ticker = lib.syminfo.tickerid
 
     lib.syminfo._opening_hours = syminfo.opening_hours
     lib.syminfo._session_starts = syminfo.session_starts
@@ -139,7 +140,7 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
         lib.syminfo._size_round_factor = 1
 
 
-# noinspection PyUnusedLocal
+# noinspection PyUnusedLocal,PyProtectedMember
 def _reset_lib_vars(lib: ModuleType):
     """
     Reset lib variables to be able to run other scripts
@@ -181,14 +182,16 @@ class ScriptRunner:
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
-                 '_script_path', '_security_data')
+                 '_script_path', '_security_data', '_magnifier_iter')
 
+    # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  inputs: dict[str, Any] | None = None,
-                 security_data: dict[str, str | Path] | None = None):
+                 security_data: dict[str, str | Path] | None = None,
+                 magnifier_iter: Iterable[OHLCV] | None = None):
         """
         Initialize the script runner
 
@@ -207,12 +210,16 @@ class ScriptRunner:
                               OHLCV file paths for request.security() contexts.
                               Examples: ``{"1D": "path/to/daily.ohlcv"}`` or
                               ``{"AAPL:1H": "path/to/aapl_1h.ohlcv"}``
+        :param magnifier_iter: Optional sub-timeframe OHLCV iterator for bar magnifier mode.
+                               When provided with use_bar_magnifier=true, order fills are checked
+                               against each sub-bar for more accurate backtesting.
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
         """
         self._script_path = script_path
         self._security_data = security_data or {}
+        self._magnifier_iter = magnifier_iter
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -329,9 +336,11 @@ class ScriptRunner:
             )
 
         # --- Security contexts setup ---
-        sec_contexts = getattr(self.script_module, '__security_contexts__', None)
+        sec_contexts: dict[str, dict] | None = getattr(
+            self.script_module, '__security_contexts__', None
+        )
         sec_processes: list = []
-        sec_cleanup_fn = None
+        sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
         sec_sync_block = None
         sec_result_blocks = None
@@ -397,26 +406,26 @@ class ScriptRunner:
                 all_sec_ids = list(sec_contexts.keys())
                 script_path_str = str(self._script_path.resolve())
 
-                def _spawn_security_process(sid: str, ohlcv_path: str):
-                    state = sec_states[sid]
-                    p = Process(
+                def _spawn_security_process(sid: str, data_path: str):
+                    sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    proc = Process(
                         target=security_process_main,
                         args=(
                             sid,
                             script_path_str,
-                            ohlcv_path,
-                            sec_sync_block.name,
+                            data_path,
+                            sec_sync_block.name,  # noqa
                             all_sec_ids,
-                            state.data_ready,
-                            state.advance_event,
-                            state.done_event,
-                            state.stop_event,
-                            state.is_ltf,
+                            sec_state.data_ready,
+                            sec_state.advance_event,
+                            sec_state.done_event,
+                            sec_state.stop_event,
+                            sec_state.is_ltf,
                         ),
                         daemon=True,
                     )
-                    p.start()
-                    sec_processes.append(p)
+                    proc.start()
+                    sec_processes.append(proc)
 
                 # Callback for lazy resolution of deferred security contexts
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
@@ -424,28 +433,31 @@ class ScriptRunner:
                         return
                     deferred_sec_ids.discard(sid)
                     # Resolve actual timeframe
-                    chart_tf = str(lib.syminfo.period)
-                    tf = timeframe if timeframe else chart_tf
+                    current_chart_tf = str(lib.syminfo.period)
+                    resolved_tf = timeframe if timeframe else current_chart_tf
                     # Update SecurityState with correct timeframe info
-                    state = sec_states[sid]
-                    state.timeframe = tf
-                    same_tf = (tf == chart_tf)
-                    state.same_timeframe = same_tf
+                    sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    sec_state.timeframe = resolved_tf
+                    same_tf = (resolved_tf == current_chart_tf)
+                    sec_state.same_timeframe = same_tf
                     if same_tf:
-                        state.resampler = None
-                    elif state.resampler is None:
+                        sec_state.resampler = None
+                    elif sec_state.resampler is None:
                         from .resampler import Resampler
-                        state.resampler = Resampler.get_resampler(tf)
+                        sec_state.resampler = Resampler.get_resampler(resolved_tf)
                     # Resolve OHLCV path and spawn process
-                    ctx = {'symbol': symbol, 'timeframe': tf}
-                    resolved = self._resolve_security_data({sid: ctx})
-                    sec_ohlcv_paths[sid] = resolved[sid]
-                    _spawn_security_process(sid, resolved[sid])
+                    resolve_ctx = {'symbol': symbol, 'timeframe': resolved_tf}
+                    resolved = self._resolve_security_data({sid: resolve_ctx})
+                    resolved_path = resolved[sid]
+                    sec_ohlcv_paths[sid] = resolved_path
+                    if resolved_path is not None:
+                        _spawn_security_process(sid, resolved_path)
 
                 # Lazy spawn callback for static contexts
                 def _lazy_spawn(sid: str):
-                    if sid in sec_ohlcv_paths and sid not in no_process_ids:
-                        _spawn_security_process(sid, sec_ohlcv_paths[sid])
+                    resolved_path = sec_ohlcv_paths.get(sid)
+                    if resolved_path is not None and sid not in no_process_ids:
+                        _spawn_security_process(sid, resolved_path)
 
                 # Build currency conversion map from security contexts
                 currency_conversions: dict[str, tuple[str, str]] = {}
@@ -476,6 +488,28 @@ class ScriptRunner:
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)
 
+            # --timeframe mode: magnifier_iter provides sub-TF data
+            if self._magnifier_iter is not None:
+                if is_strat and self.script.use_bar_magnifier:
+                    # Bar magnifier: accurate order fills at sub-bar resolution
+                    yield from self._run_iter_magnified(
+                        lib, barstate, position, script_mod=script,
+                        is_strat=is_strat, on_progress=on_progress, string=string,
+                    )
+                    return
+                else:
+                    # On-the-fly aggregation: aggregate sub-TF to chart TF
+                    from .bar_magnifier import BarMagnifier
+                    chart_tf = str(lib.syminfo.period)
+                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+                    self.ohlcv_iter = (w.aggregated for w in magnifier)
+
+            # Initialize calc_on_order_fills snapshot (only for strategies with COOF)
+            var_snapshot = None
+            if is_strat and self.script.calc_on_order_fills:
+                from .var_snapshot import VarSnapshot
+                var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
+
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_candle = next(ohlcv_iterator, None)
@@ -502,9 +536,34 @@ class ScriptRunner:
                 # Update last price
                 self.last_price = lib.close  # type: ignore
 
-                # Process limit orders
-                if is_strat and position:
+                # calc_on_order_fills path: snapshot, process, re-execute on fills
+                if var_snapshot and position:
+                    if var_snapshot.has_vars:
+                        var_snapshot.save()
+
+                    old_fills = position._fill_counter
                     position.process_orders()
+                    new_fills = position._fill_counter
+
+                    while new_fills > old_fills:
+                        if var_snapshot.has_vars:
+                            var_snapshot.restore()
+                        function_isolation.reset()
+                        lib._lib_semaphore = True
+                        for library_title, main_func in script._registered_libraries:
+                            main_func()
+                        lib._lib_semaphore = False
+                        self.script_module.main()
+                        old_fills = new_fills
+                        position.process_orders()
+                        new_fills = position._fill_counter
+
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                else:
+                    # Standard path (no COOF)
+                    if is_strat and position:
+                        position.process_orders()
 
                 # Execute registered library main functions before main script
                 lib._lib_semaphore = True
@@ -600,6 +659,7 @@ class ScriptRunner:
 
         except GeneratorExit:
             pass
+
         finally:  # Python reference counter will close this even if the iterator is not exhausted
             if is_strat and position:
                 # Export remaining open trades before closing
@@ -686,7 +746,7 @@ class ScriptRunner:
                 self.trades_writer.close()
 
             # Shutdown security processes
-            if sec_processes:
+            if sec_processes and sec_states is not None:
                 for state in sec_states.values():
                     state.stop_event.set()
                     state.advance_event.set()  # wake up if waiting
@@ -694,7 +754,8 @@ class ScriptRunner:
                     p.join(timeout=5)
                     if p.is_alive():
                         p.terminate()
-                if sec_cleanup_fn:
+                if callable(sec_cleanup_fn):
+                    sec_cleanup_fn: Callable
                     sec_cleanup_fn()
                 if sec_sync_block and sec_result_blocks:
                     from .security import cleanup_shared_memory
@@ -704,6 +765,159 @@ class ScriptRunner:
             _reset_lib_vars(lib)
             # Reset function isolation
             function_isolation.reset()
+
+    # noinspection PyProtectedMember
+    def _run_iter_magnified(self, lib, barstate, position, script_mod, is_strat, on_progress, string):
+        """
+        Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
+        resolution, execute script once per chart bar.
+        """
+        from .bar_magnifier import BarMagnifier
+        # Needed for COOF re-execution path (already loaded by run_iter, safe to re-import)
+        from pynecore.core import function_isolation
+
+        chart_tf = str(lib.syminfo.period)
+        assert self._magnifier_iter is not None
+        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+
+        trade_num = 0
+
+        # Initialize calc_on_order_fills snapshot for magnified path
+        var_snapshot = None
+        if is_strat and self.script.calc_on_order_fills:
+            from .var_snapshot import VarSnapshot
+            var_snapshot = VarSnapshot(self.script_module, script_mod._registered_libraries)
+
+        for window in magnifier:
+            barstate.islast = window.is_last_window
+
+            # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib)
+
+            # Store first price for buy & hold calculation
+            if self.first_price is None:
+                self.first_price = lib.close  # type: ignore
+
+            # Update last price
+            self.last_price = lib.close  # type: ignore
+
+            # Process orders against each sub-bar for accurate fills
+            if var_snapshot and position:
+                if var_snapshot.has_vars:
+                    var_snapshot.save()
+
+                old_fills = position._fill_counter
+                position.process_orders_magnified(window.sub_bars, window.aggregated)
+                new_fills = position._fill_counter
+
+                while new_fills > old_fills:
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                    function_isolation.reset()
+                    lib._lib_semaphore = True
+                    for library_title, main_func in script_mod._registered_libraries:
+                        main_func()
+                    lib._lib_semaphore = False
+                    self.script_module.main()
+                    old_fills = new_fills
+                    position.process_orders_magnified(window.sub_bars, window.aggregated)
+                    new_fills = position._fill_counter
+
+                if var_snapshot.has_vars:
+                    var_snapshot.restore()
+            elif position:
+                position.process_orders_magnified(window.sub_bars, window.aggregated)
+
+            # Execute registered library main functions before main script
+            lib._lib_semaphore = True
+            for library_title, main_func in script_mod._registered_libraries:
+                main_func()
+            lib._lib_semaphore = False
+
+            # Run the script
+            res = self.script_module.main()
+
+            # Process deferred margin calls (after script runs, before results)
+            if position:
+                position.process_deferred_margin_call()
+
+            # Update plot data with the results
+            if res is not None:
+                assert isinstance(res, dict), "The 'main' function must return a dictionary!"
+                lib._plot_data.update(res)
+
+            # Write plot data to CSV if we have a writer
+            if self.plot_writer and lib._plot_data:
+                extra_fields = {} if window.aggregated.extra_fields is None \
+                    else dict(window.aggregated.extra_fields)
+                extra_fields.update(lib._plot_data)
+                updated_candle = window.aggregated._replace(extra_fields=extra_fields)
+                self.plot_writer.write_ohlcv(updated_candle)
+
+            # Yield results
+            if not is_strat:
+                yield window.aggregated, lib._plot_data
+            elif position:
+                yield window.aggregated, lib._plot_data, position.new_closed_trades
+
+            # Save trade data
+            if is_strat and self.trades_writer and position:
+                for trade in position.new_closed_trades:
+                    trade_num += 1
+                    self.trades_writer.write(
+                        trade_num,
+                        trade.entry_bar_index,
+                        "Entry long" if trade.size > 0 else "Entry short",
+                        trade.entry_comment if trade.entry_comment else trade.entry_id,
+                        string.format_time(trade.entry_time),  # type: ignore
+                        trade.entry_price,
+                        abs(trade.size),
+                        trade.profit,
+                        f"{trade.profit_percent:.2f}",
+                        trade.cum_profit,
+                        f"{trade.cum_profit_percent:.2f}",
+                        trade.max_runup,
+                        f"{trade.max_runup_percent:.2f}",
+                        trade.max_drawdown,
+                        f"{trade.max_drawdown_percent:.2f}",
+                    )
+                    self.trades_writer.write(
+                        trade_num,
+                        trade.exit_bar_index,
+                        "Exit long" if trade.size > 0 else "Exit short",
+                        trade.exit_comment if trade.exit_comment else trade.exit_id,
+                        string.format_time(trade.exit_time),  # type: ignore
+                        trade.exit_price,
+                        abs(trade.size),
+                        trade.profit,
+                        f"{trade.profit_percent:.2f}",
+                        trade.cum_profit,
+                        f"{trade.cum_profit_percent:.2f}",
+                        trade.max_runup,
+                        f"{trade.max_runup_percent:.2f}",
+                        trade.max_drawdown,
+                        f"{trade.max_drawdown_percent:.2f}",
+                    )
+
+            # Clear plot data
+            lib._plot_data.clear()
+
+            # Track equity curve for strategies
+            if is_strat and position:
+                current_equity = float(position.equity) if position.equity else self.script.initial_capital
+                self.equity_curve.append(current_equity)
+
+            # Call the progress callback
+            if on_progress and lib._datetime is not None:
+                on_progress(lib._datetime.replace(tzinfo=None))
+
+            # Update bar index
+            self.bar_index += 1
+            # It is no longer the first bar
+            barstate.isfirst = False
+
+        if on_progress:
+            on_progress(datetime.max)
 
     def _resolve_security_data(self, contexts: dict) -> dict[str, str | None]:
         """

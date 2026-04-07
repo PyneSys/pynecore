@@ -53,15 +53,14 @@ class DataConverter:
         :param ohlcv_path: Path to the OHLCV file (auto-generated if None)
         :return: True if conversion is needed
         """
-        if ohlcv_path is None:
-            ohlcv_path = source_path.with_suffix('.ohlcv')
+        path = ohlcv_path if ohlcv_path is not None else source_path.with_suffix('.ohlcv')
 
         # If OHLCV file doesn't exist, conversion is needed
-        if not ohlcv_path.exists():
+        if not path.exists():
             return True
 
         # Use existing file utility to check if source is newer
-        return is_updated(source_path, ohlcv_path)
+        return is_updated(source_path, path)
 
     def convert_to_ohlcv(
             self,
@@ -157,10 +156,11 @@ class DataConverter:
                     raise ConversionError(f"Unsupported format for conversion: {detected_format}")
 
                 # Get timeframe directly from writer
-                if ohlcv_writer.interval is None:
+                interval = ohlcv_writer.interval
+                if interval is None:
                     raise ConversionError("Cannot determine timeframe from OHLCV file (less than 2 records)")
                 try:
-                    detected_timeframe = from_seconds(ohlcv_writer.interval)
+                    detected_timeframe = from_seconds(interval)
                 except (ValueError, AssertionError):
                     raise ConversionError(
                         f"Cannot convert interval {ohlcv_writer.interval} seconds to valid timeframe")

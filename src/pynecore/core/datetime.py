@@ -59,13 +59,13 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
     :return: ZoneInfo object
     :raises ValueError: If timezone format is invalid
     """
-    if not timezone:
+    if not timezone and syminfo.timezone:
         timezone = syminfo.timezone
 
     # Try as IANA timezone first
     try:
         try:
-            return ZoneInfo(timezone)
+            return ZoneInfo(timezone)  # type: ignore
         except TypeError:  # It should not be possible
             return ZoneInfo('UTC')
     except KeyError:
@@ -81,7 +81,7 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
         pass
 
     # Parse UTC/GMT±HHMM format with optional colon
-    match = re.match(r'^(UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2})?)?$', timezone)
+    match = re.match(r'^(UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2})?)?$', timezone)  # type: ignore
     if not match:
         raise ValueError(
             f"Invalid timezone format: {timezone}. "

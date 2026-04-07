@@ -156,7 +156,7 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
                 if isinstance(stmt, ast.ImportFrom):
                     self._handle_import_from(stmt)
                 else:
-                    self._handle_import(cast(ast.Import, stmt))
+                    self._handle_import(stmt)
 
         # Process the rest of the module to collect attribute usages
         node = cast(ast.Module, self.generic_visit(node))
@@ -248,7 +248,7 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
             # Don't replace function parameters
             if node.id in self.function_parameters:
                 return node
-            
+
             # Handle regular imports
             if node.id in self.names_to_replace:
                 path = self.import_map[node.id]
@@ -291,13 +291,13 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
         """Process function definitions and handle imports"""
         old_function = self.current_function
         old_parameters = self.function_parameters.copy()
-        
+
         self.current_function = node.name
-        
+
         # Collect function parameters
         for arg in node.args.args:
             self.function_parameters.add(arg.arg)
-        
+
         # Also handle keyword-only args, positional-only args, vararg, and kwarg
         for arg in node.args.posonlyargs:
             self.function_parameters.add(arg.arg)

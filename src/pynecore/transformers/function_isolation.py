@@ -123,7 +123,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         # Track function context for better call IDs
         self.current_function = None
         # Track parent functions to build the full scope path
-        self.parent_functions = []
+        self.parent_functions: list[str] = []
         # Track context to avoid wrappers in certain places
         self.in_decorator = False
         self.in_default_arg = False
@@ -200,7 +200,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         return stdlib_checker.is_stdlib(module_path)
 
     @staticmethod
-    def _get_func_path(func: ast.Attribute | ast.Expr) -> str | None:
+    def _get_func_path(func: ast.expr) -> str | None:
         """Get the full path of a function as a string"""
         if isinstance(func, ast.Name):
             return func.id
@@ -215,7 +215,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             return '.'.join(reversed(parts))
         return None
 
-    def _create_call_id(self, func: ast.Expr | ast.Attribute) -> str | None:
+    def _create_call_id(self, func: ast.expr) -> str | None:
         """Create a unique call ID for a function with full scope path"""
         func_path = self._get_func_path(func)
         if not func_path:
@@ -275,9 +275,10 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         # Find the right position to insert new nodes
         # First, check if there's a docstring
         insert_pos = 0
-        if (node.body and isinstance(node.body[0], ast.Expr) and
-                isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant) and
-                isinstance(cast(ast.Constant, cast(ast.Expr, node.body[0]).value).value, str)):
+        first_stmt = node.body[0] if node.body else None
+        if (isinstance(first_stmt, ast.Expr) and
+                isinstance(first_stmt.value, ast.Constant) and
+                isinstance(first_stmt.value.value, str)):
             insert_pos = 1
 
         # Then find the last import statement after docstring
@@ -394,9 +395,10 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             insert_pos = 0
 
             # Check for docstring
-            if (node.body and isinstance(node.body[0], ast.Expr) and
-                    isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant) and
-                    isinstance(cast(ast.Constant, cast(ast.Expr, node.body[0]).value).value, str)):
+            first_stmt = node.body[0] if node.body else None
+            if (isinstance(first_stmt, ast.Expr) and
+                    isinstance(first_stmt.value, ast.Constant) and
+                    isinstance(first_stmt.value.value, str)):
                 insert_pos = 1
 
             # Add global scope_id declaration

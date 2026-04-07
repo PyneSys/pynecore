@@ -25,3 +25,4 @@ Advanced topics and features of PyneCore
 - [CSV Reader/Writer](./csv-reader-writer.md) - Fast CSV processing
 - [Extra Fields](./extra-fields.md) - Custom CSV columns beyond OHLCV in scripts
 - [request.security() Internals](./request-security-internals.md) - Multiprocessing architecture, AST transformation, shared memory
+- [Bar Magnifier](./bar-magnifier.md) - Accurate intrabar order fills using lower-timeframe data

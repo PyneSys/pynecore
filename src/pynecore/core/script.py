@@ -14,9 +14,8 @@ import pynecore.lib.currency as _currency
 import pynecore.lib.display as _display
 
 from pynecore.types import script_type as _script_type
-from pynecore.types.series import Series
 from pynecore.types.color import Color
-from pynecore.types.na import NA
+from pynecore.types import PyneFloat, PyneInt
 
 __all__ = ['script', 'input']
 
@@ -52,7 +51,7 @@ class InputData:
 
 _old_input_values: dict[str, Any] = {}
 _programmatic_inputs: dict[str, Any] = {}
-inputs: dict[str | None, InputData] = {}
+inputs: dict[str, InputData] = {}
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames,PyDunderSlots,PyUnresolvedReferences
@@ -102,10 +101,10 @@ class Script:
     margin_long: int | float = 100.0  # Defaulted to 100.0 in Pine Script v6
     margin_short: int | float = 100.0  # Defaulted to 100.0 in Pine Script v6
     risk_free_rate: float = 2.0
-    use_bar_magnifier: bool = False
+    use_bar_magnifier: bool = True
     fill_orders_on_standard_ohlc: bool = False
 
-    position: _strategy.Position | None = None
+    position: _strategy.Position = None  # type: ignore[assignment]
 
     _modified: set[str] = field(default_factory=set)
 
@@ -159,8 +158,7 @@ class Script:
 
         # Save inputs
         for arg_name, input_data in self.inputs.items():
-            # Skip None keys (can happen with some input configurations)
-            if arg_name is None:
+            if not arg_name:
                 continue
             lines.append(f"\n[inputs.{arg_name.removesuffix('__global__')}]")
             lines.append("# Input metadata, cannot be modified")
@@ -373,7 +371,7 @@ class Script:
             calc_bars_count=0,
 
             risk_free_rate=2.0,
-            use_bar_magnifier=False,
+            use_bar_magnifier=True,
             fill_orders_on_standard_ohlc=False,
 
             max_polylines_count=50,
@@ -522,7 +520,7 @@ class _Input:
 
     def __call__(self, defval: Any, title: str | None = None, *,
                  tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
-                 display: _display.Display | None = None, _id: str | None = None, **__) -> Any:
+                 display: _display.Display | None = None, _id: str = "", **__) -> Any:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
 
@@ -555,7 +553,7 @@ class _Input:
              minval: int | None = None, maxval: int | None = None, step: int | None = None,
              tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
              confirm: bool | None = False, options: tuple[int] | None = None,
-             display: _display.Display | None = None, _id: str | None = None, **__) -> int | NA[int]:
+             display: _display.Display | None = None, _id: str = "", **__) -> PyneInt:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for an integer input to the script's inputs.
@@ -595,7 +593,7 @@ class _Input:
     def _bool(cls, defval: bool, title: str | None = None, *,
               tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
               confirm: bool | None = False, display: _display.Display | None = None,
-              _id: str | None = None, **__) -> bool:
+              _id: str = "", **__) -> bool:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a boolean input to the script's inputs.
@@ -628,7 +626,7 @@ class _Input:
                tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
                confirm: bool | None = False, options: tuple[int] | None = None,
                minval: float | None = None, maxval: float | None = None, step: float | None = None,
-               display: _display.Display | None = None, _id: str | None = None, **__) -> float | NA[float]:
+               display: _display.Display | None = None, _id: str = "", **__) -> PyneFloat:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a float input to the script's inputs.
@@ -670,7 +668,7 @@ class _Input:
                confirm: bool | None = False,
                options: tuple[str] | None = None,
                display: _display.Display | None = None,
-               _id: str | None = None, **__) -> str:
+               _id: str = "", **__) -> str:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a string input to the script's inputs.
@@ -704,7 +702,7 @@ class _Input:
     def color(cls, defval: Color, title: str | None = None, *,
               tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
               confirm: bool | None = False, display: _display.Display | None = None,
-              _id: str | None = None, **__) -> Color:
+              _id: str = "", **__) -> Color:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a color input to the script's inputs.
@@ -736,7 +734,7 @@ class _Input:
     def source(cls, defval: str | Source, title: str | None = None, *,
                tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
                confirm: bool | None = False, display: _display.Display | None = None,
-               _id: str | None = None, **__) -> Series[float]:
+               _id: str = "", **__) -> PyneFloat:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a source input to the script's inputs.
@@ -765,7 +763,7 @@ class _Input:
             display=display,
         )
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
-        return defval if _id not in _old_input_values else _old_input_values[_id]
+        return defval if _id not in _old_input_values else _old_input_values[_id]  # type: ignore[return-value]
 
     @classmethod
     def enum(cls, defval: TEnum, title: str | None = None, *,
@@ -773,7 +771,7 @@ class _Input:
              confirm: bool | None = False,
              options: tuple[str] | None = None,
              display: _display.Display | None = None,
-             _id: str | None = None, **__) -> TEnum:
+             _id: str = "", **__) -> TEnum:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a enum input to the script's inputs.

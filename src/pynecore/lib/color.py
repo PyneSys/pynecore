@@ -72,7 +72,7 @@ def new(color: Color | str, transp: float = 0) -> Color:
     :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
     """
     if isinstance(color, str):
-        color = Color(color)
+        color: Color = Color(color)
     color.t = transp
     return color
 
@@ -117,7 +117,7 @@ def from_gradient(value: int | float, bottom_value: int | float, top_value: int 
     red_comp = int(bottom_color.r + (top_color.r - bottom_color.r) * position)
     green_comp = int(bottom_color.g + (top_color.g - bottom_color.g) * position)
     blue_comp = int(bottom_color.b + (top_color.b - bottom_color.b) * position)
-    
+
     # Interpolate transparency
     bottom_transp = bottom_color.t
     top_transp = top_color.t

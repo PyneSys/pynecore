@@ -26,14 +26,14 @@ from pynecore.lib import (
 
 @script.indicator(title="Symbol Info Display", overlay=True)
 def main():
-    # Build symbol identifier
-    sym_id: str = f"{syminfo.prefix}:{syminfo.ticker}"
+    # syminfo.tickerid and syminfo.ticker both contain "PREFIX:SYMBOL"
+    full_id: str = syminfo.tickerid  # "NASDAQ:AAPL"
     currency: str = syminfo.currency or "NA"
     market_type: str = syminfo.type or "NA"
     
     # Display symbol details at first bar
     if bar_index == 0:
-        info_text: str = f"{sym_id} | {market_type} | {currency}"
+        info_text: str = f"{full_id} | {market_type} | {currency}"
         label.new(bar_index, close, info_text)
 ```
 
@@ -53,16 +53,16 @@ exch: str | NA[str] = syminfo.prefix  # "NASDAQ"
 #### ticker
 Type: `str | NA[str]`
 
-The symbol name without the exchange prefix. For example, "AAPL" for "NASDAQ:AAPL" or "BTCUSDT" for "BINANCE:BTCUSDT".
+The full symbol identifier including the exchange prefix, in `"PREFIX:SYMBOL"` format. For example, `"NASDAQ:AAPL"` or `"BINANCE:BTCUSDT"`. In PyneCore, `ticker` and `tickerid` return the same value.
 
 ```python
-sym: str | NA[str] = syminfo.ticker  # "AAPL"
+sym: str | NA[str] = syminfo.ticker  # "NASDAQ:AAPL"
 ```
 
 #### tickerid
 Type: `str | NA[str]`
 
-A full ticker identifier representing the symbol, including the exchange prefix and name separated by a colon.
+The full symbol identifier including the exchange prefix, in `"PREFIX:SYMBOL"` format. Same value as `ticker`. This is the form used as the first argument to `request.security()`.
 
 ```python
 full_id: str | NA[str] = syminfo.tickerid  # "NASDAQ:AAPL"
@@ -71,10 +71,10 @@ full_id: str | NA[str] = syminfo.tickerid  # "NASDAQ:AAPL"
 #### root
 Type: `str | NA[str]`
 
-The root contract name for derivatives like futures. For non-derivative symbols, returns the same value as `ticker`.
+The symbol name without the exchange prefix. For example, `"AAPL"` for `"NASDAQ:AAPL"`. For derivatives, this is the root contract name (e.g., `"ES"` for E-mini S&P 500 futures).
 
 ```python
-root_name: str | NA[str] = syminfo.root  # "AAPL" or "ES" for futures
+root_name: str | NA[str] = syminfo.root  # "AAPL"
 ```
 
 ### Currency and Location

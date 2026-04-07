@@ -85,13 +85,13 @@ class InputTransformer(ast.NodeTransformer):
                     # Only proceed if it's a source call or input call with a defval
                     if (is_source_call or is_input_call) and defval_node:
                         source_name = None
-                        
+
                         if isinstance(defval_node, ast.Constant) and is_source_call:
                             # Handle string constant in lib.input.source
-                            source_name = cast(ast.Constant, defval_node).value
+                            source_name = defval_node.value
                         elif isinstance(defval_node, ast.Attribute):
                             # Handle attribute reference (e.g., lib.close or close)
-                            attr = cast(ast.Attribute, defval_node)
+                            attr = defval_node
                             if isinstance(attr.value, ast.Name) and attr.value.id == 'lib':
                                 # For lib.xxx pattern, store the attribute name
                                 source_name = attr.attr

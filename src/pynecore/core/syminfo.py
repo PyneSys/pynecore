@@ -47,6 +47,7 @@ class SymInfo:
     target_price_high: float | None = None
     target_price_low: float | None = None
     target_price_date: int | None = None  # UNIX timestamp
+    target_price_estimates: int | None = None
 
     @classmethod
     def load_toml(cls, path: Path) -> Self:
@@ -122,7 +123,8 @@ class SymInfo:
             target_price_average=symbol.get('target_price_average'),
             target_price_high=symbol.get('target_price_high'),
             target_price_low=symbol.get('target_price_low'),
-            target_price_date=symbol.get('target_price_date')
+            target_price_date=symbol.get('target_price_date'),
+            target_price_estimates=symbol.get('target_price_estimates')
         )
 
     def save_toml(self, path: Path):
@@ -157,7 +159,8 @@ class SymInfo:
         for key in ['prefix', 'description', 'ticker', 'currency', 'basecurrency',
                     'period', 'type', 'mintick', 'pricescale', 'minmove', 'pointvalue',
                     'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee',
-                    'target_price_average', 'target_price_high', 'target_price_low', 'target_price_date']:
+                    'target_price_average', 'target_price_high', 'target_price_low', 'target_price_date',
+                    'target_price_estimates']:
             lines.append(format_field(key, getattr(self, key)))
 
         # Arrays of tables

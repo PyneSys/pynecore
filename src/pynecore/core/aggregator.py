@@ -82,7 +82,11 @@ def aggregate_ohlcv(
             window: list[OHLCV] = []
             current_bar_time: int | None = None
 
-            for candle in reader.read_from(reader.start_timestamp):
+            start_ts = reader.start_timestamp
+            if start_ts is None:
+                return 0, 0
+
+            for candle in reader.read_from(start_ts):
                 source_count += 1
 
                 # Resampler works in ms, OHLCV timestamps are in seconds

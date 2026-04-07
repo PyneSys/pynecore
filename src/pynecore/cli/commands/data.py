@@ -195,34 +195,37 @@ def download(
                 ohlcv_writer.truncate()
 
             # If the start date is "continue" (default), we resume from the last download
+            resolved_from: datetime | None = time_from
             if time_from == "continue":
-                if ohlcv_writer.end_timestamp:  # Resume from last download
-                    time_from = datetime.fromtimestamp(ohlcv_writer.end_timestamp, UTC)
+                end_ts = ohlcv_writer.end_timestamp
+                interval = ohlcv_writer.interval
+                if end_ts and interval:  # Resume from last download
+                    resolved_from = datetime.fromtimestamp(end_ts, UTC)
                     # We need to add one interval to the start date to avoid downloading the same data
-                    time_from += timedelta(seconds=ohlcv_writer.interval)
+                    resolved_from += timedelta(seconds=interval)
                 elif provider.value == 'tv':  # TV provider: fetch all available data
-                    time_from = None
+                    resolved_from = None
                 else:  # No data, download one year as default
-                    time_from = datetime.now(UTC) - timedelta(days=365)
+                    resolved_from = datetime.now(UTC) - timedelta(days=365)
 
             # We need to remove timezone info
-            if time_from is not None:
-                time_from = time_from.replace(tzinfo=None)
+            if resolved_from is not None:
+                resolved_from = resolved_from.replace(tzinfo=None)
             time_to = time_to.replace(tzinfo=None)
 
             # We cannot download data from the future otherwise it would take very long
             if time_to > datetime.now(UTC).replace(tzinfo=None):
                 time_to = datetime.now(UTC).replace(tzinfo=None)
 
-            # Check time range (skip for TV provider when time_from is None)
-            if time_from is not None and time_to < time_from:
+            # Check time range (skip for TV provider when resolved_from is None)
+            if resolved_from is not None and time_to < resolved_from:
                 secho("Error: End date (to) must be greater than start date (from)!", err=True, fg=colors.RED)
                 raise Exit(1)
 
             # If the start date is before the start of the existing file, we truncate the file
-            if ohlcv_writer.start_timestamp and time_from is not None:
-                if time_from < ohlcv_writer.start_datetime.replace(tzinfo=None):
-                    secho(f"The start date (from: {time_from}) is before the start of the "
+            if ohlcv_writer.start_timestamp and resolved_from is not None:
+                if resolved_from < ohlcv_writer.start_datetime.replace(tzinfo=None):
+                    secho(f"The start date (from: {resolved_from}) is before the start of the "
                           f"existing file ({ohlcv_writer.start_datetime.replace(tzinfo=None)}).\n"
                           f"If you continue, the file will be truncated.",
                           fg=colors.YELLOW)
@@ -231,8 +234,8 @@ def download(
                     ohlcv_writer.seek(0)
                     ohlcv_writer.truncate()
 
-            # TV provider with no time_from: use spinner-only progress (no time-based progress bar)
-            if time_from is None:
+            # TV provider with no resolved_from: use spinner-only progress (no time-based progress bar)
+            if resolved_from is None:
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
                         TextColumn("{task.description}"),
@@ -243,15 +246,16 @@ def download(
                         total=None,
                     )
                     # Start downloading (no progress callback - TV provider shows its own progress)
-                    provider_instance.download_ohlcv(time_from, time_to, on_progress=None, limit=chunk_size)
+                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=None, limit=chunk_size)
             else:
-                total_seconds = int((time_to - time_from).total_seconds())
+                start_from = resolved_from  # narrowed to datetime
+                total_seconds = int((time_to - start_from).total_seconds())
 
                 # Get OHLCV data
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
                         TextColumn("{task.description}"),
-                        DateColumn(time_from),
+                        DateColumn(start_from),
                         BarColumn(),
                         TimeElapsedColumn(),
                         "/",
@@ -264,11 +268,11 @@ def download(
 
                     def cb_progress(current_time: datetime):
                         """ Callback to update progress """
-                        elapsed_seconds = int((current_time - time_from).total_seconds())
+                        elapsed_seconds = int((current_time - start_from).total_seconds())
                         progress.update(task, completed=elapsed_seconds)
 
                     # Start downloading
-                    provider_instance.download_ohlcv(time_from, time_to, on_progress=cb_progress, limit=chunk_size)
+                    provider_instance.download_ohlcv(start_from, time_to, on_progress=cb_progress, limit=chunk_size)
 
     except (ImportError, ValueError) as e:
         secho(str(e), err=True, fg=colors.RED)
@@ -455,17 +459,19 @@ def aggregate(
             new_stem = stem[:-len(source_tf)] + timeframe
         else:
             new_stem = f"{stem}_{timeframe}"
-        output = source.parent / f"{new_stem}.ohlcv"
+        out_path: Path = source.parent / f"{new_stem}.ohlcv"
+    else:
+        out_path = output
 
-    if len(output.parts) == 1:
-        output = app_state.data_dir / output
+    if len(out_path.parts) == 1:
+        out_path = app_state.data_dir / out_path
 
-    if output.suffix == "":
-        output = output.with_suffix(".ohlcv")
+    if out_path.suffix == "":
+        out_path = out_path.with_suffix(".ohlcv")
 
     # Confirm before overwriting existing file
-    if output.exists():
-        secho(f"Target file already exists: {output.name}", fg=colors.YELLOW)
+    if out_path.exists():
+        secho(f"Target file already exists: {out_path.name}", fg=colors.YELLOW)
         confirm("Overwrite?", abort=True)
 
     # Perform aggregation
@@ -483,13 +489,13 @@ def aggregate(
             from zoneinfo import ZoneInfo
             data_tz = ZoneInfo(syminfo.timezone) if syminfo.timezone else None
             source_count, target_count = aggregate_ohlcv(
-                source, output, timeframe, tz=data_tz)
+                source, out_path, timeframe, tz=data_tz)
         except Exception as e:
             secho(f"Error during aggregation: {e}", err=True, fg=colors.RED)
             raise Exit(1)
 
     # Copy and update TOML for the target file
-    target_toml = output.with_suffix('.toml')
+    target_toml = out_path.with_suffix('.toml')
     try:
         syminfo.period = timeframe
         syminfo.save_toml(target_toml)
@@ -497,4 +503,4 @@ def aggregate(
         secho(f"Warning: Could not write metadata: {e}", fg=colors.YELLOW)
 
     secho(f"Aggregated {source_count:,} → {target_count:,} candles ({source_tf} → {timeframe})")
-    secho(f'Output: "{output}"')
+    secho(f'Output: "{out_path}"')

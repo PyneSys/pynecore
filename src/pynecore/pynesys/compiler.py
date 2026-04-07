@@ -48,12 +48,11 @@ class PyneComp:
                              f"Only .pine files can be compiled!")
 
         # Determine output path
-        if output_path is None:
-            output_path = pine_path.with_suffix('.py')
+        resolved_output: Path = output_path if output_path is not None else pine_path.with_suffix('.py')
 
         # Check if compilation is needed (unless forced)
-        if not force and not self.needs_compilation(pine_path, output_path):
-            return output_path
+        if not force and not self.needs_compilation(pine_path, resolved_output):
+            return resolved_output
 
         # Read Pine Script content
         try:
@@ -74,12 +73,13 @@ class PyneComp:
                 )
 
             # Write compiled code to output file
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
+            assert response.compiled_code is not None
+            resolved_output.parent.mkdir(parents=True, exist_ok=True)
+            with open(resolved_output, 'w', encoding='utf-8') as f:
                 f.write(response.compiled_code)
 
             # No need to update tracking info with mtime approach
-            return output_path
+            return resolved_output
 
         except (APIError, AuthError, RateLimitError, CompilationError):
             # Re-raise API-related errors as-is

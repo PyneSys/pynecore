@@ -28,10 +28,10 @@ binary format using the CLI:
 
 ```bash
 # Chart data (5-minute EURUSD)
-pyne data convert csv EURUSD_5m.csv
+pyne data convert-from EURUSD_5m.csv
 
 # Security data (daily EURUSD for HTF analysis)
-pyne data convert csv EURUSD_1D.csv
+pyne data convert-from EURUSD_1D.csv
 
 # Or aggregate from existing data
 pyne data aggregate EURUSD_5m -tf 1D
