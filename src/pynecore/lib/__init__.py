@@ -102,6 +102,12 @@ extra_fields: dict[str, Any] = {}
 # Lib semaphore - to prevent lib`s main function to do things it must not (plot, strategy things, etc.)
 _lib_semaphore = False
 
+# Live trading mode flag — set by run.py when --live is specified
+_is_live = False
+
+# Strategy suppression — prevents strategy order placement during historical phase in live mode
+_strategy_suppressed = False
+
 #
 # Callable modules
 #

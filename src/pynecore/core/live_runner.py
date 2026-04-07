@@ -2,7 +2,7 @@
 Async/sync bridge for live data streaming.
 
 Runs a LiveProviderPlugin's async watch_ohlcv() in a background thread
-and yields OHLCV objects to the synchronous ScriptRunner via queue.Queue.
+and yields BarUpdate objects to the synchronous ScriptRunner via queue.Queue.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from collections.abc import Iterator
 from queue import Queue, Empty
 
 from pynecore.core.plugin.live_provider import LiveProviderPlugin, BarUpdate
-from pynecore.types.ohlcv import OHLCV
 
 __all__ = ['live_ohlcv_generator']
 
@@ -33,19 +32,19 @@ def live_ohlcv_generator(
         *,
         last_historical_timestamp: int | None = None,
         shutdown_timeout: float = 120.0,
-) -> Iterator[OHLCV]:
+) -> Iterator[BarUpdate]:
     """
-    Bridge async watch_ohlcv() to a sync Iterator[OHLCV].
+    Bridge async watch_ohlcv() to a sync Iterator[BarUpdate].
 
     Spawns a background thread running asyncio, collects BarUpdate objects
-    via queue.Queue, filters for closed bars, and yields OHLCV.
+    via queue.Queue, and yields them including intra-bar updates.
 
     :param provider: A LiveProviderPlugin instance (already configured).
     :param symbol: Symbol in provider-specific format.
     :param timeframe: Timeframe in TradingView format.
     :param last_historical_timestamp: Timestamp of the last historical bar to avoid duplicates.
     :param shutdown_timeout: Max seconds to wait for graceful shutdown. 0 = wait forever.
-    :return: Iterator yielding OHLCV objects as bars close.
+    :return: Iterator yielding BarUpdate objects (both closed and intra-bar).
     """
     bar_queue: Queue[BarUpdate | BaseException] = Queue(maxsize=100)
     stop_event = threading.Event()
@@ -96,12 +95,13 @@ def live_ohlcv_generator(
                     )
                     reconnect_attempts = 0
 
-                    if not bar_update.is_closed:
-                        continue
-
-                    if (last_historical_timestamp is not None
-                            and bar_update.ohlcv.timestamp <= last_historical_timestamp):
-                        continue
+                    # Filter duplicates from the historical phase
+                    if last_historical_timestamp is not None:
+                        ts = bar_update.ohlcv.timestamp
+                        if bar_update.is_closed and ts <= last_historical_timestamp:
+                            continue
+                        if not bar_update.is_closed and ts < last_historical_timestamp:
+                            continue
 
                     bar_queue.put(bar_update)
 
@@ -159,7 +159,7 @@ def live_ohlcv_generator(
             if isinstance(item, BaseException):
                 raise item
 
-            yield item.ohlcv
+            yield item
 
     except KeyboardInterrupt:
         logger.info("Live streaming interrupted by user")

@@ -1807,7 +1807,7 @@ def cancel(id: str):
 
     :param id: The identifier of the order to cancel
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -1819,7 +1819,7 @@ def cancel_all():
     """
     Cancels all pending or unfilled orders
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
     position = lib._script.position
     position.entry_orders.clear()
@@ -1842,7 +1842,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     :param alert_message: Custom text for the alert that fires when an order fills.
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -1885,7 +1885,7 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     :param alert_message: Custom text for the alert that fires when an order fills
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -1921,7 +1921,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param comment: Additional notes on the filled order
     :param alert_message: Custom text for the alert that fires when an order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script
@@ -2079,7 +2079,7 @@ def exit(id: str, from_entry: str = "",
     :param alert_trailing: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the alert will not fire when the order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script
@@ -2226,7 +2226,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param alert_message: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script

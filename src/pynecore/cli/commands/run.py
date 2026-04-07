@@ -539,6 +539,12 @@ def run(
             sys.path.insert(0, str(lib_dir))
             lib_path_added = True
 
+        # Set live mode flags before ScriptRunner creation
+        if live:
+            from pynecore import lib as _lib
+            _lib._is_live = True
+            _lib._strategy_suppressed = True
+
         # Show loading spinner while importing
         with Progress(
                 SpinnerColumn(finished_text="[green]✓"),

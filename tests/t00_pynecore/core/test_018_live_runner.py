@@ -57,8 +57,8 @@ class MockLiveProvider:
         return True
 
 
-def __test_live_generator_yields_closed_bars__():
-    """live_ohlcv_generator only yields bars where is_closed=True"""
+def __test_live_generator_yields_all_bar_updates__():
+    """live_ohlcv_generator yields both intra-bar and closed bar updates"""
     updates = [
         _make_bar_update(1000, is_closed=False, close=100.0),
         _make_bar_update(1000, is_closed=True, close=101.0),
@@ -69,9 +69,13 @@ def __test_live_generator_yields_closed_bars__():
     provider = MockLiveProvider(updates)
     bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
 
-    assert len(bars) == 2
-    assert bars[0].close == 101.0
-    assert bars[1].close == 103.0
+    assert len(bars) == 4
+    assert not bars[0].is_closed
+    assert bars[0].ohlcv.close == 100.0
+    assert bars[1].is_closed
+    assert bars[1].ohlcv.close == 101.0
+    assert not bars[2].is_closed
+    assert bars[3].is_closed
 
 
 def __test_live_generator_filters_old_bars__():
@@ -87,12 +91,12 @@ def __test_live_generator_filters_old_bars__():
                                      last_historical_timestamp=2000))
 
     assert len(bars) == 1
-    assert bars[0].timestamp == 3000
-    assert bars[0].close == 300.0
+    assert bars[0].ohlcv.timestamp == 3000
+    assert bars[0].ohlcv.close == 300.0
 
 
-def __test_live_generator_yields_ohlcv_objects__():
-    """live_ohlcv_generator yields OHLCV, not BarUpdate"""
+def __test_live_generator_yields_bar_update_objects__():
+    """live_ohlcv_generator yields BarUpdate objects (not raw OHLCV)"""
     updates = [
         _make_bar_update(1000, is_closed=True),
     ]
@@ -101,7 +105,8 @@ def __test_live_generator_yields_ohlcv_objects__():
     bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
 
     assert len(bars) == 1
-    assert isinstance(bars[0], OHLCV)
+    assert isinstance(bars[0], BarUpdate)
+    assert isinstance(bars[0].ohlcv, OHLCV)
 
 
 def __test_live_generator_connects_and_disconnects__():

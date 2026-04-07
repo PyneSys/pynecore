@@ -266,6 +266,15 @@ class CSVWriter:
         except queue.Full:
             return False
 
+    def flush(self, timeout: Optional[float] = None):
+        """
+        Wait for all pending writes to be processed by the worker thread.
+
+        :param timeout: Optional timeout in seconds
+        """
+        if self._is_open and self._queue is not None:
+            self._queue.join()
+
     def close(self, timeout: Optional[float] = None):
         """
         Close the CSV file and stop the worker thread.

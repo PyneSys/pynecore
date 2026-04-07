@@ -2,7 +2,7 @@ from ..core.module_property import module_property
 
 __all__ = [
     'isfirst',
-    'islast', 
+    'islast',
     'isconfirmed',
     'ishistory',
     'islastconfirmedhistory',
@@ -10,7 +10,11 @@ __all__ = [
     'isrealtime'
 ]
 
-# TODO: support live trading
+# Dynamic state variables set by ScriptRunner during live mode
+_is_live_phase = False
+_is_confirmed = True
+_is_new_bar = False
+_is_last_confirmed_history = False
 
 isfirst = True
 """ Returns true if current bar is first bar in barset, false otherwise."""
@@ -26,8 +30,7 @@ def isconfirmed() -> bool:
 
     :return: True if the script is calculating the last (closing) update of the current bar
     """
-    # TODO: now it is always true, but if we implement bar magnifier, it should be calculated
-    return True
+    return _is_confirmed
 
 
 @module_property
@@ -37,8 +40,7 @@ def ishistory() -> bool:
 
     :return: True if script is calculating on historical bars, false otherwise
     """
-    # TODO: now it is always true, but for live trading it should be implemented
-    return True
+    return not _is_live_phase
 
 
 @module_property
@@ -50,8 +52,7 @@ def islastconfirmedhistory() -> bool:
     :return: True if script is executing on the dataset's last bar when market is closed, or script
              is executing on the bar immediately preceding the real-time bar, if market is open
     """
-    # TODO: now is always false, but for live trading it should be implemented
-    return False
+    return _is_last_confirmed_history
 
 
 @module_property
@@ -61,8 +62,7 @@ def isnew() -> bool:
 
     :return: True if script is currently calculating on new bar, false otherwise
     """
-    # TODO: now it is always false, but if we implement bar magnifier, it should be calculated
-    return False
+    return _is_new_bar
 
 
 @module_property
@@ -72,5 +72,4 @@ def isrealtime() -> bool:
 
     :return: True if script is calculating on real-time bars, false otherwise
     """
-    # TODO: now it is always false, but for live trading it should be implemented
-    return False
+    return _is_live_phase

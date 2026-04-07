@@ -166,9 +166,15 @@ def _reset_lib_vars(lib: ModuleType):
 
     lib.extra_fields = {}
     lib._lib_semaphore = False
+    lib._is_live = False
+    lib._strategy_suppressed = False
 
     lib.barstate.isfirst = True
     lib.barstate.islast = False
+    lib.barstate._is_live_phase = False
+    lib.barstate._is_confirmed = True
+    lib.barstate._is_new_bar = False
+    lib.barstate._is_last_confirmed_history = False
 
     from ..lib import request
     request._reset_request_state()
@@ -504,27 +510,119 @@ class ScriptRunner:
                     magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
-            # Initialize calc_on_order_fills snapshot (only for strategies with COOF)
+            # Initialize calc_on_order_fills snapshot (for COOF or live mode)
             var_snapshot = None
+            is_live = lib._is_live
             if is_strat and self.script.calc_on_order_fills:
                 from .var_snapshot import VarSnapshot
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
+            elif is_live:
+                from .var_snapshot import VarSnapshot
+                var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
 
-            # Peek-ahead pattern: look one step ahead to detect the last bar accurately
+            # --- Helper closures for DRY ---
+            registered_libraries = script._registered_libraries
+
+            def _run_libs_and_main():
+                lib._lib_semaphore = True
+                for _title, main_func in registered_libraries:
+                    main_func()
+                lib._lib_semaphore = False
+                r = self.script_module.main()
+                if r is not None:
+                    assert isinstance(r, dict), "The 'main' function must return a dictionary!"
+                    lib._plot_data.update(r)
+
+            def _write_bar_output(bar_candle):
+                nonlocal trade_num
+                if self.plot_writer and lib._plot_data:
+                    ef = {} if bar_candle.extra_fields is None else dict(bar_candle.extra_fields)
+                    ef.update(lib._plot_data)
+                    self.plot_writer.write_ohlcv(bar_candle._replace(extra_fields=ef))
+
+                if is_strat and self.trades_writer and position:
+                    for t in position.new_closed_trades:
+                        trade_num += 1
+                        self.trades_writer.write(
+                            trade_num, t.entry_bar_index,
+                            "Entry long" if t.size > 0 else "Entry short",
+                            t.entry_comment if t.entry_comment else t.entry_id,
+                            string.format_time(t.entry_time),  # type: ignore
+                            t.entry_price, abs(t.size), t.profit,
+                            f"{t.profit_percent:.2f}", t.cum_profit,
+                            f"{t.cum_profit_percent:.2f}", t.max_runup,
+                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
+                            f"{t.max_drawdown_percent:.2f}",
+                        )
+                        self.trades_writer.write(
+                            trade_num, t.exit_bar_index,
+                            "Exit long" if t.size > 0 else "Exit short",
+                            t.exit_comment if t.exit_comment else t.exit_id,
+                            string.format_time(t.exit_time),  # type: ignore
+                            t.exit_price, abs(t.size), t.profit,
+                            f"{t.profit_percent:.2f}", t.cum_profit,
+                            f"{t.cum_profit_percent:.2f}", t.max_runup,
+                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
+                            f"{t.max_drawdown_percent:.2f}",
+                        )
+
+            def _coof_loop():
+                """COOF re-execution loop: process orders, re-execute on fills."""
+                old_fills = position._fill_counter
+                position.process_orders()
+                new_fills = position._fill_counter
+                while new_fills > old_fills:
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                    function_isolation.reset()
+                    _run_libs_and_main()
+                    old_fills = new_fills
+                    position.process_orders()
+                    new_fills = position._fill_counter
+
+            def _coof_magnified_loop(sub_bars_list, aggregated_candle):
+                """COOF re-execution loop with magnified order processing."""
+                old_fills = position._fill_counter
+                position.process_orders_magnified(sub_bars_list, aggregated_candle)
+                new_fills = position._fill_counter
+                while new_fills > old_fills:
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                    function_isolation.reset()
+                    _run_libs_and_main()
+                    old_fills = new_fills
+                    position.process_orders_magnified(sub_bars_list, aggregated_candle)
+                    new_fills = position._fill_counter
+
+            # --- Peek-ahead pattern: historical bars ---
+            from pynecore.core.plugin.live_provider import BarUpdate
+
             ohlcv_iterator = iter(self.ohlcv_iter)
-            next_candle = next(ohlcv_iterator, None)
+            next_item = next(ohlcv_iterator, None)
+            first_live_update = None  # Will hold the first BarUpdate if we transition
 
-            while next_candle is not None:
-                candle = next_candle
-                next_candle = next(ohlcv_iterator, None)
+            while next_item is not None:
+                # If a BarUpdate arrives, we transition to live mode
+                if isinstance(next_item, BarUpdate):
+                    first_live_update = next_item
+                    break
 
-                # Update syminfo lib properties if needed, other ScriptRunner instances may have changed them
+                candle = next_item
+                next_item = next(ohlcv_iterator, None)
+
+                # Update syminfo lib properties if needed
                 if self.update_syminfo_every_run:
                     _set_lib_syminfo_properties(self.syminfo, lib)
                     self.tz = _parse_timezone(lib.syminfo.timezone)
 
-                # Accurate last bar detection - no more estimation needed
-                barstate.islast = (next_candle is None)
+                # Last bar detection
+                if is_live:
+                    barstate.islast = False
+                    barstate._is_last_confirmed_history = (
+                        next_item is None or isinstance(next_item, BarUpdate)
+                    )
+                else:
+                    barstate.islast = (next_item is None)
 
                 # Update lib properties
                 _set_lib_properties(candle, self.bar_index, self.tz, lib)
@@ -532,129 +630,163 @@ class ScriptRunner:
                 # Store first price for buy & hold calculation
                 if self.first_price is None:
                     self.first_price = lib.close  # type: ignore
-
-                # Update last price
                 self.last_price = lib.close  # type: ignore
 
                 # calc_on_order_fills path: snapshot, process, re-execute on fills
-                if var_snapshot and position:
+                if var_snapshot and position and not lib._strategy_suppressed:
                     if var_snapshot.has_vars:
                         var_snapshot.save()
-
-                    old_fills = position._fill_counter
-                    position.process_orders()
-                    new_fills = position._fill_counter
-
-                    while new_fills > old_fills:
-                        if var_snapshot.has_vars:
-                            var_snapshot.restore()
-                        function_isolation.reset()
-                        lib._lib_semaphore = True
-                        for library_title, main_func in script._registered_libraries:
-                            main_func()
-                        lib._lib_semaphore = False
-                        self.script_module.main()
-                        old_fills = new_fills
-                        position.process_orders()
-                        new_fills = position._fill_counter
-
+                    _coof_loop()
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
-                else:
-                    # Standard path (no COOF)
-                    if is_strat and position:
-                        position.process_orders()
+                elif is_strat and position and not lib._strategy_suppressed:
+                    position.process_orders()
 
-                # Execute registered library main functions before main script
-                lib._lib_semaphore = True
-                for library_title, main_func in script._registered_libraries:
-                    main_func()
-                lib._lib_semaphore = False
+                # Execute libraries + script
+                _run_libs_and_main()
 
-                # Run the script
-                res = self.script_module.main()
-
-                # Process deferred margin calls (after script runs, before results)
-                if is_strat and position:
+                # Process deferred margin calls
+                if is_strat and position and not lib._strategy_suppressed:
                     position.process_deferred_margin_call()
 
-                # Update plot data with the results
-                if res is not None:
-                    assert isinstance(res, dict), "The 'main' function must return a dictionary!"
-                    lib._plot_data.update(res)
+                # Write output
+                _write_bar_output(candle)
 
-                # Write plot data to CSV if we have a writer
-                if self.plot_writer and lib._plot_data:
-                    # Create a new dictionary combining extra_fields (if any) with plot data
-                    extra_fields = {} if candle.extra_fields is None else dict(candle.extra_fields)
-                    extra_fields.update(lib._plot_data)
-                    # Create a new OHLCV instance with updated extra_fields
-                    updated_candle = candle._replace(extra_fields=extra_fields)
-                    self.plot_writer.write_ohlcv(updated_candle)
-
-                # Yield plot data to be able to process in a subclass
+                # Yield
                 if not is_strat:
                     yield candle, lib._plot_data
                 elif position:
                     yield candle, lib._plot_data, position.new_closed_trades
 
-                # Save trade data if we have a writer
-                if is_strat and self.trades_writer and position:
-                    for trade in position.new_closed_trades:
-                        trade_num += 1  # Start from 1
-                        self.trades_writer.write(
-                            trade_num,
-                            trade.entry_bar_index,
-                            "Entry long" if trade.size > 0 else "Entry short",
-                            trade.entry_comment if trade.entry_comment else trade.entry_id,
-                            string.format_time(trade.entry_time),  # type: ignore
-                            trade.entry_price,
-                            abs(trade.size),
-                            trade.profit,
-                            f"{trade.profit_percent:.2f}",
-                            trade.cum_profit,
-                            f"{trade.cum_profit_percent:.2f}",
-                            trade.max_runup,
-                            f"{trade.max_runup_percent:.2f}",
-                            trade.max_drawdown,
-                            f"{trade.max_drawdown_percent:.2f}",
-                        )
-                        self.trades_writer.write(
-                            trade_num,
-                            trade.exit_bar_index,
-                            "Exit long" if trade.size > 0 else "Exit short",
-                            trade.exit_comment if trade.exit_comment else trade.exit_id,
-                            string.format_time(trade.exit_time),  # type: ignore
-                            trade.exit_price,
-                            abs(trade.size),
-                            trade.profit,
-                            f"{trade.profit_percent:.2f}",
-                            trade.cum_profit,
-                            f"{trade.cum_profit_percent:.2f}",
-                            trade.max_runup,
-                            f"{trade.max_runup_percent:.2f}",
-                            trade.max_drawdown,
-                            f"{trade.max_drawdown_percent:.2f}",
-                        )
-
-                # Clear plot data
                 lib._plot_data.clear()
 
-                # Track equity curve for strategies
                 if is_strat and position:
-                    current_equity = float(position.equity) if position.equity else self.script.initial_capital
+                    current_equity = float(position.equity) if position.equity \
+                        else self.script.initial_capital
                     self.equity_curve.append(current_equity)
 
-                # Call the progress callback
                 if on_progress and lib._datetime is not None:
                     on_progress(lib._datetime.replace(tzinfo=None))
 
-                # Update bar index
                 self.bar_index += 1
-                # It is no longer the first bar
                 barstate.isfirst = False
 
-            if on_progress:
+            # --- Live mode: transition and intra-bar loop ---
+            if first_live_update is not None:
+                import itertools
+
+                # Transition: historical → live
+                barstate._is_live_phase = True
+                barstate._is_last_confirmed_history = False
+                lib._strategy_suppressed = False
+
+                # Flush output at transition point
+                if self.plot_writer:
+                    self.plot_writer.flush()
+                if self.trades_writer:
+                    self.trades_writer.flush()
+
+                last_bar_timestamp: int | None = None
+                sub_bars: list[OHLCV] = []
+
+                live_stream = itertools.chain([first_live_update], ohlcv_iterator)
+                for bar_update in live_stream:
+                    if not isinstance(bar_update, BarUpdate):
+                        continue
+
+                    candle = bar_update.ohlcv
+                    is_new_bar = (candle.timestamp != last_bar_timestamp)
+
+                    barstate.islast = True
+                    barstate._is_confirmed = bar_update.is_closed
+                    barstate._is_new_bar = is_new_bar
+
+                    _set_lib_properties(candle, self.bar_index, self.tz, lib)
+
+                    if self.first_price is None:
+                        self.first_price = lib.close  # type: ignore
+                    self.last_price = lib.close  # type: ignore
+
+                    if is_new_bar and not bar_update.is_closed:
+                        # ── Bar open (first intra-bar tick) ──
+                        sub_bars = [candle]
+                        if var_snapshot and var_snapshot.has_vars:
+                            var_snapshot.save()
+                        _run_libs_and_main()
+                        last_bar_timestamp = candle.timestamp
+
+                    elif not bar_update.is_closed:
+                        # ── Subsequent intra-bar tick ──
+                        sub_bars.append(candle)
+                        if var_snapshot and var_snapshot.has_vars:
+                            var_snapshot.restore()
+                        function_isolation.reset()
+                        _run_libs_and_main()
+
+                    elif bar_update.is_closed:
+                        # ── Bar close ──
+                        if is_new_bar:
+                            sub_bars = []
+                            if var_snapshot and var_snapshot.has_vars:
+                                var_snapshot.save()
+                        else:
+                            sub_bars.append(candle)
+                            if var_snapshot and var_snapshot.has_vars:
+                                var_snapshot.restore()
+                            function_isolation.reset()
+
+                        # Order processing: magnified if sub_bars available
+                        if is_strat and position:
+                            if sub_bars:
+                                if var_snapshot and var_snapshot.has_vars:
+                                    _coof_magnified_loop(sub_bars, candle)
+                                    var_snapshot.restore()
+                                else:
+                                    position.process_orders_magnified(sub_bars, candle)
+                            else:
+                                if var_snapshot and var_snapshot.has_vars:
+                                    _coof_loop()
+                                    var_snapshot.restore()
+                                else:
+                                    position.process_orders()
+
+                        # Final script execution for the closed bar
+                        _run_libs_and_main()
+
+                        if is_strat and position:
+                            position.process_deferred_margin_call()
+
+                        # Commit state for next bar
+                        if var_snapshot and var_snapshot.has_vars:
+                            var_snapshot.save()
+
+                        # Output (only on closed bars)
+                        _write_bar_output(candle)
+
+                        if not is_strat:
+                            yield candle, lib._plot_data
+                        elif position:
+                            yield candle, lib._plot_data, position.new_closed_trades
+
+                        lib._plot_data.clear()
+
+                        if is_strat and position:
+                            current_equity = float(position.equity) if position.equity \
+                                else self.script.initial_capital
+                            self.equity_curve.append(current_equity)
+
+                        last_bar_timestamp = candle.timestamp
+                        self.bar_index += 1
+                        barstate.isfirst = False
+
+                        # Live strategy stats: rewrite stats file after each bar
+                        if is_strat and self.strat_writer and position:
+                            self._write_live_strategy_stats(position)
+
+                        if on_progress and lib._datetime is not None:
+                            on_progress(lib._datetime.replace(tzinfo=None))
+
+            elif on_progress:
                 on_progress(datetime.max)
 
         except GeneratorExit:
@@ -973,6 +1105,24 @@ class ScriptRunner:
             if ohlcv_path.exists():
                 return str(ohlcv_path)
         return str(path)
+
+    def _write_live_strategy_stats(self, position):
+        """Rewrite strategy stats file with current state (live mode, after each bar)."""
+        from .strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
+        try:
+            self.strat_writer.open()
+            stats = calculate_strategy_statistics(
+                position, self.script.initial_capital,
+                self.equity_curve if self.equity_curve else None,
+                self.first_price, self.last_price,
+            )
+            write_strategy_statistics_csv(stats, self.strat_writer)
+            self.strat_writer.close()
+        except Exception:
+            try:
+                self.strat_writer.close()
+            except Exception:
+                pass
 
     def run(self, on_progress: Callable[[datetime], None] | None = None):
         """
