@@ -514,10 +514,12 @@ class ScriptRunner:
             # Initialize calc_on_order_fills snapshot (for COOF or live mode)
             var_snapshot = None
             is_live = lib._is_live
+            # Indicators always run on every tick; strategies only if calc_on_every_tick
+            run_on_every_tick = not is_strat or self.script.calc_on_every_tick
             if is_strat and self.script.calc_on_order_fills:
                 from .var_snapshot import VarSnapshot
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
-            elif is_live:
+            elif is_live and run_on_every_tick:
                 from .var_snapshot import VarSnapshot
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
 
@@ -712,18 +714,20 @@ class ScriptRunner:
                     if is_new_bar and not bar_update.is_closed:
                         # ── Bar open (first intra-bar tick) ──
                         sub_bars = [candle]
-                        if var_snapshot and var_snapshot.has_vars:
-                            var_snapshot.save()
-                        _run_libs_and_main()
+                        if run_on_every_tick:
+                            if var_snapshot and var_snapshot.has_vars:
+                                var_snapshot.save()
+                            _run_libs_and_main()
                         last_bar_timestamp = candle.timestamp
 
                     elif not bar_update.is_closed:
                         # ── Subsequent intra-bar tick ──
                         sub_bars.append(candle)
-                        if var_snapshot and var_snapshot.has_vars:
-                            var_snapshot.restore()
-                        function_isolation.reset()
-                        _run_libs_and_main()
+                        if run_on_every_tick:
+                            if var_snapshot and var_snapshot.has_vars:
+                                var_snapshot.restore()
+                            function_isolation.reset()
+                            _run_libs_and_main()
 
                     elif bar_update.is_closed:
                         # ── Bar close ──
@@ -733,9 +737,14 @@ class ScriptRunner:
                                 var_snapshot.save()
                         else:
                             sub_bars.append(candle)
-                            if var_snapshot and var_snapshot.has_vars:
-                                var_snapshot.restore()
-                            function_isolation.reset()
+                            if run_on_every_tick:
+                                if var_snapshot and var_snapshot.has_vars:
+                                    var_snapshot.restore()
+                                function_isolation.reset()
+
+                        # Strategy not running on ticks: bar close is first execution
+                        if not run_on_every_tick:
+                            barstate.isnew = True
 
                         # Order processing: magnified if sub_bars available
                         if is_strat and position:
@@ -753,6 +762,7 @@ class ScriptRunner:
                                     position.process_orders()
 
                         # Final script execution for the closed bar
+                        lib._plot_data.clear()
                         _run_libs_and_main()
 
                         if is_strat and position:
