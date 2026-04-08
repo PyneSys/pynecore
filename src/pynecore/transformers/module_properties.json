@@ -103,25 +103,25 @@
   },
   "lib.barstate": {
     "isconfirmed": {
-      "type": "property"
+      "type": "variable"
     },
     "isfirst": {
       "type": "variable"
     },
     "ishistory": {
-      "type": "property"
+      "type": "variable"
     },
     "islast": {
       "type": "variable"
     },
     "islastconfirmedhistory": {
-      "type": "property"
+      "type": "variable"
     },
     "isnew": {
-      "type": "property"
+      "type": "variable"
     },
     "isrealtime": {
-      "type": "property"
+      "type": "variable"
     }
   },
   "lib.box": {

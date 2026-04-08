@@ -171,10 +171,11 @@ def _reset_lib_vars(lib: ModuleType):
 
     lib.barstate.isfirst = True
     lib.barstate.islast = False
-    lib.barstate._is_live_phase = False
-    lib.barstate._is_confirmed = True
-    lib.barstate._is_new_bar = False
-    lib.barstate._is_last_confirmed_history = False
+    lib.barstate.isconfirmed = True
+    lib.barstate.ishistory = True
+    lib.barstate.isrealtime = False
+    lib.barstate.isnew = False
+    lib.barstate.islastconfirmedhistory = False
 
     from ..lib import request
     request._reset_request_state()
@@ -618,7 +619,7 @@ class ScriptRunner:
                 # Last bar detection
                 if is_live:
                     barstate.islast = False
-                    barstate._is_last_confirmed_history = (
+                    barstate.islastconfirmedhistory = (
                         next_item is None or isinstance(next_item, BarUpdate)
                     )
                 else:
@@ -676,8 +677,9 @@ class ScriptRunner:
                 import itertools
 
                 # Transition: historical → live
-                barstate._is_live_phase = True
-                barstate._is_last_confirmed_history = False
+                barstate.ishistory = False
+                barstate.isrealtime = True
+                barstate.islastconfirmedhistory = False
                 lib._strategy_suppressed = False
 
                 # Flush output at transition point
@@ -698,8 +700,8 @@ class ScriptRunner:
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
 
                     barstate.islast = True
-                    barstate._is_confirmed = bar_update.is_closed
-                    barstate._is_new_bar = is_new_bar
+                    barstate.isconfirmed = bar_update.is_closed
+                    barstate.isnew = is_new_bar
 
                     _set_lib_properties(candle, self.bar_index, self.tz, lib)
 
