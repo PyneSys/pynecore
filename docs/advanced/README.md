@@ -26,3 +26,4 @@ Advanced topics and features of PyneCore
 - [Extra Fields](./extra-fields.md) - Custom CSV columns beyond OHLCV in scripts
 - [request.security() Internals](./request-security-internals.md) - Multiprocessing architecture, AST transformation, shared memory
 - [Bar Magnifier](./bar-magnifier.md) - Accurate intrabar order fills using lower-timeframe data
+- [Live Mode](./live-mode.md) - Real-time streaming with intra-bar updates and paper trading

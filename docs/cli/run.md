@@ -138,6 +138,40 @@ The `run` command has two required arguments:
 Note: you don't need to write the file extensions in the command.
 </small>
 
+## Provider Mode
+
+Instead of a local data file, you can pass a **provider string** as the `DATA` argument.
+The provider plugin downloads historical data and (with `--live`) streams real-time updates:
+
+```bash
+# Download historical data from CCXT/Bybit and run the script
+pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1
+
+# Same, but continue with live streaming after the historical phase
+pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
+```
+
+Provider string format: `provider:EXCHANGE:SYMBOL:SETTLE@TIMEFRAME`
+
+| Part        | Example      | Description                    |
+|-------------|-------------|--------------------------------|
+| `provider`  | `ccxt`      | Plugin name (entry point)      |
+| `EXCHANGE`  | `BYBIT`     | Exchange identifier            |
+| `SYMBOL`    | `BTC/USDT`  | Trading pair                   |
+| `SETTLE`    | `USDT`      | Settlement currency (optional) |
+| `TIMEFRAME` | `1`         | TradingView timeframe format   |
+
+The `-f` / `--from` option accepts a **negative integer** for relative bar count when using
+a provider string:
+
+```bash
+# Prefetch the last 500 bars
+pyne run script.py ccxt:BYBIT:ETH/USDT:USDT@5 -f -500
+```
+
+See [Live Mode](../advanced/live-mode.md) for details on real-time streaming, intra-bar
+updates, strategy suppression, and paper trading.
+
 ## Command Options
 
 The `run` command supports several options to customize the execution:
@@ -148,13 +182,24 @@ The `run` command supports several options to customize the execution:
 
 ### Date Range Options
 
-- `--from`, `-f`: Start date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format. If not specified, it will use the first date in the data
+- `--from`, `-f`: Start date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format. If not specified, it will use the first date in the data. In provider mode, also accepts a negative integer for relative bar count (e.g. `-f -500`); defaults to `-500` bars if omitted.
 - `--to`, `-t`: End date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format. If not specified, it will use the last date in the data.
 
 Example:
 ```bash
 # Run a script for a specific date range
 pyne run my_strategy.py eurusd_data.ohlcv --from "2023-01-01" --to "2023-12-31"
+```
+
+### Live Mode Options
+
+- `--live`, `-l`: Continue with real-time data streaming after the historical phase. Only available in provider mode (provider string as data source). See [Live Mode](../advanced/live-mode.md).
+- `--shutdown-timeout`: Maximum seconds to wait for graceful provider shutdown when stopping (default: 120).
+
+Example:
+```bash
+# Stream live 1-minute BTC/USDT bars after 500 historical bars
+pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
 ```
 
 ### Output Path Options

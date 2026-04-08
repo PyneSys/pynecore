@@ -26,11 +26,14 @@ class hierarchy determines what a plugin can do:
 
 ```
 Plugin (base)
-├── ProviderPlugin   — Offline OHLCV data provider
-├── CLIPlugin        — CLI subcommands and parameter hooks
-├── ExtensionPlugin  — Hook-based script extension (planned)
-└── LiveProviderPlugin — WebSocket/streaming data (planned)
+├── ProviderPlugin      — Offline OHLCV data provider
+│   └── LiveProviderPlugin — WebSocket/streaming data (extends ProviderPlugin)
+├── CLIPlugin           — CLI subcommands and parameter hooks
+└── ExtensionPlugin     — Hook-based script extension (planned)
 ```
+
+`LiveProviderPlugin` inherits from `ProviderPlugin` — every live provider can also download
+historical data.  See [Live Mode](../advanced/live-mode.md) for usage details.
 
 Multiple inheritance combines capabilities:
 

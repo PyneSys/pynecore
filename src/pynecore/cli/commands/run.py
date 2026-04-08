@@ -135,12 +135,9 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         secho(f"Plugin '{ps.provider}' is not a data provider.", err=True, fg=colors.RED)
         raise Exit(1)
 
-    # Parse --from (required in provider mode)
+    # Default to -500 bars if --from not specified in provider mode
     if not time_from_str:
-        secho("Error: --from / -f is required in provider mode.\n"
-              "  Examples: -f 30 (30 days back), -f -500 (500 bars back), -f 2025-01-01",
-              err=True, fg=colors.RED)
-        raise Exit(1)
+        time_from_str = "-500"
 
     time_from_value = _parse_time_value(time_from_str, allow_bars=True)
     time_to_dt = datetime.now(UTC).replace(second=0, microsecond=0)
@@ -215,7 +212,7 @@ def run(
         time_from: str | None = Option(None, '--from', '-f',
                                        metavar="[DATE|DAYS|-BARS]",
                                        help="Start: date (2025-01-01), days back (30), "
-                                            "or -N bars back (-500). Required in provider mode."),
+                                            "or -N bars back (-500). Default: -500 bars in provider mode."),
         time_to: str | None = Option(None, '--to', '-t',
                                      metavar="[DATE|DAYS]",
                                      help="End: date or days from start (default: end of data or now)"),
@@ -269,7 +266,7 @@ def run(
       Provider mode: pyne run script.py ccxt:BYBIT:BTC/USDT:USDT@1D -f -500
 
     In provider mode, historical data is downloaded automatically. The --from/-f parameter
-    is required and accepts: date (2025-01-01), days back (30), or -N bars back (-500).
+    accepts: date (2025-01-01), days back (30), or -N bars back (-500). Default: -500 bars.
 
     [bold]Pine Script Support:[/bold]
     Pine Script (.pine) files are automatically compiled to Python (.py) before execution.
