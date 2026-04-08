@@ -194,7 +194,8 @@ class OHLCVWriter:
                  '_price_changes', '_price_decimals', '_last_close', '_analyzed_tick_size',
                  '_analyzed_price_scale', '_analyzed_min_move', '_confidence',
                  '_trading_hours', '_analyzed_opening_hours', '_timestamp_offsets', '_analyzed_timezone',
-                 '_truncate')
+                 '_truncate',
+                 '_extra_file', '_extra_writer', '_extra_headers', '_extra_row_count')
 
     def __init__(self, path: str | Path, truncate: bool = False):
         self.path: str = str(path)
@@ -216,6 +217,11 @@ class OHLCVWriter:
         # Trading hours analysis
         self._trading_hours: dict[tuple[int, int], int] = {}  # (weekday, hour) -> count
         self._analyzed_opening_hours: list | None = None
+        # Extra fields sidecar CSV
+        self._extra_file = None
+        self._extra_writer = None
+        self._extra_headers: list[str] | None = None
+        self._extra_row_count: int = 0
 
     def __enter__(self):
         self.open()
@@ -359,6 +365,16 @@ class OHLCVWriter:
         if self._size > 0 and not self._truncate:
             self._collect_existing_trading_hours()
 
+        # Check for existing extra fields sidecar
+        extra_path = Path(self.path).with_suffix('.extra.csv')
+        if extra_path.exists():
+            with open(extra_path, 'r', newline='') as ef:
+                reader = csv.reader(ef)
+                headers = next(reader, None)
+                if headers:
+                    self._extra_headers = headers
+                    self._extra_row_count = sum(1 for _ in reader)
+
         return self
 
     def write(self, candle: OHLCV) -> None:
@@ -418,6 +434,7 @@ class OHLCVWriter:
                                                        prev_close, prev_close, -1.0)
                         self._file.seek(self._current_pos * RECORD_SIZE)
                         self._file.write(gap_data)
+                        self._write_extra_gap()
                         self._current_pos += 1
                         self._size = max(self._size, self._current_pos)
                         expected_ts += self._interval
@@ -429,6 +446,9 @@ class OHLCVWriter:
                            candle.low, candle.close, candle.volume)
         self._file.write(data)
         self._file.flush()
+
+        # Write extra fields to sidecar CSV
+        self._write_extra_data(candle.extra_fields)
 
         # Collect data for tick size analysis
         self._collect_price_data(candle)
@@ -486,6 +506,15 @@ class OHLCVWriter:
             if self._size == 0:
                 self._start_timestamp = None
 
+        # Clean up extra fields sidecar on full truncate
+        if self._current_pos == 0:
+            self._close_extra_csv()
+            extra_path = Path(self.path).with_suffix('.extra.csv')
+            if extra_path.exists():
+                extra_path.unlink()
+            self._extra_headers = None
+            self._extra_row_count = 0
+
     def close(self):
         """
         Close the file
@@ -493,6 +522,65 @@ class OHLCVWriter:
         if self._file:
             self._file.close()
             self._file = None
+        self._close_extra_csv()
+
+    def _close_extra_csv(self) -> None:
+        """Close the extra fields sidecar CSV if open."""
+        if self._extra_file:
+            self._extra_file.close()
+            self._extra_file = None
+            self._extra_writer = None
+
+    def _open_extra_csv(self, headers: list[str]) -> None:
+        """Open the extra fields sidecar CSV for writing."""
+        extra_path = Path(self.path).with_suffix('.extra.csv')
+
+        if (self._extra_headers == headers
+                and self._extra_row_count <= self._current_pos):
+            # Compatible header exists, append and pad if needed
+            self._extra_file = open(extra_path, 'a', newline='')
+            self._extra_writer = csv.writer(self._extra_file)
+            empty = [''] * len(headers)
+            for _ in range(self._current_pos - self._extra_row_count):
+                self._extra_writer.writerow(empty)
+            self._extra_row_count = self._current_pos
+        else:
+            # New file or incompatible header
+            self._extra_file = open(extra_path, 'w', newline='')
+            self._extra_writer = csv.writer(self._extra_file)
+            self._extra_headers = headers
+            self._extra_writer.writerow(headers)
+            empty = [''] * len(headers)
+            for _ in range(self._current_pos):
+                self._extra_writer.writerow(empty)
+            self._extra_row_count = self._current_pos
+
+    def _write_extra_gap(self) -> None:
+        """Write an empty row to the extra CSV for a gap-fill position."""
+        if self._extra_writer is not None:
+            self._extra_writer.writerow([''] * len(self._extra_headers))
+            self._extra_row_count += 1
+
+    def _write_extra_data(self, extra_fields: dict | None) -> None:
+        """Write extra fields data row to the sidecar CSV."""
+        if extra_fields and self._extra_writer is None:
+            self._open_extra_csv(list(extra_fields.keys()))
+        if self._extra_writer is not None:
+            if extra_fields:
+                row = []
+                for h in self._extra_headers:
+                    v = extra_fields.get(h)
+                    if v is None:
+                        row.append('')
+                    elif isinstance(v, float):
+                        row.append(_format_float(v))
+                    else:
+                        row.append(str(v))
+                self._extra_writer.writerow(row)
+            else:
+                self._extra_writer.writerow([''] * len(self._extra_headers))
+            self._extra_row_count += 1
+            self._extra_file.flush()
 
     def _collect_price_data(self, candle: OHLCV) -> None:
         """
@@ -995,8 +1083,14 @@ class OHLCVWriter:
                 for record in current_records:
                     temp_writer.write(record)
 
-            # Close current file
+            # Close current file and clean up extra CSV (will be rebuilt)
             self._file.close()
+            self._close_extra_csv()
+            extra_path = Path(self.path).with_suffix('.extra.csv')
+            if extra_path.exists():
+                extra_path.unlink()
+            self._extra_headers = None
+            self._extra_row_count = 0
 
             # Replace original with rebuilt file
             shutil.move(temp_path, self.path)

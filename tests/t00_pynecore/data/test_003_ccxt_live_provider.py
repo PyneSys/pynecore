@@ -137,12 +137,13 @@ def __test_ccxt_live_generator_integration__():
     )
 
     received = []
-    for ohlcv in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
-                                       shutdown_timeout=5.0):
-        received.append(ohlcv)
-        assert isinstance(ohlcv, OHLCV)
-        assert ohlcv.timestamp > 0
-        assert ohlcv.close > 0
+    for update in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
+                                        shutdown_timeout=5.0):
+        received.append(update)
+        assert isinstance(update, BarUpdate)
+        assert isinstance(update.ohlcv, OHLCV)
+        assert update.ohlcv.timestamp > 0
+        assert update.ohlcv.close > 0
         if len(received) >= 1:
             break
 

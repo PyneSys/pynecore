@@ -108,11 +108,10 @@ def __test_ccxt_real_data_download__(tmp_path):
     if not config_dir.exists() or not config_dir.is_dir():
         pytest.skip("No config directory found in workdir")
 
-    # Check if ccxt config exists (new per-plugin config or legacy providers.toml)
-    ccxt_toml = config_dir / "ccxt.toml"
-    providers_toml = config_dir / "providers.toml"
-    if not ccxt_toml.exists() and not providers_toml.exists():
-        pytest.skip("No ccxt.toml or providers.toml found in config directory")
+    # Check if ccxt config exists
+    ccxt_toml = config_dir / "plugins" / "ccxt.toml"
+    if not ccxt_toml.exists():
+        pytest.skip("No config/plugins/ccxt.toml found")
 
     # Create temporary data directory for the test
     data_dir = tmp_path / "data"
@@ -149,7 +148,7 @@ def __test_ccxt_real_data_download__(tmp_path):
     # Load config via plugin config system
     from pynecore.core.config import ensure_config
     from pynecore.providers.ccxt import CCXTConfig
-    config = ensure_config(CCXTConfig, config_dir / 'ccxt.toml')
+    config = ensure_config(CCXTConfig, ccxt_toml)
 
     # Create provider instance
     provider = CCXTProvider(
