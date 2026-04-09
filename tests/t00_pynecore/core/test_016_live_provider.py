@@ -1,12 +1,10 @@
 """
-Tests for LiveProviderPlugin and BarUpdate.
+Tests for LiveProviderPlugin and OHLCV is_closed field.
 """
 
 from abc import ABCMeta
-from dataclasses import fields
 
 from pynecore.core.plugin import Plugin, ProviderPlugin, LiveProviderPlugin
-from pynecore.core.plugin.live_provider import BarUpdate
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -46,19 +44,13 @@ def __test_live_provider_default_reconnect_values__():
     assert LiveProviderPlugin.max_reconnect_attempts == 10
 
 
-def __test_bar_update_fields__():
-    """BarUpdate has ohlcv and is_closed fields"""
-    field_names = {f.name for f in fields(BarUpdate)}
-    assert field_names == {'ohlcv', 'is_closed'}
-
-
-def __test_bar_update_creation__():
-    """BarUpdate can be created with OHLCV and is_closed flag"""
+def __test_ohlcv_is_closed_field__():
+    """OHLCV has is_closed field with default True"""
     ohlcv = OHLCV(timestamp=1000, open=100.0, high=105.0, low=95.0, close=102.0, volume=1000.0)
+    assert ohlcv.is_closed is True
 
-    closed = BarUpdate(ohlcv=ohlcv, is_closed=True)
-    assert closed.ohlcv is ohlcv
+    closed = ohlcv._replace(is_closed=True)
     assert closed.is_closed is True
 
-    update = BarUpdate(ohlcv=ohlcv, is_closed=False)
+    update = ohlcv._replace(is_closed=False)
     assert update.is_closed is False

@@ -25,15 +25,10 @@ def main():
     }
 
 
-def _make_ohlcv(ts, close=100.0):
+def _make_ohlcv(ts, close=100.0, is_closed=True):
     from pynecore.types.ohlcv import OHLCV
     return OHLCV(timestamp=ts, open=close, high=close + 1, low=close - 1,
-                 close=close, volume=1000.0)
-
-
-def _make_bar_update(ts, is_closed=True, close=100.0):
-    from pynecore.core.plugin.live_provider import BarUpdate
-    return BarUpdate(ohlcv=_make_ohlcv(ts, close), is_closed=is_closed)
+                 close=close, volume=1000.0, is_closed=is_closed)
 
 
 def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
@@ -50,14 +45,20 @@ def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     return ScriptRunner(script_path, ohlcv_iter, syminfo)
 
 
+def _chain_live(historical, live):
+    """Chain historical OHLCV with LIVE_TRANSITION sentinel and live OHLCV."""
+    from pynecore.core.script_runner import LIVE_TRANSITION
+    return itertools.chain(historical, [LIVE_TRANSITION], live)
+
+
 def __test_barstate_historical_then_live__(script_path, module_key, syminfo):
     """barstate transitions from ishistory=True to isrealtime=True at live phase"""
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(3)]
-    live = [_make_bar_update(3 * 60, is_closed=True, close=104.0)]
+    live = [_make_ohlcv(3 * 60, is_closed=True, close=104.0)]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = [(c, dict(p)) for c, p in runner.run_iter()]
@@ -80,11 +81,11 @@ def __test_barstate_historical_then_live__(script_path, module_key, syminfo):
 def __test_islastconfirmedhistory__(script_path, module_key, syminfo):
     """islastconfirmedhistory is True only on the final historical bar before live"""
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(3)]
-    live = [_make_bar_update(3 * 60, is_closed=True, close=104.0)]
+    live = [_make_ohlcv(3 * 60, is_closed=True, close=104.0)]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = [(c, dict(p)) for c, p in runner.run_iter()]
@@ -100,14 +101,14 @@ def __test_intrabar_barstate__(script_path, module_key, syminfo):
     """Intra-bar ticks have isconfirmed=False, isnew=True on first tick"""
     historical = [_make_ohlcv(0, 100.0)]
     live = [
-        _make_bar_update(60, is_closed=False, close=101.0),  # bar open
-        _make_bar_update(60, is_closed=False, close=101.5),  # intra-bar
-        _make_bar_update(60, is_closed=True, close=102.0),   # bar close
+        _make_ohlcv(60, is_closed=False, close=101.0),  # bar open
+        _make_ohlcv(60, is_closed=False, close=101.5),  # intra-bar
+        _make_ohlcv(60, is_closed=True, close=102.0),   # bar close
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = [(c, dict(p)) for c, p in runner.run_iter()]
@@ -126,14 +127,14 @@ def __test_var_rollback_varip_persist__(script_path, module_key, syminfo):
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(3)]
     live = [
         # Bar with 3 executions: open tick, intra-bar tick, close
-        _make_bar_update(3 * 60, is_closed=False, close=104.0),
-        _make_bar_update(3 * 60, is_closed=False, close=104.5),
-        _make_bar_update(3 * 60, is_closed=True, close=105.0),
+        _make_ohlcv(3 * 60, is_closed=False, close=104.0),
+        _make_ohlcv(3 * 60, is_closed=False, close=104.5),
+        _make_ohlcv(3 * 60, is_closed=True, close=105.0),
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = [(c, dict(p)) for c, p in runner.run_iter()]
@@ -158,16 +159,16 @@ def __test_yield_only_on_closed_bars__(script_path, module_key, syminfo):
     """run_iter only yields for closed bars, not intra-bar ticks"""
     historical = [_make_ohlcv(0, 100.0)]
     live = [
-        _make_bar_update(60, is_closed=False, close=101.0),
-        _make_bar_update(60, is_closed=False, close=101.5),
-        _make_bar_update(60, is_closed=False, close=101.8),
-        _make_bar_update(60, is_closed=True, close=102.0),
-        _make_bar_update(120, is_closed=True, close=103.0),
+        _make_ohlcv(60, is_closed=False, close=101.0),
+        _make_ohlcv(60, is_closed=False, close=101.5),
+        _make_ohlcv(60, is_closed=False, close=101.8),
+        _make_ohlcv(60, is_closed=True, close=102.0),
+        _make_ohlcv(120, is_closed=True, close=103.0),
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = [(c, dict(p)) for c, p in runner.run_iter()]
@@ -177,7 +178,7 @@ def __test_yield_only_on_closed_bars__(script_path, module_key, syminfo):
 
 
 def __test_no_live_bars_unchanged_behavior__(script_path, module_key, syminfo):
-    """When is_live=True but no BarUpdate arrives, behaves like normal backtest"""
+    """When is_live=True but no live OHLCV arrives, behaves like normal backtest"""
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(5)]
 
     runner = _create_live_runner(

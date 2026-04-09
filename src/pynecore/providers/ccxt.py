@@ -6,8 +6,6 @@ from pathlib import Path
 import tomllib
 
 from pynecore.core.plugin import LiveProviderPlugin, override
-from pynecore.core.plugin.live_provider import BarUpdate
-
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
 
@@ -269,7 +267,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         )
 
     @override
-    def download_ohlcv(self, time_from: datetime | None, time_to: datetime | None,
+    def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
         """
@@ -284,7 +282,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         assert self.xchg_timeframe is not None
 
         tf: datetime = time_from.replace(tzinfo=None)
-        tt: datetime = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
+        tt: datetime = time_to.replace(tzinfo=None)
 
         if limit is None:
             assert self._client.id
@@ -370,7 +368,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         return hasattr(self, '_async_client') and self._async_client is not None
 
     @override
-    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
         """
         Wait for the next OHLCV update from the exchange websocket.
 
@@ -380,7 +378,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         :param symbol: Symbol in CCXT format (e.g. "BTC/USDT:USDT").
         :param timeframe: Timeframe in TradingView format (e.g. "1D", "1", "4H").
-        :return: BarUpdate with OHLCV data and closed/open status.
+        :return: OHLCV with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
         xchg_tf = self.to_exchange_timeframe(timeframe)
 
@@ -396,15 +394,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 low=float(last[3]),
                 close=float(last[4]),
                 volume=float(last[5]),
+                is_closed=False,
             )
 
             if (self._last_bar_timestamp is not None
                     and timestamp != self._last_bar_timestamp):
-                closed_bar = self._last_bar_ohlcv
+                assert self._last_bar_ohlcv is not None
+                closed_bar = self._last_bar_ohlcv._replace(is_closed=True)
                 self._last_bar_timestamp = timestamp
                 self._last_bar_ohlcv = current_ohlcv
-                return BarUpdate(ohlcv=closed_bar, is_closed=True)
+                return closed_bar
 
             self._last_bar_timestamp = timestamp
             self._last_bar_ohlcv = current_ohlcv
-            return BarUpdate(ohlcv=current_ohlcv, is_closed=False)
+            return current_ohlcv

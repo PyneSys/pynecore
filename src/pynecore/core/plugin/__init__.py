@@ -28,8 +28,6 @@ Discovery::
     cls = load_plugin("capitalcom")
 """
 
-from __future__ import annotations
-
 import re
 import sys
 from typing import TypeVar, Generic
@@ -119,6 +117,7 @@ def get_plugin_metadata(ep: EntryPoint) -> dict[str, str]:
     :param ep: The entry point of the plugin.
     :return: Dict with ``name``, ``version``, ``description``, ``min_pynecore``.
     """
+    assert ep.dist is not None
     meta = ep.dist.metadata
     return {
         'name': ep.name,
@@ -138,6 +137,7 @@ def _parse_min_pynecore(ep: EntryPoint) -> str:
     :param ep: The entry point of the plugin.
     :return: Version string (e.g. ``"6.5"``) or ``""`` if not found.
     """
+    assert ep.dist is not None
     requires = ep.dist.requires
     if not requires:
         return ''

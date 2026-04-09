@@ -29,15 +29,10 @@ def main():
     plot(1 if barstate.isnew else 0, 'isnew')
 
 
-def _make_ohlcv(ts, close=100.0):
+def _make_ohlcv(ts, close=100.0, is_closed=True):
     from pynecore.types.ohlcv import OHLCV
     return OHLCV(timestamp=ts, open=close, high=close + 1, low=close - 1,
-                 close=close, volume=1000.0)
-
-
-def _make_bar_update(ts, is_closed=True, close=100.0):
-    from pynecore.core.plugin.live_provider import BarUpdate
-    return BarUpdate(ohlcv=_make_ohlcv(ts, close), is_closed=is_closed)
+                 close=close, volume=1000.0, is_closed=is_closed)
 
 
 def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
@@ -53,18 +48,24 @@ def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     return ScriptRunner(script_path, ohlcv_iter, syminfo)
 
 
+def _chain_live(historical, live):
+    """Chain historical OHLCV with LIVE_TRANSITION sentinel and live OHLCV."""
+    from pynecore.core.script_runner import LIVE_TRANSITION
+    return itertools.chain(historical, [LIVE_TRANSITION], live)
+
+
 def __test_strategy_default_var_equals_varip__(script_path, module_key, syminfo):
     """Default strategy: script runs only at bar close, var and varip are identical."""
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(3)]
     live = [
-        _make_bar_update(3 * 60, is_closed=False, close=104.0),   # bar open
-        _make_bar_update(3 * 60, is_closed=False, close=104.5),   # intra-bar
-        _make_bar_update(3 * 60, is_closed=True, close=105.0),    # bar close
+        _make_ohlcv(3 * 60, is_closed=False, close=104.0),   # bar open
+        _make_ohlcv(3 * 60, is_closed=False, close=104.5),   # intra-bar
+        _make_ohlcv(3 * 60, is_closed=True, close=105.0),    # bar close
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = []
@@ -88,14 +89,14 @@ def __test_strategy_calc_on_every_tick__(script_path, module_key, syminfo):
     """Strategy with calc_on_every_tick: var rolls back, varip persists like indicator."""
     historical = [_make_ohlcv(i * 60, 100.0 + i) for i in range(3)]
     live = [
-        _make_bar_update(3 * 60, is_closed=False, close=104.0),   # bar open
-        _make_bar_update(3 * 60, is_closed=False, close=104.5),   # intra-bar
-        _make_bar_update(3 * 60, is_closed=True, close=105.0),    # bar close
+        _make_ohlcv(3 * 60, is_closed=False, close=104.0),   # bar open
+        _make_ohlcv(3 * 60, is_closed=False, close=104.5),   # intra-bar
+        _make_ohlcv(3 * 60, is_closed=True, close=105.0),    # bar close
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
     runner.script.calc_on_every_tick = True
 
@@ -122,19 +123,19 @@ def __test_strategy_default_barstate_isnew_on_every_live_bar__(script_path, modu
     historical = [_make_ohlcv(0, 100.0)]
     live = [
         # First live bar: intra-bar ticks then close
-        _make_bar_update(60, is_closed=False, close=101.0),
-        _make_bar_update(60, is_closed=True, close=102.0),
+        _make_ohlcv(60, is_closed=False, close=101.0),
+        _make_ohlcv(60, is_closed=True, close=102.0),
         # Second live bar: direct close (no intra-bar)
-        _make_bar_update(120, is_closed=True, close=103.0),
+        _make_ohlcv(120, is_closed=True, close=103.0),
         # Third live bar: with intra-bar ticks
-        _make_bar_update(180, is_closed=False, close=104.0),
-        _make_bar_update(180, is_closed=False, close=104.5),
-        _make_bar_update(180, is_closed=True, close=105.0),
+        _make_ohlcv(180, is_closed=False, close=104.0),
+        _make_ohlcv(180, is_closed=False, close=104.5),
+        _make_ohlcv(180, is_closed=True, close=105.0),
     ]
 
     runner = _create_live_runner(
         script_path, module_key, syminfo,
-        itertools.chain(historical, live),
+        _chain_live(historical, live),
     )
 
     results = []

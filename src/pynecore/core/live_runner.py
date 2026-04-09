@@ -2,7 +2,7 @@
 Async/sync bridge for live data streaming.
 
 Runs a LiveProviderPlugin's async watch_ohlcv() in a background thread
-and yields BarUpdate objects to the synchronous ScriptRunner via queue.Queue.
+and yields OHLCV objects to the synchronous ScriptRunner via queue.Queue.
 """
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ import threading
 from collections.abc import Iterator
 from queue import Queue, Empty
 
-from pynecore.core.plugin.live_provider import LiveProviderPlugin, BarUpdate
+from pynecore.types.ohlcv import OHLCV
+from pynecore.core.plugin.live_provider import LiveProviderPlugin
 
 __all__ = ['live_ohlcv_generator']
 
@@ -32,11 +33,11 @@ def live_ohlcv_generator(
         *,
         last_historical_timestamp: int | None = None,
         shutdown_timeout: float = 120.0,
-) -> Iterator[BarUpdate]:
+) -> Iterator[OHLCV]:
     """
-    Bridge async watch_ohlcv() to a sync Iterator[BarUpdate].
+    Bridge async watch_ohlcv() to a sync Iterator[OHLCV].
 
-    Spawns a background thread running asyncio, collects BarUpdate objects
+    Spawns a background thread running asyncio, collects OHLCV objects
     via queue.Queue, and yields them including intra-bar updates.
 
     :param provider: A LiveProviderPlugin instance (already configured).
@@ -44,9 +45,9 @@ def live_ohlcv_generator(
     :param timeframe: Timeframe in TradingView format.
     :param last_historical_timestamp: Timestamp of the last historical bar to avoid duplicates.
     :param shutdown_timeout: Max seconds to wait for graceful shutdown. 0 = wait forever.
-    :return: Iterator yielding BarUpdate objects (both closed and intra-bar).
+    :return: Iterator yielding OHLCV objects (both closed and intra-bar).
     """
-    bar_queue: Queue[BarUpdate | BaseException] = Queue(maxsize=100)
+    bar_queue: Queue[OHLCV | BaseException] = Queue(maxsize=100)
     stop_event = threading.Event()
 
     async def _graceful_shutdown():
@@ -97,7 +98,7 @@ def live_ohlcv_generator(
 
                     # Filter duplicates from the historical phase
                     if last_historical_timestamp is not None:
-                        ts = bar_update.ohlcv.timestamp
+                        ts = bar_update.timestamp
                         if bar_update.is_closed and ts <= last_historical_timestamp:
                             continue
                         if not bar_update.is_closed and ts < last_historical_timestamp:

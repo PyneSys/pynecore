@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, TypeAlias, cast
 from pathlib import Path
 from enum import Enum
 from datetime import datetime, timedelta, UTC
@@ -45,7 +45,7 @@ else:
             _cls = _ep.load()
             if isinstance(_cls, type) and issubclass(_cls, ProviderPlugin):
                 _provider_names.append(_name)
-        except Exception:
+        except Exception:  # noqa
             pass
     AvailableProvidersEnum = Enum('Provider', {
         name.upper(): name.lower() for name in sorted(_provider_names)
@@ -137,15 +137,16 @@ def download(
     Download historical OHLCV data
     """
     # Load provider class via plugin system
-    provider_class = load_plugin(provider.value)
+    provider_class = cast(type[ProviderPlugin], load_plugin(provider.value))
 
     try:
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:
             from ...core.config import ensure_config
             config = None
-            if hasattr(provider_class, 'Config') and provider_class.Config is not None:
-                config = ensure_config(provider_class.Config,
+            config_cls: type | None = getattr(provider_class, 'Config', None)
+            if config_cls is not None:
+                config = ensure_config(config_cls,
                                        app_state.config_dir / 'plugins' / f'{provider.value}.toml')
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
                 progress.add_task(description="Fetching market data...", total=None)
@@ -163,11 +164,12 @@ def download(
         # Create provider instance with config
         from ...core.config import ensure_config
         config = None
-        if hasattr(provider_class, 'Config') and provider_class.Config is not None:
-            config = ensure_config(provider_class.Config,
+        config_cls: type | None = getattr(provider_class, 'Config', None)
+        if config_cls is not None:
+            config = ensure_config(config_cls,
                                    app_state.config_dir / 'plugins' / f'{provider.value}.toml')
         provider_instance: ProviderPlugin = provider_class(symbol=symbol, timeframe=timeframe,
-                                                     ohlv_dir=app_state.data_dir, config=config)
+                                                           ohlv_dir=app_state.data_dir, config=config)
 
         # Download symbol info if not exists
         if force_save_info or not provider_instance.is_symbol_info_exists():
@@ -195,7 +197,8 @@ def download(
                 ohlcv_writer.truncate()
 
             # If the start date is "continue" (default), we resume from the last download
-            resolved_from: datetime | None = time_from
+            resolved_from: datetime = time_from
+            fetch_all = False
             if time_from == "continue":
                 end_ts = ohlcv_writer.end_timestamp
                 interval = ohlcv_writer.interval
@@ -204,26 +207,26 @@ def download(
                     # We need to add one interval to the start date to avoid downloading the same data
                     resolved_from += timedelta(seconds=interval)
                 elif getattr(provider_class, 'fetch_all_by_default', False):
-                    resolved_from = None
+                    resolved_from = datetime.fromtimestamp(0, UTC)
+                    fetch_all = True
                 else:  # No data, download one year as default
                     resolved_from = datetime.now(UTC) - timedelta(days=365)
 
             # We need to remove timezone info
-            if resolved_from is not None:
-                resolved_from = resolved_from.replace(tzinfo=None)
+            resolved_from = resolved_from.replace(tzinfo=None)
             time_to = time_to.replace(tzinfo=None)
 
             # We cannot download data from the future otherwise it would take very long
             if time_to > datetime.now(UTC).replace(tzinfo=None):
                 time_to = datetime.now(UTC).replace(tzinfo=None)
 
-            # Check time range (skip for TV provider when resolved_from is None)
-            if resolved_from is not None and time_to < resolved_from:
+            # Check time range (skip for fetch_all providers)
+            if not fetch_all and time_to < resolved_from:
                 secho("Error: End date (to) must be greater than start date (from)!", err=True, fg=colors.RED)
                 raise Exit(1)
 
             # If the start date is before the start of the existing file, we truncate the file
-            if ohlcv_writer.start_timestamp and resolved_from is not None:
+            if ohlcv_writer.start_timestamp and not fetch_all:
                 if resolved_from < ohlcv_writer.start_datetime.replace(tzinfo=None):
                     secho(f"The start date (from: {resolved_from}) is before the start of the "
                           f"existing file ({ohlcv_writer.start_datetime.replace(tzinfo=None)}).\n"
@@ -234,8 +237,8 @@ def download(
                     ohlcv_writer.seek(0)
                     ohlcv_writer.truncate()
 
-            # TV provider with no resolved_from: use spinner-only progress (no time-based progress bar)
-            if resolved_from is None:
+            # fetch_all provider: use spinner-only progress (no time-based progress bar)
+            if fetch_all:
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
                         TextColumn("{task.description}"),
@@ -245,17 +248,15 @@ def download(
                         description="Downloading all available OHLCV data...",
                         total=None,
                     )
-                    # Start downloading (no progress callback - TV provider shows its own progress)
                     provider_instance.download_ohlcv(resolved_from, time_to, on_progress=None, limit=chunk_size)
             else:
-                start_from = resolved_from  # narrowed to datetime
-                total_seconds = int((time_to - start_from).total_seconds())
+                total_seconds = int((time_to - resolved_from).total_seconds())
 
                 # Get OHLCV data
                 with Progress(
                         SpinnerColumn(finished_text="[green]✓"),
                         TextColumn("{task.description}"),
-                        DateColumn(start_from),
+                        DateColumn(resolved_from),
                         BarColumn(),
                         TimeElapsedColumn(),
                         "/",
@@ -268,11 +269,11 @@ def download(
 
                     def cb_progress(current_time: datetime):
                         """ Callback to update progress """
-                        elapsed_seconds = int((current_time - start_from).total_seconds())
+                        elapsed_seconds = int((current_time - resolved_from).total_seconds())
                         progress.update(task, completed=elapsed_seconds)
 
                     # Start downloading
-                    provider_instance.download_ohlcv(start_from, time_to, on_progress=cb_progress, limit=chunk_size)
+                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress, limit=chunk_size)
 
     except (ImportError, ValueError) as e:
         secho(str(e), err=True, fg=colors.RED)

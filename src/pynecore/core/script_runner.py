@@ -8,18 +8,23 @@ from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
+from pynecore.core.var_snapshot import VarSnapshot
 
 from pynecore.types import script_type
 
 if TYPE_CHECKING:
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
-    from pynecore.lib.strategy import Trade  # noqa
+    from pynecore.lib.strategy import Trade, Position  # noqa
 
 __all__ = [
     'import_script',
     'ScriptRunner',
+    'LIVE_TRANSITION',
 ]
+
+LIVE_TRANSITION = OHLCV(timestamp=-1, open=-1, high=-1, low=-1, close=-1, volume=-1)
+"""Sentinel inserted between historical and live OHLCV data in the iterator."""
 
 
 def import_script(script_path: Path) -> ModuleType:
@@ -249,16 +254,13 @@ class ScriptRunner:
 
         self.script: script = self.script_module.main.script
 
-        # noinspection PyProtectedMember
-        from ..lib import _parse_timezone
-
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
         self.last_bar_index = last_bar_index
         self.bar_index = 0
 
-        self.tz = _parse_timezone(syminfo.timezone)
+        self.tz = lib._parse_timezone(syminfo.timezone)
 
         # Initialize tracking variables for statistics
         self.equity_curve: list[float] = []
@@ -512,20 +514,19 @@ class ScriptRunner:
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
             # Initialize calc_on_order_fills snapshot (for COOF or live mode)
-            var_snapshot = None
+            var_snapshot: VarSnapshot | None = None
             is_live = lib._is_live
             # Indicators always run on every tick; strategies only if calc_on_every_tick
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
             if is_strat and self.script.calc_on_order_fills:
-                from .var_snapshot import VarSnapshot
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
             elif is_live and run_on_every_tick:
-                from .var_snapshot import VarSnapshot
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
 
             # --- Helper closures for DRY ---
             registered_libraries = script._registered_libraries
 
+            # noinspection PyProtectedMember
             def _run_libs_and_main():
                 lib._lib_semaphore = True
                 for _title, main_func in registered_libraries:
@@ -536,6 +537,7 @@ class ScriptRunner:
                     assert isinstance(r, dict), "The 'main' function must return a dictionary!"
                     lib._plot_data.update(r)
 
+            # noinspection PyProtectedMember
             def _write_bar_output(bar_candle):
                 nonlocal trade_num
                 if self.plot_writer and lib._plot_data:
@@ -569,28 +571,30 @@ class ScriptRunner:
                             f"{t.max_drawdown_percent:.2f}",
                         )
 
+            # noinspection PyProtectedMember
             def _coof_loop():
                 """COOF re-execution loop: process orders, re-execute on fills."""
                 old_fills = position._fill_counter
                 position.process_orders()
                 new_fills = position._fill_counter
                 while new_fills > old_fills:
-                    if var_snapshot.has_vars:
-                        var_snapshot.restore()
+                    if var_snapshot.has_vars:  # type: ignore
+                        var_snapshot.restore()  # type: ignore
                     function_isolation.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
                     position.process_orders()
                     new_fills = position._fill_counter
 
+            # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
                 """COOF re-execution loop with magnified order processing."""
                 old_fills = position._fill_counter
                 position.process_orders_magnified(sub_bars_list, aggregated_candle)
                 new_fills = position._fill_counter
                 while new_fills > old_fills:
-                    if var_snapshot.has_vars:
-                        var_snapshot.restore()
+                    if var_snapshot.has_vars:  # type: ignore
+                        var_snapshot.restore()  # type: ignore
                     function_isolation.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
@@ -598,20 +602,14 @@ class ScriptRunner:
                     new_fills = position._fill_counter
 
             # --- Peek-ahead pattern: historical bars ---
-            from pynecore.core.plugin.live_provider import BarUpdate
-
+            # LIVE_TRANSITION doubles as end-of-data sentinel → next() always returns OHLCV
             ohlcv_iterator = iter(self.ohlcv_iter)
-            next_item = next(ohlcv_iterator, None)
-            first_live_update = None  # Will hold the first BarUpdate if we transition
+            next_item = next(ohlcv_iterator, LIVE_TRANSITION)
+            first_live_update: OHLCV | None = None
 
-            while next_item is not None:
-                # If a BarUpdate arrives, we transition to live mode
-                if isinstance(next_item, BarUpdate):
-                    first_live_update = next_item
-                    break
-
+            while next_item is not LIVE_TRANSITION:
                 candle = next_item
-                next_item = next(ohlcv_iterator, None)
+                next_item = next(ohlcv_iterator, LIVE_TRANSITION)
 
                 # Update syminfo lib properties if needed
                 if self.update_syminfo_every_run:
@@ -621,11 +619,9 @@ class ScriptRunner:
                 # Last bar detection
                 if is_live:
                     barstate.islast = False
-                    barstate.islastconfirmedhistory = (
-                        next_item is None or isinstance(next_item, BarUpdate)
-                    )
+                    barstate.islastconfirmedhistory = (next_item is LIVE_TRANSITION)
                 else:
-                    barstate.islast = (next_item is None)
+                    barstate.islast = (next_item is LIVE_TRANSITION)
 
                 # Update lib properties
                 _set_lib_properties(candle, self.bar_index, self.tz, lib)
@@ -675,6 +671,10 @@ class ScriptRunner:
                 barstate.isfirst = False
 
             # --- Live mode: transition and intra-bar loop ---
+            # After the historical loop, if LIVE_TRANSITION was hit, get the first live bar
+            if next_item is LIVE_TRANSITION and is_live:
+                first_live_update = next(ohlcv_iterator, None)
+
             if first_live_update is not None:
                 import itertools
 
@@ -695,10 +695,7 @@ class ScriptRunner:
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
-                    if not isinstance(bar_update, BarUpdate):
-                        continue
-
-                    candle = bar_update.ohlcv
+                    candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
 
                     barstate.islast = True
@@ -927,9 +924,8 @@ class ScriptRunner:
         trade_num = 0
 
         # Initialize calc_on_order_fills snapshot for magnified path
-        var_snapshot = None
+        var_snapshot: VarSnapshot | None = None
         if is_strat and self.script.calc_on_order_fills:
-            from .var_snapshot import VarSnapshot
             var_snapshot = VarSnapshot(self.script_module, script_mod._registered_libraries)
 
         for window in magnifier:
@@ -1120,7 +1116,10 @@ class ScriptRunner:
 
     def _write_live_strategy_stats(self, position):
         """Rewrite strategy stats file with current state (live mode, after each bar)."""
+        if self.strat_writer is None:
+            return
         from .strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
+        # noinspection PyBroadException
         try:
             self.strat_writer.open()
             stats = calculate_strategy_statistics(
@@ -1131,6 +1130,7 @@ class ScriptRunner:
             write_strategy_statistics_csv(stats, self.strat_writer)
             self.strat_writer.close()
         except Exception:
+            # noinspection PyBroadException
             try:
                 self.strat_writer.close()
             except Exception:

@@ -9,3 +9,4 @@ class OHLCV(NamedTuple):
     close: float
     volume: float
     extra_fields: dict[str, Any] | None = None
+    is_closed: bool = True

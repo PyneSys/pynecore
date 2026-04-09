@@ -1,23 +1,11 @@
 from __future__ import annotations
 
 from abc import abstractmethod, ABCMeta
-from dataclasses import dataclass
 
 from pynecore.types.ohlcv import OHLCV
 
 from . import ConfigT
 from .provider import ProviderPlugin
-
-
-@dataclass
-class BarUpdate:
-    """A single bar update from a live data source."""
-
-    ohlcv: OHLCV
-    """The OHLCV data for this update."""
-
-    is_closed: bool
-    """True if the bar is final (closed), False for intra-bar updates."""
 
 
 class LiveProviderPlugin(ProviderPlugin[ConfigT], metaclass=ABCMeta):
@@ -56,7 +44,7 @@ class LiveProviderPlugin(ProviderPlugin[ConfigT], metaclass=ABCMeta):
     # --- Data streaming ---
 
     @abstractmethod
-    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
         """
         Wait for and return the next OHLCV update.
 
@@ -65,7 +53,7 @@ class LiveProviderPlugin(ProviderPlugin[ConfigT], metaclass=ABCMeta):
 
         :param symbol: The symbol in provider-specific format.
         :param timeframe: Timeframe in TradingView format (e.g. ``"1D"``, ``"1"``, ``"4H"``).
-        :return: A :class:`BarUpdate` with the OHLCV data and closed/open status.
+        :return: An :class:`OHLCV` with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
 
     # --- Reconnection hooks (override for custom behavior) ---
@@ -78,6 +66,7 @@ class LiveProviderPlugin(ProviderPlugin[ConfigT], metaclass=ABCMeta):
 
     # --- Shutdown hooks ---
 
+    # noinspection PyMethodMayBeStatic
     async def can_shutdown(self) -> bool:
         """
         Whether the provider is ready to shut down.

@@ -5,23 +5,18 @@ import asyncio
 import time
 
 from pynecore.core.live_runner import live_ohlcv_generator
-from pynecore.core.plugin.live_provider import BarUpdate
 from pynecore.types.ohlcv import OHLCV
 
 
-def _make_ohlcv(timestamp: int, close: float = 100.0) -> OHLCV:
+def _make_ohlcv(timestamp: int, close: float = 100.0, is_closed: bool = True) -> OHLCV:
     return OHLCV(timestamp=timestamp, open=close, high=close + 1,
-                 low=close - 1, close=close, volume=1000.0)
-
-
-def _make_bar_update(timestamp: int, is_closed: bool = True, close: float = 100.0) -> BarUpdate:
-    return BarUpdate(ohlcv=_make_ohlcv(timestamp, close), is_closed=is_closed)
+                 low=close - 1, close=close, volume=1000.0, is_closed=is_closed)
 
 
 class MockLiveProvider:
     """Mock LiveProviderPlugin for testing the bridge."""
 
-    def __init__(self, bar_updates: list[BarUpdate]):
+    def __init__(self, bar_updates: list[OHLCV]):
         self._bar_updates = bar_updates
         self._index = 0
         self._connected = False
@@ -38,7 +33,7 @@ class MockLiveProvider:
     def is_connected(self):
         return self._connected
 
-    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
         if self._index >= len(self._bar_updates):
             raise asyncio.CancelledError()
 
@@ -60,10 +55,10 @@ class MockLiveProvider:
 def __test_live_generator_yields_all_bar_updates__():
     """live_ohlcv_generator yields both intra-bar and closed bar updates"""
     updates = [
-        _make_bar_update(1000, is_closed=False, close=100.0),
-        _make_bar_update(1000, is_closed=True, close=101.0),
-        _make_bar_update(2000, is_closed=False, close=102.0),
-        _make_bar_update(2000, is_closed=True, close=103.0),
+        _make_ohlcv(1000, is_closed=False, close=100.0),
+        _make_ohlcv(1000, is_closed=True, close=101.0),
+        _make_ohlcv(2000, is_closed=False, close=102.0),
+        _make_ohlcv(2000, is_closed=True, close=103.0),
     ]
 
     provider = MockLiveProvider(updates)
@@ -71,9 +66,9 @@ def __test_live_generator_yields_all_bar_updates__():
 
     assert len(bars) == 4
     assert not bars[0].is_closed
-    assert bars[0].ohlcv.close == 100.0
+    assert bars[0].close == 100.0
     assert bars[1].is_closed
-    assert bars[1].ohlcv.close == 101.0
+    assert bars[1].close == 101.0
     assert not bars[2].is_closed
     assert bars[3].is_closed
 
@@ -81,9 +76,9 @@ def __test_live_generator_yields_all_bar_updates__():
 def __test_live_generator_filters_old_bars__():
     """live_ohlcv_generator skips bars older than last_historical_timestamp"""
     updates = [
-        _make_bar_update(1000, is_closed=True, close=100.0),
-        _make_bar_update(2000, is_closed=True, close=200.0),
-        _make_bar_update(3000, is_closed=True, close=300.0),
+        _make_ohlcv(1000, is_closed=True, close=100.0),
+        _make_ohlcv(2000, is_closed=True, close=200.0),
+        _make_ohlcv(3000, is_closed=True, close=300.0),
     ]
 
     provider = MockLiveProvider(updates)
@@ -91,28 +86,28 @@ def __test_live_generator_filters_old_bars__():
                                      last_historical_timestamp=2000))
 
     assert len(bars) == 1
-    assert bars[0].ohlcv.timestamp == 3000
-    assert bars[0].ohlcv.close == 300.0
+    assert bars[0].timestamp == 3000
+    assert bars[0].close == 300.0
 
 
-def __test_live_generator_yields_bar_update_objects__():
-    """live_ohlcv_generator yields BarUpdate objects (not raw OHLCV)"""
+def __test_live_generator_yields_ohlcv_objects__():
+    """live_ohlcv_generator yields OHLCV objects directly"""
     updates = [
-        _make_bar_update(1000, is_closed=True),
+        _make_ohlcv(1000, is_closed=True),
     ]
 
     provider = MockLiveProvider(updates)
     bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
 
     assert len(bars) == 1
-    assert isinstance(bars[0], BarUpdate)
-    assert isinstance(bars[0].ohlcv, OHLCV)
+    assert isinstance(bars[0], OHLCV)
+    assert bars[0].is_closed is True
 
 
 def __test_live_generator_connects_and_disconnects__():
     """live_ohlcv_generator calls connect on start and disconnect on finish"""
     updates = [
-        _make_bar_update(1000, is_closed=True),
+        _make_ohlcv(1000, is_closed=True),
     ]
 
     provider = MockLiveProvider(updates)
@@ -131,7 +126,7 @@ def __test_live_generator_empty_stream__():
 class DelayedShutdownProvider(MockLiveProvider):
     """Provider that delays shutdown for a number of can_shutdown() calls."""
 
-    def __init__(self, bar_updates: list[BarUpdate], deny_count: int = 2):
+    def __init__(self, bar_updates: list[OHLCV], deny_count: int = 2):
         super().__init__(bar_updates)
         self._deny_count = deny_count
         self._shutdown_calls = 0
@@ -145,7 +140,7 @@ class DelayedShutdownProvider(MockLiveProvider):
 
 def __test_graceful_shutdown_waits_for_can_shutdown__():
     """Shutdown waits until can_shutdown() returns True"""
-    updates = [_make_bar_update(1000, is_closed=True)]
+    updates = [_make_ohlcv(1000, is_closed=True)]
     provider = DelayedShutdownProvider(updates, deny_count=2)
 
     list(live_ohlcv_generator(provider, "BTC/USDT", "1D", shutdown_timeout=10.0))
@@ -166,7 +161,7 @@ def __test_graceful_shutdown_timeout_forces_disconnect__():
             self._shutdown_calls += 1
             return False
 
-    updates = [_make_bar_update(1000, is_closed=True)]
+    updates = [_make_ohlcv(1000, is_closed=True)]
     provider = NeverReadyProvider(updates)
 
     start = time.monotonic()
@@ -180,7 +175,7 @@ def __test_graceful_shutdown_timeout_forces_disconnect__():
 
 def __test_graceful_shutdown_zero_timeout_waits_until_ready__():
     """shutdown_timeout=0 waits indefinitely until can_shutdown() returns True"""
-    updates = [_make_bar_update(1000, is_closed=True)]
+    updates = [_make_ohlcv(1000, is_closed=True)]
     provider = DelayedShutdownProvider(updates, deny_count=3)
 
     list(live_ohlcv_generator(provider, "BTC/USDT", "1D", shutdown_timeout=0))

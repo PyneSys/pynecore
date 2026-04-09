@@ -156,7 +156,7 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
                 self.ohlcv_file.write(candle)
 
     @abstractmethod
-    def download_ohlcv(self, time_from: datetime | None, time_to: datetime | None,
+    def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
         """
@@ -164,8 +164,8 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
 
         Use :meth:`save_ohlcv_data` to write records to the data file.
 
-        :param time_from: The start time (None to fetch all available data).
-        :param time_to: The end time (None to fetch up to the latest).
+        :param time_from: The start time. Use ``datetime.fromtimestamp(0)`` to fetch all available data.
+        :param time_to: The end time.
         :param on_progress: Optional progress callback.
         :param limit: Override the automatic chunk size (number of bars per API request).
         """

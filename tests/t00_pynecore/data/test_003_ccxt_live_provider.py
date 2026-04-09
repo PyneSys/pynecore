@@ -10,7 +10,6 @@ import logging
 import pytest
 
 from pynecore.providers.ccxt import CCXTProvider
-from pynecore.core.plugin.live_provider import BarUpdate
 from pynecore.types.ohlcv import OHLCV
 
 logging.getLogger("ccxt").setLevel(logging.WARNING)
@@ -58,16 +57,13 @@ def __test_ccxt_live_watch_ohlcv__():
     async def _run():
         await provider.connect()
         try:
-            bar_update = await asyncio.wait_for(
+            ohlcv = await asyncio.wait_for(
                 provider.watch_ohlcv("BTC/USDT:USDT", "1"),
                 timeout=30.0,
             )
 
-            assert isinstance(bar_update, BarUpdate)
-            assert isinstance(bar_update.ohlcv, OHLCV)
-            assert isinstance(bar_update.is_closed, bool)
-
-            ohlcv = bar_update.ohlcv
+            assert isinstance(ohlcv, OHLCV)
+            assert isinstance(ohlcv.is_closed, bool)
             assert ohlcv.timestamp > 0
             assert ohlcv.open > 0
             assert ohlcv.high >= ohlcv.low
@@ -94,16 +90,16 @@ def __test_ccxt_live_multiple_updates__():
         try:
             updates = []
             for _ in range(3):
-                bar_update = await asyncio.wait_for(
+                ohlcv = await asyncio.wait_for(
                     provider.watch_ohlcv("BTC/USDT:USDT", "1"),
                     timeout=30.0,
                 )
-                updates.append(bar_update)
+                updates.append(ohlcv)
 
             assert len(updates) == 3
             for u in updates:
-                assert isinstance(u, BarUpdate)
-                assert u.ohlcv.timestamp > 0
+                assert isinstance(u, OHLCV)
+                assert u.timestamp > 0
         finally:
             await provider.disconnect()
 
@@ -137,13 +133,12 @@ def __test_ccxt_live_generator_integration__():
     )
 
     received = []
-    for update in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
-                                        shutdown_timeout=5.0):
-        received.append(update)
-        assert isinstance(update, BarUpdate)
-        assert isinstance(update.ohlcv, OHLCV)
-        assert update.ohlcv.timestamp > 0
-        assert update.ohlcv.close > 0
+    for ohlcv in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
+                                       shutdown_timeout=5.0):
+        received.append(ohlcv)
+        assert isinstance(ohlcv, OHLCV)
+        assert ohlcv.timestamp > 0
+        assert ohlcv.close > 0
         if len(received) >= 1:
             break
 

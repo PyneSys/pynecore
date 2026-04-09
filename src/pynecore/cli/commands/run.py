@@ -75,7 +75,7 @@ def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetim
     """
     if value is None:
         return None
-    value = value.strip()
+    value: str = value.strip()
 
     # Negative number = bar count (only for --from in provider mode)
     if allow_bars and value.startswith('-'):
@@ -148,12 +148,14 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         tf_seconds = in_seconds(ps.timeframe)
         time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * bar_count)
     else:
+        assert isinstance(time_from_value, datetime)
         time_from_dt = time_from_value
 
     # Load config
     config = None
-    if hasattr(provider_class, 'Config') and provider_class.Config is not None:
-        config = ensure_config(provider_class.Config,
+    config_cls: type | None = getattr(provider_class, 'Config', None)
+    if config_cls is not None:
+        config = ensure_config(config_cls,
                                app_state.config_dir / 'plugins' / f'{ps.provider}.toml')
 
     # Create provider instance
@@ -195,6 +197,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
 
             provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
 
+    assert provider_instance.ohlcv_path is not None
     return _ProviderData(
         ohlcv_path=provider_instance.ohlcv_path,
         syminfo=syminfo,
@@ -462,6 +465,7 @@ def run(
         if not time_to_dt:
             time_to_dt = reader.end_datetime
 
+        assert isinstance(time_from_dt, datetime) and isinstance(time_to_dt, datetime)
         time_from_ts = int(time_from_dt.timestamp())
         time_to_ts = int(time_to_dt.timestamp())
 
@@ -491,6 +495,8 @@ def run(
                       err=True, fg=colors.RED)
                 raise Exit(1)
 
+            from pynecore.core.script_runner import LIVE_TRANSITION
+
             live_iter = live_ohlcv_generator(
                 provider=provider_data.provider_instance,
                 symbol=provider_data.parsed_string.symbol,
@@ -498,7 +504,7 @@ def run(
                 last_historical_timestamp=time_to_ts,
                 shutdown_timeout=shutdown_timeout,
             )
-            ohlcv_iter = itertools.chain(ohlcv_iter, live_iter)
+            ohlcv_iter = itertools.chain(ohlcv_iter, [LIVE_TRANSITION], live_iter)
             size = 0
 
         # Parse security data mappings
