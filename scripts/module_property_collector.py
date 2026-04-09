@@ -68,6 +68,20 @@ class ModulePropertyCollector:
             "type": "property",
         }
 
+        # Promote submodule self-named properties to parent module.
+        # E.g., lib.strategy.opentrades has property "opentrades" →
+        #   add "opentrades" as property under lib.strategy too,
+        #   so that strategy.opentrades is transformed to strategy.opentrades()
+        for module_path, attrs in list(self.module_info.items()):
+            parts = module_path.split('.')
+            if len(parts) >= 3:  # lib.X.Y or deeper
+                submodule_name = parts[-1]
+                parent_path = '.'.join(parts[:-1])
+                if (submodule_name in attrs
+                        and attrs[submodule_name].get("type") == "property"
+                        and parent_path in self.module_info):
+                    self.module_info[parent_path][submodule_name] = attrs[submodule_name]
+
         # Save results
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.json_path, 'w') as f:

@@ -12,6 +12,9 @@
     "dayofweek": {
       "type": "property"
     },
+    "extra_fields": {
+      "type": "variable"
+    },
     "high": {
       "type": "variable"
     },
@@ -58,6 +61,9 @@
       "type": "property"
     },
     "time_close": {
+      "type": "property"
+    },
+    "timenow": {
       "type": "property"
     },
     "volume": {
@@ -261,6 +267,46 @@
       "type": "variable"
     }
   },
+  "lib.dividends": {
+    "future_amount": {
+      "type": "variable"
+    },
+    "future_ex_date": {
+      "type": "variable"
+    },
+    "future_pay_date": {
+      "type": "variable"
+    },
+    "gross": {
+      "type": "variable"
+    },
+    "net": {
+      "type": "variable"
+    }
+  },
+  "lib.earnings": {
+    "actual": {
+      "type": "variable"
+    },
+    "estimate": {
+      "type": "variable"
+    },
+    "future_eps": {
+      "type": "variable"
+    },
+    "future_period_end_time": {
+      "type": "variable"
+    },
+    "future_revenue": {
+      "type": "variable"
+    },
+    "future_time": {
+      "type": "variable"
+    },
+    "standardized": {
+      "type": "variable"
+    }
+  },
   "lib.extend": {
     "both": {
       "type": "variable"
@@ -283,6 +329,7 @@
       "type": "variable"
     }
   },
+  "lib.footprint": {},
   "lib.format": {
     "inherit": {
       "type": "variable"
@@ -437,12 +484,36 @@
       "type": "variable"
     }
   },
-  "lib.matrix": {},
+  "lib.matrix": {
+    "all": {
+      "type": "property"
+    }
+  },
   "lib.order": {
     "ascending": {
       "type": "variable"
     },
     "descending": {
+      "type": "variable"
+    }
+  },
+  "lib.pivotpointtype": {
+    "camarilla": {
+      "type": "variable"
+    },
+    "classic": {
+      "type": "variable"
+    },
+    "dm": {
+      "type": "variable"
+    },
+    "fibonacci": {
+      "type": "variable"
+    },
+    "traditional": {
+      "type": "variable"
+    },
+    "woodie": {
       "type": "variable"
     }
   },
@@ -499,6 +570,7 @@
       "type": "variable"
     }
   },
+  "lib.request": {},
   "lib.runtime": {},
   "lib.scale": {
     "left": {
@@ -602,6 +674,9 @@
     "cash": {
       "type": "variable"
     },
+    "closedtrades": {
+      "type": "property"
+    },
     "equity": {
       "type": "property"
     },
@@ -638,6 +713,9 @@
     "openprofit": {
       "type": "property"
     },
+    "opentrades": {
+      "type": "property"
+    },
     "percent_of_equity": {
       "type": "variable"
     },
@@ -649,6 +727,9 @@
     },
     "short": {
       "type": "variable"
+    },
+    "wintrades": {
+      "type": "property"
     }
   },
   "lib.strategy.closedtrades": {
@@ -743,6 +824,9 @@
       "type": "variable"
     },
     "target_price_date": {
+      "type": "variable"
+    },
+    "target_price_estimates": {
       "type": "variable"
     },
     "target_price_high": {
@@ -868,6 +952,7 @@
       "type": "property"
     }
   },
+  "lib.volume_row": {},
   "lib.xloc": {
     "bar_index": {
       "type": "variable"
