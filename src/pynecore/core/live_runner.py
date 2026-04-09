@@ -114,6 +114,10 @@ def live_ohlcv_generator(
                             pass
 
                 except asyncio.TimeoutError:
+                    if not provider.is_connected:
+                        raise ConnectionError(
+                            "Provider reports disconnected state"
+                        )
                     continue
                 except asyncio.CancelledError:
                     break
