@@ -1,5 +1,7 @@
+import logging
 from pathlib import Path
 
+import click
 import typer
 
 from ..app import app, app_state
@@ -10,6 +12,7 @@ from . import run, data, compile, benchmark, debug, plugin
 
 __all__ = ['run', 'data', 'compile', 'benchmark', 'debug', 'plugin']
 
+logger = logging.getLogger(__name__)
 
 
 @app.callback()
@@ -234,8 +237,8 @@ def main(
                 plugin_cls = ep.load()
                 if hasattr(plugin_cls, 'Config') and plugin_cls.Config is not None:
                     ensure_config(plugin_cls.Config, config_path)
-            except Exception:
-                pass  # Don't crash CLI if a plugin is broken
+            except Exception as e:
+                logger.warning("Failed to load plugin config '%s': %s", name, e)
 
     # Create api.toml file for PyneSys API (if not exists)
     api_file = config_dir / 'api.toml'
@@ -290,7 +293,9 @@ def _register_cli_plugins():
                 if not params:
                     continue
 
-                click_cmd = typer.main.get_command(app).commands.get(cmd_name)
+                group = typer.main.get_command(app)
+                assert isinstance(group, click.Group)
+                click_cmd = group.commands.get(cmd_name)
                 if not isinstance(click_cmd, PluggableCommand):
                     continue
 
@@ -302,8 +307,8 @@ def _register_cli_plugins():
                             fg="yellow", err=True,
                         )
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to load CLI plugin '%s': %s", name, e)
 
 
 _register_cli_plugins()

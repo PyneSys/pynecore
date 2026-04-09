@@ -153,7 +153,8 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                              "(or simple exchange, if you want to list symbols)")
 
         self.symbol = symbol
-        exchange_name = xchg.lower()
+        self._exchange_name = xchg.lower()
+        exchange_name = self._exchange_name
 
         # Build exchange config from the Config dataclass + optional exchange-specific TOML sections
         exchange_config = {}
@@ -187,6 +188,11 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             'adjustForTimeDifference': True,
             **exchange_config
         })
+
+    @override
+    def normalize_symbol(self, symbol: str) -> str:
+        """Strip exchange prefix: ``"binance:BTC/USDT"`` → ``"BTC/USDT"``."""
+        return self.symbol or symbol
 
     @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:

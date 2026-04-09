@@ -11,7 +11,7 @@ import logging
 import time
 import threading
 from collections.abc import Iterator
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
@@ -83,6 +83,7 @@ def live_ohlcv_generator(
     async def _async_loop():
         try:
             await provider.connect()
+            watch_symbol = provider.normalize_symbol(symbol)
             logger.info("Live provider connected: %s %s@%s",
                         type(provider).__name__, symbol, timeframe)
 
@@ -91,7 +92,7 @@ def live_ohlcv_generator(
             while not stop_event.is_set():
                 try:
                     bar_update = await asyncio.wait_for(
-                        provider.watch_ohlcv(symbol, timeframe),
+                        provider.watch_ohlcv(watch_symbol, timeframe),
                         timeout=2.0,
                     )
                     reconnect_attempts = 0
@@ -104,7 +105,13 @@ def live_ohlcv_generator(
                         if not bar_update.is_closed and ts < last_historical_timestamp:
                             continue
 
-                    bar_queue.put(bar_update)
+                    if bar_update.is_closed:
+                        bar_queue.put(bar_update)
+                    else:
+                        try:
+                            bar_queue.put_nowait(bar_update)
+                        except Full:
+                            pass
 
                 except asyncio.TimeoutError:
                     continue
@@ -124,14 +131,27 @@ def live_ohlcv_generator(
                     await provider.on_disconnect()
 
                     delay = provider.reconnect_delay * (2 ** (reconnect_attempts - 1))
-                    await asyncio.sleep(delay)
+                    slept = 0.0
+                    while slept < delay and not stop_event.is_set():
+                        await asyncio.sleep(min(0.5, delay - slept))
+                        slept += 0.5
+                    if stop_event.is_set():
+                        break
+
+                    try:
+                        await provider.disconnect()
+                    except Exception as disc_err:
+                        logger.debug("disconnect() before reconnect raised: %s", disc_err)
 
                     try:
                         await provider.connect()
                         await provider.on_reconnect()
                         logger.info("Reconnected successfully")
                     except Exception as reconn_err:
-                        logger.error("Reconnect failed: %s", reconn_err)
+                        logger.error("Reconnect failed (attempt %d/%d): %s",
+                                     reconnect_attempts,
+                                     provider.max_reconnect_attempts, reconn_err)
+                        continue
 
         except Exception as e:
             bar_queue.put(e)

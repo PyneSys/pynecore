@@ -57,20 +57,20 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         """
 
     @classmethod
-    def get_ohlcv_path(cls, symbol: str, timeframe: str, ohlv_dir: Path,
+    def get_ohlcv_path(cls, symbol: str, timeframe: str, ohlcv_dir: Path,
                        provider_name: str | None = None) -> Path:
         """
         Get the output path of the OHLCV data file.
 
         :param symbol: Symbol name.
         :param timeframe: Timeframe in TradingView format.
-        :param ohlv_dir: Directory to save OHLCV data.
+        :param ohlcv_dir: Directory to save OHLCV data.
         :param provider_name: Override provider name in filename.
         :return: Path to the OHLCV file.
         """
-        return ohlv_dir / (f"{provider_name or cls.__name__.lower().replace('provider', '').replace('plugin', '')}"
-                           f"_{symbol.replace('/', '_').replace(':', '_').upper()}"
-                           f"_{timeframe}.ohlcv")
+        return ohlcv_dir / (f"{provider_name or cls.__name__.lower().replace('provider', '').replace('plugin', '')}"
+                            f"_{symbol.replace('/', '_').replace(':', '_').upper()}"
+                            f"_{timeframe}.ohlcv")
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
                  ohlcv_dir: Path | None = None, config: ConfigT | None = None):
@@ -90,6 +90,24 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
             self.ohlcv_path = None
         self.ohlcv_file = OHLCVWriter(self.ohlcv_path) if self.ohlcv_path else None
         self.config: ConfigT | None = config
+
+    def normalize_symbol(self, symbol: str) -> str:
+        """
+        Normalize a provider-format symbol to the exchange API format.
+
+        Called by the framework before passing ``symbol`` to :meth:`watch_ohlcv`
+        in the live runner. For historical methods (:meth:`download_ohlcv`,
+        :meth:`update_symbol_info`), providers use ``self.symbol`` directly —
+        handle any needed format conversion in ``__init__`` instead.
+
+        Override when the user-configured symbol includes prefixes or formatting
+        that the exchange API cannot accept
+        (e.g. stripping ``"binance:"`` from ``"binance:BTC/USDT"``).
+
+        :param symbol: Symbol as configured by the user.
+        :return: Symbol in the format the exchange API expects.
+        """
+        return symbol
 
     def __enter__(self) -> OHLCVWriter:
         assert self.ohlcv_file is not None

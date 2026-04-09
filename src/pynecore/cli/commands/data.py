@@ -169,7 +169,7 @@ def download(
             config = ensure_config(config_cls,
                                    app_state.config_dir / 'plugins' / f'{provider.value}.toml')
         provider_instance: ProviderPlugin = provider_class(symbol=symbol, timeframe=timeframe,
-                                                           ohlv_dir=app_state.data_dir, config=config)
+                                                           ohlcv_dir=app_state.data_dir, config=config)
 
         # Download symbol info if not exists
         if force_save_info or not provider_instance.is_symbol_info_exists():

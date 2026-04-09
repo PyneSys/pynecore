@@ -161,7 +161,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     # Create provider instance
     provider_instance: ProviderPlugin = provider_class(
         symbol=ps.symbol, timeframe=ps.timeframe,
-        ohlv_dir=app_state.data_dir, config=config
+        ohlcv_dir=app_state.data_dir, config=config
     )
 
     # Fetch symbol info
