@@ -32,7 +32,7 @@ def __test_ccxt_live_connect_disconnect__():
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
         timeframe="1",
-        ohlv_dir=None,
+        ohlcv_dir=None,
     )
 
     async def _run():
@@ -51,7 +51,7 @@ def __test_ccxt_live_watch_ohlcv__():
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
         timeframe="1",
-        ohlv_dir=None,
+        ohlcv_dir=None,
     )
 
     async def _run():
@@ -82,7 +82,7 @@ def __test_ccxt_live_multiple_updates__():
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
         timeframe="1",
-        ohlv_dir=None,
+        ohlcv_dir=None,
     )
 
     async def _run():
@@ -113,7 +113,7 @@ def __test_ccxt_live_can_shutdown_default__():
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
         timeframe="1",
-        ohlv_dir=None,
+        ohlcv_dir=None,
     )
 
     result = asyncio.run(provider.can_shutdown())
@@ -129,12 +129,12 @@ def __test_ccxt_live_generator_integration__():
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
         timeframe="1",
-        ohlv_dir=None,
+        ohlcv_dir=None,
     )
 
     received = []
     for ohlcv in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
-                                       shutdown_timeout=5.0):
+                                      shutdown_timeout=5.0):
         received.append(ohlcv)
         assert isinstance(ohlcv, OHLCV)
         assert ohlcv.timestamp > 0

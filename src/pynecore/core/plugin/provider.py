@@ -73,19 +73,19 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
                            f"_{timeframe}.ohlcv")
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlv_dir: Path | None = None, config: ConfigT | None = None):
+                 ohlcv_dir: Path | None = None, config: ConfigT | None = None):
         """
         :param symbol: The symbol to get data for.
         :param timeframe: The timeframe to get data for in TradingView format.
-        :param ohlv_dir: The directory to save OHLCV data.
+        :param ohlcv_dir: The directory to save OHLCV data.
         :param config: Pre-loaded config dataclass instance.
         """
         self.symbol = symbol
         self.timeframe = timeframe
         self.xchg_timeframe = self.to_exchange_timeframe(timeframe) if timeframe else None
-        if ohlv_dir:
+        if ohlcv_dir:
             assert symbol and timeframe
-            self.ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlv_dir)
+            self.ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
         else:
             self.ohlcv_path = None
         self.ohlcv_file = OHLCVWriter(self.ohlcv_path) if self.ohlcv_path else None

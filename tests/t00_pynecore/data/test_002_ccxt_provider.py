@@ -83,7 +83,6 @@ def __test_ccxt_real_data_download__(tmp_path):
     import os
     import json
     import logging
-    import tomllib
     import tempfile
     from pathlib import Path
     from datetime import datetime, UTC, timedelta
@@ -154,7 +153,7 @@ def __test_ccxt_real_data_download__(tmp_path):
     provider = CCXTProvider(
         symbol=symbol,
         timeframe=timeframe,
-        ohlv_dir=data_dir,
+        ohlcv_dir=data_dir,
         config=config
     )
 
@@ -232,7 +231,7 @@ def __test_ccxt_real_data_download__(tmp_path):
         # We have reference data, compare the downloaded data with it
         # Compare the actual results with the expected data
         # We'll check the first 5 candles as they should be stable for this historical period
-        check_count = min(5, len(candles), len(expected_data))
+        check_count = min(5, len(candles), len(expected_data))  # type: ignore
 
         print(f"Comparing first {check_count} candles with expected data")
         for i in range(check_count):

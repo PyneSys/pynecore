@@ -125,11 +125,11 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @override
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlv_dir: Path | None = None, config: object | None = None):
+                 ohlcv_dir: Path | None = None, config: object | None = None):
         """
         :param symbol: The symbol to get data for (e.g. "binance:BTC/USDT")
         :param timeframe: The timeframe to get data for in TradingView fmt
-        :param ohlv_dir: The directory to save OHLCV data
+        :param ohlcv_dir: The directory to save OHLCV data
         :param config: Pre-loaded CCXTConfig instance
         """
         try:
@@ -137,7 +137,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         except ImportError:
             raise ImportError("CCXT is not installed. Please install it using `pip install ccxt`.")
 
-        super().__init__(symbol=symbol, timeframe=timeframe, ohlv_dir=ohlv_dir, config=config)
+        super().__init__(symbol=symbol, timeframe=timeframe, ohlcv_dir=ohlcv_dir, config=config)
 
         # Check symbol fmt
         try:
