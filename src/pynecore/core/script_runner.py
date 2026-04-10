@@ -33,9 +33,6 @@ def import_script(script_path: Path) -> ModuleType:
     """
     from importlib import import_module
     import re
-    # Import hook only before importing the script, to make import hook being used only for Pyne scripts
-    # (this makes 1st run faster, than if it would be a top-level import)
-    from . import import_hook  # noqa
 
     # Check for @pyne magic doc comment before importing (prevents import errors)
     # Without this user may get strange errors which are very hard to debug
@@ -57,7 +54,8 @@ def import_script(script_path: Path) -> ModuleType:
     # Add script's directory to Python path temporarily
     sys.path.insert(0, str(script_path.parent))
     try:
-        # This will use the import system, including our hook
+        # Import hook is registered at pynecore package import time (see pynecore/__init__.py),
+        # so any subsequent import goes through PyneLoader and AST transformers.
         module = import_module(script_path.stem)
     finally:
         # Remove the directory from path
@@ -139,7 +137,7 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
     lib.syminfo._session_ends = syminfo.session_ends
 
     if syminfo.type == 'crypto':
-        decimals = 6 if syminfo.basecurrency == 'BTC' else 4  # TODO: is it correct?
+        decimals = 6 if syminfo.basecurrency == 'BTC' else 4
         lib.syminfo._size_round_factor = 10 ** decimals
     else:
         lib.syminfo._size_round_factor = 1

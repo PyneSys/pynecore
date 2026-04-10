@@ -21,7 +21,7 @@ from ..core.script import script, input
 from ..types.na import NA
 from ..types import Series, PyneInt
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
-from . import barstate, string, log, math, plot, hline, linefill, alert
+from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
 from . import timeframe as timeframe_module
 from . import session as session_module
 
@@ -54,7 +54,7 @@ __all__ = [
 
     # Module properties
     'dayofmonth', 'dayofweek', 'hour', 'minute', 'month', 'second', 'weekofyear', 'year',
-    'time', 'time_close', 'na',
+    'time', 'time_close', 'timenow', 'na',
 ]
 
 #
@@ -341,22 +341,6 @@ def dayofmonth(time: int | None = None, timezone: str | None = None) -> int:
     :return: The day of the month
     """
     return _get_dt(time, timezone).day
-
-
-# noinspection PyShadowingNames
-@module_property
-def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
-    """
-    Day of the week
-
-    :param time: The time to get the day of the week from, if None the current time is used
-    :param timezone: The timezone of the time, if not specified the exchange timezone is used
-    :return: The day of the week, 1 is Sunday, 2 is Monday, ..., 7 is Saturday
-    """
-    res = _get_dt(time, timezone).weekday() + 2
-    if res == 8:
-        res = 1
-    return res
 
 
 # noinspection PyShadowingNames
