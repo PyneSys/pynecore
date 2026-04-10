@@ -71,10 +71,11 @@ class ModulePropertyCollector:
         # Promote submodule self-named properties to parent module.
         # E.g., lib.strategy.opentrades has property "opentrades" →
         #   add "opentrades" as property under lib.strategy too,
-        #   so that strategy.opentrades is transformed to strategy.opentrades()
+        #   so that strategy.opentrades is transformed to strategy.opentrades().
+        # Also handles lib.dayofweek → lib for single-level submodules.
         for module_path, attrs in list(self.module_info.items()):
             parts = module_path.split('.')
-            if len(parts) >= 3:  # lib.X.Y or deeper
+            if len(parts) >= 2:  # lib.X or deeper
                 submodule_name = parts[-1]
                 parent_path = '.'.join(parts[:-1])
                 if (submodule_name in attrs

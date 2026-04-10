@@ -225,26 +225,8 @@
   },
   "lib.currency": {},
   "lib.dayofweek": {
-    "friday": {
-      "type": "variable"
-    },
-    "monday": {
-      "type": "variable"
-    },
-    "saturday": {
-      "type": "variable"
-    },
-    "sunday": {
-      "type": "variable"
-    },
-    "thursday": {
-      "type": "variable"
-    },
-    "tuesday": {
-      "type": "variable"
-    },
-    "wednesday": {
-      "type": "variable"
+    "dayofweek": {
+      "type": "property"
     }
   },
   "lib.display": {
