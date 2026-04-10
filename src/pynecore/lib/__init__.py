@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from ..types.session import SessionInfo
 
 import sys
+import math as _math
 
 from functools import lru_cache
 from datetime import datetime, UTC
@@ -291,13 +292,20 @@ def fixnan(source: Any) -> Any:
 
 def is_na(source: Any = None) -> bool | NA:
     """
-    Check if the source is NA
+    Check if the source is NA.
+
+    Pine treats inf/-inf/nan floats as "na" for na() predicate purposes,
+    even though they participate in arithmetic/comparisons as normal IEEE-754
+    values. This matches that dual behavior.
     """
     if source is None:
         return NA(None)
     # If the source is a type or GenericAlias (like list[float]), return NA of that type
     if isinstance(source, (type, GenericAlias)) and source is not NA:
         return NA(source)
+    if isinstance(source, float):
+        if _math.isnan(source) or _math.isinf(source):
+            return True
     return isinstance(source, NA) or source is NA
 
 
