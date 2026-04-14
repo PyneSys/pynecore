@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from ..types.na import NA
 from ..lib.strategy import Trade
 from .csv_file import CSVWriter
-from ..lib.strategy import Position
+from ..lib.strategy import PositionBase
 
 
 @dataclass
@@ -185,7 +185,7 @@ class StrategyStatistics:
 
 
 def calculate_strategy_statistics(
-        position: Position,
+        position: PositionBase,
         initial_capital: float,
         equity_curve: list[float] | None = None,
         first_price: float | None = None,

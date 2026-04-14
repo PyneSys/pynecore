@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Literal, overload
 
 import math
+from abc import ABC, abstractmethod
 from datetime import datetime, UTC
 from collections import deque, defaultdict
 from copy import copy
@@ -25,7 +26,7 @@ __all__ = [
     "fixed", "cash", "percent_of_equity",
     "long", "short", 'direction',
 
-    'Trade', 'Order', 'Position',
+    'Trade', 'Order', 'PositionBase', 'SimPosition',
     "cancel", "cancel_all", "close", "close_all", "entry", "exit", "order",
 
     "closedtrades", "opentrades",
@@ -401,12 +402,68 @@ class PriceOrderBook:
         self.order_prices.clear()
 
 
-# noinspection PyProtectedMember,PyShadowingNames,DuplicatedCode
-class Position:
+class PositionBase(ABC):
     """
-    This holds data about positions and trades
+    Abstract base class for position tracking.
 
-    This is the main class for strategies
+    Both backtest simulation (:class:`SimPosition`) and live broker trading
+    (:class:`pynecore.core.broker.position.BrokerPosition`) subclass this.
+    The Pine Script API surface — ``strategy.position_size``,
+    ``strategy.opentrades``, ``strategy.netprofit``, ``strategy.equity``,
+    etc. — reads the attributes declared here, so concrete subclasses MUST
+    initialize all of them in ``__init__``.
+    """
+    __slots__ = ()
+
+    # Attribute surface (declared for documentation and type-checking only —
+    # concrete subclasses declare these in ``__slots__`` and initialize them).
+    size: float
+    sign: float
+    avg_price: PyneFloat
+    netprofit: PyneFloat
+    openprofit: PyneFloat
+    grossprofit: PyneFloat
+    grossloss: PyneFloat
+    open_commission: float
+    eventrades: int
+    wintrades: int
+    losstrades: int
+    max_drawdown: float
+    max_runup: float
+    open_trades: list['Trade']
+    closed_trades: 'deque[Trade]'
+    entry_orders: dict[str | None, 'Order']
+    exit_orders: dict[str | None, 'Order']
+
+    @property
+    def equity(self) -> PyneFloat:
+        """The current equity (initial capital + realized + unrealized P&L)."""
+        return lib._script.initial_capital + self.netprofit + self.openprofit
+
+    @abstractmethod
+    def _add_order(self, order: 'Order') -> None:
+        """Register an order with this position."""
+
+    @abstractmethod
+    def _remove_order(self, order: 'Order') -> None:
+        """Cancel/remove an order from this position."""
+
+    @abstractmethod
+    def _remove_order_by_id(self, order_id: str) -> None:
+        """Remove an order by its id (searches both exit and entry books)."""
+
+
+# noinspection PyProtectedMember,PyShadowingNames,DuplicatedCode
+class SimPosition(PositionBase):
+    """
+    Backtest simulation of position and trade state.
+
+    Reproduces TradingView's strategy simulator faithfully: OHLC-based fill
+    detection, synthetic slippage, margin-call emulation, gap-through logic,
+    OCA reduce/cancel handling, trailing-stop tracking, etc.
+
+    Live broker trading uses :class:`BrokerPosition` instead — exchange fills
+    override all of the simulator logic below.
     """
 
     __slots__ = (
@@ -497,11 +554,6 @@ class Position:
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
         self._fill_counter: int = 0
-
-    @property
-    def equity(self) -> PyneFloat:
-        """ The current equity """
-        return lib._script.initial_capital + self.netprofit + self.openprofit
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
