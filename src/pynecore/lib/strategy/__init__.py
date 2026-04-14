@@ -2056,9 +2056,11 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
 
-    # Creation-time margin check for market entry orders (TradingView behavior)
-    # TV checks _size_round(qty) × (close + slippage) > equity at strategy.entry() call time
-    if limit is None and stop is None:
+    # Creation-time margin check for market entry orders (TradingView backtest behavior).
+    # Skip in broker mode: the exchange enforces margin authoritatively, and the script's
+    # equity view can drift from the exchange (funding, fees, transfers) — making the
+    # local check a source of silent false positives rather than a safety net.
+    if limit is None and stop is None and isinstance(position, SimPosition):
         margin_percent = (script.margin_short if direction_sign < 0
                           else script.margin_long)
         if margin_percent > 0:
