@@ -5,7 +5,7 @@ title: "Pine Script Compatibility"
 description: "Implementation status of Pine Script v6 features in PyneCore"
 icon: "checklist"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-04-13"
 draft: false
 toc: true
 categories: ["Overview", "Compatibility"]
@@ -62,6 +62,8 @@ implementation status of all major Pine Script features.
 | `strategy.close_all()`  | full   |                                     |
 | `strategy.cancel_all()` | full   |                                     |
 | Risk management         | full   | `strategy.risk.*` functions         |
+| `calc_on_order_fills`   | full   | Re-execution after fills, var rollback / varip persist |
+| `calc_on_every_tick`    | full   | Live mode only — no effect on historical bars          |
 
 ## Request Module
 
@@ -178,7 +180,7 @@ All Pine Script v6 enum constants are implemented:
 | `if`/`else`/`switch`       | full   | Via PyneComp compilation              |
 | `for`/`while` loops        | full   |                                       |
 | `var` (persistent)         | full   | `Persistent[T]` annotation            |
-| `varip` (intrabar persist) | —      | Not applicable in offline mode        |
+| `varip` (intrabar persist) | full   | Persists across re-executions (COOF and live mode) |
 | Methods on types           | full   | `.get()`, `.set()`, `.size()`, etc.   |
 | User-defined types (UDT)   | full   | Via PyneComp compilation              |
 | Enums                      | full   | Via PyneComp compilation              |
@@ -193,17 +195,13 @@ All Pine Script v6 enum constants are implemented:
 
 ## Not Applicable to PyneCore
 
-These Pine Script features exist only in TradingView's live charting environment and are not
-applicable to offline backtesting:
+These Pine Script features exist only in TradingView's live charting environment and have no
+equivalent in PyneCore:
 
-| Feature              | Reason                                            |
-|----------------------|---------------------------------------------------|
-| `varip`              | Intrabar persistence — offline bars are confirmed |
-| Realtime bar updates | All bars are historical in offline mode           |
-| `alert()` triggers   | No broker/notification integration                |
-| Chart rendering      | No visual chart — output is CSV                   |
-| `input()` UI widgets | Inputs are function parameters or TOML config     |
-| Order execution      | Strategy simulator, not live trading              |
+| Feature              | Reason                                           |
+|----------------------|--------------------------------------------------|
+| Chart rendering      | No visual chart — output is CSV                  |
+| `input()` UI widgets | Inputs are function parameters or TOML config    |
 
 ## Precision
 
