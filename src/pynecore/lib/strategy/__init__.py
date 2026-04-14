@@ -432,8 +432,10 @@ class PositionBase(ABC):
     max_runup: float
     open_trades: list['Trade']
     closed_trades: 'deque[Trade]'
+    new_closed_trades: list['Trade']
     entry_orders: dict[str | None, 'Order']
     exit_orders: dict[str | None, 'Order']
+    risk_halt_trading: bool
 
     @property
     def equity(self) -> PyneFloat:

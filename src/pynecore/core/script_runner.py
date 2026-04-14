@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
     from pynecore.lib.strategy import Trade, Position  # noqa
+    from pynecore.core.plugin.broker import BrokerPlugin
+    from pynecore.core.broker.sync_engine import OrderSyncEngine
 
 __all__ = [
     'import_script',
@@ -192,7 +194,8 @@ class ScriptRunner:
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
-                 '_script_path', '_security_data', '_magnifier_iter')
+                 '_script_path', '_security_data', '_magnifier_iter',
+                 '_broker_plugin', '_order_sync_engine', '_broker_event_loop')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -201,7 +204,9 @@ class ScriptRunner:
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  inputs: dict[str, Any] | None = None,
                  security_data: dict[str, str | Path] | None = None,
-                 magnifier_iter: Iterable[OHLCV] | None = None):
+                 magnifier_iter: Iterable[OHLCV] | None = None,
+                 broker_plugin: 'BrokerPlugin | None' = None,
+                 broker_event_loop: Any = None):
         """
         Initialize the script runner
 
@@ -223,6 +228,16 @@ class ScriptRunner:
         :param magnifier_iter: Optional sub-timeframe OHLCV iterator for bar magnifier mode.
                                When provided with use_bar_magnifier=true, order fills are checked
                                against each sub-bar for more accurate backtesting.
+        :param broker_plugin: If set, the runner operates in **broker (live trading) mode**:
+                              ``script.position`` is replaced by a :class:`BrokerPosition`,
+                              ``strategy.*`` orders are dispatched through an
+                              :class:`OrderSyncEngine`, and the simulator's order processing
+                              is bypassed. The plugin also drives the OHLCV stream
+                              (a :class:`BrokerPlugin` extends :class:`LiveProviderPlugin`).
+        :param broker_event_loop: The shared ``asyncio`` event loop on which the broker plugin
+                                  runs. Passed to the :class:`OrderSyncEngine` so that
+                                  broker coroutines can be awaited from the runner thread
+                                  via ``run_coroutine_threadsafe``.
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -251,6 +266,27 @@ class ScriptRunner:
                               f"@script.[indicator|strategy|library] to run!")
 
         self.script: script = self.script_module.main.script
+
+        # Broker (live trading) mode setup.
+        # Done before ohlcv_iter is consumed so the engine is ready before run_iter.
+        self._broker_plugin: 'BrokerPlugin | None' = broker_plugin
+        self._broker_event_loop = broker_event_loop
+        self._order_sync_engine: 'OrderSyncEngine | None' = None
+        if broker_plugin is not None:
+            from pynecore.core.broker.position import BrokerPosition
+            from pynecore.core.broker.sync_engine import OrderSyncEngine
+            # Swap the simulator position for a live tracker. The
+            # @script.strategy(...) decorator already attached a SimPosition;
+            # in live broker mode the exchange is authoritative, so the
+            # simulator is dropped entirely.
+            self.script.position = BrokerPosition()
+            self._order_sync_engine = OrderSyncEngine(
+                broker=broker_plugin,
+                position=self.script.position,  # type: ignore[arg-type]
+                symbol=str(syminfo.ticker),
+                event_loop=broker_event_loop,
+                mintick=float(syminfo.mintick) if syminfo.mintick else 0.01,
+            )
 
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
@@ -281,6 +317,41 @@ class ScriptRunner:
             "Drawdown %",
         )) if trade_path else None
 
+    # === Order-processing dispatch =========================================
+
+    def _process_orders(self, position) -> None:
+        """Run one order-processing step.
+
+        In backtest mode this invokes the :class:`SimPosition` simulator
+        (OHLC fill detection, slippage, OCA, margin). In broker mode it
+        hands the pending Pine order book to the :class:`OrderSyncEngine`,
+        which dispatches real exchange calls and routes any fills that
+        arrived asynchronously through :meth:`BrokerPosition.record_fill`.
+        """
+        if self._order_sync_engine is not None:
+            self._order_sync_engine.sync()
+        else:
+            position.process_orders()
+
+    def _process_orders_magnified(self, position, sub_bars, candle) -> None:
+        """Backtest sub-bar order processing; in broker mode, the exchange
+        is the source of truth — magnification is irrelevant and the engine
+        runs a plain sync."""
+        if self._order_sync_engine is not None:
+            self._order_sync_engine.sync()
+        else:
+            position.process_orders_magnified(sub_bars, candle)
+
+    def _process_deferred_margin_call(self, position) -> None:
+        """Simulator-only. The exchange handles margin in broker mode, so
+        any deferred margin handling is a no-op there."""
+        if self._order_sync_engine is None:
+            position.process_deferred_margin_call()
+
+    @property
+    def _broker_mode(self) -> bool:
+        return self._order_sync_engine is not None
+
     # noinspection PyProtectedMember
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None) \
             -> Iterator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']]]:
@@ -305,6 +376,21 @@ class ScriptRunner:
 
         # Set script data
         lib._script = self.script  # Store script object in lib
+
+        # Broker mode: refuse to start if the script needs capabilities the
+        # exchange doesn't offer. Fail fast — never on the first bar.
+        if self._broker_plugin is not None:
+            from pynecore.core.broker.validation import validate_at_startup
+            from pynecore.core.broker.exceptions import ExchangeCapabilityError
+            caps = self._broker_plugin.get_capabilities()
+            reqs = getattr(self.script, '_broker_requirements', None)
+            if reqs is not None:
+                errors = validate_at_startup(reqs, caps)
+                if errors:
+                    raise ExchangeCapabilityError(
+                        "Script requirements not met by exchange:\n"
+                        + "\n".join(f"  - {e}" for e in errors)
+                    )
 
         # Update syminfo lib properties if needed
         if not self.update_syminfo_every_run:
@@ -572,6 +658,11 @@ class ScriptRunner:
             # noinspection PyProtectedMember
             def _coof_loop():
                 """COOF re-execution loop: process orders, re-execute on fills."""
+                # Broker mode: no synchronous fill-driven re-execution — exchange
+                # fills arrive asynchronously and are routed on the next sync.
+                if self._broker_mode:
+                    self._process_orders(position)
+                    return
                 old_fills = position._fill_counter
                 position.process_orders()
                 new_fills = position._fill_counter
@@ -587,6 +678,9 @@ class ScriptRunner:
             # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
                 """COOF re-execution loop with magnified order processing."""
+                if self._broker_mode:
+                    self._process_orders(position)
+                    return
                 old_fills = position._fill_counter
                 position.process_orders_magnified(sub_bars_list, aggregated_candle)
                 new_fills = position._fill_counter
@@ -637,14 +731,14 @@ class ScriptRunner:
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                 elif is_strat and position and not lib._strategy_suppressed:
-                    position.process_orders()
+                    self._process_orders(position)
 
                 # Execute libraries + script
                 _run_libs_and_main()
 
                 # Process deferred margin calls
                 if is_strat and position and not lib._strategy_suppressed:
-                    position.process_deferred_margin_call()
+                    self._process_deferred_margin_call(position)
 
                 # Write output
                 _write_bar_output(candle)
@@ -748,20 +842,20 @@ class ScriptRunner:
                                     _coof_magnified_loop(sub_bars, candle)
                                     var_snapshot.restore()
                                 else:
-                                    position.process_orders_magnified(sub_bars, candle)
+                                    self._process_orders_magnified(position, sub_bars, candle)
                             else:
                                 if var_snapshot and var_snapshot.has_vars:
                                     _coof_loop()
                                     var_snapshot.restore()
                                 else:
-                                    position.process_orders()
+                                    self._process_orders(position)
 
                         # Final script execution for the closed bar
                         lib._plot_data.clear()
                         _run_libs_and_main()
 
                         if is_strat and position:
-                            position.process_deferred_margin_call()
+                            self._process_deferred_margin_call(position)
 
                         # Commit state for next bar
                         if var_snapshot and var_snapshot.has_vars:

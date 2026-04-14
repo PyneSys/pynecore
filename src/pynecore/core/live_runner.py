@@ -33,6 +33,8 @@ def live_ohlcv_generator(
         *,
         last_historical_timestamp: int | None = None,
         shutdown_timeout: float = 120.0,
+        event_loop: asyncio.AbstractEventLoop | None = None,
+        engine_event_stream: asyncio.coroutines | None = None,
 ) -> Iterator[OHLCV]:
     """
     Bridge async watch_ohlcv() to a sync Iterator[OHLCV].
@@ -45,6 +47,14 @@ def live_ohlcv_generator(
     :param timeframe: Timeframe in TradingView format.
     :param last_historical_timestamp: Timestamp of the last historical bar to avoid duplicates.
     :param shutdown_timeout: Max seconds to wait for graceful shutdown. 0 = wait forever.
+    :param event_loop: Optional externally-owned event loop. When supplied, the background
+                       thread runs the async loop on it via ``run_until_complete`` instead
+                       of ``asyncio.run``. Required for broker mode so that the Order Sync
+                       Engine can submit coroutines to the same loop.
+    :param engine_event_stream: Optional coroutine (typically
+                                ``OrderSyncEngine.run_event_stream()``) to run as a
+                                long-lived task alongside the OHLCV watcher. The engine
+                                receives its :class:`OrderEvent` stream this way.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar).
     """
     bar_queue: Queue[OHLCV | BaseException] = Queue(maxsize=100)
@@ -86,6 +96,13 @@ def live_ohlcv_generator(
             watch_symbol = provider.normalize_symbol(symbol)
             logger.info("Live provider connected: %s %s@%s",
                         type(provider).__name__, symbol, timeframe)
+
+            # Broker mode: attach the Order Sync Engine's event stream as
+            # a background task so OrderEvents land in its queue without
+            # blocking the OHLCV reader.
+            engine_task: asyncio.Task | None = None
+            if engine_event_stream is not None:
+                engine_task = asyncio.create_task(engine_event_stream)
 
             reconnect_attempts = 0
 
@@ -160,11 +177,25 @@ def live_ohlcv_generator(
         except Exception as e:
             bar_queue.put(e)
         finally:
+            if engine_task is not None and not engine_task.done():
+                engine_task.cancel()
+                try:
+                    await engine_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             await _graceful_shutdown()
             bar_queue.put(_SENTINEL)
 
     def _thread_target():
-        asyncio.run(_async_loop())
+        if event_loop is not None:
+            asyncio.set_event_loop(event_loop)
+            try:
+                event_loop.run_until_complete(_async_loop())
+            finally:
+                # The caller owns the loop; don't close it here.
+                pass
+        else:
+            asyncio.run(_async_loop())
 
     thread = threading.Thread(target=_thread_target, daemon=True, name="live-provider")
     thread.start()

@@ -44,8 +44,9 @@ class BrokerPosition(PositionBase):
         'open_commission',
         'eventrades', 'wintrades', 'losstrades',
         'max_drawdown', 'max_runup',
-        'open_trades', 'closed_trades',
+        'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
+        'risk_halt_trading',
         '_current_price',
     )
 
@@ -68,11 +69,53 @@ class BrokerPosition(PositionBase):
 
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)
+        self.new_closed_trades: list[Trade] = []
 
         self.entry_orders: dict[str | None, 'Order'] = {}
         self.exit_orders: dict[str | None, 'Order'] = {}
 
+        self.risk_halt_trading: bool = False
+
         self._current_price: float = 0.0
+
+    # === Pine API compatibility shims ======================================
+    # Pine strategy.* functions read ``position.c`` / ``.o`` / ``.h`` / ``.l``
+    # for the simulator's creation-time margin check. In broker mode those
+    # attributes are served from the live OHLCV module; the exchange enforces
+    # margin for real, so the Pine-level check still acts as a safety net
+    # on script-side state without a separate simulator update path.
+
+    @property
+    def c(self) -> float:
+        try:
+            v = lib.close
+        except AttributeError:
+            return self._current_price or 0.0
+        try:
+            return float(v) if v is not None else self._current_price or 0.0
+        except (TypeError, ValueError):
+            return self._current_price or 0.0
+
+    @property
+    def o(self) -> float:
+        try:
+            return float(lib.open)
+        except (AttributeError, TypeError, ValueError):
+            return self.c
+
+    @property
+    def h(self) -> float:
+        try:
+            return float(lib.high)
+        except (AttributeError, TypeError, ValueError):
+            return self.c
+
+    @property
+    def l(self) -> float:  # noqa: E743 — mirrors the Pine attribute name
+        try:
+            return float(lib.low)
+        except (AttributeError, TypeError, ValueError):
+            return self.c
 
     # === Pine-side order book ===
 
@@ -270,3 +313,4 @@ class BrokerPosition(PositionBase):
         if trade in self.open_trades:
             self.open_trades.remove(trade)
         self.closed_trades.append(trade)
+        self.new_closed_trades.append(trade)

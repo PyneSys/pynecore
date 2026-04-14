@@ -236,6 +236,10 @@ def run(
         live: bool = Option(False, "--live", "-l",
                             help="Continue with live data after historical phase "
                                  "(provider mode only)"),
+        broker: bool = Option(False, "--broker",
+                              help="Enable live broker trading — requires a provider plugin that "
+                                   "subclasses BrokerPlugin. Implies --live.",
+                              rich_help_panel="Live Options"),
         shutdown_timeout: float = Option(120.0, "--shutdown-timeout",
                                          help="Max seconds to wait for graceful shutdown "
                                               "(0 = wait forever)",
@@ -485,6 +489,30 @@ def run(
         else:
             ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
 
+        # --broker implies --live.
+        if broker:
+            live = True
+
+        # Broker mode: verify plugin capability up front.
+        broker_plugin = None
+        broker_event_loop = None
+        if broker:
+            if not provider_data:
+                secho("--broker requires a provider string (ccxt:EXCHANGE:SYMBOL@TIMEFRAME).",
+                      err=True, fg=colors.RED)
+                raise Exit(1)
+            from pynecore.core.plugin.broker import BrokerPlugin
+            if not isinstance(provider_data.provider_instance, BrokerPlugin):
+                secho(
+                    f"Plugin '{provider_data.parsed_string.provider}' is not a BrokerPlugin "
+                    f"— broker mode requires an exchange-backed plugin.",
+                    err=True, fg=colors.RED,
+                )
+                raise Exit(1)
+            broker_plugin = provider_data.provider_instance
+            import asyncio as _asyncio
+            broker_event_loop = _asyncio.new_event_loop()
+
         # Chain live iterator after historical if --live
         if live and provider_data:
             import itertools
@@ -503,6 +531,7 @@ def run(
                 timeframe=provider_data.parsed_string.timeframe,
                 last_historical_timestamp=time_to_ts,
                 shutdown_timeout=shutdown_timeout,
+                event_loop=broker_event_loop,
             )
             ohlcv_iter = itertools.chain(ohlcv_iter, [LIVE_TRANSITION], live_iter)
             size = 0
@@ -560,7 +589,9 @@ def run(
                 runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                       plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                       security_data=security_data,
-                                      magnifier_iter=magnifier_iter)
+                                      magnifier_iter=magnifier_iter,
+                                      broker_plugin=broker_plugin,
+                                      broker_event_loop=broker_event_loop)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:
