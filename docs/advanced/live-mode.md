@@ -217,8 +217,8 @@ only cares whether it receives `OHLCV` or `BarUpdate` objects.
 
 ## Limitations
 
-- **Paper trading only** — no real order execution.  `BrokerPlugin` for live order routing is
-  planned but not yet implemented.
+- **Paper trading only** — no real order execution.  Live order routing is provided by
+  dedicated per-exchange broker plugins (`pynecore-bybit`, `pynecore-binance`, etc.).
 - **Single timeframe** — `request.security()` with live providers (multi-timeframe live) is not
   yet supported.
 - **Provider required** — `--live` only works with provider strings, not local data files.

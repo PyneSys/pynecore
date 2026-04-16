@@ -1,17 +1,18 @@
-from typing import Callable
+from typing import Any, Callable
 from dataclasses import dataclass
 import re
 from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from pynecore.core.plugin import LiveProviderPlugin, override
+from pynecore.core.plugin import override
+from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
 
 __all__ = ['CCXTProvider']
 
-known_limits = {
+_KNOWN_LIMITS = {
     'binance': 1000,
     'bitget': {
         '1w': 12,
@@ -28,6 +29,11 @@ known_limits = {
     'huobi': 2000,
 }
 
+_PYNECORE_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({
+    'sandbox',
+    'default_type',
+})
+
 
 def add_space_before_uppercase(s):
     return re.sub(r'(?<!^)([A-Z])', r' \1', s)
@@ -35,7 +41,13 @@ def add_space_before_uppercase(s):
 
 @dataclass
 class CCXTConfig:
-    """CCXT provider configuration"""
+    """CCXT provider configuration.
+
+    Fields map to CCXT constructor keyword arguments, so adding a new
+    exchange-specific setting is usually as simple as declaring it here
+    with the same name CCXT uses — ``vars(config)`` is filtered for
+    truthy values and spread into the CCXT client constructor.
+    """
 
     apiKey: str = ""
     """Default API key for all exchanges"""
@@ -46,10 +58,21 @@ class CCXTConfig:
     password: str = ""
     """Default API password (required by some exchanges like KuCoin)"""
 
+    sandbox: bool = False
+    """Enable the exchange's testnet / demo endpoint via ``set_sandbox_mode``."""
+
+    default_type: str = "swap"
+    """Default market type — ``"spot"`` / ``"swap"`` / ``"future"`` / ``"margin"``."""
+
 
 class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     """
-    CCXT provider
+    CCXT-based provider for live OHLCV data and market metadata.
+
+    Uses CCXT for symbol discovery, historical candle downloads, and
+    CCXT Pro for real-time websocket OHLCV streaming.  Order execution
+    is NOT provided — use a dedicated exchange broker plugin
+    (``pynecore-bybit``, ``pynecore-binance``, etc.) for that.
     """
 
     plugin_name = "CCXT"
@@ -159,9 +182,9 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         # Build exchange config from the Config dataclass + optional exchange-specific TOML sections
         exchange_config = {}
         if self.config:
-            # Base config from dataclass fields
             exchange_config = {
-                k: v for k, v in vars(self.config).items() if v
+                k: v for k, v in vars(self.config).items()
+                if v and k not in _PYNECORE_ONLY_CONFIG_KEYS
             }
 
             # Check for exchange-specific override in the raw TOML
@@ -181,6 +204,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         self._async_client = None
         self._last_bar_timestamp: int | None = None
         self._last_bar_ohlcv: OHLCV | None = None
+        self._exchange_config: dict[str, Any] = dict(exchange_config)
 
         # Create the CCXT client
         self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
@@ -188,6 +212,11 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             'adjustForTimeDifference': True,
             **exchange_config
         })
+        if self.config and getattr(self.config, 'sandbox', False):
+            try:
+                self._client.set_sandbox_mode(True)
+            except Exception:  # noqa: BLE001
+                pass
 
     @override
     def normalize_symbol(self, symbol: str) -> str:
@@ -196,9 +225,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
-        """
-        Get list of symbols.
-        """
+        """Get list of symbols."""
         self._client.load_markets()
         return self._client.symbols or []
 
@@ -224,9 +251,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @override
     def update_symbol_info(self) -> SymInfo:
-        """
-        Update symbol info from the exchange.
-        """
+        """Update symbol info from the exchange."""
         self._client.load_markets()
         assert self._client.markets
         market_details = self._client.markets[self.symbol]
@@ -292,7 +317,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         if limit is None:
             assert self._client.id
-            limit_config = known_limits.get(self._client.id, 100)
+            limit_config = _KNOWN_LIMITS.get(self._client.id, 100)
 
             if isinstance(limit_config, dict):
                 limit = limit_config.get(self.xchg_timeframe, limit_config.get('default', 100))
@@ -342,7 +367,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @override
     async def connect(self) -> None:
-        """Establish async CCXT connection for live data streaming."""
+        """Establish async CCXT Pro connection for live OHLCV streaming."""
         try:
             import ccxt.pro as ccxtpro
         except ImportError:
@@ -352,13 +377,32 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         exchange_name = self._client.id
 
-        exchange_config = {
-            'enableRateLimit': True,
-        }
+        exchange_config: dict[str, Any] = {'enableRateLimit': True}
+        exchange_config.update(self._exchange_config)
+
         if self.config:
-            exchange_config.update({k: v for k, v in vars(self.config).items() if v})
+            exchange_config.update({
+                k: v for k, v in vars(self.config).items()
+                if v and k not in _PYNECORE_ONLY_CONFIG_KEYS
+            })
 
         self._async_client = getattr(ccxtpro, exchange_name)(exchange_config)
+
+        if self.config and self.config.sandbox:
+            try:
+                self._async_client.set_sandbox_mode(True)
+            except Exception as exc:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Exchange %r does not support sandbox mode: %s",
+                    exchange_name, exc,
+                )
+
+        if self.config and self.config.default_type:
+            self._async_client.options = {
+                **getattr(self._async_client, 'options', {}),
+                'defaultType': self.config.default_type,
+            }
 
     @override
     async def disconnect(self) -> None:

@@ -26,14 +26,17 @@ class hierarchy determines what a plugin can do:
 
 ```
 Plugin (base)
-├── ProviderPlugin      — Offline OHLCV data provider
-│   └── LiveProviderPlugin — WebSocket/streaming data (extends ProviderPlugin)
-├── CLIPlugin           — CLI subcommands and parameter hooks
-└── ExtensionPlugin     — Hook-based script extension (planned)
+├── ProviderPlugin           — Offline OHLCV data provider
+│   └── LiveProviderPlugin   — WebSocket/streaming data (extends ProviderPlugin)
+├── CLIPlugin                — CLI subcommands and parameter hooks
+└── ExtensionPlugin          — Hook-based script extension (planned)
 ```
 
 `LiveProviderPlugin` inherits from `ProviderPlugin` — every live provider can also download
-historical data.  See [Live Mode](../advanced/live-mode.md) for usage details.
+historical data.  See [Live Mode](../advanced/live-mode.md) for data-side details.
+
+Order execution is handled by dedicated per-exchange broker plugins
+(`pynecore-bybit`, `pynecore-binance`, etc.) — not by the data provider.
 
 Multiple inheritance combines capabilities:
 

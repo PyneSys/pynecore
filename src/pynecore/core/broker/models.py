@@ -27,6 +27,12 @@ __all__ = [
     'CancelIntent',
     'ScriptRequirements',
     'InterceptorResult',
+    'BrokerEvent',
+    'BracketRegisteredEvent',
+    'LegPartialRepairedEvent',
+    'LegRepairFailedEvent',
+    'BracketReconstructedEvent',
+    'ProtectionDegradedEvent',
 ]
 
 
@@ -76,6 +82,10 @@ class ExchangeOrder:
     fee: float
     fee_currency: str
     reduce_only: bool = False
+    # Exchange-side clientOrderId (our allocation, echoed back by the exchange).
+    # Required for post-restart bracket reconstruction — without it, open TP/SL
+    # legs left on the exchange cannot be mapped back to Pine identity.
+    client_order_id: str | None = None
 
 
 @dataclass
@@ -116,13 +126,27 @@ class ExchangePosition:
 
 @dataclass
 class ExchangeCapabilities:
-    """What the exchange supports. Declared once at startup by the plugin."""
+    """
+    What the plugin can deliver end-to-end for the script, not raw exchange
+    support.  Declared once at startup.  A capability is ``True`` when the
+    plugin can uphold its semantics on this exchange — natively (one atomic
+    exchange call) or in software (e.g. two reduce-only orders + stream-driven
+    repair with OCA reduce semantics).  If neither path can uphold the
+    required semantics, declare ``False`` and
+    :func:`~pynecore.core.broker.validation.validate_at_startup` rejects the
+    script.
+    """
     # Order types
     stop_order: bool = False
     stop_limit_order: bool = False
     trailing_stop: bool = False
-    # Exit bracket (TP+SL with OCA reduce semantics)
+    # Exit bracket (TP+SL with OCA reduce semantics).  ``tp_sl_bracket=True``
+    # means the plugin delivers the bracket on this exchange; it does NOT
+    # imply native support.  ``tp_sl_bracket_native=True`` additionally
+    # promises a single atomic exchange call — useful for diagnostics,
+    # latency budgeting, and per-exchange reconcile strategy.
     tp_sl_bracket: bool = False
+    tp_sl_bracket_native: bool = False
     # Order management
     amend_order: bool = False
     cancel_all: bool = False
@@ -260,6 +284,66 @@ class ScriptRequirements:
 
 
 # === Interceptor (Order Sync Engine extension point) ===
+
+# === Broker events (observability) =======================================
+
+@dataclass
+class BrokerEvent:
+    """Base class for structured broker-side events.
+
+    The plugin emits these via an injected callback so the runner can
+    surface them in logs, metrics, and the user-facing event stream
+    without the plugin coupling to any specific sink.
+    """
+
+
+@dataclass
+class BracketRegisteredEvent(BrokerEvent):
+    pine_id: str
+    from_entry: str
+    tp_order_id: str | None
+    sl_order_id: str | None
+
+
+@dataclass
+class LegPartialRepairedEvent(BrokerEvent):
+    pine_id: str
+    from_entry: str
+    leg: str  # "tp" | "sl"
+    generation: int
+    old_qty: float
+    new_qty: float
+
+
+@dataclass
+class LegRepairFailedEvent(BrokerEvent):
+    pine_id: str
+    from_entry: str
+    leg: str  # "tp" | "sl"
+    reason: str
+    action_taken: str  # "degraded" | "retry" | ...
+
+
+@dataclass
+class BracketReconstructedEvent(BrokerEvent):
+    pine_id: str
+    from_entry: str
+    source: str  # "open_orders" | "position_snapshot" | ...
+
+
+@dataclass
+class ProtectionDegradedEvent(BrokerEvent):
+    """The bracket can no longer be maintained with OCA reduce semantics.
+
+    ``reason`` is human-readable / diagnostic; ``policy_action`` names the
+    manager's chosen follow-up (``"degraded"`` → bracket left in place but
+    unsupervised; ``"terminal"`` → bracket closed out).
+    """
+    pine_id: str
+    from_entry: str
+    reason: str
+    policy_action: str
+
 
 @dataclass
 class InterceptorResult:
