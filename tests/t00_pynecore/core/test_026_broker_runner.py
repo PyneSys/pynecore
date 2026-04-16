@@ -394,3 +394,90 @@ def __test_unchanged_intent_not_redispatched__(tmp_path):
     # Pine re-creates the same order every bar; the engine must see it as
     # unchanged from bar 2 onwards.
     assert len(plugin.entry_calls) == 1
+
+
+def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
+    """With ``calc_on_every_tick=True`` in broker+live mode, an order queued
+    on intra-bar tick N must dispatch via the sync engine on tick N+1, not
+    only at bar close.
+
+    Without the intra-bar sync, broker ``execute_entry`` would only be called
+    at bar-close, leaving the exchange blind to the order mid-bar. This also
+    implies async fills from ``watch_orders`` become visible to the script on
+    the very next tick instead of one bar late.
+    """
+    import sys
+    from pynecore import lib as _lib
+    from pynecore.core.script_runner import LIVE_TRANSITION
+
+    plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
+    script_path = _write_script(tmp_path, textwrap.dedent('''\
+        """
+        @pyne
+        """
+        from pynecore.lib import script, strategy
+
+        @script.strategy("IntraBarEntry")
+        def main():
+            strategy.entry("L", strategy.long, qty=1.0, limit=49_000.0)
+    '''))
+
+    # One historical bar (strategy suppressed, warmup only), then three live
+    # updates for the same bar timestamp: open tick, intra-bar tick, close.
+    historical = _make_bars(1)
+    live_ts = historical[-1].timestamp + 86_400
+    live = [
+        OHLCV(timestamp=live_ts, open=50_000.0, high=50_050.0, low=49_950.0,
+              close=50_000.0, volume=1.0, is_closed=False),   # tick 1 (open)
+        OHLCV(timestamp=live_ts, open=50_000.0, high=50_050.0, low=49_800.0,
+              close=49_900.0, volume=1.0, is_closed=False),   # tick 2 (intra)
+        OHLCV(timestamp=live_ts, open=50_000.0, high=50_100.0, low=49_800.0,
+              close=50_050.0, volume=1.0, is_closed=True),    # tick 3 (close)
+    ]
+
+    observations: list[tuple[str, int]] = []
+
+    def observing_iter():
+        # Historical phase.
+        for h in historical:
+            yield h
+        yield LIVE_TRANSITION
+        # Live tick 1: runner will process it on the next advance.
+        yield live[0]
+        # Resumes AFTER tick 1 was processed.
+        observations.append(('after_tick_1', len(plugin.entry_calls)))
+        yield live[1]
+        observations.append(('after_tick_2', len(plugin.entry_calls)))
+        yield live[2]
+        observations.append(('after_tick_3', len(plugin.entry_calls)))
+
+    # Set live flags before instantiation so the historical suppression
+    # and live transition paths run as in production.
+    for key in [script_path.stem]:
+        sys.modules.pop(key, None)
+    setattr(_lib, '_is_live', True)
+    setattr(_lib, '_strategy_suppressed', True)
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=observing_iter(),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+    )
+    runner.script.calc_on_every_tick = True
+
+    # Drain the generator.
+    list(runner.run_iter())
+
+    obs = dict(observations)
+    # Tick 1 opens the bar; script queues the limit entry. Sync ran before
+    # the script, so no dispatch yet.
+    assert obs['after_tick_1'] == 0, \
+        f"entry should not be dispatched on bar-open tick, got {obs['after_tick_1']}"
+    # Tick 2 is the decisive assertion: sync must run before the script on
+    # each intra-bar tick, so the entry queued on tick 1 now dispatches.
+    assert obs['after_tick_2'] == 1, \
+        f"entry must dispatch on next intra-bar tick, got {obs['after_tick_2']}"
+    # Bar close keeps the dispatch idempotent.
+    assert obs['after_tick_3'] == 1, \
+        f"entry should not re-dispatch at bar close, got {obs['after_tick_3']}"

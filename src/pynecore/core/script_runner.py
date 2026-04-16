@@ -806,6 +806,12 @@ class ScriptRunner:
                         if run_on_every_tick:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.save()
+                            # Broker sync runs before the script so orders queued by the
+                            # previous tick dispatch now, and async fills from watch_orders
+                            # become visible to this script run via record_fill.
+                            if is_strat and position and self._broker_mode \
+                                    and not lib._strategy_suppressed:
+                                self._process_orders(position)
                             _run_libs_and_main()
                         last_bar_timestamp = candle.timestamp
 
@@ -816,6 +822,9 @@ class ScriptRunner:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.restore()
                             function_isolation.reset()
+                            if is_strat and position and self._broker_mode \
+                                    and not lib._strategy_suppressed:
+                                self._process_orders(position)
                             _run_libs_and_main()
 
                     elif bar_update.is_closed:
