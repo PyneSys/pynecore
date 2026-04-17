@@ -23,6 +23,7 @@ from pynecore.core.broker.models import (
     EntryIntent,
     ExitIntent,
     CloseIntent,
+    OcaType,
     OrderType,
 )
 from pynecore.lib.strategy import (
@@ -78,10 +79,25 @@ def _coerce_oca(order: Order) -> tuple[str | None, str | None]:
     even when no OCA participation is requested. The intent layer uses
     ``None`` to mean "not in an OCA group" — so only emit ``oca_type`` when
     the order actually names a group.
+
+    Unknown ``oca_type`` strings are rejected here rather than silently passed
+    through to the sync engine, where a typo would disable cascade cancel
+    without any diagnostic. The accepted values are exactly the members of
+    :class:`OcaType`.
     """
     if order.oca_name is None:
         return None, None
-    return order.oca_name, str(order.oca_type) if order.oca_type is not None else None
+    if order.oca_type is None:
+        return order.oca_name, None
+    oca_type_str = str(order.oca_type)
+    try:
+        OcaType(oca_type_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"unknown oca_type {oca_type_str!r}; expected one of "
+            f"{[m.value for m in OcaType]}",
+        ) from exc
+    return order.oca_name, oca_type_str
 
 
 def build_entry_intent(order: Order, symbol: str) -> EntryIntent:

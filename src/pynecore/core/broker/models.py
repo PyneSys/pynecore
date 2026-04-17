@@ -13,10 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from pynecore.core.broker.idempotency import build_client_order_id
+
 __all__ = [
     'OrderStatus',
     'OrderType',
     'LegType',
+    'OcaType',
+    'OcaPartialFillPolicy',
     'ExchangeOrder',
     'OrderEvent',
     'ExchangePosition',
@@ -25,9 +29,11 @@ __all__ = [
     'ExitIntent',
     'CloseIntent',
     'CancelIntent',
+    'DispatchEnvelope',
     'ScriptRequirements',
     'InterceptorResult',
     'BrokerEvent',
+    'AuthenticationFailedEvent',
     'BracketRegisteredEvent',
     'LegPartialRepairedEvent',
     'LegRepairFailedEvent',
@@ -60,6 +66,40 @@ class LegType(StrEnum):
     STOP_LOSS = "sl"
     TRAILING_STOP = "trail"
     CLOSE = "close"
+
+
+class OcaType(StrEnum):
+    """Canonical OCA semantics for the sync engine.
+
+    The Pine-level literal values (``strategy.oca.cancel`` / ``.reduce`` /
+    ``.none``) are plain strings for script compatibility; this enum is the
+    single authority the sync engine and intent builder match against. Adding
+    a new OCA semantic therefore requires exactly one source edit, not a
+    scattered grep across the intent-builder / sync-engine / validator.
+    """
+    CANCEL = "cancel"
+    REDUCE = "reduce"
+    NONE = "none"
+
+
+class OcaPartialFillPolicy(StrEnum):
+    """How the sync engine treats a *partial* fill for OCA-cancel cascading.
+
+    On a full fill the behaviour is unambiguous: sibling orders in the same
+    OCA-cancel group must be cancelled. Partial fills are the grey zone — some
+    exchanges re-fill the remainder at a better price (risking sibling fills
+    too), others do not. The policy lets the user pick:
+
+    - :data:`FILL_CANCELS` (default): a partial fill already commits the script
+      to this side, so sibling cancel triggers immediately. Matches the
+      Pine backtester, where the first touch on any leg wins.
+    - :data:`FULL_FILL_ONLY`: wait until the leg is fully filled. Useful when
+      the user prefers siblings to stay live in case the first leg partial is
+      followed by a same-bar reversal that would otherwise lock in a
+      sub-optimal entry.
+    """
+    FILL_CANCELS = "fill_cancels"
+    FULL_FILL_ONLY = "full_fill_only"
 
 
 # === Exchange state snapshots ===
@@ -147,6 +187,14 @@ class ExchangeCapabilities:
     # latency budgeting, and per-exchange reconcile strategy.
     tp_sl_bracket: bool = False
     tp_sl_bracket_native: bool = False
+    # Native OCA-cancel groups: the plugin has registered the OCA group with
+    # the exchange such that the exchange itself cancels sibling orders when
+    # one fills (Bybit bracket, OKX algo orders, ...). When True the sync
+    # engine SUPPRESSES its own cascade-cancel logic — the exchange is
+    # authoritative. When False (the default, and the case for the vast
+    # majority of exchanges), the engine synthesises CancelIntent dispatches
+    # for surviving siblings the moment a fill event lands.
+    oca_cancel_native: bool = False
     # Order management
     amend_order: bool = False
     cancel_all: bool = False
@@ -154,6 +202,17 @@ class ExchangeCapabilities:
     # Streaming & position
     watch_orders: bool = False
     fetch_position: bool = False
+    # Idempotency.  ``client_id_echo`` means the plugin can attach a client-side
+    # order id that the exchange returns verbatim on ``get_open_orders`` — the
+    # foundation of the restart-safe recovery path in
+    # :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`.  Without it the
+    # engine cannot re-associate orders after a timeout or restart and live
+    # scripts are rejected at startup.  ``idempotency_native`` additionally
+    # promises that the exchange itself rejects duplicates of the same id
+    # (Binance/Bybit/OKX/Capital.com); ``False`` means the plugin must dedup
+    # client-side before each dispatch (Interactive Brokers, Deribit).
+    client_id_echo: bool = False
+    idempotency_native: bool = False
 
 
 # === Pine Script intents ===
@@ -205,6 +264,21 @@ class ExitIntent:
     comment_loss: str | None = None
     comment_trailing: str | None = None
     alert_message: str | None = None
+    # One-way Pine semantics: every strategy.exit is reduce-only by definition.
+    # A manual position close while the exit is pending must not flip the
+    # book back to the other side. The plugin must pass this to the exchange
+    # (Binance/Bybit/OKX ``reduceOnly``, Capital.com force-close, etc.).
+    # ``False`` is rejected at construction — a future ``HedgeBrokerPlugin``
+    # subclass will introduce a separate hedge-aware intent rather than flip
+    # this flag.
+    reduce_only: bool = True
+
+    def __post_init__(self) -> None:
+        if self.reduce_only is not True:
+            raise ValueError(
+                "ExitIntent.reduce_only must be True — one-way Pine semantics. "
+                "Hedge-mode intents belong on a future HedgeBrokerPlugin subclass."
+            )
 
     @property
     def intent_key(self) -> str:
@@ -241,6 +315,15 @@ class CloseIntent:
     immediately: bool = False
     comment: str | None = None
     alert_message: str | None = None
+    # Same invariant as :attr:`ExitIntent.reduce_only` — a close can never
+    # flip the book to the other side in one-way Pine mode.
+    reduce_only: bool = True
+
+    def __post_init__(self) -> None:
+        if self.reduce_only is not True:
+            raise ValueError(
+                "CloseIntent.reduce_only must be True — one-way Pine semantics."
+            )
 
     @property
     def intent_key(self) -> str:
@@ -269,6 +352,44 @@ class CancelIntent:
         return self.pine_id
 
 
+# === Dispatch envelope ===
+
+@dataclass(frozen=True)
+class DispatchEnvelope:
+    """Broker dispatch envelope — an intent plus idempotency metadata.
+
+    The :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine` wraps every
+    intent in a fresh envelope before handing it to the :class:`BrokerPlugin`.
+    Plugins call :meth:`client_order_id` for each exchange order they place;
+    the result is deterministic, so a retry or restart regenerates the same id
+    and the exchange dedups the duplicate.
+
+    :ivar intent: The Pine-level intent this dispatch carries.
+    :ivar run_tag: 4-char base36 session tag (see :func:`make_run_tag`).
+    :ivar bar_ts_ms: Bar open timestamp (ms since Unix epoch).
+    :ivar retry_seq: Bumped by the recovery path only when a prior attempt is
+        deliberately abandoned — defaults to ``0``.
+    """
+    intent: 'EntryIntent | ExitIntent | CloseIntent | CancelIntent'
+    run_tag: str
+    bar_ts_ms: int
+    retry_seq: int = 0
+
+    def client_order_id(self, kind: str) -> str:
+        """Allocate the canonical client-order-id for a given leg kind.
+
+        :param kind: One of the ``KIND_*`` constants from
+            :mod:`pynecore.core.broker.idempotency`.
+        """
+        return build_client_order_id(
+            run_tag=self.run_tag,
+            pine_id=self.intent.pine_id,
+            bar_ts_ms=self.bar_ts_ms,
+            kind=kind,
+            retry_seq=self.retry_seq,
+        )
+
+
 # === Compile-time detected script requirements ===
 
 @dataclass
@@ -281,6 +402,12 @@ class ScriptRequirements:
     tp_sl_bracket: bool = False  # strategy.exit() with BOTH limit+stop or profit+loss
     trailing_stop: bool = False
     strategy_order: bool = False  # strategy.order() — no pyramiding limit
+    # True if the script calls any of ``strategy.exit`` / ``strategy.close`` /
+    # ``strategy.close_all``. Every such call requires the exchange to honour
+    # reduce-only semantics — a manual position close otherwise lets the
+    # still-pending exit flip the book the other way. The validator turns
+    # this into a hard reject when ``caps.reduce_only=False``.
+    exit_orders: bool = False
 
 
 # === Interceptor (Order Sync Engine extension point) ===
@@ -295,6 +422,17 @@ class BrokerEvent:
     surface them in logs, metrics, and the user-facing event stream
     without the plugin coupling to any specific sink.
     """
+
+
+@dataclass
+class AuthenticationFailedEvent(BrokerEvent):
+    """Emitted when the plugin's credentials are rejected by the exchange.
+
+    ``reason`` is the short human-readable cause (``AuthenticationError.reason``);
+    the runner surfaces the event to observability sinks and then performs a
+    graceful stop — reconnect cannot gain access with wrong credentials.
+    """
+    reason: str
 
 
 @dataclass

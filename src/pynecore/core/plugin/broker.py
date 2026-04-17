@@ -21,14 +21,15 @@ from typing import TYPE_CHECKING
 
 from pynecore.core.plugin import ConfigT
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
-from pynecore.core.broker.exceptions import ExchangeCapabilityError
-from pynecore.core.broker.models import CancelIntent
+from pynecore.core.broker.exceptions import (
+    BrokerError,
+    ExchangeCapabilityError,
+    ExchangeConnectionError,
+)
+from pynecore.core.broker.models import CancelIntent, DispatchEnvelope
 
 if TYPE_CHECKING:
     from pynecore.core.broker.models import (
-        EntryIntent,
-        ExitIntent,
-        CloseIntent,
         ExchangeOrder,
         ExchangePosition,
         ExchangeCapabilities,
@@ -59,13 +60,21 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     """
 
     # === High-level order intents ===
+    #
+    # Every execute_* method takes a :class:`DispatchEnvelope` rather than a
+    # bare intent.  The envelope carries the idempotency metadata the plugin
+    # needs to allocate stable ``client_order_id`` values via
+    # :meth:`DispatchEnvelope.client_order_id`.  The wrapped intent is on
+    # ``envelope.intent`` with its original Pine-level fields intact.
 
     @abstractmethod
-    async def execute_entry(self, intent: 'EntryIntent') -> list['ExchangeOrder']:
+    async def execute_entry(self, envelope: 'DispatchEnvelope') -> list['ExchangeOrder']:
         """
         Open or add to a position.
 
-        Maps to ``strategy.entry()`` and ``strategy.order()``.
+        Maps to ``strategy.entry()`` and ``strategy.order()``. ``envelope.intent``
+        is the :class:`EntryIntent`. Use ``envelope.client_order_id(KIND_ENTRY)``
+        for the exchange-side client id.
 
         | Pine params         | order_type   | limit    | stop     |
         |---------------------|--------------|----------|----------|
@@ -76,11 +85,14 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         """
 
     @abstractmethod
-    async def execute_exit(self, intent: 'ExitIntent') -> list['ExchangeOrder']:
+    async def execute_exit(self, envelope: 'DispatchEnvelope') -> list['ExchangeOrder']:
         """
         Exit (reduce) a position.  OCA REDUCE semantics expected.
 
-        Maps to ``strategy.exit()``.
+        Maps to ``strategy.exit()``. ``envelope.intent`` is the
+        :class:`ExitIntent`. Allocate per-leg client ids via
+        ``envelope.client_order_id(KIND_EXIT_TP)`` and
+        ``envelope.client_order_id(KIND_EXIT_SL)``.
 
         The plugin decides HOW to implement the TP+SL bracket on its exchange:
         native bracket orders, separate orders with monitoring, etc.
@@ -91,17 +103,23 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         """
 
     @abstractmethod
-    async def execute_close(self, intent: 'CloseIntent') -> 'ExchangeOrder':
+    async def execute_close(self, envelope: 'DispatchEnvelope') -> 'ExchangeOrder':
         """
         Close a position with a market order.
 
-        Maps to ``strategy.close()`` / ``strategy.close_all()``.
+        Maps to ``strategy.close()`` / ``strategy.close_all()``. Use
+        ``envelope.client_order_id(KIND_CLOSE)`` for the exchange-side id.
         """
 
     @abstractmethod
-    async def execute_cancel(self, intent: 'CancelIntent') -> bool:
+    async def execute_cancel(self, envelope: 'DispatchEnvelope') -> bool:
         """
         Cancel pending order(s).  Returns ``True`` if cancelled.
+
+        ``envelope.intent`` is the :class:`CancelIntent`. The canonical cancel
+        id (``envelope.client_order_id(KIND_CANCEL)``) is primarily useful for
+        audit and retry correlation — the actual exchange call typically
+        references the existing order by its exchange-side id.
         """
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
@@ -112,7 +130,7 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     # === Modify (upsert/replace) ===
 
     async def modify_entry(
-            self, old_intent: 'EntryIntent', new_intent: 'EntryIntent',
+            self, old: 'DispatchEnvelope', new: 'DispatchEnvelope',
     ) -> list['ExchangeOrder']:
         """
         Modify an existing entry order (price/qty changed).
@@ -120,14 +138,20 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         Default implementation: cancel + execute.  Plugin authors SHOULD
         override with an atomic amend when the exchange supports it.
         """
-        await self.execute_cancel(CancelIntent(
-            pine_id=old_intent.pine_id,
-            symbol=old_intent.symbol,
-        ))
-        return await self.execute_entry(new_intent)
+        cancel_envelope = DispatchEnvelope(
+            intent=CancelIntent(
+                pine_id=old.intent.pine_id,
+                symbol=old.intent.symbol,
+            ),
+            run_tag=new.run_tag,
+            bar_ts_ms=new.bar_ts_ms,
+            retry_seq=new.retry_seq,
+        )
+        await self.execute_cancel(cancel_envelope)
+        return await self.execute_entry(new)
 
     async def modify_exit(
-            self, old_intent: 'ExitIntent', new_intent: 'ExitIntent',
+            self, old: 'DispatchEnvelope', new: 'DispatchEnvelope',
     ) -> list['ExchangeOrder']:
         """
         Modify an existing exit bracket (TP/SL price changed).
@@ -136,12 +160,19 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         plugin authors SHOULD override with an atomic amend when the
         exchange supports it (``editOrder``, Bybit amend, etc.).
         """
-        await self.execute_cancel(CancelIntent(
-            pine_id=old_intent.pine_id,
-            symbol=old_intent.symbol,
-            from_entry=old_intent.from_entry,
-        ))
-        return await self.execute_exit(new_intent)
+        old_exit = old.intent
+        cancel_envelope = DispatchEnvelope(
+            intent=CancelIntent(
+                pine_id=old_exit.pine_id,
+                symbol=old_exit.symbol,
+                from_entry=getattr(old_exit, 'from_entry', None),
+            ),
+            run_tag=new.run_tag,
+            bar_ts_ms=new.bar_ts_ms,
+            retry_seq=new.retry_seq,
+        )
+        await self.execute_cancel(cancel_envelope)
+        return await self.execute_exit(new)
 
     # === State queries ===
 
@@ -169,6 +200,28 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         (``pine_id``, ``from_entry``, ``leg_type``) on each event.
         """
         raise NotImplementedError
+
+    # === Exception mapping ===
+
+    # noinspection PyMethodMayBeStatic
+    def _map_exception(self, raw: Exception) -> BrokerError | None:
+        """Translate a raw exchange-SDK exception into the broker taxonomy.
+
+        Utility hook for plugin authors — **not** called by the sync engine
+        directly. Plugin ``execute_*`` implementations wrap their SDK calls in
+        try/except and delegate classification here so exchange-specific
+        knowledge stays in one place. Default implementation only handles
+        stdlib exceptions common to every plugin: a concrete plugin should
+        override to layer in its SDK's error types (``ccxt.AuthenticationError``,
+        IB ``errorCode``, etc.) and return ``None`` for anything it doesn't
+        recognise so the caller re-raises the original.
+
+        :returns: A :class:`BrokerError` subclass instance if ``raw`` can be
+            classified, or ``None`` if the plugin should re-raise as-is.
+        """
+        if isinstance(raw, ConnectionError):
+            return ExchangeConnectionError(str(raw) or "Connection lost")
+        return None
 
     # === Capabilities ===
 

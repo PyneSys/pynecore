@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from datetime import datetime, UTC
 
+from pynecore import lib
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.csv_file import CSVWriter
@@ -273,6 +274,7 @@ class ScriptRunner:
         self._broker_event_loop = broker_event_loop
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         if broker_plugin is not None:
+            from pynecore.core.broker.idempotency import make_run_tag
             from pynecore.core.broker.position import BrokerPosition
             from pynecore.core.broker.sync_engine import OrderSyncEngine
             # Swap the simulator position for a live tracker. The
@@ -280,10 +282,14 @@ class ScriptRunner:
             # in live broker mode the exchange is authoritative, so the
             # simulator is dropped entirely.
             self.script.position = BrokerPosition()
+            run_tag = make_run_tag(
+                f"{script_path.read_text(encoding='utf-8')}\n{syminfo.ticker}",
+            )
             self._order_sync_engine = OrderSyncEngine(
                 broker=broker_plugin,
                 position=self.script.position,  # type: ignore[arg-type]
                 symbol=str(syminfo.ticker),
+                run_tag=run_tag,
                 event_loop=broker_event_loop,
                 mintick=float(syminfo.mintick) if syminfo.mintick else 0.01,
             )
@@ -329,7 +335,7 @@ class ScriptRunner:
         arrived asynchronously through :meth:`BrokerPosition.record_fill`.
         """
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync()
+            self._order_sync_engine.sync(int(lib.last_bar_time))
         else:
             position.process_orders()
 
@@ -338,7 +344,7 @@ class ScriptRunner:
         is the source of truth — magnification is irrelevant and the engine
         runs a plain sync."""
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync()
+            self._order_sync_engine.sync(int(lib.last_bar_time))
         else:
             position.process_orders_magnified(sub_bars, candle)
 
@@ -380,8 +386,12 @@ class ScriptRunner:
         # Broker mode: refuse to start if the script needs capabilities the
         # exchange doesn't offer. Fail fast — never on the first bar.
         if self._broker_plugin is not None:
+            import asyncio
             from pynecore.core.broker.validation import validate_at_startup
-            from pynecore.core.broker.exceptions import ExchangeCapabilityError
+            from pynecore.core.broker.exceptions import (
+                AuthenticationError,
+                ExchangeCapabilityError,
+            )
             caps = self._broker_plugin.get_capabilities()
             reqs = getattr(self.script, '_broker_requirements', None)
             if reqs is not None:
@@ -391,6 +401,25 @@ class ScriptRunner:
                         "Script requirements not met by exchange:\n"
                         + "\n".join(f"  - {e}" for e in errors)
                     )
+
+            # Auth check: fail fast on bad credentials rather than on the
+            # first order attempt. A single get_balance() call is cheap and
+            # every exchange supports it. An AuthenticationError here is
+            # terminal — reconnect can never recover wrong keys.
+            coro = self._broker_plugin.get_balance()
+            try:
+                if self._broker_event_loop is None:
+                    asyncio.run(coro)
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        coro, self._broker_event_loop,
+                    ).result(timeout=30.0)
+            except AuthenticationError as exc:
+                raise AuthenticationError(
+                    "Broker authentication failed at startup — cannot begin "
+                    f"trading: {exc.reason}",
+                    reason=exc.reason,
+                ) from exc
 
         # Update syminfo lib properties if needed
         if not self.update_syminfo_every_run:

@@ -34,7 +34,10 @@ from pynecore.core.broker.models import (
     OrderType,
     LegType,
 )
-from pynecore.core.broker.exceptions import ExchangeCapabilityError
+from pynecore.core.broker.exceptions import (
+    AuthenticationError,
+    ExchangeCapabilityError,
+)
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.core.syminfo import SymInfo
@@ -90,13 +93,15 @@ class MockBrokerPlugin:
     exit_calls: list[ExitIntent] = field(default_factory=list)
     close_calls: list[CloseIntent] = field(default_factory=list)
     cancel_calls: list[CancelIntent] = field(default_factory=list)
+    auth_error: AuthenticationError | None = None
     _next_id: int = 0
 
     def get_capabilities(self) -> ExchangeCapabilities:
         return self.capabilities
 
-    def _mk_order(self, intent) -> ExchangeOrder:
+    def _mk_order(self, envelope) -> ExchangeOrder:
         self._next_id += 1
+        intent = getattr(envelope, 'intent', envelope)
         return ExchangeOrder(
             id=f"xchg-{self._next_id}",
             symbol=getattr(intent, 'symbol', 'BTCUSDT'),
@@ -108,22 +113,24 @@ class MockBrokerPlugin:
             price=None, stop_price=None, average_fill_price=None,
             status=OrderStatus.OPEN,
             timestamp=0.0, fee=0.0, fee_currency="",
+            client_order_id=envelope.client_order_id('e')
+            if hasattr(envelope, 'client_order_id') else None,
         )
 
-    async def execute_entry(self, intent):
-        self.entry_calls.append(intent)
-        return [self._mk_order(intent)]
+    async def execute_entry(self, envelope):
+        self.entry_calls.append(envelope.intent)
+        return [self._mk_order(envelope)]
 
-    async def execute_exit(self, intent):
-        self.exit_calls.append(intent)
-        return [self._mk_order(intent)]
+    async def execute_exit(self, envelope):
+        self.exit_calls.append(envelope.intent)
+        return [self._mk_order(envelope)]
 
-    async def execute_close(self, intent):
-        self.close_calls.append(intent)
-        return self._mk_order(intent)
+    async def execute_close(self, envelope):
+        self.close_calls.append(envelope.intent)
+        return self._mk_order(envelope)
 
-    async def execute_cancel(self, intent):
-        self.cancel_calls.append(intent)
+    async def execute_cancel(self, envelope):
+        self.cancel_calls.append(envelope.intent)
         return True
 
     async def modify_entry(self, old, new):
@@ -137,6 +144,11 @@ class MockBrokerPlugin:
 
     async def get_position(self, symbol):
         return None
+
+    async def get_balance(self):
+        if self.auth_error is not None:
+            raise self.auth_error
+        return {"USDT": 1000.0}
 
 
 # === Script templates ===
@@ -234,11 +246,11 @@ def __test_startup_validation_rejects_incompatible_script__(tmp_path):
 
 
 def __test_startup_validation_accepts_compatible_script__(tmp_path):
-    # The bracket script needs tp_sl_bracket AND stop_orders from its
-    # syntactic keywords; the plugin must advertise both.
+    # The bracket script needs tp_sl_bracket, stop_order AND reduce_only —
+    # the last one because strategy.exit implies reduce-only semantics.
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(
-            tp_sl_bracket=True, stop_order=True,
+            tp_sl_bracket=True, stop_order=True, reduce_only=True,
         ),
     )
     script_path = _write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
@@ -276,7 +288,11 @@ def __test_market_entry_dispatches_execute_entry__(tmp_path):
 def __test_close_dispatches_execute_close__(tmp_path):
     """``strategy.close`` only emits an order when there is an open position;
     in broker mode that requires a real exchange fill first."""
-    plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
+    # ``strategy.close`` triggers the ``exit_orders`` requirement, which the
+    # validator pairs with ``caps.reduce_only``.
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(reduce_only=True),
+    )
     # 3-bar script: enter on bar 0, hold, close on bar 2 once filled.
     script_path = _write_script(tmp_path, textwrap.dedent('''\
         """
@@ -481,3 +497,31 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
     # Bar close keeps the dispatch idempotent.
     assert obs['after_tick_3'] == 1, \
         f"entry should not re-dispatch at bar close, got {obs['after_tick_3']}"
+
+
+# === Startup authentication check (WS3) ===
+
+
+def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
+    """Bad credentials on get_balance() must abort startup with
+    AuthenticationError — before any order is sent."""
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(),
+        auth_error=AuthenticationError("Invalid API key", reason="invalid key"),
+    )
+    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(2),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+    )
+    with pytest.raises(AuthenticationError) as excinfo:
+        list(runner.run_iter())
+    # The runner wraps with its own descriptive message but preserves the
+    # original reason.
+    assert excinfo.value.reason == "invalid key"
+    assert "authentication failed at startup" in str(excinfo.value).lower()
+    # No orders should have been dispatched.
+    assert plugin.entry_calls == []

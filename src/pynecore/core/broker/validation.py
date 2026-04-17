@@ -46,4 +46,11 @@ def validate_at_startup(
         errors.append(
             "Script uses trailing stops, but the exchange doesn't support them."
         )
+    if reqs.exit_orders and not caps.reduce_only:
+        errors.append(
+            "Script uses strategy.exit / strategy.close, but the exchange "
+            "doesn't support reduce-only orders. A later-arriving exit "
+            "could flip the book to the other side once the position is "
+            "already closed — refuse to start."
+        )
     return errors

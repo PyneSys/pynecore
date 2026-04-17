@@ -98,6 +98,7 @@ def __test_exit_price_bracket_detects_tp_sl__():
     flags = _get_requirements_keyword(tree)
     assert flags == {
         'limit_orders': True, 'stop_orders': True, 'tp_sl_bracket': True,
+        'exit_orders': True,
     }
 
 
@@ -111,6 +112,7 @@ def __test_exit_tick_bracket_detects_tp_sl__():
     flags = _get_requirements_keyword(tree)
     assert flags == {
         'limit_orders': True, 'stop_orders': True, 'tp_sl_bracket': True,
+        'exit_orders': True,
     }
 
 
@@ -121,7 +123,7 @@ def __test_exit_trail_offset_detects_trailing_stop__():
             strategy.exit('TR', from_entry='Long', trail_offset=50, trail_points=100)
     """)
     flags = _get_requirements_keyword(tree)
-    assert flags == {'trailing_stop': True}
+    assert flags == {'trailing_stop': True, 'exit_orders': True}
 
 
 def __test_strategy_order_detects_strategy_order_flag__():
@@ -141,7 +143,30 @@ def __test_close_detects_market_orders__():
         def main():
             strategy.close('Long')
     """)
-    assert _get_requirements_keyword(tree) == {'market_orders': True}
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'exit_orders': True,
+    }
+
+
+def __test_close_all_detects_exit_orders__():
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.close_all()
+    """)
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'exit_orders': True,
+    }
+
+
+def __test_plain_exit_detects_exit_orders__():
+    """A bracket-less strategy.exit still requires reduce-only semantics."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.exit('X', from_entry='Long')
+    """)
+    assert _get_requirements_keyword(tree) == {'exit_orders': True}
 
 
 def __test_import_is_injected_when_requirements_present__():
@@ -202,7 +227,25 @@ def __test_validate_collects_all_missing_capabilities__():
     reqs = ScriptRequirements(
         stop_orders=True, stop_limit_orders=True,
         tp_sl_bracket=True, trailing_stop=True,
+        exit_orders=True,
     )
     caps = ExchangeCapabilities()
     errors = validate_at_startup(reqs, caps)
-    assert len(errors) == 4
+    assert len(errors) == 5
+
+
+def __test_validate_rejects_exit_without_reduce_only_capability__():
+    """A script that uses strategy.exit/close must refuse to start on an
+    exchange that doesn't honour reduce-only semantics — otherwise a
+    later-arriving exit can flip the book to the other side."""
+    reqs = ScriptRequirements(exit_orders=True)
+    caps = ExchangeCapabilities()  # reduce_only=False
+    errors = validate_at_startup(reqs, caps)
+    assert len(errors) == 1
+    assert 'reduce-only' in errors[0]
+
+
+def __test_validate_accepts_exit_with_reduce_only_capability__():
+    reqs = ScriptRequirements(exit_orders=True)
+    caps = ExchangeCapabilities(reduce_only=True)
+    assert validate_at_startup(reqs, caps) == []

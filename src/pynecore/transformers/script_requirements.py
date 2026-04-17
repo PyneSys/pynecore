@@ -33,6 +33,7 @@ _FLAG_STOP_LIMIT = 'stop_limit_orders'
 _FLAG_BRACKET = 'tp_sl_bracket'
 _FLAG_TRAIL = 'trailing_stop'
 _FLAG_STRATEGY_ORDER = 'strategy_order'
+_FLAG_EXIT_ORDERS = 'exit_orders'
 
 
 def _strategy_call_name(node: ast.Call) -> str | None:
@@ -106,6 +107,7 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             _FLAG_BRACKET: False,
             _FLAG_TRAIL: False,
             _FLAG_STRATEGY_ORDER: False,
+            _FLAG_EXIT_ORDERS: False,
         }
         self._strategy_decorator: ast.Call | None = None
 
@@ -145,8 +147,10 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             self._apply_entry_or_order(kws, is_strategy_order=True)
         elif name == 'exit':
             self._apply_exit(kws)
+            self._reqs[_FLAG_EXIT_ORDERS] = True
         elif name in ('close', 'close_all'):
             self._reqs[_FLAG_MARKET] = True
+            self._reqs[_FLAG_EXIT_ORDERS] = True
         return node
 
     # === Detection rules (see design doc, "Detektálható Minták" table) ===

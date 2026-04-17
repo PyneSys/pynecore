@@ -203,3 +203,42 @@ def __test_mixed_entry_and_exit_produce_both_intents__():
     intents = build_intents({"L": e}, {"L": x}, SYMBOL)
     kinds = [type(i).__name__ for i in intents]
     assert kinds == ["EntryIntent", "ExitIntent"]
+
+
+# === reduce_only invariant (WS2) ===
+
+def __test_exit_intent_defaults_to_reduce_only_true__():
+    x = _exit("L", -1.0, "TP", limit=60_000.0, stop=45_000.0)
+    i = build_intents({}, {"L": x}, SYMBOL)[0]
+    assert isinstance(i, ExitIntent)
+    assert i.reduce_only is True
+
+
+def __test_close_intent_defaults_to_reduce_only_true__():
+    i = build_intents({}, {"L": _close("L", -1.0)}, SYMBOL)[0]
+    assert isinstance(i, CloseIntent)
+    assert i.reduce_only is True
+
+
+def __test_close_all_intent_defaults_to_reduce_only_true__():
+    i = build_intents({}, {None: _close_all(-1.0)}, SYMBOL)[0]
+    assert isinstance(i, CloseIntent)
+    assert i.reduce_only is True
+
+
+def __test_exit_intent_rejects_reduce_only_false__():
+    import pytest
+    with pytest.raises(ValueError, match="reduce_only must be True"):
+        ExitIntent(
+            pine_id="TP", from_entry="L", symbol=SYMBOL,
+            side="sell", qty=1.0, reduce_only=False,
+        )
+
+
+def __test_close_intent_rejects_reduce_only_false__():
+    import pytest
+    with pytest.raises(ValueError, match="reduce_only must be True"):
+        CloseIntent(
+            pine_id="L", symbol=SYMBOL, side="sell", qty=1.0,
+            reduce_only=False,
+        )

@@ -8,11 +8,13 @@ Broker plugin runtime support.
   position tracker (no simulation).
 """
 from pynecore.core.broker.exceptions import (
+    AuthenticationError,
     BrokerError,
     ExchangeCapabilityError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
+    InsufficientMarginError,
     OrderSyncError,
     UnexpectedCancelError,
 )
@@ -34,11 +36,13 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.position import BrokerPosition
 
 __all__ = [
+    'AuthenticationError',
     'BrokerError',
     'ExchangeCapabilityError',
     'ExchangeConnectionError',
     'ExchangeOrderRejectedError',
     'ExchangeRateLimitError',
+    'InsufficientMarginError',
     'OrderSyncError',
     'UnexpectedCancelError',
     'OrderStatus',
