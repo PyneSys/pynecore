@@ -47,6 +47,11 @@ from pynecore.core.broker.models import (
     OcaType,
     OrderEvent,
 )
+from pynecore.core.broker.state_store import (
+    EnvelopeRecord,
+    PendingRecord,
+    StateStore,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
@@ -87,6 +92,13 @@ class OrderSyncEngine:
         guards, ...). ``None`` disables emission — useful in tests and
         single-shot backtests; production wires the runner's observability
         bus here.
+    :param state_store: Optional :class:`StateStore` for cross-restart
+        recovery. When provided the engine persists envelope identity and
+        parked-verification entries; on construction it replays the file so
+        a restarted process re-uses the same ``client_order_id`` for every
+        live intent and matches up parked dispatches against
+        ``get_open_orders`` on the next sync. Pass ``None`` for unit tests
+        and single-shot backtests where restart safety is not required.
     """
 
     def __init__(
@@ -102,6 +114,7 @@ class OrderSyncEngine:
             mintick: float = 0.01,
             oca_partial_fill_policy: OcaPartialFillPolicy = OcaPartialFillPolicy.FILL_CANCELS,
             broker_event_sink: Callable[[BrokerEvent], None] | None = None,
+            state_store: StateStore | None = None,
     ) -> None:
         self._broker = broker
         self._position = position
@@ -113,6 +126,7 @@ class OrderSyncEngine:
         self._mintick = mintick
         self._oca_partial_policy = oca_partial_fill_policy
         self._broker_event_sink = broker_event_sink
+        self._state_store = state_store
         # Capabilities are declared once at plugin startup — cache the lookup
         # so the cascade-cancel fast path does not pay a method call per event.
         caps = broker.get_capabilities()
@@ -135,6 +149,24 @@ class OrderSyncEngine:
         # but kept stable within the pass so two fills in the same group do
         # not emit duplicate CancelIntents.
         self._cancelled_oca_groups_this_sync: set[str] = set()
+
+        # Cross-restart recovery anchors. The state store persists envelope
+        # identity and parked-verification entries; replay rebuilds these
+        # *anchor* dicts (intent objects are not persisted — they are rebuilt
+        # from the Pine order book on the first post-restart sync). The first
+        # _build_envelope / _verify_pending_dispatches call for an anchored key
+        # promotes the anchor into the live in-memory state and clears it.
+        self._persisted_envelope_anchors: dict[str, EnvelopeRecord] = {}
+        self._persisted_pending_anchors: dict[str, PendingRecord] = {}
+        if state_store is not None:
+            envelopes, pending = state_store.replay()
+            self._persisted_envelope_anchors = dict(envelopes)
+            self._persisted_pending_anchors = dict(pending)
+            if envelopes or pending:
+                _log.info(
+                    "broker state replay: %d envelope(s), %d pending verification(s)",
+                    len(envelopes), len(pending),
+                )
 
     # === Public API ===
 
@@ -250,12 +282,17 @@ class OrderSyncEngine:
         ``client_order_id`` that now appears on the exchange, promotes the
         envelope back into ``_order_mapping`` without re-dispatching.
 
+        After a restart the persisted parked entries are also matched here —
+        the in-memory envelope is gone, but the persisted ``key`` is enough to
+        attach the recovered exchange order to the right ``_order_mapping``
+        slot.
+
         A pending entry that does *not* show up stays parked — the engine
         deliberately does not re-dispatch because the original may still land
         (slow network round-trip). The user can inspect
         :attr:`pending_verification` to surface stuck entries.
         """
-        if not self._pending_verification:
+        if not self._pending_verification and not self._persisted_pending_anchors:
             return
         orders = self._run_async(self._broker.get_open_orders(self._symbol))
         by_coid = {o.client_order_id: o for o in orders if o.client_order_id}
@@ -268,9 +305,25 @@ class OrderSyncEngine:
             current = self._order_mapping.setdefault(key, [])
             if order.id not in current:
                 current.append(order.id)
+            if self._state_store is not None:
+                self._state_store.record_unpark(coid)
             _log.info(
                 "recovered pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, key,
+            )
+        for coid in list(self._persisted_pending_anchors):
+            order = by_coid.get(coid)
+            if order is None:
+                continue
+            anchor = self._persisted_pending_anchors.pop(coid)
+            current = self._order_mapping.setdefault(anchor.key, [])
+            if order.id not in current:
+                current.append(order.id)
+            if self._state_store is not None:
+                self._state_store.record_unpark(coid)
+            _log.info(
+                "recovered persisted pending dispatch %s -> exchange order %s "
+                "for intent %s", coid, order.id, anchor.key,
             )
 
     def reconcile(self) -> None:
@@ -338,7 +391,7 @@ class OrderSyncEngine:
                 )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
-                self._envelopes.pop(key, None)
+                self._drop_envelope(key)
         elif t == 'rejected':
             key = self._find_key_for_order_id(event.order.id)
             if key is not None:
@@ -348,7 +401,19 @@ class OrderSyncEngine:
                 )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
-                self._envelopes.pop(key, None)
+                self._drop_envelope(key)
+
+    def _drop_envelope(self, key: str) -> None:
+        """Remove envelope state for ``key`` and persist a ``complete`` marker.
+
+        Called from every site that retires an intent (cancel dispatch,
+        unexpected cancel event, reject event). The persisted marker lets the
+        replay path skip the envelope and any still-pending verifications
+        attached to the same ``key`` — keeping the JSONL self-compacting.
+        """
+        self._envelopes.pop(key, None)
+        if self._state_store is not None:
+            self._state_store.record_complete(key)
 
     def _find_key_for_order_id(self, order_id: str) -> str | None:
         for key, ids in self._order_mapping.items():
@@ -680,8 +745,18 @@ class OrderSyncEngine:
 
         for key, intent in new_map.items():
             if key not in self._active_intents:
-                self._dispatch_new(intent)
-                self._active_intents[key] = intent
+                if key in self._order_mapping:
+                    # Cross-restart adoption: the persisted state recovered an
+                    # exchange-side order for this intent (via
+                    # _verify_pending_dispatches). Re-dispatching here would
+                    # duplicate the order — instead, adopt the existing
+                    # mapping and pin the envelope from the persisted anchor
+                    # so subsequent modifies emit the same client_order_id.
+                    self._build_envelope(intent)
+                    self._active_intents[key] = intent
+                else:
+                    self._dispatch_new(intent)
+                    self._active_intents[key] = intent
             elif intent != self._active_intents[key]:
                 self._dispatch_modify(self._active_intents[key], intent)
                 self._active_intents[key] = intent
@@ -695,6 +770,11 @@ class OrderSyncEngine:
         anchor so the ``client_order_id`` stays stable across amend cycles —
         that stability is what lets the exchange recognise a retry as a
         duplicate rather than a new order.
+
+        After a restart, the anchor for an existing ``intent_key`` is
+        reconstructed from the persisted :class:`StateStore` instead of being
+        recomputed from ``_current_bar_ts_ms`` — the latter would yield a new
+        ``client_order_id`` and break exchange-side dedup.
         """
         existing = self._envelopes.get(intent.intent_key)
         if existing is not None:
@@ -704,6 +784,16 @@ class OrderSyncEngine:
                 bar_ts_ms=existing.bar_ts_ms,
                 retry_seq=existing.retry_seq,
             )
+        anchor = self._persisted_envelope_anchors.pop(intent.intent_key, None)
+        if anchor is not None:
+            envelope = DispatchEnvelope(
+                intent=intent,
+                run_tag=self._run_tag,
+                bar_ts_ms=anchor.bar_ts_ms,
+                retry_seq=anchor.retry_seq,
+            )
+            self._envelopes[intent.intent_key] = envelope
+            return envelope
         envelope = DispatchEnvelope(
             intent=intent,
             run_tag=self._run_tag,
@@ -711,6 +801,12 @@ class OrderSyncEngine:
             retry_seq=0,
         )
         self._envelopes[intent.intent_key] = envelope
+        if self._state_store is not None:
+            self._state_store.record_envelope(
+                key=intent.intent_key,
+                bar_ts_ms=envelope.bar_ts_ms,
+                retry_seq=envelope.retry_seq,
+            )
         return envelope
 
     def _build_cancel_envelope(self, cancel: CancelIntent) -> DispatchEnvelope:
@@ -731,6 +827,11 @@ class OrderSyncEngine:
         ``_order_mapping`` once the order shows up.
         """
         self._pending_verification[error.client_order_id] = envelope
+        if self._state_store is not None:
+            self._state_store.record_park(
+                coid=error.client_order_id,
+                key=envelope.intent.intent_key,
+            )
         _log.warning(
             "dispatch for %s ended with unknown disposition "
             "(client_order_id=%s); will verify on next sync: %s",
@@ -781,7 +882,7 @@ class OrderSyncEngine:
         else:
             # CloseIntent is immediate market — nothing to cancel.
             self._order_mapping.pop(old.intent_key, None)
-            self._envelopes.pop(old.intent_key, None)
+            self._drop_envelope(old.intent_key)
             return
         cancel_envelope = self._build_cancel_envelope(cancel)
         try:
@@ -797,7 +898,7 @@ class OrderSyncEngine:
                 old.intent_key, e.client_order_id, e,
             )
         self._order_mapping.pop(old.intent_key, None)
-        self._envelopes.pop(old.intent_key, None)
+        self._drop_envelope(old.intent_key)
 
     # === Async bridge ===
 
