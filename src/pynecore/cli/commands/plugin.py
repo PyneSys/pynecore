@@ -97,6 +97,7 @@ def plugin_info(
     from ...core.plugin import discover_plugins, get_plugin_metadata, get_plugin_description
     from rich.console import Console
     from rich.markdown import Markdown
+    from rich.padding import Padding
     import dataclasses
 
     plugins = discover_plugins()
@@ -127,10 +128,11 @@ def plugin_info(
     description = get_plugin_description(cls)
     if description:
         secho("\n  Details:", fg=colors.BRIGHT_WHITE, bold=True)
-        Console().print(Markdown(description))
+        Console().print(Padding(Markdown(description), (0, 0, 0, 2)))
 
-    config_cls = getattr(cls, 'Config', None)
-    if config_cls and dataclasses.is_dataclass(config_cls):
+    config_cls: type | None = getattr(cls, 'Config', None)
+    if config_cls is not None and dataclasses.is_dataclass(config_cls):
+        # noinspection PyDataclass
         fields = dataclasses.fields(config_cls)
         if fields:
             secho(f"\n  Config fields (defaults):")
