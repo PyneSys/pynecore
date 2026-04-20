@@ -28,6 +28,7 @@ Discovery::
     cls = load_plugin("capitalcom")
 """
 
+import inspect
 import re
 import sys
 from typing import TypeVar, Generic
@@ -126,6 +127,35 @@ def get_plugin_metadata(ep: EntryPoint) -> dict[str, str]:
         'description': meta['Summary'] or '',
         'min_pynecore': _parse_min_pynecore(ep),
     }
+
+
+def get_plugin_summary(cls: type) -> str:
+    """
+    Return the first paragraph of the plugin class docstring.
+
+    The first paragraph is the text up to the first blank line, with
+    internal newlines collapsed to single spaces — suitable for a
+    one-line summary in listings.
+
+    :param cls: The plugin class.
+    :return: First-paragraph summary, or ``""`` if no docstring.
+    """
+    doc = inspect.getdoc(cls) or ""
+    first_para = doc.split("\n\n", 1)[0].strip()
+    return " ".join(first_para.split())
+
+
+def get_plugin_description(cls: type) -> str:
+    """
+    Return the full normalized plugin class docstring.
+
+    Uses :func:`inspect.getdoc`, which strips the uniform leading
+    indentation per PEP 257.
+
+    :param cls: The plugin class.
+    :return: Normalized docstring, or ``""`` if no docstring.
+    """
+    return inspect.getdoc(cls) or ""
 
 
 def _parse_min_pynecore(ep: EntryPoint) -> str:

@@ -66,13 +66,29 @@ class CCXTConfig:
 
 
 class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
-    """
-    CCXT-based provider for live OHLCV data and market metadata.
+    """CCXT-based market-data provider for ~100 crypto exchanges.
 
-    Uses CCXT for symbol discovery, historical candle downloads, and
-    CCXT Pro for real-time websocket OHLCV streaming.  Order execution
-    is NOT provided — use a dedicated exchange broker plugin
-    (``pynecore-bybit``, ``pynecore-binance``, etc.) for that.
+    Wraps the CCXT library for symbol discovery and historical candle
+    downloads, and CCXT Pro for real-time WebSocket OHLCV streaming.
+    One plugin instance serves every CCXT-registered exchange — the
+    exchange is selected from the symbol prefix (`BYBIT:BTCUSDT` etc.).
+
+    **Supported**
+
+    - Symbol discovery and market metadata across all CCXT exchanges
+    - Historical candle downloads with per-exchange bar-limit hints
+    - Real-time OHLCV WebSocket streaming (CCXT Pro)
+    - Sandbox / testnet endpoints via the `sandbox` config flag
+    - Forwards any extra field on `CCXTConfig` as a CCXT constructor
+      kwarg — add exchange-specific settings without touching the plugin
+
+    **Limitations**
+
+    - **No order execution** — this plugin is market-data only. For live
+      trading use a dedicated exchange `BrokerPlugin` (Capital.com,
+      Interactive Brokers, Bybit, Binance).
+    - API credentials are per-exchange; the defaults on `CCXTConfig`
+      apply to every exchange unless overridden via CCXT's own routing.
     """
 
     plugin_name = "CCXT"
@@ -215,7 +231,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         if self.config and getattr(self.config, 'sandbox', False):
             try:
                 self._client.set_sandbox_mode(True)
-            except Exception:  # noqa: BLE001
+            except ccxt.NotSupported:
                 pass
 
     @override
