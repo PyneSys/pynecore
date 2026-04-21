@@ -34,6 +34,7 @@ _FLAG_BRACKET = 'tp_sl_bracket'
 _FLAG_TRAIL = 'trailing_stop'
 _FLAG_STRATEGY_ORDER = 'strategy_order'
 _FLAG_EXIT_ORDERS = 'exit_orders'
+_FLAG_PARTIAL_QTY_BRACKET_EXIT = 'partial_qty_bracket_exit'
 
 
 def _strategy_call_name(node: ast.Call) -> str | None:
@@ -108,6 +109,7 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             _FLAG_TRAIL: False,
             _FLAG_STRATEGY_ORDER: False,
             _FLAG_EXIT_ORDERS: False,
+            _FLAG_PARTIAL_QTY_BRACKET_EXIT: False,
         }
         self._strategy_decorator: ast.Call | None = None
 
@@ -179,6 +181,10 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
         has_trail = (
             'trail_offset' in kws or 'trail_price' in kws or 'trail_points' in kws
         )
+        has_qty = 'qty' in kws
+        has_bracket_leg = (
+            has_limit or has_stop or has_profit_ticks or has_loss_ticks or has_trail
+        )
 
         # Full OCA-reduce bracket (both TP and SL)
         if (has_limit and has_stop) or (has_profit_ticks and has_loss_ticks):
@@ -192,6 +198,17 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
                 self._reqs[_FLAG_STOP] = True
         if has_trail:
             self._reqs[_FLAG_TRAIL] = True
+        # ``strategy.exit(qty=N, ..., limit=.../stop=.../profit=.../loss=.../
+        # trail_*=...)`` — the script pairs an explicit exit qty with bracket
+        # leg parameters. Compile-time cannot prove ``N < total entry qty``
+        # (the value may be a Series or a runtime expression), so we flag the
+        # requirement conservatively: any ``qty`` + any bracket leg → the
+        # validator rejects the script against exchanges that only support
+        # full-row position-attribute brackets (Capital.com). Scripts that
+        # always exit the entire row should omit ``qty=`` — that leaves the
+        # exchange free to cover the whole position.
+        if has_qty and has_bracket_leg:
+            self._reqs[_FLAG_PARTIAL_QTY_BRACKET_EXIT] = True
 
     # === AST injection ===
 

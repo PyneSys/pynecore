@@ -30,7 +30,10 @@ import queue
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError,
+    OrderDispositionUnknownError,
+)
 from pynecore.core.broker.intent_builder import build_intents
 from pynecore.core.broker.models import (
     BrokerEvent,
@@ -43,6 +46,7 @@ from pynecore.core.broker.models import (
     LegPartialRepairedEvent,
     LegRepairFailedEvent,
     LegType,
+    ManualInterventionRequiredEvent,
     OcaPartialFillPolicy,
     OcaType,
     OrderEvent,
@@ -154,6 +158,19 @@ class OrderSyncEngine:
         # not emit duplicate CancelIntents.
         self._cancelled_oca_groups_this_sync: set[str] = set()
 
+        # Manual-intervention halt flag. Once set (via :meth:`_record_halt`),
+        # every subsequent :meth:`sync` returns early without dispatching or
+        # draining events — the strategy must be restarted after the operator
+        # resolves the broker-side ambiguity. Plugins signal the halt by
+        # raising :class:`BrokerManualInterventionError` from any ``execute_*``
+        # or ``watch_orders``; the engine catches once, emits a
+        # :class:`ManualInterventionRequiredEvent`, and re-raises so the
+        # runner performs a graceful stop.
+        self._halted: bool = False
+        self._halted_reason: str | None = None
+        self._halted_intent_key: str | None = None
+        self._halted_context: dict = {}
+
         # Cross-restart recovery anchors. The state store persists envelope
         # identity and parked-verification entries; replay rebuilds these
         # *anchor* dicts (intent objects are not persisted — they are rebuilt
@@ -232,6 +249,9 @@ class OrderSyncEngine:
             return
         except asyncio.CancelledError:
             raise
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
         except Exception:  # pragma: no cover — defensive
             _log.exception("watch_orders stream terminated with an error")
             raise
@@ -248,6 +268,13 @@ class OrderSyncEngine:
             every :class:`DispatchEnvelope` built in this cycle. The caller
             (typically the script runner) sources this from ``lib._time``.
         """
+        if self._halted:
+            _log.warning(
+                "sync engine halted (%s); skipping sync at bar_ts_ms=%d",
+                self._halted_reason or "manual intervention required",
+                bar_ts_ms,
+            )
+            return
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
         self._drain_events()
@@ -653,6 +680,32 @@ class OrderSyncEngine:
         except Exception:  # pragma: no cover — defensive
             _log.exception("broker_event_sink raised for event %r", event)
 
+    def _record_halt(self, error: BrokerManualInterventionError) -> None:
+        """Record a manual-intervention halt and emit the observability event.
+
+        Idempotent — the first call latches the halt state and emits one
+        :class:`ManualInterventionRequiredEvent`; subsequent calls (e.g. from
+        a second dispatch path that also raised) are no-ops. After this the
+        engine's :meth:`sync` returns early on every invocation until the
+        strategy restarts.
+        """
+        if self._halted:
+            return
+        self._halted = True
+        self._halted_reason = error.reason
+        self._halted_intent_key = error.intent_key
+        self._halted_context = dict(error.context)
+        _log.error(
+            "sync engine halted by BrokerManualInterventionError: %s "
+            "(intent_key=%s, context=%r)",
+            error.reason, error.intent_key, error.context,
+        )
+        self._emit_broker_event(ManualInterventionRequiredEvent(
+            reason=error.reason,
+            intent_key=error.intent_key,
+            context=dict(error.context),
+        ))
+
     # === Tick resolution ===
 
     def _resolve_ticks(self, intent: Intent) -> Intent:
@@ -856,6 +909,9 @@ class OrderSyncEngine:
                 self._order_mapping[intent.intent_key] = [order.id]
         except OrderDispositionUnknownError as e:
             self._park_pending(envelope, e)
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
         old_env = self._build_envelope(old)
@@ -873,6 +929,9 @@ class OrderSyncEngine:
                 self._dispatch_new(new)
         except OrderDispositionUnknownError as e:
             self._park_pending(new_env, e)
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
 
     def _dispatch_cancel(self, old: Intent) -> None:
         if isinstance(old, EntryIntent):
@@ -901,6 +960,9 @@ class OrderSyncEngine:
                 "(client_order_id=%s); next reconcile will verify: %s",
                 old.intent_key, e.client_order_id, e,
             )
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
         self._order_mapping.pop(old.intent_key, None)
         self._drop_envelope(old.intent_key)
 

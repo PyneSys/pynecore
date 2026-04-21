@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 __all__ = [
     'AuthenticationError',
     'BrokerError',
+    'BrokerManualInterventionError',
     'ExchangeCapabilityError',
     'ExchangeConnectionError',
     'ExchangeOrderRejectedError',
@@ -137,3 +138,38 @@ class UnexpectedCancelError(BrokerError):
     maintenance, margin-induced cancel, etc.). The default policy is a
     graceful stop.
     """
+
+
+class BrokerManualInterventionError(BrokerError):
+    """Automated execution cannot safely continue — a human must resolve
+    broker-side ambiguity before the strategy runs again.
+
+    Raised by a BrokerPlugin when reconcile or recovery logic encounters a
+    state that cannot be resolved without risking an incorrect trade — e.g.
+    a partial-close race whose reverse leg cannot be confidently identified,
+    or a crash-recovery heuristic that finds multiple candidate deals for a
+    single submitted intent. Semantics are **terminal**: the sync engine
+    halts all further dispatches and the runner performs a graceful stop.
+    Distinct from :class:`ExchangeOrderRejectedError` (the order is known
+    not to exist) and :class:`OrderDispositionUnknownError` (the plugin
+    parks and retries on next sync) — manual intervention signals that
+    *automated* recovery cannot proceed safely.
+
+    :ivar reason: Human-readable description of the ambiguity.
+    :ivar intent_key: The intent's diff key, if the ambiguity relates to a
+        specific in-flight intent. ``None`` for orphan/recovery cases.
+    :ivar context: Plugin-supplied diagnostic dictionary (e.g. candidate
+        deal ids, snapshot totals, timing) for operator triage.
+    """
+
+    def __init__(
+            self,
+            reason: str,
+            *,
+            intent_key: str | None = None,
+            context: dict | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.intent_key = intent_key
+        self.context = context or {}

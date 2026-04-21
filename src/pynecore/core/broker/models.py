@@ -38,6 +38,7 @@ __all__ = [
     'LegPartialRepairedEvent',
     'LegRepairFailedEvent',
     'BracketReconstructedEvent',
+    'ManualInterventionRequiredEvent',
     'ProtectionDegradedEvent',
 ]
 
@@ -187,6 +188,15 @@ class ExchangeCapabilities:
     # latency budgeting, and per-exchange reconcile strategy.
     tp_sl_bracket: bool = False
     tp_sl_bracket_native: bool = False
+    # Exit bracket on a partial-qty. ``True`` means the plugin can attach
+    # TP/SL/trailing to a partial quantity of a position (e.g. Bybit/Binance
+    # per-order bracket, or any exchange where exits are separate orders).
+    # ``False`` means the bracket is a *position-level* attribute that
+    # covers the full row only (Capital.com ``stopLevel`` / ``profitLevel``
+    # on ``/positions``), so Pine ``strategy.exit(qty=N, from_entry="L")``
+    # with ``N < entry qty`` cannot be upheld — the validator rejects such
+    # scripts at startup rather than producing incorrect bracket coverage.
+    partial_qty_bracket_exit: bool = False
     # Native OCA-cancel groups: the plugin has registered the OCA group with
     # the exchange such that the exchange itself cancels sibling orders when
     # one fills (Bybit bracket, OKX algo orders, ...). When True the sync
@@ -409,6 +419,15 @@ class ScriptRequirements:
     # still-pending exit flip the book the other way. The validator turns
     # this into a hard reject when ``caps.reduce_only=False``.
     exit_orders: bool = False
+    # True if the script calls ``strategy.exit(qty=N, from_entry="L", ...)``
+    # with ``N < total qty entered under "L"`` AND includes any bracket-leg
+    # parameters (``limit=``/``stop=``/``profit=``/``loss=``/``trail_*=``).
+    # The validator rejects the script at startup when
+    # ``caps.partial_qty_bracket_exit=False`` — position-attribute bracket
+    # exchanges (Capital.com) can only attach bracket to the whole row, not
+    # a partial quantity, and silently covering the full qty would be a
+    # safety violation.
+    partial_qty_bracket_exit: bool = False
 
 
 # === Interceptor (Order Sync Engine extension point) ===
@@ -482,6 +501,23 @@ class ProtectionDegradedEvent(BrokerEvent):
     from_entry: str
     reason: str
     policy_action: str
+
+
+@dataclass
+class ManualInterventionRequiredEvent(BrokerEvent):
+    """Emitted when the sync engine halts because the plugin raised
+    :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`.
+
+    Surfaces the operator-actionable details (reason, optional intent key,
+    plugin-supplied diagnostic context) so the observability bus, on-call
+    alerting, and the user-facing event stream can page without the runner
+    needing to reach into plugin internals. After this event fires the
+    engine is halted — all subsequent :meth:`sync` calls return early until
+    the strategy is restarted.
+    """
+    reason: str
+    intent_key: str | None = None
+    context: dict | None = None
 
 
 @dataclass

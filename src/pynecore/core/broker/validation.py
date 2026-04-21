@@ -53,4 +53,16 @@ def validate_at_startup(
             "could flip the book to the other side once the position is "
             "already closed — refuse to start."
         )
+    if reqs.partial_qty_bracket_exit and not caps.partial_qty_bracket_exit:
+        errors.append(
+            "Script calls strategy.exit(qty=N, from_entry='L', ...) with a "
+            "bracket parameter (limit/stop/profit/loss/trail_*) where N is "
+            "less than the total qty entered under 'L', but the exchange "
+            "only supports full-row position-attribute brackets. The plugin "
+            "cannot attach TP/SL to a partial quantity, and silently "
+            "covering the full row would mis-hedge the strategy. Either "
+            "split into (a) strategy.exit(qty=N) without bracket + "
+            "(b) strategy.exit with bracket on the full row, or use a "
+            "different broker."
+        )
     return errors
