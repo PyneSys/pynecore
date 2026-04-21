@@ -24,8 +24,19 @@ from pynecore.core.broker.idempotency import (
     VALID_KINDS,
     build_client_order_id,
     hash_pine_id,
-    make_run_tag,
 )
+from pynecore.core.broker.run_identity import RunIdentity
+
+
+def _make_run_tag(script_source: str) -> str:
+    """Helper that adapts the old 1-arg ``make_run_tag`` signature to the new
+    :class:`RunIdentity`-based tag derivation, for test assertions that only
+    care about the ``script_source`` dimension."""
+    identity = RunIdentity(
+        strategy_id="test", symbol="S", timeframe="60",
+        account_id="default", label=None,
+    )
+    return identity.make_run_tag(script_source)
 
 # === Determinism =========================================================
 
@@ -49,7 +60,7 @@ def __test_hash_pine_id_is_deterministic__():
 
 
 def __test_make_run_tag_is_deterministic__():
-    assert make_run_tag('strategy("x")\nplot(close)') == make_run_tag('strategy("x")\nplot(close)')
+    assert _make_run_tag('strategy("x")\nplot(close)') == _make_run_tag('strategy("x")\nplot(close)')
 
 
 # === Length budget =======================================================
@@ -75,9 +86,9 @@ def __test_hash_pine_id_is_exactly_expected_width__():
 
 
 def __test_make_run_tag_is_exactly_expected_width__():
-    assert len(make_run_tag('')) == RUN_TAG_WIDTH
-    assert len(make_run_tag('strategy("x")')) == RUN_TAG_WIDTH
-    assert len(make_run_tag('y' * 100_000)) == RUN_TAG_WIDTH
+    assert len(_make_run_tag('')) == RUN_TAG_WIDTH
+    assert len(_make_run_tag('strategy("x")')) == RUN_TAG_WIDTH
+    assert len(_make_run_tag('y' * 100_000)) == RUN_TAG_WIDTH
 
 
 def __test_bar_ts_is_exactly_expected_width__():

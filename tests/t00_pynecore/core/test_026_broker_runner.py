@@ -94,6 +94,7 @@ class MockBrokerPlugin:
     close_calls: list[CloseIntent] = field(default_factory=list)
     cancel_calls: list[CancelIntent] = field(default_factory=list)
     auth_error: AuthenticationError | None = None
+    account_id: str = "default"
     _next_id: int = 0
 
     def get_capabilities(self) -> ExchangeCapabilities:

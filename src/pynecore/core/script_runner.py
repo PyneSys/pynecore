@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from pynecore.lib.strategy import Trade, Position  # noqa
     from pynecore.core.plugin.broker import BrokerPlugin
     from pynecore.core.broker.sync_engine import OrderSyncEngine
+    from pynecore.core.broker.storage import RunContext
 
 __all__ = [
     'import_script',
@@ -196,7 +197,8 @@ class ScriptRunner:
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter',
-                 '_broker_plugin', '_order_sync_engine', '_broker_event_loop')
+                 '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
+                 '_broker_store_ctx')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -207,7 +209,8 @@ class ScriptRunner:
                  security_data: dict[str, str | Path] | None = None,
                  magnifier_iter: Iterable[OHLCV] | None = None,
                  broker_plugin: 'BrokerPlugin | None' = None,
-                 broker_event_loop: Any = None):
+                 broker_event_loop: Any = None,
+                 broker_store_ctx: 'RunContext | None' = None):
         """
         Initialize the script runner
 
@@ -239,6 +242,14 @@ class ScriptRunner:
                                   runs. Passed to the :class:`OrderSyncEngine` so that
                                   broker coroutines can be awaited from the runner thread
                                   via ``run_coroutine_threadsafe``.
+        :param broker_store_ctx: Optional :class:`RunContext` from the unified
+                                 :class:`BrokerStore`. When provided the engine persists
+                                 envelope identity and parked-verification entries through
+                                 it, and the runner heartbeats this context on every sync
+                                 so crash detection works. ``None`` means no persistence
+                                 (tests, backtests) — the ``run_tag`` is then derived
+                                 locally from the plugin's ``account_id``. Caller owns
+                                 the lifecycle: ``close()`` on shutdown.
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -272,19 +283,39 @@ class ScriptRunner:
         # Done before ohlcv_iter is consumed so the engine is ready before run_iter.
         self._broker_plugin: 'BrokerPlugin | None' = broker_plugin
         self._broker_event_loop = broker_event_loop
+        self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         if broker_plugin is not None:
-            from pynecore.core.broker.idempotency import make_run_tag
             from pynecore.core.broker.position import BrokerPosition
+            from pynecore.core.broker.run_identity import RunIdentity
             from pynecore.core.broker.sync_engine import OrderSyncEngine
             # Swap the simulator position for a live tracker. The
             # @script.strategy(...) decorator already attached a SimPosition;
             # in live broker mode the exchange is authoritative, so the
             # simulator is dropped entirely.
             self.script.position = BrokerPosition()
-            run_tag = make_run_tag(
-                f"{script_path.read_text(encoding='utf-8')}\n{syminfo.ticker}",
-            )
+            if broker_store_ctx is not None:
+                # Persistence-backed run: the CLI already opened a RunContext
+                # via BrokerStore.open_run(), which computed the canonical
+                # run_tag from the full RunIdentity.
+                run_tag = broker_store_ctx.run_tag
+            else:
+                # No-persistence fallback (tests, single-shot backtests):
+                # derive the run_tag locally so every sub-path still has a
+                # stable id. The fallback identity uses the plugin's
+                # ``account_id`` (``"default"`` when the plugin has not been
+                # authenticated), matching what the persistence path would
+                # compute.
+                identity = RunIdentity(
+                    strategy_id=script_path.stem,
+                    symbol=str(syminfo.ticker),
+                    timeframe=str(syminfo.period or ""),
+                    account_id=broker_plugin.account_id,
+                    label=None,
+                )
+                run_tag = identity.make_run_tag(
+                    script_path.read_text(encoding='utf-8'),
+                )
             self._order_sync_engine = OrderSyncEngine(
                 broker=broker_plugin,
                 position=self.script.position,  # type: ignore[arg-type]
@@ -292,7 +323,13 @@ class ScriptRunner:
                 run_tag=run_tag,
                 event_loop=broker_event_loop,
                 mintick=float(syminfo.mintick) if syminfo.mintick else 0.01,
+                store_ctx=broker_store_ctx,
             )
+            # Plugin-side access to the storage run: the Capital.com plugin
+            # uses this for ``find_by_ref`` lookups, order upserts and audit
+            # event logging without having the context threaded through every
+            # ``execute_*`` signature.
+            broker_plugin.store_ctx = broker_store_ctx
 
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
@@ -336,6 +373,13 @@ class ScriptRunner:
         """
         if self._order_sync_engine is not None:
             self._order_sync_engine.sync(int(lib.last_bar_time))
+            # Heartbeat the storage run on every sync — the RunContext
+            # rate-limits internally to ``HEARTBEAT_INTERVAL_MS``, so the
+            # actual UPDATE fires at most once per minute regardless of
+            # sync frequency. SIGKILL / OOM then gets cleaned on the next
+            # open_run() via the stale-run threshold.
+            if self._broker_store_ctx is not None:
+                self._broker_store_ctx.heartbeat()
         else:
             position.process_orders()
 
@@ -345,6 +389,8 @@ class ScriptRunner:
         runs a plain sync."""
         if self._order_sync_engine is not None:
             self._order_sync_engine.sync(int(lib.last_bar_time))
+            if self._broker_store_ctx is not None:
+                self._broker_store_ctx.heartbeat()
         else:
             position.process_orders_magnified(sub_bars, candle)
 

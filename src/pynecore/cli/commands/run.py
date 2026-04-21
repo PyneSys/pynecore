@@ -240,6 +240,11 @@ def run(
                               help="Enable live broker trading — requires a provider plugin that "
                                    "subclasses BrokerPlugin. Implies --live.",
                               rich_help_panel="Live Options"),
+        run_label: str | None = Option(None, "--run-label",
+                                       help="Optional label to distinguish parallel instances of the "
+                                            "same strategy+account+symbol+timeframe. Stored in the "
+                                            "broker run_id as ``...#<label>``.",
+                                       rich_help_panel="Live Options"),
         shutdown_timeout: float = Option(120.0, "--shutdown-timeout",
                                          help="Max seconds to wait for graceful shutdown "
                                               "(0 = wait forever)",
@@ -496,6 +501,8 @@ def run(
         # Broker mode: verify plugin capability up front.
         broker_plugin = None
         broker_event_loop = None
+        broker_store = None
+        broker_store_ctx = None
         if broker:
             if not provider_data:
                 secho("--broker requires a provider string (ccxt:EXCHANGE:SYMBOL@TIMEFRAME).",
@@ -513,177 +520,221 @@ def run(
             import asyncio as _asyncio
             broker_event_loop = _asyncio.new_event_loop()
 
-        # Chain live iterator after historical if --live
-        if live and provider_data:
-            import itertools
-            from pynecore.core.plugin.live_provider import LiveProviderPlugin
-
-            if not isinstance(provider_data.provider_instance, LiveProviderPlugin):
-                secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
-                      err=True, fg=colors.RED)
+            # Open the unified broker storage and register a new run instance.
+            # The plugin's account_id is already populated by this point —
+            # _download_provider_data has driven authentication through the
+            # provider side, and the plugin stashes the identifier during
+            # its session setup.
+            from pynecore.core.broker.run_identity import RunIdentity
+            from pynecore.core.broker.storage import BrokerStore
+            store_path = app_state.workdir / "output" / "logs" / "broker.sqlite"
+            broker_store = BrokerStore(
+                store_path, plugin_name=broker_plugin.plugin_name,
+            )
+            identity = RunIdentity(
+                strategy_id=script.stem,
+                symbol=str(syminfo.ticker),
+                timeframe=str(syminfo.period or ""),
+                account_id=broker_plugin.account_id,
+                label=run_label,
+            )
+            try:
+                broker_store_ctx = broker_store.open_run(
+                    identity,
+                    script_source=script.read_text(encoding='utf-8'),
+                    script_path=script,
+                )
+            except RuntimeError as e:
+                secho(str(e), err=True, fg=colors.RED)
+                broker_store.close()
                 raise Exit(1)
 
-            from pynecore.core.script_runner import LIVE_TRANSITION
+        # The broker run is now open; every subsequent startup step
+        # (security parsing, live iterator chaining, ScriptRunner import)
+        # must run under the same try/finally that also wraps runner.run(),
+        # otherwise an early raise would leave the active runs row with a
+        # NULL ``ended_ts_ms`` and block the next startup of the same bot
+        # until the stale-cleanup window (5 min) expires.
+        try:
+            # Chain live iterator after historical if --live
+            if live and provider_data:
+                import itertools
+                from pynecore.core.plugin.live_provider import LiveProviderPlugin
 
-            live_iter = live_ohlcv_generator(
-                provider=provider_data.provider_instance,
-                symbol=provider_data.parsed_string.symbol,
-                timeframe=provider_data.parsed_string.timeframe,
-                last_historical_timestamp=time_to_ts,
-                shutdown_timeout=shutdown_timeout,
-                event_loop=broker_event_loop,
-            )
-            ohlcv_iter = itertools.chain(ohlcv_iter, [LIVE_TRANSITION], live_iter)
-            size = 0
-
-        # Parse security data mappings
-        security_data: dict[str, str | Path] | None = None
-        if security:
-            sec_map: dict[str, str | Path] = {}
-            for entry in security:
-                if '=' not in entry:
-                    secho(
-                        f"Invalid --security format: '{entry}'. "
-                        f"Expected 'TIMEFRAME=data_name' or 'SYMBOL:TIMEFRAME=data_name'",
-                        fg="red", err=True,
-                    )
+                if not isinstance(provider_data.provider_instance, LiveProviderPlugin):
+                    secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
+                          err=True, fg=colors.RED)
                     raise Exit(1)
-                key, value = entry.split('=', 1)
-                sec_path = Path(value)
-                if len(sec_path.parts) == 1:
-                    sec_path = app_state.data_dir / sec_path
-                if sec_path.suffix:
-                    sec_path = sec_path.with_suffix('')
-                ohlcv_check = sec_path.with_suffix('.ohlcv')
-                if not ohlcv_check.exists():
-                    secho(
-                        f"Security data not found: {ohlcv_check}",
-                        fg="red", err=True,
-                    )
-                    raise Exit(1)
-                sec_map[key] = str(sec_path)
-            security_data = sec_map
 
-        # Add lib directory to Python path for library imports
-        lib_dir = app_state.scripts_dir / "lib"
-        lib_path_added = False
-        if lib_dir.exists() and lib_dir.is_dir():
-            sys.path.insert(0, str(lib_dir))
-            lib_path_added = True
+                from pynecore.core.script_runner import LIVE_TRANSITION
 
-        # Set live mode flags before ScriptRunner creation
-        if live:
-            from pynecore import lib as _lib
-            _lib._is_live = True
-            _lib._strategy_suppressed = True
+                live_iter = live_ohlcv_generator(
+                    provider=provider_data.provider_instance,
+                    symbol=provider_data.parsed_string.symbol,
+                    timeframe=provider_data.parsed_string.timeframe,
+                    last_historical_timestamp=time_to_ts,
+                    shutdown_timeout=shutdown_timeout,
+                    event_loop=broker_event_loop,
+                )
+                ohlcv_iter = itertools.chain(ohlcv_iter, [LIVE_TRANSITION], live_iter)
+                size = 0
 
-        # Show loading spinner while importing
-        with Progress(
-                SpinnerColumn(finished_text="[green]✓"),
-                TextColumn("{task.description}"),
-        ) as loading_progress:
-            loading_task = loading_progress.add_task("Loading PyneCore...", total=1)
+            # Parse security data mappings
+            security_data: dict[str, str | Path] | None = None
+            if security:
+                sec_map: dict[str, str | Path] = {}
+                for entry in security:
+                    if '=' not in entry:
+                        secho(
+                            f"Invalid --security format: '{entry}'. "
+                            f"Expected 'TIMEFRAME=data_name' or 'SYMBOL:TIMEFRAME=data_name'",
+                            fg="red", err=True,
+                        )
+                        raise Exit(1)
+                    key, value = entry.split('=', 1)
+                    sec_path = Path(value)
+                    if len(sec_path.parts) == 1:
+                        sec_path = app_state.data_dir / sec_path
+                    if sec_path.suffix:
+                        sec_path = sec_path.with_suffix('')
+                    ohlcv_check = sec_path.with_suffix('.ohlcv')
+                    if not ohlcv_check.exists():
+                        secho(
+                            f"Security data not found: {ohlcv_check}",
+                            fg="red", err=True,
+                        )
+                        raise Exit(1)
+                    sec_map[key] = str(sec_path)
+                security_data = sec_map
 
-            try:
-                # Create script runner (this is where the import happens)
-                runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                                      plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
-                                      security_data=security_data,
-                                      magnifier_iter=magnifier_iter,
-                                      broker_plugin=broker_plugin,
-                                      broker_event_loop=broker_event_loop)
-            finally:
-                # Remove lib directory from Python path
-                if lib_path_added:
-                    sys.path.remove(str(lib_dir))
+            # Add lib directory to Python path for library imports
+            lib_dir = app_state.scripts_dir / "lib"
+            lib_path_added = False
+            if lib_dir.exists() and lib_dir.is_dir():
+                sys.path.insert(0, str(lib_dir))
+                lib_path_added = True
 
-            # Mark as completed
-            loading_progress.update(loading_task, completed=1)
+            # Set live mode flags before ScriptRunner creation
+            if live:
+                from pynecore import lib as _lib
+                _lib._is_live = True
+                _lib._strategy_suppressed = True
 
-        if live:
-            # Live mode: spinner instead of progress bar (no known end time)
-            with Progress(
-                    SpinnerColumn(),
-                    TextColumn("{task.description}"),
-                    CustomTimeElapsedColumn(),
-            ) as progress:
-                task = progress.add_task(description="Live streaming...", total=None)
-
-                def cb_progress_live(current_time: datetime | None):
-                    if current_time:
-                        progress.update(task, description=f"Live — {current_time:%Y-%m-%d %H:%M}")
-
-                try:
-                    runner.run(on_progress=cb_progress_live)
-                except KeyboardInterrupt:
-                    secho("\nLive streaming stopped.", fg=colors.YELLOW)
-
-        else:
-            # Batch mode: progress bar with time range
+            # Show loading spinner while importing
             with Progress(
                     SpinnerColumn(finished_text="[green]✓"),
                     TextColumn("{task.description}"),
-                    DateColumn(time_from_display),
-                    BarColumn(),
-                    CustomTimeElapsedColumn(),
-                    "/",
-                    CustomTimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task(
-                    description="Running script...",
-                    total=total_seconds,
-                )
-
-                # Create queue for progress updates
-                progress_queue = queue.Queue()
-                stop_event = threading.Event()
-
-                def progress_worker():
-                    """Worker thread that updates progress bar at 30Hz"""
-                    last_update = 0
-                    while not stop_event.is_set():
-                        try:
-                            # Drain all pending updates
-                            current_time = None
-                            while True:
-                                try:
-                                    current_time = progress_queue.get_nowait()
-                                except queue.Empty:
-                                    break
-
-                            # Update progress if we have new data
-                            if current_time is not None:
-                                if current_time == datetime.max:
-                                    current_time = time_to_display
-                                elapsed_seconds = int(
-                                    (current_time - time_from_display).total_seconds())
-                                if elapsed_seconds != last_update:
-                                    progress.update(task, completed=elapsed_seconds)
-                                    last_update = elapsed_seconds
-                        except Exception:  # noqa
-                            pass
-
-                        time.sleep(1 / 30)
-
-                # Start worker thread
-                worker = threading.Thread(target=progress_worker, daemon=True)
-                worker.start()
-
-                def cb_progress(current_time: datetime | None):
-                    """Callback that just puts timestamp in queue"""
-                    try:
-                        progress_queue.put_nowait(current_time)
-                    except queue.Full:
-                        pass
+            ) as loading_progress:
+                loading_task = loading_progress.add_task("Loading PyneCore...", total=1)
 
                 try:
-                    runner.run(on_progress=cb_progress)
-
-                    progress_queue.put(time_to_display)
-                    time.sleep(0.05)
-
-                    progress.update(task, completed=total_seconds)
+                    # Create script runner (this is where the import happens)
+                    runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
+                                          plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
+                                          security_data=security_data,
+                                          magnifier_iter=magnifier_iter,
+                                          broker_plugin=broker_plugin,
+                                          broker_event_loop=broker_event_loop,
+                                          broker_store_ctx=broker_store_ctx)
                 finally:
-                    stop_event.set()
-                    worker.join(timeout=0.1)
-                    progress.refresh()
+                    # Remove lib directory from Python path
+                    if lib_path_added:
+                        sys.path.remove(str(lib_dir))
+
+                # Mark as completed
+                loading_progress.update(loading_task, completed=1)
+
+            if live:
+                # Live mode: spinner instead of progress bar (no known end time)
+                with Progress(
+                        SpinnerColumn(),
+                        TextColumn("{task.description}"),
+                        CustomTimeElapsedColumn(),
+                ) as progress:
+                    task = progress.add_task(description="Live streaming...", total=None)
+
+                    def cb_progress_live(current_time: datetime | None):
+                        if current_time:
+                            progress.update(task, description=f"Live — {current_time:%Y-%m-%d %H:%M}")
+
+                    try:
+                        runner.run(on_progress=cb_progress_live)
+                    except KeyboardInterrupt:
+                        secho("\nLive streaming stopped.", fg=colors.YELLOW)
+
+            else:
+                # Batch mode: progress bar with time range
+                with Progress(
+                        SpinnerColumn(finished_text="[green]✓"),
+                        TextColumn("{task.description}"),
+                        DateColumn(time_from_display),
+                        BarColumn(),
+                        CustomTimeElapsedColumn(),
+                        "/",
+                        CustomTimeRemainingColumn(),
+                ) as progress:
+                    task = progress.add_task(
+                        description="Running script...",
+                        total=total_seconds,
+                    )
+
+                    # Create queue for progress updates
+                    progress_queue = queue.Queue()
+                    stop_event = threading.Event()
+
+                    def progress_worker():
+                        """Worker thread that updates progress bar at 30Hz"""
+                        last_update = 0
+                        while not stop_event.is_set():
+                            try:
+                                # Drain all pending updates
+                                current_time = None
+                                while True:
+                                    try:
+                                        current_time = progress_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+
+                                # Update progress if we have new data
+                                if current_time is not None:
+                                    if current_time == datetime.max:
+                                        current_time = time_to_display
+                                    elapsed_seconds = int(
+                                        (current_time - time_from_display).total_seconds())
+                                    if elapsed_seconds != last_update:
+                                        progress.update(task, completed=elapsed_seconds)
+                                        last_update = elapsed_seconds
+                            except Exception:  # noqa
+                                pass
+
+                            time.sleep(1 / 30)
+
+                    # Start worker thread
+                    worker = threading.Thread(target=progress_worker, daemon=True)
+                    worker.start()
+
+                    def cb_progress(current_time: datetime | None):
+                        """Callback that just puts timestamp in queue"""
+                        try:
+                            progress_queue.put_nowait(current_time)
+                        except queue.Full:
+                            pass
+
+                    try:
+                        runner.run(on_progress=cb_progress)
+
+                        progress_queue.put(time_to_display)
+                        time.sleep(0.05)
+
+                        progress.update(task, completed=total_seconds)
+                    finally:
+                        stop_event.set()
+                        worker.join(timeout=0.1)
+                        progress.refresh()
+        finally:
+            # Close the broker storage run cleanly — happy-path lezárás.
+            # Crash-path (SIGKILL, OOM) a storage stale-run cleanupjára bízott.
+            if broker_store_ctx is not None:
+                broker_store_ctx.close()
+            if broker_store is not None:
+                broker_store.close()

@@ -29,6 +29,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.models import CancelIntent, DispatchEnvelope
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import (
         ExchangeOrder,
         ExchangePosition,
@@ -57,6 +58,50 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     (stop + cancel remaining bot orders), ``"re_place"`` (auto-replace
     protective orders), or ``"ignore"`` (continue).  Plugin authors may
     override the default; users may further override via plugin config.
+    """
+
+    _account_id: str | None = None
+    """Plugin-qualified broker account identifier.
+
+    Subclasses populate this during the authentication flow
+    (``connect()`` / ``create_session()``), e.g.
+    ``self._account_id = f"capitalcom-demo-{preferred_account}"``.  The
+    :meth:`account_id` property reads from here and falls back to
+    ``"default"`` when the plugin has not been authenticated — keeps tests
+    and backtest-only paths working without mandating an identity.
+
+    The value is used by the :class:`~pynecore.core.broker.run_identity.RunIdentity`
+    to derive the ``run_id`` and ``run_tag``.  It is fixed at run-creation
+    time — if the user switches accounts at the broker UI mid-run, the bot
+    must be restarted so a new ``run_instance_id`` is allocated.  That is
+    the intended safety boundary, not a limitation.
+    """
+
+    @property
+    def account_id(self) -> str:
+        """Plugin-qualified broker account identifier.
+
+        Sync property (not async) by design: the identity must be fixed
+        before the broker storage opens a run, and the storage layer is
+        sync.  Authentication (which **is** network I/O) populates
+        ``self._account_id`` once; the property reads it back without
+        making any further calls.
+
+        :return: The populated identifier, or ``"default"`` when the plugin
+            has not yet authenticated.  Returning a sentinel rather than
+            raising keeps test paths (mock brokers, backtests) simple.
+        """
+        return self._account_id or "default"
+
+    store_ctx: 'RunContext | None' = None
+    """Optional per-run :class:`RunContext` from the unified broker storage.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` sets this on the
+    plugin after :meth:`~pynecore.core.broker.storage.BrokerStore.open_run`
+    returns, so plugin code can perform ``add_ref`` / ``find_by_ref`` /
+    ``upsert_order`` / ``log_event`` calls without receiving the context
+    as a parameter on every broker API.  ``None`` during test paths or
+    when persistence is off; plugin methods should guard accordingly.
     """
 
     # === High-level order intents ===

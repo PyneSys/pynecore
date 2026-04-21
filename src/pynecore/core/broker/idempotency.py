@@ -52,7 +52,6 @@ __all__ = [
     'BAR_TS_WIDTH',
     'build_client_order_id',
     'hash_pine_id',
-    'make_run_tag',
 ]
 
 # === Kind codes (single-character) =======================================
@@ -129,24 +128,6 @@ def hash_pine_id(pine_id: str) -> str:
     return _to_base36(value, width=PINE_ID_HASH_WIDTH)
 
 
-def make_run_tag(script_source: str) -> str:
-    """Return a 4-character base36 session tag for a script source.
-
-    Two runs of the same script under the same config yield the same tag, so
-    a restarted process reconstructs the same ``client_order_id`` for every
-    logical intent — the exchange then dedups the retry as a duplicate.
-
-    :param script_source: The Pine script source text (or any string the
-        caller wants to participate in session identity — add a config hash
-        to the input if config changes should invalidate the tag).
-    :return: Exactly 4 lower-case base36 characters.
-    """
-    digest = hashlib.sha256(script_source.encode('utf-8')).digest()
-    # 20 bits → ceil(log36(2**20)) == 4 chars. Keeps ~1M distinct tags.
-    value = int.from_bytes(digest[:3], 'big') & 0x0FFFFF
-    return _to_base36(value, width=RUN_TAG_WIDTH)
-
-
 def build_client_order_id(
         *,
         run_tag: str,
@@ -157,7 +138,8 @@ def build_client_order_id(
 ) -> str:
     """Build the canonical client-order-id for a broker dispatch.
 
-    :param run_tag: 4-char base36 session tag (see :func:`make_run_tag`).
+    :param run_tag: 4-char base36 session tag (see
+        :meth:`~pynecore.core.broker.run_identity.RunIdentity.make_run_tag`).
     :param pine_id: Pine-level order identifier; hashed internally.
     :param bar_ts_ms: Bar open timestamp in milliseconds since the Unix epoch.
         Must be non-negative.

@@ -365,7 +365,8 @@ class DispatchEnvelope:
     and the exchange dedups the duplicate.
 
     :ivar intent: The Pine-level intent this dispatch carries.
-    :ivar run_tag: 4-char base36 session tag (see :func:`make_run_tag`).
+    :ivar run_tag: 4-char base36 session tag (see
+        :meth:`~pynecore.core.broker.run_identity.RunIdentity.make_run_tag`).
     :ivar bar_ts_ms: Bar open timestamp (ms since Unix epoch).
     :ivar retry_seq: Bumped by the recovery path only when a prior attempt is
         deliberately abandoned — defaults to ``0``.

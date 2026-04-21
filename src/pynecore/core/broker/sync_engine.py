@@ -47,10 +47,10 @@ from pynecore.core.broker.models import (
     OcaType,
     OrderEvent,
 )
-from pynecore.core.broker.state_store import (
+from pynecore.core.broker.storage import (
     EnvelopeRecord,
     PendingRecord,
-    StateStore,
+    RunContext,
 )
 
 if TYPE_CHECKING:
@@ -70,7 +70,8 @@ class OrderSyncEngine:
     :param broker: The concrete :class:`BrokerPlugin` instance to drive.
     :param position: The live :class:`BrokerPosition` this engine updates.
     :param symbol: The trading symbol (as the plugin expects it).
-    :param run_tag: 4-char base36 session tag (see :func:`make_run_tag`) — seeds
+    :param run_tag: 4-char base36 session tag (see
+        :meth:`~pynecore.core.broker.run_identity.RunIdentity.make_run_tag`) — seeds
         every :class:`DispatchEnvelope` this engine builds, so restarting the
         same script under the same config regenerates the same
         ``client_order_id`` values and the exchange dedups duplicates.
@@ -92,13 +93,16 @@ class OrderSyncEngine:
         guards, ...). ``None`` disables emission — useful in tests and
         single-shot backtests; production wires the runner's observability
         bus here.
-    :param state_store: Optional :class:`StateStore` for cross-restart
-        recovery. When provided the engine persists envelope identity and
-        parked-verification entries; on construction it replays the file so
-        a restarted process re-uses the same ``client_order_id`` for every
-        live intent and matches up parked dispatches against
-        ``get_open_orders`` on the next sync. Pass ``None`` for unit tests
-        and single-shot backtests where restart safety is not required.
+    :param store_ctx: Optional :class:`RunContext` from the unified
+        :class:`BrokerStore`. When provided the engine persists envelope
+        identity and parked-verification entries through it; on construction
+        the context is replayed (``SELECT``-ed from SQLite) so a restarted
+        process re-uses the same ``client_order_id`` for every live intent
+        and matches up parked dispatches against ``get_open_orders`` on the
+        next sync. Pass ``None`` for unit tests and single-shot backtests
+        where restart safety is not required. The context also carries the
+        ``run_tag`` the engine needs — but the engine still takes ``run_tag``
+        explicitly so test paths that do not use a storage context can run.
     """
 
     def __init__(
@@ -114,7 +118,7 @@ class OrderSyncEngine:
             mintick: float = 0.01,
             oca_partial_fill_policy: OcaPartialFillPolicy = OcaPartialFillPolicy.FILL_CANCELS,
             broker_event_sink: Callable[[BrokerEvent], None] | None = None,
-            state_store: StateStore | None = None,
+            store_ctx: RunContext | None = None,
     ) -> None:
         self._broker = broker
         self._position = position
@@ -126,7 +130,7 @@ class OrderSyncEngine:
         self._mintick = mintick
         self._oca_partial_policy = oca_partial_fill_policy
         self._broker_event_sink = broker_event_sink
-        self._state_store = state_store
+        self._store_ctx = store_ctx
         # Capabilities are declared once at plugin startup — cache the lookup
         # so the cascade-cancel fast path does not pay a method call per event.
         caps = broker.get_capabilities()
@@ -158,8 +162,8 @@ class OrderSyncEngine:
         # promotes the anchor into the live in-memory state and clears it.
         self._persisted_envelope_anchors: dict[str, EnvelopeRecord] = {}
         self._persisted_pending_anchors: dict[str, PendingRecord] = {}
-        if state_store is not None:
-            envelopes, pending = state_store.replay()
+        if store_ctx is not None:
+            envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
             self._persisted_pending_anchors = dict(pending)
             if envelopes or pending:
@@ -305,8 +309,8 @@ class OrderSyncEngine:
             current = self._order_mapping.setdefault(key, [])
             if order.id not in current:
                 current.append(order.id)
-            if self._state_store is not None:
-                self._state_store.record_unpark(coid)
+            if self._store_ctx is not None:
+                self._store_ctx.record_unpark(coid)
             _log.info(
                 "recovered pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, key,
@@ -319,8 +323,8 @@ class OrderSyncEngine:
             current = self._order_mapping.setdefault(anchor.key, [])
             if order.id not in current:
                 current.append(order.id)
-            if self._state_store is not None:
-                self._state_store.record_unpark(coid)
+            if self._store_ctx is not None:
+                self._store_ctx.record_unpark(coid)
             _log.info(
                 "recovered persisted pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, anchor.key,
@@ -412,8 +416,8 @@ class OrderSyncEngine:
         attached to the same ``key`` — keeping the JSONL self-compacting.
         """
         self._envelopes.pop(key, None)
-        if self._state_store is not None:
-            self._state_store.record_complete(key)
+        if self._store_ctx is not None:
+            self._store_ctx.record_complete(key)
 
     def _find_key_for_order_id(self, order_id: str) -> str | None:
         for key, ids in self._order_mapping.items():
@@ -772,9 +776,9 @@ class OrderSyncEngine:
         duplicate rather than a new order.
 
         After a restart, the anchor for an existing ``intent_key`` is
-        reconstructed from the persisted :class:`StateStore` instead of being
-        recomputed from ``_current_bar_ts_ms`` — the latter would yield a new
-        ``client_order_id`` and break exchange-side dedup.
+        reconstructed from the persisted :class:`BrokerStore` / :class:`RunContext`
+        instead of being recomputed from ``_current_bar_ts_ms`` — the latter
+        would yield a new ``client_order_id`` and break exchange-side dedup.
         """
         existing = self._envelopes.get(intent.intent_key)
         if existing is not None:
@@ -801,8 +805,8 @@ class OrderSyncEngine:
             retry_seq=0,
         )
         self._envelopes[intent.intent_key] = envelope
-        if self._state_store is not None:
-            self._state_store.record_envelope(
+        if self._store_ctx is not None:
+            self._store_ctx.record_envelope(
                 key=intent.intent_key,
                 bar_ts_ms=envelope.bar_ts_ms,
                 retry_seq=envelope.retry_seq,
@@ -827,8 +831,8 @@ class OrderSyncEngine:
         ``_order_mapping`` once the order shows up.
         """
         self._pending_verification[error.client_order_id] = envelope
-        if self._state_store is not None:
-            self._state_store.record_park(
+        if self._store_ctx is not None:
+            self._store_ctx.record_park(
                 coid=error.client_order_id,
                 key=envelope.intent.intent_key,
             )

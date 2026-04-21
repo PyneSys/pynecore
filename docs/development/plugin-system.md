@@ -28,6 +28,7 @@ class hierarchy determines what a plugin can do:
 Plugin (base)
 ├── ProviderPlugin           — Offline OHLCV data provider
 │   └── LiveProviderPlugin   — WebSocket/streaming data (extends ProviderPlugin)
+│       └── BrokerPlugin     — Order execution (extends LiveProviderPlugin)
 ├── CLIPlugin                — CLI subcommands and parameter hooks
 └── ExtensionPlugin          — Hook-based script extension (planned)
 ```
@@ -35,8 +36,10 @@ Plugin (base)
 `LiveProviderPlugin` inherits from `ProviderPlugin` — every live provider can also download
 historical data.  See [Live Mode](../advanced/live-mode.md) for data-side details.
 
-Order execution is handled by dedicated per-exchange broker plugins
-(`pynecore-bybit`, `pynecore-binance`, etc.) — not by the data provider.
+`BrokerPlugin` inherits from `LiveProviderPlugin` — an exchange that routes orders can
+also deliver the live market data those orders trade against.  Order execution is handled
+by dedicated per-exchange broker plugins (`pynecore-bybit`, `pynecore-binance`,
+`pynecore-capitalcom`, etc.) — not by standalone data providers.
 
 Multiple inheritance combines capabilities:
 
@@ -239,6 +242,135 @@ out, users uncomment and edit what they need:
 
 The Generic type parameter (`ProviderPlugin[FooConfig]`) gives your IDE
 full type information on `self.config` — no more `object | None` warnings.
+
+### BrokerPlugin — Order Execution
+
+A `BrokerPlugin` is a `LiveProviderPlugin` that can also **route orders** to an
+exchange.  It receives high-level intents from the engine (`execute_entry`,
+`execute_exit`, `execute_close`, `execute_cancel`) and translates them into
+exchange-specific calls.  The engine handles idempotency, retry, and reconcile
+— the plugin focuses on the actual REST/WebSocket wiring.
+
+```python
+from dataclasses import dataclass
+from pynecore.core.plugin import BrokerPlugin, override
+from pynecore.core.broker.models import (
+    DispatchEnvelope, ExchangeCapabilities, ExchangeOrder, ExchangePosition,
+)
+
+
+@dataclass
+class FooBrokerConfig:
+    """Foo exchange credentials."""
+    api_key: str = ""
+    api_secret: str = ""
+    demo: bool = True
+
+
+class FooBroker(BrokerPlugin[FooBrokerConfig]):
+    Config = FooBrokerConfig
+
+    @override
+    async def connect(self) -> None:
+        # Authenticate and populate self._account_id.
+        # The account_id property later reads it back as a sync value.
+        await self._authenticate()
+        self._account_id = f"foo-{'demo' if self.config.demo else 'live'}-{self._login}"
+
+    @override
+    def get_capabilities(self) -> ExchangeCapabilities:
+        return ExchangeCapabilities(
+            stop_order=True,
+            tp_sl_bracket=True,
+            reduce_only=True,
+            # ... see pynecore.core.broker.models for the full struct
+        )
+
+    @override
+    async def execute_entry(self, envelope: DispatchEnvelope) -> ExchangeOrder:
+        ...
+
+    @override
+    async def get_position(self, symbol: str) -> ExchangePosition | None:
+        ...
+```
+
+#### Storage — `self.store_ctx`
+
+Every broker plugin gets a `RunContext` wired in by `ScriptRunner` at startup
+(`self.store_ctx`).  This is the single entry point for persistence — you do
+**not** write your own JSONL, SQLite, or in-memory bookkeeping.  The
+`RunContext` is backed by a shared `BrokerStore` (SQLite, WAL mode) at
+`workdir/output/logs/broker.sqlite`, and it gives you:
+
+- **Generic alias lookup.**  Exchange IDs that arrive later in the lifecycle
+  (Capital.com `dealId`, IB `permId`, Bybit `orderLinkId`) are stored in the
+  `order_refs` table.  Reverse lookup is a single indexed SELECT:
+
+  ```python
+  # When the exchange returns a durable ID, stash it as an alias.
+  self.store_ctx.add_ref(client_order_id, 'exchange_order_id', exchange_id)
+
+  # Later, when a fill event arrives with only the exchange ID, resolve it:
+  row = self.store_ctx.find_by_ref('exchange_order_id', exchange_id)
+  if row is not None:
+      client_order_id = row.client_order_id
+  ```
+
+- **Audit log.**  Plugin-specific events (rate-limit hits, degraded protection,
+  reconcile outcomes) go through `log_event`:
+
+  ```python
+  self.store_ctx.log_event(
+      'rate_limit_hit',
+      client_order_id=coid,
+      payload={'retry_after_s': 1.5},
+  )
+  ```
+
+- **Order state writes.**  The sync engine handles the canonical order
+  lifecycle automatically.  Only touch `upsert_order` / `set_exchange_id` /
+  `set_risk` if your plugin needs to record extra state the engine doesn't
+  know about.
+
+**Authentication and `account_id`.**  `BrokerPlugin.account_id` is a sync
+property that returns `self._account_id`.  Your `connect()` (or the first
+authenticating call) must populate `self._account_id` as a
+**plugin-qualified** string, e.g. `"foo-demo-1234567"`.  The `ScriptRunner`
+reads it once during startup to build the `run_id` — if the bot later
+switches accounts on the broker UI, the stored `run_id` won't silently drift.
+
+**Restart recovery.**  If the process is `SIGKILL`-ed or the host restarts,
+the `runs` row is left with `ended_ts_ms IS NULL` but its heartbeat goes
+stale.  The next startup's `open_run()` automatically closes stale rows
+(heartbeat > 5 min) and logs a `stale_run_cleaned` event.  There is nothing
+for the plugin to do here — recovery is built into the store.
+
+#### `BrokerStore` schema — what gets stored where
+
+A single SQLite file at `workdir/output/logs/broker.sqlite` is shared by
+every bot process in the same workdir (WAL mode; one writer at a time, no
+blocked readers).  Two identity keys share the tables:
+
+- **`run_id`** — logical stream, the humanly recognizable identifier of
+  a bot: `"{strategy}@{account}:{symbol}:{tf}[#label]"`.  Stable across
+  restarts.
+- **`run_instance_id`** — physical autoincrement integer, unique per
+  process-level run.  Historical isolation.
+
+| Table                   | Keyed by             | What it holds                                          |
+|-------------------------|----------------------|--------------------------------------------------------|
+| `runs`                  | `run_instance_id`    | Per-run metadata, heartbeat, lifecycle timestamps.     |
+| `envelopes`             | `run_id`             | Sync engine envelope identity (cross-restart).         |
+| `pending_verifications` | `run_id`             | Parked dispatches awaiting confirmation.               |
+| `orders`                | `run_instance_id`    | Live order snapshot (+ plugin-specific `extras` JSON). |
+| `order_refs`            | `run_instance_id`    | Generic alias lookup (broker IDs → `client_order_id`). |
+| `events`                | `run_instance_id`    | Audit log (dispatch, fill, reconcile, stale-cleanup).  |
+
+The `envelopes` and `pending_verifications` tables key on the **logical**
+`run_id`, so a restarted bot picks up the same idempotency anchors.
+Everything else keys on the **physical** `run_instance_id`, so historical
+runs stay isolated.
 
 ## Combining Capabilities
 
