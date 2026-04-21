@@ -16,6 +16,7 @@ réteg adott, de a mostani egyesített SQLite-based storage-on keresztül:
 Az egységtesztek a ``BrokerStore`` API-járól a ``test_029_broker_store.py``
 fájlban élnek; itt kizárólag a két réteg együttműködését vizsgáljuk.
 """
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -346,3 +347,332 @@ def __test_crashed_run_is_cleaned_on_next_open_run__(tmp_path: Path) -> None:
             (ctx_a.run_instance_id,),
         ).fetchone()
         assert ev is not None
+
+
+# === Capital.com plugin × OrderSyncEngine integration ======================
+#
+# The tests below stand up a real ``CapitalCom`` plugin (with the live
+# ``_call`` method replaced by an in-memory response table) wired through
+# the real ``OrderSyncEngine`` and ``BrokerStore``. Three end-to-end
+# scenarios are exercised:
+#
+# 1. Entry → confirm → restart → ``deal_id`` ref survives.
+# 2. POST-confirm timeout parks the dispatch, restart recovery promotes
+#    the row to ``confirmed``, next sync's ``get_open_orders`` unparks
+#    the envelope without re-dispatching.
+# 3. Market entry + bracket exit in the same sync cycle — the Capital
+#    plugin receives both envelopes and attaches the bracket to the
+#    confirmed entry row.
+#
+# These complement the plugin-local unit tests (which stub REST at
+# ``_call``) and the sync-engine-local tests above (which stub the broker
+# at the plugin interface) by exercising both layers together.
+
+
+import httpx  # noqa: E402
+
+from pynecore.lib.strategy import _order_type_close  # noqa: E402
+
+
+class _FakeCapitalCom:  # Forward-declared; replaced at import time below.
+    pass
+
+
+# Conditional import — the capitalcom plugin is editable-installed in the
+# monorepo, but tests should not hard-fail if the plugin tree is missing
+# (e.g. a pynecore-only sdist). ``pytest.skip`` provides a soft gate.
+try:
+    from pynecore_capitalcom import CapitalCom, CapitalComConfig
+except ImportError:  # pragma: no cover — defensive; plugin is installed in repo
+    CapitalCom = None  # type: ignore[assignment]
+    CapitalComConfig = None  # type: ignore[assignment]
+
+
+if CapitalCom is not None:
+
+    class _FakeCapitalCom(CapitalCom):  # type: ignore[no-redef]
+        """Capital plugin with REST stubbed via an (endpoint, method) table.
+
+        Mirrors the plugin-local test harness, but lives here so the
+        integration tests can drive the plugin end-to-end through the real
+        :class:`OrderSyncEngine` without importing the plugin's private
+        test helpers.
+        """
+
+        def __init__(self, *, config, responses=None):
+            super().__init__(config=config)
+            self._responses: dict = responses or {}
+            self._calls: list = []
+
+        async def _call(self, endpoint, *, data=None, method='post'):
+            self._calls.append((endpoint, method, data))
+            err = self._responses.get(('error', endpoint, method))
+            if err is not None:
+                # One-shot errors — consume so restart replays can succeed.
+                del self._responses[('error', endpoint, method)]
+                raise err
+            return self._responses.get((endpoint, method), {})
+
+
+_CAP_SYMBOL = "EURUSD"
+_CAP_BAR = 1_700_000_000_000
+# Minimal dealingRules payload so ``_get_instrument_rules`` returns a
+# usable :class:`_InstrumentRules` without each test re-declaring it.
+_CAP_RULES = {
+    'dealingRules': {
+        'minStepDistance': {'value': 0.01},
+        'minDealSize': {'value': 0.01},
+        'minNormalStopOrLimitDistance': {'value': 0.0001},
+    },
+    'instrument': {'lotSize': 0.01},
+}
+
+
+def _cap_config():
+    return CapitalComConfig(
+        demo=True, user_email="t@example.com",
+        api_key="k", api_password="p",
+    )
+
+
+def _open_cap_ctx(store: BrokerStore) -> RunContext:
+    identity = RunIdentity(
+        strategy_id="cap-integration", symbol=_CAP_SYMBOL, timeframe="60",
+        account_id="cap-acct", label=None,
+    )
+    return store.open_run(identity, script_source="// cap integration")
+
+
+def _mk_cap_engine(
+        broker, ctx: RunContext,
+) -> tuple[OrderSyncEngine, BrokerPosition]:
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=broker,  # type: ignore[arg-type]
+        position=pos,
+        symbol=_CAP_SYMBOL,
+        run_tag=ctx.run_tag,
+        mintick=0.0001,
+        store_ctx=ctx,
+    )
+    return engine, pos
+
+
+pytestmark_cap = pytest.mark.skipif(
+    CapitalCom is None, reason="pynecore_capitalcom plugin not installed",
+)
+
+
+@pytestmark_cap
+def __test_integration_capitalcom_entry_confirm_persists_deal_id_and_maps_order__(
+        tmp_path: Path,
+) -> None:
+    """LIMIT entry dispatched through the engine → plugin's PERSIST-FIRST
+    chain commits the deal_id ref and the engine's order_mapping reflects
+    the exchange id in a single sync cycle.
+
+    Exercises the full wiring: ``OrderSyncEngine._dispatch_new`` →
+    :meth:`CapitalCom.execute_entry` → BrokerStore upserts/refs →
+    return into :attr:`OrderSyncEngine.order_mapping`.
+    """
+    db = tmp_path / "broker.sqlite"
+
+    broker = _FakeCapitalCom(config=_cap_config(), responses={
+        (f'markets/{_CAP_SYMBOL}', 'get'): _CAP_RULES,
+        ('workingorders', 'post'): {'dealReference': 'ref-A'},
+        ('confirms/ref-A', 'get'): {
+            'dealStatus': 'ACCEPTED', 'dealId': 'deal-A',
+            'level': 1.0800, 'size': 1.0, 'status': 'WORKING',
+        },
+    })
+
+    with BrokerStore(db, plugin_name="capitalcom") as store:
+        ctx = _open_cap_ctx(store)
+        broker.store_ctx = ctx
+        engine, pos = _mk_cap_engine(broker, ctx)
+        pos.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry, limit=1.0800,
+        )
+        engine.sync(_CAP_BAR)
+
+        # engine.order_mapping is keyed by intent_key ('L') and values are
+        # the exchange ids — the plugin must return deal-A for the LIMIT
+        # entry.
+        assert engine.order_mapping["L"] == ["deal-A"]
+        # deal_id ref committed before execute_entry returned.
+        row = ctx.find_by_ref('deal_id', 'deal-A')
+        assert row is not None
+        assert row.exchange_order_id == 'deal-A'
+        assert row.state == 'confirmed'
+        # A deal_reference ref is also attached from the PERSIST-FIRST
+        # intermediate state — tests the whole §5.1 ordering.
+        assert ctx.find_by_ref('deal_reference', 'ref-A') is not None
+        ctx.close()
+
+
+@pytestmark_cap
+def __test_integration_capitalcom_parked_dispatch_recovers_and_unparks__(
+        tmp_path: Path,
+) -> None:
+    """POST timeout parks the dispatch; a subsequent recovery pass + a new
+    engine sync unpark it via ``get_open_orders`` without re-POSTing.
+
+    Same run_instance throughout — the current architecture scopes
+    ``orders`` / ``order_refs`` per run_instance, so this is the
+    widest recovery cycle the plugin + engine actually support. A
+    cross-restart variant would need run_instance-spanning reads, which
+    is out of scope here.
+    """
+    db = tmp_path / "broker.sqlite"
+
+    broker = _FakeCapitalCom(config=_cap_config(), responses={
+        (f'markets/{_CAP_SYMBOL}', 'get'): _CAP_RULES,
+        # First POST times out — engine parks the envelope.
+        ('error', 'workingorders', 'post'): httpx.TimeoutException(
+            "simulated POST timeout",
+        ),
+    })
+
+    with BrokerStore(db, plugin_name="capitalcom") as store:
+        ctx = _open_cap_ctx(store)
+        broker.store_ctx = ctx
+        engine, pos = _mk_cap_engine(broker, ctx)
+        pos.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry, limit=1.0800,
+        )
+        engine.sync(_CAP_BAR)
+
+        # The POST timeout path parks the envelope and marks the row
+        # ``disposition_unknown`` — both persisted invariants of §5.1.
+        assert len(engine.pending_verification) == 1
+        parked_coid = next(iter(engine.pending_verification))
+        row = ctx.get_order(parked_coid)
+        assert row is not None
+        assert row.state == 'disposition_unknown'
+
+        # Reset the one-shot error and seed the recovery endpoints so the
+        # next call graph succeeds. The plugin's recovery uses activity
+        # with a ±3 s createdDateUTC window against the row's
+        # created_ts_ms — align it to the row timestamp.
+        assert row.created_ts_ms is not None
+        import datetime as _dt
+        act_iso = _dt.datetime.fromtimestamp(
+            row.created_ts_ms / 1000.0, tz=_dt.UTC,
+        ).strftime('%Y-%m-%dT%H:%M:%S.000')
+        broker._responses.update({
+            ('positions', 'get'): {'positions': []},
+            ('workingorders', 'get'): {
+                'workingOrders': [
+                    {'market': {'epic': _CAP_SYMBOL},
+                     'workingOrderData': {
+                         'dealId': 'deal-P', 'direction': 'BUY',
+                         'orderType': 'LIMIT', 'orderLevel': 1.0800,
+                         'orderSize': 1.0,
+                         'createdDateUTC': act_iso,
+                     }},
+                ],
+            },
+            ('history/activity', 'get'): {'activities': [
+                {'epic': _CAP_SYMBOL, 'direction': 'BUY', 'size': 1.0,
+                 'dateUTC': act_iso, 'dealId': 'deal-P',
+                 'type': 'WORKING_ORDER', 'status': 'ACCEPTED'},
+            ]},
+        })
+
+        # Run the plugin-side recovery directly — connect() would do the
+        # same before the WS subscribes, minus the network I/O.
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        # ``disposition_unknown`` → single activity match → confirmed.
+        row = ctx.get_order(parked_coid)
+        assert row.state == 'confirmed'
+        assert row.exchange_order_id == 'deal-P'
+
+        # Drop the POST-time error so a re-dispatch would succeed (for
+        # the asserting-that-it-does-NOT-happen test below).
+        broker._responses.pop(('error', 'workingorders', 'post'), None)
+        pre_sync_calls = list(broker._calls)
+
+        # Second sync: ``_verify_pending_dispatches`` hits get_open_orders
+        # (GET /workingorders), looks the coid up via the ``deal_id`` ref
+        # the recovery just committed, and unparks.
+        engine.sync(_CAP_BAR + 60_000)
+        new_calls = broker._calls[len(pre_sync_calls):]
+        assert not any(c[0] == 'workingorders' and c[1] == 'post'
+                       for c in new_calls), (
+            "the parked envelope must unpark via get_open_orders echo, "
+            "not via a fresh POST — that would duplicate the order"
+        )
+        assert 'deal-P' in engine.order_mapping.get("L", [])
+        assert parked_coid not in engine.pending_verification
+
+        ctx.close()
+
+
+@pytestmark_cap
+def __test_integration_capitalcom_full_roundtrip_entry_bracket_tp_fill__(
+        tmp_path: Path,
+) -> None:
+    """MARKET entry + bracket exit through the engine → plugin attaches
+    the bracket to the just-confirmed entry row inside a single sync cycle.
+
+    The engine dispatches the entry intent first, which flips the row to
+    ``state='confirmed'`` before the exit intent's dispatch reads it —
+    the ordering invariant the plugin's exit handler depends on.
+    """
+    db = tmp_path / "broker.sqlite"
+
+    broker = _FakeCapitalCom(config=_cap_config(), responses={
+        (f'markets/{_CAP_SYMBOL}', 'get'): _CAP_RULES,
+        # Entry (MARKET) — POST /positions + confirm
+        ('positions', 'post'): {'dealReference': 'ref-E'},
+        ('confirms/ref-E', 'get'): {
+            'dealStatus': 'ACCEPTED', 'dealId': 'deal-E',
+            'level': 1.0800, 'size': 1.0, 'status': 'OPEN',
+        },
+        # Exit bracket PUT
+        ('positions/deal-E', 'put'): {'dealReference': 'ref-X'},
+        ('confirms/ref-X', 'get'): {
+            'dealStatus': 'ACCEPTED', 'dealId': 'deal-E',
+        },
+    })
+
+    with BrokerStore(db, plugin_name="capitalcom") as store:
+        ctx = _open_cap_ctx(store)
+        broker.store_ctx = ctx
+        engine, pos = _mk_cap_engine(broker, ctx)
+
+        pos.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry,
+        )
+        pos.exit_orders["L"] = Order(
+            "L", -1.0, order_type=_order_type_close, exit_id="TP",
+            limit=1.0900, stop=1.0750,
+        )
+        engine.sync(_CAP_BAR)
+
+        # Entry confirmed, bracket legs persisted.
+        entry_row = ctx.find_by_ref('deal_id', 'deal-E')
+        assert entry_row is not None
+        assert entry_row.state == 'confirmed'
+
+        # Bracket legs share the parent deal id under a composite
+        # client_order_id convention managed by the plugin.
+        leg_coids = [r.client_order_id for r in ctx.iter_live_orders()
+                     if (r.extras or {}).get('leg_kind') in ('tp', 'sl')]
+        assert len(leg_coids) == 2, (
+            "both TP and SL bracket legs must be persisted after the "
+            "exit dispatch completes"
+        )
+
+        # Both bracket legs are mapped under intent_key 'TP\0L' (the
+        # engine's composite key for strategy.exit("TP", from_entry="L")).
+        tp_sl_ids = engine.order_mapping.get("TP\0L", [])
+        assert any(':tp' in oid for oid in tp_sl_ids), (
+            "TP leg composite id missing from engine.order_mapping"
+        )
+        assert any(':sl' in oid for oid in tp_sl_ids), (
+            "SL leg composite id missing from engine.order_mapping"
+        )
+
+        ctx.close()
