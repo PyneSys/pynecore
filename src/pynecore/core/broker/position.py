@@ -43,6 +43,7 @@ class BrokerPosition(PositionBase):
         'netprofit', 'openprofit', 'grossprofit', 'grossloss',
         'open_commission',
         'eventrades', 'wintrades', 'losstrades',
+        'closed_trades_count',
         'max_drawdown', 'max_runup',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
@@ -64,6 +65,7 @@ class BrokerPosition(PositionBase):
         self.eventrades: int = 0
         self.wintrades: int = 0
         self.losstrades: int = 0
+        self.closed_trades_count: int = 0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
 
@@ -314,3 +316,4 @@ class BrokerPosition(PositionBase):
             self.open_trades.remove(trade)
         self.closed_trades.append(trade)
         self.new_closed_trades.append(trade)
+        self.closed_trades_count += 1

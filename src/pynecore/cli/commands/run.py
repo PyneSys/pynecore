@@ -501,6 +501,7 @@ def run(
         # Broker mode: verify plugin capability up front.
         broker_plugin = None
         broker_event_loop = None
+        broker_event_loop_thread = None
         broker_store = None
         broker_store_ctx = None
         if broker:
@@ -519,6 +520,17 @@ def run(
             broker_plugin = provider_data.provider_instance
             import asyncio as _asyncio
             broker_event_loop = _asyncio.new_event_loop()
+            # Drive the loop on a dedicated daemon thread. Broker plugin
+            # coroutines are submitted from the (synchronous) Pine script
+            # thread via ``run_coroutine_threadsafe``, which requires the
+            # target loop to actually be running — without this pump every
+            # broker call would park forever.
+            broker_event_loop_thread = threading.Thread(
+                target=broker_event_loop.run_forever,
+                daemon=True,
+                name="broker-event-loop",
+            )
+            broker_event_loop_thread.start()
 
             # Open the unified broker storage and register a new run instance.
             # The plugin's account_id is already populated by this point —
@@ -738,3 +750,14 @@ def run(
                 broker_store_ctx.close()
             if broker_store is not None:
                 broker_store.close()
+            # Stop the broker event-loop pump thread before process exit.
+            # ``call_soon_threadsafe`` is required because the loop runs on
+            # a different thread than the one issuing the stop.
+            if broker_event_loop is not None:
+                try:
+                    broker_event_loop.call_soon_threadsafe(broker_event_loop.stop)
+                except RuntimeError:
+                    pass
+                if broker_event_loop_thread is not None:
+                    broker_event_loop_thread.join(timeout=5.0)
+                broker_event_loop.close()

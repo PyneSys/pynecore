@@ -91,6 +91,9 @@ def live_ohlcv_generator(
             pass
 
     async def _async_loop():
+        # Declared before ``try`` so the ``finally`` branch can reference
+        # it even when ``provider.connect()`` raises before assignment.
+        engine_task: asyncio.Task | None = None
         try:
             await provider.connect()
             watch_symbol = provider.normalize_symbol(symbol)
@@ -100,7 +103,6 @@ def live_ohlcv_generator(
             # Broker mode: attach the Order Sync Engine's event stream as
             # a background task so OrderEvents land in its queue without
             # blocking the OHLCV reader.
-            engine_task: asyncio.Task | None = None
             if engine_event_stream is not None:
                 engine_task = asyncio.create_task(engine_event_stream)
 
@@ -188,12 +190,20 @@ def live_ohlcv_generator(
 
     def _thread_target():
         if event_loop is not None:
-            asyncio.set_event_loop(event_loop)
-            try:
-                event_loop.run_until_complete(_async_loop())
-            finally:
-                # The caller owns the loop; don't close it here.
-                pass
+            if event_loop.is_running():
+                # Loop is already driven elsewhere (e.g. the CLI broker
+                # event-loop pump). Submit our async worker onto it and
+                # block this thread on the resulting future instead of
+                # trying to start the loop a second time.
+                future = asyncio.run_coroutine_threadsafe(_async_loop(), event_loop)
+                future.result()
+            else:
+                asyncio.set_event_loop(event_loop)
+                try:
+                    event_loop.run_until_complete(_async_loop())
+                finally:
+                    # The caller owns the loop; don't close it here.
+                    pass
         else:
             asyncio.run(_async_loop())
 
