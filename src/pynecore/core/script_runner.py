@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, UTC
 
 from pynecore import lib
+from pynecore.lib.log import broker_info, ohlcv_info
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.csv_file import CSVWriter
@@ -198,7 +199,7 @@ class ScriptRunner:
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
-                 '_broker_store_ctx')
+                 '_broker_store_ctx', '_log_ohlcv', '_price_decimals')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -210,7 +211,8 @@ class ScriptRunner:
                  magnifier_iter: Iterable[OHLCV] | None = None,
                  broker_plugin: 'BrokerPlugin | None' = None,
                  broker_event_loop: Any = None,
-                 broker_store_ctx: 'RunContext | None' = None):
+                 broker_store_ctx: 'RunContext | None' = None,
+                 log_ohlcv: bool = False):
         """
         Initialize the script runner
 
@@ -257,6 +259,7 @@ class ScriptRunner:
         self._script_path = script_path
         self._security_data = security_data or {}
         self._magnifier_iter = magnifier_iter
+        self._log_ohlcv = log_ohlcv
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -335,7 +338,24 @@ class ScriptRunner:
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
         self.last_bar_index = last_bar_index
-        self.bar_index = 0
+        # Pre-increment scheme: bumped at the start of each bar's processing
+        # (warmup, live, security loops). Starting at -1 keeps the first
+        # processed bar at index 0 — matches Pine ``bar_index`` semantics.
+        self.bar_index = -1
+
+        # Precompute price decimals from ``syminfo.mintick`` so live OHLCV
+        # log lines keep a constant column width (fix-width ``%.*f``). The
+        # Pine ``format.mintick`` path in ``lib.string.tostring`` strips
+        # trailing zeros and would jitter the width, which is why we don't
+        # route through it here.
+        mintick = getattr(syminfo, 'mintick', 0) or 0
+        if mintick > 0:
+            tick_str = f"{mintick:.20f}".rstrip('0').rstrip('.')
+            self._price_decimals = (
+                len(tick_str.split('.')[1]) if '.' in tick_str else 0
+            )
+        else:
+            self._price_decimals = 2
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
@@ -405,12 +425,14 @@ class ScriptRunner:
         return self._order_sync_engine is not None
 
     # noinspection PyProtectedMember
-    def run_iter(self, on_progress: Callable[[datetime], None] | None = None) \
+    def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
+                 on_tick: Callable[[OHLCV], None] | None = None) \
             -> Iterator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']]]:
         """
         Run the script on the data
 
         :param on_progress: Callback to call on every iteration
+        :param on_tick: Optional per-update live callback (see :meth:`run`).
         :return: Return a dictionary with all data the sctipt plotted
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
@@ -421,8 +443,8 @@ class ScriptRunner:
 
         is_strat = self.script.script_type == script_type.strategy
 
-        # Reset bar_index
-        self.bar_index = 0
+        # Reset bar_index — pre-increment scheme starts at -1.
+        self.bar_index = -1
         # Reset function isolation
         function_isolation.reset()
 
@@ -455,9 +477,9 @@ class ScriptRunner:
             coro = self._broker_plugin.get_balance()
             try:
                 if self._broker_event_loop is None:
-                    asyncio.run(coro)
+                    balance = asyncio.run(coro)
                 else:
-                    asyncio.run_coroutine_threadsafe(
+                    balance = asyncio.run_coroutine_threadsafe(
                         coro, self._broker_event_loop,
                     ).result(timeout=30.0)
             except AuthenticationError as exc:
@@ -466,6 +488,13 @@ class ScriptRunner:
                     f"trading: {exc.reason}",
                     reason=exc.reason,
                 ) from exc
+
+            broker_info(
+                "authenticated: plugin=%s account=%s equity=%s",
+                type(self._broker_plugin).__name__,
+                self._broker_plugin.account_id,
+                balance,
+            )
 
         # Update syminfo lib properties if needed
         if not self.update_syminfo_every_run:
@@ -773,10 +802,20 @@ class ScriptRunner:
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_item = next(ohlcv_iterator, LIVE_TRANSITION)
             first_live_update: OHLCV | None = None
+            # Tracks the last warmup-bar timestamp so the live loop can tell
+            # whether the first live update is a new bar or an intra-bar
+            # tick of the warmup's last bar (e.g. the still-open bar that
+            # ``download_ohlcv`` brought in as historical).
+            last_warmup_timestamp: int | None = None
 
             while next_item is not LIVE_TRANSITION:
                 candle = next_item
                 next_item = next(ohlcv_iterator, LIVE_TRANSITION)
+
+                # Pre-increment: bar_index becomes the index of the bar we
+                # are about to process (first bar -> 0).
+                self.bar_index += 1
+                last_warmup_timestamp = candle.timestamp
 
                 # Update syminfo lib properties if needed
                 if self.update_syminfo_every_run:
@@ -834,7 +873,6 @@ class ScriptRunner:
                 if on_progress and lib._datetime is not None:
                     on_progress(lib._datetime.replace(tzinfo=None))
 
-                self.bar_index += 1
                 barstate.isfirst = False
 
             # --- Live mode: transition and intra-bar loop ---
@@ -851,19 +889,38 @@ class ScriptRunner:
                 barstate.islastconfirmedhistory = False
                 lib._strategy_suppressed = False
 
+                if self._broker_mode:
+                    # ``bar_index`` and ``lib._time`` are still pointing at
+                    # the last warmup bar (e.g. 499) — this log line marks
+                    # the transition AT that boundary; the next live bar
+                    # arrival will pre-increment to 500.
+                    broker_info(
+                        "live trading active - strategy no longer suppressed",
+                    )
+
                 # Flush output at transition point
                 if self.plot_writer:
                     self.plot_writer.flush()
                 if self.trades_writer:
                     self.trades_writer.flush()
 
-                last_bar_timestamp: int | None = None
+                # Seed with the last warmup bar's timestamp so that an
+                # incoming live update with the same timestamp (common when
+                # ``download_ohlcv`` returned the still-open current bar)
+                # is recognised as a continuation of the last warmup bar
+                # instead of a fresh one.
+                last_bar_timestamp: int | None = last_warmup_timestamp
                 sub_bars: list[OHLCV] = []
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
                     candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
+
+                    if is_new_bar:
+                        # Pre-increment on bar open; intra-bar ticks for the
+                        # same bar reuse the index already assigned here.
+                        self.bar_index += 1
 
                     barstate.islast = True
                     barstate.isconfirmed = bar_update.is_closed
@@ -874,6 +931,10 @@ class ScriptRunner:
                     if self.first_price is None:
                         self.first_price = lib.close  # type: ignore
                     self.last_price = lib.close  # type: ignore
+
+                    # Fire per-update tick hook (bid/ask spinner, other UI).
+                    if on_tick is not None:
+                        on_tick(candle)
 
                     if is_new_bar and not bar_update.is_closed:
                         # ── Bar open (first intra-bar tick) ──
@@ -945,6 +1006,30 @@ class ScriptRunner:
                         if var_snapshot and var_snapshot.has_vars:
                             var_snapshot.save()
 
+                        # Per-bar OHLCV log (live mode; opt-out via --no-log-ohlcv).
+                        if self._log_ohlcv:
+                            extra = candle.extra_fields or {}
+                            ask_close = extra.get('ask_close')
+                            spread = extra.get('spread')
+                            d = self._price_decimals
+                            if ask_close is not None:
+                                ohlcv_info(
+                                    "O=%.*f H=%.*f L=%.*f C=%.*f V=%.0f  "
+                                    "ask=%.*f  spread=%.*f",
+                                    d, candle.open, d, candle.high,
+                                    d, candle.low, d, candle.close,
+                                    candle.volume,
+                                    d, ask_close,
+                                    d, spread if spread is not None else 0.0,
+                                )
+                            else:
+                                ohlcv_info(
+                                    "O=%.*f H=%.*f L=%.*f C=%.*f V=%.0f",
+                                    d, candle.open, d, candle.high,
+                                    d, candle.low, d, candle.close,
+                                    candle.volume,
+                                )
+
                         # Output (only on closed bars)
                         _write_bar_output(candle)
 
@@ -961,7 +1046,6 @@ class ScriptRunner:
                             self.equity_curve.append(current_equity)
 
                         last_bar_timestamp = candle.timestamp
-                        self.bar_index += 1
                         barstate.isfirst = False
 
                         # Live strategy stats: rewrite stats file after each bar
@@ -1017,7 +1101,7 @@ class ScriptRunner:
 
                             self.trades_writer.write(
                                 trade_num,
-                                self.bar_index - 1,  # Last bar index
+                                self.bar_index,  # Last bar index processed
                                 "Exit long" if trade.size > 0 else "Exit short",
                                 "Open",  # TradingView uses "Open" signal for automatic closes
                                 string.format_time(lib._time),  # type: ignore
@@ -1105,6 +1189,10 @@ class ScriptRunner:
             var_snapshot = VarSnapshot(self.script_module, script_mod._registered_libraries)
 
         for window in magnifier:
+            # Pre-increment: bar_index becomes the index of the current
+            # aggregated chart bar.
+            self.bar_index += 1
+
             barstate.islast = window.is_last_window
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
@@ -1227,8 +1315,6 @@ class ScriptRunner:
             if on_progress and lib._datetime is not None:
                 on_progress(lib._datetime.replace(tzinfo=None))
 
-            # Update bar index
-            self.bar_index += 1
             # It is no longer the first bar
             barstate.isfirst = False
 
@@ -1312,12 +1398,18 @@ class ScriptRunner:
             except Exception:
                 pass
 
-    def run(self, on_progress: Callable[[datetime], None] | None = None):
+    def run(self, on_progress: Callable[[datetime], None] | None = None,
+            on_tick: Callable[[OHLCV], None] | None = None):
         """
         Run the script on the data
 
         :param on_progress: Callback to call on every iteration
+        :param on_tick: Optional callback invoked on every live OHLCV update
+                        (intra-bar tick + closed bar). Receives the OHLCV
+                        candle. Only fires in live mode, after the historical
+                        phase has transitioned. Used by the CLI to render
+                        bid/ask in the progress spinner.
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        for _ in self.run_iter(on_progress=on_progress):
+        for _ in self.run_iter(on_progress=on_progress, on_tick=on_tick):
             pass

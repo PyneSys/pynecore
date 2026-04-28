@@ -21,6 +21,7 @@ from ...utils.rich.date_column import DateColumn
 from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.aggregator import validate_aggregation
+from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.syminfo import SymInfo
@@ -108,11 +109,15 @@ class _ProviderData:
     """Result of provider data download, including the provider instance for live mode."""
 
     def __init__(self, ohlcv_path: Path, syminfo: 'SymInfo', provider_instance=None,
-                 parsed_string=None):
+                 parsed_string=None, time_from_ts: int | None = None):
         self.ohlcv_path = ohlcv_path
         self.syminfo = syminfo
         self.provider_instance = provider_instance
         self.parsed_string = parsed_string
+        # Exact start timestamp that yields exactly the requested bar
+        # count in ``-N bars`` mode — None when the caller should use
+        # the file's natural start (date/days mode, no bar target).
+        self.time_from_ts = time_from_ts
 
 
 def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
@@ -142,10 +147,14 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     time_from_value = _parse_time_value(time_from_str, allow_bars=True)
     time_to_dt = datetime.now(UTC).replace(second=0, microsecond=0)
 
-    # Convert bar count to time range
+    # Convert bar count to time range. ``bar_count`` being set signals
+    # the "-N bars" mode — we then guarantee at least N *real* bars
+    # (exchange-provided, non-gap-fill) after download, extending the
+    # from-timestamp on miss. Date/days ranges are left untouched.
+    tf_seconds = in_seconds(ps.timeframe)
+    bar_count: int | None = None
     if isinstance(time_from_value, int) and time_from_value < 0:
         bar_count = abs(time_from_value)
-        tf_seconds = in_seconds(ps.timeframe)
         time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * bar_count)
     else:
         assert isinstance(time_from_value, datetime)
@@ -170,39 +179,89 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         syminfo = provider_instance.get_symbol_info(force_update=not provider_instance.is_symbol_info_exists())
         progress.update(task, completed=1)
 
-    # Download OHLCV data (always fresh in provider mode)
-    with provider_instance as ohlcv_writer:
-        ohlcv_writer.seek(0)
-        ohlcv_writer.truncate()
+    # Download OHLCV data (always fresh in provider mode). In bar-count
+    # mode we may re-download with an extended ``from`` until we hit the
+    # target — some feeds omit minutes with no ticks (CFD quiet hours,
+    # illiquid futures), and ``--from -500`` must mean 500 real bars.
+    max_retries = 4
+    for attempt in range(max_retries + 1):
+        with provider_instance as ohlcv_writer:
+            ohlcv_writer.seek(0)
+            ohlcv_writer.truncate()
 
-        time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
-        time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
+            time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
+            time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
 
-        total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+            total_seconds = int((time_to_dl - time_from_dl).total_seconds())
 
-        with Progress(
-                SpinnerColumn(finished_text="[green]✓"),
-                TextColumn("{task.description}"),
-                DateColumn(time_from_dl),
-                BarColumn(),
-                TimeElapsedColumn(),
-                "/",
-                TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task("Downloading OHLCV data...", total=total_seconds)
+            with Progress(
+                    SpinnerColumn(finished_text="[green]✓"),
+                    TextColumn("{task.description}"),
+                    DateColumn(time_from_dl),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    "/",
+                    TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task("Downloading OHLCV data...", total=total_seconds)
 
-            def cb_progress(current_time: datetime):
-                elapsed_seconds = int((current_time - time_from_dl).total_seconds())
-                progress.update(task, completed=elapsed_seconds)
+                def cb_progress(current_time: datetime):
+                    elapsed_seconds = int((current_time - time_from_dl).total_seconds())
+                    progress.update(task, completed=elapsed_seconds)
 
-            provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+                provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+
+        if bar_count is None:
+            break
+
+        # Count real bars (``volume >= 0``) in the requested range —
+        # gap-fill rows (``volume == -1``) emitted by the OHLCV writer
+        # don't count against the target.
+        with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
+            real_bars = sum(1 for _ in r.read_from(
+                int(time_from_dt.timestamp()),
+                int(time_to_dt.timestamp()),
+                skip_gaps=True,
+            ))
+
+        if real_bars >= bar_count:
+            break
+        if attempt == max_retries:
+            secho(
+                f"Warning: requested {bar_count} bars, only got {real_bars} "
+                f"real bars after {max_retries + 1} attempts (feed has "
+                f"sparse coverage).",
+                fg=colors.YELLOW,
+            )
+            break
+
+        # Extend the range by the shortfall plus a proportional buffer so
+        # we likely finish in one extra pass instead of retrying again.
+        missing = bar_count - real_bars
+        gap_ratio = missing / real_bars if real_bars else 1.0
+        extra_bars = int(missing * (1.0 + gap_ratio)) + 10
+        time_from_dt -= timedelta(seconds=tf_seconds * extra_bars)
 
     assert provider_instance.ohlcv_path is not None
+
+    # For bar-count mode, pin the start timestamp to the N-th last real
+    # bar so the reader serves *exactly* N bars, not the over-fetched
+    # surplus we used to guarantee coverage through gaps.
+    exact_from_ts: int | None = None
+    if bar_count is not None:
+        with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
+            real_ts = [b.timestamp for b in r.read_from(
+                0, int(time_to_dt.timestamp()), skip_gaps=True,
+            )]
+        if len(real_ts) >= bar_count:
+            exact_from_ts = real_ts[-bar_count]
+
     return _ProviderData(
         ohlcv_path=provider_instance.ohlcv_path,
         syminfo=syminfo,
         provider_instance=provider_instance,
         parsed_string=ps,
+        time_from_ts=exact_from_ts,
     )
 
 
@@ -249,6 +308,10 @@ def run(
                                          help="Max seconds to wait for graceful shutdown "
                                               "(0 = wait forever)",
                                          rich_help_panel="Live Options"),
+        no_log_ohlcv: bool = Option(False, "--no-log-ohlcv",
+                                    help="Disable per-bar OHLCV log lines in live mode "
+                                         "(default: enabled).",
+                                    rich_help_panel="Live Options"),
         security: list[str] | None = Option(None, "--security", "-sec",
                                             help='Security data: "TIMEFRAME=data_name" or '
                                                  '"SYMBOL:TIMEFRAME=data_name"',
@@ -470,7 +533,14 @@ def run(
         time_to_dt = _parse_time_value(time_to) if time_to else None
 
         if not time_from_dt:
-            time_from_dt = reader.start_datetime
+            # Provider bar-count mode pins the start to the N-th last
+            # real bar; otherwise use the file's natural start.
+            if provider_data is not None and provider_data.time_from_ts is not None:
+                time_from_dt = datetime.fromtimestamp(
+                    provider_data.time_from_ts, UTC,
+                )
+            else:
+                time_from_dt = reader.start_datetime
         if not time_to_dt:
             time_to_dt = reader.end_datetime
 
@@ -647,7 +717,8 @@ def run(
                                           magnifier_iter=magnifier_iter,
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
-                                          broker_store_ctx=broker_store_ctx)
+                                          broker_store_ctx=broker_store_ctx,
+                                          log_ohlcv=live and not no_log_ohlcv)
                 finally:
                     # Remove lib directory from Python path
                     if lib_path_added:
@@ -657,20 +728,82 @@ def run(
                 loading_progress.update(loading_task, completed=1)
 
             if live:
+                # Share the Pine logger's Console with the live Progress so
+                # `logger.info(...)` lines render above the spinner rather
+                # than colliding with it. The PineRichHandler owns the only
+                # Console; reusing it keeps Rich's Live-intercept coherent.
+                live_console = None
+                for _h in pyne_logger.handlers:
+                    _h_console = getattr(_h, 'console', None)
+                    if _h_console is not None:
+                        live_console = _h_console
+                        break
+
+                # Latest quote snapshot — the tick hook updates these so the
+                # spinner text carries the current bid/ask even between bar
+                # closes.
+                spinner_state = {
+                    'time': None,
+                    'bid': None,
+                    'ask': None,
+                }
+
+                # Derive fixed price decimals from ``syminfo.mintick`` so
+                # the spinner prices keep a constant width (``1.16830`` /
+                # ``1.16837`` instead of ``1.1683`` / ``1.16837``). Matches
+                # the same computation in ScriptRunner for the OHLCV log.
+                _mintick = getattr(syminfo, 'mintick', 0) or 0
+                if _mintick > 0:
+                    _tick_str = f"{_mintick:.20f}".rstrip('0').rstrip('.')
+                    price_decimals = (
+                        len(_tick_str.split('.')[1])
+                        if '.' in _tick_str else 0
+                    )
+                else:
+                    price_decimals = 2
+
+                def _spinner_text() -> str:
+                    t = spinner_state['time']
+                    head = f"Live — {t:%Y-%m-%d %H:%M:%S}" if t else "Live streaming..."
+                    bid = spinner_state['bid']
+                    ask = spinner_state['ask']
+                    d = price_decimals
+                    if bid is not None and ask is not None:
+                        return (f"{head}  [green]▼ {bid:.{d}f}[/]  "
+                                f"[red]▲ {ask:.{d}f}[/]")
+                    if bid is not None:
+                        return f"{head}  [green]{bid:.{d}f}[/]"
+                    return head
+
                 # Live mode: spinner instead of progress bar (no known end time)
                 with Progress(
                         SpinnerColumn(),
                         TextColumn("{task.description}"),
                         CustomTimeElapsedColumn(),
+                        console=live_console,
                 ) as progress:
                     task = progress.add_task(description="Live streaming...", total=None)
 
                     def cb_progress_live(current_time: datetime | None):
-                        if current_time:
-                            progress.update(task, description=f"Live — {current_time:%Y-%m-%d %H:%M}")
+                        if current_time is not None:
+                            spinner_state['time'] = current_time
+                            progress.update(task, description=_spinner_text())
+
+                    def cb_tick_live(candle):
+                        extra = candle.extra_fields or {}
+                        # Prefer the live quote snapshot over ``candle.close``:
+                        # on a closed OHLC bar ``candle.close`` is the previous
+                        # period's bid-side close, not the current quote.
+                        spinner_state['bid'] = extra.get('bid_close', candle.close)
+                        spinner_state['ask'] = extra.get('ask_close')
+                        spinner_state['time'] = datetime.fromtimestamp(
+                            candle.timestamp, UTC,
+                        ).replace(tzinfo=None)
+                        progress.update(task, description=_spinner_text())
 
                     try:
-                        runner.run(on_progress=cb_progress_live)
+                        runner.run(on_progress=cb_progress_live,
+                                   on_tick=cb_tick_live)
                     except KeyboardInterrupt:
                         secho("\nLive streaming stopped.", fg=colors.YELLOW)
 

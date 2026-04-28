@@ -33,8 +33,14 @@ from typing import TYPE_CHECKING, Any
 from pynecore.core.broker.exceptions import (
     BrokerManualInterventionError,
     OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
 )
 from pynecore.core.broker.intent_builder import build_intents
+from pynecore.lib.log import (
+    broker_info as _blog_info,
+    broker_warning as _blog_warning,
+    broker_error as _blog_error,
+)
 from pynecore.core.broker.models import (
     BrokerEvent,
     CancelIntent,
@@ -408,6 +414,7 @@ class OrderSyncEngine:
     def _route_event(self, event: OrderEvent) -> None:
         t = event.event_type
         if t in ('filled', 'partial'):
+            _blog_info("event %s", event)
             self._position.record_fill(event)
             if event.leg_type == LegType.ENTRY and event.pine_id:
                 self._resolve_deferred_for_entry(event.pine_id)
@@ -416,23 +423,33 @@ class OrderSyncEngine:
         elif t == 'cancelled':
             key = self._find_key_for_order_id(event.order.id)
             if key is not None:
-                _log.error(
-                    "unexpected cancel for intent %s (exchange order %s)",
-                    key, event.order.id,
+                _blog_error(
+                    "unexpected cancel for intent %s (%s)",
+                    key, event,
                 )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
+            else:
+                _blog_info(
+                    "external cancel observed (%s)", event,
+                )
         elif t == 'rejected':
             key = self._find_key_for_order_id(event.order.id)
             if key is not None:
-                _log.warning(
-                    "order rejected for intent %s (exchange order %s)",
-                    key, event.order.id,
+                _blog_warning(
+                    "order rejected for intent %s (%s)",
+                    key, event,
                 )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
+            else:
+                _blog_warning(
+                    "order rejected (%s)", event,
+                )
+        else:
+            _blog_info("event %s", event)
 
     def _drop_envelope(self, key: str) -> None:
         """Remove envelope state for ``key`` and persist a ``complete`` marker.
@@ -461,7 +478,11 @@ class OrderSyncEngine:
         if resolved.has_unresolved_ticks:
             self._deferred_exits[entry_id] = deferred
             return
-        self._dispatch_new(resolved)
+        try:
+            self._dispatch_new(resolved)
+        except OrderSkippedByPlugin as e:
+            _blog_warning("%s", e)
+            return
         self._active_intents[resolved.intent_key] = resolved
 
     # === OCA cascade cancel ===
@@ -795,6 +816,16 @@ class OrderSyncEngine:
     def _diff_and_dispatch(self, intents: list[Intent]) -> None:
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 
+        # Pine semantic: when an entry intent fails to dispatch in this same
+        # sync (e.g. plugin reports qty below venue minimum), a bracket exit
+        # that references it via ``from_entry`` is a silent no-op — same as
+        # Pine's own simulator returning at the missing-entry check
+        # (``strategy/__init__.py``). We only short-circuit brackets whose
+        # parent we just observed skipping; brackets that reference an
+        # already-filled position (no entry intent in this sync) keep the
+        # existing dispatch behaviour.
+        skipped_entry_ids_this_sync: set[str] = set()
+
         for key in list(self._active_intents):
             if key not in new_map:
                 old = self._active_intents.pop(key)
@@ -812,10 +843,34 @@ class OrderSyncEngine:
                     self._build_envelope(intent)
                     self._active_intents[key] = intent
                 else:
-                    self._dispatch_new(intent)
+                    if (isinstance(intent, ExitIntent)
+                            and intent.from_entry is not None
+                            and intent.from_entry in skipped_entry_ids_this_sync):
+                        # Parent entry was just skipped — drop the bracket
+                        # silently. Re-evaluated next bar.
+                        continue
+                    try:
+                        self._dispatch_new(intent)
+                    except OrderSkippedByPlugin as e:
+                        # Plugin declined (e.g. qty below venue minimum).
+                        # Don't register — the intent is re-evaluated next
+                        # bar so a later sizing change can still trade.
+                        _blog_warning("%s", e)
+                        if isinstance(intent, EntryIntent):
+                            skipped_entry_ids_this_sync.add(intent.pine_id)
+                        continue
                     self._active_intents[key] = intent
             elif intent != self._active_intents[key]:
-                self._dispatch_modify(self._active_intents[key], intent)
+                try:
+                    self._dispatch_modify(self._active_intents[key], intent)
+                except OrderSkippedByPlugin as e:
+                    # The cancel+re-execute fallback inside _dispatch_modify
+                    # cancelled the old order before the plugin declined the
+                    # new one. The exchange now has nothing for this key, so
+                    # drop it from active too.
+                    _blog_warning("%s", e)
+                    self._active_intents.pop(key, None)
+                    continue
                 self._active_intents[key] = intent
             # else: unchanged — skip
 
@@ -897,6 +952,7 @@ class OrderSyncEngine:
 
     def _dispatch_new(self, intent: Intent) -> None:
         envelope = self._build_envelope(intent)
+        _blog_info("dispatching %s", intent)
         try:
             if isinstance(intent, EntryIntent):
                 orders = self._run_async(self._broker.execute_entry(envelope))
@@ -907,15 +963,39 @@ class OrderSyncEngine:
             elif isinstance(intent, CloseIntent):
                 order = self._run_async(self._broker.execute_close(envelope))
                 self._order_mapping[intent.intent_key] = [order.id]
+            _blog_info(
+                "dispatched %s -> %s",
+                intent, self._order_mapping.get(intent.intent_key),
+            )
         except OrderDispositionUnknownError as e:
+            _blog_warning(
+                "dispatch parked (unknown disposition) for %s: %s",
+                intent, e,
+            )
             self._park_pending(envelope, e)
         except BrokerManualInterventionError as e:
+            _blog_error(
+                "dispatch halted (manual intervention) for %s: %s",
+                intent, e,
+            )
             self._record_halt(e)
+            raise
+        except OrderSkippedByPlugin:
+            # Caller (_diff_and_dispatch / _resolve_deferred_for_entry) is
+            # responsible for the warning + active-intents bookkeeping —
+            # don't mislabel this as a dispatch failure.
+            raise
+        except Exception as e:
+            _blog_error(
+                "dispatch failed for %s: %s: %s",
+                intent, type(e).__name__, e,
+            )
             raise
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
         old_env = self._build_envelope(old)
         new_env = self._build_envelope(new)
+        _blog_info("modifying %s -> %s", old, new)
         try:
             if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
                 orders = self._run_async(self._broker.modify_entry(old_env, new_env))
@@ -928,9 +1008,24 @@ class OrderSyncEngine:
                 self._dispatch_cancel(old)
                 self._dispatch_new(new)
         except OrderDispositionUnknownError as e:
+            _blog_warning(
+                "modify parked (unknown disposition) for %s: %s", new, e,
+            )
             self._park_pending(new_env, e)
         except BrokerManualInterventionError as e:
+            _blog_error(
+                "modify halted (manual intervention) for %s: %s", new, e,
+            )
             self._record_halt(e)
+            raise
+        except OrderSkippedByPlugin:
+            # Inner _dispatch_new (the cancel+re-execute fallback) declined.
+            # _diff_and_dispatch handles the active-intents pop + warning.
+            raise
+        except Exception as e:
+            _blog_error(
+                "modify failed for %s: %s: %s", new, type(e).__name__, e,
+            )
             raise
 
     def _dispatch_cancel(self, old: Intent) -> None:
@@ -948,6 +1043,7 @@ class OrderSyncEngine:
             self._drop_envelope(old.intent_key)
             return
         cancel_envelope = self._build_cancel_envelope(cancel)
+        _blog_info("cancelling %s", cancel)
         try:
             self._run_async(self._broker.execute_cancel(cancel_envelope))
         except OrderDispositionUnknownError as e:
@@ -955,9 +1051,9 @@ class OrderSyncEngine:
             # state. The next reconcile() pass observes whether the order is
             # still live; if so, a subsequent cancel attempt hits the same
             # deterministic id and the exchange treats it idempotently.
-            _log.warning(
-                "cancel dispatch for %s timed out "
-                "(client_order_id=%s); next reconcile will verify: %s",
+            _blog_warning(
+                "cancel dispatch for %s timed out (coid=%s); "
+                "next reconcile will verify: %s",
                 old.intent_key, e.client_order_id, e,
             )
         except BrokerManualInterventionError as e:

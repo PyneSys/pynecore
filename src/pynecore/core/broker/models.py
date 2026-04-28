@@ -151,6 +151,24 @@ class OrderEvent:
     fee: float = 0.0
     fee_currency: str = ""
 
+    def __str__(self) -> str:
+        parts = [
+            self.event_type.upper(),
+            f"id={self.order.id}",
+            f"side={self.order.side}",
+            f"qty={self.order.qty}",
+            f"filled={self.order.filled_qty}",
+        ]
+        if self.fill_price is not None:
+            parts.append(f"price={self.fill_price}")
+        if self.pine_id:
+            parts.append(f"pine={self.pine_id!r}")
+        if self.from_entry:
+            parts.append(f"from={self.from_entry!r}")
+        if self.leg_type is not None:
+            parts.append(f"leg={self.leg_type.value}")
+        return " ".join(parts)
+
 
 @dataclass
 class ExchangePosition:
@@ -248,6 +266,18 @@ class EntryIntent:
         """Stable diff key for the sync engine."""
         return self.pine_id
 
+    def __str__(self) -> str:
+        parts = [
+            f"ENTRY {self.side.upper()} id={self.pine_id!r}",
+            f"qty={self.qty}",
+            f"type={self.order_type.value}",
+        ]
+        if self.limit is not None:
+            parts.append(f"limit={self.limit}")
+        if self.stop is not None:
+            parts.append(f"stop={self.stop}")
+        return " ".join(parts)
+
 
 @dataclass(frozen=True)
 class ExitIntent:
@@ -307,6 +337,20 @@ class ExitIntent:
         return (self.profit_ticks is not None or self.loss_ticks is not None
                 or self.trail_points_ticks is not None)
 
+    def __str__(self) -> str:
+        parts = [
+            f"EXIT id={self.pine_id!r}",
+            f"from={self.from_entry!r}",
+            f"qty={self.qty}",
+        ]
+        if self.tp_price is not None:
+            parts.append(f"tp={self.tp_price}")
+        if self.sl_price is not None:
+            parts.append(f"sl={self.sl_price}")
+        if self.trail_price is not None or self.trail_offset is not None:
+            parts.append(f"trail={self.trail_price}/{self.trail_offset}")
+        return " ".join(parts)
+
 
 @dataclass(frozen=True)
 class CloseIntent:
@@ -339,6 +383,11 @@ class CloseIntent:
     def intent_key(self) -> str:
         return self.pine_id
 
+    def __str__(self) -> str:
+        return (
+            f"CLOSE id={self.pine_id!r} side={self.side} qty={self.qty}"
+        )
+
 
 @dataclass(frozen=True)
 class CancelIntent:
@@ -360,6 +409,10 @@ class CancelIntent:
         if self.from_entry is not None:
             return f"{self.pine_id}\0{self.from_entry}"
         return self.pine_id
+
+    def __str__(self) -> str:
+        tail = f" from={self.from_entry!r}" if self.from_entry else ""
+        return f"CANCEL id={self.pine_id!r}{tail}"
 
 
 # === Dispatch envelope ===

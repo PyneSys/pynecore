@@ -1,11 +1,12 @@
 from typing import Any
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
 from .string import format as _format
 from .. import lib
+from ..types import NA
 
 # Try to import rich, but don't fail if not available
 try:
@@ -14,38 +15,50 @@ try:
 except ImportError:
     rich = None
 
-__all__ = 'info', 'warning', 'error', 'logger', 'setup_security_file_log'
+
+__all__ = (
+    'info', 'warning', 'error', 'logger', 'setup_security_file_log',
+    'broker_info', 'broker_warning', 'broker_error', 'ohlcv_info',
+)
 
 _security_logger: logging.Logger | None = None
 
 if os.environ.get("PYNE_NO_COLOR_LOG", "") == "1":
     rich = None
 
+
+# noinspection PyProtectedMember
+def _resolve_log_time(record: logging.LogRecord) -> datetime:
+    """Pick the timestamp + timezone for a log record.
+
+    Single source of truth for all three formatters (Rich, plain, security
+    file). Prefers Pine time (``lib._time``); falls back to the record's
+    wall clock when Pine time is unset (startup phase before the first bar).
+    Either way the result is timezone-aware: ``syminfo.timezone`` if set,
+    otherwise UTC — so the ``%z`` column is never blank.
+    """
+    tz = getattr(getattr(lib, 'syminfo', None), 'timezone', None)
+    tz_valid = bool(tz) and not isinstance(tz, NA)
+    if lib._time:
+        if tz_valid:
+            return lib._get_dt(lib._time, tz)
+        return datetime.fromtimestamp(lib._time / 1000, UTC)
+    dt = datetime.fromtimestamp(record.created, UTC)
+    if tz_valid:
+        return dt.astimezone(lib._parse_timezone(tz))
+    return dt
+
 # Custom RichHandler that uses Pine Script time and timezone
 if rich:
     class PineRichHandler(rich.logging.RichHandler):
         """Custom RichHandler that formats time using syminfo.timezone"""
 
-        # noinspection PyProtectedMember
         def render(self, *, record, traceback, message_renderable):
             """Override render to use Pine Script time and timezone"""
-            from ..types import NA
-            from datetime import UTC
             from rich.text import Text
             from rich.table import Table
 
-            # Get the datetime in the correct timezone
-            if lib._time:
-                tz = lib.syminfo.timezone
-                if not tz or isinstance(tz, NA):
-                    # No timezone, use UTC
-                    log_time = datetime.fromtimestamp(lib._time / 1000, UTC)
-                else:
-                    # Use specified timezone
-                    log_time = lib._get_dt(lib._time, tz)
-            else:
-                # No Pine time, use current time
-                log_time = datetime.fromtimestamp(record.created)
+            log_time = _resolve_log_time(record)
 
             # Format the time
             path = Path(record.pathname).name
@@ -98,21 +111,7 @@ class PineLogFormatter(logging.Formatter):
 
     def formatTime(self, record: logging.LogRecord, datefmt: str = None) -> str:
         """Format the time using syminfo.timezone"""
-        from datetime import UTC
-        from ..types import NA
-
-        # Get the appropriate datetime
-        if lib._time:
-            tz = lib.syminfo.timezone
-            if not tz or isinstance(tz, NA):
-                # No timezone, use UTC
-                dt = datetime.fromtimestamp(lib._time / 1000, UTC)
-            else:
-                # Use specified timezone
-                dt = lib._get_dt(lib._time, tz)
-        else:
-            # No Pine time, use record's time
-            dt = datetime.fromtimestamp(record.created)
+        dt = _resolve_log_time(record)
 
         # Format the datetime
         if datefmt:
@@ -198,24 +197,13 @@ class SecurityFileFormatter(logging.Formatter):
         self.context_label = context_label
 
     def format(self, record: logging.LogRecord) -> str:
-        from datetime import UTC
-        from ..types import NA
-
         if record.args:
             msg = _format(record.msg, *record.args)
             record.args = ()
         else:
             msg = str(record.msg)
 
-        if lib._time:
-            tz = lib.syminfo.timezone
-            if not tz or isinstance(tz, NA):
-                dt = datetime.fromtimestamp(lib._time / 1000, UTC)
-            else:
-                dt = lib._get_dt(lib._time, tz)
-        else:
-            dt = datetime.fromtimestamp(record.created)
-
+        dt = _resolve_log_time(record)
         time_str = dt.strftime("%Y-%m-%d %H:%M:%S%z")
         bar_str = f" bar: {lib.bar_index:6}" if hasattr(lib, 'bar_index') and lib.bar_index is not None else ""
 
@@ -271,3 +259,41 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
             _security_logger.error(formatString, *args)
         return
     logger.error(formatString, *args)
+
+
+#
+# Internal tagged helpers
+#
+# These route non-Pine-script events (broker dispatch, OHLCV market data,
+# any future category) through the same logger handler as ``info/warning/
+# error`` above — uniform Pine-time + ``bar: N`` columns, same Rich
+# Console (which the live CLI spinner shares). They pre-format ``%``-style
+# placeholders client-side so call sites use idiomatic Python logging
+# rather than Pine's ``string.format`` ``{0}/{1}`` numbered placeholders.
+# All internal tagging lives here so the codebase has one central log
+# module, not one per subsystem.
+#
+
+def _emit_tagged(level: int, prefix: str, message: str, args: tuple) -> None:
+    text = prefix + (message % args if args else message)
+    logger.log(level, text)
+
+
+def broker_info(message: str, *args: Any) -> None:
+    """Emit an INFO-level broker event (``[BROKER]`` tag)."""
+    _emit_tagged(logging.INFO, "[BROKER] ", message, args)
+
+
+def broker_warning(message: str, *args: Any) -> None:
+    """Emit a WARNING-level broker event (``[BROKER]`` tag)."""
+    _emit_tagged(logging.WARNING, "[BROKER] ", message, args)
+
+
+def broker_error(message: str, *args: Any) -> None:
+    """Emit an ERROR-level broker event (``[BROKER]`` tag)."""
+    _emit_tagged(logging.ERROR, "[BROKER] ", message, args)
+
+
+def ohlcv_info(message: str, *args: Any) -> None:
+    """Emit an INFO-level market-data line (``[OHLCV]`` tag)."""
+    _emit_tagged(logging.INFO, "[OHLCV] ", message, args)

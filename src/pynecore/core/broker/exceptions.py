@@ -20,6 +20,7 @@ __all__ = [
     'ExchangeRateLimitError',
     'InsufficientMarginError',
     'OrderDispositionUnknownError',
+    'OrderSkippedByPlugin',
     'OrderSyncError',
     'UnexpectedCancelError',
 ]
@@ -125,6 +126,39 @@ class OrderDispositionUnknownError(BrokerError):
         super().__init__(message)
         self.client_order_id = client_order_id
         self.cause = cause
+
+
+class OrderSkippedByPlugin(BrokerError):
+    """Plugin proactively declined to dispatch — not a failure, no order sent.
+
+    Distinct from :class:`ExchangeOrderRejectedError` (the exchange said no)
+    and :class:`OrderDispositionUnknownError` (network-ambiguous): the plugin
+    short-circuited *before* contacting the exchange because the intent does
+    not satisfy a known venue constraint (e.g. ``intent.qty`` below the
+    instrument's ``min_size``). The Order Sync Engine logs a broker-warning
+    and refuses to register the intent in ``_active_intents``, so the next
+    bar re-evaluates the intent freely — a runtime sizing model that yields
+    a placeable qty later just trades normally without recovery glue.
+
+    :ivar intent_key: The intent's diff key, for engine-side lookups.
+    :ivar reason: Short stable token (e.g. ``"below_min_size"``) for log
+        filtering and programmatic policy.
+    :ivar context: Plugin-supplied diagnostic dictionary (symbol, qty,
+        min_size, …) for operator triage.
+    """
+
+    def __init__(
+            self,
+            message: str,
+            *,
+            intent_key: str,
+            reason: str = "",
+            context: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.intent_key = intent_key
+        self.reason = reason
+        self.context = context or {}
 
 
 class OrderSyncError(BrokerError):
