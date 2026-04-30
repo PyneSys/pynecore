@@ -337,20 +337,6 @@ class ScriptRunner:
             # ``execute_*`` signature.
             broker_plugin.store_ctx = broker_store_ctx
 
-            # Drive ``BrokerPlugin.watch_orders`` into the engine's event
-            # queue on the broker event loop. Without this task, fill events
-            # never reach ``BrokerPosition.record_fill`` and ``position.size``
-            # stays at 0 forever — the script then keeps re-entering on
-            # every flat-only branch tick because it never sees its own
-            # already-open position. ``run_coroutine_threadsafe`` is the
-            # right primitive: ``ScriptRunner`` constructs synchronously
-            # while ``broker_event_loop`` runs on its own daemon thread.
-            if broker_event_loop is not None:
-                self._engine_event_stream_future = asyncio.run_coroutine_threadsafe(
-                    self._order_sync_engine.run_event_stream(),
-                    broker_event_loop,
-                )
-
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
@@ -396,6 +382,39 @@ class ScriptRunner:
             "Cumulative profit %", f"Run-up {syminfo.currency}", "Run-up %", f"Drawdown {syminfo.currency}",
             "Drawdown %",
         )) if trade_path else None
+
+    # === Broker startup ====================================================
+
+    def start_broker(self) -> None:
+        """Start broker-side I/O after construction.
+
+        Two side effects, both intentionally kept out of ``__init__`` so the
+        caller can finish ``Loading PyneCore`` (script import + runner setup)
+        before any broker logs appear:
+
+        1. Schedule :meth:`OrderSyncEngine.run_event_stream` on the broker
+           event loop. Without this task, fill events never reach
+           :meth:`BrokerPosition.record_fill` and ``position.size`` stays
+           at 0 — the script then keeps re-entering on every flat-only
+           branch tick because it never sees its own already-open position.
+        2. Run the startup reconcile. Adopts the exchange's authoritative
+           state (``get_position`` → ``BrokerPosition.size``/``avg_price``,
+           ``get_open_orders`` → ``_order_mapping``) before the first bar
+           runs. Without this, a fresh process restart with an open
+           exchange position would see ``position_size == 0`` in Pine and
+           re-enter — opening a *second* position alongside the existing
+           one.
+
+        No-op when not in broker mode.
+        """
+        if self._order_sync_engine is None:
+            return
+        if self._broker_event_loop is not None:
+            self._engine_event_stream_future = asyncio.run_coroutine_threadsafe(
+                self._order_sync_engine.run_event_stream(),
+                self._broker_event_loop,
+            )
+        self._order_sync_engine.reconcile()
 
     # === Order-processing dispatch =========================================
 
@@ -921,9 +940,7 @@ class ScriptRunner:
                     # the last warmup bar (e.g. 499) — this log line marks
                     # the transition AT that boundary; the next live bar
                     # arrival will pre-increment to 500.
-                    broker_info(
-                        "live trading active - strategy no longer suppressed",
-                    )
+                    broker_info("live trading active")
 
                 # Flush output at transition point.
                 if self.plot_writer:
@@ -1021,18 +1038,16 @@ class ScriptRunner:
                         # caused them.
                         if self._log_ohlcv:
                             extra = candle.extra_fields or {}
-                            ask_close = extra.get('ask_close')
                             spread = extra.get('spread')
                             d = self._price_decimals
-                            if ask_close is not None:
+                            if spread is not None:
                                 ohlcv_info(
-                                    "O=%.*f H=%.*f L=%.*f C=%.*f V=%.0f  "
-                                    "ask=%.*f  spread=%.*f",
+                                    "O=%.*f H=%.*f L=%.*f C=%.*f "
+                                    "spread=%.*f V=%.0f",
                                     d, candle.open, d, candle.high,
                                     d, candle.low, d, candle.close,
+                                    d, spread,
                                     candle.volume,
-                                    d, ask_close,
-                                    d, spread if spread is not None else 0.0,
                                 )
                             else:
                                 ohlcv_info(

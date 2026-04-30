@@ -165,15 +165,6 @@ class OrderSyncError(BrokerError):
     """Exchange state diverged from the expected internal state."""
 
 
-class UnexpectedCancelError(BrokerError):
-    """A bot-owned order disappeared without the bot having cancelled it.
-
-    Indicates external interference (manual user action, exchange-side
-    maintenance, margin-induced cancel, etc.). The default policy is a
-    graceful stop.
-    """
-
-
 class BrokerManualInterventionError(BrokerError):
     """Automated execution cannot safely continue — a human must resolve
     broker-side ambiguity before the strategy runs again.
@@ -207,3 +198,17 @@ class BrokerManualInterventionError(BrokerError):
         self.reason = reason
         self.intent_key = intent_key
         self.context = context or {}
+
+
+class UnexpectedCancelError(BrokerManualInterventionError):
+    """A bot-owned order disappeared without the bot having cancelled it.
+
+    Indicates external interference (manual user action, exchange-side
+    maintenance, margin-induced cancel, etc.). Modelled as a manual-
+    intervention error because automated recovery cannot reason about why
+    the order vanished — the safe default is to halt and let a human
+    inspect. The sync engine's :meth:`run_event_stream` and dispatch paths
+    catch :class:`BrokerManualInterventionError` uniformly, so the same
+    graceful-stop pipeline applies whether the trigger came from a polling
+    snapshot or from an in-flight dispatch.
+    """

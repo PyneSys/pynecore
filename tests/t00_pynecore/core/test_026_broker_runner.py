@@ -95,6 +95,8 @@ class MockBrokerPlugin:
     cancel_calls: list[CancelIntent] = field(default_factory=list)
     auth_error: AuthenticationError | None = None
     account_id: str = "default"
+    startup_position: ExchangePosition | None = None
+    startup_open_orders: list[ExchangeOrder] = field(default_factory=list)
     _next_id: int = 0
 
     def get_capabilities(self) -> ExchangeCapabilities:
@@ -141,10 +143,10 @@ class MockBrokerPlugin:
         return [self._mk_order(new)]
 
     async def get_open_orders(self, symbol=None):
-        return []
+        return list(self.startup_open_orders)
 
     async def get_position(self, symbol):
-        return None
+        return self.startup_position
 
     async def get_balance(self):
         if self.auth_error is not None:
@@ -228,6 +230,38 @@ def __test_broker_mode_swaps_position_to_broker_position__(tmp_path):
 
     assert isinstance(runner.script.position, BrokerPosition)
     assert runner._order_sync_engine is not None
+
+
+def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
+    """A pre-existing exchange position is adopted into ``BrokerPosition``
+    before the script runs, so a flat-only entry condition does NOT re-fire
+    and double up. Without the startup reconcile call, the script sees
+    ``position_size == 0`` after a process restart and dispatches a fresh
+    entry alongside the live one.
+    """
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(),
+        startup_position=ExchangePosition(
+            symbol="BTCUSDT", side="long", size=1.5, entry_price=50_000.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="cross",
+        ),
+    )
+    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(1),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+    )
+    runner.start_broker()
+
+    pos = runner.script.position
+    assert isinstance(pos, BrokerPosition)
+    assert pos.size == 1.5
+    assert pos.sign == 1.0
+    assert pos.avg_price == 50_000.0
 
 
 def __test_startup_validation_rejects_incompatible_script__(tmp_path):

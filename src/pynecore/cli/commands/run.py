@@ -638,29 +638,16 @@ def run(
         # NULL ``ended_ts_ms`` and block the next startup of the same bot
         # until the stale-cleanup window (5 min) expires.
         try:
-            # Chain live iterator after historical if --live
+            # Validate live mode capability up front (the live iterator is
+            # created only AFTER ``Loading PyneCore`` finishes, so its eager
+            # ``WS connect`` log doesn't race the spinner).
             if live and provider_data:
-                import itertools
                 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 
                 if not isinstance(provider_data.provider_instance, LiveProviderPlugin):
                     secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
                           err=True, fg=colors.RED)
                     raise Exit(1)
-
-                # Eager start: the live iterator subscribes immediately
-                # and yields its own LIVE_TRANSITION sentinel once the
-                # warmup catch-up queue empties — no static delimiter in
-                # the chain.
-                live_iter = live_ohlcv_generator(
-                    provider=provider_data.provider_instance,
-                    symbol=provider_data.parsed_string.symbol,
-                    timeframe=provider_data.parsed_string.timeframe,
-                    last_historical_timestamp=time_to_ts,
-                    shutdown_timeout=shutdown_timeout,
-                    event_loop=broker_event_loop,
-                )
-                ohlcv_iter = itertools.chain(ohlcv_iter, live_iter)
                 size = 0
 
             # Parse security data mappings
@@ -728,6 +715,27 @@ def run(
 
                 # Mark as completed
                 loading_progress.update(loading_task, completed=1)
+
+            # Now that the script is loaded, start the live OHLCV stream.
+            # ``live_ohlcv_generator`` eager-starts the WS connect (and
+            # blocks until subscribed), so doing it AFTER the spinner keeps
+            # the ``[BROKER] WS connect …`` lines below ``✓ Loading PyneCore``
+            # in the user-visible startup log.
+            if live and provider_data:
+                import itertools
+                live_iter = live_ohlcv_generator(
+                    provider=provider_data.provider_instance,
+                    symbol=provider_data.parsed_string.symbol,
+                    timeframe=provider_data.parsed_string.timeframe,
+                    last_historical_timestamp=time_to_ts,
+                    shutdown_timeout=shutdown_timeout,
+                    event_loop=broker_event_loop,
+                )
+                runner.ohlcv_iter = itertools.chain(runner.ohlcv_iter, live_iter)
+
+            # Start broker-side I/O (watch_orders task + startup reconcile).
+            # No-op when ``broker_plugin`` is None.
+            runner.start_broker()
 
             if live:
                 # Share the Pine logger's Console with the live Progress so

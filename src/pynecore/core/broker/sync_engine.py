@@ -275,12 +275,16 @@ class OrderSyncEngine:
             (typically the script runner) sources this from ``lib._time``.
         """
         if self._halted:
-            _log.warning(
-                "sync engine halted (%s); skipping sync at bar_ts_ms=%d",
+            # Surface the halt so the script_runner bar loop exits via its
+            # ``finally`` block — without this, an async halt triggered from
+            # ``run_event_stream`` (e.g. an :class:`UnexpectedCancelError`
+            # observed by the polling plugin) would only set the flag and the
+            # runner would silently keep iterating.
+            raise BrokerManualInterventionError(
                 self._halted_reason or "manual intervention required",
-                bar_ts_ms,
+                intent_key=self._halted_intent_key,
+                context=dict(self._halted_context),
             )
-            return
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
         self._drain_events()
@@ -378,18 +382,18 @@ class OrderSyncEngine:
         exchange_ids = {o.id for o in orders}
         stale = tracked_ids - exchange_ids
         if stale:
-            _log.warning(
+            _blog_warning(
                 "tracked orders missing from exchange: %s", stale,
             )
         untracked = exchange_ids - tracked_ids
         if untracked:
-            _log.info(
+            _blog_info(
                 "unknown orders on exchange (not bot-owned): %s", untracked,
             )
 
         exch_pos = self._run_async(self._broker.get_position(self._symbol))
         if exch_pos is not None and exch_pos.size != self._position.size:
-            _log.warning(
+            _blog_warning(
                 "position size mismatch (exchange=%s, internal=%s) — "
                 "adopting exchange",
                 exch_pos.size, self._position.size,
