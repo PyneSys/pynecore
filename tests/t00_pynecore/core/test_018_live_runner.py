@@ -5,12 +5,36 @@ import asyncio
 import time
 
 from pynecore.core.live_runner import live_ohlcv_generator
+from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.types.ohlcv import OHLCV
 
 
 def _make_ohlcv(timestamp: int, close: float = 100.0, is_closed: bool = True) -> OHLCV:
     return OHLCV(timestamp=timestamp, open=close, high=close + 1,
                  low=close - 1, close=close, volume=1000.0, is_closed=is_closed)
+
+
+def _drain(provider, *args, **kwargs) -> tuple[list[OHLCV], list[OHLCV]]:
+    """Consume the live iterator and split out the pre/post LIVE_TRANSITION halves.
+
+    Returns ``(catchup_bars, live_bars)`` — the warmup catch-up batch
+    (empty in tests where the producer hasn't queued anything by the
+    time the consumer hits its first ``get_nowait``) and everything
+    yielded after the in-band transition sentinel. Tests typically only
+    care about ``live_bars``; the split makes the boundary explicit.
+    """
+    catchup: list[OHLCV] = []
+    live: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, *args, **kwargs):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if seen_transition:
+            live.append(item)
+        else:
+            catchup.append(item)
+    return catchup, live
 
 
 class MockLiveProvider:
@@ -56,7 +80,7 @@ class MockLiveProvider:
 
 
 def __test_live_generator_yields_all_bar_updates__():
-    """live_ohlcv_generator yields both intra-bar and closed bar updates"""
+    """live_ohlcv_generator yields both intra-bar and closed bar updates after the transition"""
     updates = [
         _make_ohlcv(1000, is_closed=False, close=100.0),
         _make_ohlcv(1000, is_closed=True, close=101.0),
@@ -65,7 +89,7 @@ def __test_live_generator_yields_all_bar_updates__():
     ]
 
     provider = MockLiveProvider(updates)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    _, bars = _drain(provider, "BTC/USDT", "1D")
 
     assert len(bars) == 4
     assert not bars[0].is_closed
@@ -77,7 +101,15 @@ def __test_live_generator_yields_all_bar_updates__():
 
 
 def __test_live_generator_filters_old_bars__():
-    """live_ohlcv_generator skips bars older than last_historical_timestamp"""
+    """live_ohlcv_generator skips bars strictly older than last_historical_timestamp.
+
+    A bar at exactly ``last_historical_timestamp`` MUST pass through —
+    that's the close of the still-open last-warmup bar (e.g.
+    Capital.com's REST history includes the currently-forming bar, and
+    the WS push for its close has the same timestamp). The script_runner
+    live loop recognises the same-timestamp first live update as a
+    continuation of the last warmup bar.
+    """
     updates = [
         _make_ohlcv(1000, is_closed=True, close=100.0),
         _make_ohlcv(2000, is_closed=True, close=200.0),
@@ -85,12 +117,14 @@ def __test_live_generator_filters_old_bars__():
     ]
 
     provider = MockLiveProvider(updates)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D",
-                                     last_historical_timestamp=2000))
+    _, bars = _drain(provider, "BTC/USDT", "1D",
+                     last_historical_timestamp=2000)
 
-    assert len(bars) == 1
-    assert bars[0].timestamp == 3000
-    assert bars[0].close == 300.0
+    assert len(bars) == 2
+    assert bars[0].timestamp == 2000
+    assert bars[0].close == 200.0
+    assert bars[1].timestamp == 3000
+    assert bars[1].close == 300.0
 
 
 def __test_live_generator_yields_ohlcv_objects__():
@@ -100,7 +134,7 @@ def __test_live_generator_yields_ohlcv_objects__():
     ]
 
     provider = MockLiveProvider(updates)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    _, bars = _drain(provider, "BTC/USDT", "1D")
 
     assert len(bars) == 1
     assert isinstance(bars[0], OHLCV)
@@ -120,10 +154,20 @@ def __test_live_generator_connects_and_disconnects__():
 
 
 def __test_live_generator_empty_stream__():
-    """live_ohlcv_generator handles empty stream gracefully"""
+    """live_ohlcv_generator emits LIVE_TRANSITION even for an empty stream"""
     provider = MockLiveProvider([])
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
-    assert len(bars) == 0
+    items = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    assert items == [LIVE_TRANSITION]
+
+
+def __test_live_generator_emits_transition_sentinel__():
+    """live_ohlcv_generator yields exactly one LIVE_TRANSITION sentinel between catch-up and live phases"""
+    updates = [_make_ohlcv(1000, is_closed=True), _make_ohlcv(2000, is_closed=True)]
+    provider = MockLiveProvider(updates)
+
+    items = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    transitions = [i for i, x in enumerate(items) if x is LIVE_TRANSITION]
+    assert len(transitions) == 1, f"expected exactly one LIVE_TRANSITION, got {len(transitions)}"
 
 
 class DelayedShutdownProvider(MockLiveProvider):
@@ -222,7 +266,7 @@ def __test_reconnect_calls_disconnect_before_connect__():
     ]
 
     provider = ReconnectTrackingProvider(updates, fail_at_index=1)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    _, bars = _drain(provider, "BTC/USDT", "1D")
 
     # Should have: connect, [fail], disconnect, connect, ..., disconnect (shutdown)
     assert provider.call_log[0] == 'connect'
@@ -283,7 +327,7 @@ def __test_queue_overflow_preserves_closed_bars__():
 
     # 200 intra-bar updates will overflow the 100-item queue
     provider = FloodProvider(intra_bar_count=200, closed_bars=closed_bars)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    _, bars = _drain(provider, "BTC/USDT", "1D")
 
     # All closed bars must be present
     closed_received = [b for b in bars if b.is_closed]
@@ -352,7 +396,7 @@ def __test_connection_error_triggers_reconnect__():
     ]
 
     provider = ListenerDeathProvider(updates, die_at_index=2)
-    bars = list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
+    _, bars = _drain(provider, "BTC/USDT", "1D")
 
     # Should get bars from before and after the simulated death
     assert len(bars) >= 2

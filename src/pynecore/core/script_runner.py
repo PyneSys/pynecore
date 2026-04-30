@@ -807,6 +807,10 @@ class ScriptRunner:
             # tick of the warmup's last bar (e.g. the still-open bar that
             # ``download_ohlcv`` brought in as historical).
             last_warmup_timestamp: int | None = None
+            warmup_bars_processed = 0
+
+            if is_live and self._broker_plugin is not None:
+                broker_info("warmup phase started — replaying historical bars")
 
             while next_item is not LIVE_TRANSITION:
                 candle = next_item
@@ -816,6 +820,7 @@ class ScriptRunner:
                 # are about to process (first bar -> 0).
                 self.bar_index += 1
                 last_warmup_timestamp = candle.timestamp
+                warmup_bars_processed += 1
 
                 # Update syminfo lib properties if needed
                 if self.update_syminfo_every_run:
@@ -875,15 +880,21 @@ class ScriptRunner:
 
                 barstate.isfirst = False
 
+            if is_live and self._broker_plugin is not None:
+                broker_info(
+                    "warmup phase complete — %d bar(s) processed",
+                    warmup_bars_processed,
+                )
+
             # --- Live mode: transition and intra-bar loop ---
-            # After the historical loop, if LIVE_TRANSITION was hit, get the first live bar
+            # Flip the historical→live flags and emit the transition log
+            # **before** blocking on the first WS bar. Otherwise the log
+            # appears to fire only when the first live update arrives,
+            # which can be a full period later (or never if the WS push
+            # for the boundary bar is dedup-eaten upstream) — making the
+            # transition look gated on data instead of on the warmup
+            # boundary it actually represents.
             if next_item is LIVE_TRANSITION and is_live:
-                first_live_update = next(ohlcv_iterator, None)
-
-            if first_live_update is not None:
-                import itertools
-
-                # Transition: historical → live
                 barstate.ishistory = False
                 barstate.isrealtime = True
                 barstate.islastconfirmedhistory = False
@@ -898,11 +909,16 @@ class ScriptRunner:
                         "live trading active - strategy no longer suppressed",
                     )
 
-                # Flush output at transition point
+                # Flush output at transition point.
                 if self.plot_writer:
                     self.plot_writer.flush()
                 if self.trades_writer:
                     self.trades_writer.flush()
+
+                first_live_update = next(ohlcv_iterator, None)
+
+            if first_live_update is not None:
+                import itertools
 
                 # Seed with the last warmup bar's timestamp so that an
                 # incoming live update with the same timestamp (common when
@@ -980,33 +996,13 @@ class ScriptRunner:
                         if not run_on_every_tick:
                             barstate.isnew = True
 
-                        # Order processing: magnified if sub_bars available
-                        if is_strat and position:
-                            if sub_bars:
-                                if var_snapshot and var_snapshot.has_vars:
-                                    _coof_magnified_loop(sub_bars, candle)
-                                    var_snapshot.restore()
-                                else:
-                                    self._process_orders_magnified(position, sub_bars, candle)
-                            else:
-                                if var_snapshot and var_snapshot.has_vars:
-                                    _coof_loop()
-                                    var_snapshot.restore()
-                                else:
-                                    self._process_orders(position)
-
-                        # Final script execution for the closed bar
-                        lib._plot_data.clear()
-                        _run_libs_and_main()
-
-                        if is_strat and position:
-                            self._process_deferred_margin_call(position)
-
-                        # Commit state for next bar
-                        if var_snapshot and var_snapshot.has_vars:
-                            var_snapshot.save()
-
                         # Per-bar OHLCV log (live mode; opt-out via --no-log-ohlcv).
+                        # Logged at bar close *before* strategy processing so
+                        # the on-screen log order — `[OHLCV] ... → [BROKER]
+                        # dispatching ENTRY ... → [BROKER] fill ...` — matches
+                        # the actual event order. Logging after the strategy
+                        # ran would make orders appear before the bar that
+                        # caused them.
                         if self._log_ohlcv:
                             extra = candle.extra_fields or {}
                             ask_close = extra.get('ask_close')
@@ -1029,6 +1025,50 @@ class ScriptRunner:
                                     d, candle.low, d, candle.close,
                                     candle.volume,
                                 )
+
+                        if self._broker_mode:
+                            # Broker mode: run the script FIRST (this bar's
+                            # close queues new orders) and THEN sync the
+                            # exchange so dispatch happens *on the same bar*.
+                            # Calling sync first would dispatch the previous
+                            # close's queue here, adding one full bar of
+                            # stale latency to every entry/exit. TV live
+                            # semantics: a market order placed at bar close
+                            # fills near the next bar's open price (sub-second
+                            # in practice). Pine sub-bar magnification and
+                            # synchronous COOF re-execution don't apply —
+                            # the exchange is the source of truth.
+                            lib._plot_data.clear()
+                            _run_libs_and_main()
+                            if is_strat and position:
+                                self._process_orders(position)
+                        else:
+                            # Backtest: simulator first (fills the previous
+                            # close's queue at this bar's open price), then
+                            # script executes at this bar's close.
+                            if is_strat and position:
+                                if sub_bars:
+                                    if var_snapshot and var_snapshot.has_vars:
+                                        _coof_magnified_loop(sub_bars, candle)
+                                        var_snapshot.restore()
+                                    else:
+                                        self._process_orders_magnified(position, sub_bars, candle)
+                                else:
+                                    if var_snapshot and var_snapshot.has_vars:
+                                        _coof_loop()
+                                        var_snapshot.restore()
+                                    else:
+                                        self._process_orders(position)
+
+                            lib._plot_data.clear()
+                            _run_libs_and_main()
+
+                        if is_strat and position:
+                            self._process_deferred_margin_call(position)
+
+                        # Commit state for next bar
+                        if var_snapshot and var_snapshot.has_vars:
+                            var_snapshot.save()
 
                         # Output (only on closed bars)
                         _write_bar_output(candle)

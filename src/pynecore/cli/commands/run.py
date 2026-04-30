@@ -648,8 +648,10 @@ def run(
                           err=True, fg=colors.RED)
                     raise Exit(1)
 
-                from pynecore.core.script_runner import LIVE_TRANSITION
-
+                # Eager start: the live iterator subscribes immediately
+                # and yields its own LIVE_TRANSITION sentinel once the
+                # warmup catch-up queue empties — no static delimiter in
+                # the chain.
                 live_iter = live_ohlcv_generator(
                     provider=provider_data.provider_instance,
                     symbol=provider_data.parsed_string.symbol,
@@ -658,7 +660,7 @@ def run(
                     shutdown_timeout=shutdown_timeout,
                     event_loop=broker_event_loop,
                 )
-                ohlcv_iter = itertools.chain(ohlcv_iter, [LIVE_TRANSITION], live_iter)
+                ohlcv_iter = itertools.chain(ohlcv_iter, live_iter)
                 size = 0
 
             # Parse security data mappings
