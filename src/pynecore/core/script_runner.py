@@ -1,5 +1,6 @@
 from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any
 from types import ModuleType
+import asyncio
 import sys
 from pathlib import Path
 from datetime import datetime, UTC
@@ -199,6 +200,7 @@ class ScriptRunner:
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
+                 '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals')
 
     # noinspection PyProtectedMember
@@ -288,6 +290,7 @@ class ScriptRunner:
         self._broker_event_loop = broker_event_loop
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
+        self._engine_event_stream_future: Any = None
         if broker_plugin is not None:
             from pynecore.core.broker.position import BrokerPosition
             from pynecore.core.broker.run_identity import RunIdentity
@@ -333,6 +336,20 @@ class ScriptRunner:
             # event logging without having the context threaded through every
             # ``execute_*`` signature.
             broker_plugin.store_ctx = broker_store_ctx
+
+            # Drive ``BrokerPlugin.watch_orders`` into the engine's event
+            # queue on the broker event loop. Without this task, fill events
+            # never reach ``BrokerPosition.record_fill`` and ``position.size``
+            # stays at 0 forever — the script then keeps re-entering on
+            # every flat-only branch tick because it never sees its own
+            # already-open position. ``run_coroutine_threadsafe`` is the
+            # right primitive: ``ScriptRunner`` constructs synchronously
+            # while ``broker_event_loop`` runs on its own daemon thread.
+            if broker_event_loop is not None:
+                self._engine_event_stream_future = asyncio.run_coroutine_threadsafe(
+                    self._order_sync_engine.run_event_stream(),
+                    broker_event_loop,
+                )
 
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
@@ -454,7 +471,6 @@ class ScriptRunner:
         # Broker mode: refuse to start if the script needs capabilities the
         # exchange doesn't offer. Fail fast — never on the first bar.
         if self._broker_plugin is not None:
-            import asyncio
             from pynecore.core.broker.validation import validate_at_startup
             from pynecore.core.broker.exceptions import (
                 AuthenticationError,
@@ -1201,6 +1217,13 @@ class ScriptRunner:
                 if sec_sync_block and sec_result_blocks:
                     from .security import cleanup_shared_memory
                     cleanup_shared_memory(sec_sync_block, sec_result_blocks)
+
+            # Cancel the broker event-stream task scheduled in __init__.
+            # Done before loop teardown so the watch_orders generator gets
+            # a chance to clean up its HTTP session.
+            if self._engine_event_stream_future is not None:
+                self._engine_event_stream_future.cancel()
+                self._engine_event_stream_future = None
 
             # Reset library variables
             _reset_lib_vars(lib)
