@@ -25,6 +25,7 @@ from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.lib.log import broker_warning
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
@@ -589,6 +590,15 @@ def run(
         broker_event_loop_thread = None
         broker_store = None
         broker_store_ctx = None
+        # Live OHLCV consumer generator — captured here so the outer
+        # ``finally`` can close it explicitly *before* the broker event
+        # loop is torn down. Without that, the consumer's own ``finally``
+        # only runs when the runner is GC'd (after the function returns),
+        # by which point ``broker_event_loop`` is already closed and the
+        # producer thread's ``run_coroutine_threadsafe`` future is stuck
+        # on a dead loop — its ``thread.join(shutdown_timeout + 5)`` then
+        # blocks the whole ~125 s before the process actually exits.
+        live_iter = None
         if broker:
             if not provider_data:
                 secho("--broker requires a provider string (ccxt:EXCHANGE:SYMBOL@TIMEFRAME).",
@@ -801,11 +811,16 @@ def run(
                     return head
 
                 # Live mode: spinner instead of progress bar (no known end time)
+                # ``transient=True`` clears the live spinner row when the
+                # ``with`` block exits, so the user-visible tail is just the
+                # ``[BROKER]`` log lines — no orphaned ``⠧ Live —``
+                # snapshot frozen below the final halt entry.
                 with Progress(
                         SpinnerColumn(),
                         TextColumn("{task.description}"),
                         CustomTimeElapsedColumn(),
                         console=live_console,
+                        transient=True,
                 ) as progress:
                     task = progress.add_task(description="Live streaming...", total=None)
 
@@ -830,21 +845,24 @@ def run(
                         runner.run(on_progress=cb_progress_live,
                                    on_tick=cb_tick_live)
                     except KeyboardInterrupt:
-                        secho("\nLive streaming stopped.", fg=colors.YELLOW)
-                    except BrokerManualInterventionError as exc:
-                        secho(
-                            f"\nLive streaming stopped: {exc.reason}",
-                            fg=colors.RED,
-                        )
-                        if exc.context:
-                            secho(
-                                f"  context: {exc.context}",
-                                fg=colors.RED,
-                            )
-                        secho(
-                            "  Manual intervention required — resolve the "
-                            "broker-side state and restart.",
-                            fg=colors.YELLOW,
+                        # Tear down the spinner BEFORE the follow-up log line
+                        # so it doesn't print over the bottom of the screen
+                        # — Rich captures the live region as a snapshot below
+                        # every log line, otherwise leaving an orphan
+                        # ``⠧ Live — …`` row in the transcript.
+                        progress.stop()
+                        broker_warning("live streaming stopped (interrupted)")
+                    except BrokerManualInterventionError:
+                        # The ``[BROKER] ERROR sync engine halted by …`` line
+                        # logged from ``OrderSyncEngine._record_halt`` already
+                        # carries the reason + context. Just append a single
+                        # follow-up hint in the same Pine log format so the
+                        # operator knows the strategy is no longer running.
+                        progress.stop()
+                        broker_warning(
+                            "live streaming stopped — manual intervention "
+                            "required, resolve the broker-side state and "
+                            "restart"
                         )
 
             else:
@@ -917,6 +935,16 @@ def run(
                         worker.join(timeout=0.1)
                         progress.refresh()
         finally:
+            # Close the live OHLCV consumer first so its ``finally`` can
+            # signal ``stop_event`` and join the producer thread WHILE the
+            # broker event loop is still alive — otherwise the producer's
+            # ``run_coroutine_threadsafe`` future never completes and the
+            # join times out at ``shutdown_timeout + 5`` seconds.
+            if live_iter is not None:
+                try:
+                    live_iter.close()
+                except Exception:  # noqa: BLE001 — defensive teardown
+                    pass
             # Close the broker storage run cleanly — happy-path lezárás.
             # Crash-path (SIGKILL, OOM) a storage stale-run cleanupjára bízott.
             if broker_store_ctx is not None:
