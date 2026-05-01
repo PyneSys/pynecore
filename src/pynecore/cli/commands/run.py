@@ -155,7 +155,12 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     bar_count: int | None = None
     if isinstance(time_from_value, int) and time_from_value < 0:
         bar_count = abs(time_from_value)
-        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * bar_count)
+        # Pad the request by one bar to absorb the still-forming current
+        # bar that closed-bars-only providers (e.g. Capital.com) filter
+        # out of history responses. Without this, every ``-N`` run
+        # against a now-aligned end-time would burn a wasted retry pass
+        # (``real_bars == N - 1`` on first attempt → retry → success).
+        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * (bar_count + 1))
     else:
         assert isinstance(time_from_value, datetime)
         time_from_dt = time_from_value
@@ -183,27 +188,36 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     # mode we may re-download with an extended ``from`` until we hit the
     # target — some feeds omit minutes with no ticks (CFD quiet hours,
     # illiquid futures), and ``--from -500`` must mean 500 real bars.
+    # The Progress wrapper lives outside the retry loop so a gap-driven
+    # second pass updates the same spinner instead of stamping a
+    # duplicate ``Downloading OHLCV data...`` line.
     max_retries = 4
-    for attempt in range(max_retries + 1):
-        with provider_instance as ohlcv_writer:
-            ohlcv_writer.seek(0)
-            ohlcv_writer.truncate()
+    with Progress(
+            SpinnerColumn(finished_text="[green]✓"),
+            TextColumn("{task.description}"),
+            DateColumn(),
+            BarColumn(),
+            TimeElapsedColumn(),
+            "/",
+            TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "Downloading OHLCV data...", total=1, start_time=time_from_dt,
+        )
+        for attempt in range(max_retries + 1):
+            with provider_instance as ohlcv_writer:
+                ohlcv_writer.seek(0)
+                ohlcv_writer.truncate()
 
-            time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
-            time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
+                time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
+                time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
 
-            total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+                total_seconds = int((time_to_dl - time_from_dl).total_seconds())
 
-            with Progress(
-                    SpinnerColumn(finished_text="[green]✓"),
-                    TextColumn("{task.description}"),
-                    DateColumn(time_from_dl),
-                    BarColumn(),
-                    TimeElapsedColumn(),
-                    "/",
-                    TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task("Downloading OHLCV data...", total=total_seconds)
+                progress.update(
+                    task, total=total_seconds, completed=0,
+                    start_time=time_from_dl,
+                )
 
                 def cb_progress(current_time: datetime):
                     elapsed_seconds = int((current_time - time_from_dl).total_seconds())
@@ -211,36 +225,36 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
 
                 provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
 
-        if bar_count is None:
-            break
+            if bar_count is None:
+                break
 
-        # Count real bars (``volume >= 0``) in the requested range —
-        # gap-fill rows (``volume == -1``) emitted by the OHLCV writer
-        # don't count against the target.
-        with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-            real_bars = sum(1 for _ in r.read_from(
-                int(time_from_dt.timestamp()),
-                int(time_to_dt.timestamp()),
-                skip_gaps=True,
-            ))
+            # Count real bars (``volume >= 0``) in the requested range —
+            # gap-fill rows (``volume == -1``) emitted by the OHLCV writer
+            # don't count against the target.
+            with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
+                real_bars = sum(1 for _ in r.read_from(
+                    int(time_from_dt.timestamp()),
+                    int(time_to_dt.timestamp()),
+                    skip_gaps=True,
+                ))
 
-        if real_bars >= bar_count:
-            break
-        if attempt == max_retries:
-            secho(
-                f"Warning: requested {bar_count} bars, only got {real_bars} "
-                f"real bars after {max_retries + 1} attempts (feed has "
-                f"sparse coverage).",
-                fg=colors.YELLOW,
-            )
-            break
+            if real_bars >= bar_count:
+                break
+            if attempt == max_retries:
+                secho(
+                    f"Warning: requested {bar_count} bars, only got {real_bars} "
+                    f"real bars after {max_retries + 1} attempts (feed has "
+                    f"sparse coverage).",
+                    fg=colors.YELLOW,
+                )
+                break
 
-        # Extend the range by the shortfall plus a proportional buffer so
-        # we likely finish in one extra pass instead of retrying again.
-        missing = bar_count - real_bars
-        gap_ratio = missing / real_bars if real_bars else 1.0
-        extra_bars = int(missing * (1.0 + gap_ratio)) + 10
-        time_from_dt -= timedelta(seconds=tf_seconds * extra_bars)
+            # Extend the range by the shortfall plus a proportional buffer so
+            # we likely finish in one extra pass instead of retrying again.
+            missing = bar_count - real_bars
+            gap_ratio = missing / real_bars if real_bars else 1.0
+            extra_bars = int(missing * (1.0 + gap_ratio)) + 10
+            time_from_dt -= timedelta(seconds=tf_seconds * extra_bars)
 
     assert provider_instance.ohlcv_path is not None
 

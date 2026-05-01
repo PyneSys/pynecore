@@ -235,6 +235,14 @@ class OrderSyncEngine:
         loop. If the plugin does not implement WebSocket streaming, the
         method logs and returns — the engine then relies on
         :meth:`reconcile` for fill detection.
+
+        Each incoming event is logged immediately on arrival — the actual
+        :meth:`_route_event` processing is deferred to the next
+        :meth:`_drain_events` call (i.e. the next bar's :meth:`sync`), so
+        a log emitted only at drain time would falsely tag the fill with
+        the *next* bar's ``bar_index``.  Logging here, on the broker event
+        loop, captures the moment the broker actually observed the
+        transition.
         """
         try:
             stream = self._broker.watch_orders()
@@ -246,6 +254,7 @@ class OrderSyncEngine:
             return
         try:
             async for event in stream:
+                _blog_info("event %s", event)
                 self._event_queue.put(event)
         except NotImplementedError:
             _log.info(
@@ -261,6 +270,28 @@ class OrderSyncEngine:
         except Exception:  # pragma: no cover — defensive
             _log.exception("watch_orders stream terminated with an error")
             raise
+
+    def apply_async_events(self) -> None:
+        """Drain any async-arrived broker events into the position state.
+
+        Call this from the script runner BEFORE running the user script on
+        each bar.  Without it, fills observed asynchronously between bars
+        only become visible to ``position.size`` when the next bar's
+        :meth:`sync` runs (i.e. AFTER that bar's script has executed),
+        leaving the script's view of the position one bar stale.
+
+        Also propagates an async-recorded halt (e.g. an
+        :class:`UnexpectedCancelError` from ``run_event_stream``) so the
+        bar loop exits via its ``finally`` block instead of running the
+        script with stale state.
+        """
+        if self._halted:
+            raise BrokerManualInterventionError(
+                self._halted_reason or "manual intervention required",
+                intent_key=self._halted_intent_key,
+                context=dict(self._halted_context),
+            )
+        self._drain_events()
 
     def sync(self, bar_ts_ms: int) -> None:
         """Run one diff/dispatch cycle.
@@ -287,6 +318,10 @@ class OrderSyncEngine:
             )
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
+        # Drain again here in case events arrived between
+        # ``apply_async_events`` (start of this bar) and now.  ``sync`` is
+        # also called from contexts that don't pre-drain (e.g. tests, the
+        # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
         self._verify_pending_dispatches()
 
@@ -416,10 +451,19 @@ class OrderSyncEngine:
             self._route_event(event)
 
     def _route_event(self, event: OrderEvent) -> None:
+        # Generic ``event %s`` arrival logging happens in
+        # :meth:`run_event_stream` so the timestamp + ``bar_index`` reflect
+        # when the broker observed the transition, not when this drain
+        # pulled it off the queue.  Only intent-key-specific lines (which
+        # need engine state) are emitted here.
         t = event.event_type
         if t in ('filled', 'partial'):
-            _blog_info("event %s", event)
             self._position.record_fill(event)
+            _blog_info(
+                "position size=%s sign=%s avg=%s (after %s pine=%r)",
+                self._position.size, self._position.sign,
+                self._position.avg_price, t, event.pine_id,
+            )
             if event.leg_type == LegType.ENTRY and event.pine_id:
                 self._resolve_deferred_for_entry(event.pine_id)
                 self._amend_bracket_qty_for_entry_fill(event)
@@ -452,8 +496,6 @@ class OrderSyncEngine:
                 _blog_warning(
                     "order rejected (%s)", event,
                 )
-        else:
-            _blog_info("event %s", event)
 
     def _drop_envelope(self, key: str) -> None:
         """Remove envelope state for ``key`` and persist a ``complete`` marker.

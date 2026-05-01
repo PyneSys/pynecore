@@ -1069,6 +1069,13 @@ class ScriptRunner:
                             # in practice). Pine sub-bar magnification and
                             # synchronous COOF re-execution don't apply —
                             # the exchange is the source of truth.
+                            #
+                            # Async fills (from ``watch_orders``) are
+                            # drained *before* the script so the new bar's
+                            # script sees the updated ``position.size``
+                            # immediately rather than one bar later.
+                            if self._order_sync_engine is not None:
+                                self._order_sync_engine.apply_async_events()
                             lib._plot_data.clear()
                             _run_libs_and_main()
                             if is_strat and position:

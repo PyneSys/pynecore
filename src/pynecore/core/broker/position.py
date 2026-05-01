@@ -11,6 +11,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from pynecore import lib
+from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
 
@@ -158,6 +159,19 @@ class BrokerPosition(PositionBase):
         fill_qty = event.fill_qty or 0.0
         fill_price = event.fill_price or 0.0
         if fill_qty <= 0.0 or fill_price <= 0.0:
+            # A zero-or-missing qty/price means the broker plugin emitted a
+            # fill event without resolving the actual fill quantity / price.
+            # Without a warning the silent skip leaves ``position.size``
+            # stuck at zero — the script keeps thinking it is flat and
+            # re-fires the entry next bar.  Surface the offending event so
+            # the operator can spot the broker-side data hole instead of
+            # debugging by guesswork.
+            _blog_warning(
+                "ignoring fill with zero qty/price (qty=%s price=%s pine=%r leg=%s) "
+                "— position.size NOT updated",
+                fill_qty, fill_price,
+                event.pine_id, event.leg_type,
+            )
             return False
 
         signed_delta = fill_qty if event.order.side == "buy" else -fill_qty
