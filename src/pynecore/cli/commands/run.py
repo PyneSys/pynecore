@@ -24,6 +24,7 @@ from pynecore.core.aggregator import validate_aggregation
 from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
 
+from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
@@ -830,6 +831,21 @@ def run(
                                    on_tick=cb_tick_live)
                     except KeyboardInterrupt:
                         secho("\nLive streaming stopped.", fg=colors.YELLOW)
+                    except BrokerManualInterventionError as exc:
+                        secho(
+                            f"\nLive streaming stopped: {exc.reason}",
+                            fg=colors.RED,
+                        )
+                        if exc.context:
+                            secho(
+                                f"  context: {exc.context}",
+                                fg=colors.RED,
+                            )
+                        secho(
+                            "  Manual intervention required — resolve the "
+                            "broker-side state and restart.",
+                            fg=colors.YELLOW,
+                        )
 
             else:
                 # Batch mode: progress bar with time range

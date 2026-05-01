@@ -963,6 +963,16 @@ class ScriptRunner:
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
+                    # An async halt latched on the broker event-loop thread
+                    # (e.g. ``UnexpectedCancelError`` from a polling plugin)
+                    # must surface NOW — before ``[OHLCV]`` is logged or any
+                    # state advances. Without this, a halt set mid-bar would
+                    # only fire at the next bar close (via
+                    # ``apply_async_events``), spilling a bogus OHLCV log line
+                    # for a bar the bot is no longer trading.
+                    if self._order_sync_engine is not None:
+                        self._order_sync_engine.raise_if_halted()
+
                     candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
 

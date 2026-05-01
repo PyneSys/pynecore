@@ -271,6 +271,28 @@ class OrderSyncEngine:
             _log.exception("watch_orders stream terminated with an error")
             raise
 
+    @property
+    def halted(self) -> bool:
+        """``True`` once :meth:`_record_halt` has latched a manual-intervention halt."""
+        return self._halted
+
+    def raise_if_halted(self) -> None:
+        """Re-raise the latched halt as :class:`BrokerManualInterventionError`.
+
+        Cheap, drain-free check meant for the script runner's tick loop:
+        an async halt set on the broker event-loop thread (e.g. from
+        :meth:`run_event_stream` reacting to an
+        :class:`UnexpectedCancelError`) should surface in the runner thread
+        on the very next tick — *not* one full bar later when
+        :meth:`apply_async_events` runs at bar close.
+        """
+        if self._halted:
+            raise BrokerManualInterventionError(
+                self._halted_reason or "manual intervention required",
+                intent_key=self._halted_intent_key,
+                context=dict(self._halted_context),
+            )
+
     def apply_async_events(self) -> None:
         """Drain any async-arrived broker events into the position state.
 
@@ -285,12 +307,7 @@ class OrderSyncEngine:
         bar loop exits via its ``finally`` block instead of running the
         script with stale state.
         """
-        if self._halted:
-            raise BrokerManualInterventionError(
-                self._halted_reason or "manual intervention required",
-                intent_key=self._halted_intent_key,
-                context=dict(self._halted_context),
-            )
+        self.raise_if_halted()
         self._drain_events()
 
     def sync(self, bar_ts_ms: int) -> None:
@@ -305,17 +322,12 @@ class OrderSyncEngine:
             every :class:`DispatchEnvelope` built in this cycle. The caller
             (typically the script runner) sources this from ``lib._time``.
         """
-        if self._halted:
-            # Surface the halt so the script_runner bar loop exits via its
-            # ``finally`` block — without this, an async halt triggered from
-            # ``run_event_stream`` (e.g. an :class:`UnexpectedCancelError`
-            # observed by the polling plugin) would only set the flag and the
-            # runner would silently keep iterating.
-            raise BrokerManualInterventionError(
-                self._halted_reason or "manual intervention required",
-                intent_key=self._halted_intent_key,
-                context=dict(self._halted_context),
-            )
+        # Surface a latched halt before any state mutation so an async halt
+        # triggered from ``run_event_stream`` (e.g. an
+        # :class:`UnexpectedCancelError` observed by the polling plugin)
+        # exits the bar loop via its ``finally`` block instead of letting
+        # the engine silently keep iterating.
+        self.raise_if_halted()
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
         # Drain again here in case events arrived between
@@ -762,7 +774,7 @@ class OrderSyncEngine:
         self._halted_reason = error.reason
         self._halted_intent_key = error.intent_key
         self._halted_context = dict(error.context)
-        _log.error(
+        _blog_error(
             "sync engine halted by BrokerManualInterventionError: %s "
             "(intent_key=%s, context=%r)",
             error.reason, error.intent_key, error.context,
