@@ -480,6 +480,20 @@ class OrderSyncEngine:
                 self._resolve_deferred_for_entry(event.pine_id)
                 self._amend_bracket_qty_for_entry_fill(event)
             self._cascade_oca_cancel(event)
+            # When a closing leg fully closes the position, drop the
+            # entry + matching exit intents and clear Pine's order
+            # dicts. Pine's ``strategy.exit`` is unconditional in most
+            # scripts; the simulator gates it via ``open_trades`` —
+            # broker mode needs equivalent gating, otherwise the next
+            # bar's ``sync()`` rebuilds the same exit and dispatches a
+            # pointless ``modify_exit`` against a position that no
+            # longer exists on the broker (which on Capital.com fails
+            # because the bracket-attached entry row is naturally
+            # closed).
+            if (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                    LegType.TRAILING_STOP, LegType.CLOSE)
+                    and self._position.size == 0):
+                self._cleanup_closed_position(event)
         elif t == 'cancelled':
             key = self._find_key_for_order_id(event.order.id)
             if key is not None:
@@ -619,6 +633,48 @@ class OrderSyncEngine:
             entry_orders.pop(intent.pine_id, None)
         elif isinstance(intent, ExitIntent) and exit_orders is not None:
             exit_orders.pop(intent.from_entry, None)
+
+    def _cleanup_closed_position(self, event: OrderEvent) -> None:
+        """Drop tracking for an entry fully closed by a TP/SL/CLOSE fill.
+
+        Identifies the closed entry's ``pine_id`` from the event:
+        ``event.from_entry`` is set on bracket-leg fills emitted by
+        plugins that own a separate exit order (Bybit, Binance USDM);
+        ``event.pine_id`` carries it on plugins where the closing
+        activity references the entry's own exchange id (Capital.com's
+        position-attached bracket). Falling back across both fields
+        keeps the cleanup correct on every plugin.
+
+        Cleans:
+
+        - ``_active_intents`` — entry intent keyed by ``pine_id``, every
+          exit intent whose ``from_entry`` matches the closed entry.
+        - ``_order_mapping`` and envelope state for the dropped keys.
+        - ``position.entry_orders`` / ``position.exit_orders`` — Pine
+          dicts keyed by the entry's ``pine_id``.
+        """
+        closed_entry_id = event.from_entry or event.pine_id
+        if not closed_entry_id:
+            return
+        # Entry intent + its mapping/envelope.
+        self._active_intents.pop(closed_entry_id, None)
+        self._order_mapping.pop(closed_entry_id, None)
+        self._drop_envelope(closed_entry_id)
+        # Every exit intent that points at this entry.
+        for key in list(self._active_intents.keys()):
+            intent = self._active_intents[key]
+            if (isinstance(intent, ExitIntent)
+                    and intent.from_entry == closed_entry_id):
+                self._active_intents.pop(key, None)
+                self._order_mapping.pop(key, None)
+                self._drop_envelope(key)
+        # Pine-side order dicts — keyed by entry pine_id on both sides.
+        entry_orders = getattr(self._position, 'entry_orders', None)
+        exit_orders = getattr(self._position, 'exit_orders', None)
+        if entry_orders is not None:
+            entry_orders.pop(closed_entry_id, None)
+        if exit_orders is not None:
+            exit_orders.pop(closed_entry_id, None)
 
     def _filled_intent_key(self, event: OrderEvent) -> str | None:
         """Resolve a fill event to the ``intent_key`` of the owning intent.

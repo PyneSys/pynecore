@@ -987,3 +987,115 @@ def __test_overfill_after_partial_caps_at_entry_qty__():
     overfill = [e for e in events if isinstance(e, LegRepairFailedEvent)]
     assert len(overfill) == 1
     assert overfill[0].action_taken == 'capped'
+
+
+# === Natural close cleanup ===========================================
+# When a TP/SL/TRAILING_STOP/CLOSE leg fully closes the position
+# (BrokerPosition.size hits 0), the engine must drop the entry +
+# matching exit intents from ``_active_intents`` AND clear Pine's
+# ``entry_orders`` / ``exit_orders`` dicts. Pine's ``strategy.exit``
+# is unconditional in most scripts; only the simulator gates it via
+# open trades. Without this cleanup the next bar's ``sync()`` rebuilds
+# the same exit intent from the still-present dict entry and dispatches
+# a pointless ``modify_exit`` against a position that no longer exists
+# on the broker — which on Capital.com fails because the entry row is
+# gone.
+
+
+def _closing_fill_event(side: str, qty: float, price: float, *,
+                        pine_id: str, from_entry: str,
+                        leg: LegType = LegType.STOP_LOSS,
+                        xchg_id: str = "xchg-close") -> OrderEvent:
+    exch = ExchangeOrder(
+        id=xchg_id, symbol=SYMBOL, side=side,
+        order_type=OrderType.MARKET, qty=qty, filled_qty=qty,
+        remaining_qty=0.0, price=None, stop_price=None,
+        average_fill_price=price, status=OrderStatus.FILLED,
+        timestamp=0.0, fee=0.0, fee_currency="",
+    )
+    return OrderEvent(
+        order=exch, event_type='filled', fill_price=price,
+        fill_qty=qty, timestamp=0.0,
+        pine_id=pine_id, from_entry=from_entry, leg_type=leg,
+    )
+
+
+def __test_natural_close_cleans_entry_and_exit_intents__():
+    """SL fill that brings position size to 0 must wipe the entry
+    intent, the exit intent, and the matching Pine-side dict entries —
+    otherwise Pine re-emits a stale exit on the next bar and the engine
+    fires a pointless ``modify_exit`` against a closed position.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders["L"] = _exit_order(
+        "L", -1.0, "Bracket", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert "L" in engine.active_intents
+    assert "Bracket\0L" in engine.active_intents
+
+    # Entry fills — position opens, intents stay in tracking.
+    engine.on_order_event(_fill_event(
+        "buy", 1.0, 50_000.0, pine_id="L", leg=LegType.ENTRY,
+    ))
+    engine._drain_events()
+    assert pos.size == 1.0
+
+    # SL fires — position closes; cleanup must run.
+    engine.on_order_event(_closing_fill_event(
+        "sell", 1.0, 45_000.0,
+        pine_id="L", from_entry="L", leg=LegType.STOP_LOSS,
+    ))
+    engine._drain_events()
+
+    assert pos.size == 0.0, "SL fill must reduce position to flat"
+    assert "L" not in engine.active_intents, (
+        "entry intent must be dropped after natural close"
+    )
+    assert "Bracket\0L" not in engine.active_intents, (
+        "exit intent must be dropped after natural close"
+    )
+    assert "L" not in pos.entry_orders, (
+        "Pine entry_orders[L] must be cleared so next bar does not "
+        "re-emit a modify against the closed position"
+    )
+    assert "L" not in pos.exit_orders, (
+        "Pine exit_orders[L] must be cleared so next bar does not "
+        "re-emit a stale Bracket exit"
+    )
+
+
+def __test_natural_close_partial_fill_does_not_cleanup__():
+    """A partial closing fill that does NOT bring size to 0 must keep
+    the entry/exit intents intact so the remainder can still close.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 2.0, limit=50_000.0)
+    pos.exit_orders["L"] = _exit_order(
+        "L", -2.0, "Bracket", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+
+    engine.on_order_event(_fill_event(
+        "buy", 2.0, 50_000.0, pine_id="L", leg=LegType.ENTRY,
+    ))
+    engine._drain_events()
+    assert pos.size == 2.0
+
+    # Partial SL fill — size goes 2 → 1, not 0.
+    partial = _closing_fill_event(
+        "sell", 1.0, 45_000.0,
+        pine_id="L", from_entry="L", leg=LegType.STOP_LOSS,
+    )
+    partial.event_type = 'partial'
+    engine.on_order_event(partial)
+    engine._drain_events()
+
+    assert pos.size == 1.0
+    assert "L" in engine.active_intents, "entry intent must survive partial close"
+    assert "Bracket\0L" in engine.active_intents, "exit intent must survive partial close"
+    assert "L" in pos.entry_orders
+    assert "L" in pos.exit_orders
