@@ -330,6 +330,13 @@ class ScriptRunner:
                 event_loop=broker_event_loop,
                 mintick=float(syminfo.mintick) if syminfo.mintick else 0.01,
                 store_ctx=broker_store_ctx,
+                # Mirror exchange position state every bar. The exchange is
+                # the source of truth — without per-sync reconciliation, an
+                # externally-closed position (manual web-UI close, broker
+                # liquidation) would never propagate back to ``position.size``,
+                # leaving Pine convinced the bot is still in a trade and
+                # blocking all subsequent entries.
+                reconcile_every_n_syncs=1,
             )
             # Plugin-side access to the storage run: the Capital.com plugin
             # uses this for ``find_by_ref`` lookups, order upserts and audit

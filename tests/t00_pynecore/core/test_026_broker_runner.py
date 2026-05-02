@@ -367,6 +367,15 @@ def __test_close_dispatches_execute_close__(tmp_path):
         event_type='filled', fill_price=50_000.0, fill_qty=1.0,
         timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
     ))
+    # Mirror the fill on the mock exchange so per-sync reconcile sees a
+    # consistent ``/positions`` snapshot — production plugins surface the
+    # same fill in both ``/history/activity`` and ``/positions`` within the
+    # same poll cycle.
+    plugin.startup_position = ExchangePosition(
+        symbol="BTCUSDT", side="long", size=1.0, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
 
     next(it)  # bar 2 — sync drains fill, script calls close (now allowed)
     next(it)  # bar 3 — sync dispatches the close order
@@ -409,6 +418,13 @@ def __test_order_event_fill_updates_broker_position__(tmp_path):
         timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
     )
     runner._order_sync_engine.on_order_event(fill)
+    # Mirror the fill on the mock exchange so per-sync reconcile sees a
+    # consistent ``/positions`` snapshot.
+    plugin.startup_position = ExchangePosition(
+        symbol="BTCUSDT", side="long", size=1.0, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
 
     next(it)  # bar 2 — sync drains the fill, updates BrokerPosition
 

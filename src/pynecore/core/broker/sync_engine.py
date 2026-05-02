@@ -62,6 +62,7 @@ from pynecore.core.broker.storage import (
     PendingRecord,
     RunContext,
 )
+from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
@@ -439,18 +440,69 @@ class OrderSyncEngine:
             )
 
         exch_pos = self._run_async(self._broker.get_position(self._symbol))
-        if exch_pos is not None and exch_pos.size != self._position.size:
+        # The exchange is the single source of truth for position state.
+        # ``get_position`` returns ``None`` when no row exists for the symbol,
+        # which is functionally a flat position — fold both branches into one
+        # ``new_size`` comparison.
+        new_size = exch_pos.size if exch_pos is not None else 0.0
+
+        # Periodic reconcile (``sync_count > 0``) only acts on **shrink-to-zero**
+        # transitions: the exchange went flat while we still think we hold a
+        # position (manual web-UI close, broker liquidation, …). Any other
+        # mismatch — including ``new_size > internal`` — could be a fill that
+        # raced /positions ahead of the activity stream; adopting it would
+        # double-count the moment the matching ``record_fill`` finally drains.
+        # The startup call (``sync_count == 0``) still adopts unconditionally
+        # so a fresh process restart over an existing exchange position does
+        # not double-enter on the first bar.
+        is_startup = self._sync_count == 0
+
+        if is_startup and new_size != self._position.size:
             _blog_warning(
                 "position size mismatch (exchange=%s, internal=%s) — "
                 "adopting exchange",
-                exch_pos.size, self._position.size,
+                new_size, self._position.size,
             )
-            self._position.size = exch_pos.size
+            self._position.size = new_size
             self._position.sign = (
-                1.0 if exch_pos.size > 0.0
-                else (-1.0 if exch_pos.size < 0.0 else 0.0)
+                1.0 if new_size > 0.0
+                else (-1.0 if new_size < 0.0 else 0.0)
             )
-            self._position.avg_price = exch_pos.entry_price
+            if new_size == 0.0:
+                self._position.avg_price = na_float
+                self._position.open_trades.clear()
+                self._position.openprofit = 0.0
+                self._position.open_commission = 0.0
+            else:
+                self._position.avg_price = (
+                    exch_pos.entry_price if exch_pos is not None else na_float
+                )
+        elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
+            # Skip while bot-initiated work is in flight — a close we
+            # dispatched ourselves will flatten /positions seconds before
+            # the matching ``OrderEvent`` reaches the queue. Pre-empting the
+            # event here would zero the position; the closing fill (which
+            # arrives with a non-zero ``signed_delta``) would then enter
+            # ``record_fill``'s ``Opening`` branch and be miscounted as a
+            # fresh entry in the opposite direction.
+            if self._active_intents:
+                return
+            # External flatten detected — wipe ALL trade state so a re-entry
+            # on the next bar starts from a clean slate. Leaving stale
+            # ``open_trades`` would corrupt P&L bookkeeping the moment the
+            # next ``record_fill`` runs (FIFO close against trades that no
+            # longer exist on the broker).
+            _blog_warning(
+                "exchange shows flat, internal=%s — external close detected, "
+                "clearing position state",
+                self._position.size,
+            )
+            self._position.size = 0.0
+            self._position.sign = 0.0
+            self._position.avg_price = na_float
+            self._position.open_trades.clear()
+            self._position.openprofit = 0.0
+            self._position.open_commission = 0.0
 
     # === Event routing ===
 

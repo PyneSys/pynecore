@@ -581,6 +581,179 @@ def __test_reconcile_adopts_exchange_position_size__():
     assert pos.avg_price == 50_000.0
 
 
+def __test_reconcile_clears_position_when_exchange_flat__():
+    """User manually closes via web UI: ``get_position`` returns ``None``.
+
+    The exchange is the source of truth — when it shows no position, the
+    engine must drop ``position.size`` to 0 even if the local view still
+    thinks there is an open position. Without this, a phantom adoption
+    (or a real position closed externally during operation) leaves Pine
+    forever convinced the bot is in a trade and blocks new entries.
+    """
+    b = MockBroker()
+    b.position = None  # exchange flat — no row at all
+    engine, pos = _mk_engine(b)
+    pos.size = 100.0  # adopted earlier; user closed manually since
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+
+    engine.reconcile()
+
+    assert pos.size == 0.0
+    assert pos.sign == 0.0
+    from pynecore.types.na import na_float
+    assert pos.avg_price is na_float
+
+
+def __test_reconcile_clears_open_trades_when_exchange_flat__():
+    """When the exchange goes flat externally, open_trades MUST be wiped.
+
+    Otherwise a re-entry on the next bar would mix new fills with stale
+    trade rows and corrupt P&L bookkeeping.
+    """
+    from pynecore.lib.strategy import Trade
+    b = MockBroker()
+    b.position = None
+    engine, pos = _mk_engine(b)
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+    pos.open_trades.append(Trade(
+        size=100.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=1.17, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+    pos.openprofit = 5.0
+    pos.open_commission = 0.5
+
+    engine.reconcile()
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    assert pos.openprofit == 0.0
+    assert pos.open_commission == 0.0
+
+
+def __test_reconcile_no_change_when_sizes_match__():
+    """No mutation when exchange and internal already agree."""
+    b = MockBroker()
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=100.0, entry_price=1.17,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+
+    engine.reconcile()
+
+    assert pos.size == 100.0
+    assert pos.avg_price == 1.17
+
+
+def __test_periodic_reconcile_clears_state_on_external_flatten__():
+    """Mid-operation reconcile after the user flattens via web UI.
+
+    Pre-condition: bot has dispatched + filled an entry, internal mirrors
+    the exchange. Then the user closes manually (exchange returns ``None``)
+    and the next sync's reconcile must wipe internal state so Pine sees
+    ``position_size == 0`` and can re-enter on a future bar.
+    """
+    from pynecore.lib.strategy import Trade
+    b = MockBroker()
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=100.0, entry_price=1.17,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+    pos.open_trades.append(Trade(
+        size=100.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=1.17, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    engine.reconcile()  # startup — agreement, no change
+    assert pos.size == 100.0
+
+    # User flattens externally; next periodic reconcile sees /positions empty.
+    b.position = None
+    engine._sync_count = 1  # simulate post-startup periodic call
+
+    engine.reconcile()
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+
+
+def __test_periodic_reconcile_does_not_adopt_size_increase__():
+    """Mid-operation reconcile MUST NOT adopt a size increase the engine
+    has not yet seen via ``record_fill``.
+
+    Race scenario: a market entry the engine just dispatched fills
+    *between* the activity poll and the engine's own /positions read, so
+    /positions briefly shows a position the matching ``OrderEvent`` has
+    not yet drained into ``BrokerPosition``. Adopting that here would
+    double-count the size when the event eventually arrives.
+    """
+    b = MockBroker()
+    # Exchange "ahead" of internal — fill in flight.
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=100.0, entry_price=1.17,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0  # event has not yet drained
+    engine._sync_count = 1  # post-startup
+
+    engine.reconcile()
+
+    assert pos.size == 0.0  # untouched — record_fill will own this update
+
+
+def __test_periodic_reconcile_skips_clear_while_close_in_flight__():
+    """Reconcile must not clear the position while a bot-dispatched close
+    is in flight.
+
+    Race scenario: bar N dispatches ``execute_close``; the broker flattens
+    /positions seconds before the matching ``OrderEvent`` reaches the
+    queue. If reconcile zeros the position now, the closing fill (when it
+    finally drains) would arrive with ``size == 0`` and enter
+    :meth:`BrokerPosition.record_fill`'s "Opening" branch — counted as a
+    fresh entry in the opposite direction.
+    """
+    from pynecore.core.broker.models import CloseIntent
+    from pynecore.lib.strategy import Trade
+    b = MockBroker()
+    b.position = None  # exchange has flattened — close hit
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.avg_price = 50_000.0
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=50_000.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+    engine._sync_count = 1
+    # Simulate a CloseIntent we dispatched but whose fill event has not
+    # yet drained.
+    engine._active_intents["L"] = CloseIntent(
+        pine_id="L", symbol=SYMBOL, side="sell", qty=1.0,
+    )
+
+    engine.reconcile()
+
+    assert pos.size == 1.0  # left alone for record_fill to own
+    assert len(pos.open_trades) == 1
+
+
 # === OCA cascade cancel ===
 #
 # The engine must cancel OCA-cancel siblings the moment a fill event arrives,
