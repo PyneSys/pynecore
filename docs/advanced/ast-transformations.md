@@ -26,6 +26,16 @@ sys.meta_path.insert(0, PyneImportHook())
 
 The `PyneLoader` class performs code transformation in multiple steps, applying the AST transformation chain.
 
+### Marker Recognition Rules
+
+The `@pyne` marker is recognized strictly to avoid accidentally transforming ordinary library modules that merely mention the token in prose:
+
+1. The module's **first statement** must be a string-literal expression (a module docstring).
+2. After `lstrip()`, the docstring's content must **start with `@pyne`**.
+3. `@pyne` must be followed by whitespace or the end of the docstring (so `@pynex` does not match, and a docstring like `"""Some description.\n@pyne\n"""` does **not** trigger transformation — the marker must come first, not somewhere inside).
+
+A cheap regex prefilter (`@pyne(\s|$)`) skips full AST parsing for files that obviously cannot match. Files that pass the prefilter still go through the strict AST check above before any transformer runs.
+
 ## Transformation Chain
 
 PyneCore applies several key transformations to Python code to make it behave like Pine Script:
@@ -535,4 +545,4 @@ def main():
     lib.plot(range_ratio, "Range Ratio", color=lib.color.green)
 ```
 
-This example demonstrates how the different transformers work together to convert a simple Pyne script into equivalent Python code that provides Pine Script-like behavior through PyneCore's runtime system.
+This example demonstrates how the different transformers work together to convert a simple Pyne code into equivalent Python code that provides Pine Script-like behavior through PyneCore's runtime system.

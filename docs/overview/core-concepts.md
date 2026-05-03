@@ -127,7 +127,7 @@ The AST transformers automatically convert normal variable assignments to the ap
 
 In Pine Script, each call to a function maintains its own independent state for internal series or persistent variables. PyneCore replicates this behavior through **function isolation**.
 
-When you call a function within your Pyne script:
+When you call a function within your Pyne code:
 - It gets its own unique context.
 - Any `Persistent` or `Series` variables defined *inside* that function maintain their state *independently* for that specific call context.
 

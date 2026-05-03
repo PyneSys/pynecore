@@ -106,7 +106,7 @@ The working directory structure is organized as follows:
 
 ```
 workdir/
-├── scripts/     # Your Pyne scripts
+├── scripts/     # Your Pyne code
 ├── data/        # OHLCV data files
 ├── output/      # Output files (plots, strategy results)
 └── config/      # Configuration files

@@ -125,7 +125,7 @@ def calculate_moving_average(values: Series[float], length: int) -> Series[float
 
 ## Testing
 
-PyneCore uses a comprehensive testing system where tests themselves are often Pyne scripts. This "dogfooding" approach ensures tests run in the same environment as real user code.
+PyneCore uses a comprehensive testing system where tests themselves are often Pyne code. This "dogfooding" approach ensures tests run in the same environment as real user code.
 
 ### Running Tests
 
@@ -142,7 +142,7 @@ python -m pytest --cov=pynecore
 
 ### Writing Tests
 
-Tests in PyneCore follow a unique pattern where test files are also valid Pyne scripts:
+Tests in PyneCore follow a unique pattern where test files are also valid Pyne code:
 
 ```python
 """
@@ -191,7 +191,7 @@ When working with library functions in `pynecore/lib/`:
 
 When modifying core runtime components in `pynecore/core/`:
 
-1. Be extra cautious - these changes affect all Pyne scripts
+1. Be extra cautious - these changes affect all Pyne code
 2. Consider backward compatibility
 3. Document performance implications
 4. Add thorough tests

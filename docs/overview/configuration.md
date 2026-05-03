@@ -25,7 +25,7 @@ The working directory is where PyneCore stores data, configuration files, output
 workdir/
 ├── config/           # Configuration files
 ├── data/             # Data files (.ohlcv files and their .toml companions)
-├── scripts/          # Your Pyne scripts (.py files and their .toml companions)
+├── scripts/          # Your Pyne code (.py files and their .toml companions)
 └── output/           # Script output (plots, strategy statistics, equity curves)
 ```
 
@@ -39,7 +39,7 @@ PyneCore automatically discovers the working directory by:
 PyneCore uses two types of TOML configuration files:
 
 1. **Symbol configuration files** - Located alongside the `.ohlcv` data files
-2. **Script configuration files** - Located alongside your Pyne scripts
+2. **Script configuration files** - Located alongside your Pyne code
 
 ### Symbol Configuration
 

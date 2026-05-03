@@ -15,11 +15,11 @@ tags: ["examples", "tutorial", "scripting", "indicators"]
 
 # Your First PyneCore Script
 
-This guide will walk you through creating and running your first PyneCore script. You'll learn the basic structure of a Pyne script and see how it differs from regular Python.
+This guide will walk you through creating and running your first PyneCore script. You'll learn the basic structure of Pyne code and see how it differs from regular Python.
 
 ## The Magic Comment
 
-Every PyneCore script must start with a special magic comment to identify it as a Pyne script:
+Every PyneCore script must begin with a module docstring whose first non-whitespace token is `@pyne`:
 
 ```python
 """
@@ -27,7 +27,21 @@ Every PyneCore script must start with a special magic comment to identify it as 
 """
 ```
 
-This comment must be placed at the beginning of your file, before any import statements. It tells the PyneCore system to apply the necessary AST transformations to make your Python code behave like Pine Script.
+The placement rule is strict:
+
+- The file's **first statement** must be a module docstring (`"""…"""`).
+- The docstring's **first non-whitespace token** must be `@pyne`.
+- `@pyne` must be followed by whitespace or the end of the docstring (so `@pynex` is not recognized, and `@pyne` cannot appear after a description line — it has to come first).
+
+It tells the PyneCore system to apply the necessary AST transformations to make your Python code behave like Pine Script. You can extend the docstring with additional prose after the marker:
+
+```python
+"""
+@pyne
+
+My indicator description goes here.
+"""
+```
 
 ## Basic Script Structure
 
@@ -47,7 +61,7 @@ def main():
 
 Let's break this down:
 
-1. **Magic Comment**: Signals that this is a Pyne script
+1. **Magic Comment**: Signals that this is Pyne code
 2. **Imports**: Import necessary modules from PyneCore
 3. **Script Declaration**: Use a decorator to define the script type (indicator, strategy, etc.)
 4. **Main Function**: The entry point of your script that will be executed for each bar

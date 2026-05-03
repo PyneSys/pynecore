@@ -35,26 +35,30 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             except (OSError, PermissionError):
                 pass  # Ignore if we can't create marker
 
-        # Fast check for @pyne decorator before parsing AST
-        # data is bytes, need to convert to string for regex
+        # Fast prefilter: require @pyne as a standalone token, not just any substring.
+        # Compiled Pyne code always has it as the first non-whitespace content of
+        # the module docstring, e.g. `"""\n@pyne\n…"""`. A loose check would AST-transform
+        # ordinary modules that merely *mention* @pyne in a docstring (e.g. standalone.py).
         data_str = data.decode('utf-8') if isinstance(data, bytes) else data
-        if not re.search(r'@pyne\b', data_str):
-            # No @pyne decorator, let Python handle it normally
+        if not re.search(r'@pyne(\s|$)', data_str):
             return compile(data, path, 'exec', optimize=_optimize)
 
         import ast
 
-        # Parse AST only if @pyne is present
         tree = ast.parse(data_str)
-
-        # Store file path in AST for transformers
         tree._module_file_path = str(path.resolve())  # type: ignore
 
-        # Only transform if it has @pyne decorator
+        # Strict check: the module docstring must START with @pyne (whitespace-stripped),
+        # followed by whitespace or end of string. Substring matches don't count — they
+        # would catch innocuous mentions inside docstrings of non-script library modules.
+        is_pyne_module = False
         if (tree.body and isinstance(tree.body[0], ast.Expr) and
                 isinstance(cast(ast.Expr, tree.body[0]).value, ast.Constant) and
-                isinstance(cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value, str) and
-                '@pyne' in cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value):  # type: ignore
+                isinstance(cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value, str)):
+            docstring = cast(str, cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value)
+            is_pyne_module = re.match(r'\s*@pyne(\s|$)', docstring) is not None
+
+        if is_pyne_module:
 
             # Remove test cases from the output, because they can coorupt the output
             transformed = tree
