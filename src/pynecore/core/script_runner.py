@@ -403,6 +403,9 @@ class ScriptRunner:
 
                 all_sec_ids = list(sec_contexts.keys())
                 script_path_str = str(self._script_path.resolve())
+                sec_result_locks = {
+                    sid: state.result_lock for sid, state in sec_states.items()
+                }
 
                 def _spawn_security_process(sid: str, data_path: str):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
@@ -419,6 +422,7 @@ class ScriptRunner:
                             sec_state.done_event,
                             sec_state.stop_event,
                             sec_state.is_ltf,
+                            sec_result_locks,
                         ),
                         daemon=True,
                     )

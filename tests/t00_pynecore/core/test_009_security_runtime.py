@@ -10,8 +10,13 @@ from pynecore.core.security_shm import (
     SyncBlock, ResultBlock, ResultReader, write_result,
 )
 from pynecore.core.resampler import Resampler
-from multiprocessing import Event
+from multiprocessing import Event, Lock
 from zoneinfo import ZoneInfo
+
+
+def _locks_for(sec_ids):
+    """Build a per-slot lock dict matching create_security_protocol's contract."""
+    return {sid: Lock() for sid in sec_ids}
 
 
 def _make_state(
@@ -169,7 +174,7 @@ def __test_security_protocol_write_read__(log):
     rb_b = ResultBlock("sec_b", create=True, version=0)
 
     signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_security_protocol(
-        "sec_a", sb, rb_a, sec_ids,
+        "sec_a", sb, rb_a, sec_ids, _locks_for(sec_ids),
     )
 
     try:
@@ -259,7 +264,7 @@ def __test_ltf_protocol_accumulation__(log):
     rb = ResultBlock("sec_ltf", create=True, version=0)
 
     signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
-        "sec_ltf", sb, rb, sec_ids, is_ltf=True,
+        "sec_ltf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
     try:
@@ -300,7 +305,7 @@ def __test_ltf_protocol_empty_flush__(log):
     rb = ResultBlock("sec_ltf2", create=True, version=0)
 
     signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
-        "sec_ltf2", sb, rb, sec_ids, is_ltf=True,
+        "sec_ltf2", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
     try:
@@ -325,7 +330,7 @@ def __test_ltf_htf_protocol_no_flush__(log):
     rb = ResultBlock("sec_htf", create=True, version=0)
 
     signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
-        "sec_htf", sb, rb, sec_ids, is_ltf=False,
+        "sec_htf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=False,
     )
 
     try:
