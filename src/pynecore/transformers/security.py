@@ -256,10 +256,25 @@ class SecurityTransformer(ast.NodeTransformer):
             orelse=[]
         )
 
-    def _sec_read_call(self, sec_id: str) -> ast.Call:
-        """Build: __sec_read__("sec_id", lib.na, __scope_id__)"""
+    def _sec_read_call(self, sec_id: str, tuple_len: int | None = None) -> ast.Call:
+        """Build: __sec_read__("sec_id", <default>, __scope_id__)
+
+        Default is ``lib.na`` for scalar reads, or an N-tuple of ``lib.na``
+        when the LHS unpacks the result. Pine `request.security()` returns a
+        tuple of `na` (one per element) on no-data bars — emitting a single
+        scalar would crash tuple-unpack with ``TypeError: cannot unpack
+        non-iterable NA object`` in `gaps_on` between-period reads or after a
+        `write_na` (session gap).
+        """
+        if tuple_len is None:
+            default: ast.expr = self._lib_na()
+        else:
+            default = ast.Tuple(
+                elts=[self._lib_na() for _ in range(tuple_len)],
+                ctx=ast.Load()
+            )
         return self._func_call(
-            '__sec_read__', ast.Constant(value=sec_id), self._lib_na(),
+            '__sec_read__', ast.Constant(value=sec_id), default,
             self._scope_id_ref()
         )
 
@@ -269,6 +284,31 @@ class SecurityTransformer(ast.NodeTransformer):
             '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load()),
             self._scope_id_ref()
         )
+
+    @staticmethod
+    def _detect_tuple_arity(stmt: ast.stmt, call: ast.Call) -> int | None:
+        """If ``stmt`` is a tuple-unpack assignment whose RHS is exactly
+        ``call``, return the LHS arity. Otherwise None.
+
+        Pine statically enforces LHS-arity == RHS-arity for tuple-returning
+        ``request.security()`` (compile errors CE10239 / CE10172), so the
+        unpack target's arity is the authoritative source.
+
+        Skipped: star-unpack (``*rest``), multi-target (``a = b = sec(...)``),
+        annotated/augmented assigns, calls wrapped in a larger expression.
+        """
+        if not isinstance(stmt, ast.Assign):
+            return None
+        if len(stmt.targets) != 1:
+            return None
+        target = stmt.targets[0]
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return None
+        if any(isinstance(e, ast.Starred) for e in target.elts):
+            return None
+        if stmt.value is not call:
+            return None
+        return len(target.elts)
 
     # --- Collection ---
 
@@ -329,14 +369,19 @@ class SecurityTransformer(ast.NodeTransformer):
 
             self._recurse_subbodies(stmt, call_exprs, runtime_sec_ids)
 
-            sec_ids_here = [
-                getattr(n, '_sec_id')
-                for n in self._walk_skip_funcs(stmt)
+            call_nodes_here = [
+                n for n in self._walk_skip_funcs(stmt)
                 if isinstance(n, ast.Call) and hasattr(n, '_sec_id')
             ]
 
-            if sec_ids_here:
-                for sid in sec_ids_here:
+            if call_nodes_here:
+                for call_node in call_nodes_here:
+                    arity = self._detect_tuple_arity(stmt, call_node)
+                    if arity is not None:
+                        call_node._tuple_len = arity  # type: ignore[attr-defined]
+
+                for call_node in call_nodes_here:
+                    sid = getattr(call_node, '_sec_id')
                     if sid in runtime_sec_ids:
                         new_body.append(self._inline_signal(sid))
                     expr = copy.deepcopy(call_exprs[sid])
@@ -521,5 +566,6 @@ class _CallReplacer(ast.NodeTransformer):
             sec_id = getattr(node, '_sec_id')
             if sec_id in self._parent._ltf_sec_ids:
                 return self._parent._sec_read_call_ltf(sec_id)
-            return self._parent._sec_read_call(sec_id)
+            tuple_len = getattr(node, '_tuple_len', None)
+            return self._parent._sec_read_call(sec_id, tuple_len)
         return node

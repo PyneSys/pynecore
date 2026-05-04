@@ -451,3 +451,105 @@ def main():
     result = _transform(source)
 
     assert 'pynecore.lib.barmerge' not in result
+
+
+def __test_tuple_unpack_emits_tuple_default__(log):
+    """LHS tuple-unpack must produce a tuple-of-na default in __sec_read__.
+
+    Pine semantics: ``request.security()`` returning a tuple yields a
+    tuple-of-na on every no-data path. A scalar ``lib.na`` default would
+    crash the unpack with TypeError on the first / between-period bars.
+    """
+    source = """
+def main():
+    (a, b, c, d, e, f) = lib.request.security(lib.syminfo.tickerid, "1D", f_six())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == '__sec_read__':
+                read_call = node
+                break
+    assert read_call is not None
+
+    default = read_call.args[1]
+    assert isinstance(default, ast.Tuple)
+    assert len(default.elts) == 6
+    for elt in default.elts:
+        assert isinstance(elt, ast.Attribute) and elt.attr == 'na'
+
+
+def __test_list_target_unpack_emits_tuple_default__(log):
+    """``[a, b] = security(...)`` (list-target) is also tuple-unpack."""
+    source = """
+def main():
+    [a, b] = lib.request.security(lib.syminfo.tickerid, "1D", f_two())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Tuple)
+    assert len(default.elts) == 2
+
+
+def __test_scalar_assign_keeps_scalar_default__(log):
+    """Single-target scalar assignment keeps the scalar ``lib.na`` default."""
+    source = """
+def main():
+    x = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(x)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_star_unpack_falls_back_to_scalar__(log):
+    """Star-unpack arity is unknown — must NOT bake a fixed-arity tuple."""
+    source = """
+def main():
+    a, *rest = lib.request.security(lib.syminfo.tickerid, "1D", f_three())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_call_wrapped_in_ifexp_falls_back_to_scalar__(log):
+    """When the call is not the direct RHS, arity is not knowable — scalar."""
+    source = """
+def main():
+    a, b = lib.request.security(lib.syminfo.tickerid, "1D", f_two()) if cond else (0, 0)
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
