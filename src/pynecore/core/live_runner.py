@@ -51,6 +51,7 @@ from pynecore.types.ohlcv import OHLCV
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.lib.log import broker_info
+from pynecore.lib.timeframe import in_seconds
 
 __all__ = ['live_ohlcv_generator']
 
@@ -147,10 +148,33 @@ def live_ohlcv_generator(
         except (OSError, RuntimeError):
             pass
 
+    # Idle-bar synthesis: providers whose WS feed only emits ohlc.event when
+    # a bar contained at least one tick (Capital.com is the documented
+    # case; Bybit/Binance/IB exhibit the same on illiquid moments) leave
+    # bar_index frozen across idle TF intervals. The REST history
+    # endpoint, however, returns those zero-volume bars on the same
+    # calendar boundaries — so on a future restart the historical replay
+    # would step through bars the live run never saw, and strategy
+    # decisions on the same minute diverge between live and replay.
+    # The watchdog below synthesises one zero-volume CLOSED bar
+    # (O=H=L=C=last close, V=0) per missed TF boundary so the live
+    # stream matches what REST will later return. This lives in the
+    # framework, not in each plugin, so providers stay free of bar-rhythm
+    # bookkeeping — they only emit when their feed pushes a real bar.
+    tf_seconds = max(1, int(in_seconds(timeframe)))
+    # Grace past close before declaring a bar missed. Floored at 2s for
+    # the WS-late case on active markets, capped so longer TFs don't sit
+    # on idle gaps too long.
+    bar_grace = max(2.0, min(tf_seconds * 0.1, 15.0))
+
     async def _async_loop():
         # Declared before ``try`` so the ``finally`` branch can reference
         # it even when ``provider.connect()`` raises before assignment.
         engine_task: asyncio.Task | None = None
+        # Last CLOSED bar seen (real or synthesised). The boundary
+        # watchdog only arms after the first real bar so we never
+        # fabricate state without a baseline.
+        last_closed_bar: OHLCV | None = None
         try:
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
@@ -176,10 +200,23 @@ def live_ohlcv_generator(
             reconnect_attempts = 0
 
             while not stop_event.is_set():
+                # Cap the per-iteration wait at 2 s for the existing
+                # is_connected healthcheck cadence; if a missed-bar
+                # deadline falls sooner, shorten the wait so synthesis
+                # fires promptly when the WS goes idle.
+                if last_closed_bar is not None:
+                    boundary_deadline = (
+                        last_closed_bar.timestamp + 2 * tf_seconds + bar_grace
+                    )
+                    boundary_remaining = boundary_deadline - time.time()
+                else:
+                    boundary_remaining = float("inf")
+                effective_timeout = min(2.0, max(0.05, boundary_remaining))
+
                 try:
                     bar_update = await asyncio.wait_for(
                         provider.watch_ohlcv(watch_symbol, timeframe),
-                        timeout=2.0,
+                        timeout=effective_timeout,
                     )
                     reconnect_attempts = 0
 
@@ -194,7 +231,23 @@ def live_ohlcv_generator(
                         if ts < last_historical_timestamp:
                             continue
 
+                    # In-stream dedup against the boundary watchdog:
+                    # if a real ``ohlc.event`` arrives late (past
+                    # ``bar_grace`` past close) for a slot we already
+                    # synthesised, the synth is already in the queue
+                    # and may have been consumed downstream — drop the
+                    # late real bar so the consumer never sees two
+                    # closed bars on the same TF boundary. Only applies
+                    # to ``is_closed=True`` because providers' intra-bar
+                    # updates legitimately reuse the last closed bar's
+                    # timestamp until the next close arrives.
+                    if (bar_update.is_closed
+                            and last_closed_bar is not None
+                            and bar_update.timestamp <= last_closed_bar.timestamp):
+                        continue
+
                     if bar_update.is_closed:
+                        last_closed_bar = bar_update
                         bar_queue.put(bar_update)
                     else:
                         try:
@@ -203,6 +256,31 @@ def live_ohlcv_generator(
                             pass
 
                 except asyncio.TimeoutError:
+                    # Boundary watchdog: if the next-bar close has passed
+                    # by more than ``bar_grace`` without a real WS bar,
+                    # synthesise a zero-volume filler. Emits exactly one
+                    # missed bar per timeout; the next iteration re-checks
+                    # against ``time.time()`` and either fills the next
+                    # gap or waits for a real push.
+                    if (last_closed_bar is not None
+                            and time.time()
+                            >= last_closed_bar.timestamp
+                            + 2 * tf_seconds + bar_grace):
+                        synth_ts = last_closed_bar.timestamp + tf_seconds
+                        last_close = last_closed_bar.close
+                        synth = OHLCV(
+                            timestamp=synth_ts,
+                            open=last_close,
+                            high=last_close,
+                            low=last_close,
+                            close=last_close,
+                            volume=0.0,
+                            extra_fields=last_closed_bar.extra_fields,
+                            is_closed=True,
+                        )
+                        last_closed_bar = synth
+                        bar_queue.put(synth)
+                        continue
                     if not provider.is_connected:
                         raise ConnectionError(
                             "Provider reports disconnected state"

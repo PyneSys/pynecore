@@ -366,6 +366,134 @@ def __test_normalize_symbol_applied_to_watch_ohlcv__():
     assert all(s == "BTC/USDT" for s in provider.received_symbols)
 
 
+# --- Idle-bar synthesis (boundary watchdog) tests ---
+
+class _IdleAfterFirstBar(MockLiveProvider):
+    """Sends pre-canned bars then blocks indefinitely.
+
+    Used to drive the boundary watchdog: once the queue is exhausted,
+    ``watch_ohlcv`` never returns, so the only way a bar lands in
+    ``bar_queue`` afterwards is via the framework's idle-bar synthesis.
+    """
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if self._index < len(self._bar_updates):
+            bar = self._bar_updates[self._index]
+            self._index += 1
+            await asyncio.sleep(0.001)
+            return bar
+        # Block until the consumer cancels the loop. ``stop_event`` set
+        # by the generator's finally tears the thread down via the outer
+        # CancelledError path, so we don't need to react to it here.
+        await asyncio.sleep(60)
+        raise asyncio.CancelledError()
+
+
+def __test_live_generator_synthesises_idle_bars_at_tf_boundary__():
+    """The framework fills idle TF intervals with zero-volume CLOSED bars.
+
+    Capital.com's WS only emits ``ohlc.event`` for bars that contained
+    at least one tick — idle minutes produce no event, freezing
+    ``bar_index`` while REST history later returns those zero-volume
+    bars. The framework's boundary watchdog synthesises one filler per
+    missed TF interval (O=H=L=C=last close, V=0) so live and replay
+    step in lockstep.
+
+    Setup: real bar with a stale timestamp (200 s ago, more than two
+    1-minute TF intervals + grace) — the watchdog therefore fires on
+    the very first iteration and immediately catches up.
+    """
+    base_ts = int(time.time()) - 200
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _IdleAfterFirstBar(updates)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if len(bars) >= 3:
+            break
+
+    assert bars[0].timestamp == base_ts
+    assert bars[0].volume == 1000.0  # real bar, untouched
+
+    # Subsequent bars are synth fillers. The watchdog advances the
+    # baseline by one TF per emission; each filler carries the previous
+    # close as O=H=L=C and zero volume.
+    for i in range(1, 3):
+        assert bars[i].timestamp == base_ts + 60 * i, (
+            f"synth bar {i} timestamp {bars[i].timestamp} "
+            f"!= expected {base_ts + 60 * i}"
+        )
+        assert bars[i].open == 100.0
+        assert bars[i].high == 100.0
+        assert bars[i].low == 100.0
+        assert bars[i].close == 100.0
+        assert bars[i].volume == 0.0
+        assert bars[i].is_closed
+
+
+class _LateBarAfterIdle(MockLiveProvider):
+    """Sends one bar, blocks long enough for the watchdog to synth, then sends a bar with the same boundary timestamp."""
+
+    def __init__(self, bar_updates: list[OHLCV], block_seconds: float = 0.3):
+        super().__init__(bar_updates)
+        self._block_seconds = block_seconds
+        self._blocked = False
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if self._index == 1 and not self._blocked:
+            # Stall once between bar 0 and bar 1 — long enough for the
+            # watchdog to synth a filler at the next boundary.
+            self._blocked = True
+            await asyncio.sleep(self._block_seconds)
+        return await super().watch_ohlcv(symbol, timeframe)
+
+
+def __test_live_generator_drops_late_real_bar_for_already_synthesised_boundary__():
+    """A late real ``ohlc.event`` for an already-synthesised slot is dropped.
+
+    Without dedup the consumer would see two CLOSED bars on the same TF
+    boundary — the synth (already published, possibly already executed
+    against the script) and the late real bar with conflicting OHLCV.
+    Drop the real one: the synth's flat values are now the authoritative
+    live record for that minute.
+    """
+    base_ts = int(time.time()) - 200
+    updates = [
+        _make_ohlcv(base_ts, is_closed=True, close=100.0),
+        # Late real bar arrives at base_ts + 60 — same boundary the
+        # watchdog will synthesise while we sleep below.
+        _make_ohlcv(base_ts + 60, is_closed=True, close=999.0),
+    ]
+    provider = _LateBarAfterIdle(updates, block_seconds=0.3)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if len(bars) >= 2:
+            break
+
+    assert bars[0].timestamp == base_ts
+    assert bars[0].close == 100.0
+    # Second bar must be the synth (V=0, close=100), NOT the late real
+    # bar with close=999. The late one was dropped by the dedup.
+    assert bars[1].timestamp == base_ts + 60
+    assert bars[1].volume == 0.0
+    assert bars[1].close == 100.0
+
+
 # --- Connection error from listener death tests ---
 
 class ListenerDeathProvider(MockLiveProvider):
