@@ -754,6 +754,56 @@ def __test_periodic_reconcile_skips_clear_while_close_in_flight__():
     assert len(pos.open_trades) == 1
 
 
+def __test_reconcile_does_not_warn_on_tracked_orders_missing_from_exchange__(caplog):
+    """Regression: ``reconcile()`` must not diff ``_order_mapping`` against
+    ``get_open_orders``.
+
+    On brokers like Capital.com a Pine entry becomes an exchange-side
+    *position* (not a working order) and the bracket lives as
+    ``profitLevel`` / ``stopLevel`` *attributes* on that position — neither
+    is visible to ``get_open_orders``, which only enumerates the
+    working-orders namespace. Diffing tracked IDs against that namespace
+    produced a permanent false-positive ``tracked orders missing from
+    exchange`` warning every bar.
+
+    Detection of bot-owned-order disappearance is now plugin-owned (signal
+    via ``watch_orders`` ``cancelled`` event or ``UnexpectedCancelError``);
+    the engine reconcile only checks position size mismatch.
+    """
+    import logging
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders["L"] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    # Engine tracks both intents — the IDs were assigned by the mock broker
+    # at dispatch time.
+    assert engine.order_mapping  # sanity: tracking IS populated
+
+    # Simulate the post-fill steady state: the bracket lives on a position
+    # that ``get_open_orders`` cannot see (Capital.com semantics).
+    b.open_orders = []
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.avg_price = 50_000.0
+    engine._sync_count = 1  # post-startup periodic call
+
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+
+    assert not any(
+        "tracked orders missing from exchange" in rec.getMessage()
+        for rec in caplog.records
+    ), "engine must not diff _order_mapping against get_open_orders"
+
+
 # === OCA cascade cancel ===
 #
 # The engine must cancel OCA-cancel siblings the moment a fill event arrives,

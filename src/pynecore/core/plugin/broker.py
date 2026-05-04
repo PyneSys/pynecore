@@ -48,6 +48,23 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     exchange supports. The Order Sync Engine only calls these methods and
     routes back the :class:`OrderEvent` objects they produce — it never
     reaches into exchange-specific APIs itself.
+
+    **Bot-owned-order disappearance detection is a plugin responsibility.**
+    The engine deliberately does not diff its in-memory order mapping
+    against :meth:`get_open_orders`, because the resource namespaces are
+    broker-specific: a Pine entry may live as a working order, an open
+    position, or a position-attached bracket on different exchanges, and
+    ``get_open_orders`` only covers one of those namespaces. The plugin must
+    therefore detect manual closes / broker-side liquidations / silent
+    cancels itself (typically a per-poll snapshot of *all* relevant
+    namespaces, with a small grace window to absorb in-flight races) and
+    report disappearance through :meth:`watch_orders` — either by emitting
+    a synthesised ``cancelled`` :class:`OrderEvent` (the engine's event
+    router cleans it out of internal tracking) or by raising
+    :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`
+    according to the configured :attr:`on_unexpected_cancel` policy. See
+    the Capital.com plugin's ``_reconcile_snapshot`` +
+    ``_emit_unexpected_cancellations`` for the reference implementation.
     """
 
     on_unexpected_cancel: str = "stop"
@@ -237,12 +254,31 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
 
     def watch_orders(self) -> AsyncIterator['OrderEvent']:
         """
-        Stream order status updates via WebSocket.
+        Stream order status updates.
 
         If not implemented, the framework polls :meth:`get_open_orders` on
         each bar.  Return an async iterator of :class:`OrderEvent` objects;
         the plugin is responsible for filling in the Pine identity fields
         (``pine_id``, ``from_entry``, ``leg_type``) on each event.
+
+        The stream is the only channel through which the engine learns
+        about broker-side state transitions, and the plugin is free to
+        emit *synthesised* events alongside any native exchange feed:
+
+        - A ``cancelled`` event for a bot-owned order the plugin itself
+          observed disappearing (e.g. via an internal ``/positions`` +
+          ``/workingorders`` poll past a grace window) — the engine's
+          event router pops the matching ``_order_mapping`` entry exactly
+          as it would for a native cancel.
+        - Recovery events that backfill state missed during a network
+          drop or restart, before the native stream catches up.
+
+        Plugins that decide a disappearance warrants a graceful halt
+        instead of a soft cancel should raise
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`
+        from the same generator — the engine catches it on the broker
+        thread and latches a halt flag so the next runner tick exits via
+        its ``finally`` block.
         """
         raise NotImplementedError
 

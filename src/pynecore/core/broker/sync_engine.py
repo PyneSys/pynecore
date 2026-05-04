@@ -416,29 +416,32 @@ class OrderSyncEngine:
             )
 
     def reconcile(self) -> None:
-        """Read-side state reconciliation with the exchange.
+        """Read-side position reconciliation with the exchange.
 
-        The exchange is authoritative for state. Any mismatch between our
-        tracking and ``get_open_orders`` / ``get_position`` is logged and
-        the local tracking is overwritten. No orders are ever **sent**
-        from a reconciliation pass — that would risk duplicate entries.
+        The exchange is authoritative for position state. ``get_position`` is
+        compared against ``self._position``: at startup the engine adopts the
+        exchange size unconditionally; on periodic passes it only acts on
+        shrink-to-zero (external flatten). No orders are ever **sent** from a
+        reconciliation pass — that would risk duplicate entries.
+
+        **What this method does NOT do:** it does not diff
+        ``_order_mapping`` against ``get_open_orders``. Detecting bot-owned
+        orders that disappear from the exchange (manual close from the broker
+        UI, broker-side liquidation, exchange-side cancel) is a
+        :class:`~pynecore.core.plugin.broker.BrokerPlugin` responsibility,
+        because the relevant resource namespace is broker-specific (working
+        orders vs open positions vs position-attached brackets vs child
+        orders), and ``get_open_orders`` only sees one of those namespaces on
+        most brokers. Plugins detect disappearance via their own internal
+        snapshot loop and signal the engine through ``watch_orders`` —
+        either by emitting a synthesised ``cancelled`` :class:`OrderEvent`
+        (which the engine's ``_route_event`` cleans out of
+        ``_order_mapping``) or by raising
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` for a
+        graceful halt. See the Capital.com plugin's
+        ``_reconcile_snapshot`` + ``_emit_unexpected_cancellations`` for the
+        reference implementation.
         """
-        orders = self._run_async(self._broker.get_open_orders(self._symbol))
-        tracked_ids: set[str] = set()
-        for ids in self._order_mapping.values():
-            tracked_ids.update(ids)
-        exchange_ids = {o.id for o in orders}
-        stale = tracked_ids - exchange_ids
-        if stale:
-            _blog_warning(
-                "tracked orders missing from exchange: %s", stale,
-            )
-        untracked = exchange_ids - tracked_ids
-        if untracked:
-            _blog_info(
-                "unknown orders on exchange (not bot-owned): %s", untracked,
-            )
-
         exch_pos = self._run_async(self._broker.get_position(self._symbol))
         # The exchange is the single source of truth for position state.
         # ``get_position`` returns ``None`` when no row exists for the symbol,
