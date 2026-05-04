@@ -48,7 +48,7 @@ pynecore/
 The heart of the PyneCore system, implementing the fundamental data structures and execution model:
 
 - **Series Implementation** (`series.py`): Circular buffer-based data structure that emulates Pine Script's series behavior (~490k ops/sec)
-- **Script Runner** (`script_runner.py`): Executes Pyne scripts bar-by-bar, handles strategy simulation lifecycle
+- **Script Runner** (`script_runner.py`): Executes Pyne code bar-by-bar, handles strategy simulation lifecycle
 - **Import Hook System** (`import_hook.py`): Allows Python to process `@pyne` scripts with AST transformations
 - **Data Handling** (`ohlcv_file.py`, `csv_file.py`, `data_converter.py`): OHLCV reading/writing, CSV conversion with extra fields support
 - **Aggregator** (`aggregator.py`): Timeframe aggregation (e.g. 1m → 1H → 1D)
@@ -111,7 +111,7 @@ Type definitions for Pine Script compatible constructs (40+ type modules):
 
 Command-line interface providing the `pyne` command:
 
-- **run**: Execute Pyne scripts with OHLCV data
+- **run**: Execute Pyne code with OHLCV data
 - **compile**: Compile Pine Script via the PyneSys API
 - **data**: Download, convert, and aggregate OHLCV data
 - **benchmark**: Performance benchmarking

@@ -504,7 +504,11 @@ class SimPosition(PositionBase):
         # Order books
         self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
         self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
-        self.exit_orders: dict[str | None, Order] = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
+        # Exit orders from strategy.exit(), strategy.close(), etc.
+        # Key is (exit_id, from_entry) — both partial-TP fan-out (same from_entry,
+        # different ids) and from_entry_na fan-out (same id, different from_entry)
+        # must coexist; only repeated calls with both fields equal modify-in-place.
+        self.exit_orders: dict[tuple[str | None, str | None], Order] = {}
         self.orderbook = PriceOrderBook()
 
         # Trades
@@ -568,8 +572,9 @@ class SimPosition(PositionBase):
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
-            existing_order = self.exit_orders.get(order.order_id)
-            self.exit_orders[order.order_id] = order
+            exit_key = (order.exit_id, order.order_id)
+            existing_order = self.exit_orders.get(exit_key)
+            self.exit_orders[exit_key] = order
         else:
             # Both entry and normal orders are stored in entry_orders dict
             existing_order = self.entry_orders.get(order.order_id)
@@ -586,7 +591,7 @@ class SimPosition(PositionBase):
         """ Remove an order from the strategy """
         order.cancelled = True
         if order.order_type == _order_type_close:
-            self.exit_orders.pop(order.order_id, None)
+            self.exit_orders.pop((order.exit_id, order.order_id), None)
         else:
             # Both entry and normal orders are stored in entry_orders dict
             self.entry_orders.pop(order.order_id, None)
@@ -598,12 +603,13 @@ class SimPosition(PositionBase):
 
     def _remove_order_by_id(self, order_id: str):
         """ Remove order by id """
-        # First check in exit orders
-        order = self.exit_orders.get(order_id)
-        if order:
-            self._remove_order(order)
+        # TV-verified semantics (FX:EURUSD 60min, 2026-05-04): cancel matches an exit
+        # by its exit_id only, and an entry by its entry id. NO cross-matching —
+        # cancel(entry_id) does not cascade to exits that referenced it via from_entry.
+        for exit_order in list(self.exit_orders.values()):
+            if exit_order.exit_id == order_id:
+                self._remove_order(exit_order)
 
-        # Then check in entry orders
         order = self.entry_orders.get(order_id)
         if order:
             self._remove_order(order)
@@ -2238,10 +2244,11 @@ def exit(id: str, from_entry: str = "",
                 size = order.size
                 from_entry = order.order_id or ""
                 # Only mark as from_entry_na on first creation (not replacement)
-                had_existing_exit = from_entry in position.exit_orders
+                exit_key = (id, from_entry)
+                had_existing_exit = exit_key in position.exit_orders
                 _exit()
                 if not had_existing_exit:
-                    exit_order = position.exit_orders.get(from_entry)
+                    exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
                         exit_order.from_entry_na = True
 
@@ -2366,79 +2373,112 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 # Properties
 #
 
+# Strategy state accessors below return inert defaults when invoked in a
+# security child process: there `lib._script` is None because no
+# ScriptRunner.run_iter() ever ran. Pine itself rejects strategy.* state
+# reads inside any request.*() argument at compile time (CE10059), so the
+# values are never consumed by the chart anyway — this only prevents the
+# child from crashing when the chart-context body references them.
+
 # noinspection PyProtectedMember
 @module_property
 def equity() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.equity
 
 
 # noinspection PyProtectedMember
 @module_property
 def eventrades() -> PyneInt:
+    if lib._script is None:
+        return 0
     return lib._script.position.eventrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def initial_capital() -> float:
+    if lib._script is None:
+        return 0.0
     return lib._script.initial_capital
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossloss() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.grossloss + lib._script.position.open_commission
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.grossprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def losstrades() -> int:
+    if lib._script is None:
+        return 0
     return lib._script.position.losstrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_drawdown() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.max_drawdown
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_runup() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.max_runup
 
 
 # noinspection PyProtectedMember
 @module_property
 def netprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.netprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def openprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.openprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_size() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.size
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_avg_price() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.avg_price
 
 
 # noinspection PyProtectedMember
 @module_property
 def wintrades() -> PyneInt:
+    if lib._script is None:
+        return 0
     return lib._script.position.wintrades

@@ -11,15 +11,10 @@ from ..types.na import NA
 from ..types import PyneFloat, PyneInt, PyneStr, PyneBool
 from ..types.color import Color
 from ..types.box import Box
-from ..types.line import Line, LineEnum
-from ..types.label import Label, LabelStyleEnum
+from ..types.line import Line
+from ..types.label import Label
 from ..types.linefill import LineFill
-from ..types.chart import ChartPoint
-from ..core.overload import overload
 from . import order as _order
-from ..lib import (box as _box, line as _line, label as _label, linefill as _linefill,
-                   color as _color, extend as _extend, xloc as _xloc, yloc as _yloc,
-                   size as _size, text as _text, font as _font)
 
 T = TypeVar('T')
 Number = TypeVar('Number', int, float)
@@ -422,281 +417,64 @@ def mode(id: list[T]) -> T:
 
 
 # noinspection PyShadowingNames
-@overload
-def new_box(top_left: ChartPoint, bottom_right: ChartPoint, border_color: _color.Color = _color.blue,
-            border_width: int = 1, border_style: LineEnum = _line.style_solid,
-            extend: _extend.Extend = _extend.none, xloc: _xloc.XLoc = _xloc.bar_index,
-            bgcolor: _color.Color = _color.blue, text: str = "", text_size: _size.Size = _size.auto,
-            text_color: _color.Color = _color.black, text_halign: _text.AlignEnum = _text.align_center,
-            text_valign: _text.AlignEnum = _text.align_center, text_wrap: _text.WrapEnum = _text.wrap_none,
-            text_font_family: _font.FontFamilyEnum = _font.family_default, force_overlay: bool = False,
-            text_formatting: _text.FormatEnum = _text.format_none) -> Box:
+def new_box(size: int = 0, initial_value: Box | NA = NA(Box)) -> list[Box | NA[Box]]:
     """
-    Creates a new box object using ChartPoint objects.
+    Creates a new array of box objects of the specified size, with each element initialized
+    to the specified value.
 
-    :param top_left: chart.point object that specifies the top-left corner location
-    :param bottom_right: chart.point object that specifies the bottom-right corner location
-    :param border_color: Color of the four borders
-    :param border_width: Width of the four borders, in pixels
-    :param border_style: Style of the four borders
-    :param extend: When extend.none is used, the horizontal borders start at the left border and end at the right border
-    :param xloc: Determines whether the arguments to 'left' and 'right' are a bar index or a time value
-    :param bgcolor: Background color of the box
-    :param text: The text to be displayed inside the box
-    :param text_size: Size of the box's text
-    :param text_color: The color of the text
-    :param text_halign: The horizontal alignment of the box's text
-    :param text_valign: The vertical alignment of the box's text
-    :param text_wrap: Whether to wrap text. Wrapped text starts a new line
-    :param text_font_family: The font family of the text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: The formatting of the displayed text
-    :return: A box object that can be used with other array functions
+    :param size: Size of the new array
+    :param initial_value: Initial value to set for each element in the array
+    :return: New array of box objects
     """
-    return _box.new(
-        top_left=top_left,
-        bottom_right=bottom_right,
-        border_color=border_color,
-        border_width=border_width,
-        border_style=border_style,
-        extend=extend,
-        xloc=xloc,
-        bgcolor=bgcolor,
-        text=text,
-        text_size=text_size,
-        text_color=text_color,
-        text_halign=text_halign,
-        text_valign=text_valign,
-        text_wrap=text_wrap,
-        text_font_family=text_font_family,
-        force_overlay=force_overlay,
-        text_formatting=text_formatting
-    )
+    assert size >= 0, "Size must be >=0!"
+    assert isinstance(initial_value, (Box, NA)), "Initial value must be Box!"
+    return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-@overload
-def new_box(left: int, top: float, right: int, bottom: float, border_color: _color.Color = _color.blue,
-            border_width: int = 1, border_style: LineEnum = _line.style_solid,
-            extend: _extend.Extend = _extend.none, xloc: _xloc.XLoc = _xloc.bar_index,
-            bgcolor: _color.Color = _color.blue, text: str = "", text_size: _size.Size = _size.auto,
-            text_color: _color.Color = _color.black, text_halign: _text.AlignEnum = _text.align_center,
-            text_valign: _text.AlignEnum = _text.align_center, text_wrap: _text.WrapEnum = _text.wrap_none,
-            text_font_family: _font.FontFamilyEnum = _font.family_default, force_overlay: bool = False,
-            text_formatting: _text.FormatEnum = _text.format_none) -> Box:
+def new_line(size: int = 0, initial_value: Line | NA = NA(Line)) -> list[Line | NA[Line]]:
     """
-    Creates a new box object using coordinate values.
+    Creates a new array of line objects of the specified size, with each element initialized
+    to the specified value.
 
-    :param left: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the left border
-    :param top: Price of the top border
-    :param right: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the right border
-    :param bottom: Price of the bottom border
-    :param border_color: Color of the four borders
-    :param border_width: Width of the four borders, in pixels
-    :param border_style: Style of the four borders
-    :param extend: When extend.none is used, the horizontal borders start at the left border and end at the right border
-    :param xloc: Determines whether the arguments to 'left' and 'right' are a bar index or a time value
-    :param bgcolor: Background color of the box
-    :param text: The text to be displayed inside the box
-    :param text_size: Size of the box's text
-    :param text_color: The color of the text
-    :param text_halign: The horizontal alignment of the box's text
-    :param text_valign: The vertical alignment of the box's text
-    :param text_wrap: Whether to wrap text. Wrapped text starts a new line
-    :param text_font_family: The font family of the text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: The formatting of the displayed text
-    :return: A box object that can be used with other array functions
+    :param size: Size of the new array
+    :param initial_value: Initial value to set for each element in the array
+    :return: New array of line objects
     """
-    return _box.new(
-        left=left,
-        top=top,
-        right=right,
-        bottom=bottom,
-        border_color=border_color,
-        border_width=border_width,
-        border_style=border_style,
-        extend=extend,
-        xloc=xloc,
-        bgcolor=bgcolor,
-        text=text,
-        text_size=text_size,
-        text_color=text_color,
-        text_halign=text_halign,
-        text_valign=text_valign,
-        text_wrap=text_wrap,
-        text_font_family=text_font_family,
-        force_overlay=force_overlay,
-        text_formatting=text_formatting
-    )
+    assert size >= 0, "Size must be >=0!"
+    assert isinstance(initial_value, (Line, NA)), "Initial value must be Line!"
+    return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-@overload
-def new_line(first_point: ChartPoint, second_point: ChartPoint, xloc: _xloc.XLoc = _xloc.bar_index,
-             extend: _extend.Extend = _extend.none, color: _color.Color = _color.blue,
-             style: LineEnum = _line.style_solid, width: int = 1, force_overlay: bool = False) -> Line:
+def new_label(size: int = 0, initial_value: Label | NA = NA(Label)) -> list[Label | NA[Label]]:
     """
-    Creates a new line object using ChartPoint objects.
+    Creates a new array of label objects of the specified size, with each element initialized
+    to the specified value.
 
-    :param first_point: chart.point object that specifies the line's starting coordinate
-    :param second_point: chart.point object that specifies the line's ending coordinate
-    :param xloc: See description of x1 argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param extend: If extend=extend.none, draws segment starting at point (x1, y1) and ending at point (x2, y2)
-    :param color: Line color
-    :param style: Line style. Possible values: line.style_solid, line.style_dotted, line.style_dashed,
-                  line.style_arrow_left, line.style_arrow_right, line.style_arrow_both
-    :param width: Line width in pixels
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :return: A line object that can be used with other array functions
+    :param size: Size of the new array
+    :param initial_value: Initial value to set for each element in the array
+    :return: New array of label objects
     """
-    return _line.new(
-        first_point=first_point,
-        second_point=second_point,
-        xloc=xloc,
-        extend=extend,
-        color=color,
-        style=style,
-        width=width,
-        force_overlay=force_overlay
-    )
+    assert size >= 0, "Size must be >=0!"
+    assert isinstance(initial_value, (Label, NA)), "Initial value must be Label!"
+    return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-@overload
-def new_line(x1: int, y1: float, x2: int, y2: float, xloc: _xloc.XLoc = _xloc.bar_index,
-             extend: _extend.Extend = _extend.none, color: _color.Color = _color.blue,
-             style: LineEnum = _line.style_solid, width: int = 1, force_overlay: bool = False) -> Line:
+def new_linefill(size: int = 0,
+                 initial_value: LineFill | NA = NA(LineFill)) -> list[LineFill | NA[LineFill]]:
     """
-    Creates a new line object using coordinate values.
+    Creates a new array of linefill objects of the specified size, with each element initialized
+    to the specified value.
 
-    :param x1: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the first point
-    :param y1: Price of the first point of the line
-    :param x2: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the second point
-    :param y2: Price of the second point of the line
-    :param xloc: See description of x1 argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param extend: If extend=extend.none, draws segment starting at point (x1, y1) and ending at point (x2, y2)
-    :param color: Line color
-    :param style: Line style. Possible values: line.style_solid, line.style_dotted,
-                  line.style_dashed, line.style_arrow_left, line.style_arrow_right, line.style_arrow_both
-    :param width: Line width in pixels
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :return: A line object that can be used with other array functions
+    :param size: Size of the new array
+    :param initial_value: Initial value to set for each element in the array
+    :return: New array of linefill objects
     """
-    return _line.new(
-        x1=x1,
-        y1=y1,
-        x2=x2,
-        y2=y2,
-        xloc=xloc,
-        extend=extend,
-        color=color,
-        style=style,
-        width=width,
-        force_overlay=force_overlay
-    )
-
-
-# noinspection PyShadowingNames
-@overload
-def new_label(point: ChartPoint, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
-              yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
-              style: LabelStyleEnum = _label.style_label_down, textcolor: _color.Color = _color.white,
-              size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
-              tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
-              force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label:
-    """
-    Creates a new label object using a ChartPoint.
-
-    :param point: chart.point object that specifies the label position
-    :param text: Label text
-    :param xloc: See description of x argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param yloc: Possible values are yloc.price, yloc.abovebar, yloc.belowbar
-    :param color: Color of the label border and arrow
-    :param style: Label style
-    :param textcolor: Color of the label text
-    :param size: Size of the label text
-    :param textalign: Alignment of the label text
-    :param tooltip: Tooltip text displayed when hovering over the label
-    :param text_font_family: Font family of the label text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: Text formatting options
-    :return: A label object that can be used with other array functions
-    """
-    return _label.new(
-        point=point,
-        text=text,
-        xloc=xloc,
-        yloc=yloc,
-        color=color,
-        style=style,
-        textcolor=textcolor,
-        size=size,
-        textalign=textalign,
-        tooltip=tooltip,
-        text_font_family=text_font_family,
-        force_overlay=force_overlay,
-        text_formatting=text_formatting
-    )
-
-
-# noinspection PyShadowingNames
-@overload
-def new_label(x: int, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
-              yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
-              style: LabelStyleEnum = _label.style_label_down, textcolor: _color.Color = _color.white,
-              size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
-              tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
-              force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label:
-    """
-    Creates a new label object using coordinate values.
-
-    :param x: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the label position
-    :param y: Price of the label position
-    :param text: Label text
-    :param xloc: See description of x argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param yloc: Possible values are yloc.price, yloc.abovebar, yloc.belowbar
-    :param color: Color of the label border and arrow
-    :param style: Label style
-    :param textcolor: Color of the label text
-    :param size: Size of the label text
-    :param textalign: Alignment of the label text
-    :param tooltip: Tooltip text displayed when hovering over the label
-    :param text_font_family: Font family of the label text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: Text formatting options
-    :return: A label object that can be used with other array functions
-    """
-    return _label.new(
-        x=x,
-        y=y,
-        text=text,
-        xloc=xloc,
-        yloc=yloc,
-        color=color,
-        style=style,
-        textcolor=textcolor,
-        size=size,
-        textalign=textalign,
-        tooltip=tooltip,
-        text_font_family=text_font_family,
-        force_overlay=force_overlay,
-        text_formatting=text_formatting
-    )
-
-
-# noinspection PyShadowingNames
-def new_linefill(line1: Line, line2: Line, color: _color.Color) -> LineFill | NA[LineFill]:
-    """
-    Creates a new linefill object and displays it on the chart, filling the space between line1 and
-    line2 with the color specified in color.
-
-    :param line1: First line object
-    :param line2: Second line object
-    :param color: The color used to fill the space between the lines
-    :return: The ID of a linefill object that can be used with other array functions, or NA if any line is NA
-    """
-    return _linefill.new(line1=line1, line2=line2, color=color)
+    assert size >= 0, "Size must be >=0!"
+    assert isinstance(initial_value, (LineFill, NA)), "Initial value must be LineFill!"
+    return [initial_value] * size
 
 
 # noinspection PyShadowingNames

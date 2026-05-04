@@ -13,7 +13,7 @@ Architecture:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from multiprocessing import Event
+from multiprocessing import Event, Lock
 from typing import TYPE_CHECKING
 
 from .security_shm import (
@@ -22,7 +22,7 @@ from .security_shm import (
 )
 
 if TYPE_CHECKING:
-    from multiprocessing.synchronize import Event as EventType
+    from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
     from zoneinfo import ZoneInfo
     from .resampler import Resampler
@@ -43,6 +43,12 @@ class SecurityState:
     advance_event: EventType = field(default_factory=Event)
     done_event: EventType = field(default_factory=Event)
     stop_event: EventType = field(default_factory=Event)
+
+    # Cross-process mutex protecting this slot's ResultBlock + sync metadata.
+    # Held by writers (write_result/write_na) and by cross-context readers in
+    # security children. Chart-side reads also acquire it for uniformity, but
+    # never contend (data_ready already gates them).
+    result_lock: LockType = field(default_factory=Lock)
 
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
@@ -164,7 +170,8 @@ def create_chart_protocol(
 
     def __sec_write__(sec_id: str, value, _scope_id=None):
         if sec_id in same_context_ids and result_blocks is not None:
-            write_result(result_blocks[sec_id], sync_block, value)
+            with states[sec_id].result_lock:
+                write_result(result_blocks[sec_id], sync_block, value)
             states[sec_id].data_ready.set()
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
@@ -174,7 +181,8 @@ def create_chart_protocol(
         if not state.is_ltf and state.gaps_on and not state.new_period:
             return default
 
-        result = readers[sec_id].read(sync_block, default)
+        with state.result_lock:
+            result = readers[sec_id].read(sync_block, default)
 
         if currency_conversions and sec_id in currency_conversions and result is not default:
             from ..lib import request
@@ -206,10 +214,11 @@ def create_chart_protocol(
 
 
 def create_security_protocol(
-    _sec_id: str,
+    sec_id: str,
     sync_block: SyncBlock,
     result_block: ResultBlock,
     all_sec_ids: list[str],
+    result_locks: 'dict[str, LockType]',
     is_ltf: bool = False,
 ) -> tuple:
     """
@@ -223,10 +232,13 @@ def create_security_protocol(
     writing to shared memory. The caller must invoke ``flush()`` at the end of
     each round to write the accumulated array.
 
-    :param _sec_id: Security context ID (unused, kept for API symmetry with chart protocol)
+    :param sec_id: This security context's ID (the only slot it writes to).
     :param sync_block: Shared memory sync block
     :param result_block: Shared memory result block for writing
     :param all_sec_ids: All security context IDs (for cross-context reads)
+    :param result_locks: Per-slot ``multiprocessing.Lock`` keyed by sec_id.
+                         Writers acquire ``result_locks[sec_id]``; cross-context
+                         readers acquire ``result_locks[<peer sid>]``.
     :param is_ltf: If True, enable LTF accumulation mode.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush)
              flush is None when is_ltf=False.
@@ -234,6 +246,7 @@ def create_security_protocol(
     readers: dict[str, ResultReader] = {
         sid: ResultReader(sid) for sid in all_sec_ids
     }
+    own_lock = result_locks[sec_id]
 
     def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _scope_id=None):
         pass
@@ -245,16 +258,19 @@ def create_security_protocol(
             _buffer.append(value)
 
         def flush():
-            write_result(result_block, sync_block, _buffer.copy())
+            with own_lock:
+                write_result(result_block, sync_block, _buffer.copy())
             _buffer.clear()
     else:
         def __sec_write__(_sid: str, value, _scope_id=None):
-            write_result(result_block, sync_block, value)
+            with own_lock:
+                write_result(result_block, sync_block, value)
 
         flush = None
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
-        return readers[sid].read(sync_block, default)
+        with result_locks[sid]:
+            return readers[sid].read(sync_block, default)
 
     def __sec_wait__(_sid: str, _scope_id=None):
         pass

@@ -1,11 +1,11 @@
-"""Standalone runner for PyneComp-compiled @pyne scripts."""
+"""Standalone runner for PyneComp-compiled Pyne code."""
 import sys
 from pathlib import Path
 
 
 def run(script_file: str) -> None:
     """
-    Run a compiled @pyne script in standalone mode.
+    Run compiled Pyne code in standalone mode.
 
     Enables ``python script.py data.csv`` without a workdir or the ``pyne`` CLI.
 

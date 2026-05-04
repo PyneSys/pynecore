@@ -2,6 +2,21 @@ import ast
 import copy
 
 
+# Strategy state accessors are meaningful only in the chart context — the
+# security child process has no strategy state of its own, so referencing
+# these in a request.security() / request.security_lower_tf() expression is
+# always a programmer error. We raise SyntaxError when the offending attribute
+# access is direct (i.e. not bound through a local alias). Transitive flow
+# analysis is intentionally skipped — at runtime the security child returns
+# inert defaults via the `lib._script is None` guard in the strategy module,
+# so escaped cases fail safe rather than crash.
+_FORBIDDEN_STRATEGY_STATE_ATTRS = frozenset({
+    "equity", "eventrades", "grossloss", "grossprofit", "initial_capital",
+    "losstrades", "max_drawdown", "max_runup", "netprofit", "openprofit",
+    "position_avg_price", "position_size", "wintrades",
+})
+
+
 class SecurityTransformer(ast.NodeTransformer):
     """
     Transform request.security() calls into multiprocessing signal/write/read pattern.
@@ -34,6 +49,7 @@ class SecurityTransformer(ast.NodeTransformer):
         self._signal_args: dict[str, tuple[ast.expr | None, ast.expr | None]] = {}
         self._needs_barmerge = False
         self._ltf_sec_ids: set[str] = set()
+        self._module_file: str = '<script>'
 
     def _gen_id(self) -> str:
         sec_id = f"sec\xb7{self._counter}"
@@ -104,6 +120,31 @@ class SecurityTransformer(ast.NodeTransformer):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             yield from SecurityTransformer._walk_skip_funcs(child)
+
+    @staticmethod
+    def _find_forbidden_strategy_state(expr: ast.expr) -> ast.Attribute | None:
+        """Return the first `lib.strategy.<state_attr>` Attribute node found in
+        ``expr``, or None if there is none.
+
+        Only direct attribute chains (`lib.strategy.position_size` form,
+        produced by ImportNormalizerTransformer for any of `strategy.x`,
+        `from pynecore.lib import strategy; strategy.x`, or
+        `from pynecore.lib.strategy import x`) are detected. Local aliases
+        (`ps = strategy.position_size; security(..., ps)`) are not —
+        catching those would need a def-use chain analyzer; instead the
+        runtime fallback in the strategy module returns inert defaults.
+        """
+        for sub in ast.walk(expr):
+            if not isinstance(sub, ast.Attribute):
+                continue
+            if sub.attr not in _FORBIDDEN_STRATEGY_STATE_ATTRS:
+                continue
+            parent = sub.value
+            if (isinstance(parent, ast.Attribute) and parent.attr == 'strategy'
+                    and isinstance(parent.value, ast.Name)
+                    and parent.value.id == 'lib'):
+                return sub
+        return None
 
     @staticmethod
     def _is_module_level_expr(node: ast.expr) -> bool:
@@ -256,10 +297,25 @@ class SecurityTransformer(ast.NodeTransformer):
             orelse=[]
         )
 
-    def _sec_read_call(self, sec_id: str) -> ast.Call:
-        """Build: __sec_read__("sec_id", lib.na, __scope_id__)"""
+    def _sec_read_call(self, sec_id: str, tuple_len: int | None = None) -> ast.Call:
+        """Build: __sec_read__("sec_id", <default>, __scope_id__)
+
+        Default is ``lib.na`` for scalar reads, or an N-tuple of ``lib.na``
+        when the LHS unpacks the result. Pine `request.security()` returns a
+        tuple of `na` (one per element) on no-data bars — emitting a single
+        scalar would crash tuple-unpack with ``TypeError: cannot unpack
+        non-iterable NA object`` in `gaps_on` between-period reads or after a
+        `write_na` (session gap).
+        """
+        if tuple_len is None:
+            default: ast.expr = self._lib_na()
+        else:
+            default = ast.Tuple(
+                elts=[self._lib_na() for _ in range(tuple_len)],
+                ctx=ast.Load()
+            )
         return self._func_call(
-            '__sec_read__', ast.Constant(value=sec_id), self._lib_na(),
+            '__sec_read__', ast.Constant(value=sec_id), default,
             self._scope_id_ref()
         )
 
@@ -269,6 +325,31 @@ class SecurityTransformer(ast.NodeTransformer):
             '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load()),
             self._scope_id_ref()
         )
+
+    @staticmethod
+    def _detect_tuple_arity(stmt: ast.stmt, call: ast.Call) -> int | None:
+        """If ``stmt`` is a tuple-unpack assignment whose RHS is exactly
+        ``call``, return the LHS arity. Otherwise None.
+
+        Pine statically enforces LHS-arity == RHS-arity for tuple-returning
+        ``request.security()`` (compile errors CE10239 / CE10172), so the
+        unpack target's arity is the authoritative source.
+
+        Skipped: star-unpack (``*rest``), multi-target (``a = b = sec(...)``),
+        annotated/augmented assigns, calls wrapped in a larger expression.
+        """
+        if not isinstance(stmt, ast.Assign):
+            return None
+        if len(stmt.targets) != 1:
+            return None
+        target = stmt.targets[0]
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return None
+        if any(isinstance(e, ast.Starred) for e in target.elts):
+            return None
+        if stmt.value is not call:
+            return None
+        return len(target.elts)
 
     # --- Collection ---
 
@@ -329,14 +410,19 @@ class SecurityTransformer(ast.NodeTransformer):
 
             self._recurse_subbodies(stmt, call_exprs, runtime_sec_ids)
 
-            sec_ids_here = [
-                getattr(n, '_sec_id')
-                for n in self._walk_skip_funcs(stmt)
+            call_nodes_here = [
+                n for n in self._walk_skip_funcs(stmt)
                 if isinstance(n, ast.Call) and hasattr(n, '_sec_id')
             ]
 
-            if sec_ids_here:
-                for sid in sec_ids_here:
+            if call_nodes_here:
+                for call_node in call_nodes_here:
+                    arity = self._detect_tuple_arity(stmt, call_node)
+                    if arity is not None:
+                        call_node._tuple_len = arity  # type: ignore[attr-defined]
+
+                for call_node in call_nodes_here:
+                    sid = getattr(call_node, '_sec_id')
                     if sid in runtime_sec_ids:
                         new_body.append(self._inline_signal(sid))
                     expr = copy.deepcopy(call_exprs[sid])
@@ -400,6 +486,19 @@ class SecurityTransformer(ast.NodeTransformer):
                 symbol, timeframe, expression, gaps, ignore_invalid, currency = (
                     self._extract_args(call)
                 )
+
+            if expression is not None:
+                bad = self._find_forbidden_strategy_state(expression)
+                if bad is not None:
+                    fn_name = 'request.security_lower_tf' if is_ltf else 'request.security'
+                    raise SyntaxError(
+                        f"'strategy.{bad.attr}' cannot be used as the expression "
+                        f"argument of {fn_name}() — strategy state is only "
+                        f"available in the chart context, not in a security "
+                        f"context.",
+                        (self._module_file, getattr(bad, 'lineno', 0),
+                         getattr(bad, 'col_offset', 0) + 1, None)
+                    )
 
             call_exprs[sec_id] = expression if expression is not None else self._lib_na()
 
@@ -481,6 +580,7 @@ class SecurityTransformer(ast.NodeTransformer):
         return self._process_func(node)  # type: ignore[return-value]
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        self._module_file = getattr(node, '_module_file_path', '<script>')
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
@@ -521,5 +621,6 @@ class _CallReplacer(ast.NodeTransformer):
             sec_id = getattr(node, '_sec_id')
             if sec_id in self._parent._ltf_sec_ids:
                 return self._parent._sec_read_call_ltf(sec_id)
-            return self._parent._sec_read_call(sec_id)
+            tuple_len = getattr(node, '_tuple_len', None)
+            return self._parent._sec_read_call(sec_id, tuple_len)
         return node

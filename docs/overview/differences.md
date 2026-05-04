@@ -21,7 +21,7 @@ tags: ["pine-script", "differences", "comparison", "python", "syntax", "types"]
 
 ### Pyne magic comment
 
-Pyne codes must start with a magic doc-comment `@pyne` to be recognized as Pyne code.
+Pyne code must start with a module docstring whose first non-whitespace token is `@pyne` to be recognized by the import hook.
 
 ```python
 """
@@ -29,8 +29,9 @@ Pyne codes must start with a magic doc-comment `@pyne` to be recognized as Pyne 
 """
 ```
 
-Under the hood, this tells the AST transformers that this is a Pyne code and should be transformed.
-Also you, the programmer can clearly see, this code will have extra Pine like features.
+The marker rule is strict: the first statement of the file has to be a docstring, that docstring must begin with `@pyne` (whitespace is allowed before it), and `@pyne` must be followed by whitespace or the end of the docstring. A docstring that mentions `@pyne` somewhere inside (e.g. after a description line) does **not** count.
+
+Under the hood this tells the AST transformers to treat the file as Pyne code and apply the transformations. As a programmer you also see at a glance that this file will have extra Pine-like features.
 
 ### Main function
 

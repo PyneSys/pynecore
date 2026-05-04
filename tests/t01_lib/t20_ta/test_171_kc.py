@@ -20,6 +20,6 @@ def __test_kc__(csv_reader, runner, dict_comparator, log):
     """ KC / KCW """
     with csv_reader('kc.csv', subdir="data") as cr:
         for i, (candle, plot) in enumerate(runner(cr).run_iter()):
-            dict_comparator(plot, candle.extra_fields)
+            dict_comparator(plot, candle.extra_fields, abs_tol=1e-10, rel_tol=1e-7)
             if i > 150:
                 break

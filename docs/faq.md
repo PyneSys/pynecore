@@ -64,7 +64,7 @@ PyneCore uses a "workdir" directory structure to organize scripts, data, and con
 
 ```
 workdir/
-├── scripts/     # Your Pyne scripts
+├── scripts/     # Your Pyne code
 ├── data/        # OHLCV data files
 ├── output/      # Output files
 └── config/      # Configuration files
@@ -92,7 +92,7 @@ More providers could be added in the future by the community as plugins.
 
 ### How do I start a PyneCore script?
 
-Every PyneCore script must start with a special magic comment to identify it as a Pyne script:
+Every PyneCore script must begin with a module docstring whose first non-whitespace token is `@pyne`. This marker tells the import hook to treat the file as Pyne code and apply the AST transformations:
 
 ```python
 """
@@ -259,8 +259,8 @@ covering CSV data, custom data sources, live exchange feeds, and FreqTrade integ
 ### My script isn't being recognized as a PyneCore script
 
 Make sure:
-1. Your file starts with the `@pyne` magic comment
-2. The comment is at the very beginning of the file (before imports)
+1. Your file's first statement is a module docstring (`"""…"""`)
+2. The docstring's first non-whitespace token is `@pyne`, followed by whitespace or the end of the docstring (so `@pynex` won't match, and `@pyne` cannot appear after a description line — it must come first)
 3. You have a main() function defined
 4. You've imported necessary modules from pynecore.lib
 

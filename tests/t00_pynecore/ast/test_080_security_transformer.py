@@ -3,6 +3,8 @@
 """
 import ast
 
+import pytest
+
 from pynecore.transformers.security import SecurityTransformer
 
 
@@ -451,3 +453,178 @@ def main():
     result = _transform(source)
 
     assert 'pynecore.lib.barmerge' not in result
+
+
+def __test_tuple_unpack_emits_tuple_default__(log):
+    """LHS tuple-unpack must produce a tuple-of-na default in __sec_read__.
+
+    Pine semantics: ``request.security()`` returning a tuple yields a
+    tuple-of-na on every no-data path. A scalar ``lib.na`` default would
+    crash the unpack with TypeError on the first / between-period bars.
+    """
+    source = """
+def main():
+    (a, b, c, d, e, f) = lib.request.security(lib.syminfo.tickerid, "1D", f_six())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == '__sec_read__':
+                read_call = node
+                break
+    assert read_call is not None
+
+    default = read_call.args[1]
+    assert isinstance(default, ast.Tuple)
+    assert len(default.elts) == 6
+    for elt in default.elts:
+        assert isinstance(elt, ast.Attribute) and elt.attr == 'na'
+
+
+def __test_list_target_unpack_emits_tuple_default__(log):
+    """``[a, b] = security(...)`` (list-target) is also tuple-unpack."""
+    source = """
+def main():
+    [a, b] = lib.request.security(lib.syminfo.tickerid, "1D", f_two())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Tuple)
+    assert len(default.elts) == 2
+
+
+def __test_scalar_assign_keeps_scalar_default__(log):
+    """Single-target scalar assignment keeps the scalar ``lib.na`` default."""
+    source = """
+def main():
+    x = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(x)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_star_unpack_falls_back_to_scalar__(log):
+    """Star-unpack arity is unknown — must NOT bake a fixed-arity tuple."""
+    source = """
+def main():
+    a, *rest = lib.request.security(lib.syminfo.tickerid, "1D", f_three())
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_call_wrapped_in_ifexp_falls_back_to_scalar__(log):
+    """When the call is not the direct RHS, arity is not knowable — scalar."""
+    source = """
+def main():
+    a, b = lib.request.security(lib.syminfo.tickerid, "1D", f_two()) if cond else (0, 0)
+    lib.plot(a)
+"""
+    tree = _transform_tree(source)
+
+    read_call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == '__sec_read__'
+    )
+    default = read_call.args[1]
+    assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_strategy_position_size_in_security_rejected__(log):
+    """Direct strategy.position_size as security expression must raise SyntaxError."""
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.position_size)
+    lib.plot(daily)
+"""
+    with pytest.raises(SyntaxError, match="strategy.position_size"):
+        _transform(source)
+
+
+def __test_strategy_state_in_binop_rejected__(log):
+    """strategy.equity inside an arithmetic expression in security() is detected."""
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.equity + 100)
+    lib.plot(daily)
+"""
+    with pytest.raises(SyntaxError, match="strategy.equity"):
+        _transform(source)
+
+
+def __test_strategy_state_in_security_lower_tf_rejected__(log):
+    """request.security_lower_tf() applies the same rule."""
+    source = """
+def main():
+    arr = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.strategy.netprofit)
+    lib.plot(arr)
+"""
+    with pytest.raises(SyntaxError, match="strategy.netprofit.*security_lower_tf"):
+        _transform(source)
+
+
+def __test_strategy_state_via_local_alias_passes__(log):
+    """Transitive (local-alias) bind is intentionally NOT detected at AST level —
+    runtime guard in the strategy module handles it via 0.0/0 inert defaults."""
+    source = """
+def main():
+    ps = lib.strategy.position_size
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", ps)
+    lib.plot(daily)
+"""
+    # Should compile cleanly; runtime falls back to inert default in security child.
+    _transform(source)
+
+
+def __test_strategy_state_in_chart_body_passes__(log):
+    """strategy.* in chart-body code (outside security expr) compiles fine."""
+    source = """
+def main():
+    if lib.strategy.position_size > 0:
+        daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+        lib.plot(daily)
+"""
+    _transform(source)
+
+
+def __test_all_thirteen_strategy_state_attrs_rejected__(log):
+    """All 13 strategy state accessors are rejected when used directly in security()."""
+    forbidden = [
+        "equity", "eventrades", "grossloss", "grossprofit", "initial_capital",
+        "losstrades", "max_drawdown", "max_runup", "netprofit", "openprofit",
+        "position_avg_price", "position_size", "wintrades",
+    ]
+    for attr in forbidden:
+        source = f"""
+def main():
+    x = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.{attr})
+"""
+        with pytest.raises(SyntaxError, match=f"strategy.{attr}"):
+            _transform(source)

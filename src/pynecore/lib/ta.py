@@ -1889,60 +1889,65 @@ def variance(source: Series[float],
     if isinstance(source, NA):
         return NA(float)
 
+    # Welford online recurrence with Pébay (2008) decremental step for sliding
+    # window. Avoids the catastrophic cancellation of the textbook
+    # `E[X²] - E[X]²` form by accumulating m2 (sum of squared deviations from
+    # the running mean) directly. Kahan compensation on `mean` and `m2`
+    # eliminates ULP-level drift across long add/remove sequences. The final
+    # `max(0.0, ...)` is a safety clamp for the rare case where decremental
+    # round-off lands one ULP below zero — `stdev()` calls `math.sqrt(var)`
+    # and would crash on a negative argument.
     count: Persistent[int] = 0
+    mu: Persistent[float] = 0.0
+    mu_c: Persistent[float] = 0.0
+    m2: Persistent[float] = 0.0
+    m2_c: Persistent[float] = 0.0
 
-    sum_val: Persistent[float] = 0.0
-    sum_val_c: Persistent[float] = 0.0
-    sum_sq: Persistent[float] = 0.0
-    sum_sq_c: Persistent[float] = 0.0
-
-    # Always add new value with Kahan summation
-    y = source - sum_val_c
-    t = sum_val + y
-    sum_val_c = (t - sum_val) - y
-    sum_val = t
-
-    # Kahan summation for squared value
-    sq = source * source
-    y = sq - sum_sq_c
-    t = sum_sq + y
-    sum_sq_c = (t - sum_sq) - y
-    sum_sq = t
-
+    # Add new sample (Welford incremental)
     if count < length:
         count += 1
-        if count < length:
-            return NA(float)
+        n_after = count
     else:
         count += 1
+        n_after = length + 1  # transient: post-add, pre-remove
 
-        # Remove old value with Kahan summation
+    delta = source - mu
+    inc = delta / n_after
+    y = inc - mu_c
+    t = mu + y
+    mu_c = (t - mu) - y  # noqa - it is persistent
+    mu = t
+    m2_inc = delta * (source - mu)
+    y = m2_inc - m2_c
+    t = m2 + y
+    m2_c = (t - m2) - y  # noqa - it is persistent
+    m2 = t
+
+    if count < length:
+        return NA(float)
+
+    if count > length:
+        # Remove oldest sample (Welford decremental, Pébay 2008)
         old_value = source[length]
-        y = -old_value - sum_val_c
-        t = sum_val + y
-        sum_val_c = (t - sum_val) - y  # noqa - it is persistent
-        sum_val = t
+        delta = old_value - mu
+        dec = -delta / length
+        y = dec - mu_c
+        t = mu + y
+        mu_c = (t - mu) - y  # noqa - it is persistent
+        mu = t
+        m2_dec = -delta * (old_value - mu)
+        y = m2_dec - m2_c
+        t = m2 + y
+        m2_c = (t - m2) - y  # noqa - it is persistent
+        m2 = t
 
-        # Remove old squared value with Kahan summation
-        sq_old = old_value * old_value
-        y = -sq_old - sum_sq_c
-        t = sum_sq + y
-        sum_sq_c = (t - sum_sq) - y  # noqa - it is persistent
-        sum_sq = t
-
-    # Calculate variance
     if biased:
-        # Biased variance: divide by n
-        mean_val = sum_val / length
-        squares = sum_sq / length
-        var = squares - mean_val * mean_val
+        var = m2 / length
     else:
-        # Unbiased variance: divide by n-1
-        mean_val = sum_val / length
-        squares = sum_sq / (length - 1)
-        var = squares - (length / (length - 1)) * mean_val * mean_val
-
-    return var
+        var = m2 / (length - 1)
+    # Safety clamp: decremental round-off can occasionally land 1 ULP below
+    # zero on long constant runs; stdev() would crash inside math.sqrt().
+    return builtins.max(0.0, var)
 
 
 def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:

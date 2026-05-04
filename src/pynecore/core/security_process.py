@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from datetime import datetime, UTC
+from typing import TYPE_CHECKING
 
 from .security_shm import (
     SyncBlock, ResultBlock, write_na,
@@ -19,6 +20,9 @@ from .security_shm import (
 from .security import (
     create_security_protocol, inject_protocol,
 )
+
+if TYPE_CHECKING:
+    from multiprocessing.synchronize import Lock as LockType
 
 
 # noinspection PyProtectedMember
@@ -34,7 +38,9 @@ def security_process_main(
         done_event,
         stop_event,
         is_ltf: bool = False,
+        result_locks: 'dict[str, LockType] | None' = None,
 ):
+    assert result_locks is not None, "result_locks must be provided by script_runner"
     """
     Entry point for a security process (multiprocessing.Process target).
 
@@ -61,7 +67,7 @@ def security_process_main(
 
     # Create protocol functions for security context
     signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
-        sec_id, sync_block, result_block, all_sec_ids, is_ltf=is_ltf,
+        sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
     )
 
     # Load OHLCV data
@@ -158,7 +164,8 @@ def security_process_main(
             elif not bars_run:
                 # HTF: no bars for this time period (session gap)
                 # Write na so chart reader doesn't deadlock
-                write_na(result_block, sync_block)
+                with result_locks[sec_id]:
+                    write_na(result_block, sync_block)
 
             # Signal: data is ready for reading
             data_ready_event.set()

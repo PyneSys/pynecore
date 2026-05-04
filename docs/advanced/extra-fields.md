@@ -2,7 +2,7 @@
 ---
 weight: 1005
 title: "Extra Fields"
-description: "Accessing custom CSV columns beyond OHLCV data in Pyne scripts"
+description: "Accessing custom CSV columns beyond OHLCV data in Pyne code"
 icon: "playlist_add"
 date: "2025-03-31"
 lastmod: "2026-03-15"
@@ -15,7 +15,7 @@ tags: ["extra-fields", "csv", "custom-data", "series", "data"]
 
 # Extra Fields
 
-PyneCore allows you to access additional columns beyond standard OHLCV data from your CSV files inside Pyne scripts. This is useful when your data includes pre-computed indicators, signals, or any other custom data that you want to use alongside price data.
+PyneCore allows you to access additional columns beyond standard OHLCV data from your CSV files inside Pyne code. This is useful when your data includes pre-computed indicators, signals, or any other custom data that you want to use alongside price data.
 
 ## How It Works
 

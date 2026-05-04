@@ -2,7 +2,7 @@
 ---
 weight: 600
 title: "Scripting with PyneCore"
-description: "Writing effective and idiomatic Pyne scripts"
+description: "Writing effective and idiomatic Pyne code"
 icon: "code"
 date: "2025-03-31"
 lastmod: "2025-03-31"
@@ -52,11 +52,25 @@ def main(
 
 ### 1. The Magic Comment
 
-The `@pyne` comment at the top of your script is essential - it signals to PyneCore that this script should undergo AST transformations to enable Pine Script-like behavior.
+The `@pyne` marker is essential — it signals to PyneCore that this file should undergo AST transformations to enable Pine Script-like behavior. The marker has a strict placement rule:
+
+- The file's **first statement** must be a module docstring (`"""…"""`).
+- The docstring's **first non-whitespace token** must be `@pyne`.
+- `@pyne` must be followed by whitespace or the end of the docstring (so `@pynex` is not recognized, and `@pyne` cannot appear after a description line — it has to come first).
 
 ```python
 """
 @pyne
+"""
+```
+
+You can keep additional prose in the same docstring, as long as `@pyne` is the first token:
+
+```python
+"""
+@pyne
+
+My indicator description goes here.
 """
 ```
 
