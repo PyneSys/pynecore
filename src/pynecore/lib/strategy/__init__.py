@@ -2310,79 +2310,112 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 # Properties
 #
 
+# Strategy state accessors below return inert defaults when invoked in a
+# security child process: there `lib._script` is None because no
+# ScriptRunner.run_iter() ever ran. Pine itself rejects strategy.* state
+# reads inside any request.*() argument at compile time (CE10059), so the
+# values are never consumed by the chart anyway — this only prevents the
+# child from crashing when the chart-context body references them.
+
 # noinspection PyProtectedMember
 @module_property
 def equity() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.equity
 
 
 # noinspection PyProtectedMember
 @module_property
 def eventrades() -> PyneInt:
+    if lib._script is None:
+        return 0
     return lib._script.position.eventrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def initial_capital() -> float:
+    if lib._script is None:
+        return 0.0
     return lib._script.initial_capital
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossloss() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.grossloss + lib._script.position.open_commission
 
 
 # noinspection PyProtectedMember
 @module_property
 def grossprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.grossprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def losstrades() -> int:
+    if lib._script is None:
+        return 0
     return lib._script.position.losstrades
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_drawdown() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.max_drawdown
 
 
 # noinspection PyProtectedMember
 @module_property
 def max_runup() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.max_runup
 
 
 # noinspection PyProtectedMember
 @module_property
 def netprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.netprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def openprofit() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.openprofit
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_size() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.size
 
 
 # noinspection PyProtectedMember
 @module_property
 def position_avg_price() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
     return lib._script.position.avg_price
 
 
 # noinspection PyProtectedMember
 @module_property
 def wintrades() -> PyneInt:
+    if lib._script is None:
+        return 0
     return lib._script.position.wintrades

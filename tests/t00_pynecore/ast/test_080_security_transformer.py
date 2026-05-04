@@ -3,6 +3,8 @@
 """
 import ast
 
+import pytest
+
 from pynecore.transformers.security import SecurityTransformer
 
 
@@ -553,3 +555,76 @@ def main():
     )
     default = read_call.args[1]
     assert isinstance(default, ast.Attribute) and default.attr == 'na'
+
+
+def __test_strategy_position_size_in_security_rejected__(log):
+    """Direct strategy.position_size as security expression must raise SyntaxError."""
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.position_size)
+    lib.plot(daily)
+"""
+    with pytest.raises(SyntaxError, match="strategy.position_size"):
+        _transform(source)
+
+
+def __test_strategy_state_in_binop_rejected__(log):
+    """strategy.equity inside an arithmetic expression in security() is detected."""
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.equity + 100)
+    lib.plot(daily)
+"""
+    with pytest.raises(SyntaxError, match="strategy.equity"):
+        _transform(source)
+
+
+def __test_strategy_state_in_security_lower_tf_rejected__(log):
+    """request.security_lower_tf() applies the same rule."""
+    source = """
+def main():
+    arr = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.strategy.netprofit)
+    lib.plot(arr)
+"""
+    with pytest.raises(SyntaxError, match="strategy.netprofit.*security_lower_tf"):
+        _transform(source)
+
+
+def __test_strategy_state_via_local_alias_passes__(log):
+    """Transitive (local-alias) bind is intentionally NOT detected at AST level —
+    runtime guard in the strategy module handles it via 0.0/0 inert defaults."""
+    source = """
+def main():
+    ps = lib.strategy.position_size
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", ps)
+    lib.plot(daily)
+"""
+    # Should compile cleanly; runtime falls back to inert default in security child.
+    _transform(source)
+
+
+def __test_strategy_state_in_chart_body_passes__(log):
+    """strategy.* in chart-body code (outside security expr) compiles fine."""
+    source = """
+def main():
+    if lib.strategy.position_size > 0:
+        daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+        lib.plot(daily)
+"""
+    _transform(source)
+
+
+def __test_all_thirteen_strategy_state_attrs_rejected__(log):
+    """All 13 strategy state accessors are rejected when used directly in security()."""
+    forbidden = [
+        "equity", "eventrades", "grossloss", "grossprofit", "initial_capital",
+        "losstrades", "max_drawdown", "max_runup", "netprofit", "openprofit",
+        "position_avg_price", "position_size", "wintrades",
+    ]
+    for attr in forbidden:
+        source = f"""
+def main():
+    x = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.{attr})
+"""
+        with pytest.raises(SyntaxError, match=f"strategy.{attr}"):
+            _transform(source)
