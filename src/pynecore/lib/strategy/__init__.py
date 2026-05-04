@@ -445,7 +445,11 @@ class Position:
         # Order books
         self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
         self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
-        self.exit_orders: dict[str | None, Order] = {}  # Exit orders from strategy.exit(), strategy.close(), etc.
+        # Exit orders from strategy.exit(), strategy.close(), etc.
+        # Key is (exit_id, from_entry) — both partial-TP fan-out (same from_entry,
+        # different ids) and from_entry_na fan-out (same id, different from_entry)
+        # must coexist; only repeated calls with both fields equal modify-in-place.
+        self.exit_orders: dict[tuple[str | None, str | None], Order] = {}
         self.orderbook = PriceOrderBook()
 
         # Trades
@@ -514,8 +518,9 @@ class Position:
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
-            existing_order = self.exit_orders.get(order.order_id)
-            self.exit_orders[order.order_id] = order
+            exit_key = (order.exit_id, order.order_id)
+            existing_order = self.exit_orders.get(exit_key)
+            self.exit_orders[exit_key] = order
         else:
             # Both entry and normal orders are stored in entry_orders dict
             existing_order = self.entry_orders.get(order.order_id)
@@ -532,7 +537,7 @@ class Position:
         """ Remove an order from the strategy """
         order.cancelled = True
         if order.order_type == _order_type_close:
-            self.exit_orders.pop(order.order_id, None)
+            self.exit_orders.pop((order.exit_id, order.order_id), None)
         else:
             # Both entry and normal orders are stored in entry_orders dict
             self.entry_orders.pop(order.order_id, None)
@@ -544,10 +549,11 @@ class Position:
 
     def _remove_order_by_id(self, order_id: str):
         """ Remove order by id """
-        # First check in exit orders
-        order = self.exit_orders.get(order_id)
-        if order:
-            self._remove_order(order)
+        # Cancel every exit whose from_entry matches the cancel id
+        # (preserves pre-composite-key semantics where exit_orders was keyed by from_entry)
+        for exit_order in list(self.exit_orders.values()):
+            if exit_order.order_id == order_id:
+                self._remove_order(exit_order)
 
         # Then check in entry orders
         order = self.entry_orders.get(order_id)
@@ -2182,10 +2188,11 @@ def exit(id: str, from_entry: str = "",
                 size = order.size
                 from_entry = order.order_id or ""
                 # Only mark as from_entry_na on first creation (not replacement)
-                had_existing_exit = from_entry in position.exit_orders
+                exit_key = (id, from_entry)
+                had_existing_exit = exit_key in position.exit_orders
                 _exit()
                 if not had_existing_exit:
-                    exit_order = position.exit_orders.get(from_entry)
+                    exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
                         exit_order.from_entry_na = True
 
