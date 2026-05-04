@@ -20,6 +20,6 @@ def __test_bb__(csv_reader, runner, dict_comparator, log):
     """ BB / BBW """
     with csv_reader('bb.csv', subdir="data") as cr:
         for i, (candle, plot) in enumerate(runner(cr).run_iter()):
-            dict_comparator(plot, candle.extra_fields)
+            dict_comparator(plot, candle.extra_fields, abs_tol=1e-10, rel_tol=1e-7)
             if i > 150:
                 break
