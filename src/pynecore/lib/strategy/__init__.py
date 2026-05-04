@@ -549,13 +549,13 @@ class Position:
 
     def _remove_order_by_id(self, order_id: str):
         """ Remove order by id """
-        # Cancel every exit whose from_entry matches the cancel id
-        # (preserves pre-composite-key semantics where exit_orders was keyed by from_entry)
+        # TV-verified semantics (FX:EURUSD 60min, 2026-05-04): cancel matches an exit
+        # by its exit_id only, and an entry by its entry id. NO cross-matching —
+        # cancel(entry_id) does not cascade to exits that referenced it via from_entry.
         for exit_order in list(self.exit_orders.values()):
-            if exit_order.order_id == order_id:
+            if exit_order.exit_id == order_id:
                 self._remove_order(exit_order)
 
-        # Then check in entry orders
         order = self.entry_orders.get(order_id)
         if order:
             self._remove_order(order)
