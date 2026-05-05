@@ -7,6 +7,7 @@ import tomllib
 
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
+from typing import Any
 
 from typer import Option, Argument, secho, Exit, colors
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -777,10 +778,12 @@ def run(
                 # Latest quote snapshot — the tick hook updates these so the
                 # spinner text carries the current bid/ask even between bar
                 # closes.
-                spinner_state = {
+                spinner_state: dict[str, Any] = {
                     'time': None,
                     'bid': None,
                     'ask': None,
+                    'last_mid': None,
+                    'arrow': ' ',
                 }
 
                 # Derive fixed price decimals from ``syminfo.mintick`` so
@@ -804,8 +807,9 @@ def run(
                     ask = spinner_state['ask']
                     d = price_decimals
                     if bid is not None and ask is not None:
-                        return (f"{head}  [green]▼ {bid:.{d}f}[/]  "
-                                f"[red]▲ {ask:.{d}f}[/]")
+                        arrow = spinner_state['arrow']
+                        return (f"{head}  [green]{bid:.{d}f}[/] {arrow} "
+                                f"[red]{ask:.{d}f}[/]")
                     if bid is not None:
                         return f"{head}  [green]{bid:.{d}f}[/]"
                     return head
@@ -838,6 +842,23 @@ def run(
                 ) as progress:
                     task = progress.add_task(description="Live streaming...", total=None)
 
+                    def _apply_quote(new_bid: float | None,
+                                     new_ask: float | None) -> None:
+                        """Update bid/ask + midline arrow in spinner_state."""
+                        if new_bid is not None and new_ask is not None:
+                            new_mid = (new_bid + new_ask) / 2
+                            last_mid = spinner_state['last_mid']
+                            if last_mid is not None:
+                                if new_mid > last_mid:
+                                    spinner_state['arrow'] = '[green]▲[/]'
+                                elif new_mid < last_mid:
+                                    spinner_state['arrow'] = '[red]▼[/]'
+                            spinner_state['last_mid'] = new_mid
+                        if new_bid is not None:
+                            spinner_state['bid'] = new_bid
+                        if new_ask is not None:
+                            spinner_state['ask'] = new_ask
+
                     def cb_progress_live(current_time: datetime | None):
                         if current_time is not None:
                             spinner_state['time'] = current_time
@@ -848,8 +869,10 @@ def run(
                         # Prefer the live quote snapshot over ``candle.close``:
                         # on a closed OHLC bar ``candle.close`` is the previous
                         # period's bid-side close, not the current quote.
-                        spinner_state['bid'] = extra.get('bid_close', candle.close)
-                        spinner_state['ask'] = extra.get('ask_close')
+                        _apply_quote(
+                            extra.get('bid_close', candle.close),
+                            extra.get('ask_close'),
+                        )
                         spinner_state['time'] = datetime.fromtimestamp(
                             candle.timestamp, UTC,
                         ).replace(tzinfo=None)
