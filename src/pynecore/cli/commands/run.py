@@ -25,7 +25,7 @@ from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
-from pynecore.lib.log import broker_warning
+from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
@@ -810,6 +810,19 @@ def run(
                         return f"{head}  [green]{bid:.{d}f}[/]"
                     return head
 
+                # ``PYNE_NO_LIVE_SPINNER`` suppresses the per-tick spinner so
+                # systemd journals / Docker logs only carry whole log lines
+                # (``[BROKER]``, ``[OHLCV]``, Pine ``log.*``) instead of the
+                # spinner refresh stream. Rich already disables live rendering
+                # on a non-TTY, but explicit opt-out works regardless of how
+                # the harness wires stdout.
+                _spinner_disabled = (
+                    os.environ.get("PYNE_NO_LIVE_SPINNER", "").lower()
+                    not in ("", "0", "false", "no", "off")
+                )
+                if _spinner_disabled:
+                    broker_info("live spinner disabled (PYNE_NO_LIVE_SPINNER)")
+
                 # Live mode: spinner instead of progress bar (no known end time)
                 # ``transient=True`` clears the live spinner row when the
                 # ``with`` block exits, so the user-visible tail is just the
@@ -821,6 +834,7 @@ def run(
                         CustomTimeElapsedColumn(),
                         console=live_console,
                         transient=True,
+                        disable=_spinner_disabled,
                 ) as progress:
                     task = progress.add_task(description="Live streaming...", total=None)
 
