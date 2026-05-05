@@ -437,10 +437,72 @@ class PositionBase(ABC):
     exit_orders: dict[str | None, 'Order']
     risk_halt_trading: bool
 
+    # Risk management state shared by Sim and Broker positions. Setters
+    # in :mod:`pynecore.lib.strategy.risk` populate the ``risk_max_*`` fields;
+    # the ``risk_*`` runtime counters are updated by the concrete subclass.
+    risk_allowed_direction: 'direction.Direction | None'
+    risk_max_drawdown_value: float | None
+    risk_max_drawdown_type: 'QtyType | None'
+    risk_max_drawdown_alert: str | None
+    risk_max_intraday_loss_value: float | None
+    risk_max_intraday_loss_type: 'QtyType | None'
+    risk_max_intraday_loss_alert: str | None
+    risk_max_cons_loss_days: int | None
+    risk_max_cons_loss_days_alert: str | None
+    risk_max_intraday_filled_orders: int | None
+    risk_max_intraday_filled_orders_alert: str | None
+    risk_max_position_size: float | None
+    risk_intraday_start_equity: float
+    risk_cons_loss_days: int
+
     @property
     def equity(self) -> PyneFloat:
         """The current equity (initial capital + realized + unrealized P&L)."""
         return lib._script.initial_capital + self.netprofit + self.openprofit
+
+    # === Risk-rule predicates (shared by Sim and Broker positions) ===
+
+    def _peak_equity(self) -> float:
+        """Reference equity for ``max_drawdown(..., percent_of_equity)``.
+
+        TradingView measures drawdown from the running peak equity, so the
+        percent threshold scales with the high-water mark — a strategy that
+        grows from $10k to $20k and is configured with ``max_drawdown(30%)``
+        tolerates a $6k drawdown from $20k, not $3k from initial capital.
+
+        Subclasses that track a peak (``SimPosition.max_equity``) override
+        this; the base falls back to initial capital, which matches the
+        first-bar value before any equity history exists.
+        """
+        return float(lib._script.initial_capital)
+
+    def _is_max_drawdown_breached(self) -> bool:
+        if self.risk_max_drawdown_value is None:
+            return False
+        if self.risk_max_drawdown_type == percent_of_equity:
+            threshold = self._peak_equity() * self.risk_max_drawdown_value * 0.01
+        else:
+            threshold = float(self.risk_max_drawdown_value)
+        return self.max_drawdown >= threshold > 0.0
+
+    def _is_max_intraday_loss_breached(self) -> bool:
+        if self.risk_max_intraday_loss_value is None:
+            return False
+        # Per TV docs: percent_of_equity for max_intraday_loss is measured
+        # against the start-of-day equity (the same anchor used for the loss
+        # delta), so the threshold scales with the day's opening capital
+        # rather than the initial-bar capital.
+        if self.risk_max_intraday_loss_type == percent_of_equity:
+            threshold = self.risk_intraday_start_equity * self.risk_max_intraday_loss_value * 0.01
+        else:
+            threshold = float(self.risk_max_intraday_loss_value)
+        intraday_loss = self.risk_intraday_start_equity - float(self.equity)
+        return intraday_loss >= threshold > 0.0
+
+    def _is_max_cons_loss_days_breached(self) -> bool:
+        if self.risk_max_cons_loss_days is None:
+            return False
+        return self.risk_cons_loss_days >= self.risk_max_cons_loss_days > 0
 
     @abstractmethod
     def _add_order(self, order: 'Order') -> None:
@@ -1061,27 +1123,68 @@ class SimPosition(PositionBase):
             # After filling, check if we need to close positions due to risk management
             if (self.risk_max_intraday_filled_orders is not None and
                     self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and self.size != 0.0):
-                # Max intraday filled orders reached - close all positions immediately
-                # Cancel all pending orders first
-                self.entry_orders.clear()
-                self.exit_orders.clear()
-                self.orderbook.clear()
-
-                # Create an immediate close order with special comment
-                close_comment = "Close Position (Max number of filled orders in one day)"
-                close_order = Order(
-                    None, -self.size,
-                    exit_id='Risk management close',
-                    order_type=_order_type_close,
-                    comment=close_comment
+                self._trigger_risk_halt(
+                    "Max number of filled orders in one day", price, h, l,
                 )
-                # Fill the close order immediately at current price
-                self._fill_order(close_order, price, h, l)
-
-                # Halt trading for the rest of the day
-                self.risk_halt_trading = True
 
             return False
+
+    def _peak_equity(self) -> float:
+        """Running high-water mark equity for percent-based drawdown threshold.
+
+        Falls back to initial capital before any fill — ``max_equity`` is
+        ``-inf`` until the first ``_fill_order`` updates it.
+        """
+        initial = float(lib._script.initial_capital)
+        if self.max_equity == -float("inf"):
+            return initial
+        return max(initial, float(self.max_equity))
+
+    def _trigger_risk_halt(self, reason: str, price: float, h: float, l: float) -> None:
+        """Cancel pending orders, close any open position at ``price``, halt trading.
+
+        ``reason`` is embedded in the synthetic close order's comment so the
+        backtest log identifies which ``strategy.risk.*`` rule fired. Once
+        :attr:`risk_halt_trading` is set, ``strategy.entry`` / ``strategy.order``
+        early-return, ``process_orders`` short-circuits, and the strategy stays
+        flat until the script completes.
+        """
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
+        if self.size != 0.0:
+            close_order = Order(
+                None, -self.size,
+                exit_id='Risk management close',
+                order_type=_order_type_close,
+                comment=f"Close Position ({reason})",
+            )
+            self._fill_order(close_order, price, h, l)
+        self.risk_halt_trading = True
+
+    def _enforce_post_bar_risk(self) -> None:
+        """Run the post-bar ``strategy.risk.*`` checks that depend on bar-end P&L.
+
+        ``max_intraday_filled_orders`` is enforced inline in :meth:`fill_order`
+        because it is fill-count driven; the rules below need the finalised
+        bar P&L (``max_drawdown``) or daily realised equity
+        (``max_intraday_loss``, ``max_cons_loss_days``) and therefore run after
+        :meth:`_finalize_bar_pnl`. The first triggered rule wins — subsequent
+        checks are skipped, since a halt closes all positions and clears
+        pending orders.
+        """
+        if self.risk_halt_trading:
+            return
+        # Use the bar-close price for the synthetic close — the bar is over.
+        price, h, l = self.c, self.h, self.l
+        if self._is_max_drawdown_breached():
+            self._trigger_risk_halt("Max drawdown reached", price, h, l)
+            return
+        if self._is_max_intraday_loss_breached():
+            self._trigger_risk_halt("Max intraday loss reached", price, h, l)
+            return
+        if self._is_max_cons_loss_days_breached():
+            self._trigger_risk_halt("Max consecutive loss days reached", price, h, l)
 
     def _check_already_filled(self, order: Order) -> bool:
         """
@@ -1359,6 +1462,8 @@ class SimPosition(PositionBase):
         self._process_at_bar_open(ohlc)
         self._process_limit_stop_orders(ohlc)
         self._finalize_bar_pnl()
+        self._enforce_post_bar_risk()
+        self._finalize_new_closed_trades()
 
     def _process_at_bar_open(self, ohlc: bool):
         """Phase 1: Process orders at bar open — gap detection, market fills, margin."""
@@ -1366,9 +1471,29 @@ class SimPosition(PositionBase):
         # TradingView tracks intraday based on trading session, not calendar day
         current_day = lib.dayofmonth()
         if current_day != self.risk_last_day_index:
-            # New trading day - reset intraday counters
+            current_equity = float(self.equity)
+            # Roll over consecutive-loss-day count for ``strategy.risk.max_cons_loss_days``.
+            # On the very first bar we have no prior day to compare against — initialise
+            # the trailing-equity anchor without touching the loss-day counter.
+            if self.risk_last_day_index != -1:
+                if current_equity < self.risk_last_day_equity:
+                    self.risk_cons_loss_days += 1
+                else:
+                    self.risk_cons_loss_days = 0
+            self.risk_last_day_equity = current_equity
+            # Anchor for ``strategy.risk.max_intraday_loss`` — captured at the
+            # start of every trading day, not just the first one.
+            self.risk_intraday_start_equity = current_equity
             self.risk_last_day_index = current_day
             self.risk_intraday_filled_orders = 0
+            # ``max_cons_loss_days`` becomes known the moment the day rolls
+            # over — halt now rather than at bar end so the new day's queued
+            # entries cannot fill at this bar's open.
+            if self._is_max_cons_loss_days_breached() and not self.risk_halt_trading:
+                self._trigger_risk_halt(
+                    "Max consecutive loss days reached", self.o, self.h, self.l,
+                )
+                return
 
         # Get script reference for slippage
         script = lib._script
@@ -1741,24 +1866,34 @@ class SimPosition(PositionBase):
             self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
             self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
 
-        # Cumulative stats
-        if self.new_closed_trades:
-            initial_capital = lib._script.initial_capital
-            for closed_trade in self.new_closed_trades:
-                # Incrementally add each trade's profit to cumulative total
-                self.cum_profit += closed_trade.profit
-                closed_trade.cum_profit = self.cum_profit
-                closed_trade.cum_max_drawdown = self.max_drawdown
-                closed_trade.cum_max_runup = self.max_runup
+    def _finalize_new_closed_trades(self) -> None:
+        """Apply cumulative stats to every trade closed on this bar.
 
-                # Cumulative profit percent
-                try:
-                    closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
-                except ZeroDivisionError:
-                    closed_trade.cum_profit_percent = 0.0
+        Split out from :meth:`_finalize_bar_pnl` so it runs **after**
+        :meth:`_enforce_post_bar_risk` — otherwise a synthetic close
+        emitted by a risk-rule halt would be appended to
+        ``new_closed_trades`` after this loop has finished, ship out with
+        default ``cum_profit`` / ``cum_max_drawdown`` / ``cum_max_runup``
+        / ``cum_profit_percent`` values, and never be revisited.
+        """
+        if not self.new_closed_trades:
+            return
+        initial_capital = lib._script.initial_capital
+        for closed_trade in self.new_closed_trades:
+            # Incrementally add each trade's profit to cumulative total
+            self.cum_profit += closed_trade.profit
+            closed_trade.cum_profit = self.cum_profit
+            closed_trade.cum_max_drawdown = self.max_drawdown
+            closed_trade.cum_max_runup = self.max_runup
 
-                # Modify entry equity, for max drawdown and runup
-                self.entry_equity += closed_trade.profit
+            # Cumulative profit percent
+            try:
+                closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
+            except ZeroDivisionError:
+                closed_trade.cum_profit_percent = 0.0
+
+            # Modify entry equity, for max drawdown and runup
+            self.entry_equity += closed_trade.profit
 
     def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV):
         """
@@ -1797,6 +1932,8 @@ class SimPosition(PositionBase):
         self.l = round_to_mintick(aggregated.low)
         self.c = round_to_mintick(aggregated.close)
         self._finalize_bar_pnl()
+        self._enforce_post_bar_risk()
+        self._finalize_new_closed_trades()
 
 
 #
