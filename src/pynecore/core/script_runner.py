@@ -1097,9 +1097,22 @@ class ScriptRunner:
                             # immediately rather than one bar later.
                             if self._order_sync_engine is not None:
                                 self._order_sync_engine.apply_async_events()
+                            # Risk management hooks (broker-side parity with
+                            # the sim's ``process_orders`` rollover/halt block):
+                            # mark-to-market the open P&L so the equity-based
+                            # drawdown / intraday-loss predicates use a fresh
+                            # price; roll over the day counters before the
+                            # script runs (so a day-rollover halt prevents a
+                            # new entry from queueing); and enforce post-bar
+                            # rules before the sync so the queued risk-close
+                            # ships in the same dispatch cycle.
+                            if is_strat and position:
+                                position.update_unrealized_pnl(float(lib.close))
+                                position._handle_bar_open_risk()
                             lib._plot_data.clear()
                             _run_libs_and_main()
                             if is_strat and position:
+                                position._enforce_post_bar_risk()
                                 self._process_orders(position)
                         else:
                             # Backtest: simulator first (fills the previous

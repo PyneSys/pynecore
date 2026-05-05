@@ -504,6 +504,68 @@ class PositionBase(ABC):
             return False
         return self.risk_cons_loss_days >= self.risk_max_cons_loss_days > 0
 
+    # === Pre-fill / pre-submit gates (shared by sim fill loop and broker submit) ===
+    # These mirror the inline checks in :meth:`SimPosition.fill_order` so that
+    # :class:`~pynecore.core.broker.position.BrokerPosition` can enforce the
+    # same policy at its pre-submit boundary (``_add_order``) without
+    # duplicating the logic. Sim and broker hit the same predicate at
+    # different points in the order lifecycle — sim at fill time, broker at
+    # submit time — but the rule body is identical.
+
+    def _is_intraday_filled_cap_reached(self) -> bool:
+        """``risk_max_intraday_filled_orders`` already at/above the cap.
+
+        Caller rejects the new entry/normal order when this returns True.
+        Mirrors the sim ``is not None`` check; a stored cap of ``0`` is
+        treated as "all orders blocked" by both sites — the
+        :mod:`~pynecore.lib.strategy.risk` setter is responsible for
+        normalizing the no-limit sentinel.
+        """
+        cap = self.risk_max_intraday_filled_orders
+        if cap is None:
+            return False
+        return self.risk_intraday_filled_orders >= cap
+
+    def _adjust_for_max_position_size(
+            self, intent_size: float, intent_sign: float,
+    ) -> float | None:
+        """Honor ``risk_max_position_size``; trim the order or reject it.
+
+        :param intent_size: Signed order size requested by the caller.
+        :param intent_sign: ``+1.0`` for buy intents, ``-1.0`` for sell.
+        :return: Possibly trimmed signed size (caller proceeds with this),
+                 the original ``intent_size`` if no cap is set or no trim
+                 needed, or ``None`` if the cap is already met and the order
+                 must be rejected.
+        """
+        cap = self.risk_max_position_size
+        if cap is None:
+            return intent_size
+        new_position_size = abs(self.size + intent_size)
+        if new_position_size <= cap:
+            return intent_size
+        max_allowed_size = cap - abs(self.size)
+        if max_allowed_size <= 0:
+            return None
+        return max_allowed_size * intent_sign
+
+    def _is_direction_allowed(self, intent_sign: float) -> bool:
+        """``risk_allowed_direction`` permits an entry/flip in this direction.
+
+        The caller decides *when* to consult this (sim only checks on
+        ``size == 0``; broker checks at every submit). The helper itself is
+        stateless w.r.t. current position size — it only inspects the
+        configured allowed direction.
+        """
+        allowed = self.risk_allowed_direction
+        if allowed is None:
+            return True
+        if intent_sign > 0:
+            return allowed == long
+        if intent_sign < 0:
+            return allowed == short
+        return True
+
     @abstractmethod
     def _add_order(self, order: 'Order') -> None:
         """Register an order with this position."""
@@ -1027,33 +1089,19 @@ class SimPosition(PositionBase):
         close_only = False
         # Apply risk management only to entry orders, not normal orders from strategy.order()
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
-            # Risk management: Check max intraday filled orders
-            if self.risk_max_intraday_filled_orders is not None:
-                if self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders:
-                    # Max intraday filled orders reached - don't fill the entry order
-                    self._remove_order(order)
-                    return False
-
-            # Risk management: Check max position size
-            if self.risk_max_position_size is not None:
-                new_position_size = abs(self.size + order.size)
-                if new_position_size > self.risk_max_position_size:
-                    # Adjust order size to not exceed max position size
-                    max_allowed_size = self.risk_max_position_size - abs(self.size)
-                    if max_allowed_size <= 0:
-                        # Can't add to position - remove order
-                        self._remove_order(order)
-                        return False
-                    # Adjust the order size
-                    order.size = max_allowed_size * order.sign
-
-            # Check risk allowed direction for new positions (when no current position)
-            if self.size == 0.0 and self.risk_allowed_direction is not None:
-                if (order.sign > 0 and self.risk_allowed_direction != long) or \
-                        (order.sign < 0 and self.risk_allowed_direction != short):
-                    # Direction not allowed - don't fill the entry order
-                    self._remove_order(order)
-                    return False
+            # Pre-fill risk gates — shared with BrokerPosition pre-submit so
+            # the same policy applies regardless of execution mode.
+            if self._is_intraday_filled_cap_reached():
+                self._remove_order(order)
+                return False
+            adjusted = self._adjust_for_max_position_size(order.size, order.sign)
+            if adjusted is None:
+                self._remove_order(order)
+                return False
+            order.size = adjusted
+            if self.size == 0.0 and not self._is_direction_allowed(order.sign):
+                self._remove_order(order)
+                return False
 
             if order.order_type == _order_type_entry:
                 # If we have an existing position
@@ -1099,13 +1147,11 @@ class SimPosition(PositionBase):
             # Check if new direction is allowed by risk management
             # According to Pine Script docs: "long exit trades will be made instead of reverse trades"
             new_direction_sign = 1.0 if new_size > 0.0 else -1.0
-            if self.risk_allowed_direction is not None:
-                if (new_direction_sign > 0 and self.risk_allowed_direction != long) or \
-                        (new_direction_sign < 0 and self.risk_allowed_direction != short):
-                    # Direction not allowed - convert entry to exit only
-                    # Don't open new position in restricted direction
-                    self._remove_order(order)
-                    return False
+            if not self._is_direction_allowed(new_direction_sign):
+                # Direction not allowed - convert entry to exit only
+                # Don't open new position in restricted direction
+                self._remove_order(order)
+                return False
 
             # Modify the original order to open a position in the new direction
             order.size = new_size
@@ -1121,8 +1167,7 @@ class SimPosition(PositionBase):
             self._fill_order(order, price, h, l)
 
             # After filling, check if we need to close positions due to risk management
-            if (self.risk_max_intraday_filled_orders is not None and
-                    self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and self.size != 0.0):
+            if self._is_intraday_filled_cap_reached() and self.size != 0.0:
                 self._trigger_risk_halt(
                     "Max number of filled orders in one day", price, h, l,
                 )

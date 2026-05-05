@@ -16,7 +16,8 @@ from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
-    from pynecore.lib.strategy import Order
+    from pynecore.lib import direction
+    from pynecore.lib.strategy import Order, QtyType
     from pynecore.core.broker.models import OrderEvent
 
 __all__ = ['BrokerPosition']
@@ -45,9 +46,21 @@ class BrokerPosition(PositionBase):
         'open_commission',
         'eventrades', 'wintrades', 'losstrades',
         'closed_trades_count',
-        'max_drawdown', 'max_runup',
+        'max_drawdown', 'max_runup', 'max_equity',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
+        # === Risk management state (mirrors SimPosition) ===
+        # Configuration set by ``strategy.risk.*`` setters:
+        'risk_allowed_direction',
+        'risk_max_drawdown_value', 'risk_max_drawdown_type', 'risk_max_drawdown_alert',
+        'risk_max_intraday_loss_value', 'risk_max_intraday_loss_type',
+        'risk_max_intraday_loss_alert',
+        'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
+        'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
+        'risk_max_position_size',
+        # Runtime counters / day-rollover tracking:
+        'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
+        'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         'risk_halt_trading',
         '_current_price',
     )
@@ -69,6 +82,10 @@ class BrokerPosition(PositionBase):
         self.closed_trades_count: int = 0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
+        # Mark-to-market peak equity, used by ``_peak_equity`` for the
+        # ``max_drawdown(percent_of_equity)`` threshold. Updated on every
+        # :meth:`update_unrealized_pnl` and :meth:`record_fill` call.
+        self.max_equity: float = -float("inf")
 
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)
@@ -81,6 +98,27 @@ class BrokerPosition(PositionBase):
         # and on ``from_entry=na`` fan-out (one exit_id, many per-entry rows).
         self.exit_orders: dict[tuple[str | None, str | None], 'Order'] = {}
 
+        # === Risk management state ===
+        # Configuration (filled by the ``strategy.risk.*`` setters via
+        # ``__init__.py``'s shared lib-property bridge):
+        self.risk_allowed_direction: 'direction.Direction | None' = None
+        self.risk_max_drawdown_value: float | None = None
+        self.risk_max_drawdown_type: 'QtyType | None' = None
+        self.risk_max_drawdown_alert: str | None = None
+        self.risk_max_intraday_loss_value: float | None = None
+        self.risk_max_intraday_loss_type: 'QtyType | None' = None
+        self.risk_max_intraday_loss_alert: str | None = None
+        self.risk_max_cons_loss_days: int | None = None
+        self.risk_max_cons_loss_days_alert: str | None = None
+        self.risk_max_intraday_filled_orders: int | None = None
+        self.risk_max_intraday_filled_orders_alert: str | None = None
+        self.risk_max_position_size: float | None = None
+        # Runtime counters / day-rollover tracking:
+        self.risk_cons_loss_days: int = 0
+        self.risk_last_day_index: int = -1
+        self.risk_last_day_equity: float = 0.0
+        self.risk_intraday_filled_orders: int = 0
+        self.risk_intraday_start_equity: float = 0.0
         self.risk_halt_trading: bool = False
 
         self._current_price: float = 0.0
@@ -127,9 +165,29 @@ class BrokerPosition(PositionBase):
     # === Pine-side order book ===
 
     def _add_order(self, order: 'Order') -> None:
-        """Register an order locally (the sync engine forwards it to the exchange)."""
+        """Register an order locally (the sync engine forwards it to the exchange).
+
+        Pre-submit risk gates run before the order is enqueued — same policy
+        as :meth:`SimPosition.fill_order` enforces at fill time, but applied
+        at the submit boundary because the broker fill is asynchronous.
+        Rejected entry/normal orders are silently dropped (matching the sim
+        ``_remove_order`` behavior on cap/direction violation); the
+        :attr:`risk_halt_trading` flag is set out-of-band by
+        :meth:`_enforce_post_bar_risk`.
+        """
         order.bar_index = int(lib.bar_index)
-        from pynecore.lib.strategy import _order_type_close  # local import avoids cycle
+        from pynecore.lib.strategy import (
+            _order_type_close, _order_type_entry, _order_type_normal,
+        )
+        if order.order_type in (_order_type_entry, _order_type_normal):
+            if self._is_intraday_filled_cap_reached():
+                return
+            adjusted = self._adjust_for_max_position_size(order.size, order.sign)
+            if adjusted is None:
+                return
+            order.size = adjusted
+            if self.size == 0.0 and not self._is_direction_allowed(order.sign):
+                return
         if order.order_type == _order_type_close:
             self.exit_orders[(order.exit_id, order.order_id)] = order
         else:
@@ -189,6 +247,12 @@ class BrokerPosition(PositionBase):
 
         # Commission bookkeeping — realized fee becomes part of net P&L at close
         fee = event.fee
+
+        # Risk management: count every filled order toward the intraday cap,
+        # matching ``SimPosition._fill_order``. The counter is read by the
+        # pre-submit gate in :meth:`_add_order` and the post-bar halt in
+        # :meth:`_enforce_post_bar_risk`.
+        self.risk_intraday_filled_orders += 1
 
         if self.size == 0.0 or (old_sign * signed_delta) > 0.0:
             # Opening or adding to an existing position (same direction)
@@ -290,15 +354,120 @@ class BrokerPosition(PositionBase):
         return self.sign != old_sign
 
     def update_unrealized_pnl(self, current_price: float) -> None:
-        """Mark-to-market: recompute :attr:`openprofit` at the given price."""
+        """Mark-to-market: recompute :attr:`openprofit` at the given price.
+
+        Also rolls the :attr:`max_equity` peak forward and the
+        :attr:`max_drawdown` running maximum off the live price — these feed
+        :meth:`_peak_equity` and :meth:`_is_max_drawdown_breached` so the
+        broker risk gates see real-time equity, not just realized P&L.
+        """
         self._current_price = current_price
         if not self.open_trades or current_price <= 0.0:
             self.openprofit = 0.0
+        else:
+            total = 0.0
+            for trade in self.open_trades:
+                total += (current_price - trade.entry_price) * trade.size
+            self.openprofit = total
+        eq = float(self.equity)
+        if eq > self.max_equity:
+            self.max_equity = eq
+        # Drawdown is measured from the running peak — same metric the sim
+        # ``max_drawdown`` field tracks, just sourced from mark-to-market.
+        if self.max_equity > -float("inf"):
+            dd = self.max_equity - eq
+            if dd > self.max_drawdown:
+                self.max_drawdown = dd
+
+    def _peak_equity(self) -> float:
+        """Reference equity for ``max_drawdown(percent_of_equity)``.
+
+        Falls back to initial capital before the first
+        :meth:`update_unrealized_pnl` (or fill) primes ``max_equity``.
+        """
+        initial = float(lib._script.initial_capital)
+        if self.max_equity == -float("inf"):
+            return initial
+        return max(initial, float(self.max_equity))
+
+    # === Risk management hooks (called by the runner once per bar) =========
+
+    def _handle_bar_open_risk(self) -> None:
+        """Day-rollover bookkeeping at the start of each bar.
+
+        Mirrors the rollover block in
+        :meth:`SimPosition._process_at_bar_open`: on a new trading day,
+        update ``risk_cons_loss_days`` from the prior-day equity delta,
+        reset the intraday anchors, and immediately halt if the
+        consecutive-loss-day cap is breached so queued entries cannot fill
+        at this bar's open. Distinct name from the sim hook because the
+        sim variant takes an ``ohlc`` argument and runs additional
+        simulator-specific work — the broker version only does
+        risk-related rollover.
+        """
+        if self.risk_halt_trading:
             return
-        total = 0.0
-        for trade in self.open_trades:
-            total += (current_price - trade.entry_price) * trade.size
-        self.openprofit = total
+        try:
+            current_day = int(lib.dayofmonth())
+        except (AttributeError, TypeError, ValueError):
+            return
+        if current_day == self.risk_last_day_index:
+            return
+        current_equity = float(self.equity)
+        # On the very first bar there is no prior day to compare against —
+        # initialise the trailing-equity anchor without touching the counter.
+        if self.risk_last_day_index != -1:
+            if current_equity < self.risk_last_day_equity:
+                self.risk_cons_loss_days += 1
+            else:
+                self.risk_cons_loss_days = 0
+        self.risk_last_day_equity = current_equity
+        self.risk_intraday_start_equity = current_equity
+        self.risk_last_day_index = current_day
+        self.risk_intraday_filled_orders = 0
+        if self._is_max_cons_loss_days_breached():
+            self._trigger_risk_halt("Max consecutive loss days reached")
+
+    def _enforce_post_bar_risk(self) -> None:
+        """Run the post-bar ``strategy.risk.*`` checks.
+
+        Called by the runner after the script executes and before the next
+        :meth:`OrderSyncEngine.sync` so the queued risk-close goes out in
+        the same dispatch cycle. The first triggered rule wins.
+        """
+        if self.risk_halt_trading:
+            return
+        if self._is_max_drawdown_breached():
+            self._trigger_risk_halt("Max drawdown reached")
+            return
+        if self._is_max_intraday_loss_breached():
+            self._trigger_risk_halt("Max intraday loss reached")
+            return
+        if self._is_max_cons_loss_days_breached():
+            self._trigger_risk_halt("Max consecutive loss days reached")
+
+    def _trigger_risk_halt(self, reason: str) -> None:
+        """Cancel pending orders, queue a market close, set the halt flag.
+
+        Differs from :meth:`SimPosition._trigger_risk_halt` in two ways: no
+        synthetic fill (the exchange owns fills, not the position), and no
+        OHLC arguments (the close is a plain market order, the broker
+        decides the fill price). The next :meth:`OrderSyncEngine.sync`
+        observes the cleared books plus the queued close and dispatches
+        accordingly.
+        """
+        from pynecore.lib.strategy import Order, _order_type_close
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        if self.size != 0.0:
+            close_order = Order(
+                None, -self.size,
+                exit_id='Risk management close',
+                order_type=_order_type_close,
+                comment=f"Close Position ({reason})",
+            )
+            self._add_order(close_order)
+        self.risk_halt_trading = True
 
     def record_liquidation(self, event: 'OrderEvent') -> None:
         """Record an exchange-initiated liquidation — close all open trades."""
