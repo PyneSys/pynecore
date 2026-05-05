@@ -43,7 +43,7 @@ import asyncio
 import logging
 import time
 import threading
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Generator
 from queue import Queue, Empty, Full
 from typing import Any
 
@@ -74,9 +74,9 @@ def live_ohlcv_generator(
         shutdown_timeout: float = 120.0,
         event_loop: asyncio.AbstractEventLoop | None = None,
         engine_event_stream: Coroutine[Any, Any, Any] | None = None,
-) -> Iterator[OHLCV]:
+) -> Generator[OHLCV, None, None]:
     """
-    Bridge async watch_ohlcv() to a sync Iterator[OHLCV].
+    Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
 
     Spawns a background thread running asyncio, collects OHLCV objects
     via queue.Queue, and yields them including intra-bar updates.
@@ -371,7 +371,7 @@ def live_ohlcv_generator(
             connect_timeout_seconds,
         )
 
-    def _consumer() -> Iterator[OHLCV]:
+    def _consumer() -> Generator[OHLCV, None, None]:
         in_warmup_catchup = True
 
         try:

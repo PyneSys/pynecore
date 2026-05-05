@@ -30,7 +30,7 @@ from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
-from pynecore.core.provider_string import is_provider_string, parse_provider_string
+from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
 from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
 
@@ -111,12 +111,12 @@ def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetim
 class _ProviderData:
     """Result of provider data download, including the provider instance for live mode."""
 
-    def __init__(self, ohlcv_path: Path, syminfo: 'SymInfo', provider_instance=None,
-                 parsed_string=None, time_from_ts: int | None = None):
+    def __init__(self, ohlcv_path: Path, syminfo: 'SymInfo', parsed_string: ProviderString,
+                 provider_instance=None, time_from_ts: int | None = None):
         self.ohlcv_path = ohlcv_path
         self.syminfo = syminfo
         self.provider_instance = provider_instance
-        self.parsed_string = parsed_string
+        self.parsed_string: ProviderString = parsed_string
         # Exact start timestamp that yields exactly the requested bar
         # count in ``-N bars`` mode — None when the caller should use
         # the file's natural start (date/days mode, no bar target).
@@ -157,13 +157,14 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     tf_seconds = in_seconds(ps.timeframe)
     bar_count: int | None = None
     if isinstance(time_from_value, int) and time_from_value < 0:
-        bar_count = abs(time_from_value)
+        bc = abs(time_from_value)
+        bar_count = bc
         # Pad the request by one bar to absorb the still-forming current
         # bar that closed-bars-only providers (e.g. Capital.com) filter
         # out of history responses. Without this, every ``-N`` run
         # against a now-aligned end-time would burn a wasted retry pass
         # (``real_bars == N - 1`` on first attempt → retry → success).
-        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * (bar_count + 1))
+        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * (bc + 1))
     else:
         assert isinstance(time_from_value, datetime)
         time_from_dt = time_from_value
@@ -674,6 +675,7 @@ def run(
                     secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
                           err=True, fg=colors.RED)
                     raise Exit(1)
+                assert provider_data.parsed_string.timeframe is not None
                 size = 0
 
             # Parse security data mappings
@@ -749,6 +751,7 @@ def run(
             # in the user-visible startup log.
             if live and provider_data:
                 import itertools
+                assert provider_data.parsed_string.timeframe is not None
                 live_iter = live_ohlcv_generator(
                     provider=provider_data.provider_instance,
                     symbol=provider_data.parsed_string.symbol,
@@ -980,7 +983,10 @@ def run(
             if live_iter is not None:
                 try:
                     live_iter.close()
-                except Exception:  # noqa: BLE001 — defensive teardown
+                except RuntimeError:
+                    # Generator.close() only raises RuntimeError when the
+                    # generator swallows GeneratorExit and yields again —
+                    # harmless during teardown.
                     pass
             # Close the broker storage run cleanly — happy-path lezárás.
             # Crash-path (SIGKILL, OOM) a storage stale-run cleanupjára bízott.
@@ -993,7 +999,7 @@ def run(
             # a different thread than the one issuing the stop.
             if broker_event_loop is not None:
                 try:
-                    broker_event_loop.call_soon_threadsafe(broker_event_loop.stop)
+                    broker_event_loop.call_soon_threadsafe(broker_event_loop.stop)  # type: ignore[call-arg]
                 except RuntimeError:
                     pass
                 if broker_event_loop_thread is not None:
