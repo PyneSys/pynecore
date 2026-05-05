@@ -893,6 +893,36 @@ class RunContext:
                 ),
             )
 
+    def iter_events_by_kind_since(
+            self, kind: str, since_ts_ms: int,
+    ) -> Iterator[dict]:
+        """Adott ``kind``-ű event-ek payload-jainak iterátora ``since_ts_ms`` óta.
+
+        ASC sorrend ``ts_ms`` szerint, csak a sikeresen JSON-deszerializált
+        payload-ok kerülnek visszaadásra (üres vagy parsolhatatlan payload-ok
+        kihagyva). Plugin-oldali cross-restart recovery (pl. activity-cursor
+        rebuild) használja, hogy a perzisztált audit-event tail közvetlen
+        SQL-elérés nélkül olvasható legyen.
+
+        :param kind: Az ``events.kind`` szűrő.
+        :param since_ts_ms: Alsó korlát ``ts_ms``-ben (inclusive).
+        :return: Payload dict-ek iterátora a beszúrási sorrendben.
+        """
+        rows = self._store._conn.execute(
+            "SELECT payload FROM events "
+            "WHERE run_instance_id = ? AND kind = ? AND ts_ms >= ? "
+            "ORDER BY ts_ms ASC",
+            (self.run_instance_id, kind, since_ts_ms),
+        )
+        for row in rows:
+            raw = row['payload']
+            if not raw:
+                continue
+            try:
+                yield json.loads(raw)
+            except ValueError:
+                continue
+
     # --- Lifecycle --------------------------------------------------------
 
     def heartbeat(self) -> None:
