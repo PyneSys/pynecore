@@ -6,7 +6,8 @@ of pending Pine orders created by ``strategy.entry``, ``strategy.order``,
 ``strategy.exit``, ``strategy.close`` and ``strategy.close_all``:
 
 - ``position.entry_orders[pine_id]`` — entries and strategy-order adds
-- ``position.exit_orders[from_entry]`` — exits, closes and close-all
+- ``position.exit_orders[(exit_id, from_entry)]`` — exits, closes and
+  close-all (composite key disambiguates multiple exits per entry)
 
 For live trading the :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`
 consumes these via :func:`build_intents`, which returns a flat list of

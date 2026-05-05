@@ -273,7 +273,7 @@ def __test_removed_entry_dispatches_cancel__():
 def __test_close_intent_dispatches_execute_close__():
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.exit_orders["L"] = Order(
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -1.0, order_type=_order_type_close,
         exit_id="Close entry(s) order L",
     )
@@ -288,7 +288,7 @@ def __test_close_intent_dispatches_execute_close__():
 def __test_exit_with_prices_dispatches_execute_exit__():
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
 
@@ -305,7 +305,7 @@ def __test_exit_with_prices_dispatches_execute_exit__():
 def __test_exit_with_ticks_without_entry_is_deferred__():
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", profit_ticks=100.0, loss_ticks=50.0,
     )
 
@@ -313,14 +313,14 @@ def __test_exit_with_ticks_without_entry_is_deferred__():
 
     # Exit never reaches the plugin while ticks are unresolved.
     assert b.exit_calls == []
-    assert "L" in engine.deferred_exits
+    assert "TP\0L" in engine.deferred_exits
     assert "TP\0L" not in engine.active_intents
 
 
 def __test_entry_fill_resolves_deferred_exit__():
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", profit_ticks=100.0, loss_ticks=50.0,
     )
     engine.sync(BAR_TS)  # defers it
@@ -337,13 +337,13 @@ def __test_entry_fill_resolves_deferred_exit__():
     assert resolved.sl_price == 49_950.0
     assert resolved.profit_ticks is None
     assert resolved.loss_ticks is None
-    assert "L" not in engine.deferred_exits
+    assert "TP\0L" not in engine.deferred_exits
 
 
 def __test_short_entry_fill_reverses_tick_direction__():
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
-    pos.exit_orders["S"] = _exit_order(
+    pos.exit_orders[("TP", "S")] = _exit_order(
         "S", 1.0, "TP", profit_ticks=100.0, loss_ticks=50.0,
     )
     engine.sync(BAR_TS)
@@ -357,6 +357,44 @@ def __test_short_entry_fill_reverses_tick_direction__():
     # Short (sign=-1): TP below entry, SL above entry.
     assert resolved.tp_price == 49_900.0
     assert resolved.sl_price == 50_050.0
+
+
+def __test_pyramiding_two_tick_exits_same_from_entry_no_collision__():
+    """Pyramiding attaches multiple tick-deferred exits to one entry.
+
+    Each exit lives under its own ``intent_key`` slot in ``_deferred_exits``;
+    a single entry fill resolves every exit pointing at that entry in one
+    pass. Fixture mirrors the Pine-side ``exit_orders`` composite keying.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b, mintick=1.0)
+    pos.exit_orders[("TP1", "L")] = _exit_order(
+        "L", -1.0, "TP1", profit_ticks=100.0, loss_ticks=50.0,
+    )
+    pos.exit_orders[("TP2", "L")] = _exit_order(
+        "L", -1.0, "TP2", profit_ticks=200.0, loss_ticks=80.0,
+    )
+
+    engine.sync(BAR_TS)  # both should defer, neither dispatch
+
+    assert b.exit_calls == []
+    assert "TP1\0L" in engine.deferred_exits
+    assert "TP2\0L" in engine.deferred_exits
+
+    engine.on_order_event(_fill_event(
+        "buy", qty=1.0, price=50_000.0, pine_id="L", leg=LegType.ENTRY,
+    ))
+    engine.sync(BAR_TS)
+
+    # Both exits must reach the plugin with their own resolved prices.
+    assert len(b.exit_calls) == 2
+    by_id = {env.intent.pine_id: env.intent for env in b.exit_calls}
+    assert by_id["TP1"].tp_price == 50_100.0
+    assert by_id["TP1"].sl_price == 49_950.0
+    assert by_id["TP2"].tp_price == 50_200.0
+    assert by_id["TP2"].sl_price == 49_920.0
+    assert "TP1\0L" not in engine.deferred_exits
+    assert "TP2\0L" not in engine.deferred_exits
 
 
 # === Interceptor ===
@@ -774,7 +812,7 @@ def __test_reconcile_does_not_warn_on_tracked_orders_missing_from_exchange__(cap
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1052,7 +1090,7 @@ def __test_partial_entry_fill_amends_bracket_qty__():
     events: list[BrokerEvent] = []
     engine, pos = _mk_engine_with_sink(b, events)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1083,7 +1121,7 @@ def __test_subsequent_partial_fill_emits_another_amend__():
     events: list[BrokerEvent] = []
     engine, pos = _mk_engine_with_sink(b, events)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1111,7 +1149,7 @@ def __test_native_bracket_skips_partial_amend__():
     )
     engine, pos = _mk_engine_with_policy(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1156,7 +1194,7 @@ def __test_overfill_is_capped_and_emits_leg_repair_failed__():
     events: list[BrokerEvent] = []
     engine, pos = _mk_engine_with_sink(b, events)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1183,7 +1221,7 @@ def __test_overfill_after_partial_caps_at_entry_qty__():
     events: list[BrokerEvent] = []
     engine, pos = _mk_engine_with_sink(b, events)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("TP", "L")] = _exit_order(
         "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1252,7 +1290,7 @@ def __test_natural_close_cleans_entry_and_exit_intents__():
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
         "L", -1.0, "Bracket", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1284,9 +1322,9 @@ def __test_natural_close_cleans_entry_and_exit_intents__():
         "Pine entry_orders[L] must be cleared so next bar does not "
         "re-emit a modify against the closed position"
     )
-    assert "L" not in pos.exit_orders, (
-        "Pine exit_orders[L] must be cleared so next bar does not "
-        "re-emit a stale Bracket exit"
+    assert ("Bracket", "L") not in pos.exit_orders, (
+        "Pine exit_orders[(Bracket, L)] must be cleared so next bar "
+        "does not re-emit a stale Bracket exit"
     )
 
 
@@ -1297,7 +1335,7 @@ def __test_natural_close_partial_fill_does_not_cleanup__():
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 2.0, limit=50_000.0)
-    pos.exit_orders["L"] = _exit_order(
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
         "L", -2.0, "Bracket", limit=60_000.0, stop=45_000.0,
     )
     engine.sync(BAR_TS)
@@ -1321,4 +1359,4 @@ def __test_natural_close_partial_fill_does_not_cleanup__():
     assert "L" in engine.active_intents, "entry intent must survive partial close"
     assert "Bracket\0L" in engine.active_intents, "exit intent must survive partial close"
     assert "L" in pos.entry_orders
-    assert "L" in pos.exit_orders
+    assert ("Bracket", "L") in pos.exit_orders

@@ -75,7 +75,11 @@ class BrokerPosition(PositionBase):
         self.new_closed_trades: list[Trade] = []
 
         self.entry_orders: dict[str | None, 'Order'] = {}
-        self.exit_orders: dict[str | None, 'Order'] = {}
+        # Composite key ``(exit_id, from_entry)`` mirrors
+        # :class:`~pynecore.lib.strategy.SimPosition.exit_orders`. Single-field
+        # keys collide on partial-TP fan-out (multiple exits for one entry)
+        # and on ``from_entry=na`` fan-out (one exit_id, many per-entry rows).
+        self.exit_orders: dict[tuple[str | None, str | None], 'Order'] = {}
 
         self.risk_halt_trading: bool = False
 
@@ -127,7 +131,7 @@ class BrokerPosition(PositionBase):
         order.bar_index = int(lib.bar_index)
         from pynecore.lib.strategy import _order_type_close  # local import avoids cycle
         if order.order_type == _order_type_close:
-            self.exit_orders[order.order_id] = order
+            self.exit_orders[(order.exit_id, order.order_id)] = order
         else:
             self.entry_orders[order.order_id] = order
 
@@ -136,14 +140,19 @@ class BrokerPosition(PositionBase):
         order.cancelled = True
         from pynecore.lib.strategy import _order_type_close
         if order.order_type == _order_type_close:
-            self.exit_orders.pop(order.order_id, None)
+            self.exit_orders.pop((order.exit_id, order.order_id), None)
         else:
             self.entry_orders.pop(order.order_id, None)
 
     def _remove_order_by_id(self, order_id: str) -> None:
-        order = self.exit_orders.get(order_id) or self.entry_orders.get(order_id)
-        if order is not None:
-            self._remove_order(order)
+        # TV-verified semantics: ``strategy.cancel(id)`` matches an exit by
+        # its ``exit_id`` and an entry by its entry id; no cross-matching.
+        for exit_order in list(self.exit_orders.values()):
+            if exit_order.exit_id == order_id:
+                self._remove_order(exit_order)
+        entry = self.entry_orders.get(order_id)
+        if entry is not None:
+            self._remove_order(entry)
 
     # === Exchange-side state updates ===
 

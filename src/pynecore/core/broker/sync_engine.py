@@ -154,6 +154,9 @@ class OrderSyncEngine:
         self._order_mapping: dict[str, list[str]] = {}
         self._envelopes: dict[str, DispatchEnvelope] = {}
         self._pending_verification: dict[str, DispatchEnvelope] = {}
+        # Keyed by ``ExitIntent.intent_key`` (``f"{pine_id}\x00{from_entry}"``)
+        # so pyramiding entries with multiple tick-deferred exits per
+        # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
         self._event_queue: queue.Queue[OrderEvent] = queue.Queue()
         self._interceptors: list[Callable[[Intent], InterceptorResult]] = []
@@ -350,7 +353,7 @@ class OrderSyncEngine:
         new_deferred: dict[str, ExitIntent] = {}
         for i in final:
             if isinstance(i, ExitIntent) and i.has_unresolved_ticks:
-                new_deferred[i.from_entry] = i
+                new_deferred[i.intent_key] = i
             else:
                 dispatchable.append(i)
         self._deferred_exits = new_deferred
@@ -597,20 +600,31 @@ class OrderSyncEngine:
         return None
 
     def _resolve_deferred_for_entry(self, entry_id: str) -> None:
-        """An entry fill unblocks any exit that references it via ticks."""
-        deferred = self._deferred_exits.pop(entry_id, None)
-        if deferred is None:
-            return
-        resolved = self._resolve_ticks(deferred)
-        if resolved.has_unresolved_ticks:
-            self._deferred_exits[entry_id] = deferred
-            return
-        try:
-            self._dispatch_new(resolved)
-        except OrderSkippedByPlugin as e:
-            _blog_warning("%s", e)
-            return
-        self._active_intents[resolved.intent_key] = resolved
+        """An entry fill unblocks every exit that references it via ticks.
+
+        Pyramiding can attach multiple tick-deferred exits (different
+        ``pine_id``) to the same ``from_entry``; all of them must be
+        resolved on the entry's fill, not just one. Iterating with a
+        snapshot of the keys lets the loop mutate ``_deferred_exits``
+        safely.
+        """
+        matches = [
+            (key, intent)
+            for key, intent in self._deferred_exits.items()
+            if intent.from_entry == entry_id
+        ]
+        for key, deferred in matches:
+            del self._deferred_exits[key]
+            resolved = self._resolve_ticks(deferred)
+            if resolved.has_unresolved_ticks:
+                self._deferred_exits[key] = deferred
+                continue
+            try:
+                self._dispatch_new(resolved)
+            except OrderSkippedByPlugin as e:
+                _blog_warning("%s", e)
+                continue
+            self._active_intents[resolved.intent_key] = resolved
 
     # === OCA cascade cancel ===
 
@@ -687,7 +701,7 @@ class OrderSyncEngine:
         if isinstance(intent, EntryIntent) and entry_orders is not None:
             entry_orders.pop(intent.pine_id, None)
         elif isinstance(intent, ExitIntent) and exit_orders is not None:
-            exit_orders.pop(intent.from_entry, None)
+            exit_orders.pop((intent.pine_id, intent.from_entry), None)
 
     def _cleanup_closed_position(self, event: OrderEvent) -> None:
         """Drop tracking for an entry fully closed by a TP/SL/CLOSE fill.
@@ -705,8 +719,9 @@ class OrderSyncEngine:
         - ``_active_intents`` — entry intent keyed by ``pine_id``, every
           exit intent whose ``from_entry`` matches the closed entry.
         - ``_order_mapping`` and envelope state for the dropped keys.
-        - ``position.entry_orders`` / ``position.exit_orders`` — Pine
-          dicts keyed by the entry's ``pine_id``.
+        - ``position.entry_orders`` (single-key by ``pine_id``) and
+          ``position.exit_orders`` (composite ``(exit_id, from_entry)``;
+          every key whose ``from_entry`` matches is dropped).
         """
         closed_entry_id = event.from_entry or event.pine_id
         if not closed_entry_id:
@@ -723,13 +738,15 @@ class OrderSyncEngine:
                 self._active_intents.pop(key, None)
                 self._order_mapping.pop(key, None)
                 self._drop_envelope(key)
-        # Pine-side order dicts — keyed by entry pine_id on both sides.
+        # Pine-side order dicts.
         entry_orders = getattr(self._position, 'entry_orders', None)
         exit_orders = getattr(self._position, 'exit_orders', None)
         if entry_orders is not None:
             entry_orders.pop(closed_entry_id, None)
         if exit_orders is not None:
-            exit_orders.pop(closed_entry_id, None)
+            for ex_key in list(exit_orders.keys()):
+                if isinstance(ex_key, tuple) and ex_key[1] == closed_entry_id:
+                    exit_orders.pop(ex_key, None)
 
     def _filled_intent_key(self, event: OrderEvent) -> str | None:
         """Resolve a fill event to the ``intent_key`` of the owning intent.
@@ -827,15 +844,15 @@ class OrderSyncEngine:
         """Mutate the Pine-side exit :class:`Order` to match the amended qty.
 
         Without this, the next :meth:`sync` rebuilds the ExitIntent from the
-        unchanged ``pos.exit_orders[from_entry]`` (whose ``size`` still equals
-        the original full qty), the diff engine sees a mismatch against the
-        amended active intent, and emits a *second* ``modify_exit`` back to
-        the original qty — undoing the partial-fill cascade we just did.
+        unchanged ``pos.exit_orders[(exit_id, from_entry)]`` (whose ``size``
+        still equals the original full qty), the diff engine sees a mismatch
+        against the amended active intent, and emits a *second* ``modify_exit``
+        back to the original qty — undoing the partial-fill cascade we just did.
         """
         exit_orders = getattr(self._position, 'exit_orders', None)
         if exit_orders is None:
             return
-        order = exit_orders.get(bracket.from_entry)
+        order = exit_orders.get((bracket.pine_id, bracket.from_entry))
         if order is None:
             return
         sign = 1.0 if order.size >= 0.0 else -1.0

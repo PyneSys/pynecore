@@ -645,7 +645,7 @@ def __test_integration_capitalcom_full_roundtrip_entry_bracket_tp_fill__(
         pos.entry_orders["L"] = Order(
             "L", 1.0, order_type=_order_type_entry,
         )
-        pos.exit_orders["L"] = Order(
+        pos.exit_orders[("TP", "L")] = Order(
             "L", -1.0, order_type=_order_type_close, exit_id="TP",
             limit=1.0900, stop=1.0750,
         )
