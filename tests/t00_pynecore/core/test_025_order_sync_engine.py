@@ -271,6 +271,29 @@ def __test_removed_entry_dispatches_cancel__():
     assert "L" not in engine.active_intents
 
 
+def __test_cancel_all_orders_dispatches_cancel_for_every_active_intent__():
+    """``Pine strategy.cancel_all()`` clears the position dicts; the engine
+    must then dispatch one cancel per previously tracked intent. Regression
+    for the broker-mode crash where ``cancel_all()`` touched a non-existent
+    ``orderbook`` attribute and bailed before any cancel went out."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0, limit=50_000.0)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0, limit=49_000.0)
+    pos.exit_orders[("TP", "L1")] = _exit_order(
+        "L1", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+
+    pos._cancel_all_orders()
+    engine.sync(BAR_TS)
+
+    cancelled_ids = {(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls}
+    assert cancelled_ids == {("L1", None), ("L2", None), ("TP", "L1")}
+    assert engine.active_intents == {}
+    assert engine.order_mapping == {}
+
+
 def __test_close_intent_dispatches_execute_close__():
     b = MockBroker()
     engine, pos = _mk_engine(b)

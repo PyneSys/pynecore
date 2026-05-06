@@ -578,6 +578,10 @@ class PositionBase(ABC):
     def _remove_order_by_id(self, order_id: str) -> None:
         """Remove an order by its id (searches both exit and entry books)."""
 
+    @abstractmethod
+    def _cancel_all_orders(self) -> None:
+        """Cancel every pending entry/exit order tracked by this position."""
+
 
 # noinspection PyProtectedMember,PyShadowingNames,DuplicatedCode
 class SimPosition(PositionBase):
@@ -737,6 +741,11 @@ class SimPosition(PositionBase):
         order = self.entry_orders.get(order_id)
         if order:
             self._remove_order(order)
+
+    def _cancel_all_orders(self) -> None:
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
 
     def _cancel_oca_group(self, oca_name: str, executed_order: Order):
         """Cancel all orders in the same OCA group except the executed one"""
@@ -2063,10 +2072,7 @@ def cancel_all():
     """
     if lib._lib_semaphore or lib._strategy_suppressed:
         return
-    position = lib._script.position
-    position.entry_orders.clear()
-    position.exit_orders.clear()
-    position.orderbook.clear()
+    lib._script.position._cancel_all_orders()
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames

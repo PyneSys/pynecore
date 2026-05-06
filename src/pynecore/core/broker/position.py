@@ -212,6 +212,15 @@ class BrokerPosition(PositionBase):
         if entry is not None:
             self._remove_order(entry)
 
+    def _cancel_all_orders(self) -> None:
+        # No ``orderbook`` attribute — that lives on ``SimPosition`` and drives
+        # the simulator's price-keyed fill loop, which has no analog in live
+        # trading. Clearing the two Pine-side dicts is enough; the next
+        # ``OrderSyncEngine.sync()`` diffs against ``_active_intents`` and
+        # dispatches a per-id cancel for every previously tracked intent.
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+
     # === Exchange-side state updates ===
 
     def record_fill(self, event: 'OrderEvent') -> bool:
