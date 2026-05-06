@@ -44,6 +44,7 @@ from pynecore.lib.log import (
 from pynecore.core.broker.models import (
     BrokerEvent,
     CancelIntent,
+    CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
     EntryIntent,
@@ -144,11 +145,14 @@ class OrderSyncEngine:
         self._store_ctx = store_ctx
         # Capabilities are declared once at plugin startup — cache the lookup
         # so the cascade-cancel fast path does not pay a method call per event.
+        # Only the NATIVE level suppresses the engine fallback path:
+        # PARTIAL_NATIVE keeps the engine running because the exchange only
+        # owns part of the semantics, and we cannot safely guess which part.
+        # Over-cancel / over-amend is idempotent; under-cancel leaves an open
+        # exposure on the book.
         caps = broker.get_capabilities()
-        self._oca_cancel_native = bool(getattr(caps, 'oca_cancel_native', False))
-        self._tp_sl_bracket_native = bool(
-            getattr(caps, 'tp_sl_bracket_native', False),
-        )
+        self._oca_cancel_native = caps.oca_cancel is CapabilityLevel.NATIVE
+        self._tp_sl_bracket_native = caps.tp_sl_bracket is CapabilityLevel.NATIVE
 
         self._active_intents: dict[str, Intent] = {}
         self._order_mapping: dict[str, list[str]] = {}
@@ -639,8 +643,8 @@ class OrderSyncEngine:
 
         The cascade is **suppressed** when:
 
-        - The plugin declared ``oca_cancel_native=True`` — the exchange
-          registers and cancels the group natively.
+        - The plugin declared ``oca_cancel = CapabilityLevel.NATIVE`` — the
+          exchange registers and cancels the group natively.
         - The filled intent has no OCA group, or its type is not ``cancel``.
           (``reduce`` groups amend quantities on fill; that belongs to the
           partial-fill qty-amend workstream, not here.)
@@ -777,8 +781,9 @@ class OrderSyncEngine:
 
         Suppressed when:
 
-        - The plugin declared ``tp_sl_bracket_native=True`` — the exchange
-          tracks partial entry fills natively (Bybit V5 attached TP/SL).
+        - The plugin declared ``tp_sl_bracket = CapabilityLevel.NATIVE`` —
+          the exchange tracks partial entry fills natively (Bybit V5
+          attached TP/SL, Capital.com position-attribute bracket).
         - No bracket is active for ``event.pine_id`` (plain entry, no exit).
         - The current ExitIntent already matches the target qty — avoids
           redundant dispatch churn.

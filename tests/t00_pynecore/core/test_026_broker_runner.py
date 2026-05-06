@@ -23,6 +23,7 @@ import pytest
 
 from pynecore.core.broker.models import (
     CancelIntent,
+    CapabilityLevel,
     CloseIntent,
     EntryIntent,
     ExchangeCapabilities,
@@ -285,7 +286,9 @@ def __test_startup_validation_accepts_compatible_script__(tmp_path):
     # the last one because strategy.exit implies reduce-only semantics.
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(
-            tp_sl_bracket=True, stop_order=True, reduce_only=True,
+            tp_sl_bracket=CapabilityLevel.NATIVE,
+            stop_order=CapabilityLevel.NATIVE,
+            reduce_only=CapabilityLevel.NATIVE,
         ),
     )
     script_path = _write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
@@ -326,7 +329,7 @@ def __test_close_dispatches_execute_close__(tmp_path):
     # ``strategy.close`` triggers the ``exit_orders`` requirement, which the
     # validator pairs with ``caps.reduce_only``.
     plugin = MockBrokerPlugin(
-        capabilities=ExchangeCapabilities(reduce_only=True),
+        capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
     )
     # 3-bar script: enter on bar 0, hold, close on bar 2 once filled.
     script_path = _write_script(tmp_path, textwrap.dedent('''\

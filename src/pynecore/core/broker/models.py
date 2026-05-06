@@ -21,6 +21,7 @@ __all__ = [
     'LegType',
     'OcaType',
     'OcaPartialFillPolicy',
+    'CapabilityLevel',
     'ExchangeOrder',
     'OrderEvent',
     'ExchangePosition',
@@ -101,6 +102,52 @@ class OcaPartialFillPolicy(StrEnum):
     """
     FILL_CANCELS = "fill_cancels"
     FULL_FILL_ONLY = "full_fill_only"
+
+
+class CapabilityLevel(StrEnum):
+    """Tri-tone declaration of how a plugin upholds a single capability.
+
+    The plugin advertises *what it can deliver end-to-end* (not raw exchange
+    support). The four levels are an at-a-glance summary the runner, sync
+    engine, validator and CLI can all consume:
+
+    - :data:`UNSUPPORTED` — neither the exchange nor the plugin can uphold the
+      semantics; :func:`~pynecore.core.broker.validation.validate_at_startup`
+      rejects scripts that need it. Default so a missing field never silently
+      advertises a capability.
+    - :data:`SOFTWARE` — upheld in the plugin / sync engine without any
+      exchange-side primitive (e.g. polling order state, software OCA cascade,
+      netting-based reduce-only). Validation passes; latency / failure
+      semantics are the plugin's responsibility.
+    - :data:`PARTIAL_NATIVE` — the exchange supports a *subset* of the
+      semantics natively, the plugin fills the rest in software. Used when a
+      capability has axes the exchange covers some but not all of (e.g.
+      Capital.com ``amend_order``: level / SL / TP amendable, ``size`` is not
+      and needs cancel+recreate). Validation passes; PARTIAL_NATIVE is a
+      diagnostic flag, not a stricter contract — the sync engine treats it
+      the same as SOFTWARE for fallback decisions.
+    - :data:`NATIVE` — single atomic exchange call delivers the full
+      semantics (e.g. Bybit attached TP/SL, exchange-side OCA group, native
+      reduce-only flag). The sync engine may suppress its software fallback
+      paths on this level (see :class:`OrderSyncEngine`).
+
+    The string values are stable and safe to log / persist (e.g. SQLite
+    columns, ``pyne plugin info`` output).
+    """
+    UNSUPPORTED = "unsupported"
+    SOFTWARE = "software"
+    PARTIAL_NATIVE = "partial_native"
+    NATIVE = "native"
+
+    @property
+    def is_supported(self) -> bool:
+        """``True`` for every level except :data:`UNSUPPORTED`.
+
+        The validator uses this to decide whether to reject a script — a
+        SOFTWARE-level capability is just as valid as NATIVE, only the cost /
+        latency / failure profile differs.
+        """
+        return self is not CapabilityLevel.UNSUPPORTED
 
 
 # === Exchange state snapshots ===
@@ -187,60 +234,109 @@ class ExchangePosition:
 class ExchangeCapabilities:
     """
     What the plugin can deliver end-to-end for the script, not raw exchange
-    support.  Declared once at startup.  A capability is ``True`` when the
-    plugin can uphold its semantics on this exchange — natively (one atomic
-    exchange call) or in software (e.g. two reduce-only orders + stream-driven
-    repair with OCA reduce semantics).  If neither path can uphold the
-    required semantics, declare ``False`` and
-    :func:`~pynecore.core.broker.validation.validate_at_startup` rejects the
-    script.
+    support. Declared once at startup. Each capability is a
+    :class:`CapabilityLevel` — :data:`~CapabilityLevel.UNSUPPORTED` (default)
+    rejects scripts that need it via
+    :func:`~pynecore.core.broker.validation.validate_at_startup`; any other
+    level passes the validator. The level distinction
+    (NATIVE / PARTIAL_NATIVE / SOFTWARE) is a diagnostic — the sync engine
+    treats NATIVE as "exchange owns this; suppress my software fallback"
+    for the fields it explicitly checks (``oca_cancel``, ``tp_sl_bracket``),
+    and everything else as "engine still runs the fallback path". Plugins
+    that can guarantee end-to-end atomic delivery should declare NATIVE so
+    the engine can skip its emulation.
     """
-    # Order types
-    stop_order: bool = False
-    stop_limit_order: bool = False
-    trailing_stop: bool = False
-    # Exit bracket (TP+SL with OCA reduce semantics).  ``tp_sl_bracket=True``
-    # means the plugin delivers the bracket on this exchange; it does NOT
-    # imply native support.  ``tp_sl_bracket_native=True`` additionally
-    # promises a single atomic exchange call — useful for diagnostics,
-    # latency budgeting, and per-exchange reconcile strategy.
-    tp_sl_bracket: bool = False
-    tp_sl_bracket_native: bool = False
-    # Exit bracket on a partial-qty. ``True`` means the plugin can attach
-    # TP/SL/trailing to a partial quantity of a position (e.g. Bybit/Binance
-    # per-order bracket, or any exchange where exits are separate orders).
-    # ``False`` means the bracket is a *position-level* attribute that
-    # covers the full row only (Capital.com ``stopLevel`` / ``profitLevel``
-    # on ``/positions``), so Pine ``strategy.exit(qty=N, from_entry="L")``
-    # with ``N < entry qty`` cannot be upheld — the validator rejects such
-    # scripts at startup rather than producing incorrect bracket coverage.
-    partial_qty_bracket_exit: bool = False
-    # Native OCA-cancel groups: the plugin has registered the OCA group with
-    # the exchange such that the exchange itself cancels sibling orders when
-    # one fills (Bybit bracket, OKX algo orders, ...). When True the sync
-    # engine SUPPRESSES its own cascade-cancel logic — the exchange is
-    # authoritative. When False (the default, and the case for the vast
-    # majority of exchanges), the engine synthesises CancelIntent dispatches
-    # for surviving siblings the moment a fill event lands.
-    oca_cancel_native: bool = False
-    # Order management
-    amend_order: bool = False
-    cancel_all: bool = False
-    reduce_only: bool = False
-    # Streaming & position
-    watch_orders: bool = False
-    fetch_position: bool = False
-    # Idempotency.  ``client_id_echo`` means the plugin can attach a client-side
-    # order id that the exchange returns verbatim on ``get_open_orders`` — the
-    # foundation of the restart-safe recovery path in
-    # :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`.  Without it the
-    # engine cannot re-associate orders after a timeout or restart and live
-    # scripts are rejected at startup.  ``idempotency_native`` additionally
-    # promises that the exchange itself rejects duplicates of the same id
-    # (Binance/Bybit/OKX/Capital.com); ``False`` means the plugin must dedup
-    # client-side before each dispatch (Interactive Brokers, Deribit).
-    client_id_echo: bool = False
-    idempotency_native: bool = False
+    # === Order types ===
+    # NATIVE = exchange has the order type as a first-class primitive.
+    # SOFTWARE = plugin emulates it (e.g. a poll loop that converts a
+    # client-side trigger price into a market submit). UNSUPPORTED rejects
+    # scripts that use the corresponding Pine parameter.
+    stop_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+    stop_limit_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+    # NATIVE = server-side trailing stop (e.g. Capital.com
+    # ``trailingStop=true, stopDistance``). SOFTWARE = plugin tracks the
+    # last extreme and amends the SL each tick / bar.
+    trailing_stop: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === Exit bracket (TP+SL with OCA reduce semantics) ===
+    # NATIVE = single atomic exchange call attaches both legs (Bybit V5
+    # attached TP/SL, Capital.com position-attribute bracket). The sync
+    # engine's partial-fill bracket-amend path is suppressed at this level.
+    # PARTIAL_NATIVE = the exchange takes one leg natively but the other
+    # requires a follow-up call (rare — e.g. SL on the position but TP only
+    # as a separate working order). Engine fallback stays active.
+    # SOFTWARE = the plugin issues two reduce-only orders and runs the
+    # OCA-reduce / cascade-cancel logic itself.
+    tp_sl_bracket: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # NATIVE / SOFTWARE = the plugin can attach TP/SL/trailing to a partial
+    # quantity of a position, so ``strategy.exit(qty=N, from_entry="L")``
+    # with ``N`` less than the full row qty is upheld correctly.
+    # UNSUPPORTED = position-attribute brackets only cover the full row
+    # (Capital.com ``stopLevel`` / ``profitLevel``); the validator rejects
+    # such scripts at startup rather than silently mis-hedging.
+    partial_qty_bracket_exit: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === OCA cancel groups ===
+    # NATIVE = the exchange tracks the OCA group and cancels siblings on
+    # fill (Bybit bracket, OKX algo orders). The sync engine SUPPRESSES its
+    # cascade-cancel logic — exchange is authoritative.
+    # SOFTWARE = the engine emits CancelIntent dispatches itself when a
+    # leg fills (the default for the vast majority of exchanges, including
+    # Capital.com — its position-attribute bracket is a separate capability
+    # under ``tp_sl_bracket``, not OCA).
+    # UNSUPPORTED = the plugin cannot deliver OCA-cancel semantics at all
+    # — scripts using ``oca_type='cancel'`` are rejected at startup.
+    oca_cancel: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === Order management ===
+    # NATIVE = the exchange amends every parameter (price, size, SL/TP).
+    # PARTIAL_NATIVE = some axes are amendable, others (commonly ``size``)
+    # require cancel+recreate (Capital.com is exactly this case — level /
+    # SL / TP fields amend in-place, ``size`` does not).
+    # SOFTWARE = no in-place amend; plugin always cancel+recreate.
+    amend_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # NATIVE = single batch call (e.g. Binance ``DELETE /openOrders``).
+    # SOFTWARE = plugin iterates per-id cancel under the hood.
+    cancel_all: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # NATIVE = exchange honours an explicit reduce-only flag on the order.
+    # SOFTWARE = upheld via netting / one-way mode (plugin maps an
+    # opposite-side order onto the existing position so it cannot flip).
+    # UNSUPPORTED = scripts using ``strategy.exit`` / ``strategy.close`` are
+    # rejected at startup.
+    reduce_only: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === Streaming & position ===
+    # NATIVE = a real WebSocket order channel.
+    # SOFTWARE = plugin emulates the stream by polling REST endpoints and
+    # diffing snapshots (Capital.com ``GET /workingorders`` +
+    # ``GET /positions`` cadence).
+    watch_orders: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # NATIVE = a single REST/WS read returns the position state.
+    # SOFTWARE = plugin reconstructs by aggregating fills locally.
+    # The distinction is mostly informational — both deliver the same
+    # contract.
+    fetch_position: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === Idempotency ===
+    # NATIVE = the exchange accepts a client-supplied order id, echoes it
+    # back on subsequent reads, AND rejects duplicate submissions of the
+    # same id (Binance/Bybit/OKX). The sync engine and recovery path can
+    # rely on the exchange to dedup retries after a timeout / restart.
+    # PARTIAL_NATIVE = the exchange echoes the client id but does NOT dedup
+    # duplicates; the plugin must dedup client-side before each dispatch
+    # (Interactive Brokers, Deribit).
+    # SOFTWARE = the exchange generates the id (Capital.com server-side
+    # ``dealReference``); the plugin dedups in its own SQLite store using
+    # :attr:`DispatchEnvelope.client_order_id` as the local key.
+    # Restart-safe recovery still works, just without exchange-side
+    # enforcement.
+    # UNSUPPORTED = neither echo nor dedup — restart/timeout retries are
+    # unsafe; live scripts are rejected at startup.
+    idempotency: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
 
 # === Pine Script intents ===

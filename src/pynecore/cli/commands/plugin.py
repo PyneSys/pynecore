@@ -130,6 +130,54 @@ def plugin_info(
         secho("\n  Details:", fg=colors.BRIGHT_WHITE, bold=True)
         Console().print(Padding(Markdown(description), (0, 0, 0, 2)))
 
+    if 'broker' in caps:
+        from rich.table import Table
+        from rich import box
+        from ...core.broker.models import CapabilityLevel
+
+        # ``get_capabilities`` is an instance method but well-behaved broker
+        # plugins return a static dataclass with no I/O. Try a default
+        # construction first; if the plugin requires its Config dataclass
+        # (e.g. Capital.com asserts on it), retry with a default-constructed
+        # Config. Fall back to a warning if even that fails — long-term fix
+        # is to make ``get_capabilities`` a classmethod.
+        ex_caps = None
+        intro_error: Exception | None = None
+        try:
+            ex_caps = cls().get_capabilities()  # type: ignore[call-arg]
+        except Exception as e1:
+            intro_error = e1
+            cfg_cls = getattr(cls, 'Config', None)
+            if cfg_cls is not None and dataclasses.is_dataclass(cfg_cls):
+                try:
+                    ex_caps = cls(config=cfg_cls()).get_capabilities()  # type: ignore[call-arg]
+                    intro_error = None
+                except Exception as e2:
+                    intro_error = e2
+        if intro_error is not None:
+            secho(
+                f"\n  Exchange Capabilities:  (cannot introspect: {intro_error})",
+                fg=colors.YELLOW,
+            )
+        else:
+            assert ex_caps is not None
+            secho("\n  Exchange Capabilities:", fg=colors.BRIGHT_WHITE, bold=True)
+            level_color = {
+                CapabilityLevel.NATIVE: "green",
+                CapabilityLevel.PARTIAL_NATIVE: "yellow",
+                CapabilityLevel.SOFTWARE: "cyan",
+                CapabilityLevel.UNSUPPORTED: "dim white",
+            }
+            table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2, 0, 2))
+            table.add_column("Capability", style="white")
+            table.add_column("Level")
+            # noinspection PyDataclass
+            for f in dataclasses.fields(ex_caps):
+                value: CapabilityLevel = getattr(ex_caps, f.name)
+                colour = level_color.get(value, "white")
+                table.add_row(f.name, f"[{colour}]{value.value}[/{colour}]")
+            Console().print(Padding(table, (0, 0, 0, 2)))
+
     config_cls: type | None = getattr(cls, 'Config', None)
     if config_cls is not None and dataclasses.is_dataclass(config_cls):
         # noinspection PyDataclass

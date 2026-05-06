@@ -11,7 +11,11 @@ from __future__ import annotations
 import ast
 import textwrap
 
-from pynecore.core.broker.models import ScriptRequirements, ExchangeCapabilities
+from pynecore.core.broker.models import (
+    CapabilityLevel,
+    ExchangeCapabilities,
+    ScriptRequirements,
+)
 from pynecore.core.broker.validation import validate_at_startup
 from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
 
@@ -211,7 +215,7 @@ def __test_lib_script_strategy_decorator_is_detected__():
 
 def __test_validate_empty_when_requirements_satisfied__():
     reqs = ScriptRequirements(tp_sl_bracket=True)
-    caps = ExchangeCapabilities(tp_sl_bracket=True)
+    caps = ExchangeCapabilities(tp_sl_bracket=CapabilityLevel.NATIVE)
     assert validate_at_startup(reqs, caps) == []
 
 
@@ -239,7 +243,7 @@ def __test_validate_rejects_exit_without_reduce_only_capability__():
     exchange that doesn't honour reduce-only semantics — otherwise a
     later-arriving exit can flip the book to the other side."""
     reqs = ScriptRequirements(exit_orders=True)
-    caps = ExchangeCapabilities()  # reduce_only=False
+    caps = ExchangeCapabilities()  # reduce_only defaults to UNSUPPORTED
     errors = validate_at_startup(reqs, caps)
     assert len(errors) == 1
     assert 'reduce-only' in errors[0]
@@ -247,5 +251,33 @@ def __test_validate_rejects_exit_without_reduce_only_capability__():
 
 def __test_validate_accepts_exit_with_reduce_only_capability__():
     reqs = ScriptRequirements(exit_orders=True)
-    caps = ExchangeCapabilities(reduce_only=True)
+    caps = ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE)
+    assert validate_at_startup(reqs, caps) == []
+
+
+def __test_capability_level_is_supported__():
+    """``is_supported`` is True for every level except UNSUPPORTED."""
+    assert CapabilityLevel.NATIVE.is_supported is True
+    assert CapabilityLevel.PARTIAL_NATIVE.is_supported is True
+    assert CapabilityLevel.SOFTWARE.is_supported is True
+    assert CapabilityLevel.UNSUPPORTED.is_supported is False
+
+
+def __test_validate_accepts_software_level__():
+    """SOFTWARE-level capabilities pass validation, same as NATIVE."""
+    reqs = ScriptRequirements(stop_orders=True, exit_orders=True)
+    caps = ExchangeCapabilities(
+        stop_order=CapabilityLevel.SOFTWARE,
+        reduce_only=CapabilityLevel.SOFTWARE,
+    )
+    assert validate_at_startup(reqs, caps) == []
+
+
+def __test_validate_accepts_partial_native_level__():
+    """PARTIAL_NATIVE-level capabilities pass validation."""
+    reqs = ScriptRequirements(tp_sl_bracket=True, exit_orders=True)
+    caps = ExchangeCapabilities(
+        tp_sl_bracket=CapabilityLevel.PARTIAL_NATIVE,
+        reduce_only=CapabilityLevel.NATIVE,
+    )
     assert validate_at_startup(reqs, caps) == []

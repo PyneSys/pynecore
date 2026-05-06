@@ -2,12 +2,10 @@
 Startup-time validation of script :class:`ScriptRequirements` against a
 plugin's :class:`ExchangeCapabilities`.
 
-Pure function — the Script Runner calls this at broker-mode startup (future
-phase) and, on a non-empty error list, refuses to start trading.
+Pure function — the Script Runner calls this at broker-mode startup and, on a
+non-empty error list, refuses to start trading.
 """
-from __future__ import annotations
-
-from pynecore.core.broker.models import ScriptRequirements, ExchangeCapabilities
+from pynecore.core.broker.models import ExchangeCapabilities, ScriptRequirements
 
 __all__ = ['validate_at_startup']
 
@@ -21,39 +19,41 @@ def validate_at_startup(
     are satisfied by the exchange capabilities.
 
     The rule is simple: if the script uses a Pine parameter, the exchange
-    must support the corresponding capability. No runtime "softening" — a
-    syntactically-present ``stop=`` keyword means stop orders are required,
-    even if the runtime value would end up being ``na`` on every bar.
+    must support the corresponding capability at *any* level (SOFTWARE,
+    PARTIAL_NATIVE or NATIVE). Only :data:`~pynecore.core.broker.models.
+    CapabilityLevel.UNSUPPORTED` fails — the level distinction is a
+    diagnostic, not a stricter contract, because :class:`ScriptRequirements`
+    has no channel today to declare a "must be native" requirement.
     Safety-first: better to refuse to start than to fail on the first
     unexpected bar in live trading.
     """
     errors: list[str] = []
-    if reqs.stop_orders and not caps.stop_order:
+    if reqs.stop_orders and not caps.stop_order.is_supported:
         errors.append(
             "Script uses stop orders, but the exchange doesn't support them."
         )
-    if reqs.stop_limit_orders and not caps.stop_limit_order:
+    if reqs.stop_limit_orders and not caps.stop_limit_order.is_supported:
         errors.append(
             "Script uses stop-limit orders, but the exchange doesn't support them."
         )
-    if reqs.tp_sl_bracket and not caps.tp_sl_bracket:
+    if reqs.tp_sl_bracket and not caps.tp_sl_bracket.is_supported:
         errors.append(
             "Script uses TP+SL exit brackets (OCA reduce), but the exchange "
             "plugin doesn't support them. Use a plugin that emulates this, "
             "or modify the script."
         )
-    if reqs.trailing_stop and not caps.trailing_stop:
+    if reqs.trailing_stop and not caps.trailing_stop.is_supported:
         errors.append(
             "Script uses trailing stops, but the exchange doesn't support them."
         )
-    if reqs.exit_orders and not caps.reduce_only:
+    if reqs.exit_orders and not caps.reduce_only.is_supported:
         errors.append(
             "Script uses strategy.exit / strategy.close, but the exchange "
             "doesn't support reduce-only orders. A later-arriving exit "
             "could flip the book to the other side once the position is "
             "already closed — refuse to start."
         )
-    if reqs.partial_qty_bracket_exit and not caps.partial_qty_bracket_exit:
+    if reqs.partial_qty_bracket_exit and not caps.partial_qty_bracket_exit.is_supported:
         errors.append(
             "Script calls strategy.exit(qty=N, from_entry='L', ...) with a "
             "bracket parameter (limit/stop/profit/loss/trail_*) where N is "

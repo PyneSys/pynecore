@@ -313,4 +313,11 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
 
         Called once at startup for validation against script requirements
         (see :func:`~pynecore.core.broker.validation.validate_at_startup`).
+
+        Each field is a :class:`~pynecore.core.broker.models.CapabilityLevel`:
+        ``UNSUPPORTED`` (rejects scripts that need it),
+        ``SOFTWARE`` / ``PARTIAL_NATIVE`` / ``NATIVE`` (all pass validation,
+        the level is a diagnostic). The sync engine reads ``NATIVE`` as
+        "exchange is authoritative; suppress my fallback" for ``oca_cancel``
+        and ``tp_sl_bracket``.
         """

@@ -21,6 +21,7 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.core.broker.models import (
     BrokerEvent,
+    CapabilityLevel,
     DispatchEnvelope,
     ExchangeOrder,
     ExchangePosition,
@@ -955,7 +956,9 @@ def __test_partial_fill_does_not_cascade_under_full_fill_only_policy__():
 
 def __test_native_oca_cancel_suppresses_cascade__():
     """When the exchange owns the OCA group, the sync engine stays hands-off."""
-    b = MockBroker(capabilities=ExchangeCapabilities(oca_cancel_native=True))
+    b = MockBroker(
+        capabilities=ExchangeCapabilities(oca_cancel=CapabilityLevel.NATIVE),
+    )
     engine, pos = _mk_engine_with_policy(b)
     pos.entry_orders["A"] = _oca_entry(
         "A", 1.0, oca_name="G", oca_type=_oca.cancel, limit=50_000.0,
@@ -1143,9 +1146,9 @@ def __test_subsequent_partial_fill_emits_another_amend__():
 
 
 def __test_native_bracket_skips_partial_amend__():
-    """tp_sl_bracket_native=True — the plugin/exchange tracks partial fills."""
+    """tp_sl_bracket=NATIVE — the plugin/exchange tracks partial fills."""
     b = MockBroker(
-        capabilities=ExchangeCapabilities(tp_sl_bracket_native=True),
+        capabilities=ExchangeCapabilities(tp_sl_bracket=CapabilityLevel.NATIVE),
     )
     engine, pos = _mk_engine_with_policy(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
