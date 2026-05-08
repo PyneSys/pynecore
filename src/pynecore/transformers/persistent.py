@@ -318,18 +318,19 @@ class PersistentTransformer(ast.NodeTransformer):
         # Process function body
         node = cast(ast.FunctionDef, self.generic_visit(node))
 
-        # *** FŐ MÓDOSÍTÁS: Csak azokat a változókat adjuk hozzá a global utasításhoz,
-        # amelyeket ténylegesen módosítunk (írunk) a függvényben ***
+        # *** KEY DETAIL: only add to the ``global`` declaration the
+        # variables actually mutated (written) inside the function. ***
         globals_to_declare = set()
 
-        # A módosított változók közül csak a perzisztens változókat és inicializálási flageket adjuk hozzá
+        # Of the modified variables, only the persistent ones and their
+        # initialisation flags are added.
         if self.current_scope in self.modified_vars:
             for global_name in self.modified_vars[self.current_scope]:
                 if global_name.startswith('__persistent_'):
                     globals_to_declare.add(global_name)
 
-                    # Az inicializálási flageket is hozzá kell adnunk, ha kapcsolódnak
-                    # módosított perzisztens változóhoz
+                    # Initialisation flags must also be added when they
+                    # belong to a modified persistent variable.
                     init_flag = f"{global_name}_initialized__"
                     if init_flag in self.initialized_flags.get(self.current_scope, set()):
                         globals_to_declare.add(init_flag)
@@ -480,7 +481,7 @@ class PersistentTransformer(ast.NodeTransformer):
                     self.scope_vars[self.current_scope] = set()
                 self.scope_vars[self.current_scope].add(global_name)
 
-                # *** JAVÍTÁS: Csak akkor jelöljük módosítottként, ha nem literál az érték ***
+                # *** FIX: only mark as modified if the value is not a literal ***
                 if node.value and not self._is_literal_or_na(node.value):
                     if self.current_scope not in self.modified_vars:
                         self.modified_vars[self.current_scope] = set()

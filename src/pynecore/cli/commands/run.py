@@ -988,8 +988,9 @@ def run(
                     # generator swallows GeneratorExit and yields again —
                     # harmless during teardown.
                     pass
-            # Close the broker storage run cleanly — happy-path lezárás.
-            # Crash-path (SIGKILL, OOM) a storage stale-run cleanupjára bízott.
+            # Close the broker storage run cleanly — happy-path teardown.
+            # Crash paths (SIGKILL, OOM) are handled by the storage's
+            # stale-run cleanup.
             if broker_store_ctx is not None:
                 broker_store_ctx.close()
             if broker_store is not None:

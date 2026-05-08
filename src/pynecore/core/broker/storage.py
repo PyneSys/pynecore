@@ -1,38 +1,40 @@
 """
-Egyesített SQLite-alapú broker storage.
+Unified SQLite-backed broker storage.
 
-Ez a modul lép a korábbi kétfelé szórt perzisztálás helyére:
+This module replaces the previously split persistence:
 
-- a core ``state_store.py`` (append-only JSONL, envelope + parked verifications),
-- plugin-szintű ledger-ek (Capital.com ``DealLedger`` stb.).
+- the core ``state_store.py`` (append-only JSONL, envelope + parked verifications),
+- plugin-level ledgers (Capital.com ``DealLedger`` etc.).
 
-A :class:`BrokerStore` egyetlen SQLite fájlba ír minden broker-relevans
-állapotot: a sync-engine envelope-identitását, a parked dispatch-eket, az
-order-ok élő nézetét, a generikus alias-táblát (broker-specifikus lookup
-kulcsokhoz) és a strukturált audit-log-ot.
+:class:`BrokerStore` writes every broker-relevant piece of state into a
+single SQLite file: the sync-engine envelope identity, parked
+dispatches, the live view of orders, the generic alias table (for
+broker-specific lookup keys) and the structured audit log.
 
-A modul fő absztrakciói:
+Main abstractions of the module:
 
-- :class:`RunIdentity` — a run humán-olvasható logikai kulcsa
-  (``{strategy_id}@{account}:{symbol}:{timeframe}[#label]``). A storage
-  előtt képződik.
-- :class:`RunContext` — egy konkrét futtatás context-objektuma. A
-  ``run_instance_id`` (fizikai autoincrement FK) itt rejtőzik, a caller
-  (sync engine, plugin) soha nem látja.
-- :class:`BrokerStore` — a lifecycle: ``open_run()`` ad vissza ``RunContext``-et,
-  kezeli a stale-run cleanupot és a séma-migrációt.
+- :class:`RunIdentity` — the run's human-readable logical key
+  (``{strategy_id}@{account}:{symbol}:{timeframe}[#label]``).
+  Constructed before storage is opened.
+- :class:`RunContext` — context object for a concrete invocation. The
+  ``run_instance_id`` (physical autoincrement FK) lives here; the
+  caller (sync engine, plugin) never sees it.
+- :class:`BrokerStore` — the lifecycle: ``open_run()`` returns a
+  ``RunContext``, handles stale-run cleanup and schema migration.
 
-Két crash-recovery mechanizmus fut egymás mellett:
+Two crash-recovery mechanisms run side by side:
 
-1. **Passzív** — a ``live_runs`` VIEW automatikusan kizárja azokat a sorokat,
-   ahol a ``last_heartbeat_ts_ms`` túllépte a küszöböt. Dashboard mindig
-   helyeset kérdez akkor is, ha fizikai takarítás még nem futott.
-2. **Aktív** — minden ``open_run()`` elején a lejárt sorokat ``ended_ts_ms``-szel
-   zárjuk és egy ``stale_run_cleaned`` event-et írunk.
+1. **Passive** — the ``live_runs`` VIEW automatically excludes rows
+   whose ``last_heartbeat_ts_ms`` is past the threshold. The dashboard
+   always sees the right answer even if physical cleanup has not run
+   yet.
+2. **Active** — every ``open_run()`` closes expired rows by setting
+   ``ended_ts_ms`` and writing a ``stale_run_cleaned`` event.
 
-Tranzakcionalitás: minden compound művelet (pl. ``close_order`` = update orders
-+ delete order_refs + insert events) egyetlen ``BEGIN IMMEDIATE ... COMMIT``
-blokkban fut. Se félig írott állapot, se félig elvesztett log.
+Transactionality: every compound operation (e.g. ``close_order`` =
+update orders + delete order_refs + insert events) runs in a single
+``BEGIN IMMEDIATE ... COMMIT`` block. No half-written state, no
+half-lost log.
 """
 import json
 import logging
@@ -58,27 +60,28 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-# Heartbeat gyakoriság: ennél sűrűbb ``RunContext.heartbeat()`` hívás no-op.
-HEARTBEAT_INTERVAL_MS: Final[int] = 60_000  # 1 perc
-# Ennyi heartbeat-hiány után egy run stale-nek számít. A ``live_runs`` VIEW
-# SQL-jében HARDKÓDOLVA is szerepel ugyanez az érték — ha itt változik, a
-# VIEW-t migrációval cserélni kell (lásd ``_MIGRATIONS``).
-STALE_THRESHOLD_MS: Final[int] = 5 * HEARTBEAT_INTERVAL_MS  # 5 perc
+# Heartbeat cadence: a denser ``RunContext.heartbeat()`` call is a no-op.
+HEARTBEAT_INTERVAL_MS: Final[int] = 60_000  # 1 minute
+# A run is considered stale after this much heartbeat silence. The same
+# value is HARD-CODED inside the ``live_runs`` VIEW's SQL — if it
+# changes here, the VIEW must be replaced via a new migration
+# (see ``_MIGRATIONS``).
+STALE_THRESHOLD_MS: Final[int] = 5 * HEARTBEAT_INTERVAL_MS  # 5 minutes
 
 
 def _now_ms() -> int:
-    """Aktuális idő ms-ben, UTC. Egy helyen kibontva a time-import-ot."""
+    """Current time in ms, UTC. Centralised so the time import lives in one place."""
     return int(time.time() * 1000)
 
 
-# === Replay-eredmény dataclass-ek ==========================================
+# === Replay-result dataclasses =============================================
 
 @dataclass(frozen=True)
 class EnvelopeRecord:
-    """Replay-output egy élő envelope-ra.
+    """Replay output for a live envelope.
 
-    Ugyanolyan shape, mint a korábbi ``state_store.EnvelopeRecord`` — a
-    sync engine változatlanul használja.
+    Same shape as the former ``state_store.EnvelopeRecord`` — the sync
+    engine consumes it unchanged.
     """
     key: str
     bar_ts_ms: int
@@ -87,17 +90,41 @@ class EnvelopeRecord:
 
 @dataclass(frozen=True)
 class PendingRecord:
-    """Replay-output egy parked dispatch-re."""
+    """Replay output for a parked dispatch.
+
+    ``resolution`` is ``None`` while the dispatch is parked; it flips to
+    ``'attached'`` or ``'rejected'`` once the plugin decides the outcome
+    via a snapshot-recovery path (see
+    :meth:`RunContext.record_resolution`). The engine consumes and
+    deletes the row on the next
+    :meth:`OrderSyncEngine._verify_pending_dispatches` cycle.
+
+    ``dispatch_kind`` distinguishes a parked new dispatch
+    (``'new'``: ``execute_entry`` / ``execute_exit`` / ``execute_close``)
+    from a parked amend (``'modify'``: ``modify_entry`` /
+    ``modify_exit``). On a ``'rejected'`` resolution the engine uses
+    this to decide whether to clear the ``_active_intents`` /
+    ``_order_mapping`` slot tied to a now-live exchange order (yes for
+    new dispatches — no broker-side order ever materialised) or to
+    keep the original mapping and only drop the parked envelope
+    (modify case — the original order is still live and the next
+    :meth:`OrderSyncEngine._diff_and_dispatch` re-emits a modify rather
+    than a fresh order). Defaults to ``'new'`` for pre-v3 rows and any
+    code path that did not specify the kind explicitly.
+    """
     key: str
     coid: str
+    resolution: str | None = None
+    dispatch_kind: str = 'new'
+    order_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
 class OrderRow:
-    """Egy sor az ``orders`` táblából, caller számára kinyerve.
+    """One row of the ``orders`` table, exposed to the caller.
 
-    Az ``extras`` már parse-olt dict (JSON-ból visszaolvasva), nem a nyers
-    string — így a plugin-ok broker-specifikus mezőket natívan elérnek.
+    ``extras`` is already a parsed dict (decoded from JSON), not the raw
+    string — so plugins can access broker-specific fields natively.
     """
     client_order_id: str
     plugin_name: str
@@ -120,11 +147,11 @@ class OrderRow:
     extras: dict = field(default_factory=dict)
 
 
-# === Séma-migrációk ========================================================
+# === Schema migrations =====================================================
 
-# A lista **append-only** — régi tuple-öket soha nem módosítunk, mert az már
-# éles DB-kben alkalmazott állapotot reprezentál. Új oszlop vagy tábla egy
-# új tuple-ként jön.
+# This list is **append-only** — old tuples are never modified because
+# they already represent state applied in production DBs. A new column
+# or table arrives as a new tuple.
 _MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "initial schema", """
         CREATE TABLE _migrations (
@@ -154,9 +181,9 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX idx_runs_heartbeat ON runs(last_heartbeat_ts_ms)
             WHERE ended_ts_ms IS NULL;
 
-        -- A 300000 ms (5 perc) küszöb HARD-CODED, mert SQLite nem támogat
-        -- paraméterezhető VIEW-t. Ha STALE_THRESHOLD_MS változik, új
-        -- migrációban DROP VIEW + CREATE VIEW kell.
+        -- The 300000 ms (5 minute) threshold is HARD-CODED because SQLite
+        -- does not support parameterised VIEWs. If STALE_THRESHOLD_MS
+        -- changes, a new migration must DROP VIEW + CREATE VIEW.
         CREATE VIEW live_runs AS
             SELECT *
             FROM runs
@@ -165,12 +192,12 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
                   CAST(strftime('%s', 'now') AS INTEGER) * 1000 - 300000
               );
 
-        -- Envelopes és pending_verifications a LOGIKAI run_id-re kötöttek,
-        -- nem a run_instance_id-re — ezek a broker-oldali idempotency
-        -- anchor-jai, amelyeket minden restart (új instance) örököl,
-        -- mivel ugyanaz a bot ugyanazokkal az intentkkel indul újra.
-        -- Orders/order_refs/events ezzel szemben instance-szintűek, mert
-        -- a historikus run-okhoz tartoznak.
+        -- Envelopes and pending_verifications are scoped to the LOGICAL
+        -- run_id, not run_instance_id — they are the broker-side
+        -- idempotency anchors that every restart (new instance)
+        -- inherits, because the same bot starts again with the same
+        -- intents. Orders/order_refs/events, by contrast, are
+        -- instance-scoped because they belong to the historical runs.
         CREATE TABLE envelopes (
             run_id           TEXT NOT NULL,
             intent_key       TEXT NOT NULL,
@@ -244,27 +271,61 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX idx_events_coid    ON events(run_instance_id, client_order_id);
         CREATE INDEX idx_events_kind_ts ON events(run_instance_id, kind, ts_ms);
     """),
+    (2, "pending_verifications resolution column", """
+        -- Plugin-driven resolution channel for parked dispatches whose
+        -- exchange-side disposition the engine cannot observe via
+        -- get_open_orders (e.g. position-attached brackets on Capital.com).
+        -- The plugin's snapshot recovery writes 'attached' or 'rejected'
+        -- here; OrderSyncEngine._verify_pending_dispatches consumes it on
+        -- the next sync. NULL = still parked, default behaviour.
+        ALTER TABLE pending_verifications
+            ADD COLUMN resolution TEXT;
+    """),
+    (3, "pending_verifications dispatch_kind column", """
+        -- Distinguishes a parked 'new' dispatch (execute_entry/exit/close)
+        -- from a parked 'modify' dispatch (modify_entry/modify_exit). The
+        -- 'rejected' path in OrderSyncEngine._consume_plugin_resolutions
+        -- must NOT clear _active_intents/_order_mapping when the original
+        -- exchange order is still live and only the amend failed —
+        -- otherwise the next _diff_and_dispatch treats the Pine intent as
+        -- brand new and re-dispatches via execute_*, creating a duplicate
+        -- order alongside the still-live original. Default 'new' covers
+        -- pre-migration rows and the unspecified-kind path.
+        ALTER TABLE pending_verifications
+            ADD COLUMN dispatch_kind TEXT NOT NULL DEFAULT 'new';
+    """),
+    (4, "pending_verifications order_ids column", """
+        -- Stores the ``_order_mapping[key]`` snapshot at park time as a
+        -- JSON array so a post-restart modify-rejected resolution can
+        -- recover the original exchange order IDs and prevent a duplicate
+        -- ``execute_*`` dispatch.
+        ALTER TABLE pending_verifications
+            ADD COLUMN order_ids TEXT NOT NULL DEFAULT '[]';
+    """),
 ]
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Migrate the schema from ``PRAGMA user_version`` up to the latest.
 
-    :param conn: A nyitott ``sqlite3.Connection``. A függvény tranzakció-
-        blokkokat nyit a connection-ön; a caller legyen tranzakciótól-mentes
-        állapotban (``conn.isolation_level`` a default ``""``).
+    :param conn: An open ``sqlite3.Connection``. The function opens
+        transaction blocks on the connection; the caller must be in a
+        transaction-free state (``conn.isolation_level`` at its default
+        ``""``).
     """
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     for version, description, sql in _MIGRATIONS:
         if version <= current:
             continue
-        # A ``with conn`` implicit BEGIN DEFERRED-et nyit, COMMIT-ra zár.
-        # Egy verzió = egy tranzakció; félig migrált séma nem maradhat.
+        # ``with conn`` opens an implicit BEGIN DEFERRED and commits on
+        # exit. One version = one transaction; a half-migrated schema
+        # must not remain.
         with conn:
             conn.executescript(sql)
-            # A ``_migrations`` tábla csak az első migráció futása után
-            # létezik — az első alkalommal a CREATE TABLE benne van a
-            # script-ben, úgyhogy az INSERT már biztonságos.
+            # The ``_migrations`` table exists only after the first
+            # migration runs — on the very first invocation the
+            # CREATE TABLE is part of the script, so the INSERT below
+            # is already safe.
             conn.execute(
                 "INSERT INTO _migrations (version, applied_ts_ms, description) "
                 "VALUES (?, ?, ?)",
@@ -277,50 +338,50 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 # === BrokerStore ===========================================================
 
 class BrokerStore:
-    """Egyesített SQLite broker-állapot tároló egy workdir-re.
+    """Unified SQLite broker-state store for one workdir.
 
-    A konstrukció megnyitja a DB-t, alkalmazza a migrációkat, és beállítja
-    a WAL + crash-safe PRAGMA-kat. Az ``open_run()`` minden hívásra egy új
-    :class:`RunContext`-et ad vissza — azon keresztül megy minden tényleges
-    adatmozgás.
+    Construction opens the DB, applies migrations and sets up the
+    WAL + crash-safe PRAGMAs. Every ``open_run()`` returns a fresh
+    :class:`RunContext` — every actual data movement goes through it.
 
-    :param path: A SQLite fájl abszolút útja. A szülő könyvtár automatikusan
-        létrehozódik.
-    :param plugin_name: A BrokerPlugin ``plugin_name`` attribútuma
-        (pl. ``"Capital.com"``). Minden ``events`` / ``orders`` sor ezt
-        kapja meg, hogy több-plugin-os workdir-ben filterezhető legyen.
+    :param path: Absolute path of the SQLite file. The parent directory
+        is created automatically.
+    :param plugin_name: The BrokerPlugin's ``plugin_name`` attribute
+        (e.g. ``"Capital.com"``). Every ``events`` / ``orders`` row
+        carries this value so a multi-plugin workdir can be filtered.
     """
 
     def __init__(self, path: Path | str, *, plugin_name: str) -> None:
         self._path = Path(path)
         self._plugin_name = plugin_name
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # ``isolation_level=""`` = default; explicit tranzakciókat mi nyitunk
-        # ``with conn:`` blokkokkal. A sqlite3-modul autocommit módja nem az,
-        # aminek első olvasásra tűnik — a default úgy viselkedik, hogy
-        # DML előtt implicit BEGIN van, és a next commit zárja. Ez nekünk
-        # megfelel.
+        # ``isolation_level=""`` = default; we open explicit transactions
+        # via ``with conn:`` blocks. The sqlite3 module's autocommit
+        # mode is not what it looks like at first glance — the default
+        # behaviour is to start an implicit BEGIN before DML and close
+        # it on the next commit. That fits our needs.
         self._conn = sqlite3.connect(
             str(self._path),
             isolation_level="",
             check_same_thread=False,
             timeout=5.0,
         )
-        # ``sqlite3.Row`` névvel elérhető oszlopokat ad — a query-helperek
-        # ettől nem pozíció-érzékenyek, könnyebb utólag oszlopot hozzáadni.
+        # ``sqlite3.Row`` returns columns accessible by name — the
+        # query helpers stay position-insensitive, so adding a column
+        # later is easy.
         self._conn.row_factory = sqlite3.Row
         self._configure_pragmas()
         _apply_migrations(self._conn)
 
     def _configure_pragmas(self) -> None:
-        """WAL + crash-safety + FK + busy-timeout beállítása."""
-        # WAL: concurrent read + single writer; crash-safe power loss esetén.
+        """Configure WAL + crash-safety + FK + busy-timeout."""
+        # WAL: concurrent read + single writer; crash-safe under power loss.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        # NORMAL: WAL mellett crash-safe, gyorsabb mint FULL.
+        # NORMAL: crash-safe with WAL, faster than FULL.
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        # 5 s blokkolás lock-collision-kor — egyetlen writer esetén ritka,
-        # de debug-CLI párhuzamos futása ezt felélesztheti.
+        # 5 s wait on lock collision — rare with a single writer, but
+        # parallel debug-CLI invocations can trigger it.
         self._conn.execute("PRAGMA busy_timeout=5000")
 
     # --- Lifecycle ---------------------------------------------------------
@@ -334,7 +395,7 @@ class BrokerStore:
         return self._plugin_name
 
     def close(self) -> None:
-        """Zárja a connection-t. Ismétlődő hívásra no-op."""
+        """Close the connection. Repeated calls are no-ops."""
         if self._conn is None:
             return
         try:
@@ -357,34 +418,36 @@ class BrokerStore:
             script_source: str,
             script_path: str | Path = "",
     ) -> 'RunContext':
-        """Nyit egy új run-instance-t.
+        """Open a new run instance.
 
-        Három lépés egyetlen tranzakcióban:
+        Three steps in a single transaction:
 
-        1. Stale-run cleanup: minden élőként jelölt, de ``last_heartbeat_ts_ms``
-           túllépett sor ``ended_ts_ms``-szel záródik, és kap egy
-           ``stale_run_cleaned`` event-et.
-        2. Élő collision check: ha ugyanazon ``run_id``-vel még van élő sor
-           a cleanup után, ``RuntimeError``.
-        3. INSERT új ``runs`` sor.
+        1. Stale-run cleanup: every row marked alive whose
+           ``last_heartbeat_ts_ms`` has expired is closed by setting
+           ``ended_ts_ms`` and gets a ``stale_run_cleaned`` event.
+        2. Live-collision check: if a live row with the same ``run_id``
+           still exists after cleanup, raise ``RuntimeError``.
+        3. INSERT a new ``runs`` row.
 
-        :param identity: A run logikai identitása (strategy, symbol, ...).
-        :param script_source: A Pine-script teljes forráskódja — a
-            ``run_tag`` képzésébe megy bemenetként.
-        :param script_path: A script fájl elérési útja (csak metaadat az
-            audit-hoz; üres string megengedett).
-        :raises RuntimeError: Ha azonos ``run_id``-val létezik élő run.
-        :return: Egy frissen nyitott :class:`RunContext`.
+        :param identity: Logical identity of the run
+            (strategy, symbol, ...).
+        :param script_source: Full source of the Pine script — fed into
+            ``run_tag`` generation.
+        :param script_path: Path to the script file (audit metadata
+            only; empty string is allowed).
+        :raises RuntimeError: If a live run already exists with the
+            same ``run_id``.
+        :return: A freshly opened :class:`RunContext`.
         """
         run_id = identity.run_id
         run_tag = identity.make_run_tag(script_source)
         now = _now_ms()
 
         with self._conn:
-            # (1) stale cleanup — minden lejárt élő sort zárunk
+            # (1) Stale cleanup — close every expired live row
             self._cleanup_stale_runs_inside_tx(now=now)
 
-            # (2) collision check a cleanup UTÁN
+            # (2) Collision check AFTER cleanup
             row = self._conn.execute(
                 "SELECT run_instance_id, last_heartbeat_ts_ms FROM runs "
                 "WHERE run_id = ? AND ended_ts_ms IS NULL",
@@ -392,13 +455,13 @@ class BrokerStore:
             ).fetchone()
             if row is not None:
                 raise RuntimeError(
-                    f"Aktív run_id már létezik: {run_id!r} "
+                    f"Active run_id already exists: {run_id!r} "
                     f"(run_instance_id={row['run_instance_id']}, "
                     f"last_heartbeat={row['last_heartbeat_ts_ms']}). "
-                    f"Adj meg `--run-label`-t, vagy állítsd le az előző instance-t."
+                    f"Pass `--run-label`, or stop the previous instance."
                 )
 
-            # (3) INSERT új instance
+            # (3) INSERT a new instance
             cur = self._conn.execute(
                 "INSERT INTO runs ("
                 "  run_id, run_tag, strategy_id, script_path, symbol, timeframe,"
@@ -416,9 +479,10 @@ class BrokerStore:
             )
             run_instance_id = cur.lastrowid
             if run_instance_id is None:
-                # Elvi eset: AUTOINCREMENT mindig ad lastrowid-ot; csak a
-                # static analyzer békéje miatt kezeljük.
-                raise RuntimeError("sqlite3 lastrowid None az INSERT után")
+                # Theoretical case: AUTOINCREMENT always returns a
+                # lastrowid; handled only to keep the static analyzer
+                # happy.
+                raise RuntimeError("sqlite3 lastrowid is None after INSERT")
 
         return RunContext(
             run_id=run_id,
@@ -430,10 +494,11 @@ class BrokerStore:
     def cleanup_stale_runs(
             self, *, stale_threshold_ms: int = STALE_THRESHOLD_MS,
     ) -> int:
-        """Publikus stale-cleanup, manuálisan is hívható (pl. debug-CLI).
+        """Public stale-cleanup, callable manually (e.g. from debug CLI).
 
-        :param stale_threshold_ms: Ennél régebbi heartbeat = stale.
-        :return: A lezárt sorok száma.
+        :param stale_threshold_ms: A heartbeat older than this counts as
+            stale.
+        :return: Number of rows closed.
         """
         now = _now_ms()
         with self._conn:
@@ -444,12 +509,12 @@ class BrokerStore:
     def _cleanup_stale_runs_inside_tx(
             self, *, now: int, stale_threshold_ms: int = STALE_THRESHOLD_MS,
     ) -> int:
-        """Tranzakción belüli stale-cleanup. Hívó felel a ``with self._conn``-ért.
+        """Stale-cleanup inside a transaction. Caller owns the ``with self._conn``.
 
-        Azért szétvágva a publikus ``cleanup_stale_runs``-től, mert az
-        ``open_run`` már nyitott tranzakción belül hívja — egy beágyazott
-        ``with self._conn`` block-savepoint-ot nyitna, ami itt felesleges
-        összetettséget ad.
+        Split from the public ``cleanup_stale_runs`` because
+        ``open_run`` calls this inside an already-open transaction — a
+        nested ``with self._conn`` would open a block savepoint, adding
+        complexity for no benefit here.
         """
         threshold = now - stale_threshold_ms
         rows = self._conn.execute(
@@ -484,13 +549,13 @@ class BrokerStore:
         return len(rows)
 
     def cleanup_old_events(self, retention_days: int = 180) -> int:
-        """Elavult event-sorok takarítása.
+        """Purge stale event rows.
 
-        Még nincs implementálva — a DB méretkritikus küszöbe (~1 GB) felett
-        lesz aktuális. A stub megőrzi a helyet az API-ban, hogy a hívó
-        kódban már most lehessen rá hivatkozni ``not-implemented`` branch-en.
+        Not implemented yet — relevant once the DB grows past its size
+        threshold (~1 GB). The stub reserves the API slot so caller
+        code can already reference it from a ``not-implemented`` branch.
 
-        :raises NotImplementedError: Mindig; implementáció a v2-ben.
+        :raises NotImplementedError: Always; implementation lands in v2.
         """
         raise NotImplementedError(
             "event retention cleanup — scheduled for v2"
@@ -501,15 +566,15 @@ class BrokerStore:
 
 @dataclass
 class RunContext:
-    """Egy konkrét futó run context-objektuma.
+    """Context object for one concrete running run.
 
-    Az összes tényleges adatmozgás ezen keresztül megy. A
-    ``run_instance_id`` (fizikai FK) itt tároljuk, de a caller-felületen
-    nem jelenik meg — minden metódus eleve erre a run-ra szűr.
+    Every actual data movement goes through it. The ``run_instance_id``
+    (physical FK) is stored here but not exposed on the caller surface —
+    every method already filters on this run.
 
-    A ``close()`` happy-path-lezárás (``SIGINT`` / ``SIGTERM`` /
-    context-manager). Crash-path-ot a storage ``open_run`` elején futó
-    stale-cleanup kezeli.
+    ``close()`` is the happy-path teardown (``SIGINT`` / ``SIGTERM`` /
+    context manager). The crash path is handled by the stale-cleanup
+    that runs at the start of ``BrokerStore.open_run``.
     """
     run_id: str
     run_instance_id: int
@@ -522,12 +587,12 @@ class RunContext:
     def record_envelope(
             self, key: str, bar_ts_ms: int, retry_seq: int,
     ) -> None:
-        """Az első envelope perzisztálása egy ``intent_key``-re.
+        """Persist the first envelope for an ``intent_key``.
 
-        UPSERT a ``(run_id, key)`` páron: a ``run_id`` logikai kulcs, így
-        minden új instance örökli ugyanezen bot korábbi envelope-jait.
-        A sync engine pinning szemantikája miatt a konfliktus csak
-        retry_seq-bump esetén fordul elő.
+        UPSERT on the ``(run_id, key)`` pair: ``run_id`` is the logical
+        key, so every new instance inherits the previous envelopes of
+        the same bot. Because of the sync engine's pinning semantics, a
+        conflict only occurs on a retry_seq bump.
         """
         now = _now_ms()
         with self._store._conn:
@@ -542,22 +607,57 @@ class RunContext:
                 (self.run_id, key, bar_ts_ms, retry_seq, now),
             )
 
-    def record_park(self, coid: str, key: str) -> None:
-        """Parked dispatch perzisztálása (unknown-disposition válaszra)."""
+    def record_park(
+            self, coid: str, key: str, *, kind: str = 'new',
+            order_ids: list[str] | None = None,
+    ) -> None:
+        """Persist a parked dispatch (unknown-disposition response).
+
+        On a re-park for the same ``(run_id, client_order_id)`` the
+        ``resolution`` column is also reset to ``NULL``: the row becomes
+        parked again after a modify/retry timeout, so the *previous*
+        attach/reject decision is now stale. Leaving an old
+        ``'attached'`` value in place would make the next restart's
+        :meth:`OrderSyncEngine._consume_plugin_resolutions` immediately
+        adopt the freshly parked dispatch (skipping the broker call) —
+        exactly the wrong outcome, since the new park exists precisely
+        because the exchange-side state is unknown.
+
+        :param kind: ``'new'`` (default) when the parked dispatch was an
+            ``execute_*`` call (new order), ``'modify'`` when it was a
+            ``modify_entry`` / ``modify_exit``. The value is overwritten
+            on re-park — a modify-park can be replaced by a later
+            new-park and vice versa. The engine uses this when
+            processing a ``'rejected'`` resolution to decide whether to
+            clear the ``_active_intents`` / ``_order_mapping`` slot
+            (kind='new') or to keep the original mapping and only drop
+            the envelope (kind='modify' — the original exchange order is
+            still live).
+        """
+        if kind not in ('new', 'modify'):
+            raise ValueError(
+                f"record_park: unknown kind {kind!r}; "
+                f"expected 'new' or 'modify'"
+            )
         now = _now_ms()
+        ids_json = json.dumps(order_ids) if order_ids else '[]'
         with self._store._conn:
             self._store._conn.execute(
                 "INSERT INTO pending_verifications ("
-                "  run_id, client_order_id, intent_key, parked_ts_ms"
-                ") VALUES (?, ?, ?, ?) "
+                "  run_id, client_order_id, intent_key, parked_ts_ms, "
+                "  dispatch_kind, order_ids"
+                ") VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id, client_order_id) DO UPDATE SET "
                 "  intent_key = excluded.intent_key, "
-                "  parked_ts_ms = excluded.parked_ts_ms",
-                (self.run_id, coid, key, now),
+                "  parked_ts_ms = excluded.parked_ts_ms, "
+                "  resolution = NULL, "
+                "  dispatch_kind = excluded.dispatch_kind, "
+                "  order_ids = excluded.order_ids",
+                (self.run_id, coid, key, now, kind, ids_json),
             )
 
     def record_unpark(self, coid: str) -> None:
-        """Parked dispatch eltávolítása (bróker-oldalon megjelent)."""
+        """Remove a parked dispatch (it has shown up at the broker)."""
         with self._store._conn:
             self._store._conn.execute(
                 "DELETE FROM pending_verifications "
@@ -565,11 +665,60 @@ class RunContext:
                 (self.run_id, coid),
             )
 
-    def record_complete(self, key: str) -> None:
-        """Egy ``intent_key`` teljes lezárása (cancel / close / rejected).
+    def record_resolution(self, coid: str, resolution: str) -> None:
+        """Record a plugin-resolved disposition for a parked COID.
 
-        Atomikusan törli az envelope-ot és minden hozzá tartozó parked
-        dispatch-et a ``run_id`` logikai scope-ján belül.
+        Used by plugins that can determine the parked dispatch's outcome
+        through a path other than ``get_open_orders`` (e.g. a position
+        snapshot). The engine consumes and deletes the row on the next
+        sync.
+
+        ``'rejected'`` is *sticky*: once a row is ``'rejected'`` a later
+        ``'attached'`` write does not overwrite it. The motivation is
+        the Capital.com bracket scenario: TP and SL legs each call
+        ``record_resolution`` for the same parent COID (the bracket has
+        a single park entry). If the TP is missing (``'rejected'``) and
+        the SL is attached (``'attached'``), an order-dependent naive
+        UPDATE could store ``'attached'`` last, the engine would keep
+        the ExitIntent and never re-dispatch the TP, leaving protection
+        permanently incomplete. ``'rejected'`` means "at least one leg
+        is definitely missing" and always wins, because re-dispatch is
+        idempotent (the already-attached leg is re-emitted with the
+        same parameters and is a no-op at the broker).
+
+        :param resolution: ``'attached'`` if the dispatch landed at the
+            broker (engine keeps the ``_active_intents`` entry),
+            ``'rejected'`` if it definitely did not (engine drops the
+            intent so the next sync re-dispatches). Any other value
+            raises ``ValueError``.
+        """
+        if resolution not in ('attached', 'rejected'):
+            raise ValueError(
+                f"record_resolution: unknown resolution {resolution!r}; "
+                f"expected 'attached' or 'rejected'"
+            )
+        with self._store._conn:
+            if resolution == 'attached':
+                self._store._conn.execute(
+                    "UPDATE pending_verifications "
+                    "SET resolution = ? "
+                    "WHERE run_id = ? AND client_order_id = ? "
+                    "  AND (resolution IS NULL OR resolution != 'rejected')",
+                    (resolution, self.run_id, coid),
+                )
+            else:
+                self._store._conn.execute(
+                    "UPDATE pending_verifications "
+                    "SET resolution = ? "
+                    "WHERE run_id = ? AND client_order_id = ?",
+                    (resolution, self.run_id, coid),
+                )
+
+    def record_complete(self, key: str) -> None:
+        """Fully close an ``intent_key`` (cancel / close / rejected).
+
+        Atomically deletes the envelope and every parked dispatch
+        attached to it within the ``run_id`` logical scope.
         """
         with self._store._conn:
             self._store._conn.execute(
@@ -586,13 +735,14 @@ class RunContext:
     def replay(
             self,
     ) -> tuple[dict[str, EnvelopeRecord], dict[str, PendingRecord]]:
-        """In-memory állapot rekonstrukció restart után.
+        """Reconstruct the in-memory state after a restart.
 
-        A ``run_id`` logikai kulcson replay-el — egy új instance örökli
-        ugyanezen logikai bot korábbi envelope-jait és parked dispatch-jeit.
+        Replays on the ``run_id`` logical key — a new instance inherits
+        the previous envelopes and parked dispatches of the same logical
+        bot.
 
-        :return: ``(envelopes_by_key, pending_by_coid)`` — ugyanolyan shape,
-            mint amit a régi ``state_store.replay`` adott.
+        :return: ``(envelopes_by_key, pending_by_coid)`` — same shape as
+            the former ``state_store.replay`` returned.
         """
         envelopes: dict[str, EnvelopeRecord] = {}
         pending: dict[str, PendingRecord] = {}
@@ -609,35 +759,68 @@ class RunContext:
             )
 
         for row in self._store._conn.execute(
-                "SELECT client_order_id, intent_key FROM pending_verifications "
+                "SELECT client_order_id, intent_key, resolution, "
+                "       dispatch_kind, order_ids "
+                "FROM pending_verifications "
                 "WHERE run_id = ?",
                 (self.run_id,),
         ):
+            raw_ids = row['order_ids'] or '[]'
             pending[row['client_order_id']] = PendingRecord(
                 key=row['intent_key'],
                 coid=row['client_order_id'],
+                resolution=row['resolution'],
+                dispatch_kind=row['dispatch_kind'] or 'new',
+                order_ids=json.loads(raw_ids),
             )
 
         return envelopes, pending
+
+    def iter_pending_resolutions(self) -> list[PendingRecord]:
+        """Fetch parked rows that the plugin has already resolved.
+
+        Called by the engine's ``_verify_pending_dispatches`` at the
+        start of every sync to learn which COIDs the plugin wrote a
+        ``record_resolution`` entry for. Returned records always have a
+        non-``None`` ``resolution`` — still-parked (unresolved) rows are
+        skipped.
+        """
+        rows = self._store._conn.execute(
+            "SELECT client_order_id, intent_key, resolution, "
+            "       dispatch_kind, order_ids "
+            "FROM pending_verifications "
+            "WHERE run_id = ? AND resolution IS NOT NULL",
+            (self.run_id,),
+        ).fetchall()
+        return [
+            PendingRecord(
+                key=row['intent_key'],
+                coid=row['client_order_id'],
+                resolution=row['resolution'],
+                dispatch_kind=row['dispatch_kind'] or 'new',
+                order_ids=json.loads(row['order_ids'] or '[]'),
+            )
+            for row in rows
+        ]
 
     # --- Orders ------------------------------------------------------------
 
     def upsert_order(
             self, client_order_id: str, **fields: Any,
     ) -> None:
-        """Order sor UPSERT — új sor vagy meglévő frissítés.
+        """UPSERT an order row — insert a new one or update an existing one.
 
-        Elfogadott mezők: ``symbol``, ``side``, ``qty``, ``state``,
+        Accepted fields: ``symbol``, ``side``, ``qty``, ``state``,
         ``intent_key``, ``exchange_order_id``, ``from_entry``,
         ``pine_entry_id``, ``sl_level``, ``tp_level``, ``trailing_stop``,
-        ``trailing_distance``, ``filled_qty``, ``extras``. A hiányzó
-        mezőket a DB default-ja szolgálja új sor esetén; meglévő sor
-        frissítésekor a nem megadott mezőket nem változtatja.
+        ``trailing_distance``, ``filled_qty``, ``extras``. Missing
+        fields are filled with the DB defaults on insert; on update
+        only the explicitly passed fields are written.
 
-        ``extras`` paraméter dict-ként érkezik és JSON-stringbe szerializálódik.
+        ``extras`` is supplied as a dict and serialised to a JSON string.
 
-        :raises ValueError: Új sor beszúrásakor hiányzó kötelező mező
-            (``symbol``, ``side``, ``qty``, ``state``).
+        :raises ValueError: When inserting a new row with required
+            fields missing (``symbol``, ``side``, ``qty``, ``state``).
         """
         now = _now_ms()
         extras = fields.pop('extras', None)
@@ -655,8 +838,8 @@ class RunContext:
                 missing = [r for r in required if r not in fields]
                 if missing:
                     raise ValueError(
-                        f"upsert_order({client_order_id!r}) új sor, hiányzó "
-                        f"kötelező mezők: {missing}"
+                        f"upsert_order({client_order_id!r}) new row, "
+                        f"missing required fields: {missing}"
                     )
                 self._store._conn.execute(
                     "INSERT INTO orders ("
@@ -680,7 +863,7 @@ class RunContext:
                 )
                 return
 
-            # Update path: csak a kifejezetten megadott mezőket írja át.
+            # Update path: only the explicitly passed fields are written.
             sets: list[str] = []
             params: list[Any] = []
             for col in (
@@ -708,13 +891,13 @@ class RunContext:
             )
 
     def set_order_state(self, client_order_id: str, state: str) -> None:
-        """Egyetlen mező-frissítés: ``orders.state``."""
+        """Single-field update: ``orders.state``."""
         self.upsert_order(client_order_id, state=state)
 
     def set_exchange_id(
             self, client_order_id: str, exchange_order_id: str,
     ) -> None:
-        """``orders.exchange_order_id`` kitöltése (Capital.com confirm, IB orderId, ...)."""
+        """Populate ``orders.exchange_order_id`` (Capital.com confirm, IB orderId, ...)."""
         self.upsert_order(client_order_id, exchange_order_id=exchange_order_id)
 
     def set_risk(
@@ -724,12 +907,12 @@ class RunContext:
             trailing_stop: bool | None = None,
             trailing_distance: float | None = None,
     ) -> None:
-        """SL/TP/trailing attribútumok egyben-frissítése.
+        """Update SL/TP/trailing attributes in one go.
 
-        A ``None`` paraméter *nem* törli a meglévő értéket — csak azt
-        jelzi, hogy a caller most nem állítja be. Ha törölni kell, írj
-        explicit ``sl=0.0``-t vagy használj külön UPDATE-et (jelenleg
-        nincs külön delete-metódus — későbbi igény esetén bekerül).
+        A ``None`` parameter *does not* erase the existing value — it
+        just indicates that the caller is not setting it now. To clear
+        a value, pass an explicit ``sl=0.0`` or use a dedicated UPDATE
+        (no delete method exists yet — added if a real need arises).
         """
         fields: dict[str, Any] = {}
         if sl is not None:
@@ -744,17 +927,65 @@ class RunContext:
             self.upsert_order(client_order_id, **fields)
 
     def set_filled(self, client_order_id: str, filled_qty: float) -> None:
-        """``orders.filled_qty`` frissítése (delta-nem-kumulatív, a caller átadja a teljes mennyiséget)."""
+        """Update ``orders.filled_qty`` (non-incremental — caller passes the full amount)."""
         self.upsert_order(client_order_id, filled_qty=filled_qty)
 
-    def close_order(self, client_order_id: str) -> None:
-        """Order lezárása: ``closed_ts_ms`` + kapcsolódó ``order_refs`` törlés
-        + ``order_closed`` audit-event egy tranzakcióban.
+    def reopen_order(self, client_order_id: str) -> None:
+        """Re-activate a previously closed order: ``closed_ts_ms = NULL``.
 
-        Az ``order_refs`` azonnali takarítása tartja a tábla méretét a
-        live-ordereknél nagyságrendileg. Historikus dealReference / dealId
-        visszakereshetőségre az ``events`` tábla szolgál — ezért írunk be
-        ide is egy eseményt a lezáráskor érvényes `exchange_order_id`-vel.
+        Typical use: a bracket leg row was closed by :meth:`close_order`
+        on an earlier REJECTED attach (``state='rejected'``,
+        ``closed_ts_ms`` set), then a later ``modify_exit`` /
+        ``execute_exit`` re-attached a fresh protective leg at the
+        broker under the same ``client_order_id`` — the row has to
+        return to the live range (``iter_live_orders``, recovery,
+        fill-fallback) or the post-persistence logic will not find it.
+
+        Reopen only nulls ``closed_ts_ms``; the caller is responsible
+        for harmonising ``state`` and other fields via
+        :meth:`upsert_order`. For audit purposes the reopen itself
+        writes an event (``order_reopened``), so the full lifecycle
+        remains traceable from the ``events`` table.
+
+        :raises: no specific error signalling. If the row does not
+            exist or is no longer closed the SQL UPDATE affects zero
+            rows and the method returns silently.
+        """
+        now = _now_ms()
+        with self._store._conn:
+            existing = self._store._conn.execute(
+                "SELECT closed_ts_ms FROM orders "
+                "WHERE run_instance_id = ? AND client_order_id = ?",
+                (self.run_instance_id, client_order_id),
+            ).fetchone()
+            if existing is None or existing['closed_ts_ms'] is None:
+                return
+            self._store._conn.execute(
+                "UPDATE orders SET closed_ts_ms = NULL, updated_ts_ms = ? "
+                "WHERE run_instance_id = ? AND client_order_id = ?",
+                (now, self.run_instance_id, client_order_id),
+            )
+            self._store._conn.execute(
+                "INSERT INTO events ("
+                "  run_instance_id, ts_ms, plugin_name, kind,"
+                "  client_order_id, exchange_order_id, intent_key, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.run_instance_id, now, self._store._plugin_name,
+                    'order_reopened', client_order_id, None, None, None,
+                ),
+            )
+
+    def close_order(self, client_order_id: str) -> None:
+        """Close an order: set ``closed_ts_ms``, delete the related
+        ``order_refs`` rows and write an ``order_closed`` audit event in
+        a single transaction.
+
+        Eagerly trimming ``order_refs`` keeps the table's size in line
+        with the number of live orders. Historical dealReference /
+        dealId lookups are served by the ``events`` table — that is why
+        we also write an event here, carrying the ``exchange_order_id``
+        valid at close time.
         """
         now = _now_ms()
         with self._store._conn:
@@ -793,11 +1024,12 @@ class RunContext:
     def add_ref(
             self, client_order_id: str, ref_type: str, ref_value: str,
     ) -> None:
-        """Broker-specifikus alias kulcs rögzítése.
+        """Record a broker-specific alias key.
 
-        Pl. Capital.com ``deal_reference`` a POST-válaszból, később
-        ``deal_id`` a confirm-ből. IB esetén ``perm_id`` / ``order_id``.
-        A ``(run_instance_id, ref_type, ref_value)` triplet egyedi.
+        E.g. Capital.com's ``deal_reference`` from the POST response,
+        followed by ``deal_id`` from the confirm. For IB:
+        ``perm_id`` / ``order_id``. The
+        ``(run_instance_id, ref_type, ref_value)`` triplet is unique.
         """
         now = _now_ms()
         with self._store._conn:
@@ -814,10 +1046,10 @@ class RunContext:
     def find_by_ref(
             self, ref_type: str, ref_value: str,
     ) -> OrderRow | None:
-        """Alias-alapú order-lookup O(log n)-ben.
+        """Alias-based order lookup in O(log n).
 
-        Join ``order_refs`` × ``orders`` a PK-n. Egyetlen indexelt SELECT,
-        ami ezt a use-case-t egyszeri DB-hívássá redukálja.
+        Joins ``order_refs`` × ``orders`` on the PK. A single indexed
+        SELECT that reduces this use case to one DB call.
         """
         row = self._store._conn.execute(
             "SELECT o.* FROM orders o "
@@ -832,7 +1064,7 @@ class RunContext:
     # --- Queries ----------------------------------------------------------
 
     def get_order(self, client_order_id: str) -> OrderRow | None:
-        """Direkt lookup a CO-ID-re."""
+        """Direct lookup by CO-ID."""
         row = self._store._conn.execute(
             "SELECT * FROM orders "
             "WHERE run_instance_id = ? AND client_order_id = ?",
@@ -845,11 +1077,11 @@ class RunContext:
             symbol: str | None = None,
             from_entry: str | None = None,
     ) -> Iterator[OrderRow]:
-        """Élő (nem lezárt) orderek iterátora.
+        """Iterator over live (not yet closed) orders.
 
-        Partial index (``idx_orders_live``) szolgálja ki a filtert; egy
-        realisztikus one-way Pine stratégiának <50 élő sora van bármikor,
-        a query-költség elhanyagolható.
+        The partial index (``idx_orders_live``) serves the filter; a
+        realistic one-way Pine strategy has fewer than 50 live rows at
+        any time, so the query cost is negligible.
         """
         sql = (
             "SELECT * FROM orders "
@@ -874,10 +1106,10 @@ class RunContext:
             intent_key: str | None = None,
             payload: dict | None = None,
     ) -> None:
-        """Egy audit-event írása.
+        """Write an audit event.
 
-        A ``payload`` JSON-ba szerializálódik; plugin-specifikus mezők
-        szabadon bekerülhetnek.
+        ``payload`` is serialised to JSON; plugin-specific fields can
+        be added freely.
         """
         now = _now_ms()
         payload_json = json.dumps(payload) if payload is not None else None
@@ -896,17 +1128,17 @@ class RunContext:
     def iter_events_by_kind_since(
             self, kind: str, since_ts_ms: int,
     ) -> Iterator[dict]:
-        """Adott ``kind``-ű event-ek payload-jainak iterátora ``since_ts_ms`` óta.
+        """Iterate event payloads of a given ``kind`` since ``since_ts_ms``.
 
-        ASC sorrend ``ts_ms`` szerint, csak a sikeresen JSON-deszerializált
-        payload-ok kerülnek visszaadásra (üres vagy parsolhatatlan payload-ok
-        kihagyva). Plugin-oldali cross-restart recovery (pl. activity-cursor
-        rebuild) használja, hogy a perzisztált audit-event tail közvetlen
-        SQL-elérés nélkül olvasható legyen.
+        ASC by ``ts_ms``; only payloads that JSON-deserialise
+        successfully are yielded (empty or malformed payloads are
+        skipped). Used by plugin-side cross-restart recovery (e.g.
+        activity-cursor rebuild) so the persisted audit-event tail can
+        be read without dropping down to raw SQL.
 
-        :param kind: Az ``events.kind`` szűrő.
-        :param since_ts_ms: Alsó korlát ``ts_ms``-ben (inclusive).
-        :return: Payload dict-ek iterátora a beszúrási sorrendben.
+        :param kind: Filter on ``events.kind``.
+        :param since_ts_ms: Lower bound on ``ts_ms`` (inclusive).
+        :return: Iterator of payload dicts in insertion order.
         """
         rows = self._store._conn.execute(
             "SELECT payload FROM events "
@@ -926,12 +1158,12 @@ class RunContext:
     # --- Lifecycle --------------------------------------------------------
 
     def heartbeat(self) -> None:
-        """Aktuális run heartbeat-je. Rate-limited ``HEARTBEAT_INTERVAL_MS``-re.
+        """Heartbeat for the current run. Rate-limited to ``HEARTBEAT_INTERVAL_MS``.
 
-        A caller nyugodtan hívhatja minden sync-ciklusban — a belső
-        gate biztosítja, hogy ne legyen egynél több UPDATE / perc.
-        Cross-run cleanupot NEM futtat (az kizárólag ``open_run()``
-        felelőssége — felelősségi határok).
+        The caller can call this every sync cycle — the internal gate
+        ensures at most one UPDATE per minute. Does NOT run cross-run
+        cleanup (that is exclusively ``open_run()``'s responsibility —
+        clear separation of concerns).
         """
         now = _now_ms()
         if now - self._last_heartbeat_write_ms < HEARTBEAT_INTERVAL_MS:
@@ -945,11 +1177,12 @@ class RunContext:
         self._last_heartbeat_write_ms = now
 
     def close(self) -> None:
-        """Happy-path run-lezárás: ``ended_ts_ms`` kitöltése.
+        """Happy-path run teardown: populate ``ended_ts_ms``.
 
-        Ismétlődő hívásra no-op (az első UPDATE után az ended_ts_ms már
-        nem-NULL, a WHERE kidobja). SIGKILL-t a stale-cleanup kezel,
-        ez csak a kontrollált leállás útvonala.
+        Repeated calls are no-ops (after the first UPDATE
+        ``ended_ts_ms`` is non-NULL and the WHERE clause excludes the
+        row). SIGKILL is handled by stale-cleanup; this method is only
+        the controlled-shutdown path.
         """
         now = _now_ms()
         with self._store._conn:
@@ -969,7 +1202,7 @@ class RunContext:
 # === Private helpers =======================================================
 
 def _row_to_order(row: sqlite3.Row) -> OrderRow:
-    """``sqlite3.Row`` → :class:`OrderRow` konverzió, extras JSON-parse."""
+    """Convert ``sqlite3.Row`` → :class:`OrderRow`, parsing extras JSON."""
     extras_raw = row['extras']
     extras: dict = json.loads(extras_raw) if extras_raw else {}
     return OrderRow(

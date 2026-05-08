@@ -1,10 +1,10 @@
 """
 Standalone unit tests for the unified SQLite-based ``BrokerStore``.
 
-Ezek a tesztek semmit nem feltételeznek az ``OrderSyncEngine``-ről vagy
-plugin integrációról — csak a storage réteg önmagában. Az end-to-end
-(sync_engine + storage) forgatókönyvek a ``test_030_broker_store_sync_engine.py``
-alá kerülnek.
+These tests assume nothing about ``OrderSyncEngine`` or plugin
+integration — only the storage layer in isolation. End-to-end
+(sync_engine + storage) scenarios live under
+``test_030_broker_store_sync_engine.py``.
 """
 import json
 import sqlite3
@@ -54,12 +54,12 @@ def _open_run(store: BrokerStore, **overrides) -> RunContext:
 
 
 def __test_migrations_applied_on_fresh_db__(tmp_path: Path) -> None:
-    """Első megnyitáskor a séma létrejön, a ``_migrations`` tábla bejegyzést kap."""
+    """First open creates the schema and adds a ``_migrations`` row."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN):
         pass
 
-    # Közvetlenül sqlite3-mal nézzük — függetlenül a BrokerStore-tól.
+    # Inspect with raw sqlite3 — independent of BrokerStore.
     conn = sqlite3.connect(str(path))
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -68,10 +68,10 @@ def __test_migrations_applied_on_fresh_db__(tmp_path: Path) -> None:
         rows = conn.execute(
             "SELECT version, description FROM _migrations ORDER BY version"
         ).fetchall()
-        assert rows, "migration táblának kell legalább egy sor"
+        assert rows, "the migrations table must hold at least one row"
         assert rows[0][0] == 1
 
-        # Séma-ellenőrzés: minden fő tábla létezik.
+        # Schema check: every main table exists.
         tables = {
             r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -83,7 +83,7 @@ def __test_migrations_applied_on_fresh_db__(tmp_path: Path) -> None:
         }
         assert expected.issubset(tables)
 
-        # A ``live_runs`` VIEW is létrejött.
+        # The ``live_runs`` VIEW is also created.
         views = {
             r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='view'"
@@ -95,7 +95,7 @@ def __test_migrations_applied_on_fresh_db__(tmp_path: Path) -> None:
 
 
 def __test_migrations_idempotent_on_reopen__(tmp_path: Path) -> None:
-    """Második megnyitás nem dobja el / nem duplikálja a sémát."""
+    """The second open does not drop or duplicate the schema."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN):
         pass
@@ -105,14 +105,20 @@ def __test_migrations_idempotent_on_reopen__(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(path))
     try:
         rows = conn.execute("SELECT version FROM _migrations").fetchall()
-        # Pontosan egy darab — nem futott újra a v1 migration.
-        assert [r[0] for r in rows] == [1]
+        versions = sorted(r[0] for r in rows)
+        # Each migration runs exactly once — no duplicates, and the
+        # versions are strictly increasing.
+        assert versions == sorted(set(versions))
+        assert versions[0] == 1
+        # Current schema cursor: the length of the _MIGRATIONS list.
+        from pynecore.core.broker.storage import _MIGRATIONS
+        assert versions == [v for v, _, _ in _MIGRATIONS]
     finally:
         conn.close()
 
 
 def __test_wal_mode_enabled__(tmp_path: Path) -> None:
-    """Induláskor WAL mode-ban kell lennie — crash-safety + concurrent read."""
+    """At start-up the DB must be in WAL mode — crash-safety + concurrent read."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -149,20 +155,20 @@ def __test_open_run_with_label_includes_suffix__(tmp_path: Path) -> None:
 
         ctx_b = _open_run(store, label="b")
         assert ctx_b.run_id.endswith("#b")
-        # Eltérő label → eltérő run_tag is (az input bővült).
+        # Different label → different run_tag too (input set widened).
         assert ctx_a.run_tag != ctx_b.run_tag
 
 
 def __test_open_run_collision_raises__(tmp_path: Path) -> None:
-    """Ugyanaz a run_id kétszer aktív → RuntimeError a második open_run-nál."""
+    """Same run_id active twice → RuntimeError on the second open_run."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         _open_run(store)
-        with pytest.raises(RuntimeError, match="Aktív run_id már létezik"):
+        with pytest.raises(RuntimeError, match="Active run_id already exists"):
             _open_run(store)
 
 
 def __test_close_allows_reopen_with_same_run_id__(tmp_path: Path) -> None:
-    """Lezárt run után ugyanaz a run_id újra nyitható (új run_instance_id)."""
+    """After a run is closed, the same run_id can be reopened (with a new run_instance_id)."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx1 = _open_run(store)
         ctx1.close()
@@ -171,45 +177,45 @@ def __test_close_allows_reopen_with_same_run_id__(tmp_path: Path) -> None:
         assert ctx2.run_id == ctx1.run_id
         assert ctx2.run_instance_id != ctx1.run_instance_id
 
-        # Történelmileg mindkét sor megvan — "mutasd a bot összes futását"
-        # lekérdezhető.
+        # Both rows are kept historically — "show every run of this bot"
+        # remains queryable.
         run_rows = store._conn.execute(
             "SELECT run_instance_id, ended_ts_ms FROM runs WHERE run_id = ? "
             "ORDER BY run_instance_id",
             (ctx1.run_id,),
         ).fetchall()
         assert len(run_rows) == 2
-        assert run_rows[0]['ended_ts_ms'] is not None  # első lezárva
-        assert run_rows[1]['ended_ts_ms'] is None      # második aktív
+        assert run_rows[0]['ended_ts_ms'] is not None  # first one is closed
+        assert run_rows[1]['ended_ts_ms'] is None      # second one is active
 
 
 # === Stale-run cleanup ====================================================
 
 
 def __test_stale_run_auto_cleaned_on_open_run__(tmp_path: Path) -> None:
-    """SIGKILL szimuláció: last_heartbeat_ts_ms elavul → open_run lezárja."""
+    """SIGKILL simulation: last_heartbeat_ts_ms expires → open_run closes it."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx_crashed = _open_run(store)
-        # Szimuláljuk a heartbeat-hiányt: közvetlenül DB-be hamisítjuk.
-        fake_stale_hb = 1_000_000  # messze a múltban
+        # Simulate the missing heartbeat by faking the value directly in the DB.
+        fake_stale_hb = 1_000_000  # far in the past
         store._conn.execute(
             "UPDATE runs SET last_heartbeat_ts_ms = ? WHERE run_instance_id = ?",
             (fake_stale_hb, ctx_crashed.run_instance_id),
         )
         store._conn.commit()
 
-        # Újraindulás szimuláció: új open_run ugyanarra a run_id-ra.
+        # Restart simulation: new open_run on the same run_id.
         ctx_new = _open_run(store)
         assert ctx_new.run_instance_id != ctx_crashed.run_instance_id
 
-        # A régi sor lezárt, az új él.
+        # The old row is closed, the new one is alive.
         old = store._conn.execute(
             "SELECT ended_ts_ms FROM runs WHERE run_instance_id = ?",
             (ctx_crashed.run_instance_id,),
         ).fetchone()
         assert old['ended_ts_ms'] == fake_stale_hb
 
-        # Esemény logja a cleanup-nak.
+        # Cleanup event logged.
         ev = store._conn.execute(
             "SELECT kind, payload FROM events "
             "WHERE run_instance_id = ? AND kind = 'stale_run_cleaned'",
@@ -221,7 +227,7 @@ def __test_stale_run_auto_cleaned_on_open_run__(tmp_path: Path) -> None:
 
 
 def __test_cleanup_stale_runs_public_api__(tmp_path: Path) -> None:
-    """Publikus ``cleanup_stale_runs`` is működik (debug CLI forgatókönyv)."""
+    """The public ``cleanup_stale_runs`` also works (debug-CLI scenario)."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         store._conn.execute(
@@ -235,12 +241,12 @@ def __test_cleanup_stale_runs_public_api__(tmp_path: Path) -> None:
 
 
 def __test_live_runs_view_excludes_stale__(tmp_path: Path) -> None:
-    """A ``live_runs`` VIEW akkor is szűri a zombikat, ha fizikai cleanup nem futott."""
+    """The ``live_runs`` VIEW filters zombies even when no physical cleanup ran."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx_fresh = _open_run(store)
         ctx_stale = _open_run(store, label="stale")
 
-        # A stale run sorának heartbeat-je túl régi — a VIEW-nek ki kell hagynia.
+        # The stale run's heartbeat is too old — the VIEW must skip it.
         store._conn.execute(
             "UPDATE runs SET last_heartbeat_ts_ms = 1 WHERE run_instance_id = ?",
             (ctx_stale.run_instance_id,),
@@ -253,8 +259,8 @@ def __test_live_runs_view_excludes_stale__(tmp_path: Path) -> None:
         ids = {r['run_instance_id'] for r in rows}
         assert ctx_fresh.run_instance_id in ids
         assert ctx_stale.run_instance_id not in ids, (
-            "live_runs VIEW-nek ki kell hagynia a stale sort akkor is, "
-            "ha a runs táblában még ``ended_ts_ms IS NULL`` állapotú"
+            "live_runs VIEW must skip the stale row even when the runs "
+            "table still has ``ended_ts_ms IS NULL`` for it"
         )
 
 
@@ -305,7 +311,7 @@ def __test_record_unpark_drops_only_that_coid__(tmp_path: Path) -> None:
 
 
 def __test_record_envelope_upsert_on_retry_seq_bump__(tmp_path: Path) -> None:
-    """Azonos ``intent_key``-re ismételt ``record_envelope`` felülírja a sort."""
+    """A repeated ``record_envelope`` for the same ``intent_key`` overwrites the row."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
@@ -315,11 +321,119 @@ def __test_record_envelope_upsert_on_retry_seq_bump__(tmp_path: Path) -> None:
         assert envelopes["Long"].retry_seq == 1
 
 
-# === Multi-run izoláció ===================================================
+def __test_record_resolution_rejected_is_sticky_against_attached__(
+        tmp_path: Path) -> None:
+    """``'rejected'`` is sticky: a later ``'attached'`` write must not
+    overwrite it. Bracket scenario: the TP and SL legs each call
+    ``record_resolution`` for the same parent COID. If the TP is
+    ``'rejected'`` and the SL is ``'attached'``, an order-dependent
+    naive UPDATE could end up with ``'attached'`` and the engine would
+    keep the ExitIntent despite the missing TP. ``'rejected'`` always
+    wins; re-dispatch is idempotent (a missing leg goes out again with
+    the same parameters, an already-attached leg is a broker-side
+    no-op).
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
+        ctx.record_park(coid="coid-entry", key="Long")
+        # TP missing: rejected.
+        ctx.record_resolution("coid-entry", "rejected")
+        # SL present: attached. Must NOT overwrite.
+        ctx.record_resolution("coid-entry", "attached")
+
+        resolutions = ctx.iter_pending_resolutions()
+        assert len(resolutions) == 1
+        assert resolutions[0].coid == "coid-entry"
+        assert resolutions[0].resolution == "rejected", (
+            f"'rejected' must remain sticky against later 'attached'; "
+            f"got {resolutions[0].resolution!r}"
+        )
+
+
+def __test_record_resolution_attached_then_rejected_flips_to_rejected__(
+        tmp_path: Path) -> None:
+    """Reverse order: SL ``'attached'`` → TP ``'rejected'``. Here
+    ``'attached'`` is written first and the later ``'rejected'``
+    overwrites it. Guarantees that whatever order leg resolutions
+    arrive in, the final state is ``'rejected'`` whenever any leg is
+    missing.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
+        ctx.record_park(coid="coid-entry", key="Long")
+        ctx.record_resolution("coid-entry", "attached")
+        ctx.record_resolution("coid-entry", "rejected")
+
+        resolutions = ctx.iter_pending_resolutions()
+        assert len(resolutions) == 1
+        assert resolutions[0].resolution == "rejected"
+
+
+def __test_record_resolution_attached_then_attached_stays_attached__(
+        tmp_path: Path) -> None:
+    """Two consecutive ``'attached'`` writes are idempotent — the final
+    state stays ``'attached'``. (TP attached + SL attached = bracket
+    fully attached.)"""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
+        ctx.record_park(coid="coid-entry", key="Long")
+        ctx.record_resolution("coid-entry", "attached")
+        ctx.record_resolution("coid-entry", "attached")
+
+        resolutions = ctx.iter_pending_resolutions()
+        assert len(resolutions) == 1
+        assert resolutions[0].resolution == "attached"
+
+
+def __test_record_park_resets_stale_resolution_on_repark__(
+        tmp_path: Path) -> None:
+    """When the same ``(run_id, client_order_id)`` is re-parked, the
+    previous ``'attached'`` (or any) ``resolution`` is *cleared* (reset
+    to NULL). Otherwise a modify/retry timeout that re-parks the same
+    coid would keep the old ``'attached'`` decision and the next
+    restart's
+    :meth:`OrderSyncEngine._consume_plugin_resolutions` would
+    immediately adopt the freshly parked dispatch — yet the whole point
+    of the new park is that the exchange-side state is *unknown*.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
+        ctx.record_park(coid="coid-entry", key="Long")
+        ctx.record_resolution("coid-entry", "attached")
+
+        # Sanity: the 'attached' resolution is present.
+        before = ctx.iter_pending_resolutions()
+        assert len(before) == 1 and before[0].resolution == "attached"
+
+        # Re-park onto the same coid (modify/retry timeout simulation).
+        ctx.record_park(coid="coid-entry", key="Long")
+
+        # ``resolution`` is now NULL → ``iter_pending_resolutions``
+        # (which only requests resolved rows) returns an empty list.
+        after = ctx.iter_pending_resolutions()
+        assert after == [], (
+            f"re-park must clear stale resolution; got {after!r}"
+        )
+
+        # Belt-and-braces: ``replay()`` also sees the NULL-reset row, so
+        # after a restart the engine will not produce a stale adopt.
+        _, pending = ctx.replay()
+        assert "coid-entry" in pending
+        assert pending["coid-entry"].resolution is None, (
+            f"re-parked row's persisted resolution must be NULL, "
+            f"got {pending['coid-entry'].resolution!r}"
+        )
+
+
+# === Multi-run isolation ==================================================
 
 
 def __test_replay_isolated_per_run_instance__(tmp_path: Path) -> None:
-    """Két párhuzamos run nem látja egymás envelope-jait."""
+    """Two parallel runs do not see each other's envelopes."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx_a = _open_run(store, timeframe="15")
         ctx_b = _open_run(store, timeframe="60")
@@ -341,7 +455,7 @@ def __test_upsert_order_new_then_update__(tmp_path: Path) -> None:
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
 
-        # Új sor
+        # New row
         ctx.upsert_order(
             "coid-1", symbol="EURUSD", side="buy", qty=1.0,
             state="submitted", from_entry="L", pine_entry_id="L",
@@ -357,12 +471,12 @@ def __test_upsert_order_new_then_update__(tmp_path: Path) -> None:
         assert row.sl_level == 1.0
         assert row.extras == {"deal_reference": "o_abc"}
 
-        # Állapot-frissítés
+        # State update
         ctx.set_order_state("coid-1", "confirmed")
         row = ctx.get_order("coid-1")
         assert row is not None
         assert row.state == "confirmed"
-        # A meg nem adott mezőket nem változtatta.
+        # Fields not passed must remain untouched.
         assert row.sl_level == 1.0
         assert row.extras == {"deal_reference": "o_abc"}
 
@@ -370,12 +484,12 @@ def __test_upsert_order_new_then_update__(tmp_path: Path) -> None:
 def __test_upsert_order_requires_core_fields_for_new_row__(tmp_path: Path) -> None:
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
-        with pytest.raises(ValueError, match="hiányzó kötelező mezők"):
+        with pytest.raises(ValueError, match="missing required fields"):
             ctx.upsert_order("coid-missing", state="submitted")
 
 
 def __test_add_ref_and_find_by_ref_round_trip__(tmp_path: Path) -> None:
-    """Generikus alias lookup: deal_reference → OrderRow egy indexelt SELECT-tel."""
+    """Generic alias lookup: deal_reference → OrderRow via one indexed SELECT."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.upsert_order(
@@ -389,7 +503,7 @@ def __test_add_ref_and_find_by_ref_round_trip__(tmp_path: Path) -> None:
         assert found_by_ref is not None and found_by_ref.client_order_id == "coid-1"
         assert found_by_id is not None and found_by_id.client_order_id == "coid-1"
 
-        # Nem létező kulcs → None, nem raise.
+        # Unknown key → None, no raise.
         assert ctx.find_by_ref("deal_id", "ghost") is None
 
 
@@ -404,13 +518,81 @@ def __test_close_order_cascades_delete_refs__(tmp_path: Path) -> None:
 
         ctx.close_order("coid-1")
 
-        # Az order megvan, de closed.
+        # The order still exists but is closed.
         row = ctx.get_order("coid-1")
         assert row is not None
         assert row.closed_ts_ms is not None
-        # A refs cascade-törlődtek.
+        # The refs were cascade-deleted.
         assert ctx.find_by_ref("deal_reference", "o_abc") is None
         assert ctx.find_by_ref("deal_id", "p_xyz") is None
+
+
+def __test_reopen_order_clears_closed_ts_ms_and_logs_event__(tmp_path: Path) -> None:
+    """``reopen_order`` nulls ``closed_ts_ms`` and writes an
+    ``order_reopened`` event. A previously closed row can come back to
+    the live range (e.g. a bracket leg COID that ``close_order`` had
+    closed after an earlier REJECTED attach, and now a fresh protective
+    leg has been attached at the broker under the same COID).
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.upsert_order(
+            "coid-1", symbol="EURUSD", side="buy", qty=1.0, state="rejected",
+        )
+        ctx.close_order("coid-1")
+        pre = ctx.get_order("coid-1")
+        assert pre is not None and pre.closed_ts_ms is not None
+
+        ctx.reopen_order("coid-1")
+        post = ctx.get_order("coid-1")
+        assert post is not None
+        assert post.closed_ts_ms is None, (
+            f"reopen_order must null closed_ts_ms; got {post.closed_ts_ms!r}"
+        )
+        # The row is now visible to iter_live_orders again.
+        live_ids = {r.client_order_id for r in ctx.iter_live_orders()}
+        assert "coid-1" in live_ids, (
+            "reopened order must appear in iter_live_orders"
+        )
+        # Audit-event written.
+        kinds = [p for p in ctx.iter_events_by_kind_since(
+            'order_reopened', 0,
+        )]
+        # No payload on the reopen event — just verify presence by
+        # walking the events table directly via the existing helper:
+        # the iterator yields parsed payloads only for non-empty
+        # payloads, so we confirm via SQL that the audit row exists.
+        cur = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM events "
+            "WHERE kind = 'order_reopened' AND client_order_id = ?",
+            ("coid-1",),
+        )
+        assert cur.fetchone()['n'] == 1, (
+            f"order_reopened event must be written; "
+            f"iter_events sample={kinds!r}"
+        )
+
+
+def __test_reopen_order_no_op_on_unknown_or_already_open_row__(tmp_path: Path) -> None:
+    """``reopen_order`` does not raise on an unknown client_order_id or
+    on an already-open row: it returns silently and writes no audit
+    event.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        # Unknown coid — must not raise.
+        ctx.reopen_order("nonexistent-coid")
+        # Already-open row — must not raise, must not write event.
+        ctx.upsert_order(
+            "coid-open", symbol="EURUSD", side="buy", qty=1.0, state="submitted",
+        )
+        ctx.reopen_order("coid-open")
+        cur = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE kind = 'order_reopened'",
+        )
+        assert cur.fetchone()['n'] == 0, (
+            "reopen_order on a still-open row must not write an audit event"
+        )
 
 
 def __test_iter_live_orders_filters_closed__(tmp_path: Path) -> None:
@@ -441,19 +623,19 @@ def __test_iter_live_orders_symbol_filter__(tmp_path: Path) -> None:
 
 
 def __test_set_risk_preserves_unset_fields__(tmp_path: Path) -> None:
-    """``set_risk`` ``None`` paraméterei nem törlik a meglévő értékeket."""
+    """``set_risk`` ``None`` parameters do not erase existing values."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.upsert_order(
             "c", symbol="EURUSD", side="buy", qty=1.0, state="submitted",
             sl_level=1.0, tp_level=1.2,
         )
-        ctx.set_risk("c", sl=1.1)  # csak SL-t állítunk
+        ctx.set_risk("c", sl=1.1)  # only set SL
 
         row = ctx.get_order("c")
         assert row is not None
         assert row.sl_level == 1.1
-        assert row.tp_level == 1.2, "a set_risk=None nem törölheti a TP-t"
+        assert row.tp_level == 1.2, "set_risk=None must not clear the TP"
 
 
 # === Extras JSON ==========================================================
@@ -464,7 +646,7 @@ def __test_extras_round_trip_preserves_dict__(tmp_path: Path) -> None:
         "deal_reference": "o_abc",
         "working_order": True,
         "nested": {"x": 1, "y": [1, 2, 3]},
-        "unicode": "árvíztűrő tükörfúrógép",
+        "unicode": "Falsches Üben von Xylophonmusik quält größere Zwerge",
     }
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -505,27 +687,27 @@ def __test_log_event_written_with_payload__(tmp_path: Path) -> None:
 
 
 def __test_heartbeat_rate_limited__(tmp_path: Path) -> None:
-    """Két gyors egymás után hívott heartbeat → csak az első ír DB-be."""
+    """Two heartbeats in quick succession → only the first writes to the DB."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
-        # Az open_run már beírt egy last_heartbeat_ts_ms-t; rögzítsük.
+        # open_run already wrote a last_heartbeat_ts_ms; capture it.
         hb_after_open = store._conn.execute(
             "SELECT last_heartbeat_ts_ms FROM runs WHERE run_instance_id = ?",
             (ctx.run_instance_id,),
         ).fetchone()[0]
 
-        # Szimuláljuk, hogy már írtunk nemrég (most ms). Ez aktiválja a gate-et.
+        # Pretend we wrote recently (now ms). This activates the gate.
         from pynecore.core.broker import storage as _storage
         ctx._last_heartbeat_write_ms = _storage._now_ms()
-        ctx.heartbeat()  # no-op — túl gyorsan a legutóbbi írás óta
+        ctx.heartbeat()  # no-op — too soon after the last write
 
         hb_after_nothing = store._conn.execute(
             "SELECT last_heartbeat_ts_ms FROM runs WHERE run_instance_id = ?",
             (ctx.run_instance_id,),
         ).fetchone()[0]
-        assert hb_after_nothing == hb_after_open, "rate-limit gate kihagyta az UPDATE-et"
+        assert hb_after_nothing == hb_after_open, "rate-limit gate must skip the UPDATE"
 
-        # Most szimuláljuk, hogy az előző írás régebbi mint az interval.
+        # Now pretend the previous write is older than the interval.
         ctx._last_heartbeat_write_ms = (
             _storage._now_ms() - HEARTBEAT_INTERVAL_MS - 1
         )
@@ -535,7 +717,7 @@ def __test_heartbeat_rate_limited__(tmp_path: Path) -> None:
             "SELECT last_heartbeat_ts_ms FROM runs WHERE run_instance_id = ?",
             (ctx.run_instance_id,),
         ).fetchone()[0]
-        assert hb_after_write >= hb_after_open, "az engedélyezett hívás írt DB-be"
+        assert hb_after_write >= hb_after_open, "the allowed call must write to the DB"
 
 
 # === Close (happy path) ====================================================
@@ -561,7 +743,7 @@ def __test_close_idempotent__(tmp_path: Path) -> None:
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.close()
-        # Kétszeri close nem dobhat.
+        # A second close must not raise.
         ctx.close()
 
 
@@ -569,7 +751,7 @@ def __test_close_idempotent__(tmp_path: Path) -> None:
 
 
 def __test_persistence_survives_reopen__(tmp_path: Path) -> None:
-    """Első megnyitás írása a második megnyitásban visszaolvasható."""
+    """Writes from the first open are readable in the second open."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -579,7 +761,7 @@ def __test_persistence_survives_reopen__(tmp_path: Path) -> None:
         )
         saved_instance_id = ctx.run_instance_id
 
-    # Második nyitás, különálló BrokerStore — megint le kell kérdezhetőnek lennie.
+    # Second open with a separate BrokerStore — must still be queryable.
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         row = store._conn.execute(
             "SELECT run_id FROM runs WHERE run_instance_id = ?",
@@ -588,16 +770,17 @@ def __test_persistence_survives_reopen__(tmp_path: Path) -> None:
         assert row is not None
         assert row['run_id'] == "ema_cross@capitalcom-demo-1234567:EURUSD:60"
 
-        # Ha újra megnyitjuk ugyanazt a run-t: collision (az előző még él,
-        # heartbeat friss). Ez a helyes viselkedés — a test a ``close`` és
-        # stale-cleanup scenariókban külön-külön kipróbálja.
+        # Reopening the same run would now collide (the previous run is
+        # still alive, heartbeat is fresh). That is the correct
+        # behaviour — the ``close`` and stale-cleanup scenarios cover
+        # the rest separately.
 
 
 # === OrderRow field coverage ==============================================
 
 
 def __test_order_row_fields_are_typed__(tmp_path: Path) -> None:
-    """A dataclass visszaadja a mezőket a megfelelő típusokkal (nem raw sqlite.Row)."""
+    """The dataclass returns fields with their proper types (not raw sqlite.Row)."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.upsert_order(

@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from pynecore.core.broker.exceptions import (
+    BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -171,6 +172,49 @@ class OrderSyncEngine:
         # but kept stable within the pass so two fills in the same group do
         # not emit duplicate CancelIntents.
         self._cancelled_oca_groups_this_sync: set[str] = set()
+
+        # Keys that received an empty :attr:`_order_mapping` adoption marker
+        # from :meth:`_consume_plugin_resolutions` during the current sync.
+        # The marker tells :meth:`_diff_and_dispatch` "this intent is already
+        # live, just adopt it" — but if no Pine intent shows up under the same
+        # key in the same sync, the marker becomes a stale trap that would
+        # silently absorb a *future* same-key dispatch into the gone-position's
+        # slot. End-of-sync cleanup drops markers that no intent claimed.
+        self._attached_adoption_keys: set[str] = set()
+
+        # Per-run dedup for ``'attached'`` resolutions. The persisted row
+        # is intentionally NOT deleted on the first attached consume —
+        # otherwise a late ``'rejected'`` write (per-leg bracket
+        # resolvers, cross-poll re-evaluation) would update zero rows
+        # and the engine would never learn the leg is missing. Keeping
+        # the row alive lets the sticky-rejected SQL flip it; this set
+        # prevents re-processing the same attached row on every sync
+        # while it lives. Cleared on ``'rejected'`` flip-back so a
+        # future re-park (different coid) is processed correctly.
+        self._consumed_attached_coids: set[str] = set()
+
+        # Pre-modify intent rollback table — keyed by ``intent_key``, set
+        # only when ``_dispatch_modify`` parks a timed-out amend. The
+        # current ``_diff_and_dispatch`` flow promotes ``_active_intents[key]``
+        # to the NEW intent immediately after ``_dispatch_modify`` returns
+        # (line 1328), so by the time a parked modify resolves as
+        # ``'rejected'`` the engine no longer remembers the pre-modify
+        # state — leaving ``_active_intents[key]`` set to the NEW intent
+        # would make the next diff observe Pine == active and never retry
+        # the amend, leaving the original exchange order indefinitely
+        # stale. Restoring from this dict on the rejected path forces
+        # the next diff to see a Pine-vs-active delta again and re-emit
+        # ``modify_*``.
+        #
+        # Limitation: in-memory only — a restart between park and
+        # resolution loses the snapshot, so the post-restart rejected
+        # path falls back to the previous Round 19 behaviour (preserve
+        # promoted active, accept the slim chance of a stale amend).
+        # Persisting the snapshot on the ``pending_verifications`` row
+        # would close that gap but requires an :class:`Intent`
+        # serialisation contract; not worth the surface area until a
+        # real restart-during-park incident motivates it.
+        self._modify_old_intents: dict[str, Intent] = {}
 
         # Manual-intervention halt flag. Once set (via :meth:`_record_halt`),
         # every subsequent :meth:`sync` returns early without dispatching or
@@ -363,6 +407,7 @@ class OrderSyncEngine:
         self._deferred_exits = new_deferred
 
         self._diff_and_dispatch(dispatchable)
+        self._cleanup_unused_adoption_markers()
 
         self._sync_count += 1
         if self._reconcile_every and self._sync_count % self._reconcile_every == 0:
@@ -383,11 +428,23 @@ class OrderSyncEngine:
         attach the recovered exchange order to the right ``_order_mapping``
         slot.
 
+        For dispatches whose disposition the broker cannot expose through
+        ``get_open_orders`` (e.g. position-attached brackets on Capital.com,
+        which never show up there once attached), the plugin writes a
+        resolution into the persisted park row via
+        :meth:`~pynecore.core.broker.storage.RunContext.record_resolution`.
+        This method consumes those resolutions first: ``'attached'`` clears
+        the park (the dispatch is live, leave the active intent alone),
+        ``'rejected'`` clears the park *and* drops the active intent so the
+        next sync re-dispatches the original Pine intent.
+
         A pending entry that does *not* show up stays parked — the engine
         deliberately does not re-dispatch because the original may still land
         (slow network round-trip). The user can inspect
         :attr:`pending_verification` to surface stuck entries.
         """
+        if self._store_ctx is not None:
+            self._consume_plugin_resolutions()
         if not self._pending_verification and not self._persisted_pending_anchors:
             return
         orders = self._run_async(self._broker.get_open_orders(self._symbol))
@@ -421,6 +478,330 @@ class OrderSyncEngine:
                 "recovered persisted pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, anchor.key,
             )
+
+    def _consume_plugin_resolutions(self) -> None:
+        """Apply plugin-driven resolutions written via ``record_resolution``.
+
+        Brokers whose protective brackets are position-attributes (e.g.
+        Capital.com native TP/SL) cannot expose them through
+        ``get_open_orders``; the plugin's snapshot recovery determines the
+        outcome and records it on the persisted park row. This method
+        consumes those rows on every sync — see
+        :meth:`_verify_pending_dispatches` for the contract.
+
+        ``attached``: the dispatch landed; clear the in-memory park and
+        leave ``_active_intents`` alone so the engine keeps treating the
+        intent as live. The persisted ``pending_verifications`` row is
+        intentionally NOT deleted here: a per-leg resolver (or a slow
+        plugin re-evaluating the bracket on a later poll) may still
+        flip the row to ``'rejected'`` via the sticky-rejected SQL in
+        :meth:`RunContext.record_resolution`. Deleting eagerly would
+        force that late UPDATE to find zero rows and the engine would
+        never learn the leg is missing. The row is reaped instead by
+        :meth:`_drop_envelope` (cancel / fill cleanup / rejected flip)
+        or by :meth:`_cleanup_unused_adoption_markers` when no Pine
+        intent claimed the marker.
+
+        ``rejected``: the dispatch did not land; clear the park *and*
+        drop the matching ``_active_intents`` / ``_order_mapping`` /
+        envelope entries (in-memory + persisted) so
+        :meth:`_diff_and_dispatch` re-dispatches the same Pine intent on
+        the next sync with a fresh envelope (the bracket goes out again,
+        restoring protection).
+        """
+        assert self._store_ctx is not None
+        # Group resolutions by intent_key so a single key resolves
+        # deterministically even when the snapshot contains multiple
+        # rows under it. Multiple rows can occur when a bracket
+        # resolver writes per-leg (Round 14 plugin-side aggregation
+        # is the typical path, but other plugins or edge replay
+        # sequences may still produce per-leg writes), or when a
+        # restart finds older 'attached' rows alongside a newer
+        # 'rejected' row that arrived during the same retry storm.
+        # Within a single key, **'rejected' dominates**: any rejected
+        # write means at least one expected exchange-side artefact is
+        # confirmed missing, so the intent must be re-dispatched —
+        # processing a stale 'attached' row last would otherwise
+        # restore the adoption marker the rejected branch had cleared
+        # and the engine would silently adopt an unverified dispatch
+        # on the next ``_diff_and_dispatch``. The same precedence
+        # rule already lives at the storage layer
+        # (:meth:`RunContext.record_resolution`'s sticky-rejected SQL);
+        # this loop mirrors it for the snapshot we just fetched.
+        records_by_key: dict[str, list] = {}
+        for record in self._store_ctx.iter_pending_resolutions():
+            if record.resolution not in ('attached', 'rejected'):
+                _log.error(
+                    "ignoring unknown plugin resolution %r for coid=%s "
+                    "intent=%s",
+                    record.resolution, record.coid, record.key,
+                )
+                continue
+            records_by_key.setdefault(record.key, []).append(record)
+
+        for key, records in records_by_key.items():
+            has_rejected = any(r.resolution == 'rejected' for r in records)
+            if has_rejected:
+                # ``dispatch_kind == 'modify'`` on ANY participating row
+                # is enough to flag the whole group as a modify-rejected
+                # event: only one parked record per (run_id, coid) ever
+                # exists, and re-park overwrites the kind, so an
+                # ``'attached'`` survivor row in the same group either
+                # came from a prior new-dispatch attached consume that
+                # was later flipped to rejected (still 'new') or from a
+                # genuine modify amend bookkeeping. The conservative
+                # treatment for the mixed case is the modify path:
+                # preserving an already-live original order can never
+                # produce a duplicate, while clearing it on a real
+                # modify-rejected definitely can.
+                kind_is_modify = any(
+                    r.dispatch_kind == 'modify' for r in records
+                )
+                for record in records:
+                    self._pending_verification.pop(record.coid, None)
+                    self._persisted_pending_anchors.pop(record.coid, None)
+                    # Drop any prior attached-consume dedup so a future
+                    # re-park (different coid, same key) is processed
+                    # correctly. Belt-and-braces — the new park gets a
+                    # fresh coid which would not collide regardless.
+                    self._consumed_attached_coids.discard(record.coid)
+                    _log.warning(
+                        "plugin-resolved pending dispatch %s as %s "
+                        "for intent %s (kind=%s); rejected wins for key "
+                        "— %s",
+                        record.coid, record.resolution, key,
+                        record.dispatch_kind,
+                        ("scheduling re-dispatch"
+                         if not kind_is_modify
+                         else "preserving original order, "
+                              "scheduling modify retry"),
+                    )
+                if not kind_is_modify:
+                    # New-dispatch rejected: no original order exists
+                    # on the exchange, so clear everything and let the
+                    # next ``_diff_and_dispatch`` re-issue the Pine
+                    # intent via ``execute_*``.
+                    self._active_intents.pop(key, None)
+                    self._order_mapping.pop(key, None)
+                    # Defensive: a 'new' rejected record should never
+                    # have left a modify rollback snapshot on the same
+                    # key (snapshots are only stashed for kind='modify'
+                    # parks), but drop any stale entry to avoid
+                    # resurrecting it on a later modify rollback.
+                    self._modify_old_intents.pop(key, None)
+                else:
+                    # Modify-rejected: the ORIGINAL exchange order is
+                    # still live (the parked dispatch was an amend that
+                    # the broker did NOT apply). Clearing
+                    # ``_active_intents`` / ``_order_mapping`` here
+                    # would make ``_diff_and_dispatch`` treat the Pine
+                    # intent as brand new and call ``execute_*``,
+                    # placing a SECOND order alongside the still-live
+                    # original. Restore ``_active_intents[key]`` from
+                    # the pre-modify snapshot captured at park time
+                    # (:meth:`_park_pending`); without this restoration
+                    # the slot still holds the NEW intent that
+                    # :meth:`_diff_and_dispatch` promoted right after
+                    # the parked ``_dispatch_modify`` returned, and the
+                    # next diff observes Pine == active so the amend
+                    # is silently dropped — leaving the original
+                    # exchange order indefinitely on the OLD parameters.
+                    # ``_order_mapping[key]`` is intentionally kept (it
+                    # still references the live original order id).
+                    restored = self._modify_old_intents.pop(key, None)
+                    if restored is not None:
+                        self._active_intents[key] = restored
+                    else:
+                        # Post-restart: the in-memory snapshot did not
+                        # survive the process bounce. Without recovery,
+                        # both ``_active_intents`` and ``_order_mapping``
+                        # stay empty for this key, and
+                        # ``_diff_and_dispatch`` issues a fresh
+                        # ``execute_*`` alongside the still-live original
+                        # — duplicating the order. Recover the exchange
+                        # order IDs from the persisted park row (v4
+                        # ``order_ids`` column) and seed
+                        # ``_order_mapping`` so the cross-restart
+                        # adoption path picks the intent up without
+                        # re-dispatching. The adoption sets
+                        # ``_active_intents[key]`` to the current Pine
+                        # intent, which is the NEW (unapplied) intent —
+                        # the exchange keeps the OLD parameters. A
+                        # subsequent Pine parameter change triggers a
+                        # normal modify retry; if Pine stays unchanged
+                        # the desync persists as a documented limitation.
+                        #
+                        # The ``modify`` row is the authoritative source —
+                        # ``_park_pending`` snapshots the live
+                        # ``_order_mapping[key]`` only on the modify park.
+                        # An older ``new``/``attached`` sibling row from
+                        # the initial dispatch carries ``order_ids=[]``
+                        # (parked before the mapping existed); SQL
+                        # returns the group unordered, so picking
+                        # ``records[0]`` could land on that empty
+                        # snapshot and skip the recovery, duplicating
+                        # the still-live original on the next dispatch.
+                        recovered_ids: list[str] = []
+                        for rec in records:
+                            if (rec.dispatch_kind == 'modify'
+                                    and rec.order_ids):
+                                recovered_ids = list(rec.order_ids)
+                                break
+                        if not recovered_ids:
+                            for rec in records:
+                                if rec.order_ids:
+                                    recovered_ids = list(rec.order_ids)
+                                    break
+                        if recovered_ids:
+                            self._order_mapping[key] = recovered_ids
+                            # Track for end-of-sync cleanup. Without this,
+                            # if the first post-restart Pine pass no longer
+                            # contains this intent (strategy cancelled it,
+                            # position closed while the bot was down),
+                            # :meth:`_diff_and_dispatch` has no
+                            # ``_active_intents`` entry to remove and the
+                            # recovered mapping silently adopts the next
+                            # same-key dispatch — skipping the broker call
+                            # entirely. Mirror the attached-path behaviour:
+                            # the cleanup pass drops markers that no Pine
+                            # intent claimed.
+                            self._attached_adoption_keys.add(key)
+                # The replayed envelope anchor is in-memory only —
+                # ``_drop_envelope`` only touches ``_envelopes`` + the DB
+                # row, so without this pop a same-sync rebuild would pin
+                # the new envelope from the rejected dispatch's anchor
+                # and reuse its ``client_order_id``. Brokers that retain
+                # idempotency state for rejected submissions would then
+                # dedupe the retry instead of accepting it as a new
+                # order. Applies to both kinds: a fresh modify retry
+                # also needs a fresh COID.
+                self._persisted_envelope_anchors.pop(key, None)
+                # ``_drop_envelope`` calls ``record_complete(key)`` which
+                # already DELETEs every pending_verifications row sharing
+                # this intent_key — no separate ``record_unpark`` needed.
+                self._drop_envelope(key)
+                # Drop any in-flight attached-adoption marker placed by
+                # an earlier sync (or this loop iteration before the
+                # grouping rewrite). Without this the next call to
+                # :meth:`_cleanup_unused_adoption_markers` would not
+                # touch it (the `_order_mapping` entry has just been
+                # popped above for kind='new', or is still set for
+                # kind='modify'), but a future same-sync attached
+                # consume would re-add it from the now-already-cleaned
+                # state. Belt-and-braces consistency.
+                self._attached_adoption_keys.discard(key)
+                continue
+
+            # All resolutions for this key are 'attached' — install
+            # the adoption marker once (vs. once per coid) and process
+            # each row's per-coid bookkeeping.
+            #
+            # If any record under this key was a parked modify, drop the
+            # rollback snapshot stashed by :meth:`_park_pending`. The
+            # amend actually went through (despite the timeout) — the
+            # promoted-new ``_active_intents[key]`` is correct, and
+            # leaving the snapshot in place would make a *future*
+            # genuine modify rollback to the wrong (now-superseded)
+            # state if its first attempt also times out and is then
+            # rejected.
+            if any(r.dispatch_kind == 'modify' for r in records):
+                self._modify_old_intents.pop(key, None)
+            for record in records:
+                coid = record.coid
+                if coid in self._consumed_attached_coids:
+                    # Already processed this attached resolution earlier
+                    # in the same run. The row stays alive (so a late
+                    # ``'rejected'`` flip can still be observed); the
+                    # in-memory state is unchanged on subsequent syncs
+                    # until either cleanup, retire, or a flip arrives.
+                    continue
+                self._consumed_attached_coids.add(coid)
+                self._pending_verification.pop(coid, None)
+                self._persisted_pending_anchors.pop(coid, None)
+                _log.info(
+                    "plugin-resolved pending dispatch %s as attached "
+                    "for intent %s; keeping active intent", coid, key,
+                )
+            # After a restart ``_active_intents`` is empty (intents are
+            # rebuilt from the Pine order book on the first post-restart
+            # sync), so the upcoming :meth:`_diff_and_dispatch` would
+            # dispatch this key again unless it sees an existing
+            # :attr:`_order_mapping` slot. Mirror the same adoption
+            # signal :meth:`_verify_pending_dispatches` uses for
+            # recovered ``get_open_orders`` matches: a present (possibly
+            # empty) mapping is the "already live, just adopt it" marker.
+            # Capital.com's bracket legs do not surface real exchange
+            # order ids on this path (their ``id`` is synthesised from
+            # the parent ``dealId`` and is never returned by
+            # ``get_open_orders``), so the empty-list shape matches how
+            # those plugins already populate the slot.
+            self._order_mapping.setdefault(key, [])
+            # Track the marker so end-of-sync cleanup can drop it if no
+            # Pine intent claimed it (e.g. the position has since closed
+            # and the strategy moved on). Without this cleanup the empty
+            # list would silently adopt a *future* same-key dispatch
+            # and skip the broker call entirely.
+            self._attached_adoption_keys.add(key)
+
+    def _cleanup_unused_adoption_markers(self) -> None:
+        """Drop adoption markers that no Pine intent claimed.
+
+        :meth:`_consume_plugin_resolutions` seeds a slot in
+        :attr:`_order_mapping` for two distinct cases:
+
+        - ``'attached'`` resolution: an empty list, signalling "this
+          intent is already live, just adopt it on the next diff".
+        - Modify-rejected post-restart recovery: the original exchange
+          order ids carried over from the persisted park row, so the
+          next diff adopts the live original instead of dispatching a
+          duplicate ``execute_*`` alongside it.
+
+        Both shapes assume Pine still wants this intent. If the upcoming
+        :meth:`_diff_and_dispatch` does not register an
+        ``_active_intents[key]`` entry (strategy cancelled the intent,
+        position closed while the bot was down), the slot becomes a
+        stale trap: a *future* sync producing a fresh intent at the same
+        key would hit the adoption branch and skip the broker dispatch
+        entirely — a silent loss of order. The same logic applies to the
+        envelope anchor: keeping it would pin the new intent to the old
+        ``client_order_id``, which the broker may dedupe against the
+        previously-attached order. The persisted ``envelopes`` and
+        ``pending_verifications`` rows are deleted alongside the
+        in-memory state; otherwise a *future restart* would replay the
+        anchor and the same staleness would resurface.
+
+        Cleanup runs once per sync, after :meth:`_diff_and_dispatch`. Only
+        markers placed *this* sync are tracked (the set is cleared here),
+        so legitimate adopters from earlier syncs are not affected.
+        """
+        for key in list(self._attached_adoption_keys):
+            # Set membership already guarantees this key was seeded by
+            # :meth:`_consume_plugin_resolutions` (either the attached
+            # adoption path with an empty mapping, or the modify-rejected
+            # post-restart recovery path with non-empty recovered ids).
+            # Both shapes are stale traps if no Pine intent claimed them
+            # this sync — drop them uniformly without inspecting the
+            # mapping value.
+            if (key not in self._active_intents
+                    and key in self._order_mapping):
+                self._order_mapping.pop(key, None)
+                self._persisted_envelope_anchors.pop(key, None)
+                # ``_drop_envelope`` removes the in-memory ``_envelopes``
+                # entry (defensive — adoption never populated it for
+                # this key, but cancel/retire paths use the same call)
+                # and persists the cleanup via
+                # :meth:`RunContext.record_complete`, which DELETEs the
+                # ``envelopes`` row AND every ``pending_verifications``
+                # row sharing this intent_key. Without that DELETE a
+                # future restart would replay the stale anchor through
+                # :meth:`_build_envelope` and reuse the old
+                # ``client_order_id`` for a genuinely fresh order.
+                self._drop_envelope(key)
+                _log.info(
+                    "cleared stale attached-adoption marker for intent %s "
+                    "(no Pine intent claimed it this sync)", key,
+                )
+        self._attached_adoption_keys.clear()
 
     def reconcile(self) -> None:
         """Read-side position reconciliation with the exchange.
@@ -1020,6 +1401,13 @@ class OrderSyncEngine:
         for key in list(self._active_intents):
             if key not in new_map:
                 old = self._active_intents.pop(key)
+                # A still-parked modify for this key (Pine cancels while
+                # the previous amend's resolution is pending) is being
+                # superseded — its rollback snapshot would target an
+                # intent the strategy no longer wants. Drop the snapshot
+                # so a late ``'rejected'`` resolution does not resurrect
+                # a cancelled key into ``_active_intents``.
+                self._modify_old_intents.pop(key, None)
                 self._dispatch_cancel(old)
 
         for key, intent in new_map.items():
@@ -1122,23 +1510,66 @@ class OrderSyncEngine:
 
     def _park_pending(
             self, envelope: DispatchEnvelope, error: OrderDispositionUnknownError,
+            *, kind: str = 'new', old_intent: Intent | None = None,
     ) -> None:
         """Stash a dispatch whose exchange disposition the plugin could not confirm.
 
         :meth:`_verify_pending_dispatches` reruns ``get_open_orders`` on each
         subsequent sync and promotes the envelope back to
         ``_order_mapping`` once the order shows up.
+
+        :param kind: ``'new'`` for ``execute_*`` parks, ``'modify'`` for
+            ``modify_*`` parks. Persisted on the pending row so a later
+            ``'rejected'`` resolution can decide whether the original
+            exchange order is still live (and only the amend failed).
+        :param old_intent: Only set for ``kind='modify'``. The pre-modify
+            ``_active_intents[key]`` snapshot, captured BEFORE
+            ``_diff_and_dispatch`` promotes the slot to the new intent
+            (line 1328). Stashed in :attr:`_modify_old_intents` so a
+            later ``'rejected'`` resolution can restore the slot and
+            force the next diff to re-emit the amend — without this the
+            promoted-new active matches Pine and the diff stays silent
+            even though the exchange still holds the OLD order
+            unmodified.
         """
-        self._pending_verification[error.client_order_id] = envelope
+        coid = error.client_order_id
+        self._pending_verification[coid] = envelope
+        # Re-parking the same coid in this engine instance must reset
+        # the in-memory ``_consumed_attached_coids`` dedup. Without
+        # this, if an earlier 'attached' resolution already marked the
+        # coid as consumed and the row has since been re-parked
+        # (record_park resets ``resolution`` to NULL on conflict), a
+        # later 'attached' write on the fresh park would be skipped by
+        # :meth:`_consume_plugin_resolutions` — leaving
+        # ``_pending_verification`` stuck for brokers whose orders
+        # never appear in ``get_open_orders`` (e.g. Capital.com
+        # position-attached brackets).
+        self._consumed_attached_coids.discard(coid)
+        if kind == 'modify' and old_intent is not None:
+            # First-park-wins: a chained modify (Pine flips parameters
+            # while a previous amend is still parked) overwrites the
+            # NEW intent in ``_active_intents`` but the EXCHANGE may
+            # still be on the OLDEST pre-park state if every park ends
+            # up rejected. The earliest captured snapshot is the safest
+            # restoration target. ``setdefault`` preserves it; an
+            # ``'attached'`` resolution clears the entry so a later
+            # genuinely-fresh modify gets a clean snapshot.
+            self._modify_old_intents.setdefault(
+                envelope.intent.intent_key, old_intent,
+            )
         if self._store_ctx is not None:
             self._store_ctx.record_park(
-                coid=error.client_order_id,
+                coid=coid,
                 key=envelope.intent.intent_key,
+                kind=kind,
+                order_ids=self._order_mapping.get(
+                    envelope.intent.intent_key, [],
+                ),
             )
         _log.warning(
             "dispatch for %s ended with unknown disposition "
-            "(client_order_id=%s); will verify on next sync: %s",
-            envelope.intent.intent_key, error.client_order_id, error,
+            "(client_order_id=%s, kind=%s); will verify on next sync: %s",
+            envelope.intent.intent_key, coid, kind, error,
         )
 
     def _dispatch_new(self, intent: Intent) -> None:
@@ -1164,6 +1595,8 @@ class OrderSyncEngine:
                 intent, e,
             )
             self._park_pending(envelope, e)
+        except BracketAttachAfterFillRejectedError as e:
+            self._handle_bracket_attach_after_fill_reject(intent, e)
         except BrokerManualInterventionError as e:
             _blog_error(
                 "dispatch halted (manual intervention) for %s: %s",
@@ -1182,6 +1615,96 @@ class OrderSyncEngine:
                 intent, type(e).__name__, e,
             )
             raise
+
+    def _handle_bracket_attach_after_fill_reject(
+            self, intent: Intent, e: BracketAttachAfterFillRejectedError,
+    ) -> None:
+        """Recover from a bracket attach reject after a parent fill committed.
+
+        The plugin already rolled back the persisted bracket leg rows;
+        the parent ENTRY/EXIT fill is on the exchange but has no
+        protective TP/SL. Halting here would leave the unprotected
+        position exposed indefinitely — instead synthesise a defensive
+        :class:`CloseIntent` and dispatch it immediately to flatten the
+        position.
+
+        The original intent is then surfaced as
+        :class:`OrderSkippedByPlugin` so the caller drops it from
+        ``_active_intents``: the position it was bracketing no longer
+        exists, and re-evaluating next bar lets the strategy rebuild
+        from the actual current state instead of replaying the same
+        rejected bracket.
+
+        If the defensive close itself fails in an unrecoverable way
+        (anything other than transient park / plugin skip), escalate
+        to :class:`BrokerManualInterventionError` — at that point the
+        position is open AND we couldn't auto-close it, an operator
+        must intervene.
+        """
+        _blog_error(
+            "bracket attach rejected after parent fill for %s; "
+            "issuing defensive market close "
+            "(deal_id=%s, side=%s, qty=%s): %s",
+            intent, e.position_deal_id, e.position_side, e.qty, e,
+        )
+        close_side = "sell" if e.position_side == "buy" else "buy"
+        defensive_pine_id = f"__pyne_defensive_close__{e.position_coid}"
+        close_intent = CloseIntent(
+            pine_id=defensive_pine_id,
+            symbol=e.symbol,
+            side=close_side,
+            qty=e.qty,
+            immediately=True,
+            comment=f"defensive close after bracket attach reject: {e}",
+        )
+        try:
+            self._dispatch_new(close_intent)
+        except (OrderDispositionUnknownError, OrderSkippedByPlugin):
+            # Defensive close parked (timeout) or skipped by plugin —
+            # the next reconcile / next bar will resolve. At worst the
+            # position remains open until then, no worse than not
+            # issuing the close at all.
+            pass
+        except BrokerManualInterventionError as halt:
+            # Inner _dispatch_new already recorded the halt before
+            # propagating (see the BrokerManualInterventionError branch
+            # in _dispatch_new) — re-raise verbatim.
+            raise halt
+        except Exception as nested:
+            # Unexpected failure — escalate. We record the halt here
+            # ourselves because this exception is being raised from a
+            # call site (the outer _dispatch_new's
+            # BracketAttachAfterFillRejectedError branch) that does
+            # NOT pass back through the BrokerManualInterventionError
+            # except in _dispatch_new, so _record_halt would otherwise
+            # be skipped.
+            halt = BrokerManualInterventionError(
+                f"Defensive close after bracket attach reject failed for "
+                f"{intent.intent_key}: {nested}",
+                intent_key=intent.intent_key,
+                context={
+                    'position_deal_id': e.position_deal_id,
+                    'position_coid': e.position_coid,
+                    'symbol': e.symbol,
+                    'qty': e.qty,
+                    'cause': str(e),
+                },
+            )
+            self._record_halt(halt)
+            raise halt from nested
+        raise OrderSkippedByPlugin(
+            f"Bracket attach rejected after entry fill — parent position "
+            f"closed defensively (deal_id={e.position_deal_id}); "
+            f"intent re-evaluation deferred to next bar",
+            intent_key=intent.intent_key,
+            reason="bracket_reject_defensive_close",
+            context={
+                'position_deal_id': e.position_deal_id,
+                'position_coid': e.position_coid,
+                'symbol': e.symbol,
+                'qty': e.qty,
+            },
+        ) from e
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
         old_env = self._build_envelope(old)
@@ -1202,7 +1725,7 @@ class OrderSyncEngine:
             _blog_warning(
                 "modify parked (unknown disposition) for %s: %s", new, e,
             )
-            self._park_pending(new_env, e)
+            self._park_pending(new_env, e, kind='modify', old_intent=old)
         except BrokerManualInterventionError as e:
             _blog_error(
                 "modify halted (manual intervention) for %s: %s", new, e,

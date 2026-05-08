@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'AuthenticationError',
+    'BracketAttachAfterFillRejectedError',
     'BrokerError',
     'BrokerManualInterventionError',
     'ExchangeCapabilityError',
@@ -85,6 +86,57 @@ class InsufficientMarginError(ExchangeOrderRejectedError):
     message. Intent-level reject — non-terminal, the runner keeps going and
     the strategy can respond (e.g. shrink size, back off).
     """
+
+
+class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
+    """A protective TP/SL bracket attach was rejected AFTER the parent
+    ENTRY/EXIT fill committed on the exchange.
+
+    Distinct from a plain :class:`ExchangeOrderRejectedError` where no
+    parent fill occurred (e.g. an entry rejected before contacting the
+    exchange — nothing open, nothing to defend). Here the position is
+    *open and unprotected*: the sync engine MUST NOT halt (which would
+    leave the unprotected fill exposed indefinitely), instead it issues a
+    defensive market close to take the position flat.
+
+    The plugin raises this *after* rolling back the persisted leg rows
+    (so the BrokerStore does not leak phantom protective legs). The sync
+    engine's :meth:`_dispatch_new` recovery path catches it, builds a
+    synthetic :class:`~pynecore.core.broker.models.CloseIntent` for the
+    parent position, and dispatches that. The runner continues.
+
+    :ivar position_deal_id: Exchange-side identifier of the unprotected
+        open position.
+    :ivar position_coid: Client-order-id of the unprotected open position
+        (the parent ENTRY row in BrokerStore).
+    :ivar symbol: Trading symbol of the unprotected position.
+    :ivar position_side: Side of the OPEN position (``"buy"`` for long,
+        ``"sell"`` for short). The defensive close picks the opposite.
+    :ivar qty: Quantity of the unprotected position (units the close
+        intent must flatten).
+    :ivar from_entry: Pine ``strategy.entry`` id, when the bracket attach
+        originated from a Pine ``strategy.exit``. Used for log
+        correlation; not required for the close itself.
+    """
+
+    def __init__(
+            self,
+            message: str,
+            *,
+            position_deal_id: str,
+            position_coid: str,
+            symbol: str,
+            position_side: str,
+            qty: float,
+            from_entry: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.position_deal_id = position_deal_id
+        self.position_coid = position_coid
+        self.symbol = symbol
+        self.position_side = position_side
+        self.qty = qty
+        self.from_entry = from_entry
 
 
 class ExchangeRateLimitError(BrokerError):

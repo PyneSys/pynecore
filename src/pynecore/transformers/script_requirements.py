@@ -155,7 +155,7 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             self._reqs[_FLAG_EXIT_ORDERS] = True
         return node
 
-    # === Detection rules (see design doc, "Detektálható Minták" table) ===
+    # === Detection rules (see design doc, "Detectable Patterns" table) ===
 
     def _apply_entry_or_order(self, kws: set[str], *, is_strategy_order: bool) -> None:
         has_limit = 'limit' in kws

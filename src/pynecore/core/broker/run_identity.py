@@ -5,22 +5,23 @@ A *run* is one concrete execution of a Pine strategy against a live broker
 account for a specific (symbol, timeframe, optional label) combination.
 Two keys exist for different purposes:
 
-- **``run_id``** — humán-olvasható, determinisztikus stream-azonosító. Azonos
-  strategy + account + symbol + timeframe + label kombináció mindig
-  ugyanazt adja. Historikus lekérdezéshez (*"mutasd ennek a botnak az
-  összes múltbeli futását"*) ez a kulcs.
-- **``run_instance_id``** — fizikai, autoincrement INTEGER, egyedi minden
-  élesben elindított futtatásra. FK-kulcs a storage összes táblájában.
-  A storage tölti ki, ez a modul nem foglalkozik vele.
+- **``run_id``** — human-readable, deterministic stream identifier. The same
+  strategy + account + symbol + timeframe + label combination always
+  yields the same value. This is the key for historical lookups
+  (*"show every past run of this bot"*).
+- **``run_instance_id``** — physical autoincrement INTEGER, unique to each
+  process invocation. FK column of every storage table. The storage
+  populates it; this module is not concerned with it.
 
-A ``RunIdentity`` ennek az egésznek a konstrukciós inputja: a strategy runner
-a CLI-ből + plugin auth-ból összerakja, átadja a storage-nak, és visszakap
-egy ``RunContext``-et a ``run_instance_id``-vel.
+``RunIdentity`` is the construction input for both keys: the strategy
+runner assembles it from the CLI + plugin auth, hands it to the storage,
+and gets a ``RunContext`` back with the ``run_instance_id`` attached.
 
-Miért külön modul az ``idempotency.py``-tól: az idempotency a
-``client_order_id`` bit-szintű formáját kezeli (broker-protokoll), a
-``RunIdentity`` a run-szintű identitást (PyneCore-belső). Két elkülönülő
-absztrakciós réteg, egy modulban összemosva átláthatatlan lenne.
+Why a separate module from ``idempotency.py``: idempotency owns the
+bit-level shape of ``client_order_id`` (broker protocol), while
+``RunIdentity`` owns run-scoped identity (PyneCore-internal). Two
+distinct abstraction layers — merging them in one module would be
+opaque.
 """
 import hashlib
 import json
@@ -33,30 +34,31 @@ __all__ = [
     'RunIdentity',
 ]
 
-# 20 bits → 4 base36 chars, ugyanaz a tartomány mint az eredeti
-# ``make_run_tag``-é. A bővebb input csak a collision-space-t javítja, a
-# kimeneti formátum (``{run_tag}-{pid}-...``) változatlan.
+# 20 bits → 4 base36 chars, the same range as the original
+# ``make_run_tag``. The wider input only improves the collision space;
+# the output format (``{run_tag}-{pid}-...``) is unchanged.
 _RUN_TAG_BITS: Final[int] = 20
 _RUN_TAG_MASK: Final[int] = (1 << _RUN_TAG_BITS) - 1
 
 
 @dataclass(frozen=True)
 class RunIdentity:
-    """Egy konkrét bot-futtatás identitása a storage előtt.
+    """Identity of a concrete bot run, prior to storage.
 
-    :param strategy_id: A script-fájl stem-je (pl. ``"ema_cross"``). A
-        kódbázis logikai neve, NEM verzió-hash — a forráskód-változásokat
-        a ``run_tag`` ragadja meg a ``make_run_tag`` hash-bemenetén
-        keresztül.
-    :param symbol: Kereskedett instrumentum (pl. ``"EURUSD"``).
-    :param timeframe: TradingView-formátum (pl. ``"60"``, ``"1D"``).
-    :param account_id: Plugin-qualified broker-account azonosító, pl.
-        ``"capitalcom-demo-1234567"``. A plugin sync ``.account_id``
-        property-je adja, az autentikáció során populált. Hiányzó
-        account esetén ``"default"``.
-    :param label: Opcionális user-override (CLI ``--run-label``). Ugyanaz
-        a (strategy_id, symbol, timeframe, account_id) kombináció több
-        példányának megkülönböztetésére. Default: ``None``.
+    :param strategy_id: Stem of the script file (e.g. ``"ema_cross"``).
+        The logical name of the codebase, NOT a version hash —
+        source-code changes are captured by ``run_tag`` via the
+        ``make_run_tag`` hash input.
+    :param symbol: Traded instrument (e.g. ``"EURUSD"``).
+    :param timeframe: TradingView format (e.g. ``"60"``, ``"1D"``).
+    :param account_id: Plugin-qualified broker-account identifier, e.g.
+        ``"capitalcom-demo-1234567"``. Provided by the plugin's sync
+        ``.account_id`` property, populated during authentication.
+        Defaults to ``"default"`` when no account is available.
+    :param label: Optional user override (CLI ``--run-label``). Used to
+        distinguish multiple instances of the same
+        (strategy_id, symbol, timeframe, account_id) combination.
+        Default: ``None``.
     """
     strategy_id: str
     symbol: str
@@ -66,41 +68,43 @@ class RunIdentity:
 
     @property
     def run_id(self) -> str:
-        """Humán-olvasható logikai kulcs.
+        """Human-readable logical key.
 
-        Formátum: ``"{strategy_id}@{account_id}:{symbol}:{timeframe}"``
-        vagy label megadása esetén ``"...#{label}"``. A külön ``#``
-        szeparátor azért kell, mert a ``:`` a timeframe után fordulhat
-        elő (pl. ``"1D"``), a ``#`` viszont a CLI flagen keresztül
-        érkező label-ben sem legális (a CLI validál).
+        Format: ``"{strategy_id}@{account_id}:{symbol}:{timeframe}"`` or,
+        when a label is provided, ``"...#{label}"``. A separate ``#``
+        separator is required because ``:`` can appear after the
+        timeframe (e.g. ``"1D"``); ``#`` on the other hand is not legal
+        even inside a label that comes through the CLI flag (the CLI
+        validates this).
         """
         base = f"{self.strategy_id}@{self.account_id}:{self.symbol}:{self.timeframe}"
         return f"{base}#{self.label}" if self.label else base
 
     def make_run_tag(self, script_source: str) -> str:
-        """4-char base36 session tag a client_order_id-hez.
+        """4-char base36 session tag for client_order_id.
 
-        Az idempotency formulának (``{run}-{pid}-{bar}-{k}{r}``) 4 karakter
-        áll rendelkezésre erre a mezőre; a bit-térfogat tehát 20 bit
-        (~1M slot). Determinisztikus: azonos input mindig azonos tag.
+        The idempotency formula (``{run}-{pid}-{bar}-{k}{r}``) reserves 4
+        characters for this field, giving 20 bits of capacity
+        (~1M slots). Deterministic: the same input always produces the
+        same tag.
 
-        Miért több input, mint a régi ``make_run_tag(script_source)``:
-        ugyanaz a script két timeframe-en egyszerre futva azonos tag-et
-        adott, ami idempotency-collision-t eredményezett (azonos
-        ``client_order_id``-k). A ``strategy_id`` / ``symbol`` /
-        ``timeframe`` / ``account`` / ``label`` bevonásával a
-        collision-space kiterjed a realisztikus run-dimenziókra.
-        ``strategy_id`` külön is kell: két külön script, azonos forrással
-        (copy-paste) ugyanarra a (symbol, tf, account) kombinációra
-        egyébként azonos tag-et kapna, és a brokernél duplikált
-        ``client_order_id``-kat generálna.
+        Why more inputs than the old ``make_run_tag(script_source)``:
+        the same script running on two timeframes simultaneously
+        produced identical tags, causing idempotency collisions
+        (identical ``client_order_id``s). Including ``strategy_id`` /
+        ``symbol`` / ``timeframe`` / ``account`` / ``label`` extends the
+        collision space across the realistic run dimensions.
+        ``strategy_id`` is also needed on its own: two distinct scripts
+        with identical sources (copy-paste) running on the same
+        (symbol, tf, account) would otherwise share a tag and emit
+        duplicate ``client_order_id``s at the broker.
 
-        A JSON-serializált input determinisztikus stringifikációt ad
-        (pipe/quote/unicode edge-case-mentes).
+        The JSON-serialised input gives a deterministic stringification
+        free of pipe/quote/unicode edge cases.
 
-        :param script_source: A Pine-script forráskódja, ahogy a runner
-            beolvasta.
-        :return: Pontosan 4 karakter lower-case base36.
+        :param script_source: Source code of the Pine script as the
+            runner read it.
+        :return: Exactly 4 lower-case base36 characters.
         """
         payload = json.dumps(
             [
@@ -115,7 +119,7 @@ class RunIdentity:
             sort_keys=False,
         )
         digest = hashlib.sha256(payload.encode('ascii')).digest()
-        # 20 bit → 4 char base36. A 3 byte-os slice bőven lefedi,
-        # utána AND-maszkolunk.
+        # 20 bit → 4 char base36. A 3-byte slice covers it with margin;
+        # we AND-mask afterwards.
         value = int.from_bytes(digest[:3], 'big') & _RUN_TAG_MASK
         return _to_base36(value, width=RUN_TAG_WIDTH)

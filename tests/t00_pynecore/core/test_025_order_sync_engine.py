@@ -16,16 +16,23 @@ from typing import Any
 import pytest
 
 from pynecore import lib
-from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+from pynecore.core.broker.exceptions import (
+    BracketAttachAfterFillRejectedError,
+    BrokerManualInterventionError,
+    OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
+)
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.core.broker.models import (
     BrokerEvent,
     CapabilityLevel,
+    CloseIntent,
     DispatchEnvelope,
     ExchangeOrder,
     ExchangePosition,
     ExchangeCapabilities,
+    ExitIntent,
     LegPartialRepairedEvent,
     LegRepairFailedEvent,
     OcaPartialFillPolicy,
@@ -1386,3 +1393,155 @@ def __test_natural_close_partial_fill_does_not_cleanup__():
     assert "Bracket\0L" in engine.active_intents, "exit intent must survive partial close"
     assert "L" in pos.entry_orders
     assert ("Bracket", "L") in pos.exit_orders
+
+
+# === BracketAttachAfterFillRejectedError → defensive close ===
+
+
+def _bracket_reject_exit_intent() -> ExitIntent:
+    return ExitIntent(
+        pine_id='Bracket',
+        from_entry='Long',
+        symbol=SYMBOL,
+        side='sell',
+        qty=1.0,
+        tp_price=51_000.0,
+        sl_price=49_000.0,
+    )
+
+
+def _bracket_reject_error(
+        original_cause: Exception | None = None,
+) -> BracketAttachAfterFillRejectedError:
+    err = BracketAttachAfterFillRejectedError(
+        "bracket attach reject",
+        position_deal_id='deal-L',
+        position_coid='coid-entry',
+        symbol=SYMBOL,
+        position_side='buy',
+        qty=1.0,
+        from_entry='Long',
+    )
+    if original_cause is not None:
+        err.__cause__ = original_cause
+    return err
+
+
+def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
+    """The plugin raises :class:`BracketAttachAfterFillRejectedError`
+    after a parent fill committed but the protective bracket attach was
+    rejected. The sync engine must:
+
+    1. Dispatch a market :class:`CloseIntent` with the OPPOSITE side
+       (long parent → 'sell' close) for the same qty/symbol — defensive
+       close to flatten the unprotected position.
+    2. Surface the original exit intent as :class:`OrderSkippedByPlugin`
+       so the caller drops it from ``_active_intents`` and lets the next
+       bar re-evaluate from real state.
+    3. NOT halt — no :class:`BrokerManualInterventionError`, no
+       ``_record_halt`` write.
+    """
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        engine._dispatch_new(intent)
+
+    assert exc.value.reason == "bracket_reject_defensive_close"
+    assert exc.value.intent_key == intent.intent_key
+
+    # Defensive close was dispatched: opposite side, same qty/symbol.
+    assert len(b.close_calls) == 1
+    close_env = b.close_calls[0]
+    assert isinstance(close_env.intent, CloseIntent)
+    assert close_env.intent.side == 'sell'  # long parent → close sells
+    assert close_env.intent.qty == 1.0
+    assert close_env.intent.symbol == SYMBOL
+    assert close_env.intent.immediately is True
+
+    # Did not halt — no manual-intervention record on the engine.
+    assert engine.halted is False
+
+
+def __test_bracket_reject_short_position_close_side_is_buy__():
+    """Symmetry guard: a short parent must be closed with a 'buy'
+    market order. Easy to flip accidentally because the *exit* intent's
+    side ('buy' for short SL/TP) and the *position* side ('sell') are
+    inverses."""
+    b = MockBroker()
+    err = BracketAttachAfterFillRejectedError(
+        "bracket attach reject",
+        position_deal_id='deal-S',
+        position_coid='coid-short-entry',
+        symbol=SYMBOL,
+        position_side='sell',  # short parent
+        qty=2.5,
+        from_entry='Short',
+    )
+    b.raise_on_next_exit = err
+    engine, _pos = _mk_engine(b)
+
+    intent = ExitIntent(
+        pine_id='Bracket', from_entry='Short', symbol=SYMBOL,
+        side='buy', qty=2.5, tp_price=49_000.0, sl_price=51_000.0,
+    )
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(intent)
+
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.side == 'buy'
+    assert b.close_calls[0].intent.qty == 2.5
+
+
+def __test_bracket_reject_defensive_close_timeout_does_not_halt__():
+    """Defensive close itself parks (timeout) — at worst the position
+    stays open until the next reconcile. Don't escalate to halt."""
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+
+    # Wire up execute_close to time out (parked disposition).
+    original_close = b.execute_close
+
+    async def _timeout_close(envelope):
+        raise OrderDispositionUnknownError(
+            "close timeout", client_order_id='c-coid',
+        )
+
+    b.execute_close = _timeout_close  # type: ignore[method-assign]
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(intent)
+
+    assert engine.halted is False
+
+    # Cleanup so other tests (if MockBroker was shared, which it isn't here)
+    # don't trip — defensive belt-and-suspenders.
+    b.execute_close = original_close  # type: ignore[method-assign]
+
+
+def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
+    """Defensive close fails with an unexpected exception (not park, not
+    skip, not already a manual-intervention) — escalate to manual
+    intervention and record the halt so the runner stops gracefully."""
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+
+    async def _broken_close(envelope):
+        raise RuntimeError("close path is wedged")
+
+    b.execute_close = _broken_close  # type: ignore[method-assign]
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(BrokerManualInterventionError) as exc:
+        engine._dispatch_new(intent)
+
+    assert "Defensive close after bracket attach reject failed" in str(exc.value)
+    assert exc.value.intent_key == intent.intent_key
+    assert exc.value.context['position_deal_id'] == 'deal-L'
+    # Halt recorded so subsequent syncs return early via the halt flag.
+    assert engine.halted is True

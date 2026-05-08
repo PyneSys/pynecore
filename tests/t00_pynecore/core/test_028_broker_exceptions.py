@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
+    BracketAttachAfterFillRejectedError,
     BrokerError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
@@ -67,6 +68,46 @@ def __test_insufficient_margin_typed_match__():
         raise InsufficientMarginError("Balance too low")
     except ExchangeOrderRejectedError as exc:
         assert isinstance(exc, InsufficientMarginError)
+
+
+# === BracketAttachAfterFillRejectedError ===
+
+def __test_bracket_attach_after_fill_rejected_is_typed_subclass__():
+    exc = BracketAttachAfterFillRejectedError(
+        "rejected",
+        position_deal_id='deal-1', position_coid='coid-1',
+        symbol='EURUSD', position_side='buy', qty=1.0,
+    )
+    assert isinstance(exc, ExchangeOrderRejectedError)
+    assert isinstance(exc, BrokerError)
+
+
+def __test_bracket_attach_after_fill_rejected_carries_position_context__():
+    """The sync engine reads these fields to build the defensive
+    CloseIntent — they must survive construction unchanged."""
+    exc = BracketAttachAfterFillRejectedError(
+        "rejected",
+        position_deal_id='deal-99', position_coid='coid-99',
+        symbol='BTCUSDT', position_side='sell', qty=2.5,
+        from_entry='Short',
+    )
+    assert exc.position_deal_id == 'deal-99'
+    assert exc.position_coid == 'coid-99'
+    assert exc.symbol == 'BTCUSDT'
+    assert exc.position_side == 'sell'
+    assert exc.qty == 2.5
+    assert exc.from_entry == 'Short'
+
+
+def __test_bracket_attach_after_fill_rejected_from_entry_optional__():
+    """``from_entry`` is informational — recovery dispatches do not
+    require it (CloseIntent has no from_entry field)."""
+    exc = BracketAttachAfterFillRejectedError(
+        "rejected",
+        position_deal_id='deal-1', position_coid='coid-1',
+        symbol='EURUSD', position_side='buy', qty=1.0,
+    )
+    assert exc.from_entry is None
 
 
 # === AuthenticationFailedEvent ===
