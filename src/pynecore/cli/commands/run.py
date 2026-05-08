@@ -824,8 +824,8 @@ def run(
                 # on a non-TTY, but explicit opt-out works regardless of how
                 # the harness wires stdout.
                 _spinner_disabled = (
-                    os.environ.get("PYNE_NO_LIVE_SPINNER", "").lower()
-                    not in ("", "0", "false", "no", "off")
+                        os.environ.get("PYNE_NO_LIVE_SPINNER", "").lower()
+                        not in ("", "0", "false", "no", "off")
                 )
                 if _spinner_disabled:
                     broker_info("live spinner disabled (PYNE_NO_LIVE_SPINNER)")
