@@ -818,7 +818,7 @@ class Position:
                 if commission_type == _commission.cash_per_order:
                     commission = commission_value
                 elif commission_type == _commission.percent:
-                    commission = abs(order.size) * commission_value * 0.01
+                    commission = abs(order.size) * price * commission_value * 0.01
                 elif commission_type == _commission.cash_per_contract:
                     commission = abs(order.size) * commission_value
                 else:  # Should not be here!
