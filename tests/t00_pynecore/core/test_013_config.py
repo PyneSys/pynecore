@@ -10,6 +10,7 @@ from pynecore.core.config import (
     extract_field_docs,
     format_value,
     generate_toml,
+    mlstr,
     parse_toml_with_comments,
 )
 
@@ -51,8 +52,94 @@ def __test_format_value_str__():
     assert format_value("hello") == '"hello"'
     assert format_value("") == '""'
     assert format_value('has "quotes"') == '"has \\"quotes\\""'
-    assert format_value("line\nbreak") == '"line\\nbreak"'
     assert format_value("back\\slash") == '"back\\\\slash"'
+
+
+def __test_format_value_multiline_str__():
+    """Multi-line strings render as TOML literal triple-quoted blocks."""
+    assert format_value("line\nbreak") == "'''\nline\nbreak'''"
+
+    pem = (
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "MHcCAQEE...\n"
+        "-----END EC PRIVATE KEY-----\n"
+    )
+    rendered = format_value(pem)
+    assert rendered.startswith("'''\n")
+    assert rendered.endswith("'''")
+    assert "-----BEGIN EC PRIVATE KEY-----" in rendered
+
+    import tomllib
+    parsed = tomllib.loads(f"key = {rendered}\n")
+    assert parsed["key"] == pem
+
+
+def __test_format_value_multiline_with_triple_quote_fallback__():
+    """Strings containing ``'''`` fall back to escaped single-line form."""
+    value = "first\n'''marker'''\nlast"
+    rendered = format_value(value)
+    assert rendered.startswith('"') and rendered.endswith('"')
+    assert "\\n" in rendered
+
+
+def __test_format_value_mlstr_empty__():
+    """Empty ``mlstr`` still renders as a triple-quoted block."""
+    assert format_value(mlstr("")) == "'''\n'''"
+
+
+def __test_format_value_mlstr_single_line__():
+    """Single-line ``mlstr`` value still renders multi-line."""
+    assert format_value(mlstr("hello")) == "'''\nhello'''"
+
+
+def __test_mlstr_field_renders_multiline_default__(tmp_path: Path):
+    """``mlstr`` field renders an empty default as ``'''\\n#'''`` placeholder."""
+
+    @dataclass
+    class WithMlstr:
+        """ML config"""
+
+        api_key: str = ""
+        """API key"""
+
+        secret: mlstr = mlstr("")
+        """Secret PEM block"""
+
+    cfg_path = tmp_path / "config.toml"
+    ensure_config(WithMlstr, cfg_path)
+
+    content = cfg_path.read_text()
+    assert "#secret = '''" in content
+    assert "#'''" in content
+    assert '#api_key = ""' in content
+
+
+def __test_mlstr_field_round_trip__(tmp_path: Path):
+    """Pasting a PEM into a ``mlstr`` field round-trips to triple-quoted form."""
+
+    @dataclass
+    class WithMlstr:
+        """ML config"""
+
+        secret: mlstr = mlstr("")
+        """Secret PEM block"""
+
+    cfg_path = tmp_path / "config.toml"
+    pem = "-----BEGIN KEY-----\nABC\n-----END KEY-----\n"
+
+    cfg_path.write_text(f'secret = "{pem.replace(chr(10), chr(92) + "n")}"\n')
+    if hasattr(WithMlstr, "_ensured"):
+        del WithMlstr._ensured
+
+    inst = ensure_config(WithMlstr, cfg_path)
+
+    assert inst.secret == pem
+    assert isinstance(inst.secret, mlstr)
+
+    content = cfg_path.read_text()
+    assert "secret = '''" in content
+    assert "-----BEGIN KEY-----" in content
+    assert "-----END KEY-----" in content
 
 
 def __test_format_value_int__():

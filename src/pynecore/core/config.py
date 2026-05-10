@@ -21,11 +21,28 @@ from pathlib import Path
 from typing import Any, cast
 
 
+class mlstr(str):
+    """TOML multi-line string marker.
+
+    Annotate a config field with this type to force the writer to render
+    the value as a multi-line literal block (``'''…'''``), even when the
+    default is empty or a single line. Useful for fields where users will
+    paste multi-line content (PEM keys, certificates, SSH keys, etc.) —
+    the commented default already shows the paste markers, so users do
+    not have to know TOML's multi-line literal syntax to fill it in.
+    """
+
+
 def format_value(value: str | int | float | bool) -> str:
     """
     Format a Python value as a TOML value string.
 
     Handles the four TOML-native types: ``str``, ``int``, ``float``, ``bool``.
+    ``mlstr`` values, and any plain string containing ``\\n``, are emitted
+    as TOML multi-line literal blocks (``'''…'''``) so PEM keys,
+    certificates and similar payloads stay readable in the generated
+    config.  Strings that contain ``'''`` fall back to a single-line
+    escaped form.
     This function is intentionally public so that other modules (e.g.
     ``core.script``) can reuse it for consistent TOML formatting.
 
@@ -38,7 +55,11 @@ def format_value(value: str | int | float | bool) -> str:
         return str(value)
     if isinstance(value, float):
         return str(value)
+    if isinstance(value, mlstr) and "'''" not in value:
+        return f"'''\n{value}'''"
     if isinstance(value, str):
+        if '\n' in value and "'''" not in value:
+            return f"'''\n{value}'''"
         escaped = (
             value
             .replace('\\', '\\\\')
@@ -48,6 +69,37 @@ def format_value(value: str | int | float | bool) -> str:
         )
         return f'"{escaped}"'
     return str(value)
+
+
+def _is_mlstr_field(f: dataclasses.Field) -> bool:
+    """Check if a dataclass field is annotated as ``mlstr``.
+
+    Relies on ``f.type`` being a real type object (not a forward-ref
+    string) — guaranteed in this project because ``from __future__ import
+    annotations`` is intentionally not used.
+    """
+    t = f.type
+    return isinstance(t, type) and issubclass(t, mlstr)
+
+
+def _emit_assignment(
+    lines: list[str],
+    name: str,
+    formatted: str,
+    *,
+    commented: bool,
+) -> None:
+    """Append a ``name = value`` assignment to ``lines``.
+
+    For multi-line formatted values (e.g. ``'''…'''``), every continuation
+    line is prefixed with ``#`` when ``commented`` is true so the whole
+    block is one TOML comment, not a half-commented stray.
+    """
+    parts = formatted.split('\n')
+    prefix = '#' if commented else ''
+    lines.append(f"{prefix}{name} = {parts[0]}")
+    for cont in parts[1:]:
+        lines.append(f"{prefix}{cont}")
 
 
 def extract_field_docs(config_cls: type) -> dict[str, str]:
@@ -119,6 +171,7 @@ def generate_toml(
     for f in dataclasses.fields(cast(Any, config_cls)):
         name = f.name
         default = f.default
+        is_ml = _is_mlstr_field(f)
 
         lines.append("")
 
@@ -127,11 +180,20 @@ def generate_toml(
                 lines.append(f"# {doc_line.strip()}")
 
         if user_values and name in user_values:
-            lines.append(f"{name} = {format_value(user_values[name])}")
+            value = user_values[name]
+            if is_ml and not isinstance(value, mlstr):
+                value = mlstr(value)
+            _emit_assignment(lines, name, format_value(value), commented=False)
         elif default is dataclasses.MISSING or default is None:
-            lines.append(f"#{name} =")
+            if is_ml:
+                _emit_assignment(lines, name, "'''\n'''", commented=True)
+            else:
+                lines.append(f"#{name} =")
         else:
-            lines.append(f"#{name} = {format_value(default)}")
+            value = default
+            if is_ml and not isinstance(value, mlstr):
+                value = mlstr(value)
+            _emit_assignment(lines, name, format_value(value), commented=True)
 
     return '\n'.join(lines) + '\n'
 
@@ -236,7 +298,9 @@ def _create_instance(config_cls: type, user_values: dict | None):
     """
     Create a dataclass instance with user values merged over defaults.
 
-    Handles ``int`` to ``float`` coercion when the field default is a float.
+    Handles ``int`` to ``float`` coercion when the field default is a
+    float, and ``str`` to ``mlstr`` coercion when the field is annotated
+    as ``mlstr`` (tomllib returns plain ``str`` regardless).
 
     :param config_cls: The config dataclass type.
     :param user_values: User-modified values, or ``None``.
@@ -257,6 +321,8 @@ def _create_instance(config_cls: type, user_values: dict | None):
             and not isinstance(value, bool)
         ):
             value = float(value)
+        if _is_mlstr_field(f) and isinstance(value, str) and not isinstance(value, mlstr):
+            value = mlstr(value)
         kwargs[f.name] = value
 
     return config_cls(**kwargs)
