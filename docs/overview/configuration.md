@@ -88,6 +88,9 @@ The symbol configuration is initially created by the data provider when you down
 - Adjust session times to match TradingView's behavior for backtesting consistency
 - Fix timezone information for a particular exchange
 - Set the correct point value or tick size for a symbol
+- Verify `basecurrency` is the bare base asset code (`"BTC"`, not `"BTCUSDT"` or `"BTC.P"`) — PyneCore relies on this for crypto qty rounding precision (see [`syminfo.basecurrency`](../reference/lib/syminfo.md#basecurrency))
+
+> **Always review the generated TOML before running a script against it.** The data downloader and CSV converter do their best to populate every field from the source data, but the symbol-info derivation is heuristic — exchange metadata is incomplete, fragmented, or absent for many tickers. Open the `.toml` and confirm that every value your script will read (`syminfo.mintick`, `pointvalue`, `currency`, `basecurrency`, `timezone`, session windows, etc.) is correct for the instrument; a silently-wrong field can drift backtest results away from TradingView without any visible error.
 
 ### Script Configuration
 
