@@ -699,9 +699,10 @@ class Position:
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
-                    # We realize later if it is cash per order or cash per contract
-                    if (commission_type == _commission.cash_per_contract or
-                            commission_type == _commission.cash_per_order):
+                    # cash_per_order is a flat fee per order: defer realization
+                    # until the order is removed so it can be split across all
+                    # closed trades it actually filled (see delete block below).
+                    if commission_type == _commission.cash_per_order:
                         closed_trade_size += abs(size)
                     else:
                         # Calculate exit commission based on commission type
@@ -709,7 +710,7 @@ class Position:
                             # For percentage commission, multiply by exit price
                             commission = abs(size) * price * pv * commission_value * 0.01
                         else:
-                            # For other types (shouldn't reach here normally)
+                            # cash_per_contract: size-proportional, charged per leg
                             commission = abs(size) * commission_value
 
                         closed_trade.commission += commission
