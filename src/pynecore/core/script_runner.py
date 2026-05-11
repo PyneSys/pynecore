@@ -167,6 +167,11 @@ def _reset_lib_vars(lib: ModuleType):
 
     lib.barstate.isfirst = True
     lib.barstate.islast = False
+    lib.barstate.isconfirmed = True
+    lib.barstate.ishistory = True
+    lib.barstate.isrealtime = False
+    lib.barstate.isnew = False
+    lib.barstate.islastconfirmedhistory = False
 
     from ..lib import request
     request._reset_request_state()
