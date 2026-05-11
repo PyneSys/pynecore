@@ -92,6 +92,10 @@ def _na_to_none(value):  # type: ignore[misc]
     return None if isinstance(value, NA) else value
 
 
+def _point_value() -> float:
+    return syminfo.pointvalue or 1.0
+
+
 #
 # Classes
 #
@@ -617,6 +621,7 @@ class Position:
         script = lib._script
         commission_type = script.commission_type
         commission_value = script.commission_value
+        point_value = _point_value()
 
         new_closed_trades = []
         closed_trade_size = 0.0
@@ -635,7 +640,7 @@ class Position:
                     delete = True
 
                     size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
-                    pnl = -size * (price - trade.entry_price)
+                    pnl = -size * (price - trade.entry_price) * point_value
 
                     # Copy and modify actual trade, because it can be partially filled
                     closed_trade = copy(trade)
@@ -652,8 +657,8 @@ class Position:
                         closed_trade.max_runup *= (1 - size_ratio)
 
                     # P/L from high/low to calculate drawdown and runup
-                    hprofit = (-size * (h - closed_trade.entry_price) - closed_trade.commission)
-                    lprofit = (-size * (l - closed_trade.entry_price) - closed_trade.commission)
+                    hprofit = -size * (h - closed_trade.entry_price) * point_value - closed_trade.commission
+                    lprofit = -size * (l - closed_trade.entry_price) * point_value - closed_trade.commission
 
                     # Drawdown and runup
                     drawdown = -min(hprofit, lprofit, 0.0)
@@ -706,7 +711,7 @@ class Position:
                         closed_trade.profit -= closed_trade.commission
 
                     # Profit percent
-                    entry_value = abs(closed_trade.size) * closed_trade.entry_price
+                    entry_value = abs(closed_trade.size) * closed_trade.entry_price * point_value
                     try:
                         # Use closed_trade.profit which includes commission, not pnl which doesn't
                         closed_trade.profit_percent = (closed_trade.profit / entry_value) * 100.0
@@ -753,7 +758,7 @@ class Position:
                         self.avg_price = self.entry_summ / abs(self.size)
 
                         # Unrealized P&L
-                        self.openprofit = self.size * (self.c - self.avg_price)
+                        self.openprofit = self.size * (self.c - self.avg_price) * point_value
                     else:
                         # If position has just closed
                         self.avg_price = na_float
@@ -805,7 +810,7 @@ class Position:
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self.entry_summ = price * abs(overshoot_trade.size)
                 self.avg_price = price
-                self.openprofit = self.size * (self.c - self.avg_price)
+                self.openprofit = self.size * (self.c - self.avg_price) * point_value
                 if not new_closed_trades:
                     self.entry_equity = self.equity
                     self.max_equity = max(self.max_equity, self.equity)
@@ -861,7 +866,7 @@ class Position:
             except ZeroDivisionError:
                 self.avg_price = na_float
             # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price)
+            self.openprofit = self.size * (self.c - self.avg_price) * point_value
             # Commission summ
             self.open_commission += commission
 
@@ -1143,9 +1148,10 @@ class Position:
             return False
 
         quantity = abs(self.size)
+        point_value = _point_value()
 
-        money_spent = quantity * self.avg_price
-        mvs = quantity * check_price
+        money_spent = quantity * self.avg_price * point_value
+        mvs = quantity * check_price * point_value
 
         open_profit = mvs - money_spent
         if self.sign < 0:
@@ -1160,7 +1166,7 @@ class Position:
             return False
 
         loss = available_funds / margin_ratio
-        cover_amount = int(loss / check_price)
+        cover_amount = int(loss / (check_price * point_value))
         margin_call_size = max(1, abs(cover_amount) * 4)
 
         if margin_call_size > quantity:
@@ -1169,7 +1175,7 @@ class Position:
         # Deferral check: mc_size==1 at first OHLC extremum, check if AF@C<0
         # Skip deferral when check_price == close: no recovery possible at same price
         if not at_open and can_defer and margin_call_size == 1 and check_price != self.c:
-            c_mvs = quantity * self.c
+            c_mvs = quantity * self.c * point_value
             c_open_profit = c_mvs - money_spent
             if self.sign < 0:
                 c_open_profit = -c_open_profit
@@ -1318,6 +1324,7 @@ class Position:
 
         # Get script reference for slippage
         script = lib._script
+        point_value = _point_value()
 
         # Skip market exit order processing if there's no open position (TradingView behavior)
         if not self.open_trades:
@@ -1432,15 +1439,15 @@ class Position:
                     margin_ratio = margin_percent / 100.0
                     if self.size == 0.0:
                         equity = script.initial_capital + self.netprofit
-                        margin_needed = abs(order.size) * fill_price * margin_ratio
+                        margin_needed = abs(order.size) * fill_price * point_value * margin_ratio
                         if margin_needed > equity:
                             self._remove_order(order)
                             continue
                     elif self.sign == order.sign:
                         new_qty = abs(self.size) + abs(order.size)
                         money_spent = (abs(self.size) * self.avg_price
-                                       + abs(order.size) * fill_price)
-                        mvs = new_qty * fill_price
+                                       + abs(order.size) * fill_price) * point_value
+                        mvs = new_qty * fill_price * point_value
                         open_profit = ((mvs - money_spent) if self.sign > 0
                                        else (money_spent - mvs))
                         equity = script.initial_capital + self.netprofit + open_profit
@@ -1645,17 +1652,19 @@ class Position:
         """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
+            point_value = _point_value()
+
             # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price)
+            self.openprofit = self.size * (self.c - self.avg_price) * point_value
 
             # Calculate open drawdowns and runups
             for trade in self.open_trades:
                 # Profit of trade
-                trade.profit = trade.size * (self.c - trade.entry_price) - 2 * trade.commission
+                trade.profit = trade.size * (self.c - trade.entry_price) * point_value - 2 * trade.commission
 
                 # P/L from high/low to calculate drawdown and runup
-                hprofit = trade.size * (self.h - self.avg_price) - trade.commission
-                lprofit = trade.size * (self.l - self.avg_price) - trade.commission
+                hprofit = trade.size * (self.h - self.avg_price) * point_value - trade.commission
+                lprofit = trade.size * (self.l - self.avg_price) * point_value - trade.commission
                 # Drawdown
                 drawdown = -min(hprofit, lprofit, 0.0)
                 trade.max_drawdown = max(drawdown, trade.max_drawdown)
@@ -1664,7 +1673,7 @@ class Position:
                 trade.max_runup = max(runup, trade.max_runup)
 
                 # Calculate percentage values for drawdown and runup
-                trade_value = abs(trade.size) * trade.entry_price
+                trade_value = abs(trade.size) * trade.entry_price * point_value
                 if trade_value > 0:
                     # Calculate drawdown percentage
                     trade.max_drawdown_percent = max(
