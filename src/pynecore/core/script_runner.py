@@ -12,6 +12,7 @@ from pynecore.core.strategy_stats import calculate_strategy_statistics, write_st
 from pynecore.types import script_type
 
 if TYPE_CHECKING:
+    from multiprocessing import Process
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
     from pynecore.lib.strategy import Trade  # noqa
@@ -342,7 +343,7 @@ class ScriptRunner:
         sec_contexts: dict[str, dict] | None = getattr(
             self.script_module, '__security_contexts__', None
         )
-        sec_processes: list = []
+        sec_processes: 'dict[str, Process]' = {}
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
         sec_sync_block = None
@@ -432,7 +433,7 @@ class ScriptRunner:
                         daemon=True,
                     )
                     proc.start()
-                    sec_processes.append(proc)
+                    sec_processes[sid] = proc
 
                 # Callback for lazy resolution of deferred security contexts
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
@@ -491,6 +492,7 @@ class ScriptRunner:
                     no_process_ids=no_process_ids,
                     result_blocks=sec_result_blocks if same_context_ids else None,
                     currency_conversions=currency_conversions or None,
+                    sec_processes=sec_processes,
                 )
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)
@@ -757,7 +759,7 @@ class ScriptRunner:
                 for state in sec_states.values():
                     state.stop_event.set()
                     state.advance_event.set()  # wake up if waiting
-                for p in sec_processes:
+                for p in sec_processes.values():
                     p.join(timeout=5)
                     if p.is_alive():
                         p.terminate()
