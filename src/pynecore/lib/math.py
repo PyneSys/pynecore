@@ -264,7 +264,10 @@ def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat:
     """
     if isinstance(number, NA):
         return NA(float)
-    return int(number / syminfo.mintick + 0.5) / syminfo.pricescale
+    # `mintick = minmove / pricescale` (Pine syminfo). Reconstruct via int math so
+    # `minmove=1` paths stay bit-identical to the old formula, while `minmove != 1`
+    # symbols (e.g. QM1!: mintick=0.025, pricescale=1000, minmove=25) round correctly.
+    return int(number / syminfo.mintick + 0.5) * syminfo.minmove / syminfo.pricescale
 
 
 def sign(number: TFI | NA[TFI]) -> PyneFloat:

@@ -274,30 +274,40 @@ class PriceOrderBook:
         self.order_prices = defaultdict(set)  # Order -> {prices}
 
     def add_order(self, order: Order):
-        """Add order to all its relevant price levels"""
+        """Add order to all its relevant price levels.
+
+        Idempotent per (order, price): callers that re-invoke after materializing
+        an additional side (e.g. close-pass / `_process_at_bar_open` resolving
+        `loss_ticks` on an exit that already had an explicit `limit`) won't
+        double-index the side that was already in the book. `remove_order`
+        only removes one occurrence per price level, so a duplicate could
+        otherwise survive past `_remove_order` and re-fill on the next bar.
+        """
+        existing = self.order_prices[order]
+
         # Add to stop price if exists
-        if order.stop is not None:
+        if order.stop is not None and order.stop not in existing:
             price = order.stop
             if price not in self.orders_at_price:
                 insort(self.price_levels, price)
             self.orders_at_price[price].append(order)
-            self.order_prices[order].add(price)
+            existing.add(price)
 
         # Add to limit price if exists
-        if order.limit is not None:
+        if order.limit is not None and order.limit not in existing:
             price = order.limit
             if price not in self.orders_at_price:
                 insort(self.price_levels, price)
             self.orders_at_price[price].append(order)
-            self.order_prices[order].add(price)
+            existing.add(price)
 
         # Add to trail price if exists
-        if order.trail_price is not None:
+        if order.trail_price is not None and order.trail_price not in existing:
             price = order.trail_price
             if price not in self.orders_at_price:
                 insort(self.price_levels, price)
             self.orders_at_price[price].append(order)
-            self.order_prices[order].add(price)
+            existing.add(price)
 
     def remove_order(self, order: Order):
         """Remove order from all price levels"""
@@ -617,6 +627,8 @@ class Position:
         script = lib._script
         commission_type = script.commission_type
         commission_value = script.commission_value
+        # USD value per 1.0-point move per 1 contract — futures-aware PnL conversion factor
+        pv = syminfo.pointvalue
 
         new_closed_trades = []
         closed_trade_size = 0.0
@@ -635,7 +647,7 @@ class Position:
                     delete = True
 
                     size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
-                    pnl = -size * (price - trade.entry_price)
+                    pnl = -size * (price - trade.entry_price) * pv
 
                     # Copy and modify actual trade, because it can be partially filled
                     closed_trade = copy(trade)
@@ -652,8 +664,8 @@ class Position:
                         closed_trade.max_runup *= (1 - size_ratio)
 
                     # P/L from high/low to calculate drawdown and runup
-                    hprofit = (-size * (h - closed_trade.entry_price) - closed_trade.commission)
-                    lprofit = (-size * (l - closed_trade.entry_price) - closed_trade.commission)
+                    hprofit = (-size * (h - closed_trade.entry_price) * pv - closed_trade.commission)
+                    lprofit = (-size * (l - closed_trade.entry_price) * pv - closed_trade.commission)
 
                     # Drawdown and runup
                     drawdown = -min(hprofit, lprofit, 0.0)
@@ -695,7 +707,7 @@ class Position:
                         # Calculate exit commission based on commission type
                         if commission_type == _commission.percent:
                             # For percentage commission, multiply by exit price
-                            commission = abs(size) * price * commission_value * 0.01
+                            commission = abs(size) * price * pv * commission_value * 0.01
                         else:
                             # For other types (shouldn't reach here normally)
                             commission = abs(size) * commission_value
@@ -705,8 +717,8 @@ class Position:
                         self.netprofit -= commission
                         closed_trade.profit -= closed_trade.commission
 
-                    # Profit percent
-                    entry_value = abs(closed_trade.size) * closed_trade.entry_price
+                    # Profit percent — both profit and entry_value are in USD
+                    entry_value = abs(closed_trade.size) * closed_trade.entry_price * pv
                     try:
                         # Use closed_trade.profit which includes commission, not pnl which doesn't
                         closed_trade.profit_percent = (closed_trade.profit / entry_value) * 100.0
@@ -753,7 +765,7 @@ class Position:
                         self.avg_price = self.entry_summ / abs(self.size)
 
                         # Unrealized P&L
-                        self.openprofit = self.size * (self.c - self.avg_price)
+                        self.openprofit = self.size * (self.c - self.avg_price) * pv
                     else:
                         # If position has just closed
                         self.avg_price = na_float
@@ -805,7 +817,7 @@ class Position:
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self.entry_summ = price * abs(overshoot_trade.size)
                 self.avg_price = price
-                self.openprofit = self.size * (self.c - self.avg_price)
+                self.openprofit = self.size * (self.c - self.avg_price) * pv
                 if not new_closed_trades:
                     self.entry_equity = self.equity
                     self.max_equity = max(self.max_equity, self.equity)
@@ -818,7 +830,7 @@ class Position:
                 if commission_type == _commission.cash_per_order:
                     commission = commission_value
                 elif commission_type == _commission.percent:
-                    commission = abs(order.size) * price * commission_value * 0.01
+                    commission = abs(order.size) * price * pv * commission_value * 0.01
                 elif commission_type == _commission.cash_per_contract:
                     commission = abs(order.size) * commission_value
                 else:  # Should not be here!
@@ -861,7 +873,7 @@ class Position:
             except ZeroDivisionError:
                 self.avg_price = na_float
             # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price)
+            self.openprofit = self.size * (self.c - self.avg_price) * pv
             # Commission summ
             self.open_commission += commission
 
@@ -1143,9 +1155,11 @@ class Position:
             return False
 
         quantity = abs(self.size)
+        # Convert price * quantity to account-currency for margin/equity comparisons.
+        pv = syminfo.pointvalue
 
-        money_spent = quantity * self.avg_price
-        mvs = quantity * check_price
+        money_spent = quantity * self.avg_price * pv
+        mvs = quantity * check_price * pv
 
         open_profit = mvs - money_spent
         if self.sign < 0:
@@ -1160,7 +1174,8 @@ class Position:
             return False
 
         loss = available_funds / margin_ratio
-        cover_amount = int(loss / check_price)
+        # One contract is worth `check_price * pv` in account currency.
+        cover_amount = int(loss / (check_price * pv))
         margin_call_size = max(1, abs(cover_amount) * 4)
 
         if margin_call_size > quantity:
@@ -1169,7 +1184,7 @@ class Position:
         # Deferral check: mc_size==1 at first OHLC extremum, check if AF@C<0
         # Skip deferral when check_price == close: no recovery possible at same price
         if not at_open and can_defer and margin_call_size == 1 and check_price != self.c:
-            c_mvs = quantity * self.c
+            c_mvs = quantity * self.c * pv
             c_open_profit = c_mvs - money_spent
             if self.sign < 0:
                 c_open_profit = -c_open_profit
@@ -1430,17 +1445,20 @@ class Position:
                                   else script.margin_long)
                 if margin_percent > 0:
                     margin_ratio = margin_percent / 100.0
+                    # Margin/equity live in account currency; convert price * qty into
+                    # account-currency units via the futures pointvalue.
+                    pv = syminfo.pointvalue
                     if self.size == 0.0:
                         equity = script.initial_capital + self.netprofit
-                        margin_needed = abs(order.size) * fill_price * margin_ratio
+                        margin_needed = abs(order.size) * fill_price * pv * margin_ratio
                         if margin_needed > equity:
                             self._remove_order(order)
                             continue
                     elif self.sign == order.sign:
                         new_qty = abs(self.size) + abs(order.size)
                         money_spent = (abs(self.size) * self.avg_price
-                                       + abs(order.size) * fill_price)
-                        mvs = new_qty * fill_price
+                                       + abs(order.size) * fill_price) * pv
+                        mvs = new_qty * fill_price * pv
                         open_profit = ((mvs - money_spent) if self.sign > 0
                                        else (money_spent - mvs))
                         equity = script.initial_capital + self.netprofit + open_profit
@@ -1645,17 +1663,20 @@ class Position:
         """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
+            # USD value per 1.0-point move per 1 contract — futures-aware PnL conversion factor
+            pv = syminfo.pointvalue
+
             # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price)
+            self.openprofit = self.size * (self.c - self.avg_price) * pv
 
             # Calculate open drawdowns and runups
             for trade in self.open_trades:
                 # Profit of trade
-                trade.profit = trade.size * (self.c - trade.entry_price) - 2 * trade.commission
+                trade.profit = trade.size * (self.c - trade.entry_price) * pv - 2 * trade.commission
 
                 # P/L from high/low to calculate drawdown and runup
-                hprofit = trade.size * (self.h - self.avg_price) - trade.commission
-                lprofit = trade.size * (self.l - self.avg_price) - trade.commission
+                hprofit = trade.size * (self.h - self.avg_price) * pv - trade.commission
+                lprofit = trade.size * (self.l - self.avg_price) * pv - trade.commission
                 # Drawdown
                 drawdown = -min(hprofit, lprofit, 0.0)
                 trade.max_drawdown = max(drawdown, trade.max_drawdown)
@@ -1663,8 +1684,8 @@ class Position:
                 runup = max(hprofit, lprofit, 0.0)
                 trade.max_runup = max(runup, trade.max_runup)
 
-                # Calculate percentage values for drawdown and runup
-                trade_value = abs(trade.size) * trade.entry_price
+                # Calculate percentage values for drawdown and runup — both in USD
+                trade_value = abs(trade.size) * trade.entry_price * pv
                 if trade_value > 0:
                     # Calculate drawdown percentage
                     trade.max_drawdown_percent = max(
@@ -1705,6 +1726,276 @@ class Position:
 
                 # Modify entry equity, for max drawdown and runup
                 self.entry_equity += closed_trade.profit
+
+    def process_orders_at_close(self):
+        """
+        Optional post-script pass that fills current-bar-submitted orders at the bar's
+        CLOSE — enabled by `script.process_orders_on_close=True`.
+
+        Pine semantics: when the flag is set, orders placed during the strategy's bar
+        calculation get an additional fill attempt at the bar close, instead of waiting
+        for the next bar's open. This covers BOTH:
+          - Market orders: trivially executable at close.
+          - Limit/stop orders: executable when the close has reached/crossed the trigger
+            price. (Non-current-bar limit/stop orders already had their fair shake in
+            `_process_limit_stop_orders` during the H/L walk.)
+        Tick-based exit orders submitted on the current bar (`strategy.exit(profit=...,
+        loss=...)`) only carry `profit_ticks` / `loss_ticks` until the next bar's
+        `_process_at_bar_open` resolves them against the entry price. The close-pass
+        materializes those into `limit` / `stop` first so the trigger check sees them.
+
+        Fill price in every case is `self.c` (Pine fills price-based orders "when their
+        limit or stop price is hit on the close" — no trigger-price snap on the close
+        pass). Slippage matches the rest of the engine: applied to market and
+        stop-triggered fills, NOT to limit-triggered fills (Pine guarantees limit
+        orders fill at the limit price or better). `filled_by_type` is set on the
+        triggering order so `_fill_order` can attach the right exit comment.
+
+        Bookkeeping note: `_finalize_bar_pnl()` already ran in `process_orders()` for the
+        same bar. Re-running it here would double-count `cum_profit` / `entry_equity` for
+        already-settled `new_closed_trades` and dupe the `drawdown_summ` / `runup_summ`
+        contribution of open trades. Instead, we only settle cumulative stats for trades
+        that close DURING this pass (`_settle_close_pass_trades`). For positions opened
+        right at the close, the bar has no remaining H/L range — their per-trade
+        `profit` / `max_drawdown_percent` are intentionally left for the next bar's
+        `_finalize_bar_pnl()` to compute, when there will actually be a range to attribute.
+        """
+        script = lib._script
+        current_bar = int(lib.bar_index)
+        close = self.c
+
+        # Collect current-bar candidates: market orders (trivially eligible) and
+        # limit/stop orders whose trigger condition is already met by the close.
+        # Each entry carries the trigger kind so slippage / `filled_by_type` mirror
+        # the regular fill paths (`_check_high_stop` etc.).
+        # Use id() as the dedup key — order objects may live in multiple dicts.
+        candidates: list[tuple[Order, str]] = []
+        seen: set[int] = set()
+
+        def _materialize_tick_exit(order: Order) -> None:
+            """Resolve profit_ticks/loss_ticks against the matching open trade.
+
+            Mirrors `_process_at_bar_open`: exits submitted during this bar's main()
+            still carry the raw tick offsets — the close-pass trigger check needs
+            them as concrete limit/stop prices.
+            """
+            if order.profit_ticks is None and order.loss_ticks is None:
+                return
+            if order.limit is not None and order.stop is not None:
+                return
+            entry_price: float | None = None
+            for trade in self.open_trades:
+                if trade.entry_id == order.order_id:
+                    entry_price = trade.entry_price
+                    break
+            if entry_price is None:
+                return
+            direction = 1.0 if order.size < 0 else -1.0
+            changed = False
+            if order.profit_ticks is not None and order.limit is None:
+                order.limit = _price_round(
+                    entry_price + direction * syminfo.mintick * order.profit_ticks,
+                    direction,
+                )
+                changed = True
+            if order.loss_ticks is not None and order.stop is None:
+                order.stop = _price_round(
+                    entry_price - direction * syminfo.mintick * order.loss_ticks,
+                    -direction,
+                )
+                changed = True
+            # If we just resolved the order's price levels, index it in the
+            # orderbook (mirrors `_process_at_bar_open`). Without this, an order
+            # that fails the close-pass trigger check would persist with
+            # `limit`/`stop` set but absent from `PriceOrderBook`, so next bar's
+            # H/L walk would never see it (next bar's tick conversion is skipped
+            # because `limit`/`stop` are already non-None).
+            if changed:
+                self.orderbook.add_order(order)
+
+        def _add_market(order: Order):
+            oid = id(order)
+            if oid in seen or order.cancelled or order.bar_index != current_bar:
+                return
+            seen.add(oid)
+            candidates.append((order, 'market'))
+
+        def _add_trigger(order: Order):
+            oid = id(order)
+            if oid in seen or order.cancelled or order.bar_index != current_bar:
+                return
+            if order.is_market_order:
+                return
+            if order.order_type == _order_type_close:
+                _materialize_tick_exit(order)
+            trigger: str | None = None
+            if order.stop is not None:
+                if order.sign > 0 and close >= order.stop:
+                    trigger = 'stop'
+                elif order.sign < 0 and close <= order.stop:
+                    trigger = 'stop'
+            if trigger is None and order.limit is not None:
+                if order.sign > 0 and close <= order.limit:
+                    trigger = 'limit'
+                elif order.sign < 0 and close >= order.limit:
+                    trigger = 'limit'
+            if trigger is not None:
+                seen.add(oid)
+                candidates.append((order, trigger))
+
+        for order in list(self.market_orders.values()):
+            _add_market(order)
+        for order in list(self.entry_orders.values()):
+            _add_trigger(order)
+        for order in list(self.exit_orders.values()):
+            _add_trigger(order)
+
+        # Bar is closed; no further H/L range can occur after the fill. Use close for both
+        # so any close-pass exit attributes 0 extra drawdown/runup to itself this bar.
+        h_after = close
+        l_after = close
+
+        closed_before = len(self.new_closed_trades)
+        # Snapshot drawdown / runup accumulators: `_finalize_bar_pnl()` in
+        # `process_orders()` already booked the open-trade contribution for the full
+        # bar H/L. `_fill_order` would add the close-pass exit PnL to the same summs,
+        # double-counting the bar for any position that was already open at bar start.
+        # We restore the snapshot after the fill loop, before the close-pass settle.
+        drawdown_summ_before = self.drawdown_summ
+        runup_summ_before = self.runup_summ
+
+        def _apply_fill(order: Order, trigger: str) -> None:
+            """Run the per-candidate fill, mirroring `_process_at_bar_open`."""
+            if order.cancelled:
+                return
+            if order.order_type == _order_type_entry:
+                if order.limit is None and order.stop is None:
+                    # Pyramiding and flip-quantity handling — mirror `_process_at_bar_open`.
+                    if self.sign == order.sign:
+                        if script.pyramiding <= len(self.open_trades):
+                            self._remove_order(order)
+                            return
+                    elif self.size != 0.0:
+                        order.size -= self.size
+
+            # Slippage: market + stop fills get slipped against the order direction,
+            # limit fills do not (Pine guarantees limit price or better — matches
+            # `_check_high` / `_check_low`).
+            fill_price = close
+            if trigger != 'limit' and script.slippage > 0:
+                fill_price = close + syminfo.mintick * script.slippage * order.sign
+
+            # Pass trigger reason through to `_fill_order` so close-pass exits get the
+            # same `exit_comment` as their intrabar counterparts.
+            if trigger == 'stop':
+                order.filled_by_type = 'loss'
+            elif trigger == 'limit':
+                order.filled_by_type = 'profit'
+
+            if order.order_type == _order_type_entry:
+                margin_percent = (script.margin_short if order.sign < 0
+                                  else script.margin_long)
+                if margin_percent > 0:
+                    margin_ratio = margin_percent / 100.0
+                    # Same pointvalue conversion as _process_at_bar_open — margin and
+                    # equity live in account currency, not price units.
+                    pv = syminfo.pointvalue
+                    if self.size == 0.0:
+                        equity = script.initial_capital + self.netprofit
+                        margin_needed = abs(order.size) * fill_price * pv * margin_ratio
+                        if margin_needed > equity:
+                            self._remove_order(order)
+                            return
+                    elif self.sign == order.sign:
+                        new_qty = abs(self.size) + abs(order.size)
+                        money_spent = (abs(self.size) * self.avg_price
+                                       + abs(order.size) * fill_price) * pv
+                        mvs = new_qty * fill_price * pv
+                        open_profit = ((mvs - money_spent) if self.sign > 0
+                                       else (money_spent - mvs))
+                        equity = script.initial_capital + self.netprofit + open_profit
+                        margin_needed = mvs * margin_ratio
+                        if margin_needed > equity:
+                            self._remove_order(order)
+                            return
+
+            self.fill_order(order, fill_price, h_after, l_after)
+
+        # Phase 1: fill the initial candidates (market entries, previously-open
+        # tick exits, current-bar limit/stop orders already executable at close).
+        for order, trigger in candidates:
+            _apply_fill(order, trigger)
+
+        # Phase 2: a current-bar entry may have just filled in Phase 1, opening a
+        # trade whose `entry_price` lets us resolve a same-bar `strategy.exit(...,
+        # profit=..., loss=...)` order whose ticks were unresolved before Phase 1.
+        # Mirror `_process_at_bar_open` line 1467-1490 — re-scan exit_orders for
+        # current-bar tick exits, materialize, and fill any newly executable.
+        for order in list(self.exit_orders.values()):
+            oid = id(order)
+            if oid in seen or order.cancelled or order.bar_index != current_bar:
+                continue
+            if order.is_market_order:
+                continue
+            if order.profit_ticks is None and order.loss_ticks is None:
+                continue
+            _materialize_tick_exit(order)
+            trigger2: str | None = None
+            if order.stop is not None:
+                if order.sign > 0 and close >= order.stop:
+                    trigger2 = 'stop'
+                elif order.sign < 0 and close <= order.stop:
+                    trigger2 = 'stop'
+            if trigger2 is None and order.limit is not None:
+                if order.sign > 0 and close <= order.limit:
+                    trigger2 = 'limit'
+                elif order.sign < 0 and close >= order.limit:
+                    trigger2 = 'limit'
+            if trigger2 is not None:
+                seen.add(oid)
+                _apply_fill(order, trigger2)
+
+        # Discard the close-pass `_fill_order` contributions to drawdown_summ / runup_summ:
+        # the same bar's H/L range is already booked for these trades by the earlier
+        # `_finalize_bar_pnl()` call. The drop-on-the-floor edge case is a brand-new
+        # trade that opens AND closes within the same close pass — extremely unlikely
+        # and its H/L would be 0 anyway since the bar has no remaining range.
+        self.drawdown_summ = drawdown_summ_before
+        self.runup_summ = runup_summ_before
+
+        # Incrementally settle only the trades that closed during the close pass;
+        # everything settled by `process_orders()` earlier in this bar stays untouched.
+        if len(self.new_closed_trades) > closed_before:
+            self._settle_close_pass_trades(closed_before)
+
+    def _settle_close_pass_trades(self, closed_before: int):
+        """
+        Apply cumulative bookkeeping for trades that closed during `process_orders_at_close`.
+
+        Mirrors the per-closed-trade cum_profit / entry_equity update tail of
+        `_finalize_bar_pnl()`, but only for new_closed_trades appended after the close
+        pass started — the earlier entries were already settled when `process_orders()`
+        ran for this same bar. Position-level max_drawdown / max_runup is intentionally
+        NOT re-rolled here: the bar's H/L drawdown_summ / runup_summ contribution was
+        already booked by `_finalize_bar_pnl()` against the open trades (which include
+        the trades that close here, since they were opened on this same bar), and the
+        close-pass `_fill_order` additions to those summs were discarded above. Re-
+        applying the snapshot would inflate `max_drawdown` whenever `entry_equity` had
+        already advanced (e.g. a losing regular-pass close shrank `entry_equity`).
+        """
+        initial_capital = lib._script.initial_capital
+        for closed_trade in self.new_closed_trades[closed_before:]:
+            self.cum_profit += closed_trade.profit
+            closed_trade.cum_profit = self.cum_profit
+            closed_trade.cum_max_drawdown = self.max_drawdown
+            closed_trade.cum_max_runup = self.max_runup
+            try:
+                closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
+            except ZeroDivisionError:
+                closed_trade.cum_profit_percent = 0.0
+            # Entry equity must roll AFTER the max_drawdown/runup snapshot above —
+            # same ordering as `_finalize_bar_pnl()`.
+            self.entry_equity += closed_trade.profit
 
     def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV):
         """
@@ -1793,6 +2084,10 @@ def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     """
     Round price to the nearest tick (floor if direction < 0, ceil otherwise)
 
+    Uses `minmove / pricescale` (matches `lib.math.round_to_mintick`), so symbols
+    with `minmove != 1` (e.g. QM1!: pricescale=1000, minmove=25, tick=0.025) snap
+    to the actual tick grid instead of `1 / pricescale`.
+
     :param price: The price to round
     :param direction: The direction of the price
     :return: The rounded price
@@ -1800,10 +2095,11 @@ def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     if isinstance(price, NA):
         return na_float
     pricescale = syminfo.pricescale
-    pmp = round(price * pricescale, 7)
+    minmove = syminfo.minmove
+    tick_count = round(price * pricescale / minmove, 7)
     if direction < 0:
-        return int(pmp) / pricescale
-    return math.ceil(pmp) / pricescale
+        return int(tick_count) * minmove / pricescale
+    return math.ceil(tick_count) * minmove / pricescale
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
@@ -2018,7 +2314,8 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             slippage_amount = script.slippage * syminfo.mintick
             expected_price = position.c + slippage_amount * direction_sign
             equity = script.initial_capital + position.netprofit + position.openprofit
-            margin_needed = abs(size) * expected_price * margin_ratio
+            # Margin/equity are in account currency — convert via pointvalue.
+            margin_needed = abs(size) * expected_price * syminfo.pointvalue * margin_ratio
             if margin_needed > equity:
                 return
 
