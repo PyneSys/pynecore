@@ -1093,3 +1093,77 @@ def __test_open_run_does_not_adopt_closed_orders__(tmp_path: Path) -> None:
             assert owner['run_instance_id'] == prior_run_instance_id
         finally:
             ctx_b.close()
+
+
+def __test_adopt_orphans_emits_single_summary_info__(
+        tmp_path: Path, caplog,
+) -> None:
+    """Adoption stays quiet at WARNING and emits one summary INFO line.
+
+    Operators do not need to see every per-row supersede/adopt entry —
+    those are forensic and live in the ``events`` table. The user-
+    visible signal is a single INFO line counting adopted rows.
+    """
+    import logging as _logging
+
+    db = tmp_path / "broker.sqlite"
+
+    # Plant two prior orphan rows under run A and stale the heartbeat.
+    with BrokerStore(db, plugin_name=PLUGIN) as store_a:
+        ctx_a = _open_run(store_a)
+        coid_kept = _coid(ctx_a, "KeptLong")
+        coid_dup = _coid(ctx_a, "DupLong")
+        for coid in (coid_kept, coid_dup):
+            ctx_a.upsert_order(
+                coid, symbol="EURUSD", side="buy", qty=1.0,
+                state=STATE_CONFIRMED,
+                intent_key=coid, pine_entry_id=coid,
+                extras={'kind': ENTRY_KIND_POSITION, 'order_type': 'market'},
+            )
+        store_a._conn.execute(
+            "UPDATE runs SET last_heartbeat_ts_ms = 1 "
+            "WHERE run_instance_id = ?",
+            (ctx_a.run_instance_id,),
+        )
+        store_a._conn.commit()
+
+    caplog.set_level(_logging.DEBUG, logger="pynecore.core.broker.storage")
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_b:
+        ctx_b = _open_run(store_b)
+        try:
+            warning_lines = [
+                rec for rec in caplog.records
+                if rec.name == "pynecore.core.broker.storage"
+                and rec.levelno == _logging.WARNING
+                and (
+                    "adopted" in rec.getMessage()
+                    or "superseded" in rec.getMessage()
+                )
+            ]
+            assert warning_lines == [], (
+                "Adoption must not emit WARNING-level lines per row "
+                "(forensic data lives in the events table)"
+            )
+
+            info_lines = [
+                rec for rec in caplog.records
+                if rec.name == "pynecore.core.broker.storage"
+                and rec.levelno == _logging.INFO
+                and "adopted" in rec.getMessage()
+            ]
+            assert len(info_lines) == 1, (
+                f"Expected exactly one summary INFO line, got "
+                f"{[r.getMessage() for r in info_lines]!r}"
+            )
+            assert "2 order(s)" in info_lines[0].getMessage()
+
+            # Audit events still recorded — both adopted, no supersede
+            # because each COID is unique across instances.
+            n_adopted = store_b._conn.execute(
+                "SELECT COUNT(*) AS n FROM events "
+                "WHERE kind = 'order_adopted'",
+            ).fetchone()['n']
+            assert n_adopted == 2
+        finally:
+            ctx_b.close()

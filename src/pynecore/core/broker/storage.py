@@ -604,7 +604,10 @@ class BrokerStore:
                     }),
                 ),
             )
-            _log.warning(
+            # Forensic only — the operator has nothing to do with this.
+            # Full audit row lands in the ``events`` table as
+            # ``order_adopt_superseded``.
+            _log.debug(
                 "broker storage: superseded orphan order coid=%r from "
                 "run_instance_id=%d (state=%r) — newer prior instance "
                 "exists for the same run_id; closed to resolve ambiguity",
@@ -652,11 +655,20 @@ class BrokerStore:
                     }),
                 ),
             )
-            _log.info(
+            _log.debug(
                 "broker storage: adopted order coid=%r from "
                 "run_instance_id=%d to %d (state=%r)",
                 row['client_order_id'], row['prior_run_instance_id'],
                 new_run_instance_id, row['state'],
+            )
+
+        # Summary INFO so the operator sees a single, actionable line on a
+        # crash-recovery restart, while the per-row noise stays at DEBUG.
+        if adopted_coids:
+            _log.info(
+                "broker storage: adopted %d order(s) from %d prior "
+                "instance(s) of run_id; per-row details at DEBUG",
+                len(adopted_coids), len(adopted_priors),
             )
 
         return len(adopted_coids)
