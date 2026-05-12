@@ -6,7 +6,7 @@ import sys
 import tomllib
 
 from pathlib import Path
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, UTC, tzinfo
 from typing import Any
 
 from typer import Option, Argument, secho, Exit, colors
@@ -67,6 +67,11 @@ class CustomTimeRemainingColumn(ProgressColumn):
         seconds = remaining % 60
 
         return Text(f"{minutes:02d}:{seconds:06.3f}", style="cyan")
+
+
+def _exchange_display_time(timestamp: int | float, display_tz: tzinfo) -> datetime:
+    """Return an exchange-local naive timestamp for terminal display."""
+    return datetime.fromtimestamp(timestamp, UTC).astimezone(display_tz).replace(tzinfo=None)
 
 
 def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime | int | None:
@@ -876,9 +881,9 @@ def run(
                             extra.get('bid_close', candle.close),
                             extra.get('ask_close'),
                         )
-                        spinner_state['time'] = datetime.fromtimestamp(
-                            candle.timestamp, UTC,
-                        ).replace(tzinfo=None)
+                        spinner_state['time'] = _exchange_display_time(
+                            candle.timestamp, runner.tz,
+                        )
                         progress.update(task, description=_spinner_text())
 
                     try:
