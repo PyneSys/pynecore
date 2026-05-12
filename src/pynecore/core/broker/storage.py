@@ -420,7 +420,7 @@ class BrokerStore:
     ) -> 'RunContext':
         """Open a new run instance.
 
-        Three steps in a single transaction:
+        Four steps in a single transaction:
 
         1. Stale-run cleanup: every row marked alive whose
            ``last_heartbeat_ts_ms`` has expired is closed by setting
@@ -428,6 +428,16 @@ class BrokerStore:
         2. Live-collision check: if a live row with the same ``run_id``
            still exists after cleanup, raise ``RuntimeError``.
         3. INSERT a new ``runs`` row.
+        4. Order adoption: every live order
+           (``closed_ts_ms IS NULL``) and its ``order_refs`` rows
+           that still belong to a previous (now ended) instance of the
+           same logical ``run_id`` get re-pointed to the fresh
+           ``run_instance_id`` and audited via an ``order_adopted``
+           event. Without this step, ``iter_live_orders`` /
+           :func:`~pynecore.core.broker.store_helpers.find_pending_dispatch`
+           would not see pending dispatches left behind by a crashed
+           instance, and :meth:`DispatchJournal.recover_pending` would
+           return an empty result after a real restart.
 
         :param identity: Logical identity of the run
             (strategy, symbol, ...).
@@ -484,12 +494,172 @@ class BrokerStore:
                 # happy.
                 raise RuntimeError("sqlite3 lastrowid is None after INSERT")
 
+            # (4) Adopt orphan live orders + refs left behind by previous
+            #     instances of the same run_id (crash recovery).
+            self._adopt_orphan_rows_inside_tx(
+                now=now,
+                new_run_instance_id=run_instance_id,
+                run_id=run_id,
+            )
+
         return RunContext(
             run_id=run_id,
             run_instance_id=run_instance_id,
             run_tag=run_tag,
             _store=self,
         )
+
+    def _adopt_orphan_rows_inside_tx(
+            self, *, now: int, new_run_instance_id: int, run_id: str,
+    ) -> int:
+        """Re-point live orders + refs from previous instances onto the new one.
+
+        Caller owns the surrounding ``with self._conn`` block. Idempotent
+        for an empty input (no orphan rows → no-op). Every adopted COID
+        gets a per-row ``order_adopted`` audit event tied to the new
+        ``run_instance_id`` (the new owner), with a payload carrying the
+        ``prior_run_instance_id`` and ``prior_state`` for forensics.
+
+        Adoption only touches rows whose ``closed_ts_ms IS NULL`` — a
+        properly finalised order stays linked to the instance that
+        finalised it. ``order_refs`` rows for adopted COIDs follow the
+        same migration; refs for already-closed orders are left alone
+        (they will be cleaned up by the standard
+        :meth:`RunContext.close_order` path).
+
+        :return: Count of adopted COIDs (useful for tests / diagnostics).
+        """
+        all_orphan_rows = self._conn.execute(
+            "SELECT o.run_instance_id AS prior_run_instance_id, "
+            "       o.client_order_id, o.exchange_order_id, "
+            "       o.intent_key, o.state "
+            "FROM orders o "
+            "JOIN runs r ON o.run_instance_id = r.run_instance_id "
+            "WHERE r.run_id = ? "
+            "  AND o.run_instance_id != ? "
+            "  AND o.closed_ts_ms IS NULL "
+            "ORDER BY o.run_instance_id DESC",
+            (run_id, new_run_instance_id),
+        ).fetchall()
+        if not all_orphan_rows:
+            return 0
+
+        # Deduplicate by COID. Repeated crash/restart cycles before
+        # adoption existed could leave the same live ``client_order_id``
+        # under multiple ended ``run_instance_id``s of this ``run_id``.
+        # The PRIMARY KEY ``(run_instance_id, client_order_id)`` forbids
+        # collapsing them onto ``new_run_instance_id`` in a single UPDATE,
+        # so adopt only the most recent prior instance's row (the highest
+        # ``run_instance_id``) and terminalize the older duplicates with
+        # ``closed_ts_ms`` so they vanish from recovery's view.
+        adopted_rows: list = []
+        superseded_rows: list = []
+        seen_coids: set[str] = set()
+        for row in all_orphan_rows:
+            coid = row['client_order_id']
+            if coid in seen_coids:
+                superseded_rows.append(row)
+            else:
+                seen_coids.add(coid)
+                adopted_rows.append(row)
+
+        adopted_priors = sorted({row['prior_run_instance_id'] for row in adopted_rows})
+        adopted_coids = sorted({row['client_order_id'] for row in adopted_rows})
+        adopted_prior_placeholders = ','.join('?' * len(adopted_priors))
+        coid_placeholders = ','.join('?' * len(adopted_coids))
+
+        # Close superseded duplicates BEFORE migrating the canonical
+        # rows, so the UPDATE below cannot accidentally pick them up via
+        # the ``run_instance_id IN (...)`` predicate. Also drop their
+        # ``order_refs`` rows — leaving them attached to the closed prior
+        # instance would still collide with the canonical refs once they
+        # land on ``new_run_instance_id`` (PK includes ``ref_value``).
+        for row in superseded_rows:
+            self._conn.execute(
+                "UPDATE orders SET closed_ts_ms = ?, updated_ts_ms = ? "
+                "WHERE run_instance_id = ? AND client_order_id = ? "
+                "  AND closed_ts_ms IS NULL",
+                (now, now,
+                 row['prior_run_instance_id'], row['client_order_id']),
+            )
+            self._conn.execute(
+                "DELETE FROM order_refs "
+                "WHERE run_instance_id = ? AND client_order_id = ?",
+                (row['prior_run_instance_id'], row['client_order_id']),
+            )
+            self._conn.execute(
+                "INSERT INTO events ("
+                "  run_instance_id, ts_ms, plugin_name, kind,"
+                "  client_order_id, exchange_order_id, intent_key, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_run_instance_id, now, self._plugin_name,
+                    'order_adopt_superseded',
+                    row['client_order_id'],
+                    row['exchange_order_id'],
+                    row['intent_key'],
+                    json.dumps({
+                        'prior_run_instance_id': row['prior_run_instance_id'],
+                        'prior_state': row['state'],
+                    }),
+                ),
+            )
+            _log.warning(
+                "broker storage: superseded orphan order coid=%r from "
+                "run_instance_id=%d (state=%r) — newer prior instance "
+                "exists for the same run_id; closed to resolve ambiguity",
+                row['client_order_id'], row['prior_run_instance_id'],
+                row['state'],
+            )
+
+        # Migrate the canonical orders rows.
+        self._conn.execute(
+            f"UPDATE orders SET run_instance_id = ?, updated_ts_ms = ? "
+            f"WHERE run_instance_id IN ({adopted_prior_placeholders}) "
+            f"  AND client_order_id IN ({coid_placeholders}) "
+            f"  AND closed_ts_ms IS NULL",
+            (new_run_instance_id, now, *adopted_priors, *adopted_coids),
+        )
+
+        # Migrate the order_refs rows for the same COIDs. order_refs has
+        # PRIMARY KEY (run_instance_id, ref_type, ref_value) — colliding
+        # refs from superseded duplicates would also fail the UPDATE, so
+        # restrict the migration to refs belonging to the canonical prior
+        # instances only.
+        self._conn.execute(
+            f"UPDATE order_refs SET run_instance_id = ? "
+            f"WHERE run_instance_id IN ({adopted_prior_placeholders}) "
+            f"  AND client_order_id IN ({coid_placeholders})",
+            (new_run_instance_id, *adopted_priors, *adopted_coids),
+        )
+
+        # Per-COID audit event under the NEW run_instance_id.
+        for row in adopted_rows:
+            self._conn.execute(
+                "INSERT INTO events ("
+                "  run_instance_id, ts_ms, plugin_name, kind,"
+                "  client_order_id, exchange_order_id, intent_key, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_run_instance_id, now, self._plugin_name,
+                    'order_adopted',
+                    row['client_order_id'],
+                    row['exchange_order_id'],
+                    row['intent_key'],
+                    json.dumps({
+                        'prior_run_instance_id': row['prior_run_instance_id'],
+                        'prior_state': row['state'],
+                    }),
+                ),
+            )
+            _log.info(
+                "broker storage: adopted order coid=%r from "
+                "run_instance_id=%d to %d (state=%r)",
+                row['client_order_id'], row['prior_run_instance_id'],
+                new_run_instance_id, row['state'],
+            )
+
+        return len(adopted_coids)
 
     def cleanup_stale_runs(
             self, *, stale_threshold_ms: int = STALE_THRESHOLD_MS,
@@ -1042,6 +1212,32 @@ class RunContext:
                 "  created_ts_ms = excluded.created_ts_ms",
                 (self.run_instance_id, ref_type, ref_value, client_order_id, now),
             )
+
+    def iter_refs_for_coid(
+            self, client_order_id: str,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield ``(ref_type, ref_value)`` pairs for one COID.
+
+        Used by recovery to materialise all alias keys that were
+        durably recorded before a crash. The narrow but real crash
+        window is between ``add_ref(deal_reference, ...)`` (commits
+        the alias) and the subsequent ``upsert_order(extras={...})``
+        that mirrors it into ``orders.extras``: in that gap the
+        ``deal_reference`` is only present in ``order_refs``, and the
+        resume hook needs it to confirm the already-submitted order
+        against the exchange.
+
+        Filtered by the current ``run_instance_id`` — adoption (see
+        :meth:`BrokerStore.open_run`) already migrates orphan refs
+        into the live instance, so this matches the row's owner.
+        """
+        rows = self._store._conn.execute(
+            "SELECT ref_type, ref_value FROM order_refs "
+            "WHERE run_instance_id = ? AND client_order_id = ?",
+            (self.run_instance_id, client_order_id),
+        )
+        for row in rows:
+            yield row['ref_type'], row['ref_value']
 
     def find_by_ref(
             self, ref_type: str, ref_value: str,
