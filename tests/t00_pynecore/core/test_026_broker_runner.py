@@ -244,7 +244,7 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
         capabilities=ExchangeCapabilities(),
         startup_position=ExchangePosition(
             symbol="BTCUSDT", side="long", size=1.5, entry_price=50_000.0,
-            unrealized_pnl=0.0, liquidation_price=None,
+            unrealized_pnl=123.45, liquidation_price=None,
             leverage=1.0, margin_mode="cross",
         ),
     )
@@ -263,6 +263,7 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
     assert pos.size == 1.5
     assert pos.sign == 1.0
     assert pos.avg_price == 50_000.0
+    assert pos.openprofit == 123.45
 
 
 def __test_startup_validation_rejects_incompatible_script__(tmp_path):
@@ -301,6 +302,7 @@ def __test_startup_validation_accepts_compatible_script__(tmp_path):
     )
     # Must not raise.
     list(runner.run_iter())
+    assert runner.broker_balance == {"USDT": 1000.0}
 
 
 def __test_market_entry_dispatches_execute_entry__(tmp_path):

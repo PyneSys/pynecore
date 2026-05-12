@@ -831,6 +831,10 @@ class OrderSyncEngine:
         reference implementation.
         """
         exch_pos = self._run_async(self._broker.get_position(self._symbol))
+        if exch_pos is not None:
+            self._position.openprofit = float(exch_pos.unrealized_pnl)
+        elif self._position.size == 0.0:
+            self._position.openprofit = 0.0
         # The exchange is the single source of truth for position state.
         # ``get_position`` returns ``None`` when no row exists for the symbol,
         # which is functionally a flat position — fold both branches into one

@@ -638,7 +638,7 @@ def __test_reconcile_adopts_exchange_position_size__():
     b = MockBroker()
     b.position = ExchangePosition(
         symbol=SYMBOL, side="long", size=2.0, entry_price=50_000.0,
-        unrealized_pnl=0.0, liquidation_price=None,
+        unrealized_pnl=12.5, liquidation_price=None,
         leverage=1.0, margin_mode="isolated",
     )
     engine, pos = _mk_engine(b)
@@ -648,6 +648,7 @@ def __test_reconcile_adopts_exchange_position_size__():
 
     assert pos.size == 2.0
     assert pos.avg_price == 50_000.0
+    assert pos.openprofit == 12.5
 
 
 def __test_reconcile_clears_position_when_exchange_flat__():

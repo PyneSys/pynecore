@@ -87,6 +87,66 @@ class ExchangeClockColumn(ProgressColumn):
         return Text(f"Live — {display_time:%m-%d %H:%M:%S}", style="white")
 
 
+def _format_broker_value(value: float, *, signed: bool = False) -> str:
+    """Format broker spinner account metrics."""
+    if signed:
+        return f"{value:+,.2f}"
+    return f"{value:,.2f}"
+
+
+def _select_broker_balance(
+        balance: dict[str, float] | None,
+        preferred_currency: str | None,
+) -> tuple[str, float] | None:
+    """Pick the balance row to display in the live broker spinner."""
+    if not balance:
+        return None
+    if preferred_currency and preferred_currency in balance:
+        return preferred_currency, balance[preferred_currency]
+    if len(balance) == 1:
+        currency, value = next(iter(balance.items()))
+        return currency, value
+    currency = sorted(balance)[0]
+    return currency, balance[currency]
+
+
+def _broker_metrics_text(
+        position: Any,
+        balance: dict[str, float] | None,
+        preferred_currency: str | None,
+        bid: float | None,
+        ask: float | None,
+        fallback_price: float | None,
+) -> str:
+    """Return spinner text for broker equity and unrealized PnL."""
+    selected_balance = _select_broker_balance(balance, preferred_currency)
+    if selected_balance is None:
+        return ""
+    currency, equity = selected_balance
+
+    unrealized = 0.0
+    if position is not None:
+        unrealized = float(getattr(position, 'openprofit', 0.0) or 0.0)
+        open_trades = list(getattr(position, 'open_trades', []) or [])
+        if open_trades:
+            unrealized = 0.0
+            for trade in open_trades:
+                size = float(getattr(trade, 'size', 0.0) or 0.0)
+                entry_price = float(getattr(trade, 'entry_price', 0.0) or 0.0)
+                mark = bid if size >= 0.0 else ask
+                if mark is None:
+                    mark = fallback_price
+                if mark is None:
+                    continue
+                unrealized += (float(mark) - entry_price) * size
+
+    pnl_style = "green" if unrealized >= 0.0 else "red"
+    return (
+        f"Eq [cyan]{_format_broker_value(equity)} {currency}[/] "
+        f"UPnL [{pnl_style}]{_format_broker_value(unrealized, signed=True)}[/]"
+    )
+
+
 def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime | int | None:
     """
     Parse a --from or --to parameter value.
@@ -802,6 +862,7 @@ def run(
                 spinner_state: dict[str, Any] = {
                     'bid': None,
                     'ask': None,
+                    'price': None,
                     'last_mid': None,
                     'arrow': ' ',
                 }
@@ -824,13 +885,22 @@ def run(
                     bid = spinner_state['bid']
                     ask = spinner_state['ask']
                     d = price_decimals
+                    metrics = _broker_metrics_text(
+                        getattr(runner.script, 'position', None),
+                        runner.broker_balance,
+                        getattr(syminfo, 'currency', None),
+                        bid,
+                        ask,
+                        spinner_state['price'],
+                    )
+                    suffix = f"  {metrics}" if metrics else ""
                     if bid is not None and ask is not None:
                         arrow = spinner_state['arrow']
                         return (f"[green]{bid:.{d}f}[/] {arrow} "
-                                f"[red]{ask:.{d}f}[/]")
+                                f"[red]{ask:.{d}f}[/]{suffix}")
                     if bid is not None:
-                        return f"[green]{bid:.{d}f}[/]"
-                    return "Live streaming..."
+                        return f"[green]{bid:.{d}f}[/]{suffix}"
+                    return f"Live streaming...{suffix}"
 
                 # ``PYNE_NO_LIVE_SPINNER`` suppresses the per-tick spinner so
                 # systemd journals / Docker logs only carry whole log lines
@@ -885,6 +955,7 @@ def run(
 
                     def cb_tick_live(candle):
                         extra = candle.extra_fields or {}
+                        spinner_state['price'] = candle.close
                         # Prefer the live quote snapshot over ``candle.close``:
                         # on a closed OHLC bar ``candle.close`` is the previous
                         # period's bid-side close, not the current quote.

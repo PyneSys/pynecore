@@ -202,7 +202,8 @@ class ScriptRunner:
                  '_script_path', '_security_data', '_magnifier_iter',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
-                 '_broker_store_ctx', '_log_ohlcv', '_price_decimals')
+                 '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
+                 'broker_balance')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -292,6 +293,7 @@ class ScriptRunner:
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         self._engine_event_stream_future: Any = None
+        self.broker_balance: dict[str, float] | None = None
         if broker_plugin is not None:
             from pynecore.core.broker.position import BrokerPosition
             from pynecore.core.broker.run_identity import RunIdentity
@@ -538,6 +540,7 @@ class ScriptRunner:
                 self._broker_plugin.account_id,
                 balance,
             )
+            self.broker_balance = balance
 
         # Update syminfo lib properties if needed
         if not self.update_syminfo_every_run:
