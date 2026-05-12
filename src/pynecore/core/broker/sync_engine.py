@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
+    ExchangeConnectionError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -387,7 +388,14 @@ class OrderSyncEngine:
         # also called from contexts that don't pre-drain (e.g. tests, the
         # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
-        self._verify_pending_dispatches()
+        try:
+            self._verify_pending_dispatches()
+        except ExchangeConnectionError as e:
+            _blog_warning(
+                "sync skipped after pending dispatch verification connection error: %s",
+                e,
+            )
+            return
 
         raw = build_intents(
             self._position.entry_orders,
@@ -411,7 +419,13 @@ class OrderSyncEngine:
 
         self._sync_count += 1
         if self._reconcile_every and self._sync_count % self._reconcile_every == 0:
-            self.reconcile()
+            try:
+                self.reconcile()
+            except ExchangeConnectionError as e:
+                _blog_warning(
+                    "periodic reconcile skipped after connection error: %s",
+                    e,
+                )
 
     def _verify_pending_dispatches(self) -> None:
         """Match parked timeouts against the exchange's open-orders view.

@@ -19,6 +19,7 @@ from pynecore import lib
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
+    ExchangeConnectionError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -93,6 +94,8 @@ class MockBroker:
     raise_on_next_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
     raise_on_next_cancel: Exception | None = None
+    raise_on_next_get_open_orders: Exception | None = None
+    raise_on_next_get_position: Exception | None = None
     capabilities: ExchangeCapabilities = field(default_factory=ExchangeCapabilities)
     _next_id: int = 0
 
@@ -157,9 +160,17 @@ class MockBroker:
         return [self._mk_order(new, 't')]
 
     async def get_open_orders(self, symbol=None):
+        if self.raise_on_next_get_open_orders is not None:
+            err = self.raise_on_next_get_open_orders
+            self.raise_on_next_get_open_orders = None
+            raise err
         return list(self.open_orders)
 
     async def get_position(self, symbol):
+        if self.raise_on_next_get_position is not None:
+            err = self.raise_on_next_get_position
+            self.raise_on_next_get_position = None
+            raise err
         return self.position
 
     def watch_orders(self):
@@ -634,6 +645,34 @@ def __test_verify_pending_keeps_pending_when_not_found__():
     assert expected_coid in engine.pending_verification
 
 
+def __test_verify_pending_connection_error_keeps_pending__():
+    """A transient read failure must leave parked dispatches for the next sync."""
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
+
+    b = MockBroker()
+    b.raise_on_next_entry = OrderDispositionUnknownError(
+        "simulated timeout", client_order_id=expected_coid,
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    engine.sync(BAR_TS)
+    b.raise_on_next_get_open_orders = ExchangeConnectionError("dns failed")
+    pos.entry_orders["M"] = _entry_order("M", 1.0, limit=51_000.0)
+
+    engine.sync(BAR_TS + 60_000)
+
+    assert expected_coid in engine.pending_verification
+    assert len(b.entry_calls) == 1
+    assert "M" not in engine.active_intents
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert expected_coid in engine.pending_verification
+    assert len(b.entry_calls) == 2
+    assert b.entry_calls[-1].intent.pine_id == "M"
+
+
 def __test_reconcile_adopts_exchange_position_size__():
     b = MockBroker()
     b.position = ExchangePosition(
@@ -785,6 +824,35 @@ def __test_periodic_reconcile_does_not_adopt_size_increase__():
     engine.reconcile()
 
     assert pos.size == 0.0  # untouched — record_fill will own this update
+
+
+def __test_sync_skips_periodic_reconcile_connection_error__():
+    """Periodic read-side reconcile retries later instead of stopping live sync."""
+    from pynecore.lib.strategy import Trade
+
+    b = MockBroker()
+    b.raise_on_next_get_position = ExchangeConnectionError("dns failed")
+    engine, pos = _mk_engine(b)
+    engine._reconcile_every = 1
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+    pos.open_trades.append(Trade(
+        size=100.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=1.17, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    engine.sync(BAR_TS)
+
+    assert pos.size == 100.0
+    assert pos.open_trades
+
+    b.position = None
+    engine.sync(BAR_TS + 60_000)
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
 
 
 def __test_periodic_reconcile_skips_clear_while_close_in_flight__():
