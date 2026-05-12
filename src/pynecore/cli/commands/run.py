@@ -114,6 +114,7 @@ def _broker_metrics_text(
         position: Any,
         balance: dict[str, float] | None,
         preferred_currency: str | None,
+        price_decimals: int,
         bid: float | None,
         ask: float | None,
         fallback_price: float | None,
@@ -124,8 +125,22 @@ def _broker_metrics_text(
         return ""
     currency, equity = selected_balance
 
+    position_text = "Pos flat"
     unrealized = 0.0
     if position is not None:
+        position_size = float(getattr(position, 'size', 0.0) or 0.0)
+        if abs(position_size) > 1e-12:
+            avg_price = getattr(position, 'avg_price', None)
+            position_text = f"Pos {position_size:g}"
+            if avg_price is not None:
+                try:
+                    avg_price_float = float(avg_price)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if avg_price_float == avg_price_float and avg_price_float > 0.0:
+                        position_text += f" Entry {avg_price_float:.{price_decimals}f}"
+
         unrealized = float(getattr(position, 'openprofit', 0.0) or 0.0)
         open_trades = list(getattr(position, 'open_trades', []) or [])
         if open_trades:
@@ -143,6 +158,7 @@ def _broker_metrics_text(
     pnl_style = "green" if unrealized >= 0.0 else "red"
     return (
         f"Eq [cyan]{_format_broker_value(equity)} {currency}[/] "
+        f"{position_text} "
         f"UPnL [{pnl_style}]{_format_broker_value(unrealized, signed=True)}[/]"
     )
 
@@ -889,6 +905,7 @@ def run(
                         getattr(runner.script, 'position', None),
                         runner.broker_balance,
                         getattr(syminfo, 'currency', None),
+                        d,
                         bid,
                         ask,
                         spinner_state['price'],

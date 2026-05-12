@@ -36,6 +36,8 @@ def __test_elapsed_column_formats_tenths__():
 
 def __test_broker_metrics_text_uses_bid_for_long_unrealized_pnl__():
     position = SimpleNamespace(
+        size=2.0,
+        avg_price=100.0,
         netprofit=10.0,
         openprofit=0.0,
         open_trades=[SimpleNamespace(size=2.0, entry_price=100.0)],
@@ -43,14 +45,16 @@ def __test_broker_metrics_text_uses_bid_for_long_unrealized_pnl__():
 
     text = _broker_metrics_text(
         position, balance={"EUR": 996.21}, preferred_currency="EUR",
-        bid=102.0, ask=103.0, fallback_price=None,
+        price_decimals=5, bid=102.0, ask=103.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]996.21 EUR[/] UPnL [green]+4.00[/]"
+    assert text == "Eq [cyan]996.21 EUR[/] Pos 2 Entry 100.00000 UPnL [green]+4.00[/]"
 
 
 def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
     position = SimpleNamespace(
+        size=-3.0,
+        avg_price=100.0,
         netprofit=0.0,
         openprofit=0.0,
         open_trades=[SimpleNamespace(size=-3.0, entry_price=100.0)],
@@ -58,14 +62,16 @@ def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
 
     text = _broker_metrics_text(
         position, balance={"USDT": 1000.0}, preferred_currency="USDT",
-        bid=98.0, ask=99.0, fallback_price=None,
+        price_decimals=2, bid=98.0, ask=99.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]1,000.00 USDT[/] UPnL [green]+3.00[/]"
+    assert text == "Eq [cyan]1,000.00 USDT[/] Pos -3 Entry 100.00 UPnL [green]+3.00[/]"
 
 
 def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
     position = SimpleNamespace(
+        size=0.0,
+        avg_price=0.0,
         netprofit=0.0,
         openprofit=-12.34,
         open_trades=[],
@@ -73,7 +79,7 @@ def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
 
     text = _broker_metrics_text(
         position, balance={"EUR": 996.21}, preferred_currency="EUR",
-        bid=102.0, ask=103.0, fallback_price=None,
+        price_decimals=5, bid=102.0, ask=103.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]996.21 EUR[/] UPnL [red]-12.34[/]"
+    assert text == "Eq [cyan]996.21 EUR[/] Pos flat UPnL [red]-12.34[/]"
