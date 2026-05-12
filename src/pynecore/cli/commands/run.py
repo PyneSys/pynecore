@@ -40,18 +40,19 @@ console = Console()
 
 
 class CustomTimeElapsedColumn(ProgressColumn):
-    """Custom time elapsed column showing milliseconds."""
+    """Custom time elapsed column showing tenths of a second."""
 
     def render(self, task: Task) -> Text:
-        """Render the time elapsed with milliseconds."""
+        """Render the time elapsed with tenths of a second."""
         elapsed = task.elapsed
         if elapsed is None:
-            return Text("--:--.-", style="cyan")
+            return Text("--:--:--.-", style="cyan")
 
-        minutes = int(elapsed // 60)
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
         seconds = elapsed % 60
 
-        return Text(f"{minutes:02d}:{seconds:06.3f}", style="cyan")
+        return Text(f"{hours:02d}:{minutes:02d}:{seconds:04.1f}", style="cyan")
 
 
 class CustomTimeRemainingColumn(ProgressColumn):
@@ -72,6 +73,18 @@ class CustomTimeRemainingColumn(ProgressColumn):
 def _exchange_display_time(timestamp: int | float, display_tz: tzinfo) -> datetime:
     """Return an exchange-local naive timestamp for terminal display."""
     return datetime.fromtimestamp(timestamp, UTC).astimezone(display_tz).replace(tzinfo=None)
+
+
+class ExchangeClockColumn(ProgressColumn):
+    """Live exchange clock for the terminal spinner."""
+
+    def __init__(self, display_tz: tzinfo):
+        super().__init__()
+        self.display_tz = display_tz
+
+    def render(self, task: Task) -> Text:
+        display_time = _exchange_display_time(time.time(), self.display_tz)
+        return Text(f"Live — {display_time:%m-%d %H:%M:%S}", style="white")
 
 
 def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime | int | None:
@@ -787,7 +800,6 @@ def run(
                 # spinner text carries the current bid/ask even between bar
                 # closes.
                 spinner_state: dict[str, Any] = {
-                    'time': None,
                     'bid': None,
                     'ask': None,
                     'last_mid': None,
@@ -809,18 +821,16 @@ def run(
                     price_decimals = 2
 
                 def _spinner_text() -> str:
-                    t = spinner_state['time']
-                    head = f"Live — {t:%Y-%m-%d %H:%M:%S}" if t else "Live streaming..."
                     bid = spinner_state['bid']
                     ask = spinner_state['ask']
                     d = price_decimals
                     if bid is not None and ask is not None:
                         arrow = spinner_state['arrow']
-                        return (f"{head}  [green]{bid:.{d}f}[/] {arrow} "
+                        return (f"[green]{bid:.{d}f}[/] {arrow} "
                                 f"[red]{ask:.{d}f}[/]")
                     if bid is not None:
-                        return f"{head}  [green]{bid:.{d}f}[/]"
-                    return head
+                        return f"[green]{bid:.{d}f}[/]"
+                    return "Live streaming..."
 
                 # ``PYNE_NO_LIVE_SPINNER`` suppresses the per-tick spinner so
                 # systemd journals / Docker logs only carry whole log lines
@@ -842,11 +852,13 @@ def run(
                 # snapshot frozen below the final halt entry.
                 with Progress(
                         SpinnerColumn(),
-                        TextColumn("{task.description}"),
+                        ExchangeClockColumn(runner.tz),
                         CustomTimeElapsedColumn(),
+                        TextColumn("{task.description}"),
                         console=live_console,
                         transient=True,
                         disable=_spinner_disabled,
+                        refresh_per_second=10,
                 ) as progress:
                     task = progress.add_task(description="Live streaming...", total=None)
 
@@ -869,7 +881,6 @@ def run(
 
                     def cb_progress_live(current_time: datetime | None):
                         if current_time is not None:
-                            spinner_state['time'] = current_time
                             progress.update(task, description=_spinner_text())
 
                     def cb_tick_live(candle):
@@ -880,9 +891,6 @@ def run(
                         _apply_quote(
                             extra.get('bid_close', candle.close),
                             extra.get('ask_close'),
-                        )
-                        spinner_state['time'] = _exchange_display_time(
-                            candle.timestamp, runner.tz,
                         )
                         progress.update(task, description=_spinner_text())
 
