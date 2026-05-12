@@ -24,6 +24,7 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **Environment:**
+- PyneCore branch: main (replace if you are testing another branch)
 - OS: (e.g. Linux, macOS, Windows)
 - Version: (e.g. Ubuntu 22.04, Windows 11)
 - Python version: (e.g. 3.11.6)

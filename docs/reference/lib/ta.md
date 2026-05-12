@@ -581,6 +581,12 @@ Crossover. Returns true when source1 crosses above source2.
 cross_up: bool = ta.crossover(close, ma)  # Price crosses above MA
 ```
 
+> **Note — equality boundary.** The comparison is strict (`>` / `<=`) with no epsilon tolerance,
+> per Pine Script spec. IEEE-754 implementations are free to differ by a few ULPs on otherwise-
+> equal arithmetic results, so PyneCore and TradingView can occasionally disagree on whether
+> two series are exactly equal on a given bar — producing a single-bar timing divergence near
+> the boundary. See [Numerical differences vs TradingView](../../overview/compatibility.md#numerical-differences-vs-tradingview).
+
 ### crossunder()
 
 Crossunder. Returns true when source1 crosses below source2.
@@ -595,6 +601,10 @@ Crossunder. Returns true when source1 crosses below source2.
 ```python
 cross_down: bool = ta.crossunder(close, ma)  # Price crosses below MA
 ```
+
+> **Note — equality boundary.** Same caveat as [`crossover()`](#crossover) — strict comparison,
+> no epsilon tolerance; IEEE-754 ULP-level disagreement between implementations can cause a
+> single-bar timing divergence from TradingView near the equality boundary.
 
 ### barssince()
 

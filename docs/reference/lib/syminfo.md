@@ -97,6 +97,8 @@ The base currency code for Forex or cryptocurrency pairs. For example, "EUR" for
 base: str | NA[str] = syminfo.basecurrency  # "EUR" or "BTC"
 ```
 
+> **Always use the bare base asset code** — `"BTC"` for `BTCUSDT`, `BTCUSDT.P`, `BINANCE:BTCUSDT`, `BYBIT:BTCUSDT.P` alike; never the full pair or ticker string (`"BTCUSDT"`, `"BTC.P"`, `"BINANCEBTC.P"`). PyneCore uses exact-match comparisons against this field internally. The most visible consequence is order-quantity rounding for crypto: `"BTC"` selects 6-decimal qty precision (matching TradingView), anything else falls back to 4 decimals. With `default_qty_type = strategy.percent_of_equity` on a high-priced BTC instrument this manifests as a small (~0.1–0.9%) per-trade undersize that compounds into multi-percent equity drift over hundreds of trades.
+
 #### country
 Type: `str | NA[str]`
 

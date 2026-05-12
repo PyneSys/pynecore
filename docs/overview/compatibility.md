@@ -210,3 +210,21 @@ PyneCore is precision-tested against TradingView:
 - **Indicator values**: 0.001% relative tolerance, 0.00000001 absolute tolerance
 - **Strategy trades**: Exact trade-by-trade matching (245+ trades verified)
 - **OHLCV data**: float32 storage with 6-significant-digit rounding
+
+### Numerical differences vs TradingView
+
+IEEE-754 leaves implementations free to differ on operation ordering and internal precision, so
+two correct implementations of the same formula can produce results that differ by a few ULPs.
+PyneCore and TradingView are no exception: occasional last-bit disagreements (typically 1e-15 to
+1e-12 absolute) are expected and add up to at most a fraction of a percent equity drift over
+thousands of trades.
+
+The disagreement is invisible in arithmetic but matters at **exact-equality comparisons**, where
+one side may see `a == b` while the other sees `a` slightly above or below `b`. At those
+sub-tick scales the difference is numerical noise, not a real trading signal. The functions
+most exposed to it are `ta.crossover` and `ta.crossunder`, which follow Pine's strict-comparison
+spec (`>` / `<=`) and therefore inherit any boundary disagreement TradingView and PyneCore have
+on the same bar. Any user code that compares two computed series with `==`, `!=`, `>`, `<` etc.
+without an explicit tolerance is subject to the same kind of ULP-level disagreement; if the
+result matters, round the operands to a meaningful number of decimal places or use
+`math.isclose`.

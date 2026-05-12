@@ -22,10 +22,44 @@ from .security_shm import (
 )
 
 if TYPE_CHECKING:
+    from multiprocessing import Process
     from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
     from zoneinfo import ZoneInfo
     from .resampler import Resampler
+
+
+# Liveness poll interval for security-process waits. Short enough to detect a
+# crashed child quickly, large enough that the wakeup overhead is negligible
+# vs. the typical per-bar processing time.
+_LIVENESS_POLL_SECONDS = 0.5
+
+
+def _wait_with_liveness(
+    event: 'EventType',
+    sec_id: str,
+    sec_processes: 'dict[str, Process] | None',
+) -> None:
+    """
+    Wait for ``event`` while polling the owning security process for liveness.
+
+    If the security process dies before signalling the event, raise
+    ``RuntimeError`` instead of deadlocking the chart forever.
+
+    Same-context and ignored sec_ids have no associated Process — they fall
+    back to a plain unbounded ``event.wait()`` because their signalling is
+    driven by the chart itself, not a separate process.
+    """
+    if sec_processes is None or sec_id not in sec_processes:
+        event.wait()
+        return
+    proc = sec_processes[sec_id]
+    while not event.wait(timeout=_LIVENESS_POLL_SECONDS):
+        if not proc.is_alive():
+            raise RuntimeError(
+                f"Security process for '{sec_id}' died unexpectedly "
+                f"(exit code: {proc.exitcode})"
+            )
 
 
 @dataclass
@@ -100,6 +134,7 @@ def create_chart_protocol(
     no_process_ids: frozenset[str] = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
+    sec_processes: 'dict[str, Process] | None' = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -116,6 +151,11 @@ def create_chart_protocol(
                            Signal/wait are skipped for these.
     :param result_blocks: Result blocks for writing same-context values to shared memory.
     :param currency_conversions: Maps sec_id → (from_currency, to_currency) for auto-conversion.
+    :param sec_processes: Live ``sec_id → Process`` map. Captured by reference, so
+                          entries added by lazy/deferred spawn become visible to the
+                          read/wait protocol functions. When provided, blocked waits
+                          poll ``proc.is_alive()`` and raise instead of deadlocking
+                          if a child dies.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup)
     """
     readers: dict[str, ResultReader] = {
@@ -176,7 +216,7 @@ def create_chart_protocol(
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
         state = states[sec_id]
-        state.data_ready.wait()
+        _wait_with_liveness(state.data_ready, sec_id, sec_processes)
 
         if not state.is_ltf and state.gaps_on and not state.new_period:
             return default
@@ -202,7 +242,7 @@ def create_chart_protocol(
     def __sec_wait__(sec_id: str, _scope_id=None):
         state = states[sec_id]
         if state.needs_wait:
-            state.done_event.wait()
+            _wait_with_liveness(state.done_event, sec_id, sec_processes)
             state.done_event.clear()
             state.needs_wait = False
 

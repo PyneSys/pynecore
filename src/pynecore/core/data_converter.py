@@ -701,8 +701,13 @@ class DataConverter:
         currency = 'USD'
         base_currency: str | None = None
 
-        # Clean up separators
-        clean_symbol = symbol_upper.replace('_', '').replace('-', '').replace(':', '').strip()
+        # Strip provider prefix ("BINANCE:BTCUSDT" -> "BTCUSDT") and TV ticker
+        # suffixes (".P" perpetual, ".F" continuous future, etc.) so the base
+        # asset extraction below sees only the actual pair. Without this,
+        # "BTCUSDT.P" -> base_currency "BTC.P", which trips downstream code
+        # that expects an exact-match basecurrency like "BTC".
+        core_symbol = symbol_upper.rsplit(':', 1)[-1].split('.', 1)[0]
+        clean_symbol = core_symbol.replace('_', '').replace('-', '').strip()
 
         # Check if it's a direct forex pair match (check both with and without slash)
         if clean_symbol in forex_pairs or symbol_upper in forex_pairs or \

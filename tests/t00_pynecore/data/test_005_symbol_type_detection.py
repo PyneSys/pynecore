@@ -176,6 +176,48 @@ def __test_detect_symbol_type_forex_with_slash__():
     assert base == "AUD"
 
 
+def __test_detect_symbol_type_provider_prefix_and_suffix__():
+    """Provider prefixes and TV ticker suffixes must not leak into base_currency.
+
+    PyneCore downstream code (e.g. `_size_round_factor` selection in
+    `core/script_runner.py`) expects an exact-match basecurrency like "BTC".
+    A leaked prefix ("BINANCEBTC") or suffix ("BTC.P") silently degrades the
+    qty rounding precision and shows up as cumulative `percent_of_equity`
+    sizing drift versus TradingView.
+    """
+    dc = DataConverter()
+
+    # Perpetual suffix on a crypto pair
+    symbol_type, currency, base = dc.guess_symbol_type("BTCUSDT.P")
+    assert symbol_type == "crypto"
+    assert currency == "USDT"
+    assert base == "BTC"
+
+    # Continuous-futures suffix
+    symbol_type, currency, base = dc.guess_symbol_type("ETHUSDT.F")
+    assert symbol_type == "crypto"
+    assert currency == "USDT"
+    assert base == "ETH"
+
+    # Provider prefix only
+    symbol_type, currency, base = dc.guess_symbol_type("BINANCE:BTCUSDT")
+    assert symbol_type == "crypto"
+    assert currency == "USDT"
+    assert base == "BTC"
+
+    # Provider prefix + perpetual suffix (full TV-style ticker string)
+    symbol_type, currency, base = dc.guess_symbol_type("BINANCE:BTCUSDT.P")
+    assert symbol_type == "crypto"
+    assert currency == "USDT"
+    assert base == "BTC"
+
+    # Forex with provider prefix
+    symbol_type, currency, base = dc.guess_symbol_type("CAPITALCOM:EURUSD")
+    assert symbol_type == "forex"
+    assert currency == "USD"
+    assert base == "EUR"
+
+
 def __test_detect_symbol_type_special_cases__():
     """Test special handling cases"""
     dc = DataConverter()
@@ -227,3 +269,7 @@ def test_detect_symbol_type_forex_with_slash():
 
 def test_detect_symbol_type_special_cases():
     __test_detect_symbol_type_special_cases__()
+
+
+def test_detect_symbol_type_provider_prefix_and_suffix():
+    __test_detect_symbol_type_provider_prefix_and_suffix__()

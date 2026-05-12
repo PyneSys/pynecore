@@ -16,6 +16,7 @@ from pynecore.core.var_snapshot import VarSnapshot
 from pynecore.types import script_type
 
 if TYPE_CHECKING:
+    from multiprocessing import Process
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
     from pynecore.lib.strategy import Trade, Position  # noqa
@@ -578,7 +579,7 @@ class ScriptRunner:
         sec_contexts: dict[str, dict] | None = getattr(
             self.script_module, '__security_contexts__', None
         )
-        sec_processes: list = []
+        sec_processes: 'dict[str, Process]' = {}
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
         sec_sync_block = None
@@ -668,7 +669,7 @@ class ScriptRunner:
                         daemon=True,
                     )
                     proc.start()
-                    sec_processes.append(proc)
+                    sec_processes[sid] = proc
 
                 # Callback for lazy resolution of deferred security contexts
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
@@ -727,6 +728,7 @@ class ScriptRunner:
                     no_process_ids=no_process_ids,
                     result_blocks=sec_result_blocks if same_context_ids else None,
                     currency_conversions=currency_conversions or None,
+                    sec_processes=sec_processes,
                 )
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)
@@ -747,12 +749,16 @@ class ScriptRunner:
                     magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
-            # Initialize calc_on_order_fills snapshot (for COOF or live mode)
+            # Initialize calc_on_order_fills snapshot (for COOF or live mode).
+            # Pine TV semantics: `calc_on_order_fills` is silently disabled when
+            # `process_orders_on_close=True` (TV reverts to a single script calculation
+            # per bar in that combo), so the snapshot stays unused in that case.
             var_snapshot: VarSnapshot | None = None
             is_live = lib._is_live
             # Indicators always run on every tick; strategies only if calc_on_every_tick
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
-            if is_strat and self.script.calc_on_order_fills:
+            if (is_strat and self.script.calc_on_order_fills
+                    and not self.script.process_orders_on_close):
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
             elif is_live and run_on_every_tick:
                 var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
@@ -900,6 +906,16 @@ class ScriptRunner:
 
                 # Execute libraries + script
                 _run_libs_and_main()
+
+                # Pine `process_orders_on_close=true` — extra fill attempt at the bar
+                # close for current-bar orders, before the next bar's open arrives.
+                # No COOF re-run here: Pine disables `calc_on_order_fills` when this
+                # flag is set (var_snapshot is None whenever both are true).
+                # Simulator-only; in broker mode the exchange owns fill timing.
+                if (is_strat and position and not self._broker_mode
+                        and not lib._strategy_suppressed
+                        and self.script.process_orders_on_close):
+                    position.process_orders_at_close()
 
                 # Process deferred margin calls
                 if is_strat and position and not lib._strategy_suppressed:
@@ -1205,11 +1221,15 @@ class ScriptRunner:
 
                         if exit_price is not None:
                             # Calculate profit/loss using the same formula as Position._fill_order
-                            # For closing, size is negative of the position
+                            # For closing, size is negative of the position.
+                            # `* syminfo.pointvalue` converts price-delta to account-currency
+                            # so the synthetic "Open" exit reports USD consistently with closed
+                            # trades on futures (pv != 1). For pv = 1 this is a no-op.
+                            pv = self.syminfo.pointvalue
                             closing_size = -trade.size
-                            pnl = -closing_size * (exit_price - trade.entry_price)
-                            pnl_percent = (pnl / (trade.entry_price * abs(trade.size))) * 100 \
-                                if trade.entry_price != 0 else 0
+                            pnl = -closing_size * (exit_price - trade.entry_price) * pv
+                            entry_value = abs(trade.size) * trade.entry_price * pv
+                            pnl_percent = (pnl / entry_value) * 100 if entry_value != 0 else 0
 
                             self.trades_writer.write(
                                 trade_num,
@@ -1263,7 +1283,7 @@ class ScriptRunner:
                 for state in sec_states.values():
                     state.stop_event.set()
                     state.advance_event.set()  # wake up if waiting
-                for p in sec_processes:
+                for p in sec_processes.values():
                     p.join(timeout=5)
                     if p.is_alive():
                         p.terminate()
@@ -1302,9 +1322,13 @@ class ScriptRunner:
 
         trade_num = 0
 
-        # Initialize calc_on_order_fills snapshot for magnified path
+        # Initialize calc_on_order_fills snapshot for magnified path.
+        # Pine TV semantics: `calc_on_order_fills` is silently disabled when
+        # `process_orders_on_close=True` (TV reverts to a single script calculation
+        # per bar in that combo), so the snapshot stays unused in that case.
         var_snapshot: VarSnapshot | None = None
-        if is_strat and self.script.calc_on_order_fills:
+        if (is_strat and self.script.calc_on_order_fills
+                and not self.script.process_orders_on_close):
             var_snapshot = VarSnapshot(self.script_module, script_mod._registered_libraries)
 
         for window in magnifier:
@@ -1359,6 +1383,13 @@ class ScriptRunner:
 
             # Run the script
             res = self.script_module.main()
+
+            # Pine `process_orders_on_close=true` — extra fill attempt at the bar
+            # close for current-bar orders. No COOF re-run: Pine disables
+            # `calc_on_order_fills` when this flag is set (var_snapshot is None
+            # whenever both are true).
+            if position and self.script.process_orders_on_close:
+                position.process_orders_at_close()
 
             # Process deferred margin calls (after script runs, before results)
             if position:
