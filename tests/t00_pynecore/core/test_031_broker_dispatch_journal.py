@@ -53,6 +53,8 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     PENDING_DISPATCH_STATES,
+    STATE_CANCEL_PENDING,
+    STATE_CLOSING,
     STATE_CONFIRMED,
     STATE_DISPOSITION_UNKNOWN,
     STATE_REJECTED,
@@ -370,7 +372,12 @@ def __test_mark_confirmed_skips_zero_fill_price__(tmp_path: Path) -> None:
 
 
 def __test_find_pending_dispatch_filters_by_state__(tmp_path: Path) -> None:
-    """Only rows in the three pending states are returned."""
+    """Only rows in pending states are returned; terminal ones excluded.
+
+    ``closing`` and ``cancel_pending`` are listed for documentation but
+    not in ``PENDING_DISPATCH_STATES`` until the M4 close / cancel
+    phases ship the corresponding recovery branches.
+    """
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -380,6 +387,8 @@ def __test_find_pending_dispatch_filters_by_state__(tmp_path: Path) -> None:
                 ('subm', STATE_SUBMITTED),
                 ('refs', STATE_SERVER_REF_SEEN),
                 ('disp', STATE_DISPOSITION_UNKNOWN),
+                ('clos', STATE_CLOSING),
+                ('canc', STATE_CANCEL_PENDING),
                 ('conf', STATE_CONFIRMED),
                 ('rej', STATE_REJECTED),
             ):
@@ -395,6 +404,8 @@ def __test_find_pending_dispatch_filters_by_state__(tmp_path: Path) -> None:
             assert pending == PENDING_DISPATCH_STATES
             assert STATE_CONFIRMED not in pending
             assert STATE_REJECTED not in pending
+            assert STATE_CLOSING not in pending
+            assert STATE_CANCEL_PENDING not in pending
         finally:
             ctx.close()
 

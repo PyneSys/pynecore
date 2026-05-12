@@ -34,17 +34,34 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
 )
 from pynecore.core.broker.models import (
+    CancelIntent,
+    CloseIntent,
     EntryIntent,
     ExchangeOrder,
+    ExitIntent,
     OrderStatus,
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    KIND_CANCEL,
+    KIND_FULL_CLOSE,
+    KIND_MODIFY_ENTRY,
+    KIND_MODIFY_EXIT,
+    KIND_PARTIAL_CLOSE,
+    create_cancel_command_row,
+    create_close_target_row,
     create_entry_order_row,
+    create_modify_entry_row,
+    create_modify_exit_row,
     find_pending_dispatch,
+    mark_cancel_completed,
+    mark_close_completed,
+    mark_closing,
     mark_confirmed_with_fill,
     mark_disposition_unknown,
+    mark_modify_completed,
     mark_rejected,
+    record_close_server_ref,
     record_server_ref,
 )
 
@@ -54,10 +71,22 @@ if TYPE_CHECKING:
 __all__ = [
     'DispatchJournal',
     'EntryDispatchHooks',
+    'CloseDispatchHooks',
+    'CancelDispatchHooks',
+    'ModifyEntryDispatchHooks',
+    'ModifyExitDispatchHooks',
     'SubmitOutcome',
     'ConfirmOutcome',
     'ResumeOutcome',
     'ResumeStatus',
+    'CloseOutcome',
+    'CancelOutcome',
+    'CancelReasonPath',
+    'ModifyEntryOutcome',
+    'ModifyExitOutcome',
+    'ModifyExitStatus',
+    'PendingResolution',
+    'PendingHooksProvider',
 ]
 
 
@@ -115,6 +144,126 @@ class ConfirmOutcome:
     is_filled: bool
     filled_qty: float = 0.0
     fill_price: float | None = None
+    raw: dict | None = None
+
+
+CancelReasonPath = Literal['deleted', 'already_gone', 'noop']
+ModifyExitStatus = Literal['ACCEPTED', 'REJECTED']
+
+
+@dataclass(frozen=True)
+class CloseOutcome:
+    """Plugin's successful close-dispatch result.
+
+    Returned from the plugin's ``submit_full_close`` or
+    ``submit_partial_close`` hook. On a confirm-REJECTED outcome the
+    hook raises
+    :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`;
+    on a network / disposition-unknown outcome it raises
+    :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`.
+
+    :ivar mode: ``'full'`` for a full-close DELETE chain, ``'partial'``
+        for the partial-close emulated POST. The journal also receives
+        the ``kind`` argument up-front; the field is echoed here so a
+        single outcome shape covers both branches.
+    :ivar applied_targets: Exchange ``dealId`` strings the dispatch
+        actually touched. Full close: every target the DELETE chain
+        completed against. Partial close: a single-element list with
+        the newly-opened opposite leg's ``dealId``, or empty if the
+        POST returned no id.
+    :ivar deal_reference: Server-allocated POST reference. Only the
+        partial-close branch carries one; full-close returns ``None``.
+    :ivar exchange_id: Single representative exchange id for the
+        :class:`ExchangeOrder` the engine receives. For full close
+        this is the first target's ``dealId``; for partial close this
+        is the new opposite leg's ``dealId``.
+    :ivar filled_qty: Quantity reported as filled by the broker
+        response (or synthesised from the intent for the full-close
+        synchronous flow).
+    :ivar fill_price: Confirm-side price when known. ``None`` when
+        the broker did not echo a fill price.
+    :ivar raw: Verbatim broker response for forensics.
+    """
+    mode: Literal['full', 'partial']
+    applied_targets: list[str]
+    deal_reference: str | None = None
+    exchange_id: str | None = None
+    filled_qty: float = 0.0
+    fill_price: float | None = None
+    raw: dict | None = None
+
+
+@dataclass(frozen=True)
+class CancelOutcome:
+    """Plugin's successful cancel-dispatch result.
+
+    :ivar succeeded: ``True`` once the per-target sweep finished
+        (including the benign already-gone path). ``False`` is
+        currently unused — cancel failures raise rather than return.
+    :ivar reason_path: Why the cancel resolved this way:
+
+        - ``'deleted'`` — at least one target was actively swept by
+          the dispatch.
+        - ``'already_gone'`` — every target had already vanished from
+          the broker; nothing was DELETEd.
+        - ``'noop'`` — no targets matched the intent at all.
+
+    :ivar cleared_legs: Number of bracket / working-order legs the
+        dispatch swept (``len(applied_target_coids)``).
+    :ivar applied_target_coids: Plugin-side COIDs the dispatch closed.
+        Persisted into ``extras['applied_target_coids']`` so recovery
+        can reason about which targets the per-target loop actually
+        reached before any crash.
+    :ivar raw: Verbatim broker response (or aggregated responses) for
+        forensics.
+    """
+    succeeded: bool
+    reason_path: CancelReasonPath
+    cleared_legs: int
+    applied_target_coids: list[str]
+    raw: dict | None = None
+
+
+@dataclass(frozen=True)
+class ModifyEntryOutcome:
+    """Plugin's successful working-order amend result.
+
+    :ivar server_ref: ``dealReference`` of the amend PUT. Persisted
+        under ``order_refs['deal_reference']`` so recovery can verify
+        the change landed via a confirm GET.
+    :ivar new_level: Echoed back from the confirm response — the
+        broker's view of the amended level. Compared against the
+        intent's requested level on recovery to detect drift.
+    :ivar raw: Verbatim confirm response for forensics.
+    """
+    server_ref: str
+    new_level: float
+    raw: dict | None = None
+
+
+@dataclass(frozen=True)
+class ModifyExitOutcome:
+    """Plugin's successful position bracket amend result.
+
+    :ivar server_ref: ``dealReference`` of the amend PUT.
+    :ivar deal_status: ``'ACCEPTED'`` for happy path,
+        ``'REJECTED'`` is converted to
+        :class:`ExchangeOrderRejectedError` at the hook boundary so
+        the journal can persist the rejection; the field exists so
+        forensics see the broker's exact verdict.
+    :ivar rejected_reason: Free-form reject reason copied from the
+        confirm response when ``deal_status == 'REJECTED'``.
+    :ivar post_put_state: Mapping of the broker-echoed levels the
+        plugin's ``mirror_bracket_legs`` callback needs to materialise
+        the synthetic leg rows post-success. Keys are plugin-defined
+        (e.g. ``'profit_level'``, ``'stop_level'``,
+        ``'trailing_stop'``).
+    :ivar raw: Verbatim confirm response for forensics.
+    """
+    server_ref: str
+    deal_status: ModifyExitStatus
+    rejected_reason: str | None = None
+    post_put_state: Mapping[str, Any] = field(default_factory=dict)
     raw: dict | None = None
 
 
@@ -247,6 +396,204 @@ class EntryDispatchHooks(Protocol):
             typical entry; ``'deal_id'`` may also be present when the
             crash happened after server-ref-seen but before
             confirmed).
+        """
+        ...
+
+
+class CloseDispatchHooks(Protocol):
+    """Plugin-supplied callbacks for a close dispatch.
+
+    Exactly one of :meth:`submit_full_close` and
+    :meth:`submit_partial_close` is invoked per dispatch, decided by
+    the ``kind`` argument the journal receives. The other method is
+    not required to do anything meaningful — implementations typically
+    raise ``RuntimeError`` from the unused one as a defensive marker.
+    """
+
+    async def submit_full_close(
+            self, *, coid: str, intent: CloseIntent,
+            targets: list['OrderRow'],
+    ) -> CloseOutcome:
+        """DELETE every target position. Synchronous fill.
+
+        ``targets`` are the live position rows the dispatch must
+        close. Implementations issue one DELETE per target and return
+        a :class:`CloseOutcome` with ``mode='full'`` and
+        ``applied_targets`` listing the ``dealId`` of every
+        successfully DELETEd position. On a benign already-gone race
+        (404) targets may be omitted from ``applied_targets``; the
+        recovery contract treats vanished targets as confirmed.
+
+        Implementations MUST NOT mutate the close command row's state
+        — only the journal does that. They MAY mutate the *target*
+        rows (e.g. ``store.set_order_state(target_coid, 'closing')``)
+        because those rows live outside the journal's command-row
+        scope.
+
+        Network / timeout errors raise
+        :class:`OrderDispositionUnknownError`; explicit broker rejects
+        raise :class:`ExchangeOrderRejectedError`.
+        """
+        ...
+
+    async def submit_partial_close(
+            self, *, coid: str, intent: CloseIntent,
+    ) -> CloseOutcome:
+        """Emulated partial close via opposite-direction POST.
+
+        Implementations issue a single POST (Capital.com has no native
+        partial-close endpoint), record the ``dealReference``, and
+        reconcile pre/post position snapshots to detect any race
+        against an unrelated opposite-side opening. Returns a
+        :class:`CloseOutcome` with ``mode='partial'``,
+        ``deal_reference`` populated, ``exchange_id`` set to the new
+        opposite-leg ``dealId``, and ``applied_targets`` listing that
+        single ``dealId``. The hook itself raises
+        :class:`BrokerManualInterventionError` on an unresolved race;
+        the journal does not catch that — it propagates to the engine.
+        """
+        ...
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', intent: CloseIntent,
+            outcome: CloseOutcome,
+    ) -> ExchangeOrder:
+        """Build the :class:`ExchangeOrder` the engine expects.
+
+        Called once the command row has reached its terminal state
+        (``closing`` for full, ``confirmed`` for partial). Pure
+        function — no I/O.
+        """
+        ...
+
+
+class CancelDispatchHooks(Protocol):
+    """Plugin-supplied callbacks for a cancel dispatch.
+
+    Cancel has no submit/confirm split — the plugin sweeps all targets
+    in a single call and returns the outcome. The journal owns the
+    command-row state transitions; the plugin owns the per-target
+    REST operations and the target-row mutations.
+    """
+
+    async def submit_cancel(
+            self, *, coid: str, intent: CancelIntent,
+            targets: list['OrderRow'],
+    ) -> CancelOutcome:
+        """Sweep every target. Returns a single :class:`CancelOutcome`.
+
+        Implementations issue the per-target REST calls (DELETE for
+        working orders, PUT-null for bracket legs) and mark the
+        target rows closed via ``store.close_order(target_coid)``.
+        Benign already-gone (404) responses are absorbed without
+        raising — the resulting :attr:`CancelOutcome.reason_path`
+        reflects whether any actual DELETE happened.
+
+        Implementations MUST NOT mutate the cancel command row's
+        state — only the journal does that.
+        """
+        ...
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', intent: CancelIntent,
+            outcome: CancelOutcome,
+    ) -> ExchangeOrder:
+        """Build the synthetic :class:`ExchangeOrder` for the cancel.
+
+        Cancel does not produce an exchange order per se, but the
+        engine signature expects one. The hook synthesises a
+        :class:`OrderStatus.CANCELLED` order so the caller can plumb
+        the outcome through unchanged channels.
+        """
+        ...
+
+
+class ModifyEntryDispatchHooks(Protocol):
+    """Plugin-supplied callbacks for a working-order amend dispatch."""
+
+    async def submit_amend(
+            self, *, coid: str, target_coid: str,
+            old_intent: EntryIntent, new_intent: EntryIntent,
+    ) -> ModifyEntryOutcome:
+        """PUT the new level and confirm.
+
+        Returns a :class:`ModifyEntryOutcome` with the broker-echoed
+        ``new_level``. On reject raises
+        :class:`ExchangeOrderRejectedError`; on timeout raises
+        :class:`OrderDispositionUnknownError`. The amend target row
+        (the working order itself) is mutated by the hook via
+        ``store.upsert_order(target_coid, ...)`` because it lives
+        outside the journal's command-row scope.
+        """
+        ...
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', new_intent: EntryIntent,
+            outcome: ModifyEntryOutcome,
+    ) -> list[ExchangeOrder]:
+        """Build the :class:`ExchangeOrder` list for the engine.
+
+        The engine's :meth:`modify_entry` signature returns a list of
+        orders; for atomic amends this is a one-element list pointing
+        at the same target as before. Pure function.
+        """
+        ...
+
+
+class ModifyExitDispatchHooks(Protocol):
+    """Plugin-supplied callbacks for a position bracket amend dispatch.
+
+    Modify-exit is the most complex dispatch — the plugin's
+    ``prepare()`` logic decides the new TP / SL / trailing levels and
+    seeds any newly-added bracket leg rows in
+    ``disposition_unknown``. The journal then drives the entry-row
+    audit trail and the ``mirror_bracket_legs`` callback that
+    materialises the synthetic legs on success.
+    """
+
+    async def submit_amend(
+            self, *, coid: str, target_coid: str,
+            old_intent: ExitIntent, new_intent: ExitIntent,
+    ) -> ModifyExitOutcome:
+        """PUT the new bracket and confirm.
+
+        On the happy path returns a :class:`ModifyExitOutcome` with
+        ``deal_status='ACCEPTED'`` and ``post_put_state`` filled.
+        On reject raises :class:`ExchangeOrderRejectedError`; on
+        timeout raises :class:`OrderDispositionUnknownError`. Before
+        raising, the hook flips any leg rows it pre-seeded into the
+        appropriate disposition-unknown state and persists the
+        attempted target levels under the leg rows' extras — those
+        side-channel writes are part of the hook's responsibility.
+        """
+        ...
+
+    def mirror_bracket_legs(
+            self, *, target_row: 'OrderRow', new_intent: ExitIntent,
+            outcome: ModifyExitOutcome,
+    ) -> None:
+        """Materialise synthetic TP / SL leg rows after success.
+
+        Invoked by the journal only on the happy path (after the
+        entry-side command row has transitioned to ``confirmed``).
+        On any ambiguous / reject path the journal does NOT call
+        this hook; the disposition-unknown leg seeds the
+        ``submit_amend`` hook already wrote remain the source of
+        truth for recovery. Pure plugin-side write — uses
+        ``store.upsert_order(leg_coid, ...)`` directly because the
+        synthetic leg rows are outside the journal's command-row
+        scope for M4.
+        """
+        ...
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', new_intent: ExitIntent,
+            outcome: ModifyExitOutcome,
+    ) -> list[ExchangeOrder]:
+        """Build the engine-facing :class:`ExchangeOrder` list.
+
+        Returns one :class:`ExchangeOrder` per active bracket leg
+        (TP / SL) reflecting the post-amend levels. Pure function.
         """
         ...
 
@@ -428,6 +775,582 @@ class DispatchJournal:
                 f"(coid={coid!r})"
             )
         return [hooks.exchange_order_from_state(row=row, intent=intent)]
+
+    # --- Close path --------------------------------------------------------
+
+    async def run_close(
+            self,
+            *,
+            coid: str,
+            intent: CloseIntent,
+            kind: str,
+            targets: list['OrderRow'],
+            hooks: CloseDispatchHooks,
+            audit_payload: dict | None = None,
+    ) -> ExchangeOrder:
+        """Run a close dispatch.
+
+        Routes between full-close (DELETE chain) and partial-close
+        (emulated POST) based on ``kind``. Each branch persists the
+        command row, calls the matching hook, and finalises the row.
+        Target-row mutations live in the hook, since they are outside
+        the command-row state-machine the journal owns.
+
+        :param coid: Close dispatch COID.
+        :param intent: The :class:`CloseIntent` being dispatched.
+        :param kind: :data:`KIND_FULL_CLOSE` or
+            :data:`KIND_PARTIAL_CLOSE`.
+        :param targets: Live position rows the dispatch should close.
+            For partial close this is the pre-existing rows (used by
+            the hook to derive the pre-snapshot delta), for full close
+            this drives the DELETE loop.
+        :param hooks: Plugin callbacks.
+        :param audit_payload: Optional extras to merge into the
+            initial ``dispatch_submitted`` event payload.
+        """
+        if kind == KIND_FULL_CLOSE:
+            return await self._run_full_close(
+                coid=coid, intent=intent, targets=targets,
+                hooks=hooks, audit_payload=audit_payload,
+            )
+        if kind == KIND_PARTIAL_CLOSE:
+            return await self._run_partial_close(
+                coid=coid, intent=intent,
+                hooks=hooks, audit_payload=audit_payload,
+            )
+        raise ValueError(
+            f"DispatchJournal.run_close: kind must be one of "
+            f"{{KIND_FULL_CLOSE, KIND_PARTIAL_CLOSE}}, got {kind!r}"
+        )
+
+    async def _run_full_close(
+            self,
+            *,
+            coid: str,
+            intent: CloseIntent,
+            targets: list['OrderRow'],
+            hooks: CloseDispatchHooks,
+            audit_payload: dict | None,
+    ) -> ExchangeOrder:
+        # (1) PERSIST command row + audit event.
+        target_ids = [r.exchange_order_id for r in targets]
+        create_close_target_row(
+            self.store,
+            coid=coid,
+            symbol=intent.symbol,
+            side=intent.side,
+            qty=intent.qty,
+            intent_key=intent.intent_key,
+            kind=KIND_FULL_CLOSE,
+            extra_payload={'targets': list(target_ids)},
+        )
+        submit_payload: dict[str, Any] = {
+            'kind': KIND_FULL_CLOSE,
+            'targets': target_ids,
+        }
+        if audit_payload:
+            submit_payload.update(audit_payload)
+        self.store.log_event(
+            'dispatch_submitted',
+            client_order_id=coid,
+            intent_key=intent.intent_key,
+            payload=submit_payload,
+        )
+
+        # (2) SUBMIT — per-target DELETE chain inside the hook.
+        try:
+            outcome = await hooks.submit_full_close(
+                coid=coid, intent=intent, targets=targets,
+            )
+        except OrderDispositionUnknownError as exc:
+            mark_disposition_unknown(self.store, coid=coid)
+            self.store.log_event(
+                'disposition_unknown',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'full_close_delete', 'reason': str(exc)},
+            )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            mark_rejected(self.store, coid=coid)
+            self.store.log_event(
+                'rejected',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'full_close_delete', 'reason': str(exc)},
+            )
+            raise
+
+        # (3) PERSIST closing state + targets.
+        mark_closing(
+            self.store,
+            coid=coid,
+            kind=KIND_FULL_CLOSE,
+            targets=outcome.applied_targets,
+        )
+        self.store.log_event(
+            'close_dispatched',
+            client_order_id=coid,
+            intent_key=intent.intent_key,
+            payload={'mode': 'full', 'applied_targets': outcome.applied_targets},
+        )
+
+        # (4) Return the synthetic ExchangeOrder built by the hook.
+        row = self.store.get_order(coid)
+        if row is None:
+            raise RuntimeError(
+                f"DispatchJournal._run_full_close: row vanished after closing "
+                f"(coid={coid!r})"
+            )
+        return hooks.exchange_order_from_state(
+            row=row, intent=intent, outcome=outcome,
+        )
+
+    async def _run_partial_close(
+            self,
+            *,
+            coid: str,
+            intent: CloseIntent,
+            hooks: CloseDispatchHooks,
+            audit_payload: dict | None,
+    ) -> ExchangeOrder:
+        # (1) PERSIST command row + audit event.
+        create_close_target_row(
+            self.store,
+            coid=coid,
+            symbol=intent.symbol,
+            side=intent.side,
+            qty=intent.qty,
+            intent_key=intent.intent_key,
+            kind=KIND_PARTIAL_CLOSE,
+        )
+        submit_payload: dict[str, Any] = {'kind': KIND_PARTIAL_CLOSE}
+        if audit_payload:
+            submit_payload.update(audit_payload)
+        self.store.log_event(
+            'dispatch_submitted',
+            client_order_id=coid,
+            intent_key=intent.intent_key,
+            payload=submit_payload,
+        )
+
+        # (2) SUBMIT — opposite-direction POST + race detection inside the hook.
+        try:
+            outcome = await hooks.submit_partial_close(
+                coid=coid, intent=intent,
+            )
+        except OrderDispositionUnknownError as exc:
+            mark_disposition_unknown(self.store, coid=coid)
+            self.store.log_event(
+                'disposition_unknown',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'partial_close_post', 'reason': str(exc)},
+            )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            mark_rejected(self.store, coid=coid)
+            self.store.log_event(
+                'rejected',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'partial_close_post', 'reason': str(exc)},
+            )
+            raise
+
+        # (3) PERSIST server ref (if any).
+        if outcome.deal_reference is not None:
+            record_close_server_ref(
+                self.store,
+                coid=coid,
+                deal_reference=outcome.deal_reference,
+                kind=KIND_PARTIAL_CLOSE,
+            )
+            self.store.log_event(
+                'deal_reference_seen',
+                client_order_id=coid,
+                payload={'deal_reference': outcome.deal_reference},
+            )
+
+        # (4) PERSIST completion. The helper only advances state;
+        # ``close_order`` is issued *after* the ``confirmed`` event so
+        # the audit order is consistent.
+        mark_close_completed(
+            self.store,
+            coid=coid,
+            kind=KIND_PARTIAL_CLOSE,
+        )
+        self.store.log_event(
+            'confirmed',
+            client_order_id=coid,
+            exchange_order_id=outcome.exchange_id,
+            intent_key=intent.intent_key,
+            payload={
+                'mode': 'partial',
+                'applied_targets': outcome.applied_targets,
+                'fill_price': outcome.fill_price,
+            },
+        )
+        self.store.close_order(coid)
+
+        # (5) Return the ExchangeOrder built by the hook.
+        row = self.store.get_order(coid)
+        if row is None:
+            raise RuntimeError(
+                f"DispatchJournal._run_partial_close: row vanished after confirm "
+                f"(coid={coid!r})"
+            )
+        return hooks.exchange_order_from_state(
+            row=row, intent=intent, outcome=outcome,
+        )
+
+    # --- Cancel path -------------------------------------------------------
+
+    async def run_cancel(
+            self,
+            *,
+            coid: str,
+            intent: CancelIntent,
+            targets: list['OrderRow'],
+            hooks: CancelDispatchHooks,
+            audit_payload: dict | None = None,
+    ) -> ExchangeOrder:
+        """Run a cancel dispatch.
+
+        The journal persists the command row, calls the hook for the
+        per-target sweep, and finalises the row with the
+        ``reason_path`` from the outcome. The per-target REST calls
+        and target-row mutations are owned by the hook.
+
+        :param coid: Cancel dispatch COID.
+        :param intent: The :class:`CancelIntent` being dispatched.
+        :param targets: Live rows the dispatch should cancel.
+        :param hooks: Plugin callbacks.
+        :param audit_payload: Optional extras for the
+            ``dispatch_submitted`` event payload.
+        """
+        target_coids = [r.client_order_id for r in targets]
+        agg_qty = sum(max(0.0, r.qty - r.filled_qty) for r in targets)
+        primary_side = targets[0].side if targets else 'buy'
+
+        # (1) PERSIST command row + audit event.
+        create_cancel_command_row(
+            self.store,
+            coid=coid,
+            symbol=intent.symbol,
+            side=primary_side,
+            qty=agg_qty,
+            intent_key=intent.intent_key,
+            pine_entry_id=intent.pine_id,
+            from_entry=intent.from_entry,
+            target_coids=target_coids,
+        )
+        submit_payload: dict[str, Any] = {
+            'kind': KIND_CANCEL,
+            'target_coids': target_coids,
+        }
+        if audit_payload:
+            submit_payload.update(audit_payload)
+        self.store.log_event(
+            'dispatch_submitted',
+            client_order_id=coid,
+            intent_key=intent.intent_key,
+            payload=submit_payload,
+        )
+
+        # (2) SUBMIT — per-target sweep inside the hook.
+        try:
+            outcome = await hooks.submit_cancel(
+                coid=coid, intent=intent, targets=targets,
+            )
+        except OrderDispositionUnknownError as exc:
+            mark_disposition_unknown(self.store, coid=coid)
+            self.store.log_event(
+                'disposition_unknown',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'cancel_sweep', 'reason': str(exc)},
+            )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            mark_rejected(self.store, coid=coid)
+            self.store.log_event(
+                'rejected',
+                client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'phase': 'cancel_sweep', 'reason': str(exc)},
+            )
+            raise
+
+        # (3) PERSIST completion with reason_path.
+        mark_cancel_completed(
+            self.store,
+            coid=coid,
+            reason_path=outcome.reason_path,
+            extra_payload={
+                'applied_target_coids': outcome.applied_target_coids,
+            },
+        )
+        self.store.log_event(
+            'confirmed',
+            client_order_id=coid,
+            intent_key=intent.intent_key,
+            payload={
+                'reason_path': outcome.reason_path,
+                'cleared_legs': outcome.cleared_legs,
+                'applied_target_coids': outcome.applied_target_coids,
+            },
+        )
+        self.store.close_order(coid)
+
+        # (4) Return the synthetic ExchangeOrder built by the hook.
+        row = self.store.get_order(coid)
+        if row is None:
+            raise RuntimeError(
+                f"DispatchJournal.run_cancel: row vanished after confirm "
+                f"(coid={coid!r})"
+            )
+        return hooks.exchange_order_from_state(
+            row=row, intent=intent, outcome=outcome,
+        )
+
+    # --- Modify entry path -------------------------------------------------
+
+    async def run_modify_entry(
+            self,
+            *,
+            coid: str,
+            target_coid: str,
+            old_intent: EntryIntent,
+            new_intent: EntryIntent,
+            qty: float,
+            hooks: ModifyEntryDispatchHooks,
+            audit_payload: dict | None = None,
+    ) -> list[ExchangeOrder]:
+        """Run an atomic working-order amend dispatch.
+
+        :param coid: COID of the amend command row.
+        :param target_coid: COID of the working order being amended.
+        :param old_intent: Intent before the amend (for audit context).
+        :param new_intent: Intent the broker should land.
+        :param qty: Order quantity (unchanged across the amend).
+        :param hooks: Plugin callbacks.
+        :param audit_payload: Optional extras for the
+            ``dispatch_submitted`` event payload.
+        """
+        # (1) PERSIST command row + audit event.
+        new_level = float(new_intent.limit if new_intent.limit is not None
+                          else new_intent.stop or 0.0)
+        create_modify_entry_row(
+            self.store,
+            coid=coid,
+            target_coid=target_coid,
+            symbol=new_intent.symbol,
+            side=new_intent.side,
+            qty=qty,
+            intent_key=new_intent.intent_key,
+            new_level=new_level,
+            pine_entry_id=new_intent.pine_id,
+        )
+        submit_payload: dict[str, Any] = {
+            'kind': KIND_MODIFY_ENTRY,
+            'target_coid': target_coid,
+            'new_level': new_level,
+        }
+        if audit_payload:
+            submit_payload.update(audit_payload)
+        self.store.log_event(
+            'dispatch_submitted',
+            client_order_id=coid,
+            intent_key=new_intent.intent_key,
+            payload=submit_payload,
+        )
+
+        # (2) SUBMIT — PUT + confirm inside the hook.
+        try:
+            outcome = await hooks.submit_amend(
+                coid=coid, target_coid=target_coid,
+                old_intent=old_intent, new_intent=new_intent,
+            )
+        except OrderDispositionUnknownError as exc:
+            mark_disposition_unknown(self.store, coid=coid)
+            self.store.log_event(
+                'disposition_unknown',
+                client_order_id=coid,
+                intent_key=new_intent.intent_key,
+                payload={'phase': 'modify_entry_put', 'reason': str(exc)},
+            )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            mark_rejected(self.store, coid=coid)
+            self.store.log_event(
+                'rejected',
+                client_order_id=coid,
+                intent_key=new_intent.intent_key,
+                payload={'phase': 'modify_entry_put', 'reason': str(exc)},
+            )
+            raise
+
+        # (3) PERSIST server ref + completion.
+        self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
+        self.store.log_event(
+            'deal_reference_seen',
+            client_order_id=coid,
+            payload={'deal_reference': outcome.server_ref},
+        )
+        mark_modify_completed(
+            self.store,
+            coid=coid,
+            extra_payload={'echoed_level': outcome.new_level},
+        )
+        self.store.log_event(
+            'confirmed',
+            client_order_id=coid,
+            intent_key=new_intent.intent_key,
+            payload={'new_level': outcome.new_level},
+        )
+        self.store.close_order(coid)
+
+        # (4) Return the engine-facing list.
+        row = self.store.get_order(coid)
+        if row is None:
+            raise RuntimeError(
+                f"DispatchJournal.run_modify_entry: row vanished after confirm "
+                f"(coid={coid!r})"
+            )
+        return hooks.exchange_order_from_state(
+            row=row, new_intent=new_intent, outcome=outcome,
+        )
+
+    # --- Modify exit path --------------------------------------------------
+
+    async def run_modify_exit(
+            self,
+            *,
+            coid: str,
+            target_coid: str,
+            target_row: 'OrderRow',
+            old_intent: ExitIntent,
+            new_intent: ExitIntent,
+            qty: float,
+            hooks: ModifyExitDispatchHooks,
+            audit_payload: dict | None = None,
+    ) -> list[ExchangeOrder]:
+        """Run a position bracket amend dispatch.
+
+        The journal owns the entry-side command row state machine and
+        invokes :meth:`mirror_bracket_legs` on the happy path. The
+        synthetic leg rows themselves are written by the hook (both
+        the disposition-unknown seeds in the ambiguous path and the
+        confirmed leg rows in the mirror path).
+
+        :param coid: COID of the amend command row.
+        :param target_coid: COID of the entry row representing the
+            position being amended.
+        :param target_row: Live row of the target entry (passed to the
+            mirror callback).
+        :param old_intent: Intent before the amend.
+        :param new_intent: Intent the broker should land.
+        :param qty: Position quantity (unchanged across the amend).
+        :param hooks: Plugin callbacks.
+        :param audit_payload: Optional extras for the
+            ``dispatch_submitted`` event payload.
+        """
+        # (1) PERSIST command row + audit event.
+        create_modify_exit_row(
+            self.store,
+            coid=coid,
+            target_coid=target_coid,
+            symbol=new_intent.symbol,
+            side=new_intent.side,
+            qty=qty,
+            intent_key=new_intent.intent_key,
+            new_tp=new_intent.tp_price,
+            new_sl=new_intent.sl_price,
+            new_trail=new_intent.trail_offset,
+            pine_entry_id=new_intent.pine_id,
+            from_entry=new_intent.from_entry,
+        )
+        submit_payload: dict[str, Any] = {
+            'kind': KIND_MODIFY_EXIT,
+            'target_coid': target_coid,
+            'new_tp': new_intent.tp_price,
+            'new_sl': new_intent.sl_price,
+            'new_trail': new_intent.trail_offset,
+        }
+        if audit_payload:
+            submit_payload.update(audit_payload)
+        self.store.log_event(
+            'dispatch_submitted',
+            client_order_id=coid,
+            intent_key=new_intent.intent_key,
+            payload=submit_payload,
+        )
+
+        # (2) SUBMIT — PUT + confirm inside the hook; ambiguous-path
+        # leg seeding is the hook's responsibility before re-raising.
+        try:
+            outcome = await hooks.submit_amend(
+                coid=coid, target_coid=target_coid,
+                old_intent=old_intent, new_intent=new_intent,
+            )
+        except OrderDispositionUnknownError as exc:
+            mark_disposition_unknown(self.store, coid=coid)
+            self.store.log_event(
+                'disposition_unknown',
+                client_order_id=coid,
+                intent_key=new_intent.intent_key,
+                payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+            )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            mark_rejected(self.store, coid=coid)
+            self.store.log_event(
+                'rejected',
+                client_order_id=coid,
+                intent_key=new_intent.intent_key,
+                payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+            )
+            raise
+
+        # (3) PERSIST server ref + completion.
+        self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
+        self.store.log_event(
+            'deal_reference_seen',
+            client_order_id=coid,
+            payload={'deal_reference': outcome.server_ref},
+        )
+        mark_modify_completed(
+            self.store,
+            coid=coid,
+            extra_payload={'post_put_state': dict(outcome.post_put_state)},
+        )
+        self.store.log_event(
+            'confirmed',
+            client_order_id=coid,
+            intent_key=new_intent.intent_key,
+            payload={
+                'deal_status': outcome.deal_status,
+                'post_put_state': dict(outcome.post_put_state),
+            },
+        )
+        self.store.close_order(coid)
+
+        # (4) MIRROR bracket legs (happy path only).
+        hooks.mirror_bracket_legs(
+            target_row=target_row, new_intent=new_intent, outcome=outcome,
+        )
+
+        # (5) Return the engine-facing list.
+        row = self.store.get_order(coid)
+        if row is None:
+            raise RuntimeError(
+                f"DispatchJournal.run_modify_exit: row vanished after confirm "
+                f"(coid={coid!r})"
+            )
+        return hooks.exchange_order_from_state(
+            row=row, new_intent=new_intent, outcome=outcome,
+        )
 
     # --- Recovery path -----------------------------------------------------
 
