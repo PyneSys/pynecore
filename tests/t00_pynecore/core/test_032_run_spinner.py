@@ -44,11 +44,15 @@ def __test_broker_metrics_text_uses_bid_for_long_unrealized_pnl__():
     )
 
     text = _broker_metrics_text(
-        position, balance={"EUR": 996.21}, preferred_currency="EUR",
+        position, exchange_position=None,
+        balance={"EUR": 996.21}, preferred_currency="EUR",
         price_decimals=5, bid=102.0, ask=103.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]996.21 EUR[/] Pos 2 Entry 100.00000 UPnL [green]+4.00[/]"
+    assert text == (
+        "Eq [cyan]996.21 EUR[/] Pos [cyan]2[/] "
+        "Entry [cyan]100.00000[/] UPnL [green]+4.00[/]"
+    )
 
 
 def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
@@ -61,11 +65,15 @@ def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
     )
 
     text = _broker_metrics_text(
-        position, balance={"USDT": 1000.0}, preferred_currency="USDT",
+        position, exchange_position=None,
+        balance={"USDT": 1000.0}, preferred_currency="USDT",
         price_decimals=2, bid=98.0, ask=99.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]1,000.00 USDT[/] Pos -3 Entry 100.00 UPnL [green]+3.00[/]"
+    assert text == (
+        "Eq [cyan]1,000.00 USDT[/] Pos [cyan]-3[/] "
+        "Entry [cyan]100.00[/] UPnL [green]+3.00[/]"
+    )
 
 
 def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
@@ -78,8 +86,56 @@ def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
     )
 
     text = _broker_metrics_text(
-        position, balance={"EUR": 996.21}, preferred_currency="EUR",
+        position, exchange_position=None,
+        balance={"EUR": 996.21}, preferred_currency="EUR",
         price_decimals=5, bid=102.0, ask=103.0, fallback_price=None,
     )
 
-    assert text == "Eq [cyan]996.21 EUR[/] Pos flat UPnL [red]-12.34[/]"
+    assert text == "Eq [cyan]996.21 EUR[/]"
+
+
+def __test_broker_metrics_text_prefers_exchange_position_snapshot__():
+    position = SimpleNamespace(
+        size=0.0,
+        avg_price=0.0,
+        netprofit=0.0,
+        openprofit=0.0,
+        open_trades=[],
+    )
+    exchange_position = SimpleNamespace(
+        side="long",
+        size=100.0,
+        entry_price=1.17293,
+        unrealized_pnl=-0.01,
+    )
+
+    text = _broker_metrics_text(
+        position, exchange_position=exchange_position,
+        balance={"EURd": 999.43}, preferred_currency="EURd",
+        price_decimals=5, bid=1.17377, ask=1.17384, fallback_price=None,
+    )
+
+    assert text == (
+        "Eq [cyan]999.43 EURd[/] Pos [cyan]100[/] "
+        "Entry [cyan]1.17293[/] UPnL [red]-0.01[/]"
+    )
+
+
+def __test_broker_metrics_text_signs_short_exchange_position__():
+    exchange_position = SimpleNamespace(
+        side="short",
+        size=25.0,
+        entry_price=1.2000,
+        unrealized_pnl=3.21,
+    )
+
+    text = _broker_metrics_text(
+        None, exchange_position=exchange_position,
+        balance={"EUR": 1000.0}, preferred_currency="EUR",
+        price_decimals=5, bid=1.1900, ask=1.1901, fallback_price=None,
+    )
+
+    assert text == (
+        "Eq [cyan]1,000.00 EUR[/] Pos [cyan]-25[/] "
+        "Entry [cyan]1.20000[/] UPnL [green]+3.21[/]"
+    )

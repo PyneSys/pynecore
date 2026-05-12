@@ -470,6 +470,12 @@ class ScriptRunner:
     def _broker_mode(self) -> bool:
         return self._order_sync_engine is not None
 
+    @property
+    def broker_position_snapshot(self) -> 'Any | None':
+        if self._order_sync_engine is None:
+            return None
+        return self._order_sync_engine.exchange_position
+
     # noinspection PyProtectedMember
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
                  on_tick: Callable[[OHLCV], None] | None = None) \

@@ -50,6 +50,7 @@ from pynecore.core.broker.models import (
     CloseIntent,
     DispatchEnvelope,
     EntryIntent,
+    ExchangePosition,
     ExitIntent,
     InterceptorResult,
     LegPartialRepairedEvent,
@@ -165,6 +166,7 @@ class OrderSyncEngine:
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
         self._event_queue: queue.Queue[OrderEvent] = queue.Queue()
+        self._exchange_position: ExchangePosition | None = None
         self._interceptors: list[Callable[[Intent], InterceptorResult]] = []
         self._sync_count = 0
         self._current_bar_ts_ms: int = 0
@@ -266,6 +268,11 @@ class OrderSyncEngine:
     def pending_verification(self) -> dict[str, DispatchEnvelope]:
         """Envelopes whose exchange-side disposition is still unknown."""
         return self._pending_verification
+
+    @property
+    def exchange_position(self) -> ExchangePosition | None:
+        """Latest position snapshot returned by the broker, if any."""
+        return self._exchange_position
 
     def register_interceptor(
             self, fn: Callable[[Intent], InterceptorResult],
@@ -845,6 +852,7 @@ class OrderSyncEngine:
         reference implementation.
         """
         exch_pos = self._run_async(self._broker.get_position(self._symbol))
+        self._exchange_position = exch_pos
         if exch_pos is not None:
             self._position.openprofit = float(exch_pos.unrealized_pnl)
         elif self._position.size == 0.0:

@@ -264,6 +264,7 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
     assert pos.sign == 1.0
     assert pos.avg_price == 50_000.0
     assert pos.openprofit == 123.45
+    assert runner.broker_position_snapshot is plugin.startup_position
 
 
 def __test_startup_validation_rejects_incompatible_script__(tmp_path):
