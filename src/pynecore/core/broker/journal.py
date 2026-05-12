@@ -27,7 +27,7 @@ documented in ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from time import time as epoch_time
-from typing import Literal, Protocol, TYPE_CHECKING
+from typing import Any, Literal, Protocol, TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
@@ -138,6 +138,15 @@ class ResumeOutcome:
     :ivar fill_price: Same semantics as :class:`ConfirmOutcome`.
     :ivar reject_reason: Free-form reject reason, written to the audit
         event when ``status == 'rejected'``.
+    :ivar recovery_path: Plugin-defined category for the resolution
+        route — e.g. ``'stored_ref'``, ``'activity_single_match'``,
+        ``'ttl_fallback_snapshot'``, ``'confirm_get_direct'``. Merged
+        into the ``recovered_*`` / ``recovery_pending`` audit event
+        payload when set. The Core does not validate the value; the
+        plugin owns the taxonomy.
+    :ivar recovery_context: Structured plugin diagnostic that goes
+        alongside ``recovery_path`` in the audit event (e.g.
+        ``{'matched_snapshot': 'working', 'activity_count': 1}``).
     """
     status: ResumeStatus
     exchange_id: str | None = None
@@ -145,6 +154,8 @@ class ResumeOutcome:
     filled_qty: float = 0.0
     fill_price: float | None = None
     reject_reason: str | None = None
+    recovery_path: str | None = None
+    recovery_context: Mapping[str, Any] | None = None
 
 
 # === Hook protocol =========================================================
@@ -470,35 +481,41 @@ class DispatchJournal:
                 filled_qty=outcome.filled_qty,
                 fill_price=outcome.fill_price,
             )
+            payload: dict[str, Any] = {
+                'is_filled': outcome.is_filled,
+                'fill_price': outcome.fill_price,
+                'prior_state': row.state,
+            }
+            _merge_recovery_diagnostics(payload, outcome)
             self.store.log_event(
                 'recovered_confirmed',
                 client_order_id=row.client_order_id,
                 exchange_order_id=outcome.exchange_id,
                 intent_key=row.intent_key,
-                payload={
-                    'is_filled': outcome.is_filled,
-                    'fill_price': outcome.fill_price,
-                    'prior_state': row.state,
-                },
+                payload=payload,
             )
         elif outcome.status == 'rejected':
             mark_rejected(self.store, coid=row.client_order_id)
+            payload = {
+                'reason': outcome.reject_reason,
+                'prior_state': row.state,
+            }
+            _merge_recovery_diagnostics(payload, outcome)
             self.store.log_event(
                 'recovered_rejected',
                 client_order_id=row.client_order_id,
                 intent_key=row.intent_key,
-                payload={
-                    'reason': outcome.reject_reason,
-                    'prior_state': row.state,
-                },
+                payload=payload,
             )
         else:
             # still_unknown — keep the row; engine reconciler retries.
+            payload = {'prior_state': row.state}
+            _merge_recovery_diagnostics(payload, outcome)
             self.store.log_event(
                 'recovery_pending',
                 client_order_id=row.client_order_id,
                 intent_key=row.intent_key,
-                payload={'prior_state': row.state},
+                payload=payload,
             )
         return PendingResolution(
             coid=row.client_order_id,
@@ -539,6 +556,21 @@ class PendingHooksProvider(Protocol):
 
 
 # === Private helpers =======================================================
+
+def _merge_recovery_diagnostics(
+        payload: dict[str, Any], outcome: ResumeOutcome,
+) -> None:
+    """Inject ``recovery_path`` / ``recovery_context`` into an event payload.
+
+    Both fields are optional plugin-supplied diagnostics; when ``None``
+    they are not written at all so the on-disk audit shape stays
+    minimal for hooks that do not bother annotating the route.
+    """
+    if outcome.recovery_path is not None:
+        payload['recovery_path'] = outcome.recovery_path
+    if outcome.recovery_context is not None:
+        payload['recovery_context'] = dict(outcome.recovery_context)
+
 
 def _collect_refs_for(store: 'RunContext', *, coid: str) -> Mapping[str, str]:
     """Materialise the full ``order_refs`` map for one COID.
