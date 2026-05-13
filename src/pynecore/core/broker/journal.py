@@ -147,7 +147,7 @@ class ConfirmOutcome:
     raw: dict | None = None
 
 
-CancelReasonPath = Literal['deleted', 'already_gone', 'noop']
+CancelReasonPath = Literal['deleted', 'already_gone', 'noop', 'recovered']
 ModifyExitStatus = Literal['ACCEPTED', 'REJECTED']
 
 
@@ -207,6 +207,9 @@ class CancelOutcome:
         - ``'already_gone'`` — every target had already vanished from
           the broker; nothing was DELETEd.
         - ``'noop'`` — no targets matched the intent at all.
+        - ``'recovered'`` — recovery declared the cancel landed because
+          all targets vanished from the snapshots; never emitted by a
+          live dispatch, only by :meth:`DispatchJournal._apply_resume_outcome`.
 
     :ivar cleared_legs: Number of bracket / working-order legs the
         dispatch swept (``len(applied_target_coids)``).
@@ -1400,10 +1403,11 @@ class DispatchJournal:
         row's ``extras['kind']``: entry rows (``ENTRY_KIND_POSITION`` /
         ``ENTRY_KIND_WORKING``) stay live as the engine-facing order, so
         :func:`mark_confirmed_with_fill` is the right helper. Command
-        rows (``KIND_MODIFY_ENTRY``, future cancel / close / modify_exit)
-        are one-shot dispatch records — they need
-        :func:`mark_modify_completed` (or sibling) plus an explicit
-        :meth:`RunContext.close_order` to leave the live-orders set.
+        rows (``KIND_MODIFY_ENTRY``, ``KIND_CANCEL``, future close /
+        modify_exit) are one-shot dispatch records — they need
+        :func:`mark_modify_completed` / :func:`mark_cancel_completed`
+        plus an explicit :meth:`RunContext.close_order` to leave the
+        live-orders set.
         """
         kind = (row.extras or {}).get('kind')
         if outcome.status == 'confirmed':
@@ -1415,6 +1419,22 @@ class DispatchJournal:
                         {'recovery_path': outcome.recovery_path}
                         if outcome.recovery_path is not None else None
                     ),
+                )
+                self.store.close_order(row.client_order_id)
+            elif kind == KIND_CANCEL:
+                extra: dict[str, Any] = {}
+                if outcome.recovery_path is not None:
+                    extra['recovery_path'] = outcome.recovery_path
+                applied = (outcome.recovery_context or {}).get(
+                    'applied_target_coids'
+                ) if outcome.recovery_context is not None else None
+                if applied is not None:
+                    extra['applied_target_coids'] = list(applied)
+                mark_cancel_completed(
+                    self.store,
+                    coid=row.client_order_id,
+                    reason_path='recovered',
+                    extra_payload=extra or None,
                 )
                 self.store.close_order(row.client_order_id)
             else:
