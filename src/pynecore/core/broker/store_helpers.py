@@ -742,6 +742,7 @@ def create_modify_exit_row(
         new_tp: float | None,
         new_sl: float | None,
         new_trail: float | None,
+        new_trail_price: float | None = None,
         pine_entry_id: str | None = None,
         from_entry: str | None = None,
         extra_payload: Mapping[str, Any] | None = None,
@@ -751,8 +752,18 @@ def create_modify_exit_row(
     Mirrors :func:`create_modify_entry_row` but for ``ExitIntent``
     amends: the target is the entry-row representing the position and
     the requested change covers TP / SL / trailing levels. Recovery
-    reads ``new_tp`` / ``new_sl`` / ``new_trail`` from ``extras`` and
-    compares them against the post-amend snapshot.
+    reads ``new_tp`` / ``new_sl`` / ``new_trail`` / ``new_trail_price``
+    from ``extras`` and compares them against the post-amend snapshot.
+
+    ``new_trail_price`` is Pine's trailing-stop *activation* price
+    (``strategy.exit(trail_price=...)``). When both ``new_trail`` and
+    ``new_trail_price`` are set the bracket is **pending trailing** —
+    the broker carries no native trailing stop yet (the local
+    activation monitor will PUT one once price crosses the threshold),
+    so the post-amend snapshot legitimately shows ``trailingStop=False``
+    and recovery must NOT require ``trailingStop=True`` to declare the
+    amend landed. Persisting the activation price is what lets the
+    snapshot verdict distinguish the two trailing shapes.
 
     Synthetic bracket leg rows (``leg_kind`` ``'tp'`` / ``'sl'``)
     remain under the plugin's leg state machine for M4; this helper
@@ -764,6 +775,7 @@ def create_modify_exit_row(
         'new_tp': new_tp,
         'new_sl': new_sl,
         'new_trail': new_trail,
+        'new_trail_price': new_trail_price,
     }
     if extra_payload:
         extras.update(extra_payload)

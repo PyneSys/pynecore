@@ -1271,6 +1271,7 @@ class DispatchJournal:
             new_tp=new_intent.tp_price,
             new_sl=new_intent.sl_price,
             new_trail=new_intent.trail_offset,
+            new_trail_price=new_intent.trail_price,
             pine_entry_id=new_intent.pine_id,
             from_entry=new_intent.from_entry,
         )
@@ -1316,13 +1317,27 @@ class DispatchJournal:
             )
             raise
 
-        # (3) PERSIST server ref + completion.
+        # (3) PERSIST server ref.
         self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
         self.store.log_event(
             'deal_reference_seen',
             client_order_id=coid,
             payload={'deal_reference': outcome.server_ref},
         )
+
+        # (4) MIRROR bracket legs BEFORE marking the command row terminal.
+        # The command row stays live (and recoverable) until the legs are
+        # written, so a crash between the broker-accepted PUT and the
+        # mirror callback leaves recovery able to re-run the verdict
+        # (confirms/{ref} → ACCEPTED) and replay the mirror on next sync
+        # via the snapshot reconciler. Once mark_modify_completed +
+        # close_order run, the row leaves the live set and the leg state
+        # must already be durable.
+        hooks.mirror_bracket_legs(
+            target_row=target_row, new_intent=new_intent, outcome=outcome,
+        )
+
+        # (5) PERSIST terminal completion + close.
         mark_modify_completed(
             self.store,
             coid=coid,
@@ -1339,12 +1354,7 @@ class DispatchJournal:
         )
         self.store.close_order(coid)
 
-        # (4) MIRROR bracket legs (happy path only).
-        hooks.mirror_bracket_legs(
-            target_row=target_row, new_intent=new_intent, outcome=outcome,
-        )
-
-        # (5) Return the engine-facing list.
+        # (6) Return the engine-facing list.
         row = self.store.get_order(coid)
         if row is None:
             raise RuntimeError(
@@ -1409,6 +1419,10 @@ class DispatchJournal:
         set:
 
         * ``KIND_MODIFY_ENTRY`` → :func:`mark_modify_completed`
+        * ``KIND_MODIFY_EXIT`` → :func:`mark_modify_completed` (same
+          one-shot semantics as the entry-amend; the bracket leg rows
+          are reconciled separately by the plugin's snapshot resolver
+          and are outside this row's scope).
         * ``KIND_CANCEL`` → :func:`mark_cancel_completed`
           (``reason_path='recovered'``)
         * ``KIND_FULL_CLOSE`` → :func:`mark_closing` (the row stays
@@ -1426,6 +1440,20 @@ class DispatchJournal:
                         {'recovery_path': outcome.recovery_path}
                         if outcome.recovery_path is not None else None
                     ),
+                )
+                self.store.close_order(row.client_order_id)
+            elif kind == KIND_MODIFY_EXIT:
+                extras_payload: dict[str, Any] = {}
+                if outcome.recovery_path is not None:
+                    extras_payload['recovery_path'] = outcome.recovery_path
+                if outcome.recovery_context is not None:
+                    extras_payload['recovery_context'] = dict(
+                        outcome.recovery_context
+                    )
+                mark_modify_completed(
+                    self.store,
+                    coid=row.client_order_id,
+                    extra_payload=extras_payload or None,
                 )
                 self.store.close_order(row.client_order_id)
             elif kind == KIND_CANCEL:
