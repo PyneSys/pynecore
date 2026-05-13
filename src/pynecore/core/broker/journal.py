@@ -1403,11 +1403,18 @@ class DispatchJournal:
         row's ``extras['kind']``: entry rows (``ENTRY_KIND_POSITION`` /
         ``ENTRY_KIND_WORKING``) stay live as the engine-facing order, so
         :func:`mark_confirmed_with_fill` is the right helper. Command
-        rows (``KIND_MODIFY_ENTRY``, ``KIND_CANCEL``, future close /
-        modify_exit) are one-shot dispatch records — they need
-        :func:`mark_modify_completed` / :func:`mark_cancel_completed`
-        plus an explicit :meth:`RunContext.close_order` to leave the
-        live-orders set.
+        rows are one-shot dispatch records — they need the matching
+        terminal-state writer plus, except for ``KIND_FULL_CLOSE``, an
+        explicit :meth:`RunContext.close_order` to leave the live-orders
+        set:
+
+        * ``KIND_MODIFY_ENTRY`` → :func:`mark_modify_completed`
+        * ``KIND_CANCEL`` → :func:`mark_cancel_completed`
+          (``reason_path='recovered'``)
+        * ``KIND_FULL_CLOSE`` → :func:`mark_closing` (the row stays
+          live in ``closing`` state until the activity stream promotes
+          each target to ``closed``).
+        * ``KIND_PARTIAL_CLOSE`` → :func:`mark_close_completed`
         """
         kind = (row.extras or {}).get('kind')
         if outcome.status == 'confirmed':
@@ -1435,6 +1442,37 @@ class DispatchJournal:
                     coid=row.client_order_id,
                     reason_path='recovered',
                     extra_payload=extra or None,
+                )
+                self.store.close_order(row.client_order_id)
+            elif kind == KIND_FULL_CLOSE:
+                # Recovery verdict says every DELETE landed (targets
+                # vanished from the broker snapshot). Promote the command
+                # row to ``closing`` — matching the live dispatch end
+                # state — and leave it open; the activity stream then
+                # closes each target row in due course.
+                ctx = outcome.recovery_context or {}
+                applied_targets = list(ctx.get('applied_targets') or [])
+                if not applied_targets:
+                    applied_targets = list((row.extras or {}).get('targets') or [])
+                extra_full: dict[str, Any] = {}
+                if outcome.recovery_path is not None:
+                    extra_full['recovery_path'] = outcome.recovery_path
+                mark_closing(
+                    self.store,
+                    coid=row.client_order_id,
+                    kind=KIND_FULL_CLOSE,
+                    targets=applied_targets,
+                    extra_payload=extra_full or None,
+                )
+            elif kind == KIND_PARTIAL_CLOSE:
+                extra_partial: dict[str, Any] = {}
+                if outcome.recovery_path is not None:
+                    extra_partial['recovery_path'] = outcome.recovery_path
+                mark_close_completed(
+                    self.store,
+                    coid=row.client_order_id,
+                    kind=KIND_PARTIAL_CLOSE,
+                    extra_payload=extra_partial or None,
                 )
                 self.store.close_order(row.client_order_id)
             else:

@@ -482,10 +482,15 @@ def record_close_server_ref(
             f"got {kind!r}"
         )
     store.add_ref(coid, 'deal_reference', deal_reference)
-    extras: dict[str, Any] = {
-        'kind': kind,
-        'deal_reference': deal_reference,
-    }
+    # ``upsert_order(extras=...)`` overwrites the whole dict, so read the
+    # current extras first and merge: plugin-side context written between
+    # row creation and this helper (e.g. ``pre_total_units`` /
+    # ``intent_units`` from the partial-close emulation's pre-snapshot)
+    # must survive the state advance so recovery has them.
+    existing = store.get_order(coid)
+    extras: dict[str, Any] = dict(existing.extras or {}) if existing else {}
+    extras['kind'] = kind
+    extras['deal_reference'] = deal_reference
     if extra_payload:
         extras.update(extra_payload)
     store.upsert_order(
