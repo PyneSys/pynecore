@@ -16,8 +16,6 @@ dataclasses the broker plugin can act on. The translation is **pure**:
 no access to ``lib._script`` or ``syminfo``; the caller supplies the
 symbol and keeps tick/mintick resolution inside the sync engine.
 """
-from __future__ import annotations
-
 from typing import Iterable
 
 from pynecore.core.broker.models import (

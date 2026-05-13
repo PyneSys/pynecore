@@ -64,6 +64,8 @@ __all__ = [
     'create_modify_entry_row',
     'create_modify_exit_row',
     'mark_modify_completed',
+    'mark_reconcile_filled',
+    'mark_reconcile_terminal_close',
 ]
 
 
@@ -818,3 +820,91 @@ def mark_modify_completed(
         merged.update(extra_payload)
         fields['extras'] = merged
     store.upsert_order(coid, **fields)
+
+
+# === Reconcile-path terminal helpers =======================================
+
+def mark_reconcile_filled(
+        store: 'RunContext',
+        *,
+        coid: str,
+        filled_qty: float,
+        new_state: str,
+        extras_patch: Mapping[str, Any] | None,
+) -> None:
+    """Promote a row to ``confirmed`` from a reconcile-path observation.
+
+    Used by :meth:`~pynecore.core.broker.journal.DispatchJournal.apply_reconcile_outcome`
+    for the working→position case: a row sitting in
+    :data:`STATE_SERVER_REF_SEEN` is observed in the live positions
+    snapshot, so the journal records the fill and flips
+    ``extras['kind']`` from :data:`ENTRY_KIND_WORKING` to
+    :data:`ENTRY_KIND_POSITION` in a single transaction.
+
+    :param store: The active run context.
+    :param coid: The row's client-order-id.
+    :param filled_qty: Confirmed fill quantity from the snapshot.
+    :param new_state: The state to land in (always :data:`STATE_CONFIRMED`
+        for the current call sites; passed through for clarity).
+    :param extras_patch: Plugin-supplied extras to merge into the row
+        (e.g. ``{'kind': 'position', 'entry_filled_at': now_ts}``).
+        Merged on top of the existing ``extras`` — the journal does not
+        validate the keys.
+    """
+    fields: dict[str, Any] = {
+        'state': new_state,
+        'filled_qty': filled_qty,
+    }
+    if extras_patch:
+        existing = store.get_order(coid)
+        merged = dict(existing.extras or {}) if existing is not None else {}
+        merged.update(extras_patch)
+        fields['extras'] = merged
+    store.upsert_order(coid, **fields)
+
+
+def mark_reconcile_terminal_close(
+        store: 'RunContext',
+        *,
+        coid: str,
+        new_state: str,
+        extras_patch: Mapping[str, Any] | None,
+        close_row: bool,
+) -> None:
+    """Terminate a row from a reconcile-path observation.
+
+    Used by :meth:`~pynecore.core.broker.journal.DispatchJournal.apply_reconcile_outcome`
+    for every terminal close that originates in the reconciler:
+    bracket sibling retire on mixed-bracket rejection, pending-trail
+    sibling parent-rejection cascade, missing-pending grace expiry,
+    unexpected-cancel cascade, and eager-teardown follow-up after a
+    natural close.
+
+    The state mutation, the optional extras merge, and the
+    :meth:`RunContext.close_order` (when ``close_row`` is ``True``)
+    happen in this single helper; the journal then writes a separate
+    audit event. The split mirrors :func:`mark_confirmed_with_fill`
+    style — terminal facts persisted first, audit logging by the
+    caller.
+
+    :param store: The active run context.
+    :param coid: The row's client-order-id.
+    :param new_state: Terminal state to land in — typically
+        :data:`STATE_REJECTED` for bracket retire / cascade paths.
+        ``close_row=True`` is what drops the row from the live set.
+    :param extras_patch: Plugin-supplied extras to merge before the
+        terminal transition (rarely used on this path; usually
+        ``None``).
+    :param close_row: When ``True``, also calls
+        :meth:`RunContext.close_order` after the state update — this
+        is the steady-state default for reconcile terminal closures.
+    """
+    fields: dict[str, Any] = {'state': new_state}
+    if extras_patch:
+        existing = store.get_order(coid)
+        merged = dict(existing.extras or {}) if existing is not None else {}
+        merged.update(extras_patch)
+        fields['extras'] = merged
+    store.upsert_order(coid, **fields)
+    if close_row:
+        store.close_order(coid)

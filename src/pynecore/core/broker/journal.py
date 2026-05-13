@@ -60,6 +60,8 @@ from pynecore.core.broker.store_helpers import (
     mark_confirmed_with_fill,
     mark_disposition_unknown,
     mark_modify_completed,
+    mark_reconcile_filled,
+    mark_reconcile_terminal_close,
     mark_rejected,
     record_close_server_ref,
     record_server_ref,
@@ -85,6 +87,10 @@ __all__ = [
     'ModifyEntryOutcome',
     'ModifyExitOutcome',
     'ModifyExitStatus',
+    'ReconcileOutcome',
+    'ReconcileKind',
+    'ReconcileReason',
+    'ReconcileTerminalState',
     'PendingResolution',
     'PendingHooksProvider',
 ]
@@ -308,6 +314,97 @@ class ResumeOutcome:
     reject_reason: str | None = None
     recovery_path: str | None = None
     recovery_context: Mapping[str, Any] | None = None
+
+
+# === Reconcile-path outcome ================================================
+
+ReconcileKind = Literal['filled', 'terminal_close']
+
+# Validated reason tags for :class:`ReconcileOutcome`. New reasons require
+# extending this literal; the journal does not enforce membership at
+# runtime, but downstream tests and broker-plugin reviews check against
+# this taxonomy. See ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``
+# §4.2 for the full contract.
+ReconcileReason = Literal[
+    # kind='filled'
+    'working_promoted_position',
+    'partial_fill_progress',
+    # kind='terminal_close'
+    'bracket_sibling_retired_on_mixed_rejection',
+    'pending_trail_parent_rejected',
+    'missing_pending_grace_expired',
+    'unexpected_cancel_cascade',
+    'bracket_natural_close_followup',
+]
+
+# Terminal states the reconcile path may land a row in. ``'confirmed'`` is
+# used by the working→position promotion (``kind='filled'``);
+# ``'rejected'`` is the typical destination for bracket sibling retires and
+# the cascade paths; ``'closed'`` is reserved for paths that already pass
+# through a non-terminal state and merely need :meth:`RunContext.close_order`
+# (current call sites use ``state='rejected'`` plus ``close_row=True``, but
+# the literal is here for the bracket-natural-close follow-up reason).
+ReconcileTerminalState = Literal['confirmed', 'rejected', 'closed']
+
+
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    """Plugin verdict for one reconcile-path terminal mutation.
+
+    Emitted per-row by the plugin reconciler (``_reconcile_snapshot``,
+    ``_missing_pending_tracker``, ``_maybe_raise_unexpected_cancel``) when
+    an observation, grace-window expiry, or cascade rule requires the
+    journal to persist a terminal lifecycle change. The journal owns the
+    actual ``state`` / ``filled_qty`` / ``closed_ts_ms`` / audit-event
+    writes; the plugin only declares "what happened and why".
+
+    The Cat 1 reconciler-private observation breadcrumbs
+    (``missing_pending_since``, ``close_event_yielded_at``,
+    ``close_event_yielded_at_poll_id``) are NOT routed through this
+    outcome — they stay plugin-direct writes. Journal ownership is
+    limited to ``state`` / ``filled_qty`` / ``closed_ts_ms`` / terminal
+    timestamps / lifecycle audit events; everything else under
+    ``extras`` is the plugin's namespace.
+
+    :ivar kind: ``'filled'`` for the working→position fill detection
+        (a row in :data:`~pynecore.core.broker.store_helpers.STATE_SERVER_REF_SEEN`
+        observed in ``/positions``). ``'terminal_close'`` for any other
+        reconcile-path retirement — bracket sibling retire, grace-window
+        expiry, unexpected-cancel cascade, eager-teardown follow-up.
+    :ivar reason: Validated literal tag describing the trigger; see
+        :data:`ReconcileReason`.
+    :ivar new_state: The state the row should land in. ``'confirmed'``
+        for ``kind='filled'``; ``'rejected'`` / ``'closed'`` for
+        ``kind='terminal_close'``.
+    :ivar filled_qty: Fill quantity (mandatory when ``kind='filled'``;
+        ignored when ``kind='terminal_close'``).
+    :ivar extras_patch: Plugin-supplied extras to merge into the row in
+        the same transaction as the state mutation. Examples:
+        ``{'kind': 'position', 'entry_filled_at': now_ts}`` for a
+        working→position fill, ``None`` for bracket retire. The journal
+        does not validate the keys.
+    :ivar close_row: ``True`` => journal also calls
+        :meth:`RunContext.close_order` to retire the row from
+        ``iter_live_orders``. ``False`` for working→position (the row
+        stays live as a position); ``True`` for the bracket / cascade /
+        grace-expiry paths.
+    :ivar audit_event: The :meth:`RunContext.log_event` ``kind`` for the
+        audit row the journal writes after the state mutation. Plugin
+        chooses the name (the broker tests pin specific event names).
+    :ivar audit_payload: Mapping merged into the audit event payload.
+    :ivar exchange_order_id: Optional exchange-side id stamped into the
+        audit event (e.g. ``parent_deal_id`` for a bracket sibling
+        retire).
+    """
+    kind: ReconcileKind
+    reason: ReconcileReason
+    new_state: ReconcileTerminalState
+    audit_event: str
+    filled_qty: float | None = None
+    extras_patch: Mapping[str, Any] | None = None
+    close_row: bool = False
+    audit_payload: Mapping[str, Any] | None = None
+    exchange_order_id: str | None = None
 
 
 # === Hook protocol =========================================================
@@ -1552,6 +1649,66 @@ class DispatchJournal:
             coid=row.client_order_id,
             status=outcome.status,
             reason=outcome.reject_reason,
+        )
+
+    def apply_reconcile_outcome(
+            self,
+            coid: str,
+            outcome: ReconcileOutcome,
+    ) -> None:
+        """Persist a reconcile-path terminal mutation.
+
+        Called once per row that the plugin reconciler decides needs a
+        terminal lifecycle write — working→position fill detection,
+        bracket sibling retire on mixed-bracket rejection, pending-trail
+        parent-rejection cascade, missing-pending grace expiry,
+        unexpected-cancel cascade, eager-teardown follow-up. The plugin
+        decides *what happened* (sibling selection, reason
+        classification, snapshot interpretation); the journal applies
+        the state transition, optionally retires the row from
+        ``iter_live_orders``, and writes the audit event.
+
+        Cat 1 reconciler-private breadcrumbs
+        (``missing_pending_since`` / ``close_event_yielded_at`` family)
+        are NOT routed here — those are plugin-namespace
+        ``extras`` and stay direct :meth:`RunContext.upsert_order`
+        writes. See :class:`ReconcileOutcome` for the full ownership
+        contract.
+
+        :param coid: The row's client-order-id.
+        :param outcome: The plugin's declared reconcile verdict.
+        :raises ValueError: when ``outcome.kind`` is ``'filled'`` but
+            ``outcome.filled_qty`` is ``None``.
+        """
+        if outcome.kind == 'filled':
+            if outcome.filled_qty is None:
+                raise ValueError(
+                    f"ReconcileOutcome kind='filled' requires filled_qty, "
+                    f"got None (coid={coid!r}, reason={outcome.reason!r})"
+                )
+            mark_reconcile_filled(
+                self.store,
+                coid=coid,
+                filled_qty=outcome.filled_qty,
+                new_state=outcome.new_state,
+                extras_patch=outcome.extras_patch,
+            )
+        else:
+            mark_reconcile_terminal_close(
+                self.store,
+                coid=coid,
+                new_state=outcome.new_state,
+                extras_patch=outcome.extras_patch,
+                close_row=outcome.close_row,
+            )
+        self.store.log_event(
+            outcome.audit_event,
+            client_order_id=coid,
+            exchange_order_id=outcome.exchange_order_id,
+            payload=(
+                dict(outcome.audit_payload)
+                if outcome.audit_payload is not None else None
+            ),
         )
 
 
