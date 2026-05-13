@@ -45,6 +45,8 @@ __all__ = [
     'KIND_EXIT_SL',
     'KIND_CLOSE',
     'KIND_CANCEL',
+    'KIND_MODIFY_ENTRY',
+    'KIND_MODIFY_EXIT',
     'VALID_KINDS',
     'CLIENT_ORDER_ID_MAX_LEN',
     'RUN_TAG_WIDTH',
@@ -61,9 +63,12 @@ KIND_EXIT_TP: Final[str] = 't'
 KIND_EXIT_SL: Final[str] = 's'
 KIND_CLOSE: Final[str] = 'c'
 KIND_CANCEL: Final[str] = 'x'
+KIND_MODIFY_ENTRY: Final[str] = 'n'
+KIND_MODIFY_EXIT: Final[str] = 'r'
 
 VALID_KINDS: Final[frozenset[str]] = frozenset({
     KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL, KIND_CLOSE, KIND_CANCEL,
+    KIND_MODIFY_ENTRY, KIND_MODIFY_EXIT,
 })
 
 # === Width constants =====================================================
@@ -143,8 +148,9 @@ def build_client_order_id(
     :param pine_id: Pine-level order identifier; hashed internally.
     :param bar_ts_ms: Bar open timestamp in milliseconds since the Unix epoch.
         Must be non-negative.
-    :param kind: One of :data:`KIND_ENTRY`, :data:`KIND_EXIT_TP`,
-        :data:`KIND_EXIT_SL`, :data:`KIND_CLOSE`, :data:`KIND_CANCEL`.
+    :param kind: One of the single-character codes in
+        :data:`VALID_KINDS` (entry / TP / SL / close / cancel /
+        modify-entry / modify-exit).
     :param retry_seq: Bumped only when the sync engine deliberately abandons
         a prior attempt (e.g. the exchange never acknowledged the original
         dispatch and the recovery timeout expired). ``0`` by default.

@@ -1394,16 +1394,38 @@ class DispatchJournal:
             row: 'OrderRow',
             outcome: ResumeOutcome,
     ) -> 'PendingResolution':
-        """Persist the recovery verdict and return a diagnostic record."""
+        """Persist the recovery verdict and return a diagnostic record.
+
+        The ``confirmed`` verdict's terminal-state writer depends on the
+        row's ``extras['kind']``: entry rows (``ENTRY_KIND_POSITION`` /
+        ``ENTRY_KIND_WORKING``) stay live as the engine-facing order, so
+        :func:`mark_confirmed_with_fill` is the right helper. Command
+        rows (``KIND_MODIFY_ENTRY``, future cancel / close / modify_exit)
+        are one-shot dispatch records — they need
+        :func:`mark_modify_completed` (or sibling) plus an explicit
+        :meth:`RunContext.close_order` to leave the live-orders set.
+        """
+        kind = (row.extras or {}).get('kind')
         if outcome.status == 'confirmed':
-            mark_confirmed_with_fill(
-                self.store,
-                coid=row.client_order_id,
-                exchange_id=outcome.exchange_id,
-                is_filled=outcome.is_filled,
-                filled_qty=outcome.filled_qty,
-                fill_price=outcome.fill_price,
-            )
+            if kind == KIND_MODIFY_ENTRY:
+                mark_modify_completed(
+                    self.store,
+                    coid=row.client_order_id,
+                    extra_payload=(
+                        {'recovery_path': outcome.recovery_path}
+                        if outcome.recovery_path is not None else None
+                    ),
+                )
+                self.store.close_order(row.client_order_id)
+            else:
+                mark_confirmed_with_fill(
+                    self.store,
+                    coid=row.client_order_id,
+                    exchange_id=outcome.exchange_id,
+                    is_filled=outcome.is_filled,
+                    filled_qty=outcome.filled_qty,
+                    fill_price=outcome.fill_price,
+                )
             payload: dict[str, Any] = {
                 'is_filled': outcome.is_filled,
                 'fill_price': outcome.fill_price,
@@ -1470,9 +1492,14 @@ class PendingHooksProvider(Protocol):
     """Callable that maps a pending row to its recovery hook.
 
     The plugin implements this to decide which hook flavour applies
-    to each ``extras['kind']`` — only ``'position'`` / ``'working'``
-    are entry rows; future kinds (``'tp'``, ``'sl'``, ...) belong to
-    their own journals.
+    to each ``extras['kind']``. Returning ``None`` makes the journal
+    record a ``skipped`` resolution for that row (e.g. bracket legs
+    handled by their own resolver).
+
+    The recovery contract only requires ``resume_pending_dispatch``;
+    the duck-typed return is annotated as :class:`EntryDispatchHooks`
+    for IDE convenience, but any hook flavour with a compatible
+    ``resume_pending_dispatch`` shape is accepted.
     """
 
     def __call__(self, row: 'OrderRow') -> EntryDispatchHooks | None: ...
