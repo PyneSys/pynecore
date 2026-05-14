@@ -67,14 +67,39 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     ``_emit_unexpected_cancellations`` for the reference implementation.
     """
 
+    require_one_way_mode: bool = True
+    """
+    When True (the default), the startup probe fails closed if the
+    account has hedging mode enabled.
+
+    The base :class:`BrokerPlugin` semantics are one-way Pine — hedging
+    mode belongs on a future ``HedgeBrokerPlugin`` subclass.  Plugins on
+    spot venues without a hedging concept leave this flag inert.
+
+    Like :attr:`on_unexpected_cancel`, the production value comes from
+    the cross-broker ``workdir/config/brokers.toml`` via
+    :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
+    ``pyne run --broker`` entry point loads it once and assigns it as an
+    instance attribute on the plugin before the script runner starts.
+    The class-level default is the strict fallback used by test paths
+    that construct plugins without the CLI.
+    """
+
     on_unexpected_cancel: str = "stop"
     """
     Policy for bot-owned orders that disappear without the bot cancelling them.
 
     One of ``"stop"`` (graceful stop, default), ``"stop_and_cancel"``
     (stop + cancel remaining bot orders), ``"re_place"`` (auto-replace
-    protective orders), or ``"ignore"`` (continue).  Plugin authors may
-    override the default; users may further override via plugin config.
+    protective orders), or ``"ignore"`` (continue).  The class-level
+    default is the graceful-stop fallback used by test paths that
+    construct plugins without the CLI.  In production the value comes
+    from the cross-broker ``workdir/config/brokers.toml`` via
+    :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
+    ``pyne run --broker`` entry point loads it once and assigns it as
+    an instance attribute on the plugin before the script runner
+    starts.  The policy is broker-agnostic by design, so plugins do
+    not declare it in their own ``Config`` dataclasses.
     """
 
     _account_id: str | None = None

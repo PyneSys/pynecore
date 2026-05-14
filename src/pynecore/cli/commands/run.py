@@ -726,6 +726,15 @@ def run(
                 )
                 raise Exit(1)
             broker_plugin = provider_data.provider_instance
+
+            # Apply cross-broker runtime defaults (workdir/config/brokers.toml).
+            # The policies are broker-agnostic; living here keeps the user-facing
+            # knobs in one place and out of every plugin's own config.
+            from pynecore.core.broker.defaults import load_broker_defaults
+            broker_defaults = load_broker_defaults(app_state.config_dir)
+            broker_plugin.on_unexpected_cancel = broker_defaults.on_unexpected_cancel
+            broker_plugin.require_one_way_mode = broker_defaults.require_one_way_mode
+
             import asyncio as _asyncio
             broker_event_loop = _asyncio.new_event_loop()
             # Drive the loop on a dedicated daemon thread. Broker plugin

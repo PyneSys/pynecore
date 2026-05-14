@@ -1,0 +1,79 @@
+"""Tests for cross-broker runtime defaults loaded from ``brokers.toml``."""
+
+from pathlib import Path
+
+import pytest
+
+from pynecore.core.broker.defaults import (
+    BrokerDefaults,
+    VALID_UNEXPECTED_CANCEL_POLICIES,
+    load_broker_defaults,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_ensured_cache():
+    """Drop the ``_ensured`` cache between tests so each call hits disk."""
+    yield
+    if hasattr(BrokerDefaults, '_ensured'):
+        del BrokerDefaults._ensured
+
+
+def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
+    """First-run smoke: no ``brokers.toml`` exists → file auto-created,
+    safe defaults returned (graceful stop, hedging-mode probe armed).
+    This is the most common production path — users get a working broker
+    without writing any TOML by hand."""
+    defaults = load_broker_defaults(tmp_path)
+    assert defaults.on_unexpected_cancel == 'stop'
+    assert defaults.require_one_way_mode is True
+    assert (tmp_path / 'brokers.toml').exists()
+
+
+def __test_require_one_way_mode_override__(tmp_path: Path) -> None:
+    """Disabling the hedging-mode probe must round-trip through the
+    self-healing TOML loader. There is no validation list here — the
+    field is a plain bool, so any truthy/falsy TOML literal is accepted."""
+    (tmp_path / 'brokers.toml').write_text(
+        'require_one_way_mode = false\n',
+        encoding='utf-8',
+    )
+    defaults = load_broker_defaults(tmp_path)
+    assert defaults.require_one_way_mode is False
+
+
+def __test_user_override_is_loaded__(tmp_path: Path) -> None:
+    """A user-edited ``on_unexpected_cancel = "ignore"`` line must round-
+    trip through the self-healing TOML loader unchanged."""
+    (tmp_path / 'brokers.toml').write_text(
+        'on_unexpected_cancel = "ignore"\n',
+        encoding='utf-8',
+    )
+    defaults = load_broker_defaults(tmp_path)
+    assert defaults.on_unexpected_cancel == 'ignore'
+
+
+def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
+    """Typos in the policy value must fail closed at startup rather than
+    surface at the first reconcile cycle — the misconfiguration would
+    otherwise silently fall through to the ``stop`` branch via the
+    ``policy not in {…}`` checks in :mod:`reconcile`, which is harder
+    to diagnose than an explicit load-time error."""
+    (tmp_path / 'brokers.toml').write_text(
+        'on_unexpected_cancel = "halt"\n',
+        encoding='utf-8',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_broker_defaults(tmp_path)
+    msg = str(excinfo.value)
+    assert 'on_unexpected_cancel' in msg
+    assert "'halt'" in msg
+
+
+def __test_valid_policy_set_contents__() -> None:
+    """Guard against accidental drift between the validator's allow-set
+    and the four branches implemented in
+    :meth:`CapitalCom._maybe_raise_unexpected_cancel`."""
+    assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
+        'stop', 'stop_and_cancel', 're_place', 'ignore',
+    })
