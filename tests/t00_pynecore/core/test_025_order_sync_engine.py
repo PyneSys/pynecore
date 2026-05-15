@@ -1615,3 +1615,135 @@ def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
     assert exc.value.context['position_deal_id'] == 'deal-L'
     # Halt recorded so subsequent syncs return early via the halt flag.
     assert engine.halted is True
+
+
+def __test_bracket_reject_defensive_close_stamps_natural_close_on_entry__(
+        tmp_path,
+):
+    """After a successful defensive close, the parent entry row must
+    be stamped with ``extras['natural_close_at']`` so the plugin-side
+    reconciler skips missing-pending accounting.
+
+    Without this stamp, the parent ``dealId`` disappears from the
+    broker snapshot (we deliberately closed the position) BEFORE the
+    close activity record arrives — the plugin's missing-pending
+    grace tracker then raises :class:`UnexpectedCancelError` and
+    halts the bot for a position we ourselves flattened.
+
+    The row is NOT physically closed (``close_order`` would break
+    ``find_by_ref`` lookups when the broker's close activity finally
+    arrives) — only the breadcrumb extras field is set.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        # Seed the parent entry row in 'confirmed' state — what
+        # ``execute_entry`` would have persisted after Capital's fill
+        # confirm, before the bracket attach attempt.
+        ctx.upsert_order(
+            'coid-entry',
+            symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+            exchange_order_id='deal-L',
+            pine_entry_id='Long',
+            filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+
+        b = MockBroker()
+        b.raise_on_next_exit = _bracket_reject_error()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        intent = _bracket_reject_exit_intent()
+        with pytest.raises(OrderSkippedByPlugin):
+            engine._dispatch_new(intent)
+
+        # Defensive close was dispatched (sanity guard).
+        assert len(b.close_calls) == 1
+
+        # Parent entry row now carries the natural-close breadcrumb.
+        row = ctx.get_order('coid-entry')
+        assert row is not None
+        assert (row.extras or {}).get('natural_close_at') is not None
+
+        # Row is NOT physically closed — find_by_ref lookups for the
+        # eventual close activity must still locate it.
+        assert row.closed_ts_ms is None
+
+
+def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
+        tmp_path,
+):
+    """When the defensive close itself parks (timeout), the position
+    may still be open — DO NOT stamp ``natural_close_at`` because
+    that would mask a legitimately stuck position from the reconciler.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry',
+            symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+            exchange_order_id='deal-L',
+            pine_entry_id='Long',
+            filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+
+        b = MockBroker()
+        b.raise_on_next_exit = _bracket_reject_error()
+
+        async def _timeout_close(envelope):
+            raise OrderDispositionUnknownError(
+                "close timeout", client_order_id='c-coid',
+            )
+
+        b.execute_close = _timeout_close  # type: ignore[method-assign]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        intent = _bracket_reject_exit_intent()
+        with pytest.raises(OrderSkippedByPlugin):
+            engine._dispatch_new(intent)
+
+        row = ctx.get_order('coid-entry')
+        assert row is not None
+        assert (row.extras or {}).get('natural_close_at') is None

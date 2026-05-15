@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import logging
 import queue
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -1718,6 +1719,36 @@ class OrderSyncEngine:
             )
             self._record_halt(halt)
             raise halt from nested
+        # Stamp ``natural_close_at`` on the parent entry row only when
+        # the defensive close landed on the exchange synchronously
+        # (``_order_mapping`` is populated on success but stays empty
+        # when ``_dispatch_new`` parks the dispatch via
+        # :meth:`_park_pending` on :class:`OrderDispositionUnknownError`).
+        # When the close PARKED, the position may still be open —
+        # stamping would mask a legitimately stuck position from the
+        # plugin-side reconciler.
+        #
+        # On the success path the parent position will vanish from
+        # the broker snapshot on the next poll, potentially BEFORE
+        # the close activity record arrives. Without the stamp the
+        # reconciler stamps ``missing_pending_since`` on the parent
+        # entry row and raises a false :class:`UnexpectedCancelError`
+        # once the grace window expires — halting the bot for a
+        # position WE deliberately closed. ``natural_close_at`` opts
+        # the row out of that accounting (same convention TP/SL
+        # natural-close flows already use). The row is NOT physically
+        # closed (``close_order`` would break ``find_by_ref`` lookups
+        # when the close activity finally arrives via the broker's
+        # history stream).
+        if (self._store_ctx is not None
+                and close_intent.intent_key in self._order_mapping):
+            row = self._store_ctx.get_order(e.position_coid)
+            if row is not None:
+                extras = dict(row.extras or {})
+                extras['natural_close_at'] = time.time()
+                self._store_ctx.upsert_order(
+                    e.position_coid, extras=extras,
+                )
         raise OrderSkippedByPlugin(
             f"Bracket attach rejected after entry fill — parent position "
             f"closed defensively (deal_id={e.position_deal_id}); "

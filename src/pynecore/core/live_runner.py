@@ -50,7 +50,7 @@ from typing import Any
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
-from pynecore.lib.log import broker_info
+from pynecore.lib.log import broker_info, broker_warning
 from pynecore.lib.timeframe import in_seconds
 
 __all__ = ['live_ohlcv_generator']
@@ -63,6 +63,13 @@ class _Sentinel(BaseException):
 
 
 _SENTINEL = _Sentinel()
+
+# Soft cap for intra-bar updates queued ahead of the consumer. Closed
+# bars are never dropped (they go through the blocking ``put`` path),
+# but intra-bar updates are advisory and must not accumulate without
+# bound when the consumer falls behind — otherwise stale ticks would
+# sit ahead of newer closed bars and delay live transition.
+_INTRA_BAR_SOFT_CAP = 32
 
 
 def live_ohlcv_generator(
@@ -108,7 +115,21 @@ def live_ohlcv_generator(
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
-    bar_queue: Queue[OHLCV | BaseException] = Queue(maxsize=100)
+    # Unbounded on the closed-bar path: a bounded queue would block
+    # ``bar_queue.put`` when the consumer (``script_runner`` live path)
+    # falls behind during heavy fill processing. Since ``_async_loop``
+    # runs as an asyncio task on the same event loop as ``_listen_loop``
+    # (broker mode pumps both via ``run_coroutine_threadsafe`` onto the
+    # main loop), a sync ``Queue.put`` parking on ``not_full`` would
+    # stall the entire event loop — listener stops draining the WS,
+    # quote ticks pile up in the kernel buffer, ``_tick_volume`` stops
+    # advancing, and the watchdog ends up synthesising V=0 bars on a
+    # market that is actually trading. Intra-bar updates are bounded
+    # by a soft ``qsize`` cap at the put site (see
+    # ``_INTRA_BAR_SOFT_CAP`` below) so advisory ticks cannot pile up
+    # ahead of closed bars when the consumer lags. The closed-bar
+    # ``broker_warning`` in the put path below flags any consumer lag.
+    bar_queue: Queue[OHLCV | BaseException] = Queue()
     stop_event = threading.Event()
     # Signalled by ``_async_loop`` once ``provider.connect()`` has either
     # succeeded (WS subscribed, ready to receive bars) or failed (with
@@ -162,10 +183,14 @@ def live_ohlcv_generator(
     # framework, not in each plugin, so providers stay free of bar-rhythm
     # bookkeeping — they only emit when their feed pushes a real bar.
     tf_seconds = max(1, int(in_seconds(timeframe)))
-    # Grace past close before declaring a bar missed. Floored at 2s for
-    # the WS-late case on active markets, capped so longer TFs don't sit
-    # on idle gaps too long.
-    bar_grace = max(2.0, min(tf_seconds * 0.1, 15.0))
+    # Grace past close before declaring a bar missed. The minimum is set
+    # to 15s so plugins that recover dropped WS bars via REST have a
+    # realistic window to fetch and inject the missing bar before this
+    # synth fires — exchanges typically publish a closed bar to REST 5-10s
+    # past close, and the plugin watchdog needs a few extra seconds to
+    # detect, fetch and inject. The cap (30s) keeps longer TFs from
+    # sitting on idle gaps too long.
+    bar_grace = max(15.0, min(tf_seconds * 0.5, 30.0))
 
     async def _async_loop():
         # Declared before ``try`` so the ``finally`` branch can reference
@@ -248,12 +273,40 @@ def live_ohlcv_generator(
 
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
+                        # Backpressure probe: a non-trivial qsize or put
+                        # latency here is the smoking gun for consumer-side
+                        # lag stalling the asyncio loop. The queue is
+                        # unbounded so ``put`` cannot actually block on
+                        # capacity, but cross-thread handoff + GIL pressure
+                        # can still take meaningful time when the consumer
+                        # is busy. Warn so the live log preserves the
+                        # evidence next time a synth-laden run happens.
+                        qsize_before = bar_queue.qsize()
+                        put_t0 = time.monotonic()
                         bar_queue.put(bar_update)
+                        put_ms = (time.monotonic() - put_t0) * 1000.0
+                        if qsize_before > 50 or put_ms > 100.0:
+                            broker_warning(
+                                "bar_queue backpressure: qsize_before=%d "
+                                "put_ms=%.1f ts=%d",
+                                qsize_before, put_ms, bar_update.timestamp,
+                            )
                     else:
-                        try:
-                            bar_queue.put_nowait(bar_update)
-                        except Full:
-                            pass
+                        # Intra-bar updates are advisory — closed bars
+                        # carry authoritative state. With an unbounded
+                        # queue, ``put_nowait`` would never raise
+                        # ``Full``, so a lagging consumer could let stale
+                        # intra-bar items pile up ahead of newer closed
+                        # bars and delay live-mode transition or fill
+                        # processing. Apply a soft cap based on
+                        # ``qsize`` so the closed-bar path retains its
+                        # unbounded guarantee while intra-bar growth
+                        # stays bounded.
+                        if bar_queue.qsize() < _INTRA_BAR_SOFT_CAP:
+                            try:
+                                bar_queue.put_nowait(bar_update)
+                            except Full:
+                                pass
 
                 except asyncio.TimeoutError:
                     # Boundary watchdog: if the next-bar close has passed
@@ -279,6 +332,18 @@ def live_ohlcv_generator(
                             is_closed=True,
                         )
                         last_closed_bar = synth
+                        # Explicit log marker so the V=0 in the next
+                        # OHLCV line is unambiguously framework synth,
+                        # not a provider-side closed bar whose
+                        # ``_tick_volume`` happened to be zero. Carries
+                        # the synth timestamp + frozen close so a
+                        # post-mortem can see exactly which TF slot the
+                        # watchdog filled and at what price.
+                        broker_warning(
+                            "idle-bar synth emitted: ts=%d close=%s "
+                            "(no real ohlc.event for >= 2*tf+grace)",
+                            synth_ts, last_close,
+                        )
                         bar_queue.put(synth)
                         continue
                     if not provider.is_connected:
