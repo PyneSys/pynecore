@@ -44,13 +44,17 @@ import logging
 import time
 import threading
 from collections.abc import Coroutine, Generator
+from datetime import datetime
 from queue import Queue, Empty, Full
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.lib.log import broker_info, broker_warning
+from pynecore.lib.session import _is_in_session, _is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 
 __all__ = ['live_ohlcv_generator']
@@ -71,11 +75,19 @@ _SENTINEL = _Sentinel()
 # sit ahead of newer closed bars and delay live transition.
 _INTRA_BAR_SOFT_CAP = 32
 
+# Sleep cadence during known-closed windows. Long enough to keep the
+# TimeoutError handler from spinning at ``effective_timeout`` (~50ms)
+# while the boundary deadline is stale, short enough that the next
+# session open is noticed within ~30s. Exposed at module scope so tests
+# can shrink it without spending the full 30s per gated timeout.
+_CLOSED_WINDOW_SLEEP_S = 30.0
+
 
 def live_ohlcv_generator(
         provider: LiveProviderPlugin,
         symbol: str,
         timeframe: str,
+        syminfo: SymInfo | None = None,
         *,
         last_historical_timestamp: int | None = None,
         shutdown_timeout: float = 120.0,
@@ -102,6 +114,12 @@ def live_ohlcv_generator(
     :param provider: A LiveProviderPlugin instance (already configured).
     :param symbol: Symbol in provider-specific format.
     :param timeframe: Timeframe in TradingView format.
+    :param syminfo: Optional symbol metadata used to gate idle-bar
+                    synthesis and reconnect attempts on the trading-
+                    session calendar. ``None`` (the default) or an
+                    empty ``opening_hours`` preserves the legacy 24/7
+                    behaviour where idle synth and reconnect fire on
+                    every timeout.
     :param last_historical_timestamp: Timestamp of the last historical bar to avoid duplicates.
     :param shutdown_timeout: Max seconds to wait for graceful shutdown. 0 = wait forever.
     :param event_loop: Optional externally-owned event loop. When supplied, the background
@@ -192,6 +210,54 @@ def live_ohlcv_generator(
     # sitting on idle gaps too long.
     bar_grace = max(15.0, min(tf_seconds * 0.5, 30.0))
 
+    # Resolve the symbol timezone once. ``syminfo.opening_hours`` times are
+    # expressed in this zone; epoch timestamps must be converted before
+    # session checks.
+    _sym_tz: ZoneInfo | None = None
+    if syminfo is not None and syminfo.opening_hours:
+        try:
+            _sym_tz = ZoneInfo(syminfo.timezone)
+        except Exception:  # noqa: BLE001
+            logger.warning("Unknown syminfo.timezone=%r; session-gate disabled",
+                           syminfo.timezone)
+    _has_calendar = (
+        syminfo is not None
+        and bool(syminfo.opening_hours)
+        and _sym_tz is not None
+    )
+
+    def _market_open_at(epoch_ts: float) -> bool:
+        """Slot-aware "is this bar slot in-session?" check.
+
+        Returns True iff the candle ``[epoch_ts, epoch_ts+tf)`` overlaps
+        any ``opening_hours`` interval (or unconditionally True for the
+        24/7 fallback when the symbol has no calendar). Use this for
+        bar-synth decisions and any other slot-aware logic — for the
+        point-in-time "is the market open right now?" question use
+        :func:`_market_open_now` instead, which does not extend the
+        instant by one timeframe.
+        """
+        if not _has_calendar:
+            return True
+        assert syminfo is not None and _sym_tz is not None
+        local_dt = datetime.fromtimestamp(epoch_ts, tz=_sym_tz)
+        return _is_in_session(syminfo.opening_hours, local_dt, tf_seconds)
+
+    def _market_open_now() -> bool:
+        """Point-in-time "is the market open right now?" check.
+
+        Does not extend wall-clock by one timeframe, so it does not
+        report a session as open one timeframe before its real start.
+        Used by the reconnect gate so a long timeframe (e.g. 1h, 1D)
+        cannot burn ``max_reconnect_attempts`` during the final
+        timeframe of a closed window.
+        """
+        if not _has_calendar:
+            return True
+        assert syminfo is not None and _sym_tz is not None
+        local_dt = datetime.fromtimestamp(time.time(), tz=_sym_tz)
+        return _is_point_in_session(syminfo.opening_hours, local_dt)
+
     async def _async_loop():
         # Declared before ``try`` so the ``finally`` branch can reference
         # it even when ``provider.connect()`` raises before assignment.
@@ -200,6 +266,10 @@ def live_ohlcv_generator(
         # watchdog only arms after the first real bar so we never
         # fabricate state without a baseline.
         last_closed_bar: OHLCV | None = None
+        # Tracks whether the last observed market state was open. Flips to
+        # False on the first synth-skip in a closed period (emits a single
+        # INFO log) and back to True when a real bar arrives.
+        market_open_state = True
         try:
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
@@ -224,7 +294,110 @@ def live_ohlcv_generator(
 
             reconnect_attempts = 0
 
+            async def _handle_connection_error(
+                    err: BaseException,
+                    attempts: int,
+            ) -> tuple[int, bool]:
+                """Drive the closed-market wait / reconnect sequence.
+
+                Returns ``(attempts, should_break)``. Used by the
+                ``except Exception`` branch below and by the
+                synth-skip session-gate when a dead WS is detected
+                inside the ``except asyncio.TimeoutError`` handler —
+                ``raise`` from one ``except`` handler does not enter
+                its sibling handlers, so the original ``raise
+                ConnectionError`` pattern would escape past
+                ``except Exception`` and kill the live iterator.
+                """
+                nonlocal market_open_state
+                # Session-gate: when the market is in a known-closed
+                # window (e.g. FX weekend), do not burn reconnect
+                # attempts on a connection error. We sleep ~30s and
+                # re-enter the loop without incrementing
+                # ``reconnect_attempts`` so ``max_reconnect_attempts``
+                # is never exhausted across a long closed window.
+                # Logs the connection error once on the closed→still-
+                # closed transition for post-mortem visibility.
+                # Uses the point-in-time helper (not the slot-aware
+                # ``_market_open_at``) so a long timeframe cannot report
+                # the market as already open one TF before the real
+                # session start and exhaust reconnect attempts.
+                if not _market_open_now():
+                    if market_open_state:
+                        broker_info(
+                            "market closed: pausing reconnect attempts "
+                            "until next session open "
+                            "(last error: %s)",
+                            err,
+                        )
+                        market_open_state = False
+                    slept = 0.0
+                    while slept < 30.0 and not stop_event.is_set():
+                        await asyncio.sleep(min(1.0, 30.0 - slept))
+                        slept += 1.0
+                    return attempts, stop_event.is_set()
+                attempts += 1
+                if attempts > provider.max_reconnect_attempts:
+                    logger.error(
+                        "Max reconnect attempts reached (%d), stopping",
+                        provider.max_reconnect_attempts,
+                    )
+                    bar_queue.put(err)
+                    return attempts, True
+                logger.warning(
+                    "Connection error (attempt %d/%d): %s",
+                    attempts, provider.max_reconnect_attempts, err,
+                )
+                await provider.on_disconnect()
+                delay = provider.reconnect_delay * (2 ** (attempts - 1))
+                slept = 0.0
+                while slept < delay and not stop_event.is_set():
+                    await asyncio.sleep(min(0.5, delay - slept))
+                    slept += 0.5
+                if stop_event.is_set():
+                    return attempts, True
+                try:
+                    await provider.disconnect()
+                except Exception as disc_err:
+                    logger.debug(
+                        "disconnect() before reconnect raised: %s",
+                        disc_err,
+                    )
+                try:
+                    await provider.connect()
+                    await provider.on_reconnect()
+                    logger.info("Reconnected successfully")
+                except Exception as reconn_err:
+                    logger.error(
+                        "Reconnect failed (attempt %d/%d): %s",
+                        attempts,
+                        provider.max_reconnect_attempts,
+                        reconn_err,
+                    )
+                return attempts, False
+
+            # Latched dead-WS signal from inside the
+            # ``except asyncio.TimeoutError`` handler: ``raise`` from one
+            # ``except`` does not enter sibling handlers of the same
+            # ``try``, so we cannot trigger ``_handle_connection_error``
+            # via ``raise``. The handler sets this flag instead and the
+            # top-of-loop dispatch at the next iteration consumes it.
+            pending_connection_error: BaseException | None = None
+
             while not stop_event.is_set():
+                # Dispatch any deferred dead-WS signal from the previous
+                # iteration's ``except asyncio.TimeoutError`` handler
+                # (see ``pending_connection_error`` notes above).
+                if pending_connection_error is not None:
+                    err = pending_connection_error
+                    pending_connection_error = None
+                    reconnect_attempts, should_break = (
+                        await _handle_connection_error(err, reconnect_attempts)
+                    )
+                    if should_break:
+                        break
+                    continue
+
                 # Cap the per-iteration wait at 2 s for the existing
                 # is_connected healthcheck cadence; if a missed-bar
                 # deadline falls sooner, shorten the wait so synthesis
@@ -273,6 +446,13 @@ def live_ohlcv_generator(
 
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
+                        if not market_open_state:
+                            broker_info(
+                                "market reopened: resuming live stream "
+                                "(first real bar ts=%d)",
+                                bar_update.timestamp,
+                            )
+                            market_open_state = True
                         # Backpressure probe: a non-trivial qsize or put
                         # latency here is the smoking gun for consumer-side
                         # lag stalling the asyncio loop. The queue is
@@ -320,6 +500,60 @@ def live_ohlcv_generator(
                             >= last_closed_bar.timestamp
                             + 2 * tf_seconds + bar_grace):
                         synth_ts = last_closed_bar.timestamp + tf_seconds
+                        # Session-gate: never synthesise a bar for a slot
+                        # that the symbol's opening_hours calendar marks
+                        # as closed. Without this gate the framework would
+                        # emit V=0 bars across the whole weekend on an FX
+                        # symbol whose feed quite legitimately goes silent
+                        # at session close. Pine remains paused;
+                        # ``bar_index`` does not advance until a real bar
+                        # arrives after the next session opens.
+                        if not _market_open_at(synth_ts):
+                            if market_open_state:
+                                broker_info(
+                                    "market closed: pausing live stream "
+                                    "until next session open "
+                                    "(skipped synth ts=%d)",
+                                    synth_ts,
+                                )
+                                market_open_state = False
+                            # Dead WS surfaces via the
+                            # ``pending_connection_error`` flag, not by
+                            # ``raise``: raising from inside this
+                            # ``except asyncio.TimeoutError`` handler
+                            # escapes past the sibling
+                            # ``except Exception`` reconnect block and
+                            # would kill the live iterator. WS alive
+                            # uses a coarse sleep instead of an
+                            # immediate ``continue`` so the loop does
+                            # not race ``wait_for`` at the 50ms floor
+                            # for the whole closed window
+                            # (``boundary_remaining`` is far past, so
+                            # ``effective_timeout`` would otherwise pin
+                            # to 0.05s → ~20 watch_ohlcv calls/s for
+                            # the entire weekend).
+                            if not provider.is_connected:
+                                pending_connection_error = ConnectionError(
+                                    "Provider reports disconnected state"
+                                )
+                            else:
+                                slept = 0.0
+                                while (slept < _CLOSED_WINDOW_SLEEP_S
+                                       and not stop_event.is_set()):
+                                    step = min(
+                                        1.0,
+                                        _CLOSED_WINDOW_SLEEP_S - slept,
+                                    )
+                                    await asyncio.sleep(step)
+                                    slept += step
+                                if stop_event.is_set():
+                                    break
+                            # Skip synth in both branches — either we are
+                            # waiting out the closed window (WS alive) or
+                            # we deferred the connection error so the next
+                            # iteration's top-of-loop dispatch drives the
+                            # reconnect path.
+                            continue
                         last_close = last_closed_bar.close
                         synth = OHLCV(
                             timestamp=synth_ts,
@@ -354,40 +588,12 @@ def live_ohlcv_generator(
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    reconnect_attempts += 1
-                    if reconnect_attempts > provider.max_reconnect_attempts:
-                        logger.error("Max reconnect attempts reached (%d), stopping",
-                                     provider.max_reconnect_attempts)
-                        bar_queue.put(e)
+                    reconnect_attempts, should_break = (
+                        await _handle_connection_error(e, reconnect_attempts)
+                    )
+                    if should_break:
                         break
-
-                    logger.warning("Connection error (attempt %d/%d): %s",
-                                   reconnect_attempts, provider.max_reconnect_attempts, e)
-
-                    await provider.on_disconnect()
-
-                    delay = provider.reconnect_delay * (2 ** (reconnect_attempts - 1))
-                    slept = 0.0
-                    while slept < delay and not stop_event.is_set():
-                        await asyncio.sleep(min(0.5, delay - slept))
-                        slept += 0.5
-                    if stop_event.is_set():
-                        break
-
-                    try:
-                        await provider.disconnect()
-                    except Exception as disc_err:
-                        logger.debug("disconnect() before reconnect raised: %s", disc_err)
-
-                    try:
-                        await provider.connect()
-                        await provider.on_reconnect()
-                        logger.info("Reconnected successfully")
-                    except Exception as reconn_err:
-                        logger.error("Reconnect failed (attempt %d/%d): %s",
-                                     reconnect_attempts,
-                                     provider.max_reconnect_attempts, reconn_err)
-                        continue
+                    continue
 
         except Exception as e:
             bar_queue.put(e)

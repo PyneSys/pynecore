@@ -529,3 +529,147 @@ def __test_connection_error_triggers_reconnect__():
     # Should get bars from before and after the simulated death
     assert len(bars) >= 2
     assert provider._reconnected
+
+
+# --- Session-gate tests ---
+
+def _make_syminfo(opening_hours, timezone: str = "UTC"):
+    """Build a minimal SymInfo with the given opening_hours + timezone.
+
+    Only the fields read by ``live_ohlcv_generator``'s session gate are
+    populated meaningfully; the rest get throw-away values.
+    """
+    from pynecore.core.syminfo import SymInfo
+    return SymInfo(
+        prefix="TEST",
+        description="test",
+        ticker="TEST",
+        currency="USD",
+        period="1",
+        type="forex",
+        mintick=0.0001,
+        pricescale=10000,
+        minmove=1,
+        pointvalue=1.0,
+        opening_hours=opening_hours,
+        session_starts=[],
+        session_ends=[],
+        timezone=timezone,
+    )
+
+
+class _IdleThenCancelProvider(MockLiveProvider):
+    """Yields pre-canned bars, then raises CancelledError after a fixed
+    number of idle ``watch_ohlcv`` calls.
+
+    The framework's ``wait_for`` cancels any in-flight ``asyncio.sleep``
+    when its timeout elapses, so a sleep-then-raise pattern never gets
+    to the raise statement — counting idle invocations works regardless.
+    Each idle call lives only as long as the framework's ``effective_timeout``
+    (down to 0.05 s once the synth deadline is in the past), so the test
+    completes within ``max_idle_calls × 0.05 s`` wall time.
+    """
+
+    def __init__(self, bar_updates: list[OHLCV], max_idle_calls: int = 30):
+        super().__init__(bar_updates)
+        self._idle_calls = 0
+        self._max_idle_calls = max_idle_calls
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if self._index < len(self._bar_updates):
+            bar = self._bar_updates[self._index]
+            self._index += 1
+            await asyncio.sleep(0.001)
+            return bar
+        self._idle_calls += 1
+        if self._idle_calls >= self._max_idle_calls:
+            raise asyncio.CancelledError()
+        # Park until ``wait_for`` cancels us so the framework synth deadline
+        # (boundary_remaining < 0 → effective_timeout=0.05 s) can elapse
+        # and the gate is actually exercised every iteration.
+        await asyncio.sleep(10.0)
+        raise asyncio.CancelledError()
+
+
+def __test_synth_gate_suppresses_synth_during_known_closed_window__():
+    """When syminfo.opening_hours says market closed, no idle synth is emitted.
+
+    Setup: a SymInfo with a single 5-minute weekday interval anchored
+    12 hours away from ``synth_ts`` (computed from ``base_ts + 60``).
+    Pinning the open interval to ``synth_ts``'s opposite half-day keeps
+    the test deterministic regardless of wall-clock time, while still
+    exercising the closed-window gate for the slot the watchdog tries
+    to synth. The synth deadline elapses (real bar 200s in the past on
+    1m TF) but the gate intercepts before any V=0 OHLCV lands in queue.
+    """
+    from pynecore.core.syminfo import SymInfoInterval
+    from datetime import datetime as ddatetime, time as dtime, timedelta, UTC
+
+    base_ts = int(time.time()) - 200
+    synth_ts = base_ts + 60
+    synth_dt = ddatetime.fromtimestamp(synth_ts, tz=UTC)
+    open_dt = synth_dt + timedelta(hours=12)
+    open_time = dtime(open_dt.hour, open_dt.minute, 0)
+    close_dt = open_dt + timedelta(minutes=5)
+    close_time = dtime(close_dt.hour, close_dt.minute, 0)
+    closed_calendar = [
+        SymInfoInterval(day=d, start=open_time, end=close_time)
+        for d in range(7)
+    ]
+    syminfo = _make_syminfo(closed_calendar, timezone="UTC")
+
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _IdleThenCancelProvider(updates, max_idle_calls=20)
+
+    # Shrink the closed-window sleep so the test does not spend the full
+    # 30s production cadence per gated timeout. With ``max_idle_calls=20``
+    # the unpatched value would block the suite for ~10 minutes per run.
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_sleep = _live_runner_mod._CLOSED_WINDOW_SLEEP_S
+    _live_runner_mod._CLOSED_WINDOW_SLEEP_S = 0.05
+    try:
+        _, bars = _drain(provider, "TEST", "1", syminfo=syminfo)
+    finally:
+        _live_runner_mod._CLOSED_WINDOW_SLEEP_S = _orig_sleep
+
+    # Only the real bar (volume=1000) was emitted. No V=0 synth filler.
+    real_bars = [b for b in bars if b.volume > 0]
+    synth_bars = [b for b in bars if b.volume == 0.0]
+    assert len(real_bars) == 1
+    assert real_bars[0].timestamp == base_ts
+    assert synth_bars == [], (
+        f"expected no synth bars during closed window, got {len(synth_bars)}"
+    )
+
+
+def __test_synth_gate_passthrough_when_opening_hours_empty__():
+    """Empty syminfo.opening_hours preserves legacy 24/7 synth behaviour.
+
+    Mirrors __test_live_generator_synthesises_idle_bars_at_tf_boundary__
+    but with an explicit empty-calendar SymInfo to verify the gate does
+    NOT short-circuit when there is no calendar data.
+    """
+    syminfo = _make_syminfo([], timezone="UTC")
+
+    base_ts = int(time.time()) - 200
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _IdleAfterFirstBar(updates)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "TEST", "1", syminfo=syminfo):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if len(bars) >= 3:
+            break
+
+    # First bar real, next two are V=0 synth fillers (no gate suppression).
+    assert bars[0].volume == 1000.0
+    assert bars[1].volume == 0.0
+    assert bars[2].volume == 0.0
+    assert bars[1].timestamp == base_ts + 60
+    assert bars[2].timestamp == base_ts + 120

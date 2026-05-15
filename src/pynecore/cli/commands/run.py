@@ -876,6 +876,7 @@ def run(
                     provider=provider_data.provider_instance,
                     symbol=provider_data.parsed_string.symbol,
                     timeframe=provider_data.parsed_string.timeframe,
+                    syminfo=syminfo,
                     last_historical_timestamp=time_to_ts,
                     shutdown_timeout=shutdown_timeout,
                     event_loop=broker_event_loop,
