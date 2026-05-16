@@ -1,9 +1,10 @@
+import sys
 from typing import TYPE_CHECKING, TypeAlias, cast
 from pathlib import Path
 from enum import Enum
 from datetime import datetime, timedelta, UTC
 
-from typer import Typer, Option, Argument, Exit, secho, colors, confirm
+from typer import Typer, Option, Argument, Exit, secho, colors, confirm, BadParameter
 
 from rich import print as rprint
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -57,6 +58,22 @@ class OutputFormat(Enum):
     JSON = 'json'
 
 
+def _typer_validate_timeframe(value: str) -> str:
+    """Typer callback wrapper: convert ValueError into a clean BadParameter."""
+    try:
+        return validate_timeframe(value)
+    except ValueError as e:
+        raise BadParameter(str(e))
+
+
+def _typer_parse_date_or_days(value: str) -> "datetime | str":
+    """Typer callback wrapper: convert ValueError into a clean BadParameter."""
+    try:
+        return parse_date_or_days(value)
+    except ValueError as e:
+        raise BadParameter(str(e))
+
+
 # TV-compatible timeframe validation function
 def validate_timeframe(value: str) -> str:
     """
@@ -80,26 +97,48 @@ def validate_timeframe(value: str) -> str:
 
 def parse_date_or_days(value: str) -> datetime | str:
     """
-    Parse a date or a number of days
+    Parse a date, a number of days, ``"continue"``, or ``"now"``.
+
+    :param value: User-supplied string.
+    :return: A ``datetime`` (UTC, seconds/microseconds zeroed) or the ``"continue"`` sentinel.
+    :raises ValueError: If the value matches none of the accepted forms. Typer
+        converts this into a clean CLI error; in-process callers (e.g. the
+        symbol-browser wizard) can catch it directly.
     """
     if value == 'continue':
         return value
     if not value:
         return datetime.now(UTC).replace(second=0, microsecond=0)
+    if value.strip().lower() == 'now':
+        return datetime.now(UTC).replace(second=0, microsecond=0)
     try:
-        # Is it a date?
         return datetime.fromisoformat(str(value))
     except ValueError:
-        try:
-            # Not a date, maybe it's a number of days
-            days = int(value)
-            if days < 0:
-                secho("Error: Days cannot be negative", err=True, fg=colors.RED)
-                raise Exit(1)
-            return (datetime.now(UTC) - timedelta(days=days)).replace(second=0, microsecond=0)
-        except ValueError:
-            secho(f"Error: Invalid date fmt or days number: {value}", err=True, fg=colors.RED)
-            raise Exit(1)
+        pass
+    try:
+        days = int(value)
+    except ValueError:
+        raise ValueError(f"Invalid date format or days number: {value}")
+    if days < 0:
+        raise ValueError("Days cannot be negative")
+    return (datetime.now(UTC) - timedelta(days=days)).replace(second=0, microsecond=0)
+
+
+def _format_date_default(value, fallback: str) -> str:
+    """Convert a parsed ``--from`` / ``--to`` value back into a user-friendly
+    string for the symbol-browser wizard's default fields.
+
+    ``parse_date_or_days`` accepts the result as input, so the round-trip is
+    semantically loss-free.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        ref = value if value.tzinfo else value.replace(tzinfo=UTC)
+        if abs((datetime.now(UTC) - ref).total_seconds()) < 60:
+            return "now"
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return fallback
 
 
 @app_data.command()
@@ -110,15 +149,15 @@ def download(
                                     help="Symbol (e.g. BYBIT:BTC/USDT:USDT)"),
         list_symbols: bool = Option(False, '--list-symbols', '-ls',
                                     help="List available symbols of the provider"),
-        timeframe: str = Option('1D', '--timeframe', '-tf', callback=validate_timeframe,
+        timeframe: str = Option('1D', '--timeframe', '-tf', callback=_typer_validate_timeframe,
                                 help="Timeframe in TradingView format (e.g., '1', '5S', '1D', '1W')"),
         time_from: DateOrDays = Option("continue", '--from', '-f',
-                                       callback=parse_date_or_days, formats=[],
+                                       callback=_typer_parse_date_or_days, formats=[],
                                        metavar="[%Y-%m-%d|%Y-%m-%d %H:%M:%S|NUMBER]|continue",
                                        help="Start date or days back from now, or 'continue' to resume last download,"
                                             " or one year if no data"),
         time_to: DateOrDays = Option(datetime.now(UTC).replace(second=0, microsecond=0), '--to', '-t',
-                                     callback=parse_date_or_days, formats=[],
+                                     callback=_typer_parse_date_or_days, formats=[],
                                      metavar="[%Y-%m-%d|%Y-%m-%d %H:%M:%S|NUMBER]",
                                      help="End date or days from start date"),
         show_info: bool = Option(False, '--symbol-info', '-si', help="Show symbol info"),
@@ -139,15 +178,17 @@ def download(
     provider_class = cast(type[ProviderPlugin], load_plugin(provider.value))
 
     try:
+        from ...core.config import ensure_config
+        config = None
+        config_cls: type | None = getattr(provider_class, 'Config', None)
+        if config_cls is not None:
+            config = ensure_config(config_cls,
+                                   app_state.config_dir / 'plugins' / f'{provider.value}.toml')
+
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:
-            from ...core.config import ensure_config
-            config = None
-            config_cls: type | None = getattr(provider_class, 'Config', None)
-            if config_cls is not None:
-                config = ensure_config(config_cls,
-                                       app_state.config_dir / 'plugins' / f'{provider.value}.toml')
-            with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                          transient=True) as progress:
                 progress.add_task(description="Fetching market data...", total=None)
                 provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
                 symbols = provider_instance.get_list_of_symbols()
@@ -155,19 +196,54 @@ def download(
                 print(s)
             return
 
-        if not symbol:
-            secho("Error: Symbol is required!", err=True, fg=colors.RED)
-            raise Exit(1)
+        # Some providers (e.g. CCXT) accept a selector-only ``--symbol``
+        # (just the exchange name): the constructor recognises it and
+        # leaves ``self.symbol`` as ``None``. That signals "we know which
+        # backend but not which instrument yet" — drop into the TUI to
+        # let the user pick. Otherwise proceed to the download path.
+        #
+        # When entering the TUI we deliberately omit ``ohlcv_dir`` from
+        # the constructor: the base class asserts ``symbol and timeframe``
+        # whenever ``ohlcv_dir`` is truthy, so passing it with ``symbol=None``
+        # would crash. The wizard sets ``provider.ohlcv_path`` /
+        # ``ohlcv_file`` itself once the user picks a symbol + timeframe.
+        symbols_list: list[str] = []
+        tui_ohlcv_dir: Path | None = None
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                      transient=True) as progress:
+            progress.add_task(description="Fetching market data...", total=None)
+            if symbol is None:
+                provider_instance: ProviderPlugin = provider_class(
+                    symbol=None, timeframe=timeframe, config=config,
+                )
+                tui_ohlcv_dir = app_state.data_dir
+            else:
+                provider_instance = provider_class(
+                    symbol=symbol, timeframe=timeframe,
+                    ohlcv_dir=app_state.data_dir, config=config,
+                )
+            if provider_instance.symbol is None and sys.stdin.isatty():
+                symbols_list = provider_instance.get_list_of_symbols()
+                tui_ohlcv_dir = app_state.data_dir
 
-        # Create provider instance with config
-        from ...core.config import ensure_config
-        config = None
-        config_cls: type | None = getattr(provider_class, 'Config', None)
-        if config_cls is not None:
-            config = ensure_config(config_cls,
-                                   app_state.config_dir / 'plugins' / f'{provider.value}.toml')
-        provider_instance: ProviderPlugin = provider_class(symbol=symbol, timeframe=timeframe,
-                                                           ohlcv_dir=app_state.data_dir, config=config)
+        if provider_instance.symbol is None:
+            if not sys.stdin.isatty():
+                secho("Error: Symbol is required "
+                      "(or use --list-symbols for non-interactive listing).",
+                      err=True, fg=colors.RED)
+                raise Exit(1)
+            from ..utils.symbol_browser import SymbolBrowser
+            assert tui_ohlcv_dir is not None
+            SymbolBrowser(
+                provider_instance,
+                symbols_list,
+                ohlcv_dir=tui_ohlcv_dir,
+                default_timeframe=timeframe,
+                default_from=_format_date_default(time_from, "continue"),
+                default_to=_format_date_default(time_to, "now"),
+                default_chunk_size=chunk_size,
+            ).run()
+            return
 
         # Download symbol info if not exists
         if force_save_info or not provider_instance.is_symbol_info_exists():
@@ -400,7 +476,7 @@ def convert_from(
 @app_data.command()
 def aggregate(
         source: Path = Argument(..., help="Source .ohlcv file (searches in workdir/data/ if only name given)"),
-        timeframe: str = Option(..., '--timeframe', '-tf', callback=validate_timeframe,
+        timeframe: str = Option(..., '--timeframe', '-tf', callback=_typer_validate_timeframe,
                                 help="Target timeframe in TradingView format (e.g., '60', '1D', '1W')"),
         output: Path | None = Option(None, '--output', '-o',
                                      help="Custom output path (auto-generated if not specified)"),
