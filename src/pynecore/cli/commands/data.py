@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, UTC
 from typer import Typer, Option, Argument, Exit, secho, colors, confirm
 
 from rich import print as rprint
-from rich.console import Console
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
@@ -152,9 +151,8 @@ def download(
                 progress.add_task(description="Fetching market data...", total=None)
                 provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
                 symbols = provider_instance.get_list_of_symbols()
-            with (console := Console()).pager():
-                for s in symbols:
-                    console.print(s)
+            for s in symbols:
+                print(s)
             return
 
         if not symbol:
