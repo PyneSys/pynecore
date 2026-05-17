@@ -187,11 +187,15 @@ def download(
 
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:
-            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
-                          transient=True) as progress:
-                progress.add_task(description="Fetching market data...", total=None)
-                provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
-                symbols = provider_instance.get_list_of_symbols()
+            try:
+                with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                              transient=True) as progress:
+                    progress.add_task(description="Fetching market data...", total=None)
+                    provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
+                    symbols = provider_instance.get_list_of_symbols()
+            except NotImplementedError as e:
+                secho(f"Error: {e}", err=True, fg=colors.RED)
+                raise Exit(1)
             for s in symbols:
                 print(s)
             return
@@ -209,22 +213,28 @@ def download(
         # ``ohlcv_file`` itself once the user picks a symbol + timeframe.
         symbols_list: list[str] = []
         tui_ohlcv_dir: Path | None = None
-        with Progress(SpinnerColumn(), TextColumn("{task.description}"),
-                      transient=True) as progress:
-            progress.add_task(description="Fetching market data...", total=None)
-            if symbol is None:
-                provider_instance: ProviderPlugin = provider_class(
-                    symbol=None, timeframe=timeframe, config=config,
-                )
-                tui_ohlcv_dir = app_state.data_dir
-            else:
-                provider_instance = provider_class(
-                    symbol=symbol, timeframe=timeframe,
-                    ohlcv_dir=app_state.data_dir, config=config,
-                )
-            if provider_instance.symbol is None and sys.stdin.isatty():
-                symbols_list = provider_instance.get_list_of_symbols()
-                tui_ohlcv_dir = app_state.data_dir
+        try:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                          transient=True) as progress:
+                progress.add_task(description="Fetching market data...", total=None)
+                if symbol is None:
+                    provider_instance: ProviderPlugin = provider_class(
+                        symbol=None, timeframe=timeframe, config=config,
+                    )
+                    tui_ohlcv_dir = app_state.data_dir
+                else:
+                    provider_instance = provider_class(
+                        symbol=symbol, timeframe=timeframe,
+                        ohlcv_dir=app_state.data_dir, config=config,
+                    )
+                if provider_instance.symbol is None and sys.stdin.isatty():
+                    symbols_list = provider_instance.get_list_of_symbols()
+                    tui_ohlcv_dir = app_state.data_dir
+        except NotImplementedError as e:
+            secho(f"Error: {e}", err=True, fg=colors.RED)
+            secho("Pass a symbol explicitly with -s/--symbol.",
+                  err=True, fg=colors.YELLOW)
+            raise Exit(1)
 
         if provider_instance.symbol is None:
             if not sys.stdin.isatty():
