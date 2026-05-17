@@ -12,6 +12,7 @@ panels. Submitting the wizard starts a download on a background worker; the
 progress strip replaces the wizard until completion, after which the user
 returns to the browse view and can pick another symbol.
 """
+import os
 import shutil
 import sys
 import threading
@@ -21,14 +22,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console, Group
 from rich.highlighter import ReprHighlighter
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (BarColumn, Progress, TextColumn,
-                           TimeElapsedColumn, TimeRemainingColumn)
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 from rich.text import Text
 
@@ -186,6 +187,7 @@ class SymbolBrowser:
         self.dl_lock = threading.Lock()
         self.dl_total_seconds: int = 1
         self.dl_elapsed_seconds: int = 0
+        self.dl_started_monotonic: float = 0.0
         self.dl_label: str = ""
         self.dl_status: str | None = None  # last download result message
         self.dl_status_ok: bool = True
@@ -193,7 +195,7 @@ class SymbolBrowser:
 
         # Resize state (Unix uses SIGWINCH; Windows polls size).
         self.resize_event: threading.Event = threading.Event()
-        self.last_size: tuple[int, int] = shutil.get_terminal_size()
+        self.last_size: os.terminal_size = shutil.get_terminal_size()
         self._old_sigwinch = None
 
     # ---- cache --------------------------------------------------------
@@ -298,7 +300,12 @@ class SymbolBrowser:
                 self._apply_filter()
             return True
         if key is Key.ENTER:
+            # Commit the filter and open the wizard in one step. The
+            # filter row's cursor already points at the selected symbol;
+            # forcing a second Enter to actually start the download felt
+            # like the first Enter was swallowed.
             self.filter_active = False
+            self._enter_wizard()
             return True
         if key is Key.BACKSPACE:
             if self.filter_text:
@@ -307,16 +314,24 @@ class SymbolBrowser:
             else:
                 self.filter_active = False
             return True
+        # Navigation keys exit the filter (keeping the typed text as the
+        # active list filter) AND move the cursor, so the next Enter goes
+        # straight into the wizard instead of being absorbed by the
+        # filter-exit transition.
         if key is Key.UP:
+            self.filter_active = False
             self._move_cursor(-1)
             return True
         if key is Key.DOWN:
+            self.filter_active = False
             self._move_cursor(1)
             return True
         if key is Key.PAGE_UP:
+            self.filter_active = False
             self._move_cursor(-10)
             return True
         if key is Key.PAGE_DOWN:
+            self.filter_active = False
             self._move_cursor(10)
             return True
         if isinstance(key, str) and key.isprintable():
@@ -396,10 +411,13 @@ class SymbolBrowser:
         except ValueError:
             return False
         symbol = self.filtered[self.cursor]
+        # noinspection PyBroadException
         try:
             path = type(self.provider).get_ohlcv_path(
                 symbol, tf, self.ohlcv_dir)
         except Exception:
+            # Provider plugin code is arbitrary — swallow anything so the
+            # browser keeps running even if the plugin misbehaves.
             return False
         return path.exists()
 
@@ -598,7 +616,7 @@ class SymbolBrowser:
             self.wiz_error = f"To: {e}"
             self.wiz_focus = self.wiz_fields.index(to_field)
             return
-        if to_value == "continue":
+        if not isinstance(to_value, datetime):
             self.wiz_error = "To: 'continue' is not valid here, use a date or 'now'"
             self.wiz_focus = self.wiz_fields.index(to_field)
             return
@@ -610,6 +628,7 @@ class SymbolBrowser:
         self.dl_label = f"{symbol} {tf}"
         self.dl_elapsed_seconds = 0
         self.dl_total_seconds = 1
+        self.dl_started_monotonic = time.monotonic()
         self.dl_status = None
         self.dl_future = self.dl_executor.submit(
             self._run_download, symbol, tf, from_value, to_value, truncate,
@@ -630,10 +649,11 @@ class SymbolBrowser:
             provider.symbol = symbol
             provider.timeframe = tf
             provider.xchg_timeframe = provider.to_exchange_timeframe(tf)
-            provider.ohlcv_path = provider.get_ohlcv_path(
+            ohlcv_path = provider.get_ohlcv_path(
                 symbol, tf, self.ohlcv_dir,
             )
-            provider.ohlcv_file = OHLCVWriter(provider.ohlcv_path)
+            provider.ohlcv_path = ohlcv_path
+            provider.ohlcv_file = OHLCVWriter(ohlcv_path)
 
             with provider as ohlcv_writer:
                 if truncate:
@@ -680,6 +700,7 @@ class SymbolBrowser:
                 # Write a fresh SymInfo TOML alongside the OHLCV — matches
                 # what the CLI download path does on first run.
                 if not provider.is_symbol_info_exists():
+                    # noinspection PyBroadException
                     try:
                         sym_info = provider.update_symbol_info()
                         assert provider.ohlcv_path is not None
@@ -794,7 +815,7 @@ class SymbolBrowser:
         table.add_column(justify="right", style="dim")
         table.add_column()
 
-        def row(label: str, value: object) -> None:
+        def row(label: str, value: Any) -> None:
             table.add_row(label, _HIGHLIGHTER(str(value)))
 
         row("Description:", info.description)
@@ -826,7 +847,7 @@ class SymbolBrowser:
         lines = []
         for day in sorted(by_day.keys()):
             label = SymbolBrowser._DAY_NAMES.get(day, f"D{day}")
-            day_ivs = sorted(by_day[day], key=lambda iv: iv.start)
+            day_ivs = sorted(by_day[day], key=lambda x: x.start)
             parts = [f"{iv.start.strftime('%H:%M')}-{iv.end.strftime('%H:%M')}"
                      for iv in day_ivs]
             lines.append(f"{label}  {', '.join(parts)}")
@@ -841,7 +862,8 @@ class SymbolBrowser:
         rows = min(len(active.options), _DROPDOWN_MAX_ROWS)
         return _STRIP_HEIGHT_BASE + rows + 2
 
-    def _render_field_cell(self, field_: WizardField, focused: bool) -> Text:
+    @staticmethod
+    def _render_field_cell(field_: WizardField, focused: bool) -> Text:
         label = _KIND_LABELS.get(field_.kind, "")
         line = Text()
         if field_.kind == 'submit':
@@ -863,7 +885,8 @@ class SymbolBrowser:
         line.append(body, style="reverse" if focused else "")
         return line
 
-    def _render_dropdown_panel(self, field_: WizardField) -> Panel:
+    @staticmethod
+    def _render_dropdown_panel(field_: WizardField) -> Panel:
         n = len(field_.options)
         view = min(n, _DROPDOWN_MAX_ROWS)
         # Center a window of size ``view`` on the cursor where possible.
@@ -945,19 +968,44 @@ class SymbolBrowser:
         with self.dl_lock:
             elapsed = self.dl_elapsed_seconds
             total = self.dl_total_seconds
+            started = self.dl_started_monotonic
+        # The Progress widget is rebuilt on every render, so Rich's built-in
+        # TimeElapsedColumn / TimeRemainingColumn always saw a freshly-created
+        # task and reported 0:00:00 / -:--:--. Compute real wall-clock elapsed
+        # and ETA from the dl_started_monotonic anchor and the progress ratio,
+        # then feed them in as plain text fields.
+        elapsed_real = max(0.0, time.monotonic() - started) if started else 0.0
+        if 0 < elapsed < total:
+            eta = elapsed_real * (total - elapsed) / elapsed
+            eta_str = self._format_hms(eta)
+        elif 0 < total <= elapsed:
+            eta_str = "0:00:00"
+        else:
+            eta_str = "-:--:--"
         progress = Progress(
             TextColumn("{task.fields[label]}", style="bold"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
+            TextColumn("{task.fields[elapsed_str]}", style="progress.elapsed"),
             "/",
-            TimeRemainingColumn(),
+            TextColumn("{task.fields[eta_str]}", style="progress.remaining"),
             expand=True,
         )
-        progress.add_task("download", total=total, completed=elapsed,
-                          label=self.dl_label)
+        progress.add_task(
+            "download", total=total, completed=elapsed,
+            label=self.dl_label,
+            elapsed_str=self._format_hms(elapsed_real),
+            eta_str=eta_str,
+        )
         return Panel(progress, title=f"Downloading {self.dl_label}",
                      title_align="left", height=_STRIP_HEIGHT_PROGRESS)
+
+    @staticmethod
+    def _format_hms(seconds: float) -> str:
+        total = int(seconds)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}"
 
     def _render_footer(self) -> Panel:
         if self.mode == 'wizard':

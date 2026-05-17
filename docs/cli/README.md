@@ -23,3 +23,4 @@ PyneCore Command Line Interface (CLI) overview and usage
 - [Run](./run.md) - Running scripts with the CLI
 - [Compile](./compile.md) - Compiling Pine Scripts to Python
 - [Data](./data.md) - Data management commands
+- [Symbol Browser TUI](./symbol-browser.md) - Interactive symbol picker for `pyne data download`

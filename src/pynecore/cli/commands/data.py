@@ -21,7 +21,7 @@ from ...core.syminfo import SymInfo
 
 from ...utils.rich.date_column import DateColumn
 
-__all__ = []
+__all__ = ['parse_date_or_days', 'validate_timeframe']
 
 app_data = Typer(help="OHLCV related commands")
 app.add_typer(app_data, name="data")

@@ -66,6 +66,10 @@ pyne data download --help
 - `--force-save-info`, `-fi`: Force save symbol information
 - `--truncate`, `-tr`: Truncate file before downloading (all data will be lost)
 
+### Interactive Symbol Browser
+
+If you run `pyne data download PROVIDER` without `--symbol` on an interactive terminal, an interactive TUI opens for picking the symbol, timeframe and date range. See [Symbol Browser TUI](./symbol-browser.md) for the full key map, wizard behaviour and progress-strip details.
+
 ### Download Examples
 
 ```bash
