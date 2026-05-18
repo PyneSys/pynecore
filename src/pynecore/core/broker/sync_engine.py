@@ -239,12 +239,16 @@ class OrderSyncEngine:
         # from the Pine order book on the first post-restart sync). The first
         # _build_envelope / _verify_pending_dispatches call for an anchored key
         # promotes the anchor into the live in-memory state and clears it.
+        # ``sync()`` re-replays both caches at the start of every cycle
+        # so a slow plugin ``connect()`` whose ``_retire_startup_orphans``
+        # finishes between syncs cannot leave a stale anchor that
+        # ``_build_envelope`` would pop into a recycled ``client_order_id``.
         self._persisted_envelope_anchors: dict[str, EnvelopeRecord] = {}
         self._persisted_pending_anchors: dict[str, PendingRecord] = {}
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
-            self._persisted_pending_anchors = dict(pending)
+            self._persisted_pending_anchors = self._unresolved_pending(pending)
             if envelopes or pending:
                 _log.info(
                     "broker state replay: %d envelope(s), %d pending verification(s)",
@@ -252,6 +256,67 @@ class OrderSyncEngine:
                 )
 
     # === Public API ===
+
+    def refresh_anchors_from_store(self) -> None:
+        """Re-read persisted envelope and pending anchors from the store.
+
+        The engine loads ``_persisted_envelope_anchors`` /
+        ``_persisted_pending_anchors`` in ``__init__`` and re-replays them
+        at the start of every :meth:`sync` cycle. This method exists for
+        callers that need an explicit mid-bar refresh (currently the
+        runner's ``start_broker`` pre-sync handshake, kept as a
+        belt-and-braces fence against pre-first-sync code that touches
+        ``_persisted_envelope_anchors`` directly).
+
+        Safe to call repeatedly. No-op when ``store_ctx`` is unset
+        (tests, single-shot backtests).
+        """
+        if self._store_ctx is None:
+            return
+        envelopes, pending = self._store_ctx.replay()
+        self._persisted_envelope_anchors = dict(envelopes)
+        self._persisted_pending_anchors = self._unresolved_pending(pending)
+
+    @staticmethod
+    def _unresolved_pending(
+            pending: dict[str, PendingRecord],
+    ) -> dict[str, PendingRecord]:
+        """Strip plugin-resolved rows from a replayed pending-anchor map.
+
+        ``RunContext.replay`` returns every ``pending_verifications`` row
+        for the run, including those a plugin has already flipped to
+        ``'attached'`` or ``'rejected'`` via ``record_resolution``. Those
+        rows are intentionally kept in SQLite so a late per-leg
+        ``'rejected'`` flip can still be observed against an earlier
+        ``'attached'`` write (see :meth:`_consume_plugin_resolutions`'s
+        docstring), but they have no business in
+        ``_persisted_pending_anchors``: that map drives
+        :meth:`_verify_pending_dispatches`'s ``get_open_orders`` matching
+        path, which is only meaningful for *unresolved* parked dispatches.
+
+        Leaving resolved rows in the map would force every sync after the
+        first attached consume to call ``get_open_orders`` for COIDs the
+        plugin has already accounted for. The in-memory
+        ``_consumed_attached_coids`` dedup short-circuits the resolution
+        bookkeeping but does **not** re-pop the anchor (the row's pop
+        already happened on the first consume), so after an in-process
+        replay the anchor is back. A transient connection error on that
+        spurious call would skip the entire sync via the
+        ``ExchangeConnectionError`` guard in :meth:`sync` — a correctness
+        regression for plugins whose protective brackets resolve via
+        ``record_resolution`` rather than ``get_open_orders`` (e.g.
+        Capital.com's position-attached TP/SL).
+
+        Resolved rows are still picked up directly from SQLite by
+        :meth:`RunContext.iter_pending_resolutions` in
+        :meth:`_consume_plugin_resolutions`; filtering them here loses no
+        information.
+        """
+        return {
+            coid: record
+            for coid, record in pending.items()
+            if record.resolution is None
+        }
 
     @property
     def active_intents(self) -> dict[str, Intent]:
@@ -389,6 +454,34 @@ class OrderSyncEngine:
         # exits the bar loop via its ``finally`` block instead of letting
         # the engine silently keep iterating.
         self.raise_if_halted()
+        # Re-replay persisted anchors at the start of every sync to keep
+        # the in-memory caches aligned with the journal. The runner's
+        # pre-sync refresh races with the broker plugin's ``connect()``
+        # orphan-retire pass when ``live_ohlcv_generator`` times out and
+        # proceeds before connect completes; ``_retire_startup_orphans``
+        # finishing between any two syncs would otherwise leave a stale
+        # anchor that the next ``_build_envelope`` pops into a recycled
+        # ``client_order_id`` (the journal's ``upsert_order`` then
+        # UPDATEs a closed row instead of inserting a fresh one — the
+        # row stays invisible to ``iter_live_orders`` and the next
+        # ``execute_exit`` raises ``no confirmed entry row``).
+        #
+        # Safe to re-populate wholesale: ``_build_envelope`` checks the
+        # live in-memory ``_envelopes`` map FIRST, so an anchor we
+        # already promoted and consumed cannot be resurrected — its DB
+        # row is still present (the envelope is live, not yet completed)
+        # and its in-memory entry takes precedence. An anchor whose
+        # ``record_complete`` already DELETEd the row simply does not
+        # come back. For ``_persisted_pending_anchors`` we additionally
+        # strip plugin-resolved rows via :meth:`_unresolved_pending`:
+        # those rows are intentionally kept in SQLite so a late
+        # ``'rejected'`` flip can still be observed, but they have no
+        # business in the map that drives ``get_open_orders`` matching
+        # (see the helper's docstring for the full rationale).
+        if self._store_ctx is not None:
+            envelopes, pending = self._store_ctx.replay()
+            self._persisted_envelope_anchors = dict(envelopes)
+            self._persisted_pending_anchors = self._unresolved_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
         # Drain again here in case events arrived between
@@ -688,19 +781,15 @@ class OrderSyncEngine:
                             # the cleanup pass drops markers that no Pine
                             # intent claimed.
                             self._attached_adoption_keys.add(key)
-                # The replayed envelope anchor is in-memory only —
-                # ``_drop_envelope`` only touches ``_envelopes`` + the DB
-                # row, so without this pop a same-sync rebuild would pin
-                # the new envelope from the rejected dispatch's anchor
-                # and reuse its ``client_order_id``. Brokers that retain
-                # idempotency state for rejected submissions would then
-                # dedupe the retry instead of accepting it as a new
-                # order. Applies to both kinds: a fresh modify retry
-                # also needs a fresh COID.
+                # ``_drop_envelope`` clears both ``_envelopes`` and
+                # ``_persisted_envelope_anchors`` (the in-memory replayed
+                # anchor) and calls ``record_complete(key)`` which DELETEs
+                # every pending_verifications row sharing this intent_key
+                # — no separate ``record_unpark`` needed. The explicit pop
+                # ordering matters historically (the anchor used to be a
+                # silent stale trap); the pop here is now idempotent
+                # belt-and-suspenders.
                 self._persisted_envelope_anchors.pop(key, None)
-                # ``_drop_envelope`` calls ``record_complete(key)`` which
-                # already DELETEs every pending_verifications row sharing
-                # this intent_key — no separate ``record_unpark`` needed.
                 self._drop_envelope(key)
                 # Drop any in-flight attached-adoption marker placed by
                 # an earlier sync (or this loop iteration before the
@@ -807,11 +896,11 @@ class OrderSyncEngine:
             if (key not in self._active_intents
                     and key in self._order_mapping):
                 self._order_mapping.pop(key, None)
-                self._persisted_envelope_anchors.pop(key, None)
                 # ``_drop_envelope`` removes the in-memory ``_envelopes``
                 # entry (defensive — adoption never populated it for
-                # this key, but cancel/retire paths use the same call)
-                # and persists the cleanup via
+                # this key, but cancel/retire paths use the same call),
+                # also clears the replayed ``_persisted_envelope_anchors``
+                # slot, and persists the cleanup via
                 # :meth:`RunContext.record_complete`, which DELETEs the
                 # ``envelopes`` row AND every ``pending_verifications``
                 # row sharing this intent_key. Without that DELETE a
@@ -1000,8 +1089,33 @@ class OrderSyncEngine:
         unexpected cancel event, reject event). The persisted marker lets the
         replay path skip the envelope and any still-pending verifications
         attached to the same ``key`` — keeping the JSONL self-compacting.
+
+        Also clears the in-memory ``_persisted_envelope_anchors`` entry. The
+        anchor map is repopulated wholesale at the top of every :meth:`sync`
+        from :meth:`storage.RunContext.replay`, so an event-driven drop
+        within the same sync (e.g. a queued ``cancelled``/``rejected``
+        drained from :meth:`_drain_events`) would otherwise leave a stale
+        anchor that :meth:`_build_envelope` then pops into a recycled
+        ``client_order_id`` for the retry — brokers with idempotency caches
+        dedupe/reject the replacement.
+
+        Mirrors the same wholesale cleanup for ``_persisted_pending_anchors``:
+        :meth:`storage.RunContext.record_complete` DELETEs every
+        ``pending_verifications`` row tied to this ``key`` from SQLite, but
+        :meth:`sync` only repopulates the in-memory map at the START of the
+        cycle. An event-driven drop after that replay (cancelled/rejected
+        drained from :meth:`_drain_events`) would otherwise leave stale
+        same-key entries that :meth:`_verify_pending_dispatches` — invoked
+        immediately afterward — could re-adopt via ``get_open_orders``,
+        resurrecting an intent that was just cancelled/rejected/closed.
         """
         self._envelopes.pop(key, None)
+        self._persisted_envelope_anchors.pop(key, None)
+        for coid in [
+            coid for coid, record in self._persisted_pending_anchors.items()
+            if record.key == key
+        ]:
+            self._persisted_pending_anchors.pop(coid, None)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 

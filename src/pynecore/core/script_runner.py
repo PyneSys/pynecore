@@ -419,6 +419,14 @@ class ScriptRunner:
         """
         if self._order_sync_engine is None:
             return
+        # Plugin ``connect()`` (run during ``live_ohlcv_generator``) may have
+        # mutated the ``envelopes`` / ``pending_verifications`` tables via
+        # ``_retire_startup_orphans``. The engine cached both replays in its
+        # ``__init__``, so refresh the in-memory anchors here BEFORE the
+        # first dispatch to avoid popping a stale ``bar_ts_ms`` that resurrects
+        # a just-retired ``client_order_id`` onto a row whose ``closed_ts_ms``
+        # is still set.
+        self._order_sync_engine.refresh_anchors_from_store()
         if self._broker_event_loop is not None:
             self._engine_event_stream_future = asyncio.run_coroutine_threadsafe(
                 self._order_sync_engine.run_event_stream(),

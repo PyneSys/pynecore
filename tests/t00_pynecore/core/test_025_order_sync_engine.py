@@ -1747,3 +1747,67 @@ def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
         row = ctx.get_order('coid-entry')
         assert row is not None
         assert (row.extras or {}).get('natural_close_at') is None
+
+
+def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
+    """Engine in-memory anchor cache must be refreshable after retire.
+
+    Reproduces the live-trade crash where ``_retire_startup_orphans``
+    deletes a stale ``envelopes`` row via ``record_complete`` AFTER the
+    engine has already loaded the anchor into
+    ``_persisted_envelope_anchors`` in ``__init__``. Without
+    ``refresh_anchors_from_store`` the next ``_build_envelope`` would
+    pop the stale ``bar_ts_ms`` and emit a ``client_order_id`` that
+    collides with the just-retired (and closed_ts_ms-stamped) order
+    row — the row stays invisible to ``iter_live_orders`` and the
+    next ``execute_exit`` raises ``no confirmed entry row``.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.models import EntryIntent
+
+    stale_bar_ts = 1_700_000_000_000  # represents an earlier-run anchor
+    fresh_bar_ts = 1_700_000_060_000  # the bar the new sync is processing
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.record_envelope(key='L', bar_ts_ms=stale_bar_ts, retry_seq=0)
+
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+        assert 'L' in engine._persisted_envelope_anchors
+        assert engine._persisted_envelope_anchors['L'].bar_ts_ms == stale_bar_ts
+
+        # Simulate the plugin's startup orphan retire: SQLite envelope row
+        # gone, but the engine's in-memory cache is still stale.
+        ctx.record_complete('L')
+        assert 'L' in engine._persisted_envelope_anchors
+
+        # The fix: refresh re-reads from the store.
+        engine.refresh_anchors_from_store()
+        assert 'L' not in engine._persisted_envelope_anchors
+
+        # Sanity: a subsequent dispatch builds the envelope from
+        # ``_current_bar_ts_ms`` (set by ``sync``) — not the stale anchor.
+        pos.entry_orders['L'] = _entry_order('L', 1.0, limit=50_000.0)
+        engine.sync(fresh_bar_ts)
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == fresh_bar_ts
