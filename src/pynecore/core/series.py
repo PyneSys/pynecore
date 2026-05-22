@@ -188,19 +188,26 @@ class SeriesImpl(Generic[T]):
         """
         Get item(s) using Pine indexing with slice support.
 
-        :param key: Integer index or slice
+        Pine semantics: subscripting with `na` or with an out-of-range integer
+        (negative = forward of the current bar, positive >= size = before
+        available history) returns `na` rather than raising.
+
+        :param key: Integer index, NA, or slice
         :return: Single value for integer index, ReadOnlySeriesView for slice
-        :raises IndexError: If index is out of range or negative
-        :raises TypeError: If key is not int or slice
+        :raises TypeError: If key is not int, NA, or slice
         """
+        # Pine: series[na] -> na. Must come before any int(key) coercion
+        # because int(NA) raises.
+        if isinstance(key, NA):
+            return NA(T)
+
         if isinstance(key, float):
             key = int(key)
 
         if isinstance(key, int):
-            # Original integer indexing behavior
-            if key < 0:
-                raise IndexError("Negative indices not supported!")
-            if key >= self._size:
+            # Pine: out-of-range subscript -> na (covers both negative and
+            # positive past-end indices).
+            if key < 0 or key >= self._size:
                 return NA(T)
             pos = self._write_pos - 1 - key
             if pos < 0:
