@@ -14,6 +14,7 @@ from pynecore.core.strategy_stats import calculate_strategy_statistics, write_st
 from pynecore.core.var_snapshot import VarSnapshot
 
 from pynecore.types import script_type
+from pynecore.core.plugin.live_provider import PluginSymbol
 
 if TYPE_CHECKING:
     from multiprocessing import Process
@@ -200,6 +201,8 @@ class ScriptRunner:
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter',
+                 '_chart_provider_name', '_chart_provider_instance',
+                 '_time_from', '_sec_syminfos', '_signal_rate_sources_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
@@ -211,12 +214,15 @@ class ScriptRunner:
                  trade_path: Path | None = None,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  inputs: dict[str, Any] | None = None,
-                 security_data: dict[str, str | Path] | None = None,
+                 security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
                  magnifier_iter: Iterable[OHLCV] | None = None,
                  broker_plugin: 'BrokerPlugin | None' = None,
                  broker_event_loop: Any = None,
                  broker_store_ctx: 'RunContext | None' = None,
-                 log_ohlcv: bool = False):
+                 log_ohlcv: bool = False,
+                 chart_provider_name: str | None = None,
+                 chart_provider_instance: Any = None,
+                 time_from: datetime | None = None):
         """
         Initialize the script runner
 
@@ -264,6 +270,26 @@ class ScriptRunner:
         self._security_data = security_data or {}
         self._magnifier_iter = magnifier_iter
         self._log_ohlcv = log_ohlcv
+        # Chart provider hooks — used in live mode by ``_resolve_security_data``
+        # to translate Pine-style cross-symbol security keys to plugin-native
+        # symbols (via ``provider.resolve_symbol``) when the user did not
+        # supply an explicit ``--security`` mapping.
+        self._chart_provider_name: str | None = chart_provider_name
+        self._chart_provider_instance: Any = chart_provider_instance
+        # Chart-side ``--from`` (already datetime). Forwarded into every
+        # live-mode :class:`PluginSymbol` so each security context's warmup
+        # window inherits the chart's look-back range instead of the
+        # hard-coded subprocess default.
+        self._time_from: datetime | None = time_from
+        # Cache for pre-fetched ``SymInfo`` per live-mode security sec_id —
+        # populated by ``_prefetch_sec_syminfos`` and consumed by the
+        # currency-rate plumbing on the chart side. Empty in backtest mode.
+        self._sec_syminfos: 'dict[str, SymInfo]' = {}
+        # Optional per-bar driver for ``__auto_rate_*`` rate-source
+        # subprocesses. Installed by ``create_chart_protocol`` when any
+        # auto-rate sec_ids exist; left as ``None`` for backtests / runs
+        # without ``currency=`` conversions, so the bar loop short-circuits.
+        self._signal_rate_sources_fn: 'Callable[[], None] | None' = None
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -580,18 +606,6 @@ class ScriptRunner:
         # Position shortcut
         position = self.script.position
 
-        # --- Currency rate provider setup ---
-        from .currency import CurrencyRateProvider
-        from ..lib import request
-        if self._security_data:
-            request._currency_provider = CurrencyRateProvider(
-                self._security_data, chart_syminfo=self.syminfo,
-            )
-        else:
-            request._currency_provider = CurrencyRateProvider(
-                {}, chart_syminfo=self.syminfo,
-            )
-
         # --- Security contexts setup ---
         sec_contexts: dict[str, dict] | None = getattr(
             self.script_module, '__security_contexts__', None
@@ -601,6 +615,24 @@ class ScriptRunner:
         sec_states = None
         sec_sync_block = None
         sec_result_blocks = None
+
+        # --- Currency rate provider (default) ---
+        # Always install a provider so ``request.currency_rate()`` works
+        # without a ``request.security()`` context — e.g. when the chart
+        # symbol itself is a currency pair (``lib.close`` is the rate) or
+        # when only legacy file-backed rate sources are supplied via
+        # ``security_data``. Replaced below inside the ``if sec_contexts``
+        # branch with a provider that also reads sec ResultBlocks.
+        from .currency import CurrencyRateProvider
+        from ..lib import request
+        _legacy_file_paths: dict[str, str | Path] = {}
+        for _key, _val in self._security_data.items():
+            if isinstance(_val, (str, Path)):
+                _legacy_file_paths[_key] = _val
+        request._currency_provider = CurrencyRateProvider(
+            security_data=_legacy_file_paths,
+            chart_syminfo=self.syminfo,
+        )
 
         try:
             if sec_contexts:
@@ -646,6 +678,25 @@ class ScriptRunner:
                 sec_ohlcv_paths = (
                     self._resolve_security_data(static_contexts) if static_contexts else {}
                 )
+                # Pre-fetch syminfo for every live-mode PluginSymbol entry
+                # from the chart process, so the chart-side currency-rate
+                # plumbing sees ``(basecurrency, currency)`` before any
+                # subprocess starts, and the subprocess can skip its own
+                # ``update_symbol_info()`` REST call. Pass ``sec_contexts``
+                # so failures on ``ignore_invalid_symbol=True`` contexts
+                # downgrade to None instead of aborting startup.
+                sec_ohlcv_paths = self._prefetch_sec_syminfos(
+                    sec_ohlcv_paths, sec_contexts=sec_contexts,
+                )
+
+                # Auto-spawn rate-source contexts for ``currency=X`` requests
+                # that no existing context already covers. Mutates
+                # ``sec_contexts`` / ``static_contexts`` / ``sec_ohlcv_paths``
+                # in place so the rest of the setup treats the new entries
+                # like any other PluginSymbol context.
+                self._autospawn_rate_sources(
+                    sec_contexts, static_contexts, sec_ohlcv_paths, chart_tf,
+                )
 
                 # Track ignored sec_ids (ignore_invalid_symbol=True, no data)
                 ignored_sec_ids: set[str] = set()
@@ -653,11 +704,39 @@ class ScriptRunner:
                     if path is None:
                         ignored_sec_ids.add(sec_id)
 
-                # No-process IDs: both same-context and ignored
-                no_process_ids = frozenset(same_context_ids | ignored_sec_ids)
+                # No-process IDs: both same-context and ignored. Kept mutable
+                # so the deferred-resolve callback can append late-discovered
+                # ignored symbols (``ignore_invalid_symbol=True`` whose live
+                # syminfo lookup fails) — without that, the chart-side
+                # ``__sec_signal__`` would wait on a process that was never
+                # spawned. ``create_chart_protocol`` captures by reference.
+                no_process_ids: set[str] = set(same_context_ids | ignored_sec_ids)
 
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
                     sec_contexts, chart_tf, self.tz, chart_symbol=chart_ticker,
+                )
+
+                # Currency rate provider — built after the SyncBlock exists so
+                # security-context lookups can read the latest pickled close
+                # from the matching ``ResultBlock``. Only **rate-source**
+                # sec contexts are exposed as FX pairs: arbitrary user
+                # ``request.security()`` expressions are not assumed to
+                # yield close, so reading their ResultBlock as an exchange
+                # rate would silently misuse indicator values as FX rates.
+                legacy_file_paths: dict[str, str | Path] = {}
+                for _key, _val in self._security_data.items():
+                    if isinstance(_val, (str, Path)):
+                        legacy_file_paths[_key] = _val
+                rate_source_syminfos: dict[str, SymInfo] = {}
+                for _sid, _ps in sec_ohlcv_paths.items():
+                    if (isinstance(_ps, PluginSymbol) and _ps.is_rate_source
+                            and _ps.syminfo is not None):
+                        rate_source_syminfos[_sid] = _ps.syminfo
+                request._currency_provider = CurrencyRateProvider(
+                    security_data=legacy_file_paths,
+                    chart_syminfo=self.syminfo,
+                    sec_syminfos=rate_source_syminfos,
+                    sync_block=sec_sync_block,
                 )
 
                 all_sec_ids = list(sec_contexts.keys())
@@ -666,14 +745,14 @@ class ScriptRunner:
                     sid: state.result_lock for sid, state in sec_states.items()
                 }
 
-                def _spawn_security_process(sid: str, data_path: str):
+                def _spawn_security_process(sid: str, data_source):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     proc = Process(
                         target=security_process_main,
                         args=(
                             sid,
                             script_path_str,
-                            data_path,
+                            data_source,
                             sec_sync_block.name,  # noqa
                             all_sec_ids,
                             sec_state.data_ready,
@@ -739,12 +818,28 @@ class ScriptRunner:
                         and sec_state.lookahead is Lookahead.ON
                     )
                     # Resolve OHLCV path and spawn process
-                    resolve_ctx = {'symbol': symbol, 'timeframe': resolved_tf}
+                    resolve_ctx = {
+                        'symbol': symbol,
+                        'timeframe': resolved_tf,
+                        'ignore_invalid_symbol': sec_contexts[sid].get(
+                            'ignore_invalid_symbol', False
+                        ),
+                    }
                     resolved = self._resolve_security_data({sid: resolve_ctx})
+                    resolved = self._prefetch_sec_syminfos(
+                        resolved, sec_contexts={sid: resolve_ctx},
+                    )
                     resolved_path = resolved[sid]
                     sec_ohlcv_paths[sid] = resolved_path
                     if resolved_path is not None:
                         _spawn_security_process(sid, resolved_path)
+                    else:
+                        # ``ignore_invalid_symbol=True`` downgraded the live
+                        # syminfo lookup to ``None``; mark the sid as
+                        # no-process so ``__sec_signal__`` short-circuits
+                        # instead of waiting on a child that was never
+                        # spawned.
+                        no_process_ids.add(sid)
 
                 # Lazy spawn callback for static contexts
                 def _lazy_spawn(sid: str):
@@ -752,24 +847,54 @@ class ScriptRunner:
                     if resolved_path is not None and sid not in no_process_ids:
                         _spawn_security_process(sid, resolved_path)
 
-                # Build currency conversion map from security contexts
+                # Eager-spawn auto-rate-source contexts. These hidden
+                # ``__auto_rate_*`` sec_ids carry the FX feed for
+                # ``request.security(..., currency=...)`` requests; no Pine
+                # statement calls ``__sec_signal__`` for them, so the lazy
+                # path never fires. Without an immediate spawn the
+                # subprocess never starts, its :class:`ResultBlock` stays
+                # empty, and ``CurrencyRateProvider`` reads ``NaN`` for
+                # every conversion.
+                for _sid, _ps in sec_ohlcv_paths.items():
+                    if (isinstance(_ps, PluginSymbol) and _ps.is_rate_source
+                            and _sid not in no_process_ids):
+                        _spawn_security_process(_sid, _ps)
+
+                # Build currency conversion map from security contexts.
+                # Live-mode PluginSymbol sources expose syminfo via the
+                # chart-side prefetch (``self._sec_syminfos``); file-mode
+                # sources still load it from the sibling ``.toml``.
                 currency_conversions: dict[str, tuple[str, str]] = {}
                 for sec_id, ctx in sec_contexts.items():
                     target_cur = ctx.get('currency')
-                    if target_cur is not None:
-                        target_cur_str = str(target_cur)
-                        if target_cur_str and target_cur_str.lower() not in ('', 'na', 'nan'):
-                            ohlcv_path = sec_ohlcv_paths.get(sec_id)
-                            if ohlcv_path:
-                                sec_toml = Path(ohlcv_path).with_suffix('.toml')
-                                if sec_toml.exists():
-                                    sec_si = SymInfo.load_toml(sec_toml)
-                                    currency_conversions[sec_id] = (
-                                        sec_si.currency, target_cur_str
-                                    )
+                    if target_cur is None:
+                        continue
+                    target_cur_str = str(target_cur)
+                    if not target_cur_str or target_cur_str.lower() in ('', 'na', 'nan'):
+                        continue
+                    sec_si = self._sec_syminfos.get(sec_id)
+                    if sec_si is None:
+                        ohlcv_path = sec_ohlcv_paths.get(sec_id)
+                        if isinstance(ohlcv_path, str):
+                            sec_toml = Path(ohlcv_path).with_suffix('.toml')
+                            if sec_toml.exists():
+                                sec_si = SymInfo.load_toml(sec_toml)
+                    if sec_si is not None and sec_si.currency:
+                        currency_conversions[sec_id] = (sec_si.currency, target_cur_str)
 
                 frozen_same_ctx = frozenset(same_context_ids)
-                signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
+                # Collect hidden ``__auto_rate_*`` sec_ids so the chart
+                # loop can tick their subprocesses each bar — no Pine call
+                # signals them, and without per-bar advance their
+                # ResultBlock stays empty and ``CurrencyRateProvider``
+                # returns NaN for every conversion.
+                auto_rate_sec_ids = frozenset(
+                    sid for sid, ps in sec_ohlcv_paths.items()
+                    if isinstance(ps, PluginSymbol) and ps.is_rate_source
+                    and sid not in no_process_ids
+                )
+                (signal_fn, write_fn, read_fn, wait_fn,
+                 sec_cleanup_fn, signal_rate_sources_fn) = create_chart_protocol(
                     sec_states, sec_sync_block,
                     deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
                     lazy_spawn_fn=_lazy_spawn if static_contexts else None,
@@ -778,9 +903,11 @@ class ScriptRunner:
                     result_blocks=sec_result_blocks if same_context_ids else None,
                     currency_conversions=currency_conversions or None,
                     sec_processes=sec_processes,
+                    auto_rate_sec_ids=auto_rate_sec_ids,
                 )
                 inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
                                 same_context=frozen_same_ctx)
+                self._signal_rate_sources_fn = signal_rate_sources_fn
 
             # --timeframe mode: magnifier_iter provides sub-TF data
             if self._magnifier_iter is not None:
@@ -814,9 +941,16 @@ class ScriptRunner:
 
             # --- Helper closures for DRY ---
             registered_libraries = script._registered_libraries
+            signal_rate_sources_fn = self._signal_rate_sources_fn
 
             # noinspection PyProtectedMember
             def _run_libs_and_main():
+                # Advance hidden ``__auto_rate_*`` subprocesses before
+                # libraries/main run so any ``request.currency_rate`` /
+                # ``currency=`` conversion looks up a freshly-written
+                # close from the rate-source ResultBlock instead of NaN.
+                if signal_rate_sources_fn is not None:
+                    signal_rate_sources_fn()
                 lib._lib_semaphore = True
                 for _title, main_func in registered_libraries:
                     main_func()
@@ -1527,36 +1661,68 @@ class ScriptRunner:
         if on_progress:
             on_progress(datetime.max)
 
-    def _resolve_security_data(self, contexts: dict) -> dict[str, str | None]:
+    def _resolve_security_data(self, contexts: dict) -> 'dict[str, str | PluginSymbol | None]':
         """
-        Resolve OHLCV file paths for each security context.
+        Resolve a data source for each security context.
 
-        Matches each context's (symbol, timeframe) to the user-provided
-        ``security_data`` dictionary using ``"SYMBOL:TF"`` or ``"TF"`` keys.
+        Walks the user-provided ``security_data`` dictionary first, matching
+        on ``"SYMBOL:TF"``, then ``"SYMBOL"``, then ``"TF"`` keys. Falls
+        through to two mode-specific behaviours when no explicit mapping
+        exists:
+
+        - **Live mode** (chart provider available): builds a
+          :class:`PluginSymbol` for the security subprocess by translating
+          the Pine-style symbol through ``chart_provider_instance.resolve_symbol``
+          (which consults the plugin's ``config.symbol_map`` TOML table
+          first, falling back to ``normalize_symbol``).
+        - **Backtest mode** (no chart provider): raises ``ValueError`` —
+          a security context cannot be resolved without either an explicit
+          ``--security`` file mapping or ``ignore_invalid_symbol``.
 
         :param contexts: The ``__security_contexts__`` dict from the script module
-        :return: Dict mapping sec_id to resolved OHLCV file path (None if ignored)
+        :return: Dict mapping sec_id to an OHLCV file path (``str``), a
+                 :class:`PluginSymbol` for live-mode subprocesses, or
+                 ``None`` when the context was opted out via
+                 ``ignore_invalid_symbol``.
         :raises ValueError: If no data found and ignore_invalid_symbol is not True
         """
-        result: dict[str, str | None] = {}
+        from dataclasses import replace as dc_replace
+        result: dict[str, str | PluginSymbol | None] = {}
         for sec_id, ctx in contexts.items():
             symbol = str(ctx.get('symbol', ''))
             timeframe = str(ctx.get('timeframe', ''))
 
-            # Try exact "SYMBOL:TF" match
+            entry: str | Path | PluginSymbol | None = None
+            # Try exact "SYMBOL:TF" match, then symbol-only, then TF-only.
             key = f"{symbol}:{timeframe}"
             if key in self._security_data:
-                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[key])
+                entry = self._security_data[key]
+            elif symbol in self._security_data:
+                entry = self._security_data[symbol]
+            elif timeframe in self._security_data:
+                entry = self._security_data[timeframe]
+
+            if isinstance(entry, PluginSymbol):
+                if entry.time_from is None and self._time_from is not None:
+                    entry = dc_replace(entry, time_from=self._time_from)
+                result[sec_id] = entry
+                continue
+            if entry is not None:
+                result[sec_id] = self._ensure_ohlcv_ext(entry)
                 continue
 
-            # Try symbol-only match (without timeframe)
-            if symbol in self._security_data:
-                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[symbol])
-                continue
-
-            # Try timeframe-only match
-            if timeframe in self._security_data:
-                result[sec_id] = self._ensure_ohlcv_ext(self._security_data[timeframe])
+            # No explicit mapping — fall back to chart-provider resolution
+            # in live mode.
+            if self._chart_provider_instance is not None and self._chart_provider_name:
+                native_symbol = self._chart_provider_instance.resolve_symbol(symbol)
+                result[sec_id] = PluginSymbol(
+                    provider_name=self._chart_provider_name,
+                    symbol=native_symbol,
+                    timeframe=timeframe,
+                    config=getattr(self._chart_provider_instance, 'config', None),
+                    time_from=self._time_from,
+                    ohlcv_dir=self._chart_ohlcv_dir(),
+                )
                 continue
 
             # No data found — check if ignore_invalid_symbol is set
@@ -1571,6 +1737,238 @@ class ScriptRunner:
                 f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
             )
         return result
+
+    def _prefetch_sec_syminfos(
+        self,
+        sec_data: 'dict[str, str | PluginSymbol | None]',
+        sec_contexts: dict | None = None,
+    ) -> 'dict[str, str | PluginSymbol | None]':
+        """Pre-fetch :class:`SymInfo` for every live-mode security context.
+
+        Builds a temporary :class:`LiveProviderPlugin` instance for each
+        :class:`PluginSymbol` entry and calls ``update_symbol_info()`` once
+        from the chart process. The result is cached on ``self._sec_syminfos``
+        (used by the currency-rate plumbing) and folded back into the
+        returned :class:`PluginSymbol` so the subprocess does not have to
+        repeat the REST round-trip on startup.
+
+        File-mode entries (backtest) are returned unchanged.
+
+        :param sec_data: Per-sec_id resolved data sources (mutated to None
+            for sec_ids whose REST lookup fails and whose context opted in
+            via ``ignore_invalid_symbol=True``).
+        :param sec_contexts: ``__security_contexts__`` dict — consulted to
+            honor ``ignore_invalid_symbol`` when a symbol fails to resolve.
+            When ``None``, every failure propagates as an exception.
+        """
+        from dataclasses import replace as dc_replace
+        from pynecore.core.plugin.live_provider import LiveProviderPlugin
+        from pynecore.core.plugin import load_plugin
+
+        out: dict[str, str | PluginSymbol | None] = {}
+        for sec_id, entry in sec_data.items():
+            if not isinstance(entry, PluginSymbol):
+                out[sec_id] = entry
+                continue
+            if entry.syminfo is not None:
+                self._sec_syminfos[sec_id] = entry.syminfo
+                out[sec_id] = entry
+                continue
+            provider_cls = load_plugin(entry.provider_name)
+            if not issubclass(provider_cls, LiveProviderPlugin):
+                raise RuntimeError(
+                    f"Plugin '{entry.provider_name}' is not a live provider; "
+                    f"cannot drive cross-symbol live request.security."
+                )
+            ignore_invalid = bool(
+                sec_contexts and sec_contexts.get(sec_id, {}).get('ignore_invalid_symbol')
+            )
+            # Constructor and ``update_symbol_info`` both share the
+            # ``ignore_invalid_symbol`` downgrade: some live providers (e.g.
+            # CCXT) validate the exchange prefix in ``__init__`` and raise
+            # before the symbol-info call ever runs.
+            try:
+                provider = provider_cls(
+                    symbol=entry.symbol,
+                    timeframe=entry.timeframe,
+                    ohlcv_dir=entry.ohlcv_dir,
+                    config=entry.config,
+                )
+                syminfo = provider.update_symbol_info()
+            except Exception:  # noqa: BLE001
+                if not ignore_invalid:
+                    raise
+                # ``ignore_invalid_symbol=True``: downgrade to the
+                # backtest-mode "no data" sentinel so the rest of the
+                # pipeline treats this context as ignored.
+                out[sec_id] = None
+                continue
+            self._sec_syminfos[sec_id] = syminfo
+            out[sec_id] = dc_replace(entry, syminfo=syminfo)
+        return out
+
+    def _autospawn_rate_sources(
+        self,
+        sec_contexts: dict,
+        static_contexts: dict,
+        sec_ohlcv_paths: 'dict[str, str | PluginSymbol | None]',
+        chart_tf: str,
+    ) -> None:
+        """Discover and spawn rate-source contexts for unresolved ``currency=X`` pairs.
+
+        For every security context whose ``currency`` parameter would
+        require a ``(basecurrency, target_currency)`` exchange-rate lookup
+        not already covered by the chart pair or by an existing security
+        context, builds a hidden rate-source :class:`PluginSymbol` (with
+        ``is_rate_source=True``) and adds it to ``sec_contexts`` /
+        ``static_contexts`` / ``sec_ohlcv_paths``. The chart's own provider
+        instance is used to validate the constructed pair symbol via
+        ``update_symbol_info()`` — invalid symbols are skipped silently
+        (the rate downstream simply remains ``NaN``).
+
+        Backtest runs (no chart-side live provider) leave everything
+        untouched; the legacy ``.toml`` lookup keeps working.
+        """
+        if self._chart_provider_instance is None or not self._chart_provider_name:
+            return
+
+        chart_pair: tuple[str, str] | None = None
+        if self.syminfo.basecurrency:
+            chart_pair = (self.syminfo.basecurrency, self.syminfo.currency)
+
+        # Only the chart pair (whose ``lib.close`` is the live rate) and
+        # other explicit rate sources count as "already covered". User
+        # security contexts are *not* assumed to expose close — their
+        # ResultBlock carries the user's ``request.security()`` expression
+        # result, which can be anything (e.g. ``ta.sma(close, 20)``, ``high``,
+        # a tuple). Treating those as FX rates would silently misuse
+        # indicator values as exchange rates.
+        existing_pairs: set[tuple[str, str]] = set()
+        if chart_pair is not None:
+            existing_pairs.add(chart_pair)
+            existing_pairs.add((chart_pair[1], chart_pair[0]))
+        for _sid, ps in sec_ohlcv_paths.items():
+            if (isinstance(ps, PluginSymbol) and ps.is_rate_source
+                    and ps.syminfo and ps.syminfo.basecurrency):
+                existing_pairs.add((ps.syminfo.basecurrency, ps.syminfo.currency))
+                existing_pairs.add((ps.syminfo.currency, ps.syminfo.basecurrency))
+
+        # Collect pairs that need an auto-rate-source.
+        needed_pairs: set[tuple[str, str]] = set()
+        for sid, ctx in sec_contexts.items():
+            target_cur = ctx.get('currency')
+            if target_cur is None:
+                continue
+            target_str = str(target_cur)
+            if not target_str or target_str.lower() in ('na', 'nan', ''):
+                continue
+            si = self._sec_syminfos.get(sid)
+            if si is None or not si.currency:
+                continue
+            from_cur, to_cur = si.currency, target_str
+            if from_cur == to_cur:
+                continue
+            if (from_cur, to_cur) in existing_pairs:
+                continue
+            needed_pairs.add((from_cur, to_cur))
+
+        if not needed_pairs:
+            return
+
+        from pynecore.core.plugin import load_plugin
+        from pynecore.core.plugin.live_provider import LiveProviderPlugin
+
+        provider_cls = load_plugin(self._chart_provider_name)
+        if not issubclass(provider_cls, LiveProviderPlugin):
+            return
+        config = getattr(self._chart_provider_instance, 'config', None)
+
+        symbol_map = getattr(config, 'symbol_map', None) or {}
+
+        def _try_pair(a: str, b: str) -> 'tuple[str, SymInfo] | None':
+            """Try to resolve ``construct_pair_symbol(a, b)``; return the
+            ``(native_symbol, syminfo)`` tuple if the provider exposes the
+            currency pair (in either direction), else ``None``.
+            """
+            pk = provider_cls.construct_pair_symbol(a, b)
+            ns = self._chart_provider_instance.resolve_symbol(pk)
+            try:
+                tp = provider_cls(
+                    symbol=ns,
+                    timeframe=chart_tf,
+                    ohlcv_dir=self._chart_ohlcv_dir(),
+                    config=config,
+                )
+                si = tp.update_symbol_info()
+            except Exception:  # noqa: BLE001
+                return None
+            act = (si.basecurrency, si.currency)
+            if act != (a, b) and act != (b, a):
+                return None
+            return ns, si
+
+        for from_cur, to_cur in sorted(needed_pairs):
+            # A prior iteration may have already spawned a rate source for
+            # the inverse direction of this pair; ``CurrencyRateProvider``
+            # inverts rates transparently, so a second feed for the same
+            # underlying pair would just duplicate WS subscriptions.
+            if (from_cur, to_cur) in existing_pairs:
+                continue
+            # Try the direct ``from_cur + to_cur`` construction first. If the
+            # provider exposes only the inverse pair (e.g. ``EURUSD`` is live
+            # but the script requested USD→EUR), fall back to the inverse
+            # construction — ``CurrencyRateProvider`` already inverts rates
+            # from a reverse-direction source. The fallback is skipped when a
+            # ``symbol_map`` already maps the direct Pine key, so user-provided
+            # explicit mappings are trusted as-is.
+            direct_pinekey = provider_cls.construct_pair_symbol(from_cur, to_cur)
+            resolved = _try_pair(from_cur, to_cur)
+            if resolved is None and direct_pinekey not in symbol_map:
+                resolved = _try_pair(to_cur, from_cur)
+            if resolved is None:
+                continue
+            native_symbol, syminfo = resolved
+            auto_sec_id = f"__auto_rate_{from_cur}_{to_cur}__"
+            if auto_sec_id in sec_contexts:
+                continue
+            ps = PluginSymbol(
+                provider_name=self._chart_provider_name,
+                symbol=native_symbol,
+                timeframe=chart_tf,
+                config=config,
+                time_from=self._time_from,
+                syminfo=syminfo,
+                is_rate_source=True,
+                ohlcv_dir=self._chart_ohlcv_dir(),
+            )
+            sec_contexts[auto_sec_id] = {
+                'symbol': native_symbol,
+                'timeframe': chart_tf,
+            }
+            static_contexts[auto_sec_id] = sec_contexts[auto_sec_id]
+            sec_ohlcv_paths[auto_sec_id] = ps
+            self._sec_syminfos[auto_sec_id] = syminfo
+            existing_pairs.add((from_cur, to_cur))
+            existing_pairs.add((to_cur, from_cur))
+
+    def _chart_ohlcv_dir(self) -> 'Path | None':
+        """Return the OHLCV data directory of the chart provider, if any.
+
+        Cross-symbol live :class:`PluginSymbol` entries forward this to the
+        subprocess so the child provider can locate workdir-side resources
+        that live next to the data dir — most notably per-exchange config
+        overrides in ``<workdir>/config/plugins/<provider>.toml`` (e.g. the
+        ``[binance]`` section of ``ccxt.toml``). Without it, the subprocess
+        provider runs with default exchange config while the chart side
+        runs with the override, breaking auth and market-type selection
+        for the cross-symbol feeds.
+        """
+        if self._chart_provider_instance is None:
+            return None
+        ohlcv_path = getattr(self._chart_provider_instance, 'ohlcv_path', None)
+        if ohlcv_path is None:
+            return None
+        return Path(ohlcv_path).parent
 
     @staticmethod
     def _ensure_ohlcv_ext(path: str | Path) -> str:

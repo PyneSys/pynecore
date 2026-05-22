@@ -57,7 +57,188 @@ from pynecore.lib.log import broker_info, broker_warning
 from pynecore.lib.session import _is_in_session, _is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 
-__all__ = ['live_ohlcv_generator']
+__all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer']
+
+
+class LiveBarStreamer:
+    """Non-blocking, thread-safe closed-bar source for security subprocesses.
+
+    Wraps :func:`live_ohlcv_generator` in a background thread that drains its
+    output into an internal queue. The security subprocess polls
+    :meth:`pop_new_closed_bars` once per chart advance — receiving zero or
+    more freshly-closed bars without ever blocking the chart-driven flow.
+
+    Intra-bar updates and the warmup→live transition sentinel are dropped:
+    cross-symbol :func:`request.security` only exposes closed bars, and the
+    subprocess does not switch modes mid-run.
+    """
+
+    def __init__(self, provider: LiveProviderPlugin, symbol: str, timeframe: str,
+                 *, syminfo: SymInfo | None = None,
+                 last_historical_timestamp: int | None = None):
+        self._provider = provider
+        self._symbol = symbol
+        self._timeframe = timeframe
+        self._syminfo = syminfo
+        self._last_historical_timestamp = last_historical_timestamp
+        self._queue: Queue[OHLCV] = Queue()
+        self._stopped = threading.Event()
+        self._gen: Generator[OHLCV, None, None] | None = None
+        self._thread: threading.Thread | None = None
+        # Captures an exception raised by the upstream generator so the
+        # next ``pop_new_closed_bars()`` call can surface it to the
+        # security subprocess. Without this, a dead WS would just stop
+        # delivering bars and the security loop would silently emit ``na``
+        # forever while the chart-side liveness check never notices.
+        self._drain_error: BaseException | None = None
+
+    def start(self) -> None:
+        """Start the background drain thread."""
+        if self._thread is not None:
+            return
+        self._gen = live_ohlcv_generator(
+            provider=self._provider,
+            symbol=self._symbol,
+            timeframe=self._timeframe,
+            syminfo=self._syminfo,
+            last_historical_timestamp=self._last_historical_timestamp,
+        )
+        self._thread = threading.Thread(
+            target=self._drain, daemon=True, name=f"sec-stream-{self._symbol}",
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        assert self._gen is not None
+        try:
+            for bar in self._gen:
+                if self._stopped.is_set():
+                    break
+                if bar is LIVE_TRANSITION:
+                    continue
+                if not getattr(bar, 'is_closed', True):
+                    continue
+                self._queue.put(bar)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("LiveBarStreamer drain raised")
+            if not self._stopped.is_set():
+                self._drain_error = exc
+
+    def pop_new_closed_bars(self) -> list[OHLCV]:
+        """Drain all currently-available closed bars (non-blocking).
+
+        Re-raises any exception captured by the upstream drain thread once
+        the queue is empty, so the security subprocess can fail loudly and
+        the chart-side liveness check (``proc.is_alive()`` polling) catches
+        the dead process instead of silently turning every bar into ``na``.
+        """
+        out: list[OHLCV] = []
+        while True:
+            try:
+                out.append(self._queue.get_nowait())
+            except Empty:
+                break
+        if not out and self._drain_error is not None:
+            err = self._drain_error
+            # Single-shot raise so a re-tried call (e.g. after restart)
+            # would not keep raising forever; ``_drain_error`` stays set
+            # only as a flag for ``stop()`` cleanup.
+            self._drain_error = None
+            raise err
+        return out
+
+    def wait_for_bars(self, timeout: float) -> list[OHLCV]:
+        """Block up to ``timeout`` seconds for at least one closed bar.
+
+        Used by the cross-symbol live HTF security loop when the chart
+        process has signaled a confirmed period whose bar has not yet been
+        published by the upstream WS feed (different exchange / network
+        delay). Blocking briefly on the streamer queue avoids advancing the
+        chart's ``last_confirmed`` watermark past the security's actual bar
+        and emitting ``na`` for that period.
+
+        Drains any further bars that have already accumulated after the
+        first one arrives so a single call still returns the full batch.
+        Re-raises a captured drain error using the same single-shot
+        semantics as :meth:`pop_new_closed_bars`.
+        """
+        out: list[OHLCV] = []
+        try:
+            first = self._queue.get(timeout=max(0.0, timeout))
+        except Empty:
+            if self._drain_error is not None:
+                err = self._drain_error
+                self._drain_error = None
+                raise err
+            return out
+        out.append(first)
+        while True:
+            try:
+                out.append(self._queue.get_nowait())
+            except Empty:
+                break
+        return out
+
+    def stop(self) -> None:
+        """Signal the drain thread to exit and close the upstream generator.
+
+        The drain thread is typically parked inside ``next(self._gen)`` at
+        this point. Calling ``self._gen.close()`` from a *different* thread
+        while the generator is suspended on a ``yield`` is supported, but
+        if the runtime considers the generator to be executing on the drain
+        side (race with the moment a bar is being yielded), CPython raises
+        ``ValueError: generator already executing``. The drain thread will
+        eventually return on its own once ``self._stopped`` is observed, so
+        swallow the race here and rely on the ``join`` below to finish
+        cleanup.
+        """
+        self._stopped.set()
+        if self._gen is not None:
+            try:
+                self._gen.close()
+            except (RuntimeError, ValueError, GeneratorExit):
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+
+def download_warmup_in_memory(
+        provider: LiveProviderPlugin,
+        time_from: datetime,
+        time_to: datetime,
+) -> list[OHLCV]:
+    """
+    Download historical OHLCV data into an in-memory list (no file written).
+
+    Used by the security subprocess to fetch warmup bars without creating
+    any ``.ohlcv`` file. Captures the records by temporarily redirecting
+    :meth:`ProviderPlugin.save_ohlcv_data` to an internal list — the
+    plugin's own ``download_ohlcv`` implementation is otherwise unchanged.
+
+    :param provider: A live provider instance (``ohlcv_dir`` may be ``None``).
+    :param time_from: Naive UTC start of the warmup window.
+    :param time_to: Naive UTC end of the warmup window.
+    :return: Fully-closed warmup bars in chronological order.
+    """
+    captured: list[OHLCV] = []
+
+    original_save = provider.save_ohlcv_data
+
+    def _capture(data):
+        if isinstance(data, OHLCV):
+            captured.append(data)
+        else:
+            captured.extend(data)
+
+    provider.save_ohlcv_data = _capture  # type: ignore[method-assign]
+    try:
+        tf = time_from.replace(tzinfo=None) if time_from.tzinfo else time_from
+        tt = time_to.replace(tzinfo=None) if time_to.tzinfo else time_to
+        provider.download_ohlcv(tf, tt)
+    finally:
+        provider.save_ohlcv_data = original_save  # type: ignore[method-assign]
+
+    return captured
 
 logger = logging.getLogger(__name__)
 

@@ -180,5 +180,5 @@ def _parse_min_pynecore(ep: EntryPoint) -> str:
 
 # Plugin type subclasses — import after Plugin is defined to avoid circular imports
 from .provider import ProviderPlugin
-from .live_provider import LiveProviderPlugin
+from .live_provider import LiveProviderPlugin, LiveProviderConfig, PluginSymbol
 from .cli import CLIPlugin

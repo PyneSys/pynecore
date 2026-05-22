@@ -113,7 +113,7 @@ def __test_chart_protocol_signal_read_flow__(log):
     state = _make_state(sec_id="sec_flow", timeframe="5", same_timeframe=True)
     states = {"sec_flow": state}
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(states, sb)
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(states, sb)
 
     try:
         # Simulate: write a value to shared memory (as if security process did it)
@@ -145,7 +145,7 @@ def __test_chart_protocol_gaps_on__(log):
     state.new_period = False  # no new period
     states = {"sec_gaps": state}
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(states, sb)
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(states, sb)
 
     try:
         write_result(rb, sb, 100.0)
@@ -396,7 +396,7 @@ def __test_chart_protocol_currency_conversion__(log):
             # Conversion: security result is in EUR, convert to USD
             currency_conversions = {"sec_cur": ("EUR", "USD")}
 
-            signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(
+            signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(
                 states, sb, currency_conversions=currency_conversions,
             )
 
@@ -443,7 +443,7 @@ def __test_chart_protocol_currency_no_data__(log):
     try:
         currency_conversions = {"sec_nodata": ("EUR", "USD")}
 
-        signal_fn, write_fn, read_fn, wait_fn, cleanup = create_chart_protocol(
+        signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(
             states, sb, currency_conversions=currency_conversions,
         )
 

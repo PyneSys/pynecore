@@ -71,6 +71,29 @@ def format_value(value: str | int | float | bool) -> str:
     return str(value)
 
 
+def _format_for_toml(value: Any) -> str:
+    """Format any supported value as a TOML literal.
+
+    Wraps :func:`format_value` for the four scalar types and adds TOML
+    inline-table / array support so ``dict`` and ``list`` fields (e.g.
+    ``LiveProviderConfig.symbol_map``) round-trip through the
+    self-healing config writer.
+    """
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        parts = [
+            f"{format_value(str(k))} = {_format_for_toml(v)}"
+            for k, v in value.items()
+        ]
+        return "{ " + ", ".join(parts) + " }"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "[" + ", ".join(_format_for_toml(v) for v in value) + "]"
+    return format_value(value)
+
+
 def _is_mlstr_field(f: dataclasses.Field) -> bool:
     """Check if a dataclass field is annotated as ``mlstr``.
 
@@ -108,39 +131,48 @@ def extract_field_docs(config_cls: type) -> dict[str, str]:
 
     Looks for ``Expr(Constant(str))`` nodes immediately following
     ``AnnAssign`` nodes in the class body (PEP 257 attribute docstrings).
+    Walks the MRO in reverse order so docstrings on inherited fields are
+    picked up too — a subclass-level docstring overrides the inherited
+    one for the same field name.
 
     :param config_cls: The dataclass type to inspect.
     :return: Mapping of field name to its docstring.
     """
-    try:
-        source = textwrap.dedent(inspect.getsource(config_cls))
-    except (OSError, TypeError):
-        return {}
-
-    tree = ast.parse(source)
-
-    class_def = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == config_cls.__name__:
-            class_def = node
-            break
-
-    if class_def is None:
-        return {}
-
     docs: dict[str, str] = {}
-    body = class_def.body
-    for i, node in enumerate(body):
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            field_name = node.target.id
-            if i + 1 < len(body):
-                next_node = body[i + 1]
-                if (
-                    isinstance(next_node, ast.Expr)
-                    and isinstance(next_node.value, ast.Constant)
-                    and isinstance(next_node.value.value, str)
-                ):
-                    docs[field_name] = next_node.value.value
+    for cls in reversed(config_cls.__mro__):
+        if cls is object:
+            continue
+        try:
+            source = textwrap.dedent(inspect.getsource(cls))
+        except (OSError, TypeError):
+            continue
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+
+        class_def = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == cls.__name__:
+                class_def = node
+                break
+
+        if class_def is None:
+            continue
+
+        body = class_def.body
+        for i, node in enumerate(body):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                field_name = node.target.id
+                if i + 1 < len(body):
+                    next_node = body[i + 1]
+                    if (
+                        isinstance(next_node, ast.Expr)
+                        and isinstance(next_node.value, ast.Constant)
+                        and isinstance(next_node.value.value, str)
+                    ):
+                        docs[field_name] = next_node.value.value
 
     return docs
 
@@ -173,6 +205,15 @@ def generate_toml(
         default = f.default
         is_ml = _is_mlstr_field(f)
 
+        # Resolve ``field(default_factory=...)`` to an actual default value
+        # so the commented placeholder shows real TOML syntax (e.g.
+        # ``#symbol_map = {}``) instead of a bare ``#symbol_map =``.
+        if default is dataclasses.MISSING and f.default_factory is not dataclasses.MISSING:
+            try:
+                default = f.default_factory()
+            except Exception:  # noqa: BLE001
+                default = dataclasses.MISSING
+
         lines.append("")
 
         if name in field_docs:
@@ -183,7 +224,7 @@ def generate_toml(
             value = user_values[name]
             if is_ml and not isinstance(value, mlstr):
                 value = mlstr(value)
-            _emit_assignment(lines, name, format_value(value), commented=False)
+            _emit_assignment(lines, name, _format_for_toml(value), commented=False)
         elif default is dataclasses.MISSING or default is None:
             if is_ml:
                 _emit_assignment(lines, name, "'''\n'''", commented=True)
@@ -193,7 +234,7 @@ def generate_toml(
             value = default
             if is_ml and not isinstance(value, mlstr):
                 value = mlstr(value)
-            _emit_assignment(lines, name, format_value(value), commented=True)
+            _emit_assignment(lines, name, _format_for_toml(value), commented=True)
 
     return '\n'.join(lines) + '\n'
 
@@ -267,31 +308,54 @@ def _parse_existing(config_path: Path, config_cls: type) -> tuple[dict, str]:
 
     field_names = {f.name for f in dataclasses.fields(cast(Any, config_cls))}
 
+    # Field-typed values are kept; non-field keys (typically TOML section
+    # headers like ``[binance]``) are left out and preserved verbatim via
+    # :func:`_extract_extra_sections`. Dict-typed user values (e.g.
+    # ``symbol_map = {...}``) are accepted only when the key matches a
+    # known dataclass field.
     user_values: dict = {}
     for key, value in parsed.items():
-        if key in field_names and not isinstance(value, dict):
+        if key in field_names:
             user_values[key] = value
 
-    extra_content = _extract_extra_sections(content)
+    extra_content = _extract_extra_sections(content, field_names)
 
     return user_values, extra_content
 
 
-def _extract_extra_sections(content: str) -> str:
+def _extract_extra_sections(content: str, field_names: set[str] | None = None) -> str:
     """
     Extract raw text of TOML table sections from file content.
 
-    Everything from the first ``[section]`` header to end of file is returned.
+    Walks the file from top to bottom and keeps every ``[section]`` block
+    whose header does not match a known dataclass field. Field-matching
+    table sections (e.g. ``[symbol_map]``) are filtered out so the
+    self-healing writer does not re-emit them alongside the inline-table
+    form already produced by :func:`generate_toml`.
 
     :param content: Raw file content.
+    :param field_names: Known dataclass field names whose sections should
+                        be dropped from the extras. ``None`` keeps every
+                        section (legacy behaviour).
     :return: Raw text of extra sections, or empty string.
     """
     lines = content.splitlines()
-    for i, line in enumerate(lines):
+    out: list[str] = []
+    skipping = False
+    for line in lines:
         stripped = line.strip()
         if stripped.startswith('[') and not stripped.startswith('#'):
-            return '\n'.join(lines[i:])
-    return ""
+            # New section header — decide whether to keep or drop.
+            header = stripped.strip('[]').split('.', 1)[0]
+            skipping = field_names is not None and header in field_names
+            if not skipping:
+                out.append(line)
+            continue
+        if not skipping:
+            # Only start capturing once we've seen the first kept header.
+            if out:
+                out.append(line)
+    return '\n'.join(out)
 
 
 def _create_instance(config_cls: type, user_values: dict | None):

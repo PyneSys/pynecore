@@ -798,32 +798,79 @@ def run(
                 assert provider_data.parsed_string.timeframe is not None
                 size = 0
 
-            # Parse security data mappings
-            security_data: dict[str, str | Path] | None = None
+            # Parse security data mappings. Two strict modes:
+            #
+            #   --live: value is a plugin-native symbol that the chart
+            #           provider can serve (e.g. ``EURUSD`` on Capital.com).
+            #           The security subprocess opens its own provider,
+            #           downloads warmup in-memory, and streams live —
+            #           no ``.ohlcv`` file is involved.
+            #
+            #   backtest: value is a static ``.ohlcv`` file (as before).
+            #
+            # Cross-mode values are rejected so a silent mismatch can't
+            # produce wrong results.
+            from pynecore.core.plugin.live_provider import PluginSymbol
+            security_data: dict[str, str | Path | PluginSymbol] | None = None
             if security:
-                sec_map: dict[str, str | Path] = {}
+                sec_map: dict[str, str | Path | PluginSymbol] = {}
                 for entry in security:
                     if '=' not in entry:
                         secho(
                             f"Invalid --security format: '{entry}'. "
-                            f"Expected 'TIMEFRAME=data_name' or 'SYMBOL:TIMEFRAME=data_name'",
+                            f"Expected 'TIMEFRAME=value' or 'SYMBOL:TIMEFRAME=value'",
                             fg="red", err=True,
                         )
                         raise Exit(1)
                     key, value = entry.split('=', 1)
-                    sec_path = Path(value)
-                    if len(sec_path.parts) == 1:
-                        sec_path = app_state.data_dir / sec_path
-                    if sec_path.suffix:
-                        sec_path = sec_path.with_suffix('')
-                    ohlcv_check = sec_path.with_suffix('.ohlcv')
-                    if not ohlcv_check.exists():
-                        secho(
-                            f"Security data not found: {ohlcv_check}",
-                            fg="red", err=True,
+
+                    if live:
+                        # Live mode: value must be a plugin-native symbol,
+                        # not a file path. Native symbols can contain ``/``
+                        # (e.g. CCXT ``binance:ETH/USDT`` or ``BTC/USDT:USDT``),
+                        # so only reject values that *look* like a path: start
+                        # with a path separator/relative prefix or carry the
+                        # ``.ohlcv`` extension.
+                        looks_like_path = (
+                            value.startswith(('/', './', '../', '~/'))
+                            or value.endswith('.ohlcv')
                         )
-                        raise Exit(1)
-                    sec_map[key] = str(sec_path)
+                        if looks_like_path:
+                            secho(
+                                f"--security value '{value}' looks like a file path. "
+                                f"In --live mode the value must be a plugin-native "
+                                f"symbol (e.g. EURUSD or binance:ETH/USDT).",
+                                fg="red", err=True,
+                            )
+                            raise Exit(1)
+                        # The chart's provider is the one that will serve
+                        # the security warmup + live stream. Derive the
+                        # timeframe from the key: ``SYMBOL:TIMEFRAME`` or
+                        # bare ``TIMEFRAME``.
+                        assert provider_data is not None  # --live already required provider mode
+                        sec_tf = key.rsplit(':', 1)[-1] if ':' in key else key
+                        sec_map[key] = PluginSymbol(
+                            provider_name=provider_data.parsed_string.provider,
+                            symbol=value,
+                            timeframe=sec_tf,
+                            config=getattr(provider_data.provider_instance, 'config', None),
+                            ohlcv_dir=app_state.data_dir,
+                        )
+                    else:
+                        # Backtest mode: value is a file stem or path.
+                        sec_path = Path(value)
+                        if len(sec_path.parts) == 1:
+                            sec_path = app_state.data_dir / sec_path
+                        if sec_path.suffix:
+                            sec_path = sec_path.with_suffix('')
+                        ohlcv_check = sec_path.with_suffix('.ohlcv')
+                        if not ohlcv_check.exists():
+                            secho(
+                                f"Security data not found: {ohlcv_check}",
+                                fg="red", err=True,
+                            )
+                            raise Exit(1)
+                        sec_map[key] = str(sec_path)
                 security_data = sec_map
 
             # Add lib directory to Python path for library imports
@@ -847,7 +894,16 @@ def run(
                 loading_task = loading_progress.add_task("Loading PyneCore...", total=1)
 
                 try:
-                    # Create script runner (this is where the import happens)
+                    # Create script runner (this is where the import happens).
+                    # In live mode we pass the chart provider so security
+                    # contexts without an explicit ``--security`` mapping can
+                    # be auto-translated through the plugin's ``symbol_map``
+                    # / ``normalize_symbol``.
+                    chart_provider_name = None
+                    chart_provider_instance = None
+                    if live and provider_data is not None:
+                        chart_provider_name = provider_data.parsed_string.provider
+                        chart_provider_instance = provider_data.provider_instance
                     runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                           security_data=security_data,
@@ -855,7 +911,10 @@ def run(
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
                                           broker_store_ctx=broker_store_ctx,
-                                          log_ohlcv=live and not no_log_ohlcv)
+                                          log_ohlcv=live and not no_log_ohlcv,
+                                          chart_provider_name=chart_provider_name,
+                                          chart_provider_instance=chart_provider_instance,
+                                          time_from=time_from_dt)
                 finally:
                     # Remove lib directory from Python path
                     if lib_path_added:

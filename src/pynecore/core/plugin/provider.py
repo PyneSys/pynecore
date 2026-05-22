@@ -109,6 +109,52 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         """
         return symbol
 
+    def resolve_symbol(self, pine_key: str) -> str:
+        """
+        Translate a Pine-style symbol key to the plugin-native form.
+
+        Live ``request.security()`` calls hand the framework a TradingView-style
+        symbol (e.g. ``"FX:EURUSD"``). This method consults
+        ``config.symbol_map`` first (the per-plugin TOML translation table);
+        if the key is not mapped the default fallback is the identity, i.e.
+        the Pine key is forwarded unchanged on the assumption that the user
+        already wrote a plugin-native symbol.
+
+        ``normalize_symbol`` is deliberately **not** used as the fallback:
+        provider instances bind ``normalize_symbol`` to the chart's own
+        symbol (e.g. CCXT's returns ``self.symbol`` regardless of the
+        argument), so consulting it for a cross-symbol key would silently
+        resolve to the chart symbol and download wrong data.
+
+        Plugins that need real cross-symbol translation should override
+        :meth:`resolve_symbol` directly.
+
+        :param pine_key: Symbol as written in the Pine script.
+        :return: Symbol in the format the plugin's exchange API expects.
+        """
+        sm = getattr(self.config, 'symbol_map', None)
+        if sm and pine_key in sm:
+            return sm[pine_key]
+        return pine_key
+
+    @classmethod
+    def construct_pair_symbol(cls, from_cur: str, to_cur: str) -> str:
+        """
+        Build a Pine-style symbol for a currency pair.
+
+        Used by the auto-spawn rate-source path when a Pine script needs a
+        ``(from_cur, to_cur)`` rate that is not already exposed by the chart
+        or by an explicit ``request.security()`` context. The default
+        concatenation (``"EUR" + "USD" -> "EURUSD"``) matches the most common
+        FX symbol convention; plugins whose API expects a different shape
+        (e.g. ``"EUR-USD"`` or ``"EUR/USD"``) can override.
+
+        The returned key is fed through :meth:`resolve_symbol`, so users can
+        still keep TradingView prefixes (``"FX:EURUSD"``) in their
+        ``symbol_map`` instead of relying on the raw concatenation.
+        """
+        return f"{from_cur}{to_cur}"
+
     def __enter__(self) -> OHLCVWriter:
         assert self.ohlcv_file is not None
         return self.ohlcv_file.open()

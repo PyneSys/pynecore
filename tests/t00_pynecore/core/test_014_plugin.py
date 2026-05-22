@@ -2,9 +2,14 @@
 Tests for the plugin discovery and loading system.
 """
 
+from dataclasses import dataclass
+
 from pynecore.core.plugin import (
     Plugin,
     ProviderPlugin,
+    LiveProviderConfig,
+    LiveProviderPlugin,
+    PluginSymbol,
     CLIPlugin,
     discover_plugins,
     load_plugin,
@@ -79,3 +84,71 @@ def __test_plugin_base_defaults__():
     assert Plugin.plugin_name == ""
     assert CLIPlugin.cli() is None
     assert CLIPlugin.cli_params('run') == []
+
+
+def __test_resolve_symbol_with_map__():
+    """resolve_symbol() consults config.symbol_map first."""
+
+    @dataclass
+    class _Cfg(LiveProviderConfig):
+        pass
+
+    class _StubProvider(ProviderPlugin):
+        Config = _Cfg
+
+        @classmethod
+        def to_tradingview_timeframe(cls, timeframe: str) -> str:
+            return timeframe
+
+        @classmethod
+        def to_exchange_timeframe(cls, timeframe: str) -> str:
+            return timeframe
+
+        def get_list_of_symbols(self, *args, **kwargs):
+            return []
+
+        def update_symbol_info(self):  # type: ignore[override]
+            raise NotImplementedError
+
+        def download_ohlcv(self, time_from, time_to, on_progress=None, limit=None):
+            raise NotImplementedError
+
+        def normalize_symbol(self, symbol: str) -> str:
+            # CCXT-style: returns ``self.symbol`` regardless of input —
+            # i.e. an instance-bound normalizer. The base ``resolve_symbol``
+            # deliberately bypasses this for unmapped keys.
+            return self.symbol or symbol
+
+    cfg = _Cfg(symbol_map={"FX:EURUSD": "EURUSD_NATIVE"})
+    p = _StubProvider(symbol="ANY", timeframe="1D", config=cfg)
+    # Mapped key wins
+    assert p.resolve_symbol("FX:EURUSD") == "EURUSD_NATIVE"
+    # Unmapped key forwards the pine key unchanged — never the instance's
+    # own symbol, which would silently misroute cross-symbol requests.
+    assert p.resolve_symbol("FX:GBPUSD") == "FX:GBPUSD"
+
+
+def __test_plugin_symbol_is_picklable__():
+    """PluginSymbol is a frozen dataclass picklable across spawn."""
+    import pickle
+
+    cfg = LiveProviderConfig(symbol_map={"FX:X": "Y"})
+    ps = PluginSymbol(
+        provider_name="cc",
+        symbol="EURUSD",
+        timeframe="1h",
+        config=cfg,
+    )
+    blob = pickle.dumps(ps)
+    rt = pickle.loads(blob)
+    assert rt == ps
+    assert rt.config.symbol_map == {"FX:X": "Y"}
+
+
+def __test_live_provider_config_default_symbol_map__():
+    """LiveProviderConfig default symbol_map is an empty mutable dict."""
+    a = LiveProviderConfig()
+    b = LiveProviderConfig()
+    # Each instance gets its own dict (default_factory), not a shared one.
+    a.symbol_map["k"] = "v"
+    assert b.symbol_map == {}

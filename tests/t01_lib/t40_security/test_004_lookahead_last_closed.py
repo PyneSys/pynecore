@@ -210,7 +210,7 @@ def __test_cross_symbol_lookahead_on_sec_read_returns_na__(log):
         assert st.na_on_developing is True
         assert st.htf_aggregator is None
 
-        _signal, _write, sec_read, _wait, cleanup = create_chart_protocol(
+        _signal, _write, sec_read, _wait, cleanup, _ = create_chart_protocol(
             states, sync_block, result_blocks=result_blocks,
         )
         try:

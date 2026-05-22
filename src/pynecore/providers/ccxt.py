@@ -6,7 +6,7 @@ from pathlib import Path
 import tomllib
 
 from pynecore.core.plugin import override
-from pynecore.core.plugin.live_provider import LiveProviderPlugin
+from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
 
@@ -32,6 +32,7 @@ _KNOWN_LIMITS = {
 _PYNECORE_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({
     'sandbox',
     'default_type',
+    'symbol_map',
 })
 
 
@@ -40,13 +41,16 @@ def add_space_before_uppercase(s):
 
 
 @dataclass
-class CCXTConfig:
+class CCXTConfig(LiveProviderConfig):
     """CCXT provider configuration.
 
     Fields map to CCXT constructor keyword arguments, so adding a new
     exchange-specific setting is usually as simple as declaring it here
     with the same name CCXT uses — ``vars(config)`` is filtered for
-    truthy values and spread into the CCXT client constructor.
+    truthy values and spread into the CCXT client constructor. Inherits
+    ``symbol_map`` from :class:`LiveProviderConfig` so ``ccxt.toml`` can
+    declare TradingView→native symbol translations for
+    :meth:`ProviderPlugin.resolve_symbol`.
     """
 
     apiKey: str = ""

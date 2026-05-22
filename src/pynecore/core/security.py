@@ -227,10 +227,11 @@ def create_chart_protocol(
     deferred_resolve_fn: 'Callable[[str, str, str | None], None] | None' = None,
     lazy_spawn_fn: 'Callable[[str], None] | None' = None,
     same_context_ids: frozenset[str] = frozenset(),
-    no_process_ids: frozenset[str] = frozenset(),
+    no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, Process] | None' = None,
+    auto_rate_sec_ids: frozenset[str] = frozenset(),
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -252,7 +253,14 @@ def create_chart_protocol(
                           read/wait protocol functions. When provided, blocked waits
                           poll ``proc.is_alive()`` and raise instead of deadlocking
                           if a child dies.
-    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup)
+    :param auto_rate_sec_ids: Hidden ``__auto_rate_*`` sec_ids driving currency
+                              rate sources. No Pine call signals them, so the
+                              chart loop must call ``signal_rate_sources()``
+                              once per bar to advance their subprocess and
+                              refresh the ResultBlock the
+                              :class:`CurrencyRateProvider` reads from.
+    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup,
+              signal_rate_sources)
     """
     readers: dict[str, ResultReader] = {
         sid: ResultReader(sid) for sid in states
@@ -415,6 +423,13 @@ def create_chart_protocol(
             states[sec_id].data_ready.set()
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
+        # ``ignore_invalid_symbol=True`` may downgrade a live security to
+        # ``no-process`` after syminfo prefetch fails — no subprocess is
+        # ever spawned, so ``data_ready`` would never be set and a plain
+        # ``_wait_with_liveness`` would deadlock here. Short-circuit to
+        # ``default`` (Pine ``na``) so the script keeps running.
+        if sec_id in no_process_ids and sec_id not in same_context_ids:
+            return default
         state = states[sec_id]
         _wait_with_liveness(state.data_ready, sec_id, sec_processes)
 
@@ -456,7 +471,37 @@ def create_chart_protocol(
         for r in readers.values():
             r.close()
 
-    return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup
+    def signal_rate_sources():
+        """Advance every auto-spawned rate-source subprocess by one bar.
+
+        No Pine call drives ``__auto_rate_*`` sec_ids (they are synthetic
+        contexts created by ``_autospawn_rate_sources``), so the chart loop
+        is the only place that can tick them forward. Each rate-source
+        subprocess runs the lightweight close-only loop in
+        ``security_process._run_rate_source_loop``: advance → drain
+        newly-closed bars → write the latest close to its ResultBlock → set
+        data_ready. We wait synchronously for data_ready so the rate value
+        :meth:`CurrencyRateProvider._lookup_sec` reads later in the same
+        chart bar reflects the bars closed up to ``chart_time``.
+        """
+        if not auto_rate_sec_ids:
+            return
+        from pynecore import lib
+        # noinspection PyProtectedMember
+        chart_time = lib._time
+        for sec_id in auto_rate_sec_ids:
+            if sec_id in no_process_ids or sec_id not in states:
+                continue
+            state = states[sec_id]
+            sync_block.set_target_time(sec_id, chart_time)
+            state.data_ready.clear()
+            state.advance_event.set()
+            _wait_with_liveness(state.data_ready, sec_id, sec_processes)
+
+    return (
+        __sec_signal__, __sec_write__, __sec_read__, __sec_wait__,
+        cleanup, signal_rate_sources,
+    )
 
 
 def create_security_protocol(
@@ -583,12 +628,15 @@ def setup_security_states(
             else:
                 lookahead_mode = Lookahead.OFF
 
-            # Live HTF transport (closed-bar override for all lookahead modes,
-            # plus developing-bar for ``Lookahead.ON``) requires same-symbol
-            # chart→HTF aggregation. The chart bar OHLCV must belong to the
-            # same instrument as the security; cross-symbol HTF therefore
-            # keeps no aggregator and falls back to the historical (.ohlcv
-            # file) path — adequate for backtests, inert in live mode.
+            # Live HTF transport via the chart's ``HTFAggregator`` (closed-bar
+            # override for all lookahead modes, plus developing-bar for
+            # ``Lookahead.ON``) requires same-symbol chart→HTF aggregation.
+            # The chart bar OHLCV must belong to the same instrument as the
+            # security, so cross-symbol HTF keeps no aggregator: in backtest
+            # it reads from the security's own ``.ohlcv`` file; in live mode
+            # the security subprocess drives its own provider (warmup
+            # download + WS stream) so the cross-symbol context advances on
+            # real feed bars instead of staying inert.
             if not same_tf and resampler is not None:
                 sym = ctx.get('symbol')
                 is_same_symbol = (
