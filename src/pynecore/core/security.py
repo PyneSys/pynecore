@@ -67,6 +67,15 @@ class Lookahead(Enum):
         in both modes because ``close[1]`` is always the previously
         closed bar regardless of whether ``close[0]`` is developing or
         the same closed bar.
+
+        **Cross-symbol HTF** — when the security symbol differs from the
+        chart symbol there is no chart-side aggregator (the chart OHLCV
+        is the wrong instrument). The chart-side read returns ``na`` while
+        an HTF period is open (``na_on_developing``); at the period
+        boundary the chart receives the just-closed cross-symbol HTF
+        close, and the TV ``request.security(..., lookahead_on)[1]``
+        idiom continues to deliver that value on the next chart bar.
+        Behaviour is identical in historical and live mode.
     """
     OFF = auto()
     LAST_CLOSED = auto()
@@ -143,6 +152,16 @@ class SecurityState:
     # and cross-symbol HTF (chart-derived OHLCV would be the wrong instrument).
     htf_aggregator: HTFAggregator | None = None
 
+    # Cross-symbol HTF + ``Lookahead.ON``: the containing developing bar
+    # cannot be aggregated (chart OHLCV is the wrong instrument), so the
+    # chart-side read returns ``na`` on every chart bar inside an open HTF
+    # period. The subprocess still advances on HTF period closes, so
+    # ``close[1]`` on the first chart bar of a fresh HTF period returns the
+    # just-closed cross-symbol HTF close — the TV ``lookahead_on + close[1]``
+    # idiom continues to work. Applies in both historical and live mode;
+    # backtest never silently emits a value live could not produce.
+    na_on_developing: bool = False
+
     # True once the ScriptRunner enters live mode (``barstate.ishistory=False``).
     # Chart-side ``__sec_signal__`` consults this to gate the developing-bar
     # transport — historical bars never emit developing OHLCV.
@@ -186,8 +205,13 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     current_period = resampler.get_bar_time(chart_time, state.tz)
     prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
 
-    if state.lookahead is Lookahead.ON and state.is_live:
-        # Live ``lookahead_on``: step into the containing (developing) period.
+    if (state.lookahead is Lookahead.ON and state.is_live
+            and state.htf_aggregator is not None):
+        # Live ``lookahead_on`` with a chart-side aggregator: step into the
+        # containing (developing) period. Cross-symbol HTF has no aggregator
+        # (chart OHLCV is the wrong instrument), so the subprocess keeps
+        # closed-bar semantics instead and the chart-side read returns ``na``
+        # while a period is open (``na_on_developing``).
         return current_period
 
     if current_period != prev_period:
@@ -394,8 +418,14 @@ def create_chart_protocol(
         state = states[sec_id]
         _wait_with_liveness(state.data_ready, sec_id, sec_processes)
 
-        if not state.is_ltf and state.gaps_on and not state.new_period:
-            return default
+        if not state.is_ltf and not state.new_period:
+            # gaps_on emits ``na`` between HTF closes (Pine semantics).
+            # na_on_developing emits ``na`` while inside an open cross-symbol
+            # HTF period when lookahead_on is requested (developing bar cannot
+            # be aggregated). Both share the same shape: ``na`` whenever the
+            # chart bar is not opening a fresh HTF period.
+            if state.gaps_on or state.na_on_developing:
+                return default
 
         with state.result_lock:
             result = readers[sec_id].read(sync_block, default)
@@ -533,6 +563,7 @@ def setup_security_states(
         is_ltf = bool(ctx.get('is_ltf', False))
 
         htf_aggregator: HTFAggregator | None = None
+        na_on_developing = False
         if is_ltf:
             is_gaps_on = False
             same_tf = False
@@ -567,6 +598,16 @@ def setup_security_states(
                 )
                 if is_same_symbol:
                     htf_aggregator = HTFAggregator(timeframe, tz)
+                elif lookahead_mode is Lookahead.ON:
+                    # Cross-symbol HTF + lookahead_on: developing bar cannot
+                    # be aggregated from chart OHLCV (wrong instrument). The
+                    # subprocess still advances on closed cross-symbol HTF
+                    # bars, but the chart-side read returns ``na`` on every
+                    # chart bar inside an open HTF period — backtest never
+                    # silently exposes a value live could not produce, and
+                    # the ``close[1]`` idiom keeps working at the period
+                    # boundary.
+                    na_on_developing = True
 
         state = SecurityState(
             sec_id=sec_id,
@@ -578,6 +619,7 @@ def setup_security_states(
             is_ltf=is_ltf,
             lookahead=lookahead_mode,
             htf_aggregator=htf_aggregator,
+            na_on_developing=na_on_developing,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()

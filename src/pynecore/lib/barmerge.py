@@ -39,11 +39,13 @@ scripts; ``lookahead_last_closed`` is a PyneSys-native alternative.
   backtests never expose a developing close.
 
 Cross-symbol HTF ``lookahead_*`` in live mode is bounded by chart-symbol
-aggregation: only same-symbol HTF contexts get the live HTF transport.
-Cross-symbol HTF falls back to the static ``.ohlcv`` file (adequate for
-historical/backtest, inert in live). Cross-symbol HTF ``lookahead_on``
-specifically raises ``NotImplementedError`` at startup because the developing
-phase would deliver wrong-instrument OHLCV.
+aggregation: only same-symbol HTF contexts get the live HTF transport. Cross-symbol
+HTF ``lookahead_off`` / ``lookahead_last_closed`` read closed bars from the
+security's own data feed. Cross-symbol HTF ``lookahead_on`` returns ``na`` for
+the current chart bar inside an open HTF period (the developing bar cannot be
+aggregated from the wrong instrument); ``close[1]`` at the period boundary
+still delivers the just-closed cross-symbol HTF close, preserving the TV
+``lookahead_on + close[1]`` idiom.
 """
 from ..types.barmerge import BarMerge
 

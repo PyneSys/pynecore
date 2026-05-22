@@ -173,7 +173,7 @@ security_data = {
 | `barmerge.gaps_on`               | supported | Returns `na` between periods                                                     |
 | `barmerge.lookahead_off`         | supported | Most recently closed bar — historical + live (same-symbol HTF in live)           |
 | `barmerge.lookahead_last_closed` | supported | PyneSys-native synonym for "last closed"; identical transport to `lookahead_off` |
-| `barmerge.lookahead_on`          | supported | TV-compatible; live mode steps into developing HTF bar (same-symbol HTF only)    |
+| `barmerge.lookahead_on`          | supported | Same-symbol HTF: TV-compatible (live steps into developing HTF bar). Cross-symbol HTF: `close[0]` is `na` inside an open HTF period, `close[1]` at boundary delivers just-closed bar |
 | `ignore_invalid_symbol`          | supported | Returns `na` for missing symbols                                                 |
 | `currency` parameter             | supported | Auto-converts result using `CurrencyRateProvider`                                |
 
@@ -232,15 +232,20 @@ last-closed value (since `close[1]` is always the previously closed bar). In liv
 subprocess additionally steps into the developing bar so `close[0]` exposes the in-progress
 close as TV does.
 
-**Cross-symbol HTF in live mode** — the chart-side `HTFAggregator` aggregates the *chart*
-symbol's OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF
-contexts therefore keep no aggregator and fall back to the static `.ohlcv` file path —
-adequate for historical/backtest, inert in live mode (the security context simply does not
-advance). For `lookahead_on` specifically this is a hard error (`script_runner.py` raises
-`NotImplementedError` at startup) because the developing-bar phase would deliver
-wrong-instrument OHLCV. For `lookahead_off` / `lookahead_last_closed` it degrades silently —
-if you need live cross-symbol HTF, run that context as a separate same-symbol chart or
-provide a live-updating OHLCV source for the security itself.
+**Cross-symbol HTF** — the chart-side `HTFAggregator` aggregates the *chart* symbol's
+OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF
+contexts therefore keep no aggregator and read closed bars directly from the
+security's own `.ohlcv` (historical) or live feed.
+
+* `lookahead_off` / `lookahead_last_closed` — closed-bar semantics, identical to
+  same-symbol behaviour. Repaint-free.
+* `lookahead_on` — the containing developing bar is **unknown** (cannot be aggregated
+  from the wrong instrument). Chart-side `__sec_read__` returns `na` for every chart
+  bar inside an open HTF period; the subprocess still advances on closed cross-symbol
+  HTF bars, so `close[1]` on the first chart bar of a fresh HTF period delivers the
+  just-closed cross-symbol HTF close. The TV `lookahead_on + close[1]` idiom continues
+  to work at the period boundary. Behaviour is identical in historical and live mode —
+  the backtest never silently emits a value live could not produce.
 
 ```python
 # Default — most recently closed bar
@@ -262,12 +267,14 @@ htf_close_prev = lib.request.security(
 
 ## Limitations
 
-- **Cross-symbol HTF in live mode** — the live HTF transport aggregates chart OHLCV, so it
+- **Cross-symbol HTF** — the live HTF transport aggregates chart OHLCV, so it
   works only when the security symbol matches the chart symbol. Cross-symbol HTF
-  `lookahead_on` raises `NotImplementedError` at startup; cross-symbol HTF
-  `lookahead_off` / `lookahead_last_closed` falls back to the static `.ohlcv` file (live
-  ticks do not advance the security context). For live cross-symbol HTF analysis, run that
-  context as a separate same-symbol chart.
+  `lookahead_off` / `lookahead_last_closed` deliver closed bars from the security's own
+  `.ohlcv` / live feed. Cross-symbol HTF `lookahead_on` returns `na` for the current
+  chart bar inside any open HTF period (the developing bar cannot be aggregated
+  cross-instrument); `close[1]` at the period boundary still delivers the just-closed
+  cross-symbol HTF close, preserving the TV idiom. For continuous developing-bar
+  coverage of a cross-symbol HTF, run that context as a separate same-symbol chart.
 - **Standalone mode** — `python script.py data.csv` does not support `--security` yet.
   Use `pyne run` or the ScriptRunner API.
 

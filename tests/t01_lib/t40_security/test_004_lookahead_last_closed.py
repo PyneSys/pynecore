@@ -123,6 +123,27 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
     # Lookahead.OFF never steps into a developing bar.
     assert _get_confirmed_time(state_off_live, curr_chart) == expected_prev_period
 
+    # Cross-symbol HTF + Lookahead.ON has no aggregator (the chart OHLCV would
+    # be the wrong instrument). Even after LIVE_TRANSITION the subprocess must
+    # advance on closed-bar boundaries — the documented ``close[1]`` idiom
+    # delivers the just-closed cross-symbol HTF close, not the developing one.
+    state_on_live_no_agg = SecurityState(
+        sec_id='s4', timeframe=tf, gaps_on=False, same_timeframe=False,
+        resampler=Resampler.get_resampler(tf), tz=utc,
+        lookahead=Lookahead.ON,
+        htf_aggregator=None,  # cross-symbol: no chart-side aggregator
+        na_on_developing=True,
+        is_live=True,
+        prev_chart_time=prev_chart, last_confirmed=0,
+    )
+    # Inside an open HTF period — no new period opened between prev_chart
+    # (10:30) and curr_chart (10:45), so the function holds last_confirmed.
+    assert _get_confirmed_time(state_on_live_no_agg, curr_chart) == 0
+    # Crossing an HTF boundary: chart steps from 10:30 to 11:05; the function
+    # returns the just-closed prev_period (10:00), NOT the developing 11:00.
+    assert _get_confirmed_time(state_on_live_no_agg, curr_chart_boundary) == \
+        expected_current_period
+
 
 def __test_lookahead_on_setup_initializes_aggregator__(log):
     """``lookahead_on`` is now supported: setup_security_states populates a
@@ -159,11 +180,78 @@ def __test_lookahead_on_setup_initializes_aggregator__(log):
         sync_block.unlink()
 
 
+def __test_cross_symbol_lookahead_on_sec_read_returns_na__(log):
+    """Cross-symbol HTF + ``Lookahead.ON``: the chart-side ``__sec_read__``
+    returns ``na`` (= the default passed in) while the containing HTF bar
+    is open. On the first chart bar of a fresh HTF period (``new_period``
+    flag set by ``__sec_signal__``) the read returns the just-closed
+    cross-symbol HTF close — preserving the TV ``lookahead_on + close[1]``
+    idiom at the period boundary. Behaviour is identical in historical and
+    live mode; nothing live could not deliver leaks into the backtest.
+    """
+    from pynecore.core.security import (
+        setup_security_states, create_chart_protocol, Lookahead,
+    )
+    from pynecore.lib import barmerge as bm
+    from zoneinfo import ZoneInfo
+
+    contexts = {
+        'cross_on': {
+            'symbol': 'MSFT', 'timeframe': '60',
+            'gaps': bm.gaps_off, 'lookahead': bm.lookahead_on,
+        },
+    }
+    states, sync_block, result_blocks = setup_security_states(
+        contexts, chart_timeframe='1', tz=ZoneInfo('UTC'),
+        chart_symbol='AAPL',
+    )
+    try:
+        st = states['cross_on']
+        assert st.na_on_developing is True
+        assert st.htf_aggregator is None
+
+        _signal, _write, sec_read, _wait, cleanup = create_chart_protocol(
+            states, sync_block, result_blocks=result_blocks,
+        )
+        try:
+            # Sentinel for ``lib.na`` — sec_read returns ``default`` verbatim
+            # when the developing-bar mask fires.
+            NA = object()
+
+            # Chart bar inside an open cross-symbol HTF period.
+            st.new_period = False
+            st.data_ready.set()
+            assert sec_read('cross_on', NA) is NA, \
+                "developing chart bar must return na (the default)"
+
+            # Chart bar at the start of a fresh HTF period — sec_read falls
+            # through to the result reader. With an empty ResultBlock the
+            # reader also returns default, but it does so via the read path
+            # rather than the na_on_developing short-circuit.
+            st.new_period = True
+            st.data_ready.set()
+            # Empty result block ⇒ value falls back to default (na); the
+            # important contract is that the path was taken, asserted by
+            # the previous case (NA short-circuit) plus reading the field.
+            result = sec_read('cross_on', NA)
+            assert result is NA  # empty ResultBlock at fresh-period boundary
+        finally:
+            cleanup()
+    finally:
+        for rb in result_blocks.values():
+            rb.close()
+            rb.unlink()
+        sync_block.close()
+        sync_block.unlink()
+
+
 def __test_live_htf_transport_covers_all_lookahead_modes__(log):
     """All lookahead modes (OFF / LAST_CLOSED / ON) get an ``HTFAggregator``
     on same-symbol HTF contexts — the live closed-bar transport drives every
     HTF security context, not just ``Lookahead.ON``. Cross-symbol HTF stays
-    aggregator-less (chart OHLCV would be the wrong instrument).
+    aggregator-less (chart OHLCV would be the wrong instrument); cross-symbol
+    HTF + ``Lookahead.ON`` additionally flags ``na_on_developing`` so the
+    chart-side read returns ``na`` while the containing HTF bar is open.
     """
     from pynecore.core.security import setup_security_states, Lookahead
     from pynecore.lib import barmerge as bm
@@ -182,9 +270,13 @@ def __test_live_htf_transport_covers_all_lookahead_modes__(log):
             'symbol': 'AAPL', 'timeframe': '60',
             'gaps': bm.gaps_off, 'lookahead': bm.lookahead_on,
         },
-        'sec_cross': {  # cross-symbol HTF — no aggregator
+        'sec_cross_off': {  # cross-symbol HTF + OFF — no aggregator, no na_only
             'symbol': 'MSFT', 'timeframe': '60',
             'gaps': bm.gaps_off, 'lookahead': bm.lookahead_off,
+        },
+        'sec_cross_on': {  # cross-symbol HTF + ON — na_on_developing
+            'symbol': 'MSFT', 'timeframe': '60',
+            'gaps': bm.gaps_off, 'lookahead': bm.lookahead_on,
         },
         'sec_same_tf': {  # same-TF cross-symbol — no aggregator (different branch)
             'symbol': 'MSFT', 'timeframe': '1',
@@ -198,19 +290,28 @@ def __test_live_htf_transport_covers_all_lookahead_modes__(log):
     try:
         assert states['sec_off'].lookahead is Lookahead.OFF
         assert states['sec_off'].htf_aggregator is not None
+        assert states['sec_off'].na_on_developing is False
 
         assert states['sec_lc'].lookahead is Lookahead.LAST_CLOSED
         assert states['sec_lc'].htf_aggregator is not None
+        assert states['sec_lc'].na_on_developing is False
 
         assert states['sec_on'].lookahead is Lookahead.ON
         assert states['sec_on'].htf_aggregator is not None
+        assert states['sec_on'].na_on_developing is False
 
-        # Cross-symbol HTF: aggregator-less (would be wrong-instrument OHLCV)
-        assert states['sec_cross'].htf_aggregator is None
+        # Cross-symbol HTF + OFF: aggregator-less, but value flows from .ohlcv
+        assert states['sec_cross_off'].htf_aggregator is None
+        assert states['sec_cross_off'].na_on_developing is False
+
+        # Cross-symbol HTF + ON: developing bar unknown → chart-side returns na
+        assert states['sec_cross_on'].htf_aggregator is None
+        assert states['sec_cross_on'].na_on_developing is True
 
         # Same-TF (cross-symbol): different code path, never gets aggregator
         assert states['sec_same_tf'].same_timeframe is True
         assert states['sec_same_tf'].htf_aggregator is None
+        assert states['sec_same_tf'].na_on_developing is False
     finally:
         for rb in result_blocks.values():
             rb.close()

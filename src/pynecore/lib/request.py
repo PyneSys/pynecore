@@ -29,14 +29,17 @@ def security(*args, **kwargs):
       "last closed" in any mode. Functionally identical to
       ``lookahead_off`` in PyneCore; prefer it when "last closed" is the
       explicit intent (no reliance on the TV ``close[1]`` idiom).
-    - ``barmerge.lookahead_on``: TV-compatible. In live mode the security
-      context steps into the containing (developing) HTF bar with
-      ``barstate.isconfirmed=False`` and OHLCV aggregated from the chart
-      timeframe. In historical mode it falls back to closed-only semantics
-      (equivalent to ``lookahead_off``) — historical backtests never
-      expose a developing security close. Cross-symbol HTF
-      ``lookahead_on`` is not supported (the chart-derived developing
-      OHLCV would be the wrong instrument).
+    - ``barmerge.lookahead_on``: TV-compatible. Same-symbol HTF: in live
+      mode the security context steps into the containing (developing) HTF
+      bar with ``barstate.isconfirmed=False`` and OHLCV aggregated from the
+      chart timeframe; in historical mode it falls back to closed-only
+      semantics (equivalent to ``lookahead_off``) — historical backtests
+      never expose a developing security close. Cross-symbol HTF: the
+      developing bar cannot be aggregated (wrong instrument), so the chart
+      bar inside an open HTF period reads as ``na``. ``close[1]`` at the
+      period boundary still delivers the just-closed cross-symbol HTF
+      close, so the TV ``lookahead_on + close[1]`` idiom continues to
+      work. Same behaviour in historical and live mode.
 
     This function exists for IDE support only. In compiled scripts, the
     SecurityTransformer rewrites all calls into the signal/write/read
