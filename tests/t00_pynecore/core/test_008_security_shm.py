@@ -324,6 +324,59 @@ def __test_concurrent_lock_protects_cross_context__(log):
         sb.unlink()
 
 
+def __test_developing_bar_roundtrip__(log):
+    """SyncBlock developing-bar slot writes and reads back exactly."""
+    from pynecore.core.security_shm import FLAG_IS_DEVELOPING
+
+    sec_ids = ["sec_0", "sec_1"]
+    sb = SyncBlock(sec_ids)
+    try:
+        # Defaults: all zeros
+        o, h, l, c, v, t = sb.get_developing_bar("sec_0")
+        assert (o, h, l, c, v, t) == (0.0, 0.0, 0.0, 0.0, 0.0, 0)
+
+        sb.set_developing_bar(
+            "sec_0",
+            dev_open=1.1, dev_high=1.5, dev_low=1.0,
+            dev_close=1.3, dev_volume=12345.0, dev_time=1_700_000_000_000,
+        )
+        sb.set_flags("sec_0", FLAG_IS_DEVELOPING)
+
+        o, h, l, c, v, t = sb.get_developing_bar("sec_0")
+        assert (o, h, l, c) == (1.1, 1.5, 1.0, 1.3)
+        assert v == 12345.0
+        assert t == 1_700_000_000_000
+        assert sb.get_flags("sec_0") == FLAG_IS_DEVELOPING
+
+        # Other slot is independent
+        o2, h2, l2, c2, v2, t2 = sb.get_developing_bar("sec_1")
+        assert (o2, h2, l2, c2, v2, t2) == (0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        assert sb.get_flags("sec_1") == 0
+    finally:
+        sb.close()
+        sb.unlink()
+
+
+def __test_developing_bar_does_not_alias_target_time__(log):
+    """Writing developing-bar fields must not clobber target_time / result meta."""
+    sec_ids = ["sec_0"]
+    sb = SyncBlock(sec_ids)
+    try:
+        sb.set_target_time("sec_0", 9_999_999)
+        sb.set_result_meta("sec_0", version=7, result_size=123)
+        sb.set_developing_bar(
+            "sec_0",
+            dev_open=2.0, dev_high=3.0, dev_low=1.0,
+            dev_close=2.5, dev_volume=100.0, dev_time=42,
+        )
+        assert sb.get_target_time("sec_0") == 9_999_999
+        ver, sz = sb.get_result_meta("sec_0")
+        assert (ver, sz) == (7, 123)
+    finally:
+        sb.close()
+        sb.unlink()
+
+
 def __test_multiple_slots_independent__(log):
     """Multiple security slots are independent in the SyncBlock"""
     sec_ids = ["sec_0", "sec_1", "sec_2"]

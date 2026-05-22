@@ -628,3 +628,122 @@ def main():
 """
         with pytest.raises(SyntaxError, match=f"strategy.{attr}"):
             _transform(source)
+
+
+def __test_lookahead_last_closed_kwarg_stored__(log):
+    """`lookahead=barmerge.lookahead_last_closed` is parsed and stored in ctx."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lookahead=lib.barmerge.lookahead_last_closed,
+    )
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    assert 'lookahead' in ctx_keys
+
+    la_idx = ctx_keys.index('lookahead')
+    la_val = ctx_dict.values[la_idx]
+    assert isinstance(la_val, ast.Attribute)
+    assert la_val.attr == 'lookahead_last_closed'
+    assert la_val.value.attr == 'barmerge'
+
+
+def __test_lookahead_positional_at_index_4__(log):
+    """Pine v6 positional order: lookahead is the 5th positional argument."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lib.barmerge.gaps_off,
+        lib.barmerge.lookahead_last_closed,
+    )
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    assert 'lookahead' in ctx_keys
+
+    la_idx = ctx_keys.index('lookahead')
+    la_val = ctx_dict.values[la_idx]
+    assert la_val.attr == 'lookahead_last_closed'
+
+
+def __test_lookahead_omitted_no_ctx_key__(log):
+    """Omitting lookahead leaves no 'lookahead' key in ctx (runtime defaults to off)."""
+    source = """
+def main():
+    val = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    assert 'lookahead' not in ctx_keys
+
+
+def __test_lookahead_on_kwarg_stored__(log):
+    """`lookahead=barmerge.lookahead_on` is parsed and stored in ctx."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lookahead=lib.barmerge.lookahead_on,
+    )
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    assert 'lookahead' in ctx_keys
+
+    la_idx = ctx_keys.index('lookahead')
+    la_val = ctx_dict.values[la_idx]
+    assert isinstance(la_val, ast.Attribute)
+    assert la_val.attr == 'lookahead_on'
+    assert la_val.value.attr == 'barmerge'
+
+
+def __test_lookahead_on_positional_stored__(log):
+    """Positional `lookahead_on` at the 5th arg slot is parsed."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lib.barmerge.gaps_off,
+        lib.barmerge.lookahead_on,
+    )
+"""
+    tree = _transform_tree(source)
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    assert 'lookahead' in ctx_keys
+
+    la_idx = ctx_keys.index('lookahead')
+    la_val = ctx_dict.values[la_idx]
+    assert la_val.attr == 'lookahead_on'
+
+
+def __test_lookahead_runtime_expr_rejected__(log):
+    """Runtime `lookahead` expressions are rejected at transform time.
+
+    Pine requires ``lookahead`` to be a ``barmerge.lookahead_*`` constant.
+    A local variable or IfExp would be inlined into the module-level
+    ``__security_contexts__`` literal and NameError at import time, so the
+    transformer raises a clear SyntaxError instead.
+    """
+    source = """
+def main():
+    mode = lib.barmerge.lookahead_on if cond else lib.barmerge.lookahead_off
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lookahead=mode,
+    )
+"""
+    with pytest.raises(SyntaxError, match="must be a constant"):
+        _transform(source)

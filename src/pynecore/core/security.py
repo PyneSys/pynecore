@@ -13,11 +13,13 @@ Architecture:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from multiprocessing import Event, Lock
 from typing import TYPE_CHECKING
 
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
+    FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
     write_result,
 )
 
@@ -27,6 +29,48 @@ if TYPE_CHECKING:
     from typing import Callable
     from zoneinfo import ZoneInfo
     from .resampler import Resampler
+    from .htf_aggregator import HTFAggregator
+
+
+class Lookahead(Enum):
+    """Lookahead mode for a security context.
+
+    OFF
+        TV-faithful default. The security context advances only to the bar
+        that has CLOSED at or before the chart bar's time. In historical
+        mode this matches TradingView's ``barmerge.lookahead_off`` exactly.
+        In live mode the chart-side ``HTFAggregator`` ships each freshly
+        closed HTF bar to the subprocess via the SyncBlock (the static
+        ``.ohlcv`` file cannot grow at runtime), so the security series
+        advances on every HTF period close — no developing-bar exposure.
+
+    LAST_CLOSED
+        PyneSys-native, repaint-free alternative. Always returns the most
+        recently closed security bar. In historical mode it is functionally
+        equivalent to ``OFF``; in live mode it uses the same closed-bar
+        transport as ``OFF`` (no developing exposure) and remains
+        repaint-free. Recommended for non-charting backtests when the TV
+        ``close[1]`` idiom is not desired.
+
+    ON
+        TV ``lookahead_on`` semantics — the security context steps into
+        the bar that *contains* the chart bar's time. In live mode the
+        bar runs with ``barstate.isconfirmed=False`` and OHLCV aggregated
+        from the chart timeframe by ``HTFAggregator``; on HTF period
+        boundaries the closed bar is delivered first (snapshot saved),
+        then the fresh developing bar. In historical mode there is no
+        chart-derived developing OHLCV, so ``_get_confirmed_time`` falls
+        back to ``OFF`` semantics (most recently closed bar) — historical
+        backtests therefore never expose a developing security close,
+        avoiding TV's classical historical future-leak. The TV idiom
+        ``request.security(..., lookahead_on)[1]`` remains TV-compatible
+        in both modes because ``close[1]`` is always the previously
+        closed bar regardless of whether ``close[0]`` is developing or
+        the same closed bar.
+    """
+    OFF = auto()
+    LAST_CLOSED = auto()
+    ON = auto()
 
 
 # Liveness poll interval for security-process waits. Short enough to detect a
@@ -87,6 +131,23 @@ class SecurityState:
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
 
+    # Lookahead mode (Pine `lookahead=barmerge.lookahead_*`). Drives whether
+    # the security process should emit a ghost-bar write step on chart bars
+    # that fall inside an unclosed HTF period.
+    lookahead: Lookahead = Lookahead.OFF
+
+    # Per-sec_id HTF aggregator (chart-side). Populated by
+    # ``setup_security_states`` for every same-symbol HTF context — drives
+    # the live-mode closed-bar transport (all lookahead modes) and, for
+    # ``Lookahead.ON``, the developing-bar transport. None for same-TF, LTF,
+    # and cross-symbol HTF (chart-derived OHLCV would be the wrong instrument).
+    htf_aggregator: HTFAggregator | None = None
+
+    # True once the ScriptRunner enters live mode (``barstate.ishistory=False``).
+    # Chart-side ``__sec_signal__`` consults this to gate the developing-bar
+    # transport — historical bars never emit developing OHLCV.
+    is_live: bool = False
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     prev_chart_time: int | None = None
@@ -96,15 +157,22 @@ class SecurityState:
 
 def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     """
-    Determine which security period is confirmed at the current chart time.
+    Determine which security period the subprocess should advance to.
 
-    For same timeframe: every chart bar is a confirmed bar (return chart_time).
-    For HTF: a period is confirmed only when a NEW period starts — the previous
-    period's opening time is returned (lookahead_off semantics).
+    Same timeframe: every chart bar is itself a confirmed bar (return chart_time).
+
+    HTF:
+      * ``OFF`` / ``LAST_CLOSED``: target is the previously CLOSED period's
+        opening time. The subprocess advances only when a new HTF period opens.
+        Historically these two modes are equivalent.
+      * ``ON``: target is the CONTAINING period's opening time — the subprocess
+        steps into the developing HTF bar (live mode supplies developing OHLCV
+        via the SyncBlock; historical mode falls back to OFF semantics because
+        there is no chart-derived developing OHLCV to feed the subprocess).
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
-    :return: Confirmed time in milliseconds
+    :return: Target time in milliseconds
     """
     if state.same_timeframe:
         return chart_time
@@ -117,6 +185,10 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     assert resampler is not None
     current_period = resampler.get_bar_time(chart_time, state.tz)
     prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
+
+    if state.lookahead is Lookahead.ON and state.is_live:
+        # Live ``lookahead_on``: step into the containing (developing) period.
+        return current_period
 
     if current_period != prev_period:
         # New period started → previous period is now confirmed
@@ -194,19 +266,123 @@ def create_chart_protocol(
             sync_block.set_target_time(sec_id, chart_time)
             state.advance_event.set()
             state.needs_wait = True
-        else:
-            target_time = _get_confirmed_time(state, chart_time)
-            state.prev_chart_time = chart_time
+            return
 
-            if target_time > state.last_confirmed:
-                state.last_confirmed = target_time
-                state.new_period = True
-                state.data_ready.clear()
-                sync_block.set_target_time(sec_id, target_time)
-                state.advance_event.set()
-                state.needs_wait = True
-            else:
-                state.new_period = False
+        # Live HTF transport — the chart aggregates its own OHLCV into the
+        # containing HTF bar via ``HTFAggregator`` and ships it to the
+        # subprocess on the SyncBlock. The static ``.ohlcv`` file cannot
+        # grow at runtime, so this transport is the *only* way for any
+        # lookahead mode to advance an HTF security context live.
+        #
+        # Phase 1 (closed-bar override): every HTF period close pushes the
+        # newly closed OHLCV to the subprocess synchronously. All lookahead
+        # modes use this phase — it is the live equivalent of reading the
+        # next ``.ohlcv`` bar in historical mode.
+        #
+        # Phase 2 (developing bar): only ``Lookahead.ON`` exposes the
+        # in-progress HTF bar with ``barstate.isconfirmed=False``; OFF and
+        # LAST_CLOSED stay repaint-free and skip this phase.
+        #
+        # Seed the aggregator on EVERY chart bar (warmup included). If we
+        # only fed it once ``is_live`` flipped, a live transition that
+        # happens mid-HTF-period would lose all warmup bars belonging to
+        # the in-progress period, and the first developing/closed override
+        # emitted live would carry partial OHLCV (open/high/low/volume
+        # missing the prior chart bars).
+        if state.htf_aggregator is not None:
+            chart_open = float(lib.open)
+            chart_high = float(lib.high)
+            chart_low = float(lib.low)
+            chart_close = float(lib.close)
+            raw_vol = lib.volume
+            chart_volume = 0.0 if raw_vol is None else float(raw_vol)
+
+            _, dev_bar, closed_bar = state.htf_aggregator.update(
+                chart_time, chart_open, chart_high, chart_low,
+                chart_close, chart_volume,
+            )
+
+            if state.is_live:
+                state.prev_chart_time = chart_time
+
+                # Phase 1: synchronously deliver any just-closed HTF bar
+                if closed_bar is not None:
+                    sync_block.set_developing_bar(
+                        sec_id,
+                        closed_bar.open, closed_bar.high, closed_bar.low,
+                        closed_bar.close, closed_bar.volume,
+                        closed_bar.period_start,
+                    )
+                    base_flags = (
+                        sync_block.get_flags(sec_id) & ~FLAG_IS_DEVELOPING
+                    ) | FLAG_CLOSED_OVERRIDE
+                    sync_block.set_flags(sec_id, base_flags)
+                    sync_block.set_target_time(sec_id, closed_bar.period_start)
+                    state.last_confirmed = closed_bar.period_start
+                    state.data_ready.clear()
+                    state.advance_event.set()
+                    # Block until the subprocess finishes processing the closed
+                    # bar (writes result, saves var_snapshot). For ON, this also
+                    # ensures the developing-bar phase below cannot race ahead
+                    # of the closed phase.
+                    _wait_with_liveness(state.done_event, sec_id, sec_processes)
+                    state.done_event.clear()
+
+                # Phase 2: developing bar — only for ``Lookahead.ON``.
+                if state.lookahead is Lookahead.ON:
+                    sync_block.set_developing_bar(
+                        sec_id,
+                        dev_bar.open, dev_bar.high, dev_bar.low,
+                        dev_bar.close, dev_bar.volume, dev_bar.period_start,
+                    )
+                    base_flags = (
+                        sync_block.get_flags(sec_id) & ~FLAG_CLOSED_OVERRIDE
+                    ) | FLAG_IS_DEVELOPING
+                    sync_block.set_flags(sec_id, base_flags)
+                    sync_block.set_target_time(sec_id, dev_bar.period_start)
+                    state.new_period = True
+                    state.data_ready.clear()
+                    state.advance_event.set()
+                    state.needs_wait = True
+                    return
+
+                # OFF / LAST_CLOSED in live mode: closed-bar transport only.
+                # ``new_period`` reflects whether a fresh HTF close just landed
+                # (drives ``gaps_on`` na/value selection in ``__sec_read__``).
+                # We already waited synchronously inside Phase 1, so no further
+                # wait is needed in ``__sec_wait__``.
+                state.new_period = closed_bar is not None
+                state.needs_wait = False
+                # Clear any stale developing flag from a prior ``Lookahead.ON``
+                # session (defensive — same SyncBlock slot).
+                if closed_bar is None:
+                    stale_flags = sync_block.get_flags(sec_id) & ~(
+                        FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                    )
+                    sync_block.set_flags(sec_id, stale_flags)
+                return
+            # Warmup with an HTF aggregator falls through to the closed-only
+            # flow below; the aggregator state has already advanced so the
+            # live transition starts with the correct in-progress HTF bar.
+
+        # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
+        target_time = _get_confirmed_time(state, chart_time)
+        state.prev_chart_time = chart_time
+
+        if target_time > state.last_confirmed:
+            state.last_confirmed = target_time
+            state.new_period = True
+            state.data_ready.clear()
+            # Make sure no stale developing/override flag leaks across modes.
+            stale_flags = sync_block.get_flags(sec_id) & ~(
+                FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+            )
+            sync_block.set_flags(sec_id, stale_flags)
+            sync_block.set_target_time(sec_id, target_time)
+            state.advance_event.set()
+            state.needs_wait = True
+        else:
+            state.new_period = False
 
     def __sec_write__(sec_id: str, value, _scope_id=None):
         if sec_id in same_context_ids and result_blocks is not None:
@@ -326,6 +502,7 @@ def setup_security_states(
     contexts: dict[str, dict],
     chart_timeframe: str,
     tz: 'ZoneInfo',
+    chart_symbol: str | None = None,
 ) -> tuple[dict[str, SecurityState], SyncBlock, dict[str, ResultBlock]]:
     """
     Initialize security states, shared memory, and events from ``__security_contexts__``.
@@ -334,10 +511,17 @@ def setup_security_states(
                      Keys are sec_ids, values are dicts with 'symbol', 'timeframe', 'gaps'.
     :param chart_timeframe: The chart's timeframe string (e.g., "5", "1D").
     :param tz: The chart's timezone.
+    :param chart_symbol: The chart's ticker (e.g. ``"AAPL"``). Drives same-symbol
+                        gating for the live HTF transport — a cross-symbol HTF
+                        context gets no ``HTFAggregator`` because the chart-side
+                        OHLCV would be the wrong instrument. ``None`` (unit-test
+                        / legacy callers without symbol context) is treated as
+                        "every HTF is same-symbol".
     :return: (states, sync_block, result_blocks)
     """
     from pynecore.lib import barmerge
     from .resampler import Resampler
+    from .htf_aggregator import HTFAggregator
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)
@@ -348,15 +532,41 @@ def setup_security_states(
         timeframe = str(ctx.get('timeframe', chart_timeframe))
         is_ltf = bool(ctx.get('is_ltf', False))
 
+        htf_aggregator: HTFAggregator | None = None
         if is_ltf:
             is_gaps_on = False
             same_tf = False
             resampler = None  # chart-side resampler not needed for LTF
+            lookahead_mode = Lookahead.OFF  # LTF has no lookahead concept
         else:
             gaps_val = ctx.get('gaps', barmerge.gaps_off)
             is_gaps_on = gaps_val is barmerge.gaps_on
             same_tf = (timeframe == chart_timeframe)
             resampler = None if same_tf else Resampler.get_resampler(timeframe)
+
+            lookahead_val = ctx.get('lookahead', barmerge.lookahead_off)
+            if lookahead_val is barmerge.lookahead_on:
+                lookahead_mode = Lookahead.ON
+            elif lookahead_val is barmerge.lookahead_last_closed:
+                lookahead_mode = Lookahead.LAST_CLOSED
+            else:
+                lookahead_mode = Lookahead.OFF
+
+            # Live HTF transport (closed-bar override for all lookahead modes,
+            # plus developing-bar for ``Lookahead.ON``) requires same-symbol
+            # chart→HTF aggregation. The chart bar OHLCV must belong to the
+            # same instrument as the security; cross-symbol HTF therefore
+            # keeps no aggregator and falls back to the historical (.ohlcv
+            # file) path — adequate for backtests, inert in live mode.
+            if not same_tf and resampler is not None:
+                sym = ctx.get('symbol')
+                is_same_symbol = (
+                    chart_symbol is None
+                    or sym is None
+                    or str(sym) == chart_symbol
+                )
+                if is_same_symbol:
+                    htf_aggregator = HTFAggregator(timeframe, tz)
 
         state = SecurityState(
             sec_id=sec_id,
@@ -366,6 +576,8 @@ def setup_security_states(
             resampler=resampler,
             tz=tz,
             is_ltf=is_ltf,
+            lookahead=lookahead_mode,
+            htf_aggregator=htf_aggregator,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()

@@ -16,11 +16,31 @@ def security(*args, **kwargs):
     """
     Request data from another symbol/timeframe.
 
-    This function exists for IDE support only. In compiled scripts, the
-    SecurityTransformer rewrites all calls into the signal/write/read protocol
-    at AST level — this function is never called at runtime.
+    Pine v6 positional signature:
+    ``security(symbol, timeframe, expression, gaps, lookahead,
+    ignore_invalid_symbol, currency, ...)``.
 
-    Only ``barmerge.lookahead_off`` is supported (deliberate safety decision).
+    Supported ``lookahead`` modes:
+
+    - ``barmerge.lookahead_off`` (default): closed-only — the security
+      context shows the most recently CLOSED security bar in both
+      historical and live mode. Repaint-free.
+    - ``barmerge.lookahead_last_closed``: PyneSys-native synonym for
+      "last closed" in any mode. Functionally identical to
+      ``lookahead_off`` in PyneCore; prefer it when "last closed" is the
+      explicit intent (no reliance on the TV ``close[1]`` idiom).
+    - ``barmerge.lookahead_on``: TV-compatible. In live mode the security
+      context steps into the containing (developing) HTF bar with
+      ``barstate.isconfirmed=False`` and OHLCV aggregated from the chart
+      timeframe. In historical mode it falls back to closed-only semantics
+      (equivalent to ``lookahead_off``) — historical backtests never
+      expose a developing security close. Cross-symbol HTF
+      ``lookahead_on`` is not supported (the chart-derived developing
+      OHLCV would be the wrong instrument).
+
+    This function exists for IDE support only. In compiled scripts, the
+    SecurityTransformer rewrites all calls into the signal/write/read
+    protocol at AST level — this function is never called at runtime.
     """
     raise RuntimeError(
         "request.security() should not be called directly. "

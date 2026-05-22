@@ -615,7 +615,7 @@ class ScriptRunner:
 
                 from .security import (
                     setup_security_states, create_chart_protocol,
-                    inject_protocol, cleanup_shared_memory,
+                    inject_protocol, cleanup_shared_memory, Lookahead,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -656,8 +656,40 @@ class ScriptRunner:
                 # No-process IDs: both same-context and ignored
                 no_process_ids = frozenset(same_context_ids | ignored_sec_ids)
 
+                # Cross-symbol HTF lookahead_on is unsupported in live mode: the
+                # developing HTF bar is aggregated from chart OHLCV, which would
+                # be a different instrument than the security. Pure backtests
+                # have no developing-bar transport — the security child reads
+                # its own .ohlcv file ahead — so the same context degrades to
+                # the historical lookahead_on semantics there. We therefore
+                # fail fast for any live run (``--live`` with or without a
+                # broker), since ``SecurityState.is_live`` will flip at
+                # LIVE_TRANSITION regardless of whether trading is enabled.
+                if lib._is_live:
+                    from pynecore.lib import barmerge as _bm_check
+                    for _sid, _sctx in sec_contexts.items():
+                        if _sid in same_context_ids or _sid in ignored_sec_ids:
+                            continue
+                        _sym = _sctx.get('symbol')
+                        _tf = str(_sctx.get('timeframe', chart_tf))
+                        _la = _sctx.get('lookahead')
+                        if (_sym is not None
+                                and str(_sym) != chart_ticker
+                                and _tf != chart_tf
+                                and _la is _bm_check.lookahead_on):
+                            raise NotImplementedError(
+                                f"request.security() with lookahead=barmerge.lookahead_on "
+                                f"requires same-symbol HTF in live mode (chart symbol "
+                                f"drives the developing-bar aggregation). Cross-symbol "
+                                f"HTF (symbol={_sym!r} != chart={chart_ticker!r}, "
+                                f"timeframe={_tf!r}) is not supported live. "
+                                f"Use barmerge.lookahead_last_closed for a "
+                                f"repaint-free last-closed bar, or omit lookahead "
+                                f"(defaults to barmerge.lookahead_off)."
+                            )
+
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
-                    sec_contexts, chart_tf, self.tz,
+                    sec_contexts, chart_tf, self.tz, chart_symbol=chart_ticker,
                 )
 
                 all_sec_ids = list(sec_contexts.keys())
@@ -706,6 +738,46 @@ class ScriptRunner:
                     elif sec_state.resampler is None:
                         from .resampler import Resampler
                         sec_state.resampler = Resampler.get_resampler(resolved_tf)
+                    # Now that the real symbol/timeframe are known, decide
+                    # whether the live HTF transport applies. ``setup_security_states``
+                    # built the aggregator under the assumption ``sym is None``
+                    # ⇒ same-symbol; reverse that decision if the resolved symbol
+                    # is cross-symbol, or attach one if the timeframe just
+                    # promoted from chart-TF to HTF.
+                    is_same_symbol = (chart_ticker is None
+                                      or str(symbol) == chart_ticker)
+                    # Cross-symbol HTF lookahead_on cannot be supported live
+                    # (chart-OHLCV aggregation would be wrong-instrument). The
+                    # up-front check at setup time only sees static contexts;
+                    # enforce the same rule once the deferred context resolves.
+                    if (lib._is_live
+                            and not is_same_symbol
+                            and not same_tf
+                            and sec_state.lookahead is Lookahead.ON):
+                        raise NotImplementedError(
+                            f"request.security() with lookahead=barmerge.lookahead_on "
+                            f"requires same-symbol HTF in live mode (chart symbol "
+                            f"drives the developing-bar aggregation). Deferred "
+                            f"context resolved to cross-symbol "
+                            f"(symbol={symbol!r} != chart={chart_ticker!r}, "
+                            f"timeframe={resolved_tf!r}) which is not supported "
+                            f"live. Use barmerge.lookahead_last_closed for a "
+                            f"repaint-free last-closed bar, or omit lookahead "
+                            f"(defaults to barmerge.lookahead_off)."
+                        )
+                    needs_aggregator = (not same_tf) and is_same_symbol
+                    if needs_aggregator and sec_state.htf_aggregator is None:
+                        from .htf_aggregator import HTFAggregator
+                        sec_state.htf_aggregator = HTFAggregator(resolved_tf, self.tz)
+                    elif not needs_aggregator and sec_state.htf_aggregator is not None:
+                        sec_state.htf_aggregator = None
+                    elif (needs_aggregator
+                          and sec_state.htf_aggregator is not None
+                          and sec_state.htf_aggregator.timeframe != resolved_tf):
+                        # Timeframe resolved to something different from the
+                        # placeholder used at setup — rebuild for the right TF.
+                        from .htf_aggregator import HTFAggregator
+                        sec_state.htf_aggregator = HTFAggregator(resolved_tf, self.tz)
                     # Resolve OHLCV path and spawn process
                     resolve_ctx = {'symbol': symbol, 'timeframe': resolved_tf}
                     resolved = self._resolve_security_data({sid: resolve_ctx})
@@ -978,6 +1050,13 @@ class ScriptRunner:
                 barstate.isrealtime = True
                 barstate.islastconfirmedhistory = False
                 lib._strategy_suppressed = False
+
+                # Promote ``request.security()`` contexts into live mode so
+                # ``lookahead_on`` switches to the developing-bar transport
+                # (see ``security.SecurityState.is_live``).
+                if sec_states is not None:
+                    for _sec_state in sec_states.values():
+                        _sec_state.is_live = True
 
                 if self._broker_mode:
                     # ``bar_index`` and ``lib._time`` are still pointing at

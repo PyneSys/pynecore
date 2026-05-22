@@ -97,10 +97,15 @@ class SecurityTransformer(ast.NodeTransformer):
     @staticmethod
     def _extract_args(call: ast.Call) -> tuple[
         ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None,
-        ast.expr | None, ast.expr | None
+        ast.expr | None, ast.expr | None, ast.expr | None
     ]:
-        """Extract (symbol, timeframe, expression, gaps, ignore_invalid_symbol, currency)
-        from request.security() call."""
+        """Extract (symbol, timeframe, expression, gaps, lookahead,
+        ignore_invalid_symbol, currency) from request.security() call.
+
+        Positional order matches Pine v6:
+        ``security(symbol, timeframe, expression, gaps, lookahead,
+        ignore_invalid_symbol, currency, ...)``.
+        """
         args = list(call.args)
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
         return (
@@ -108,7 +113,8 @@ class SecurityTransformer(ast.NodeTransformer):
             kwargs.get('timeframe', args[1] if len(args) > 1 else None),
             kwargs.get('expression', args[2] if len(args) > 2 else None),
             kwargs.get('gaps', args[3] if len(args) > 3 else None),
-            kwargs.get('ignore_invalid_symbol', args[4] if len(args) > 4 else None),
+            kwargs.get('lookahead', args[4] if len(args) > 4 else None),
+            kwargs.get('ignore_invalid_symbol', args[5] if len(args) > 5 else None),
             kwargs.get('currency', args[6] if len(args) > 6 else None),
         )
 
@@ -477,13 +483,14 @@ class SecurityTransformer(ast.NodeTransformer):
 
         for call, sec_id, is_ltf in calls:
             currency = None
+            lookahead = None
             if is_ltf:
                 symbol, timeframe, expression, ignore_invalid = (
                     self._extract_ltf_args(call)
                 )
                 gaps = None
             else:
-                symbol, timeframe, expression, gaps, ignore_invalid, currency = (
+                symbol, timeframe, expression, gaps, lookahead, ignore_invalid, currency = (
                     self._extract_args(call)
                 )
 
@@ -529,6 +536,22 @@ class SecurityTransformer(ast.NodeTransformer):
                     copy.deepcopy(gaps) if gaps is not None else self._default_gaps()
                 )
                 ctx['gaps'] = gaps_expr
+                if lookahead is not None:
+                    # ``lookahead`` must be a Pine constant (``barmerge.lookahead_*``)
+                    # — the value is consumed at module load to wire the live HTF
+                    # transport, well before ``main()`` runs. A local/runtime
+                    # expression here would NameError at import time, so reject
+                    # it with a clear message.
+                    if not self._is_module_level_expr(lookahead):
+                        raise SyntaxError(
+                            "'lookahead' argument of request.security() must be a "
+                            "constant (barmerge.lookahead_off, barmerge.lookahead_on, "
+                            "or barmerge.lookahead_last_closed); runtime expressions "
+                            "are not supported.",
+                            (self._module_file, getattr(lookahead, 'lineno', 0),
+                             getattr(lookahead, 'col_offset', 0) + 1, None)
+                        )
+                    ctx['lookahead'] = copy.deepcopy(lookahead)
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
@@ -542,6 +565,12 @@ class SecurityTransformer(ast.NodeTransformer):
                     self._needs_barmerge = True
                 elif isinstance(gaps, ast.Attribute) and hasattr(gaps, 'value'):
                     v = gaps.value
+                    if isinstance(v, ast.Attribute) and v.attr == 'barmerge':
+                        self._needs_barmerge = True
+                if (lookahead is not None
+                        and isinstance(lookahead, ast.Attribute)
+                        and hasattr(lookahead, 'value')):
+                    v = lookahead.value
                     if isinstance(v, ast.Attribute) and v.attr == 'barmerge':
                         self._needs_barmerge = True
 

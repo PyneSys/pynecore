@@ -14,20 +14,34 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 # Per-slot layout in the sync block:
-#   int64   last_timestamp  (8 bytes) — last bar timestamp from security process
-#   uint32  version         (4 bytes) — result block version (incremented on realloc)
-#   uint32  result_size     (4 bytes) — current pickle data size in bytes
-#   int64   target_time     (8 bytes) — target time the process should advance to
-#   uint8   flags           (1 byte)  — state flags
+#   offset 0:  int64   last_timestamp  (8 bytes) — last bar timestamp from security process
+#   offset 8:  uint32  version         (4 bytes) — result block version (incremented on realloc)
+#   offset 12: uint32  result_size     (4 bytes) — current pickle data size in bytes
+#   offset 16: int64   target_time     (8 bytes) — target time the process should advance to
+#   offset 24: uint8   flags           (1 byte)  — state flags
+#   offset 25: 7 bytes pad (alignment to 32)
+#   offset 32: float64 dev_open        (8 bytes) — developing HTF bar OHLCV (lookahead_on live)
+#   offset 40: float64 dev_high        (8 bytes)
+#   offset 48: float64 dev_low         (8 bytes)
+#   offset 56: float64 dev_close       (8 bytes)
+#   offset 64: float64 dev_volume      (8 bytes)
+#   offset 72: int64   dev_time        (8 bytes) — developing HTF bar timestamp (ms)
 #
-# Total per slot: 25 bytes, padded to 32 for alignment
+# Total per slot: 80 bytes
 SLOT_FORMAT = '<qIIqB'
-SLOT_SIZE = 32  # padded
-SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 25 bytes
+SLOT_SIZE = 80
+SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 25 bytes — original fields only
+
+# Offset of the developing-bar block within a slot.
+_DEV_OHLCV_OFFSET = 32
+_DEV_OHLCV_FORMAT = '<dddddq'  # open, high, low, close, volume, time(ms)
 
 # Flag bits
 FLAG_HAS_DATA = 0x01  # result block contains valid data
 FLAG_SAME_CONTEXT = 0x02  # same symbol + TF as chart (no process needed)
+FLAG_IS_DEVELOPING = 0x04  # current target_time refers to a developing (open) HTF bar
+FLAG_CLOSED_OVERRIDE = 0x08  # closed-bar OHLCV is supplied via SyncBlock (live mode);
+                             # subprocess must use SyncBlock OHLCV, not the .ohlcv file
 
 # Initial result block size
 INITIAL_RESULT_SIZE = 4096
@@ -124,6 +138,28 @@ class SyncBlock:
         """Read the flags byte."""
         off = self._offset(sec_id)
         return struct.unpack_from('<B', self._buf, off + 24)[0]
+
+    def set_developing_bar(
+        self, sec_id: str,
+        dev_open: float, dev_high: float, dev_low: float,
+        dev_close: float, dev_volume: float, dev_time: int,
+    ):
+        """Write developing HTF bar OHLCV+time for live ``lookahead_on``."""
+        off = self._offset(sec_id) + _DEV_OHLCV_OFFSET
+        struct.pack_into(
+            _DEV_OHLCV_FORMAT, self._buf, off,
+            dev_open, dev_high, dev_low, dev_close, dev_volume, dev_time,
+        )
+
+    def get_developing_bar(
+        self, sec_id: str,
+    ) -> tuple[float, float, float, float, float, int]:
+        """Read developing HTF bar OHLCV+time.
+
+        :return: (open, high, low, close, volume, time_ms)
+        """
+        off = self._offset(sec_id) + _DEV_OHLCV_OFFSET
+        return struct.unpack_from(_DEV_OHLCV_FORMAT, self._buf, off)
 
     def close(self):
         """Close the shared memory (does not unlink)."""

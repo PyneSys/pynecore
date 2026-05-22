@@ -154,27 +154,28 @@ def main():
 security_data = {
     "USI:ADVN.NY": "workdir/data/USI_ADVN_NY",
     "USI:DECL.NY": "workdir/data/USI_DECL_NY",
-}
+} 
 ```
 
 > **Note:** When the timeframe argument is `""` (empty string), the chart's own timeframe is used.
 
 ## Supported Features
 
-| Feature                 | Status        | Notes                                             |
-|-------------------------|---------------|---------------------------------------------------|
-| Different timeframe     | supported     | HTF (1D, 1W, 1M, etc.) from lower TF chart        |
-| Different symbol        | supported     | Any symbol with available OHLCV data              |
-| Lower timeframe (LTF)   | supported     | `request.security_lower_tf()` returns arrays      |
-| Multiple security calls | supported     | Each gets its own process                         |
-| Conditional calls       | supported     | Inside `if`/`for`/`while` blocks                  |
-| Nested security calls   | supported     | `security(... security(...) ...)`                 |
-| `barmerge.gaps_off`     | supported     | Forward-fills last value (default)                |
-| `barmerge.gaps_on`      | supported     | Returns `na` between periods                      |
-| `lookahead_off`         | supported     | Confirmed previous period (default)               |
-| `ignore_invalid_symbol` | supported     | Returns `na` for missing symbols                  |
-| `lookahead_on`          | not supported | Deliberate safety-first decision                  |
-| `currency` parameter    | supported     | Auto-converts result using `CurrencyRateProvider` |
+| Feature                          | Status    | Notes                                                                            |
+|----------------------------------|-----------|----------------------------------------------------------------------------------|
+| Different timeframe              | supported | HTF (1D, 1W, 1M, etc.) from lower TF chart                                       |
+| Different symbol                 | supported | Any symbol with available OHLCV data                                             |
+| Lower timeframe (LTF)            | supported | `request.security_lower_tf()` returns arrays                                     |
+| Multiple security calls          | supported | Each gets its own process                                                        |
+| Conditional calls                | supported | Inside `if`/`for`/`while` blocks                                                 |
+| Nested security calls            | supported | `security(... security(...) ...)`                                                |
+| `barmerge.gaps_off`              | supported | Forward-fills last value (default)                                               |
+| `barmerge.gaps_on`               | supported | Returns `na` between periods                                                     |
+| `barmerge.lookahead_off`         | supported | Most recently closed bar — historical + live (same-symbol HTF in live)           |
+| `barmerge.lookahead_last_closed` | supported | PyneSys-native synonym for "last closed"; identical transport to `lookahead_off` |
+| `barmerge.lookahead_on`          | supported | TV-compatible; live mode steps into developing HTF bar (same-symbol HTF only)    |
+| `ignore_invalid_symbol`          | supported | Returns `na` for missing symbols                                                 |
+| `currency` parameter             | supported | Auto-converts result using `CurrencyRateProvider`                                |
 
 ## How It Works
 
@@ -208,16 +209,65 @@ For same-timeframe contexts (different symbol), values are confirmed on every ba
 | `gaps_off` | Return new value     | Return last value (forward-fill) |
 | `gaps_on`  | Return new value     | Return `na`                      |
 
+### Lookahead modes
+
+`request.security()` accepts a `lookahead` argument. Three modes are recognized:
+
+| Mode                               | Behavior (historical / backtest)                                                                  | Behavior (live mode, same-symbol HTF)                                                                                                                                                                                                                                                                                                 |
+|------------------------------------|---------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `barmerge.lookahead_off` (default) | Most recently CLOSED security bar (TV-faithful)                                                   | Most recently CLOSED security bar; each HTF period close is shipped via the chart-side `HTFAggregator` (the static `.ohlcv` file cannot grow at runtime). No developing exposure.                                                                                                                                                     |
+| `barmerge.lookahead_last_closed`   | Most recently CLOSED security bar (functionally equivalent to `lookahead_off`)                    | Most recently CLOSED security bar — uses the same closed-bar transport as `lookahead_off`; repaint-free.                                                                                                                                                                                                                              |
+| `barmerge.lookahead_on`            | Most recently CLOSED security bar — historical falls back to `lookahead_off` to avoid future-leak | Developing (containing) HTF bar with `barstate.isconfirmed=False`; OHLCV is aggregated from the chart timeframe by `HTFAggregator`. On HTF period close the just-closed bar is delivered first (so the security `bar_index` advances), then the new developing bar. TV-compatible `close[1]` idiom returns the previously closed bar. |
+
+**Why `lookahead_last_closed`** — in historical backtests it matches `lookahead_off`, and in
+live mode it stays repaint-free (it never shows the developing security bar). Prefer it when
+you want stable last-closed values without depending on the TV `close[1]` idiom.
+
+**Why historical `lookahead_on` is degraded to `lookahead_off`** — TV's classical historical
+`lookahead_on` behavior is to expose the containing HTF bar's close on every chart bar,
+producing a future-leak that silently inflates backtest results. PyneCore deliberately does
+not reproduce this leak: in historical mode the closed bar is the only bar the subprocess
+ever runs. The TV idiom `request.security(..., lookahead_on)[1]` still returns the correct
+last-closed value (since `close[1]` is always the previously closed bar). In live mode the
+subprocess additionally steps into the developing bar so `close[0]` exposes the in-progress
+close as TV does.
+
+**Cross-symbol HTF in live mode** — the chart-side `HTFAggregator` aggregates the *chart*
+symbol's OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF
+contexts therefore keep no aggregator and fall back to the static `.ohlcv` file path —
+adequate for historical/backtest, inert in live mode (the security context simply does not
+advance). For `lookahead_on` specifically this is a hard error (`script_runner.py` raises
+`NotImplementedError` at startup) because the developing-bar phase would deliver
+wrong-instrument OHLCV. For `lookahead_off` / `lookahead_last_closed` it degrades silently —
+if you need live cross-symbol HTF, run that context as a separate same-symbol chart or
+provide a live-updating OHLCV source for the security itself.
+
+```python
+# Default — most recently closed bar
+htf_close = lib.request.security(lib.syminfo.tickerid, "60", lib.close)
+
+# PyneSys-native — repaint-free in both historical and live mode
+htf_close = lib.request.security(
+    lib.syminfo.tickerid, "60", lib.close,
+    lookahead=lib.barmerge.lookahead_last_closed,
+)
+
+# TV-compatible — live mode exposes the developing bar; the close[1] idiom
+# is the canonical TV way to read the most recently closed HTF bar.
+htf_close_prev = lib.request.security(
+    lib.syminfo.tickerid, "60", lib.close[1],
+    lookahead=lib.barmerge.lookahead_on,
+)
+```
+
 ## Limitations
 
-- **lookahead_on** — not supported. Only `lookahead_off` (confirmed previous period) semantics are
-  available. `lookahead_on` gives the script access to the *current* (unconfirmed) higher-timeframe
-  value before the period closes. This has legitimate uses in **retrospective market analysis** —
-  for example, examining how intraday price action related to the final daily close. However, in
-  backtesting it effectively leaks future data into past decisions, producing inflated results that
-  cannot be replicated in live trading. Since PyneCore is designed primarily for **backtesting and
-  forward-looking strategy evaluation** rather than retrospective charting, supporting `lookahead_on`
-  would undermine the reliability of its results.
+- **Cross-symbol HTF in live mode** — the live HTF transport aggregates chart OHLCV, so it
+  works only when the security symbol matches the chart symbol. Cross-symbol HTF
+  `lookahead_on` raises `NotImplementedError` at startup; cross-symbol HTF
+  `lookahead_off` / `lookahead_last_closed` falls back to the static `.ohlcv` file (live
+  ticks do not advance the security context). For live cross-symbol HTF analysis, run that
+  context as a separate same-symbol chart.
 - **Standalone mode** — `python script.py data.csv` does not support `--security` yet.
   Use `pyne run` or the ScriptRunner API.
 
