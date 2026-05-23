@@ -1,6 +1,6 @@
 from copy import copy as _copy
+from typing import overload
 
-from ..core.overload import overload
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.label import LabelStyleEnum, Label
@@ -39,66 +39,39 @@ def new(point: ChartPoint, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
         style: LabelStyleEnum = style_label_down, textcolor: _color.Color = _color.white,
         size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
         tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none):
-    """
-    Creates new label object using a ChartPoint.
-
-    :param point: chart.point object that specifies the label position
-    :param text: Label text
-    :param xloc: See description of x argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param yloc: Possible values are yloc.price, yloc.abovebar, yloc.belowbar
-    :param color: Color of the label border and arrow
-    :param style: Label style
-    :param textcolor: Text color
-    :param size: Size of the label
-    :param textalign: Label text alignment
-    :param tooltip: Hover to see tooltip label
-    :param text_font_family: The font family of the text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: The formatting of the displayed text
-    :return: A label object
-    """
-    # Extract coordinates from ChartPoint based on xloc
-    if xloc == _xloc.bar_time:
-        x, y = point.time, point.price
-    else:  # xloc.bar_index (default)
-        x, y = point.index, point.price
-
-    label_obj = Label(
-        x=x,
-        y=y,
-        text=text,
-        xloc=xloc,
-        yloc=yloc or _yloc.price,
-        color=color,
-        style=style or style_label_down,
-        textcolor=textcolor,
-        size=size or _size.normal,
-        textalign=textalign or _text.align_center,
-        tooltip=tooltip,
-        text_font_family=text_font_family or _font.family_default,
-        force_overlay=force_overlay,
-        text_formatting=text_formatting or _text.format_none
-    )
-    _registry.append(label_obj)
-    return label_obj
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label: ...
 
 
 @overload
-def new(x: int, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
+def new(x: int | float, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
         yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
         style: LabelStyleEnum = style_label_down, textcolor: _color.Color = _color.white,
         size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
         tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none):
-    """
-    Creates new label object.
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label: ...
 
-    :param x: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of the label position
-    :param y: Price of the label position. It is taken into account only if yloc=yloc.price
+
+def new(point_or_x, y=None, text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
+        yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
+        style: LabelStyleEnum = style_label_down, textcolor: _color.Color = _color.white,
+        size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
+        tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label:
+    """
+    Creates a new label object.
+
+    Two call shapes are accepted (Pine-compatible):
+    - ``label.new(point, text="", ...)`` where ``point`` is a ``chart.point`` object.
+    - ``label.new(x, y, text="", ...)`` where ``x`` is bar index (``xloc.bar_index``) or
+      bar UNIX time in milliseconds (``xloc.bar_time``), and ``y`` is the price.
+      A float ``x`` is truncated to int to mirror Pine's implicit float-to-int
+      conversion on ``series int`` parameters.
+
+    :param point_or_x: ``chart.point`` object, or bar index / bar time
+    :param y: Price of the label position (used only when ``point_or_x`` is not a ``ChartPoint``)
     :param text: Label text
-    :param xloc: See description of x argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param yloc: Possible values are yloc.price, yloc.abovebar, yloc.belowbar
+    :param xloc: Possible values: ``xloc.bar_index`` and ``xloc.bar_time``
+    :param yloc: Possible values are ``yloc.price``, ``yloc.abovebar``, ``yloc.belowbar``
     :param color: Color of the label border and arrow
     :param style: Label style
     :param textcolor: Text color
@@ -110,9 +83,18 @@ def new(x: int, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc.bar_ind
     :param text_formatting: The formatting of the displayed text
     :return: A label object
     """
+    if isinstance(point_or_x, ChartPoint):
+        if xloc == _xloc.bar_time:
+            x, y_val = point_or_x.time, point_or_x.price
+        else:
+            x, y_val = point_or_x.index, point_or_x.price
+    else:
+        x = int(point_or_x) if isinstance(point_or_x, float) else point_or_x
+        y_val = y
+
     label_obj = Label(
         x=x,
-        y=y,
+        y=y_val,
         text=text,
         xloc=xloc,
         yloc=yloc or _yloc.price,
