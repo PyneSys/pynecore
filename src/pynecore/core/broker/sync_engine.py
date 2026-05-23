@@ -177,6 +177,21 @@ class OrderSyncEngine:
         # not emit duplicate CancelIntents.
         self._cancelled_oca_groups_this_sync: set[str] = set()
 
+        # Entry ids defensively closed during the current bar cycle via
+        # :meth:`_handle_bracket_attach_after_fill_reject`. Populated after
+        # :meth:`_cleanup_position_tracking` removes the entry/bracket
+        # state; consulted by :meth:`_diff_and_dispatch` so that intents in
+        # the precomputed ``new_map`` referencing the same ``from_entry``
+        # (sibling brackets, alternate ``exit_id`` for the same parent,
+        # OR an exit the user script re-emitted in the SAME bar after
+        # observing the parent fill via :meth:`apply_async_events`) are
+        # NOT re-dispatched as fresh orders into the just-flattened
+        # position. Cleared at the END of :meth:`sync` (after
+        # ``_diff_and_dispatch``) so a marker set by an ``apply_async_events``
+        # drain that ran BEFORE the script on this bar survives until the
+        # diff pass consumes it.
+        self._defensively_closed_entries_this_sync: set[str] = set()
+
         # Keys that received an empty :attr:`_order_mapping` adoption marker
         # from :meth:`_consume_plugin_resolutions` during the current sync.
         # The marker tells :meth:`_diff_and_dispatch` "this intent is already
@@ -484,6 +499,16 @@ class OrderSyncEngine:
             self._persisted_pending_anchors = self._unresolved_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
         self._cancelled_oca_groups_this_sync.clear()
+        # ``_defensively_closed_entries_this_sync`` is intentionally NOT
+        # cleared here: :meth:`_handle_bracket_attach_after_fill_reject`
+        # can populate it from :meth:`apply_async_events` (which runs
+        # BEFORE the script on every bar) when a queued entry fill
+        # triggers :meth:`_resolve_deferred_for_entry` → ``_dispatch_new``
+        # → bracket-attach reject. Clearing at the top of ``sync`` would
+        # erase that marker before ``_diff_and_dispatch`` consumes it,
+        # letting a sibling/recreated bracket re-dispatch into the just
+        # defensively-closed position. The clear is deferred to the END
+        # of ``sync`` instead, after ``_diff_and_dispatch``.
         # Drain again here in case events arrived between
         # ``apply_async_events`` (start of this bar) and now.  ``sync`` is
         # also called from contexts that don't pre-drain (e.g. tests, the
@@ -517,6 +542,14 @@ class OrderSyncEngine:
 
         self._diff_and_dispatch(dispatchable)
         self._cleanup_unused_adoption_markers()
+        # End-of-sync clear: the defensive-close markers populated during
+        # this sync (whether by an ``apply_async_events`` drain on this
+        # bar or by the in-line ``_drain_events`` above) have now been
+        # consumed by ``_diff_and_dispatch``. Reset so the next bar
+        # starts fresh. If the sync above returned early (e.g. connection
+        # error in ``_verify_pending_dispatches``) we deliberately leave
+        # the set intact for the next sync attempt to consume.
+        self._defensively_closed_entries_this_sync.clear()
 
         self._sync_count += 1
         if self._reconcile_every and self._sync_count % self._reconcile_every == 0:
@@ -1176,15 +1209,34 @@ class OrderSyncEngine:
           double-fill (e.g. TP and entry both filling on the same bar) from
           emitting duplicate cancels.
         """
-        if self._oca_cancel_native:
-            return
         if event.event_type == 'partial' and (
                 self._oca_partial_policy is OcaPartialFillPolicy.FULL_FILL_ONLY
         ):
             return
-
         filled_key = self._filled_intent_key(event)
         if filled_key is None:
+            return
+        self._cascade_oca_cancel_for_key(filled_key)
+
+    def _cascade_oca_cancel_for_key(self, filled_key: str) -> None:
+        """Run the OCA-cancel cascade for ``filled_key``.
+
+        Event-agnostic core extracted from :meth:`_cascade_oca_cancel` so
+        proactive paths (notably
+        :meth:`_handle_bracket_attach_after_fill_reject`) can fire the
+        cascade BEFORE dropping the parent intent — otherwise the later
+        in-band cascade call in :meth:`_route_event` finds
+        ``_active_intents`` empty for ``filled_key`` and the OCA-cancel
+        siblings stay live exchange-side.
+
+        The cascade is **suppressed** when the plugin declared
+        ``oca_cancel = CapabilityLevel.NATIVE`` (exchange handles the
+        group) or the filled intent has no ``cancel`` OCA group.
+        Idempotent within a sync via
+        :attr:`_cancelled_oca_groups_this_sync`, so a follow-up
+        in-band call on the same fill is a no-op.
+        """
+        if self._oca_cancel_native:
             return
         filled_intent = self._active_intents.get(filled_key)
         if filled_intent is None:
@@ -1240,6 +1292,19 @@ class OrderSyncEngine:
         position-attached bracket). Falling back across both fields
         keeps the cleanup correct on every plugin.
 
+        Delegates to :meth:`_cleanup_position_tracking` for the actual
+        intent / Pine-order-book teardown so the bracket-reject
+        defensive-close path can reuse the same logic without
+        synthesising a fake event.
+        """
+        closed_entry_id = event.from_entry or event.pine_id
+        if not closed_entry_id:
+            return
+        self._cleanup_position_tracking(closed_entry_id)
+
+    def _cleanup_position_tracking(self, closed_entry_id: str) -> None:
+        """Drop active intent + Pine order-book entries for ``closed_entry_id``.
+
         Cleans:
 
         - ``_active_intents`` — entry intent keyed by ``pine_id``, every
@@ -1248,10 +1313,12 @@ class OrderSyncEngine:
         - ``position.entry_orders`` (single-key by ``pine_id``) and
           ``position.exit_orders`` (composite ``(exit_id, from_entry)``;
           every key whose ``from_entry`` matches is dropped).
+
+        Idempotent: callable from both the natural close-fill handler
+        (:meth:`_cleanup_closed_position`) and proactive paths such as
+        :meth:`_handle_bracket_attach_after_fill_reject` — a follow-up
+        invocation on the same id finds nothing to do.
         """
-        closed_entry_id = event.from_entry or event.pine_id
-        if not closed_entry_id:
-            return
         # Entry intent + its mapping/envelope.
         self._active_intents.pop(closed_entry_id, None)
         self._order_mapping.pop(closed_entry_id, None)
@@ -1565,16 +1632,25 @@ class OrderSyncEngine:
                 else:
                     if (isinstance(intent, ExitIntent)
                             and intent.from_entry is not None
-                            and intent.from_entry in skipped_entry_ids_this_sync):
-                        # Parent entry was just skipped — drop the bracket
-                        # silently. Re-evaluated next bar.
+                            and (intent.from_entry in skipped_entry_ids_this_sync
+                                 or intent.from_entry
+                                 in self._defensively_closed_entries_this_sync)):
+                        # Parent entry was just skipped (plugin declined) or
+                        # defensively closed earlier in this same loop via the
+                        # bracket-attach-after-fill reject recovery. Either way
+                        # the parent will not be open after this sync, so the
+                        # bracket must not dispatch. Re-evaluated next bar.
                         continue
                     try:
                         self._dispatch_new(intent)
                     except OrderSkippedByPlugin as e:
-                        # Plugin declined (e.g. qty below venue minimum).
-                        # Don't register — the intent is re-evaluated next
-                        # bar so a later sizing change can still trade.
+                        # Plugin declined (e.g. qty below venue minimum) OR
+                        # the bracket-attach-after-fill recovery path raised
+                        # ``reason="bracket_reject_defensive_close"`` — the
+                        # latter has already populated
+                        # ``_defensively_closed_entries_this_sync`` so any
+                        # remaining same-entry intents handled later in this
+                        # loop short-circuit at the guard above.
                         _blog_warning("%s", e)
                         if isinstance(intent, EntryIntent):
                             skipped_entry_ids_this_sync.add(intent.pine_id)
@@ -1854,15 +1930,74 @@ class OrderSyncEngine:
         # closed (``close_order`` would break ``find_by_ref`` lookups
         # when the close activity finally arrives via the broker's
         # history stream).
-        if (self._store_ctx is not None
-                and close_intent.intent_key in self._order_mapping):
-            row = self._store_ctx.get_order(e.position_coid)
-            if row is not None:
-                extras = dict(row.extras or {})
-                extras['natural_close_at'] = time.time()
-                self._store_ctx.upsert_order(
-                    e.position_coid, extras=extras,
-                )
+        if close_intent.intent_key in self._order_mapping:
+            if self._store_ctx is not None:
+                row = self._store_ctx.get_order(e.position_coid)
+                if row is not None:
+                    extras = dict(row.extras or {})
+                    extras['natural_close_at'] = time.time()
+                    self._store_ctx.upsert_order(
+                        e.position_coid, extras=extras,
+                    )
+            # Proactively drop the entry intent + bracket exit intent +
+            # Pine ``entry_orders``/``exit_orders`` keys for this
+            # ``from_entry``. The defensive close has been accepted by
+            # the broker and the position will close; without this
+            # cleanup the next :meth:`sync` rebuilds the same
+            # entry+bracket pair from Pine's order book and
+            # ``execute_exit`` raises :class:`ExchangeOrderRejectedError`
+            # — the entry row carries ``natural_close_at`` so
+            # ``_find_active_entry_row`` returns ``None``, and if the
+            # broker has already flattened the position
+            # ``get_position`` also returns ``None``, falling through
+            # to the hard reject. The close FILL event still triggers
+            # :meth:`_cleanup_closed_position` later but finds nothing
+            # to do (idempotent).
+            # Resolve the entry id from the exception first; fall back to
+            # the dispatched intent when the plugin omitted ``from_entry``
+            # on the exception (it is an optional field —
+            # :class:`BracketAttachAfterFillRejectedError` allows
+            # ``from_entry=None``). For an :class:`ExitIntent` the entry
+            # id is ``intent.from_entry`` (required), for an
+            # :class:`EntryIntent` the entry IS the intent itself so its
+            # ``pine_id`` is the entry id. Without this fallback plugins
+            # that don't populate ``e.from_entry`` would skip the OCA
+            # cascade + tracking cleanup, leaving stale intents in
+            # ``_active_intents`` and the next sync would rebuild the
+            # same rejected bracket.
+            entry_id: str | None = e.from_entry
+            if entry_id is None:
+                if isinstance(intent, ExitIntent):
+                    entry_id = intent.from_entry
+                elif isinstance(intent, EntryIntent):
+                    entry_id = intent.pine_id
+            if entry_id:
+                # Fire the OCA-cancel cascade BEFORE removing the
+                # parent ENTRY intent. We are running inside
+                # :meth:`_resolve_deferred_for_entry`, which itself
+                # runs from :meth:`_route_event` BEFORE the in-band
+                # :meth:`_cascade_oca_cancel` call — dropping the
+                # intent here without cascading first would leave
+                # ``_active_intents`` empty when that later call runs,
+                # silently skipping sibling cancellation for
+                # ``oca_type='cancel'`` groups and leaving the
+                # siblings live exchange-side after the defensive
+                # close. The cascade is idempotent within a sync via
+                # :attr:`_cancelled_oca_groups_this_sync`, so the
+                # in-band follow-up is a no-op.
+                self._cascade_oca_cancel_for_key(entry_id)
+                self._cleanup_position_tracking(entry_id)
+                # Mark the entry as defensively closed so the in-flight
+                # :meth:`_diff_and_dispatch` loop (when it is the caller)
+                # short-circuits any subsequent intent in its precomputed
+                # ``new_map`` that still references this ``from_entry``.
+                # Without this guard a sibling bracket leg or an alternate
+                # ``exit_id`` for the same parent — already missing from
+                # ``_active_intents`` after the cleanup — would look fresh
+                # and trigger another bracket dispatch against a position
+                # we just flattened. The set is per-sync and harmless
+                # outside the loop context (event-driven callers ignore it).
+                self._defensively_closed_entries_this_sync.add(entry_id)
         raise OrderSkippedByPlugin(
             f"Bracket attach rejected after entry fill — parent position "
             f"closed defensively (deal_id={e.position_deal_id}); "

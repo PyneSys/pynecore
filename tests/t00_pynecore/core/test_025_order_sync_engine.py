@@ -1749,6 +1749,251 @@ def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
         assert (row.extras or {}).get('natural_close_at') is None
 
 
+def __test_bracket_reject_defensive_close_cleans_pine_orders_and_intents__(
+        tmp_path,
+):
+    """After a successful defensive close, the engine MUST drop the
+    entry intent + bracket exit intent from ``_active_intents`` AND
+    clear ``position.entry_orders[from_entry]`` /
+    ``position.exit_orders[(*, from_entry)]``.
+
+    Without this proactive cleanup, the next :meth:`sync` rebuilds
+    the same entry+bracket pair from Pine's order book and
+    re-dispatches the bracket. ``execute_exit`` then raises
+    :class:`ExchangeOrderRejectedError` because the parent entry row
+    is flagged ``natural_close_at`` (so ``_find_active_entry_row``
+    returns ``None``) and the exchange has already flattened the
+    position via the defensive close (so ``get_position`` also returns
+    ``None``), falling through to the hard reject.
+
+    The close FILL event still triggers
+    :meth:`_cleanup_closed_position` when it arrives via the activity
+    stream, but the helper is idempotent — calling it on already-clean
+    state is a no-op.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry',
+            symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+            exchange_order_id='deal-L',
+            pine_entry_id='Long',
+            filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+
+        b = MockBroker()
+        b.raise_on_next_exit = _bracket_reject_error()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        # Seed the Pine-side order book + matching active-intent state
+        # — what ``build_intents`` would produce after Pine called
+        # ``strategy.entry('Long')`` + ``strategy.exit('Bracket',
+        # from_entry='Long', ...)``.
+        pos.entry_orders["Long"] = _entry_order("Long", 1.0, limit=50_000.0)
+        pos.exit_orders[("Bracket", "Long")] = _exit_order(
+            "Long", -1.0, "Bracket", limit=51_000.0, stop=49_000.0,
+        )
+
+        engine.sync(BAR_TS)
+
+        # Defensive close was issued (sanity guard).
+        assert len(b.close_calls) == 1
+
+        # Pine-side order dicts cleared for this from_entry — next
+        # sync would build no intents for 'Long', preventing the
+        # spurious bracket re-dispatch that previously crashed with
+        # ExchangeOrderRejectedError.
+        assert "Long" not in pos.entry_orders
+        assert ("Bracket", "Long") not in pos.exit_orders
+
+        # Engine-side tracking also cleared.
+        assert "Long" not in engine.active_intents
+        assert "Bracket\0Long" not in engine.active_intents
+
+
+def __test_bracket_reject_skips_sibling_exit_for_same_from_entry_in_diff_loop__(
+        tmp_path,
+):
+    """When :meth:`_diff_and_dispatch` iterates a precomputed ``new_map``
+    and the first bracket exit for an entry triggers the
+    :class:`BracketAttachAfterFillRejectedError` recovery, sibling exits
+    that reference the same ``from_entry`` later in the same loop MUST
+    NOT be dispatched.
+
+    Without the guard, ``_cleanup_position_tracking`` removes the sibling
+    from ``_active_intents`` mid-loop and the diff loop then treats it as
+    brand-new — dispatching another bracket against a position that was
+    just defensively closed. The new
+    ``_defensively_closed_entries_this_sync`` set short-circuits the
+    sibling so only the first (failing) exit reaches the plugin and the
+    runner converges next bar.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry',
+            symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+            exchange_order_id='deal-L',
+            pine_entry_id='Long',
+            filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+
+        b = MockBroker()
+        # Every execute_exit hits the bracket-reject path (sibling exits
+        # would otherwise look like a fresh attach attempt against the
+        # just-flattened position and re-trigger the recovery).
+        async def _always_bracket_reject(envelope):
+            b.exit_calls.append(envelope)
+            raise _bracket_reject_error()
+
+        b.execute_exit = _always_bracket_reject  # type: ignore[method-assign]
+
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        # Two bracket exits for the same Pine entry — Pine allows multiple
+        # ``strategy.exit`` calls per entry (e.g. partial TP at different
+        # levels). The diff loop iterates them in insertion order.
+        pos.entry_orders['Long'] = _entry_order('Long', 1.0, limit=50_000.0)
+        pos.exit_orders[('BracketA', 'Long')] = _exit_order(
+            'Long', -1.0, 'BracketA', limit=51_000.0, stop=49_000.0,
+        )
+        pos.exit_orders[('BracketB', 'Long')] = _exit_order(
+            'Long', -1.0, 'BracketB', limit=52_000.0, stop=48_000.0,
+        )
+
+        engine.sync(BAR_TS)
+
+        # Exactly ONE exit dispatch reached the plugin: the second sibling
+        # was short-circuited by the defensive-close-this-sync guard.
+        assert len(b.exit_calls) == 1
+        # And exactly ONE defensive close was emitted — without the guard
+        # the second exit dispatch would re-enter the recovery path and
+        # emit a duplicate (or escalate to halt if the plugin path raised
+        # a plain ``ExchangeOrderRejectedError`` instead).
+        assert len(b.close_calls) == 1
+        # Engine state still cleaned (sibling cleanup is idempotent).
+        assert 'Long' not in engine.active_intents
+        assert 'BracketA\0Long' not in engine.active_intents
+        assert 'BracketB\0Long' not in engine.active_intents
+        # No halt — defensive recovery completed and absorbed both siblings.
+        assert engine.halted is False
+
+
+def __test_bracket_reject_marker_survives_apply_async_events_to_sync__(tmp_path):
+    """The ``_defensively_closed_entries_this_sync`` guard must remain
+    valid across the apply_async_events -> script -> sync cycle.
+
+    Scenario: a tick-deferred bracket exit waits for the parent entry
+    fill. Between bars an async entry-fill event arrives. The runner
+    calls :meth:`apply_async_events` BEFORE running the user script;
+    that drain resolves the deferred exit, dispatches it, and the
+    plugin raises :class:`BracketAttachAfterFillRejectedError` —
+    populating ``_defensively_closed_entries_this_sync`` with the
+    parent ``from_entry``. The user script then unconditionally
+    re-emits ``strategy.exit('TP', from_entry='Long')``, re-populating
+    ``position.exit_orders``. Finally :meth:`sync` runs and must
+    short-circuit the recreated exit so it is NOT dispatched against
+    the just defensively-closed position.
+
+    Without the fix the marker is cleared at the top of :meth:`sync`,
+    the diff loop treats the re-emitted exit as brand-new, and
+    ``execute_exit`` is called against a flattened position (live
+    behaviour: ``no confirmed entry row`` / duplicate defensive close).
+    """
+    b = MockBroker()
+    # First exit dispatch (from the apply_async_events drain) hits the
+    # bracket-reject path. Any subsequent execute_exit must NOT be
+    # called — the guard must short-circuit it.
+    async def _reject_first_exit_only(envelope):
+        b.exit_calls.append(envelope)
+        if len(b.exit_calls) == 1:
+            raise _bracket_reject_error()
+
+    b.execute_exit = _reject_first_exit_only  # type: ignore[method-assign]
+
+    engine, pos = _mk_engine(b, mintick=1.0)
+    # Deferred bracket exit pending parent fill.
+    pos.exit_orders[('TP', 'Long')] = _exit_order(
+        'Long', -1.0, 'TP', profit_ticks=100.0, loss_ticks=50.0,
+    )
+    engine.sync(BAR_TS)
+    assert 'TP\0Long' in engine.deferred_exits
+
+    # Async entry fill arrives between bars. Runner drains it via
+    # apply_async_events BEFORE running the script. The drain resolves
+    # the deferred exit, dispatches it, hits the bracket-reject path,
+    # and populates _defensively_closed_entries_this_sync['Long'].
+    engine.on_order_event(_fill_event(
+        'buy', qty=1.0, price=50_000.0, pine_id='Long', leg=LegType.ENTRY,
+    ))
+    engine.apply_async_events()
+    assert 'Long' in engine._defensively_closed_entries_this_sync
+    assert len(b.exit_calls) == 1
+    assert len(b.close_calls) == 1
+
+    # Simulate the user script re-emitting strategy.exit() in the same
+    # bar (Pine's strategy.exit is unconditional in most scripts), which
+    # repopulates position.exit_orders after the cleanup wiped it.
+    pos.exit_orders[('TP', 'Long')] = _exit_order(
+        'Long', -1.0, 'TP', limit=50_100.0, stop=49_950.0,
+    )
+
+    engine.sync(BAR_TS + 1)
+
+    # Guard held across the apply_async_events -> sync boundary: the
+    # recreated exit was short-circuited, no second execute_exit, no
+    # second defensive close.
+    assert len(b.exit_calls) == 1
+    assert len(b.close_calls) == 1
+    # And cleared at end of sync — fresh bar starts clean.
+    assert 'Long' not in engine._defensively_closed_entries_this_sync
+    assert engine.halted is False
+
+
 def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
     """Engine in-memory anchor cache must be refreshable after retire.
 
