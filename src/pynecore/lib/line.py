@@ -111,7 +111,8 @@ def delete(id):
     """Delete line object"""
     if isinstance(id, NA):
         return
-    _registry.remove(id)
+    if id in _registry:
+        _registry.remove(id)
 
 
 # noinspection PyShadowingBuiltins

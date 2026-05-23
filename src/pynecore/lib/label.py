@@ -142,7 +142,8 @@ def delete(id):
     """Delete label object"""
     if isinstance(id, NA):
         return
-    _registry.remove(id)
+    if id in _registry:
+        _registry.remove(id)
 
 
 # noinspection PyShadowingBuiltins
