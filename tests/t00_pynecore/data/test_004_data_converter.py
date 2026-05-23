@@ -235,21 +235,78 @@ def __test_symbol_provider_detection_forex_pairs__():
 def __test_symbol_provider_detection_our_format__():
     """Test PyneCore own format detection"""
     dc = DataConverter()
-    
+
     # Our format with provider and symbol
     symbol, provider = dc.guess_symbol_from_filename(Path("capitalcom_EURUSD_60.ohlcv"))
     assert symbol == "EURUSD"
     assert provider == "capitalcom"
-    
+
     # CCXT style with exchange - provider is exchange name
     symbol, provider = dc.guess_symbol_from_filename(Path("ccxt_BYBIT_BTC_USDT_USDT_1.ohlcv"))
     assert symbol == "BTC/USDT"
     assert provider == "bybit"  # When ccxt_ prefix, provider is the exchange name
-    
+
     # Simple format without provider
     symbol, provider = dc.guess_symbol_from_filename(Path("BTCUSD_1h.ohlcv"))
     assert symbol == "BTC/USD"
     assert provider == "ccxt"  # Should default to ccxt for crypto
+
+
+def __test_symbol_provider_detection_from_csv_content_databento__(tmp_path):
+    """Databento CSVs carry the symbol in a column; provider tagged via ts_event."""
+    csv_path = tmp_path / "glbx-mdp3-20220103.ohlcv-1m.csv"
+    with open(csv_path, 'w') as f:
+        f.write("ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol\n")
+        f.write("2022-01-03T19:06:00.000000000Z,33,1,206323,4765.0,4765.0,4765.0,4765.0,2,ESZ2\n")
+
+    symbol, provider = DataConverter.guess_symbol_from_csv_content(csv_path)
+    assert symbol == "ESZ2"
+    assert provider == "databento"
+
+
+def __test_symbol_provider_detection_from_csv_content_ticker_column__(tmp_path):
+    """`ticker` column is honoured the same way as `symbol`."""
+    csv_path = tmp_path / "raw_export.csv"
+    with open(csv_path, 'w') as f:
+        f.write("time,open,high,low,close,volume,ticker\n")
+        f.write("2025-01-01T00:00:00Z,100,101,99,100.5,42,AAPL\n")
+
+    symbol, provider = DataConverter.guess_symbol_from_csv_content(csv_path)
+    assert symbol == "AAPL"
+    assert provider is None  # no Databento marker
+
+
+def __test_symbol_provider_detection_from_csv_content_no_hints__(tmp_path):
+    """Plain OHLCV CSV without symbol/ticker column returns (None, None)."""
+    csv_path = tmp_path / "plain.csv"
+    with open(csv_path, 'w') as f:
+        f.write("timestamp,open,high,low,close,volume\n")
+        f.write("1641236760,100,101,99,100.5,42\n")
+
+    symbol, provider = DataConverter.guess_symbol_from_csv_content(csv_path)
+    assert symbol is None
+    assert provider is None
+
+
+def __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path):
+    """End-to-end: convert_to_ohlcv on a Databento CSV without filename hints
+    must pick up symbol from the `symbol` column and provider from `ts_event`."""
+    from pynecore.core.syminfo import SymInfo
+    csv_path = tmp_path / "glbx-mdp3-20220103-20220104.ohlcv-1m.csv"
+    with open(csv_path, 'w') as f:
+        f.write("ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol\n")
+        f.write("2022-01-03T19:06:00.000000000Z,33,1,206323,4765.0,4765.0,4765.0,4765.0,2,ESZ2\n")
+        f.write("2022-01-03T19:07:00.000000000Z,33,1,206323,4765.0,4766.0,4764.0,4765.5,5,ESZ2\n")
+        f.write("2022-01-03T19:08:00.000000000Z,33,1,206323,4765.5,4767.0,4765.0,4766.0,3,ESZ2\n")
+
+    DataConverter().convert_to_ohlcv(csv_path, force=True)
+
+    toml_path = csv_path.with_suffix('.toml')
+    assert toml_path.exists()
+
+    syminfo = SymInfo.load_toml(toml_path)
+    assert syminfo.ticker == "ESZ2"
+    assert syminfo.prefix == "DATABENTO"
 
 
 # Test runner functions that pytest will find
@@ -295,3 +352,19 @@ def test_symbol_provider_detection_forex_pairs():
 
 def test_symbol_provider_detection_our_format():
     __test_symbol_provider_detection_our_format__()
+
+
+def test_symbol_provider_detection_from_csv_content_databento(tmp_path):
+    __test_symbol_provider_detection_from_csv_content_databento__(tmp_path)
+
+
+def test_symbol_provider_detection_from_csv_content_ticker_column(tmp_path):
+    __test_symbol_provider_detection_from_csv_content_ticker_column__(tmp_path)
+
+
+def test_symbol_provider_detection_from_csv_content_no_hints(tmp_path):
+    __test_symbol_provider_detection_from_csv_content_no_hints__(tmp_path)
+
+
+def test_convert_to_ohlcv_databento_uses_csv_symbol(tmp_path):
+    __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path)

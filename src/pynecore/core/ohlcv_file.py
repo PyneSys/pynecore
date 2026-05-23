@@ -18,6 +18,7 @@ import json
 import math
 import mmap
 import os
+import re
 import struct
 from collections import Counter
 from datetime import datetime, time, timedelta, timezone as dt_timezone, UTC
@@ -97,8 +98,8 @@ def _find_timestamp_columns(headers: list[str],
             except ValueError:
                 raise ValueError(f"Timestamp column not found: {timestamp_col}")
         else:
-            # Try common names
-            for col in ['timestamp', 'time', 'date']:
+            # Try common names (ts_event / ts_recv are Databento's nanosecond timestamps)
+            for col in ['timestamp', 'time', 'date', 'ts_event', 'ts_recv']:
                 try:
                     timestamp_idx = headers.index(col)
                     break
@@ -141,13 +142,18 @@ def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=
     :return: Unix timestamp as integer
     :raises ValueError: If timestamp cannot be parsed
     """
-    # Handle numeric timestamps
+    # Handle numeric timestamps (seconds / ms / us / ns since epoch)
     if ts_str.isdigit():
         timestamp = int(ts_str)
-        # Handle millisecond timestamps (common in JSON APIs)
-        if timestamp > 253402300799:  # 9999-12-31 23:59:59
+        # Repeatedly downscale by 1000 until we land in the valid seconds range.
+        # Covers ms (13 digits), us (16 digits) and ns (19 digits, e.g. Databento).
+        while timestamp > 253402300799:  # 9999-12-31 23:59:59
             timestamp //= 1000
         return timestamp
+
+    # Truncate sub-microsecond fractional digits (Databento emits nanoseconds,
+    # e.g. "2026-02-23T00:00:00.000000000Z" — Python's %f only matches 1-6 digits).
+    ts_str = re.sub(r'(\.\d{6})\d+', r'\1', ts_str)
 
     # Parse datetime string
     dt = None
@@ -159,6 +165,8 @@ def _parse_timestamp(ts_str: str, timestamp_format: str | None = None, timezone=
             '%Y-%m-%d %H:%M:%S%z',  # 2024-01-08 19:00:00+0000
             '%Y-%m-%d %H:%M:%S%Z',  # 2024-01-08 19:00:00UTC
             '%Y-%m-%dT%H:%M:%S%z',  # 2024-01-08T19:00:00+0000
+            '%Y-%m-%dT%H:%M:%S.%f%z',  # 2024-01-08T19:00:00.123456+0000
+            '%Y-%m-%dT%H:%M:%S.%fZ',  # 2026-02-23T00:00:00.000000Z (Databento)
             '%Y-%m-%d %H:%M:%S',
             '%Y/%m/%d %H:%M:%S',
             '%d.%m.%Y %H:%M:%S',
