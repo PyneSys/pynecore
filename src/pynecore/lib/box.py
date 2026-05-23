@@ -13,7 +13,7 @@ _registry: list[Box] = []
 
 
 @overload
-def new(top_left: ChartPoint, bottom_right: ChartPoint, border_color: _color.Color = _color.blue,
+def new(left: ChartPoint, top: ChartPoint, border_color: _color.Color = _color.blue,
         border_width: int = 1, border_style: _line.LineEnum = _line.style_solid,
         extend: _extend.Extend = _extend.none, xloc: _xloc.XLoc = _xloc.bar_index,
         bgcolor: _color.Color = _color.blue, text: str = "", text_size: _size.Size = _size.auto,
@@ -34,7 +34,7 @@ def new(left: int | float, top: float, right: int | float, bottom: float,
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
 
 
-def new(top_left_or_left, bottom_right_or_top=None, right=None, bottom=None,
+def new(left, top=None, right=None, bottom=None,
         border_color: _color.Color = _color.blue, border_width: int = 1,
         border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
         xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
@@ -46,14 +46,15 @@ def new(top_left_or_left, bottom_right_or_top=None, right=None, bottom=None,
     Creates a new box object.
 
     Two call shapes are accepted (Pine-compatible):
-    - ``box.new(top_left, bottom_right, ...)`` where the corners are ``chart.point`` objects.
+    - ``box.new(left, top, ...)`` where ``left`` is the top-left corner ``chart.point``
+      and ``top`` is the bottom-right corner ``chart.point``.
     - ``box.new(left, top, right, bottom, ...)`` where ``left`` / ``right`` are bar index
       (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
       and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated
       to int to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
 
-    :param top_left_or_left: ``chart.point`` for the top-left corner, or bar index / bar time of the left border
-    :param bottom_right_or_top: ``chart.point`` for the bottom-right corner, or price of the top border
+    :param left: Top-left ``chart.point`` (point form), or bar index / bar time of the left border (coordinate form)
+    :param top: Bottom-right ``chart.point`` (point form), or price of the top border (coordinate form)
     :param right: Bar index / bar time of the right border (coordinate form only)
     :param bottom: Price of the bottom border (coordinate form only)
     :param border_color: Color of the four borders
@@ -73,9 +74,9 @@ def new(top_left_or_left, bottom_right_or_top=None, right=None, bottom=None,
     :param text_formatting: The formatting of the displayed text
     :return: A box object
     """
-    if isinstance(top_left_or_left, ChartPoint):
-        top_left = top_left_or_left
-        bottom_right = bottom_right_or_top
+    if isinstance(left, ChartPoint):
+        top_left = left
+        bottom_right = top
         if xloc == _xloc.bar_time:
             left_val, top_val = top_left.time, top_left.price
             right_val, bottom_val = bottom_right.time, bottom_right.price
@@ -83,8 +84,8 @@ def new(top_left_or_left, bottom_right_or_top=None, right=None, bottom=None,
             left_val, top_val = top_left.index, top_left.price
             right_val, bottom_val = bottom_right.index, bottom_right.price
     else:
-        left_val = int(top_left_or_left) if isinstance(top_left_or_left, float) else top_left_or_left
-        top_val = bottom_right_or_top
+        left_val = int(left) if isinstance(left, float) else left
+        top_val = top
         right_val = int(right) if isinstance(right, float) else right
         bottom_val = bottom
 
