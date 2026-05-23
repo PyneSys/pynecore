@@ -1,6 +1,6 @@
 from copy import copy as _copy
+from typing import overload
 
-from ..core.overload import overload
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.line import LineEnum, Line
@@ -20,74 +20,64 @@ style_solid = LineEnum('sol')
 @overload
 def new(first_point: ChartPoint, second_point: ChartPoint, xloc: _xloc.XLoc = _xloc.bar_index,
         extend: _extend.Extend = _extend.none, color: _color.Color = _color.blue,
-        style: LineEnum = style_solid, width: int = 1, force_overlay: bool = False):
-    """
-    Creates new line object.
-
-    :param first_point: chart.point object that specifies the line's starting coordinate
-    :param second_point: chart.point object that specifies the line's ending coordinate
-    :param xloc: See description of x1 argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param extend: If extend=extend.none, draws segment starting at point (x1, y1) and ending at point (x2, y2)
-    :param color: Line color
-    :param style: Line style. Possible values: line.style_solid, line.style_dotted, line.style_dashed,
-                  line.style_arrow_left, line.style_arrow_right, line.style_arrow_both
-    :param width: Line width in pixels
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :return: A line object
-    """
-    # Extract coordinates from ChartPoint objects based on xloc
-    from ..lib import xloc as xloc_lib
-
-    if xloc == xloc_lib.bar_time:
-        x1, y1 = first_point.time, first_point.price
-        x2, y2 = second_point.time, second_point.price
-    else:  # xloc.bar_index (default)
-        x1, y1 = first_point.index, first_point.price
-        x2, y2 = second_point.index, second_point.price
-
-    line_obj = Line(
-        x1=x1,
-        y1=y1,
-        x2=x2,
-        y2=y2,
-        xloc=xloc,
-        extend=extend,
-        color=color,
-        style=style or style_solid,
-        width=width,
-        force_overlay=force_overlay
-    )
-    _registry.append(line_obj)
-    return line_obj
+        style: LineEnum = style_solid, width: int = 1, force_overlay: bool = False) -> Line: ...
 
 
 @overload
-def new(x1: int, y1: float, x2: int, y2: float,
+def new(x1: int | float, y1: float, x2: int | float, y2: float,
         xloc: _xloc.XLoc = _xloc.bar_index, extend: _extend.Extend = _extend.none,
-        color: _color.Color = _color.blue, style: LineEnum = style_solid, width: int = 1, force_overlay: bool = False):
-    """
-    Creates new line object.
+        color: _color.Color = _color.blue, style: LineEnum = style_solid,
+        width: int = 1, force_overlay: bool = False) -> Line: ...
 
-    :param x1: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of
-               the first point of the line
-    :param y1: Price of the first point of the line
-    :param x2: Bar index (if xloc = xloc.bar_index) or bar UNIX time (if xloc = xloc.bar_time) of
-               the second point of the line
-    :param y2: Price of the second point of the line
-    :param xloc: See description of x1 argument. Possible values: xloc.bar_index and xloc.bar_time
-    :param extend: If extend=extend.none, draws segment starting at point (x1, y1) and ending at point (x2, y2)
+
+def new(first_or_x1, second_or_y1=None, x2=None, y2=None,
+        xloc: _xloc.XLoc = _xloc.bar_index, extend: _extend.Extend = _extend.none,
+        color: _color.Color = _color.blue, style: LineEnum = style_solid,
+        width: int = 1, force_overlay: bool = False) -> Line:
+    """
+    Creates a new line object.
+
+    Two call shapes are accepted (Pine-compatible):
+    - ``line.new(first_point, second_point, ...)`` where the points are ``chart.point`` objects.
+    - ``line.new(x1, y1, x2, y2, ...)`` where ``x1`` / ``x2`` are bar index
+      (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
+      and ``y1`` / ``y2`` are prices. Float ``x1`` / ``x2`` are truncated to int
+      to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
+
+    :param first_or_x1: ``chart.point`` object for the first point, or bar index / bar time of the first point
+    :param second_or_y1: ``chart.point`` object for the second point, or price of the first point
+    :param x2: Bar index / bar time of the second point (positional / coordinate form only)
+    :param y2: Price of the second point (positional / coordinate form only)
+    :param xloc: Possible values: ``xloc.bar_index`` and ``xloc.bar_time``
+    :param extend: If ``extend=extend.none``, draws segment from (x1, y1) to (x2, y2)
     :param color: Line color
-    :param style: Line style. Possible values: line.style_solid, line.style_dotted,
-                  line.style_dashed, line.style_arrow_left, line.style_arrow_right, line.style_arrow_both
+    :param style: Line style. Possible values: ``line.style_solid``, ``line.style_dotted``,
+                  ``line.style_dashed``, ``line.style_arrow_left``, ``line.style_arrow_right``,
+                  ``line.style_arrow_both``
     :param width: Line width in pixels
     :param force_overlay: If true, the drawing will display on the main chart pane
     :return: A line object
     """
+    if isinstance(first_or_x1, ChartPoint):
+        first_point = first_or_x1
+        second_point = second_or_y1
+        if xloc == _xloc.bar_time:
+            x1_val, y1_val = first_point.time, first_point.price
+            x2_val, y2_val = second_point.time, second_point.price
+        else:
+            x1_val, y1_val = first_point.index, first_point.price
+            x2_val, y2_val = second_point.index, second_point.price
+    else:
+        x1_val = int(first_or_x1) if isinstance(first_or_x1, float) else first_or_x1
+        y1_val = second_or_y1
+        x2_val = int(x2) if isinstance(x2, float) else x2
+        y2_val = y2
+
     line_obj = Line(
-        x1=x1,
-        y1=y1,
-        x2=x2,
-        y2=y2,
+        x1=x1_val,
+        y1=y1_val,
+        x2=x2_val,
+        y2=y2_val,
         xloc=xloc,
         extend=extend,
         color=color,

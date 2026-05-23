@@ -1,6 +1,6 @@
 from copy import copy as _copy
+from typing import overload
 
-from ..core.overload import overload
 from ..core.module_property import module_property
 
 from ..types.box import Box
@@ -20,17 +20,47 @@ def new(top_left: ChartPoint, bottom_right: ChartPoint, border_color: _color.Col
         text_color: _color.Color = _color.black, text_halign: _text.AlignEnum = _text.align_center,
         text_valign: _text.AlignEnum = _text.align_center, text_wrap: _text.WrapEnum = _text.wrap_none,
         text_font_family: _font.FontFamilyEnum = _font.family_default, force_overlay: bool = False,
-        text_formatting: _text.FormatEnum = _text.format_none):
+        text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
+
+
+@overload
+def new(left: int | float, top: float, right: int | float, bottom: float,
+        border_color: _color.Color = _color.blue, border_width: int = 1,
+        border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
+        xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
+        text_size: _size.Size = _size.auto, text_color: _color.Color = _color.black,
+        text_halign: _text.AlignEnum = _text.align_center, text_valign: _text.AlignEnum = _text.align_center,
+        text_wrap: _text.WrapEnum = _text.wrap_none, text_font_family: _font.FontFamilyEnum = _font.family_default,
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
+
+
+def new(top_left_or_left, bottom_right_or_top=None, right=None, bottom=None,
+        border_color: _color.Color = _color.blue, border_width: int = 1,
+        border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
+        xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
+        text_size: _size.Size = _size.auto, text_color: _color.Color = _color.black,
+        text_halign: _text.AlignEnum = _text.align_center, text_valign: _text.AlignEnum = _text.align_center,
+        text_wrap: _text.WrapEnum = _text.wrap_none, text_font_family: _font.FontFamilyEnum = _font.family_default,
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box:
     """
     Creates a new box object.
 
-    :param top_left: chart.point object that specifies the top-left corner location
-    :param bottom_right: chart.point object that specifies the bottom-right corner location
+    Two call shapes are accepted (Pine-compatible):
+    - ``box.new(top_left, bottom_right, ...)`` where the corners are ``chart.point`` objects.
+    - ``box.new(left, top, right, bottom, ...)`` where ``left`` / ``right`` are bar index
+      (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
+      and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated
+      to int to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
+
+    :param top_left_or_left: ``chart.point`` for the top-left corner, or bar index / bar time of the left border
+    :param bottom_right_or_top: ``chart.point`` for the bottom-right corner, or price of the top border
+    :param right: Bar index / bar time of the right border (coordinate form only)
+    :param bottom: Price of the bottom border (coordinate form only)
     :param border_color: Color of the four borders
     :param border_width: Width of the four borders, in pixels
     :param border_style: Style of the four borders
-    :param extend: When extend.none is used, the horizontal borders start at the left border and end at the right border
-    :param xloc: Determines whether the arguments to 'left' and 'right' are a bar index or a time value
+    :param extend: When ``extend.none`` is used, the horizontal borders start at the left border and end at the right border
+    :param xloc: Determines whether ``left`` / ``right`` are a bar index or a bar time value
     :param bgcolor: Background color of the box
     :param text: The text to be displayed inside the box
     :param text_size: Size of the box's text
@@ -43,80 +73,26 @@ def new(top_left: ChartPoint, bottom_right: ChartPoint, border_color: _color.Col
     :param text_formatting: The formatting of the displayed text
     :return: A box object
     """
-    # Extract coordinates from ChartPoint objects based on xloc
-    if xloc == _xloc.bar_time:
-        left, top = top_left.time, top_left.price
-        right, bottom = bottom_right.time, bottom_right.price
-    else:  # xloc.bar_index (default)
-        left, top = top_left.index, top_left.price
-        right, bottom = bottom_right.index, bottom_right.price
+    if isinstance(top_left_or_left, ChartPoint):
+        top_left = top_left_or_left
+        bottom_right = bottom_right_or_top
+        if xloc == _xloc.bar_time:
+            left_val, top_val = top_left.time, top_left.price
+            right_val, bottom_val = bottom_right.time, bottom_right.price
+        else:
+            left_val, top_val = top_left.index, top_left.price
+            right_val, bottom_val = bottom_right.index, bottom_right.price
+    else:
+        left_val = int(top_left_or_left) if isinstance(top_left_or_left, float) else top_left_or_left
+        top_val = bottom_right_or_top
+        right_val = int(right) if isinstance(right, float) else right
+        bottom_val = bottom
 
     box = Box(
-        left=left,
-        top=top,
-        right=right,
-        bottom=bottom,
-        border_color=border_color,
-        border_width=border_width,
-        border_style=border_style,
-        extend=extend,
-        xloc=xloc,
-        bgcolor=bgcolor,
-        text=text,
-        text_size=text_size,
-        text_color=text_color,
-        text_halign=text_halign,
-        text_valign=text_valign,
-        text_wrap=text_wrap,
-        text_font_family=text_font_family,
-        text_formatting=text_formatting,
-        force_overlay=force_overlay,
-    )
-    _registry.append(box)
-    return box
-
-
-@overload
-def new(left: int, top: float, right: int, bottom: float,
-        border_color: _color.Color = _color.blue, border_width: int = 1,
-        border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
-        xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
-        text_size: _size.Size = _size.auto, text_color: _color.Color = _color.black,
-        text_halign: _text.AlignEnum = _text.align_center, text_valign: _text.AlignEnum = _text.align_center,
-        text_wrap: _text.WrapEnum = _text.wrap_none, text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none):
-    """
-    Creates a new box object.
-
-    :param left: Bar index (if xloc = xloc.bar_index) or UNIX time (if xloc = xloc.bar_time) of the
-                 left border of the box
-    :param top: Price of the top border of the box
-    :param right: Bar index (if xloc = xloc.bar_index) or UNIX time (if xloc = xloc.bar_time) of the
-                  right border of the box
-    :param bottom: Price of the bottom border of the box
-    :param border_color: Color of the four borders. Optional. The default is color.blue
-    :param border_width: Width of the four borders, in pixels. Optional. The default is 1 pixel
-    :param border_style: Style of the four borders. Possible values: line.style_solid,
-                         line.style_dotted, line.style_dashed
-    :param extend: When extend.none is used, the horizontal borders start at the left border and end at the right border
-    :param xloc: Determines whether the arguments to 'left' and 'right' are a bar index or a time value
-    :param bgcolor: Background color of the box. Optional. The default is color.blue
-    :param text: The text to be displayed inside the box. Optional. The default is empty string
-    :param text_size: Size of the box's text
-    :param text_color: The color of the text. Optional. The default is color.black
-    :param text_halign: The horizontal alignment of the box's text
-    :param text_valign: The vertical alignment of the box's text
-    :param text_wrap: Whether to wrap text. Wrapped text starts a new line
-    :param text_font_family: The font family of the text
-    :param force_overlay: If true, the drawing will display on the main chart pane
-    :param text_formatting: The formatting of the displayed text
-    :return: A box object
-    """
-    box = Box(
-        left=left,
-        top=top,
-        right=right,
-        bottom=bottom,
+        left=left_val,
+        top=top_val,
+        right=right_val,
+        bottom=bottom_val,
         border_color=border_color,
         border_width=border_width,
         border_style=border_style,
