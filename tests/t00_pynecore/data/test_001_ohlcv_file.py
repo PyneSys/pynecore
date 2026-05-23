@@ -1272,3 +1272,48 @@ def __test_ohlcv_json_conversion_alternative_wrappers__(tmp_path):
         candles = list(reader)
         assert len(candles) == 2
         assert candles[0].close == 105.0
+
+
+def __test_ohlcv_csv_conversion_databento_iso_nanoseconds__(tmp_path):
+    """Databento OHLCV CSV: `ts_event` column with nanosecond ISO timestamps."""
+    ohlcv_path = tmp_path / "databento_iso.ohlcv"
+    csv_path = tmp_path / "glbx-mdp3-ohlcv-1m.csv"
+
+    # Matches Databento's actual schema (see preview.csv sample).
+    with open(csv_path, 'w') as f:
+        f.write("ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol\n")
+        f.write("2022-01-03T19:06:00.000000000Z,33,1,206323,4765.0,4765.0,4765.0,4765.0,2,ESZ2\n")
+        f.write("2022-01-03T19:07:00.000000000Z,33,1,206323,4765.0,4766.0,4764.0,4765.5,5,ESZ2\n")
+        f.write("2022-01-03T19:08:00.000000000Z,33,1,206323,4765.5,4767.0,4765.0,4766.0,3,ESZ2\n")
+
+    with OHLCVWriter(ohlcv_path) as writer:
+        writer.load_from_csv(csv_path)
+
+    with OHLCVReader(ohlcv_path) as reader:
+        candles = list(reader)
+        assert len(candles) == 3
+        # 2022-01-03 19:06:00 UTC == 1641236760
+        assert candles[0].timestamp == 1641236760
+        assert candles[1].timestamp == 1641236820
+        assert candles[2].close == 4766.0
+
+
+def __test_ohlcv_csv_conversion_databento_nanosecond_integer__(tmp_path):
+    """Databento OHLCV CSV with raw nanosecond-since-epoch integer timestamps."""
+    ohlcv_path = tmp_path / "databento_int.ohlcv"
+    csv_path = tmp_path / "databento_ns_int.csv"
+
+    # 2022-01-03 19:06:00 UTC == 1_641_236_760 s == 1_641_236_760_000_000_000 ns
+    with open(csv_path, 'w') as f:
+        f.write("ts_event,open,high,low,close,volume\n")
+        f.write("1641236760000000000,4765.0,4765.0,4765.0,4765.0,2\n")
+        f.write("1641236820000000000,4765.0,4766.0,4764.0,4765.5,5\n")
+
+    with OHLCVWriter(ohlcv_path) as writer:
+        writer.load_from_csv(csv_path)
+
+    with OHLCVReader(ohlcv_path) as reader:
+        candles = list(reader)
+        assert len(candles) == 2
+        assert candles[0].timestamp == 1641236760
+        assert candles[1].timestamp == 1641236820

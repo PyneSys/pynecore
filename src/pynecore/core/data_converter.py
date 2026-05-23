@@ -112,6 +112,14 @@ class DataConverter:
             if provider is None and detected_provider is not None:
                 provider = detected_provider
 
+        # Fallback: peek inside CSV content (Databento puts the symbol in a column)
+        if (symbol is None or provider is None) and detected_format == 'csv':
+            content_symbol, content_provider = self.guess_symbol_from_csv_content(file_path)
+            if symbol is None and content_symbol:
+                symbol = content_symbol
+            if provider is None and content_provider:
+                provider = content_provider
+
         # Use default provider if not specified
         if provider is None:
             provider = "CUSTOM"
@@ -257,9 +265,10 @@ class DataConverter:
                         pass
             raise ConversionError(f"Failed to convert {file_path}: {e}") from e
 
-    # Column names that are part of standard OHLCV data (not extra fields)
+    # Column names that are part of standard OHLCV data (not extra fields).
+    # ts_event / ts_recv are Databento's timestamp column names.
     _OHLCV_COLUMNS = {
-        'timestamp', 'time', 'date', 'datetime',
+        'timestamp', 'time', 'date', 'datetime', 'ts_event', 'ts_recv',
         'open', 'high', 'low', 'close', 'volume',
     }
 
@@ -670,6 +679,49 @@ class DataConverter:
                 detected_symbol = clean_upper
 
         return detected_symbol, detected_provider
+
+    @staticmethod
+    def guess_symbol_from_csv_content(file_path: Path) -> tuple[str | None, str | None]:
+        """
+        Inspect the first row of a CSV file for symbol/provider hints that
+        cannot be derived from the filename.
+
+        Recognises Databento OHLCV exports (``ts_event`` / ``ts_recv`` timestamp
+        column tags the provider as ``databento``), and reads the ``symbol`` or
+        ``ticker`` column from the first data row when present.
+
+        :param file_path: Path to the CSV file
+        :return: Tuple of (symbol, provider). Either may be ``None``.
+        """
+        try:
+            with open(file_path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    return None, None
+
+                headers_lower = [h.lower().strip() for h in headers]
+
+                # Provider hint: Databento ships ts_event / ts_recv columns
+                provider: str | None = None
+                if 'ts_event' in headers_lower or 'ts_recv' in headers_lower:
+                    provider = 'databento'
+
+                # Symbol hint: first matching column from the first data row
+                symbol: str | None = None
+                for col in ('symbol', 'ticker'):
+                    if col in headers_lower:
+                        idx = headers_lower.index(col)
+                        first_row = next(reader, None)
+                        if first_row and idx < len(first_row):
+                            value = first_row[idx].strip()
+                            if value:
+                                symbol = value
+                        break
+
+                return symbol, provider
+        except (OSError, IOError, UnicodeDecodeError, csv.Error):
+            return None, None
 
     @staticmethod
     def guess_symbol_type(symbol_upper: str) -> tuple[Literal["forex", "crypto", "other"], str, str | None]:

@@ -445,6 +445,14 @@ def convert_from(
     if provider is None and detected_provider is not None:
         provider = detected_provider
 
+    # Fallback: peek into CSV content (Databento exports carry the symbol as a column)
+    if (symbol is None or provider is None) and file_path.suffix.lower() == '.csv':
+        content_symbol, content_provider = DataConverter.guess_symbol_from_csv_content(file_path)
+        if symbol is None and content_symbol:
+            symbol = content_symbol
+        if provider is None and content_provider:
+            provider = content_provider
+
     # Ensure we have required parameters
     if symbol is None:
         secho(f"Error: Could not detect symbol from filename '{file_path.name}'!", fg=colors.RED, err=True)
