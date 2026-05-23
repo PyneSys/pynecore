@@ -1570,17 +1570,15 @@ class SimPosition(PositionBase):
 
         # Skip market exit order processing if there's no open position (TradingView behavior)
         if not self.open_trades:
-            # Remove all exit orders when position is flat
+            # Remove orphan exit orders when position is flat. An exit is orphan
+            # when its ``order_id`` (the ``from_entry`` it was bound to) no longer
+            # has a pending entry — the entry was cancelled, margin-rejected, or
+            # never existed. Pending entries (limit/stop/market) keep their exits
+            # alive so the stop/limit fires once the entry fills.
             for order in list(self.exit_orders.values()):
                 if not order.is_market_order:
-                    # Check if there is an open market order with this ID
-                    try:
-                        entry_order = self.entry_orders[order.order_id]
-                        if entry_order.is_market_order:
-                            continue
-                    except KeyError:
-                        pass
-                    # Keep from_entry_na exits — they persist until filled or replaced
+                    if order.order_id in self.entry_orders:
+                        continue
                     if order.from_entry_na:
                         continue
                     self._remove_order(order)
