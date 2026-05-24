@@ -403,13 +403,26 @@ class OHLCVWriter:
             assert self._start_timestamp is not None
             interval = candle.timestamp - self._start_timestamp
             self._interval = interval
-            if interval <= 0:
-                raise ValueError(f"Invalid interval: {self._interval}")
+            if interval == 0:
+                raise ValueError(
+                    f"Duplicate timestamp {candle.timestamp} on consecutive rows. "
+                    f"Input data must contain a single bar per timestamp "
+                    f"(e.g. for Databento, pre-filter to one publisher_id / instrument_id).")
+            if interval < 0:
+                raise ValueError(
+                    f"Timestamps must be in chronological order. "
+                    f"Got {candle.timestamp} after {self._start_timestamp}.")
         elif self._size >= 2:  # Changed from elif self._size == 2: to properly handle all cases
             # Check chronological order
-            if self._last_timestamp is not None and candle.timestamp <= self._last_timestamp:
+            if self._last_timestamp is not None and candle.timestamp == self._last_timestamp:
                 raise ValueError(
-                    f"Timestamps must be in chronological order. Got {candle.timestamp} after {self._last_timestamp}")
+                    f"Duplicate timestamp {candle.timestamp} on consecutive rows. "
+                    f"Input data must contain a single bar per timestamp "
+                    f"(e.g. for Databento, pre-filter to one publisher_id / instrument_id).")
+            if self._last_timestamp is not None and candle.timestamp < self._last_timestamp:
+                raise ValueError(
+                    f"Timestamps must be in chronological order. "
+                    f"Got {candle.timestamp} after {self._last_timestamp}.")
 
             # Check if we found a smaller interval (indicates initial interval was wrong due to gap)
             if self._interval is not None and self._last_timestamp is not None:
