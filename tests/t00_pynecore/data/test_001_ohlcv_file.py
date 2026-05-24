@@ -312,13 +312,14 @@ def __test_chronological_order_validation__(tmp_path):
     # Verify the error message contains the expected text
     assert "Timestamps must be in chronological order" in str(excinfo.value)
 
-    # Try writing a timestamp equal to the last one - should also raise ValueError
+    # Try writing a timestamp equal to the last one - should also raise ValueError,
+    # but with the duplicate-specific message (more actionable for users).
     with pytest.raises(ValueError) as excinfo:
         with OHLCVWriter(file_path) as writer:
             writer.write(OHLCV(timestamp=1609459260, open=105.0, high=115.0, low=95.0, close=110.0, volume=1200.0))
 
     # Verify the error message
-    assert "Timestamps must be in chronological order" in str(excinfo.value)
+    assert "Duplicate timestamp" in str(excinfo.value)
 
 
 def __test_ohlcv_gap_filling_and_skipping__(tmp_path):
