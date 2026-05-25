@@ -10,7 +10,7 @@ See ``docs/pynecore/plugin-system/broker-plugin-plan.md`` for the full design.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,7 @@ __all__ = [
     'OcaType',
     'OcaPartialFillPolicy',
     'CapabilityLevel',
+    'PartialQtyBracketExitMode',
     'ExchangeOrder',
     'OrderEvent',
     'ExchangePosition',
@@ -156,6 +157,62 @@ class CapabilityLevel(StrEnum):
         return self is not CapabilityLevel.UNSUPPORTED
 
 
+class PartialQtyBracketExitMode(StrEnum):
+    """Mechanism a plugin uses to deliver partial-qty exit brackets.
+
+    A specialisation of :class:`CapabilityLevel` for the
+    :attr:`ExchangeCapabilities.partial_qty_bracket_exit` field only, because
+    the general :data:`~CapabilityLevel.SOFTWARE` value cannot disambiguate
+    the two software paths the order sync engine has to dispatch differently:
+
+    - :data:`UNSUPPORTED` — the plugin cannot attach a TP/SL/trailing leg to
+      a fraction of a position. ``strategy.exit(qty=N, from_entry='L', ...)``
+      with ``N < total_qty`` is rejected by
+      :func:`~pynecore.core.broker.validation.validate_at_startup` rather
+      than silently mis-hedging onto the whole row. Default for every
+      plugin.
+    - :data:`SOFTWARE_ENGINE_TRIGGER` — no parked broker order. The engine
+      arms an in-memory leg state machine per
+      ``strategy.exit`` call and dispatches a partial close via the plugin's
+      existing ``execute_close`` route when the price crosses the trigger
+      level. The plugin only needs the primitives it already has
+      (``execute_close`` partial-close, ``get_position``, WS quote feed).
+      Used by per-deal CFD brokers (Capital.com, IG, OANDA) where a
+      reduce-only flag is either absent or not submit-time guaranteed.
+    - :data:`SOFTWARE_REDUCE_ONLY_ORDER` — the plugin parks a reduce-only
+      working order at the trigger level and the exchange guarantees it can
+      only ever reduce the position, never open a new one. Used by
+      aggregated-position brokers with documented reduce-only semantics
+      (Bybit USDT-Perp, Binance Futures). Requires the three primitives
+      ``submit_reduce_only_working_order`` /
+      ``modify_reduce_only_working_order`` /
+      ``cancel_reduce_only_working_order``.
+    - :data:`NATIVE` — the exchange itself supports a partial-qty bracket
+      within a single position as a first-class primitive. Placeholder for
+      future plugins; no current broker delivers this.
+
+    The order sync engine matches on this enum to pick the dispatch path
+    (``_dispatch_engine_trigger_partial_bracket`` vs the reduce-only-order
+    path), so the explicit ENUM value carries the contract — no implicit
+    pairing with a companion field.
+    """
+    UNSUPPORTED = "unsupported"
+    SOFTWARE_ENGINE_TRIGGER = "software_engine_trigger"
+    SOFTWARE_REDUCE_ONLY_ORDER = "software_reduce_only_order"
+    NATIVE = "native"
+
+    @property
+    def is_supported(self) -> bool:
+        """``True`` for every mode except :data:`UNSUPPORTED`.
+
+        Mirrors :attr:`CapabilityLevel.is_supported` so
+        :func:`~pynecore.core.broker.validation.validate_at_startup` can
+        treat this field with the same ``capability.is_supported`` check it
+        uses for every other capability.
+        """
+        return self is not PartialQtyBracketExitMode.UNSUPPORTED
+
+
 # === Exchange state snapshots ===
 
 @dataclass
@@ -275,13 +332,39 @@ class ExchangeCapabilities:
     # OCA-reduce / cascade-cancel logic itself.
     tp_sl_bracket: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
-    # NATIVE / SOFTWARE = the plugin can attach TP/SL/trailing to a partial
-    # quantity of a position, so ``strategy.exit(qty=N, from_entry="L")``
-    # with ``N`` less than the full row qty is upheld correctly.
-    # UNSUPPORTED = position-attribute brackets only cover the full row
-    # (Capital.com ``stopLevel`` / ``profitLevel``); the validator rejects
-    # such scripts at startup rather than silently mis-hedging.
-    partial_qty_bracket_exit: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+    # Mechanism the plugin uses to deliver a partial-qty exit bracket
+    # (``strategy.exit(qty=N, from_entry="L", ...)`` with ``N`` less than
+    # the full row qty entered under ``"L"``). Uses a dedicated
+    # :class:`PartialQtyBracketExitMode` ENUM rather than
+    # :class:`CapabilityLevel` because the order sync engine has to dispatch
+    # the two software paths differently:
+    #
+    # - ``SOFTWARE_ENGINE_TRIGGER``: no parked broker order; the engine arms
+    #   a per-leg state machine and triggers a partial close via the
+    #   existing ``execute_close`` route on price cross. Capital.com / IG /
+    #   OANDA path.
+    # - ``SOFTWARE_REDUCE_ONLY_ORDER``: the plugin parks a reduce-only
+    #   working order at the trigger level; broker guarantees it can only
+    #   reduce, never open. Bybit / Binance path (future Slice C).
+    # - ``NATIVE``: exchange supports partial-qty bracket inside a single
+    #   position. Placeholder; no current broker delivers this.
+    # - ``UNSUPPORTED``: validator rejects such scripts at startup rather
+    #   than silently covering the whole row.
+    partial_qty_bracket_exit: PartialQtyBracketExitMode = (
+        PartialQtyBracketExitMode.UNSUPPORTED
+    )
+
+    # Companion to :attr:`partial_qty_bracket_exit`. ``True`` declares that
+    # the plugin can route a partial-qty bracket correctly even when the
+    # script's ``pyramiding > 1`` (i.e. multiple parent positions share the
+    # Pine ``entry_id`` "L"). Aggregated-position brokers (Bybit netting,
+    # Binance Futures) can flip this on once they implement the bracket
+    # path; per-deal brokers (Capital.com, IG) leave it ``False`` until the
+    # multi-row reduction-order routing question is answered empirically
+    # (see ``partial-qty-bracket-exit-plan.md`` §9 #13). When ``False`` the
+    # validator rejects ``pyramiding > 1`` scripts that need
+    # partial-qty bracket support, regardless of the chosen mechanism.
+    partial_qty_bracket_exit_supports_pyramiding: bool = False
 
     # === OCA cancel groups ===
     # NATIVE = the exchange tracks the OCA group and cancels siblings on
@@ -414,6 +497,32 @@ class ExitIntent:
     # subclass will introduce a separate hedge-aware intent rather than flip
     # this flag.
     reduce_only: bool = True
+    # ``True`` when the script asked for a TP/SL/trailing bracket on a
+    # *fraction* of the parent entry's declared quantity
+    # (``strategy.exit(qty=N, from_entry='L', tp=...)`` with ``N`` strictly
+    # less than the declared total under ``'L'``). The intent builder
+    # fills this from ``position.entry_orders[from_entry].size`` — the
+    # script's declaration, not the broker's actual fill — falling back
+    # to the ``open_trades`` aggregate when the entry Order has been
+    # cancelled / cleared. The order sync engine dispatches on this flag
+    # together with ``caps.partial_qty_bracket_exit`` to pick between the
+    # native bracket path (NATIVE), the engine-side trigger state machine
+    # (``SOFTWARE_ENGINE_TRIGGER``) and the parked reduce-only
+    # working-order path (``SOFTWARE_REDUCE_ONLY_ORDER``). A bracket on
+    # the whole row keeps this ``False`` and falls back to the existing
+    # full-row path.
+    #
+    # ``compare=False`` deliberately excludes the flag from
+    # :meth:`__eq__` / :meth:`__hash__`: it is a *route selector* derived
+    # from the intent, not state that needs to be diff-synced to the
+    # broker. The sync engine's qty-cap reconciliation
+    # (``_sync_pine_exit_qty``) mutates ``exit_orders[(exit_id, from_entry
+    # )].size`` after a partial entry fill so the next ``build_intents``
+    # produces an ExitIntent with the capped qty; including the derived
+    # flag in equality would let that cap mutation flip the flag and
+    # trigger a spurious second ``modify_exit`` dispatch even though
+    # nothing the broker needs to know has changed.
+    is_partial_qty_bracket: bool = field(default=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.reduce_only is not True:

@@ -557,7 +557,8 @@ class ScriptRunner:
             caps = self._broker_plugin.get_capabilities()
             reqs = getattr(self.script, '_broker_requirements', None)
             if reqs is not None:
-                errors = validate_at_startup(reqs, caps)
+                pyramiding = int(getattr(self.script, 'pyramiding', 1) or 1)
+                errors = validate_at_startup(reqs, caps, pyramiding=pyramiding)
                 if errors:
                     raise ExchangeCapabilityError(
                         "Script requirements not met by exchange:\n"

@@ -13,6 +13,7 @@ __all__ = ['validate_at_startup']
 def validate_at_startup(
         reqs: ScriptRequirements,
         caps: ExchangeCapabilities,
+        pyramiding: int = 1,
 ) -> list[str]:
     """
     Return a list of human-readable error strings — empty if all requirements
@@ -26,6 +27,19 @@ def validate_at_startup(
     has no channel today to declare a "must be native" requirement.
     Safety-first: better to refuse to start than to fail on the first
     unexpected bar in live trading.
+
+    :param pyramiding: ``strategy(pyramiding=...)`` from the running script;
+        ``1`` (the default) means single-row, where the partial-qty bracket
+        path is always safe — *unless* the script also calls
+        ``strategy.order()``, which is exempt from the pyramiding cap and
+        can open multiple same-id rows on its own. ``pyramiding > 1`` or
+        ``reqs.strategy_order=True`` activates the
+        :attr:`ExchangeCapabilities.partial_qty_bracket_exit_supports_pyramiding`
+        gate: the intent builder's
+        ``entry_orders[from_entry]`` lookup keys on a single Pine entry id
+        and would silently use the latest row's quantity if multiple rows
+        share that id, so the validator refuses to start until the plugin
+        explicitly opts the multi-row path in.
     """
     errors: list[str] = []
     if reqs.stop_orders and not caps.stop_order.is_supported:
@@ -64,5 +78,30 @@ def validate_at_startup(
             "split into (a) strategy.exit(qty=N) without bracket + "
             "(b) strategy.exit with bracket on the full row, or use a "
             "different broker."
+        )
+    if (
+        reqs.partial_qty_bracket_exit
+        and caps.partial_qty_bracket_exit.is_supported
+        and (pyramiding > 1 or reqs.strategy_order)
+        and not caps.partial_qty_bracket_exit_supports_pyramiding
+    ):
+        if reqs.strategy_order and pyramiding <= 1:
+            trigger = (
+                "Script uses strategy.order() (which is exempt from the "
+                "pyramiding cap and can open multiple same-id rows) "
+            )
+        else:
+            trigger = "Script combines strategy(pyramiding>1) "
+        errors.append(
+            trigger +
+            "with a partial-qty exit bracket "
+            "(strategy.exit(qty=N, from_entry='L', ...) where N is "
+            "less than the row total). This exchange plugin's partial-qty "
+            "bracket path is single-row only — multiple parent entries "
+            "sharing one Pine entry id would be routed against just the "
+            "latest row's declared quantity, silently mis-hedging the "
+            "older rows. Use strategy(pyramiding=1) without "
+            "strategy.order() on this broker, or switch to a plugin that "
+            "opts into partial-qty bracket pyramiding support."
         )
     return errors

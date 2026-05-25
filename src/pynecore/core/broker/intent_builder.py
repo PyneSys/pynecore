@@ -27,6 +27,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.lib.strategy import (
     Order,
+    Trade,
     _order_type_normal,
     _order_type_close,
 )
@@ -118,7 +119,12 @@ def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
     )
 
 
-def build_exit_intent(order: Order, symbol: str) -> ExitIntent:
+def build_exit_intent(
+        order: Order,
+        symbol: str,
+        *,
+        parent_total_qty: float = 0.0,
+) -> ExitIntent:
     """Translate a ``strategy.exit`` Pine order.
 
     Tick-based exits (``profit=``/``loss=``/``trail_points=``) carry unresolved
@@ -126,6 +132,14 @@ def build_exit_intent(order: Order, symbol: str) -> ExitIntent:
     fill price is known. The intent preserves the tick values
     **alongside** empty ``tp_price``/``sl_price`` fields; the sync engine
     resolves them on the corresponding entry fill event.
+
+    :param parent_total_qty: total open qty currently associated with the
+        ``from_entry`` Pine id — used to set
+        :attr:`ExitIntent.is_partial_qty_bracket` when the script asks for a
+        bracket on a fraction of the parent. ``0.0`` (the default) leaves
+        the flag ``False``; ``build_intents`` supplies the live value from
+        ``position.open_trades`` so the order sync engine can dispatch on
+        ``caps.partial_qty_bracket_exit``.
     """
     oca_name, oca_type_str = _coerce_oca(order)
     # Tick values take priority over explicit prices — mirrors Pine's
@@ -137,12 +151,30 @@ def build_exit_intent(order: Order, symbol: str) -> ExitIntent:
         order.trail_price is not None or order.trail_points_ticks is not None
     )
     trail_offset = order.trail_offset if has_trail else None
+    has_bracket_leg = (
+        tp_price is not None
+        or sl_price is not None
+        or trail_price is not None
+        or trail_offset is not None
+        or order.profit_ticks is not None
+        or order.loss_ticks is not None
+        or order.trail_points_ticks is not None
+    )
+    exit_qty = abs(order.size)
+    # A bracket on the whole row stays on the full-row dispatch path even
+    # when the capability advertises a partial-aware mechanism — Pine
+    # semantics for ``qty == total`` are identical to the simple bracket.
+    is_partial = (
+        has_bracket_leg
+        and parent_total_qty > 0.0
+        and exit_qty + 1e-12 < parent_total_qty
+    )
     return ExitIntent(
         pine_id=order.exit_id or "",
         from_entry=order.order_id or "",
         symbol=symbol,
         side=_side_from_size(order.size),
-        qty=abs(order.size),
+        qty=exit_qty,
         tp_price=tp_price,
         sl_price=sl_price,
         trail_price=trail_price,
@@ -157,6 +189,7 @@ def build_exit_intent(order: Order, symbol: str) -> ExitIntent:
         comment_loss=_na_to_none(order.comment_loss),
         comment_trailing=_na_to_none(order.comment_trailing),
         alert_message=_na_to_none(order.alert_message),
+        is_partial_qty_bracket=is_partial,
     )
 
 
@@ -192,6 +225,7 @@ def build_intents(
     entry_orders: dict,
     exit_orders: dict,
     symbol: str,
+    open_trades: Iterable[Trade] | None = None,
 ) -> list[EntryIntent | ExitIntent | CloseIntent]:
     """Flatten a position's pending orders into intent objects.
 
@@ -199,8 +233,25 @@ def build_intents(
     :class:`~pynecore.lib.strategy.SimPosition` exposes. Orders already
     marked ``cancelled`` (e.g. via OCA or :func:`strategy.cancel`) are
     filtered out — the caller treats their absence as an implicit cancel.
+
+    ``open_trades`` is ``position.open_trades`` — used solely to compute the
+    total open qty per ``from_entry`` for the partial-qty bracket flag on
+    :class:`ExitIntent`. Optional; when omitted the flag stays ``False``
+    and the exit falls back to the full-row dispatch path (the safe
+    default for unit tests and simulator-only callers that don't carry a
+    live trade ledger).
     """
     intents: list[EntryIntent | ExitIntent | CloseIntent] = []
+
+    qty_by_entry: dict[str, float] = {}
+    if open_trades is not None:
+        for trade in open_trades:
+            entry_id = trade.entry_id
+            if entry_id is None:
+                continue
+            qty_by_entry[entry_id] = (
+                qty_by_entry.get(entry_id, 0.0) + abs(trade.size)
+            )
 
     for order in _active(entry_orders.values()):
         intents.append(build_entry_intent(order, symbol))
@@ -212,7 +263,30 @@ def build_intents(
         elif kind == 'close':
             intents.append(build_close_intent(order, symbol, is_close_all=False))
         else:
-            intents.append(build_exit_intent(order, symbol))
+            from_entry = order.order_id or ""
+            # Script-intent first: the Pine declaration in
+            # ``entry_orders[from_entry]`` is the stable "what the script
+            # asked for" signal, and survives the fill (``record_fill``
+            # only touches ``open_trades``, never pops the entry Order).
+            # Falling back to ``open_trades`` would let broker fill noise
+            # (e.g. an overfill of 1.0 -> 1.2) flip the partial flag
+            # mid-lifecycle and trigger a spurious diff -> modify_exit
+            # dispatch — the flag must reflect script intent, not
+            # broker-actual state. ``open_trades`` is the fallback only
+            # when the entry Order is gone (cancelled / cleared);
+            # pyramiding+partial-bracket is blocked at the validator
+            # (``partial_qty_bracket_exit_supports_pyramiding=False``)
+            # until a per-plugin opt-in proves multi-row routing safe,
+            # so the "second strategy.entry overwrote the original"
+            # ambiguity does not arise on a supported path.
+            declared_entry = entry_orders.get(from_entry)
+            if declared_entry is not None:
+                parent_total_qty = abs(declared_entry.size)
+            else:
+                parent_total_qty = qty_by_entry.get(from_entry, 0.0)
+            intents.append(build_exit_intent(
+                order, symbol, parent_total_qty=parent_total_qty,
+            ))
 
     return intents
 

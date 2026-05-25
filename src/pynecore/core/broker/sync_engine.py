@@ -645,6 +645,7 @@ class OrderSyncEngine:
             self._position.entry_orders,
             self._position.exit_orders,
             self._symbol,
+            self._position.open_trades,
         )
         resolved = [self._resolve_ticks(i) for i in raw]
         final = self._apply_interceptors(resolved)

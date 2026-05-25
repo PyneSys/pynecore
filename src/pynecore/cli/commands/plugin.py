@@ -133,6 +133,7 @@ def plugin_info(
     if 'broker' in caps:
         from rich.table import Table
         from rich import box
+        from enum import StrEnum
         from ...core.broker.models import CapabilityLevel
 
         # ``get_capabilities`` is an instance method but well-behaved broker
@@ -173,9 +174,22 @@ def plugin_info(
             table.add_column("Level")
             # noinspection PyDataclass
             for f in dataclasses.fields(ex_caps):
-                value: CapabilityLevel = getattr(ex_caps, f.name)
-                colour = level_color.get(value, "white")
-                table.add_row(f.name, f"[{colour}]{value.value}[/{colour}]")
+                value = getattr(ex_caps, f.name)
+                # ``ExchangeCapabilities`` mixes CapabilityLevel,
+                # PartialQtyBracketExitMode (both StrEnum) and plain ``bool``
+                # (e.g. ``partial_qty_bracket_exit_supports_pyramiding``).
+                # Render each shape on its own terms instead of assuming
+                # every field has a ``.value`` attribute.
+                if isinstance(value, StrEnum):
+                    colour = level_color.get(value, "cyan")
+                    display = value.value
+                elif isinstance(value, bool):
+                    colour = "green" if value else "dim white"
+                    display = "yes" if value else "no"
+                else:
+                    colour = "white"
+                    display = str(value)
+                table.add_row(f.name, f"[{colour}]{display}[/{colour}]")
             Console().print(Padding(table, (0, 0, 0, 2)))
 
     config_cls: type | None = getattr(cls, 'Config', None)
