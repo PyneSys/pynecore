@@ -159,6 +159,23 @@ class MockBroker:
         self.modify_exit_calls.append((old, new))
         return [self._mk_order(new, 't')]
 
+    # Defensive-close residual contract — defaults mirror BrokerPlugin
+    # base. Tests that exercise residual cancellation override these on
+    # the instance.
+    residual_refs_for_reject: list[str] = field(default_factory=list)
+    cancel_broker_order_calls: list[str] = field(default_factory=list)
+    raise_on_next_cancel_broker_ref: Exception | None = None
+
+    def get_residual_orders_after_bracket_attach_reject(self, context):
+        return list(self.residual_refs_for_reject)
+
+    async def cancel_broker_order_ref(self, ref):
+        self.cancel_broker_order_calls.append(ref)
+        if self.raise_on_next_cancel_broker_ref is not None:
+            err = self.raise_on_next_cancel_broker_ref
+            self.raise_on_next_cancel_broker_ref = None
+            raise err
+
     async def get_open_orders(self, symbol=None):
         if self.raise_on_next_get_open_orders is not None:
             err = self.raise_on_next_get_open_orders
@@ -742,6 +759,370 @@ def __test_reconcile_clears_open_trades_when_exchange_flat__():
     assert pos.open_trades == []
     assert pos.openprofit == 0.0
     assert pos.open_commission == 0.0
+
+
+def __test_reconcile_pending_defensive_close_within_grace_does_not_halt__():
+    """A fresh pending marker (pending_since within the grace window)
+    must NOT halt — the close FILL is legitimately in flight."""
+    b = MockBroker()
+    b.position = None
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref='xchg-2',
+        pending_since=_time.time(),  # fresh
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    engine.reconcile()
+    assert engine.halted is False
+
+
+def __test_reconcile_pending_defensive_close_past_grace_halts__():
+    """A pending marker older than the grace window halts the run when
+    the broker still reports the position open — the FILL we are
+    waiting on is not coming and the close was not silently completed
+    server-side."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    # Broker still shows the position open — the close did NOT happen
+    # silently on the server, this is a genuine stuck-pending halt.
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=1.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref='xchg-2',
+        pending_since=_time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    with pytest.raises(BrokerManualInterventionError) as exc:
+        engine.reconcile()
+    assert exc.value.intent_key == '__pyne_defensive_close__coid-1'
+    assert engine.halted is True
+
+
+def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
+    """A pending marker past the grace window does NOT halt when the
+    broker snapshot already shows the position flat — the close did
+    settle, only the FILL event has not yet been queued (long restart
+    gap, poll-based broker)."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    b.position = None  # broker is flat — close already happened
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0  # reconcile-startup will adopt flat snapshot
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref='xchg-2',
+        close_client_order_id='coid-close-1',
+        pending_since=_time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    engine.reconcile()
+    assert engine.halted is False
+    # Marker is settled — duplicate caches seeded, marker dropped.
+    assert 'Long' not in engine._pending_defensive_close
+    assert (
+        '__pyne_defensive_close__coid-1'
+        in engine._settled_defensive_close_pine_ids
+    )
+    assert 'xchg-2' in engine._settled_defensive_close_order_refs
+    assert (
+        'coid-close-1'
+        in engine._settled_defensive_close_client_order_ids
+    )
+
+
+def __test_reconcile_pending_defensive_close_oldest_drives_halt__():
+    """When multiple markers exist, the OLDEST one drives the halt
+    message — so operator triage starts from the longest-stuck close."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    # Broker still shows the position open — both stale markers are
+    # genuinely stuck waiting for a FILL that did not arrive.
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=2.0, entry_price=1.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    older = _time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 120.0)
+    newer = _time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 30.0)
+    engine._pending_defensive_close['LongA'] = PendingDefensiveClose(
+        entry_id='LongA',
+        close_intent_key='__pyne_defensive_close__coid-A',
+        close_order_ref='xchg-A',
+        pending_since=newer,
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0LongA', position_coid='coid-A',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    engine._pending_defensive_close['LongB'] = PendingDefensiveClose(
+        entry_id='LongB',
+        close_intent_key='__pyne_defensive_close__coid-B',
+        close_order_ref='xchg-B',
+        pending_since=older,
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0LongB', position_coid='coid-B',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    with pytest.raises(BrokerManualInterventionError) as exc:
+        engine.reconcile()
+    assert exc.value.intent_key == '__pyne_defensive_close__coid-B'  # older one
+
+
+def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_reduced__():
+    """With pyramiding/multi-entry, a successful defensive close for one
+    entry reduces — but does not flatten — the netted aggregate position.
+    The stale-grace path must accept "broker matches engine's pre-close
+    view minus the closed entry's qty" as proof the close filled, instead
+    of false-halting because the aggregate is not zero."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    # Two long entries totalled 2.0; defensive close for one (qty=1.0)
+    # has filled silently, broker now reports the remaining 1.0 long.
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=1.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    # Engine still has the pre-close view (FILL not yet routed).
+    pos.size = 2.0
+    engine._pending_defensive_close['LongB'] = PendingDefensiveClose(
+        entry_id='LongB',
+        close_intent_key='__pyne_defensive_close__coid-B',
+        close_order_ref='xchg-B',
+        close_client_order_id='coid-close-B',
+        pending_since=_time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0),
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0LongB', position_coid='coid-B',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    # Should NOT halt: broker_signed=+1.0 matches expected
+    # (pos.size 2.0 minus marker qty 1.0 on the buy side).
+    engine.reconcile()
+    assert engine.halted is False
+    assert 'LongB' not in engine._pending_defensive_close
+    assert (
+        '__pyne_defensive_close__coid-B'
+        in engine._settled_defensive_close_pine_ids
+    )
+    # Engine view must track the broker snapshot we just used to prove
+    # settlement. Without this catch-up the engine would stay at the
+    # pre-close aggregate (2.0) while the broker is at 1.0 — periodic
+    # reconcile's adopt-mismatch branch only acts on startup, so the
+    # drift would survive until restart.
+    assert pos.size == 1.0
+    assert pos.sign == 1.0
+
+
+def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__():
+    """Pyramiding extension must NOT accept arbitrary leftover qty. If
+    the broker's reduction does not match the stale markers' aggregate
+    qty, the run must still halt — the deviation could mean the close
+    did not fill or an unrelated fill arrived."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    # Engine view: 2.0 long. Marker says close qty 1.0. Broker reports
+    # 1.5 long — no clean match (off by 0.5) — must halt.
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.5, entry_price=1.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+    pos.size = 2.0
+    engine._pending_defensive_close['LongB'] = PendingDefensiveClose(
+        entry_id='LongB',
+        close_intent_key='__pyne_defensive_close__coid-B',
+        close_order_ref='xchg-B',
+        pending_since=_time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0),
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0LongB', position_coid='coid-B',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    with pytest.raises(BrokerManualInterventionError) as exc:
+        engine.reconcile()
+    assert exc.value.intent_key == '__pyne_defensive_close__coid-B'
+    assert engine.halted is True
+
+
+def __test_no_fifo_defensive_close_fill_preserves_pyramiding_size__():
+    """When the engine has an adopted aggregate position (size != 0, no
+    open_trades) — for example pyramiding after a restart — and a
+    defensive close FILL for one entry arrives via the no-FIFO routing
+    branch, the in-memory position must shrink by the close's qty rather
+    than fully flatten. Otherwise the engine would think the position is
+    closed while the broker still has the other entries open.
+    """
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # Adopted-position state: two long entries netted to 2.0, no FIFO
+    # rows (typical of post-restart reconcile that adopted size but did
+    # not reconstruct ``open_trades``).
+    pos.size = 2.0
+    pos.sign = 1.0
+    pos.open_trades.clear()
+    engine._pending_defensive_close['LongB'] = PendingDefensiveClose(
+        entry_id='LongB',
+        close_intent_key='__pyne_defensive_close__coid-B',
+        close_order_ref='xchg-B',
+        close_client_order_id='coid-close-B',
+        pending_since=0.0,
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0LongB', position_coid='coid-B',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    # Defensive close FILL for LongB, qty 1.0, sell side.
+    engine.on_order_event(_fill_event(
+        'sell', qty=1.0, price=50_000.0,
+        pine_id="__pyne_defensive_close__coid-B",
+        leg=LegType.CLOSE,
+        xchg_id='xchg-B',
+    ))
+    engine.apply_async_events()
+    # Engine must track broker reality: 2.0 - 1.0 = 1.0 remaining long.
+    assert pos.size == 1.0
+    assert pos.sign == 1.0
+    # Marker was settled.
+    assert 'LongB' not in engine._pending_defensive_close
+
+
+def __test_no_fifo_defensive_close_fill_flattens_single_entry__():
+    """The original single-entry no-FIFO defensive close path must still
+    flatten the position. With ``pos.size == 1.0`` and a 1.0 close FILL,
+    the signed-delta logic naturally lands at zero (regression guard for
+    the historic flatten behaviour)."""
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades.clear()
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref='xchg-2',
+        close_client_order_id='coid-close-1',
+        pending_since=0.0,
+        reject_context=BracketAttachRejectContext(
+            intent_key='B\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    engine.on_order_event(_fill_event(
+        'sell', qty=1.0, price=50_000.0,
+        pine_id="__pyne_defensive_close__coid-1",
+        leg=LegType.CLOSE,
+        xchg_id='xchg-2',
+    ))
+    engine.apply_async_events()
+    assert pos.size == 0.0
+    assert pos.sign == 0.0
+    assert 'Long' not in engine._pending_defensive_close
+
+
+def __test_reconcile_plugin_override_grace_window__():
+    """A plugin can extend the grace window via the
+    ``defensive_close_resolution_grace_s`` class attribute — useful for
+    slow venues with multi-minute post-trade reporting latency."""
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    # Wider than default — the marker we install would halt under the
+    # default 30 s grace but stays under 5 minutes.
+    b.defensive_close_resolution_grace_s = 600.0  # type: ignore[attr-defined]
+    b.position = None
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref='xchg-2',
+        pending_since=_time.time() - (DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+    )
+    engine.reconcile()
+    assert engine.halted is False
 
 
 def __test_reconcile_no_change_when_sizes_match__():
@@ -1749,27 +2130,18 @@ def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
         assert (row.extras or {}).get('natural_close_at') is None
 
 
-def __test_bracket_reject_defensive_close_cleans_pine_orders_and_intents__(
+def __test_bracket_reject_defensive_close_pending_state_set_before_dispatch__(
         tmp_path,
 ):
-    """After a successful defensive close, the engine MUST drop the
-    entry intent + bracket exit intent from ``_active_intents`` AND
-    clear ``position.entry_orders[from_entry]`` /
-    ``position.exit_orders[(*, from_entry)]``.
+    """The engine arms a :class:`PendingDefensiveClose` marker on the
+    parent entry id BEFORE the synthetic close dispatches.
 
-    Without this proactive cleanup, the next :meth:`sync` rebuilds
-    the same entry+bracket pair from Pine's order book and
-    re-dispatches the bracket. ``execute_exit`` then raises
-    :class:`ExchangeOrderRejectedError` because the parent entry row
-    is flagged ``natural_close_at`` (so ``_find_active_entry_row``
-    returns ``None``) and the exchange has already flattened the
-    position via the defensive close (so ``get_position`` also returns
-    ``None``), falling through to the hard reject.
-
-    The close FILL event still triggers
-    :meth:`_cleanup_closed_position` when it arrives via the activity
-    stream, but the helper is idempotent — calling it on already-clean
-    state is a no-op.
+    This is the load-bearing invariant of the defensive-close pending
+    lifecycle: the close FILL may race in synchronously with the
+    dispatch return, so the marker has to exist by the time the route
+    layer asks "is this FILL ours?". The marker survives in
+    ``engine.pending_defensive_close`` and is mirrored to the parent
+    entry row's ``extras['defensive_close_pending']``.
     """
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.run_identity import RunIdentity
@@ -1807,10 +2179,6 @@ def __test_bracket_reject_defensive_close_cleans_pine_orders_and_intents__(
             store_ctx=ctx,
         )
 
-        # Seed the Pine-side order book + matching active-intent state
-        # — what ``build_intents`` would produce after Pine called
-        # ``strategy.entry('Long')`` + ``strategy.exit('Bracket',
-        # from_entry='Long', ...)``.
         pos.entry_orders["Long"] = _entry_order("Long", 1.0, limit=50_000.0)
         pos.exit_orders[("Bracket", "Long")] = _exit_order(
             "Long", -1.0, "Bracket", limit=51_000.0, stop=49_000.0,
@@ -1818,18 +2186,91 @@ def __test_bracket_reject_defensive_close_cleans_pine_orders_and_intents__(
 
         engine.sync(BAR_TS)
 
-        # Defensive close was issued (sanity guard).
+        # Marker exists in-memory under the parent entry id.
+        marker = engine.pending_defensive_close.get("Long")
+        assert marker is not None
+        assert marker.entry_id == "Long"
+        assert marker.close_intent_key == "__pyne_defensive_close__coid-entry"
+        # close_order_ref captured from the successful dispatch (mock returns xchg-N).
+        assert marker.close_order_ref == "xchg-2"
+        assert marker.reject_context.position_coid == "coid-entry"
+        assert marker.reject_context.symbol == SYMBOL
+
+        # Mirrored to the parent entry row's extras for cross-restart replay.
+        row = ctx.get_order('coid-entry')
+        assert row is not None
+        assert 'defensive_close_pending' in row.extras
+        persisted = row.extras['defensive_close_pending']
+        assert persisted['entry_id'] == 'Long'
+        assert persisted['close_intent_key'] == "__pyne_defensive_close__coid-entry"
+
+
+def __test_bracket_reject_defensive_close_cleanup_deferred_to_fill__(
+        tmp_path,
+):
+    """``_active_intents`` + Pine ``entry_orders`` / ``exit_orders``
+    state for the parent stay PUT immediately after the defensive
+    close dispatches — cleanup is deferred to the FILL handler so
+    :meth:`reconcile` cannot misclassify the flat broker snapshot as
+    an external flatten while the close is in flight.
+
+    A future change that re-introduces dispatch-time cleanup would
+    silently re-open the same-bar duplicate-entry race the lifecycle
+    redesign closed.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry',
+            symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+            exchange_order_id='deal-L',
+            pine_entry_id='Long',
+            filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+
+        b = MockBroker()
+        b.raise_on_next_exit = _bracket_reject_error()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        pos.entry_orders["Long"] = _entry_order("Long", 1.0, limit=50_000.0)
+        pos.exit_orders[("Bracket", "Long")] = _exit_order(
+            "Long", -1.0, "Bracket", limit=51_000.0, stop=49_000.0,
+        )
+
+        engine.sync(BAR_TS)
+
+        # Defensive close dispatched (sanity guard).
         assert len(b.close_calls) == 1
 
-        # Pine-side order dicts cleared for this from_entry — next
-        # sync would build no intents for 'Long', preventing the
-        # spurious bracket re-dispatch that previously crashed with
-        # ExchangeOrderRejectedError.
-        assert "Long" not in pos.entry_orders
-        assert ("Bracket", "Long") not in pos.exit_orders
-
-        # Engine-side tracking also cleared.
-        assert "Long" not in engine.active_intents
+        # Cleanup deferred — state intact until the close FILL arrives.
+        assert "Long" in pos.entry_orders
+        assert ("Bracket", "Long") in pos.exit_orders
+        assert "Long" in engine.active_intents
+        # The sibling exit intent did get dropped (its dispatch raised
+        # the reject — the engine surfaces OrderSkippedByPlugin which
+        # the diff loop translates into "do not register").
         assert "Bracket\0Long" not in engine.active_intents
 
 
@@ -1915,8 +2356,14 @@ def __test_bracket_reject_skips_sibling_exit_for_same_from_entry_in_diff_loop__(
         # emit a duplicate (or escalate to halt if the plugin path raised
         # a plain ``ExchangeOrderRejectedError`` instead).
         assert len(b.close_calls) == 1
-        # Engine state still cleaned (sibling cleanup is idempotent).
-        assert 'Long' not in engine.active_intents
+        # The parent entry intent intentionally STAYS in ``_active_intents``
+        # until the close FILL — the defensive-close pending lifecycle
+        # uses it as the guard that keeps :meth:`reconcile` from flipping
+        # state out from under us while the close is in flight.
+        assert 'Long' in engine.active_intents
+        # Neither sibling bracket made it into ``_active_intents``:
+        # ``BracketA`` was raised away by its own dispatch, ``BracketB``
+        # was short-circuited by the defensively-closed-this-sync guard.
         assert 'BracketA\0Long' not in engine.active_intents
         assert 'BracketB\0Long' not in engine.active_intents
         # No halt — defensive recovery completed and absorbed both siblings.
@@ -1992,6 +2439,511 @@ def __test_bracket_reject_marker_survives_apply_async_events_to_sync__(tmp_path)
     # And cleared at end of sync — fresh bar starts clean.
     assert 'Long' not in engine._defensively_closed_entries_this_sync
     assert engine.halted is False
+
+
+def _bracket_reject_scenario(tmp_path, mock_broker=None):
+    """Set up an engine that has just dispatched a defensive close —
+    pending marker is armed, parent state intact, and a defensive close
+    FILL event has not yet arrived. Used as a fixture by the FILL-handler
+    regression tests below.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker")
+    ctx = store.open_run(
+        RunIdentity(
+            strategy_id="t025",
+            symbol=SYMBOL,
+            timeframe="60",
+            account_id="testbroker-demo",
+            label=None,
+        ),
+        script_source="src",
+        script_path="t025.py",
+    )
+    ctx.upsert_order(
+        'coid-entry',
+        symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+        exchange_order_id='deal-L',
+        pine_entry_id='Long',
+        filled_qty=1.0,
+        extras={'kind': 'position'},
+    )
+
+    b = mock_broker if mock_broker is not None else MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        mintick=1.0,
+        store_ctx=ctx,
+    )
+
+    pos.entry_orders["Long"] = _entry_order("Long", 1.0, limit=50_000.0)
+    pos.exit_orders[("Bracket", "Long")] = _exit_order(
+        "Long", -1.0, "Bracket", limit=51_000.0, stop=49_000.0,
+    )
+
+    engine.sync(BAR_TS)
+    return store, ctx, engine, pos, b
+
+
+def __test_defensive_close_fill_runs_deferred_cleanup__(tmp_path):
+    """When the defensive close FILL arrives via the WS path (pine_id
+    matches the synthetic close_intent_key), the engine runs the
+    deferred parent-entry cleanup that the dispatch-time path now
+    skips."""
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        # Defensive close FILL arrives — synthetic pine_id carries the
+        # close_intent_key.
+        engine.on_order_event(_fill_event(
+            'sell', qty=1.0, price=50_000.0,
+            pine_id="__pyne_defensive_close__coid-entry",
+            leg=LegType.CLOSE,
+            xchg_id='xchg-2',
+        ))
+        engine.apply_async_events()
+
+        # Parent entry + bracket exit + Pine order book all cleared
+        # NOW (FILL-time), not at dispatch time.
+        assert "Long" not in engine.active_intents
+        assert "Long" not in pos.entry_orders
+        assert ("Bracket", "Long") not in pos.exit_orders
+        # Marker dropped both in-memory and from extras.
+        assert "Long" not in engine.pending_defensive_close
+        row = ctx.get_order('coid-entry')
+        assert row is not None
+        assert 'defensive_close_pending' not in row.extras
+    finally:
+        store.close()
+
+
+def __test_defensive_close_fill_matched_by_order_ref__(tmp_path):
+    """A polled-orders FILL event without ``pine_id`` still routes to
+    the defensive-close cleanup via ``close_order_ref`` match."""
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        # FILL with pine_id=None, but order.id matches the captured
+        # close_order_ref (xchg-2 from the mock's defensive close
+        # dispatch).
+        exch = ExchangeOrder(
+            id='xchg-2', symbol=SYMBOL, side='sell',
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
+            remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        )
+        engine.on_order_event(OrderEvent(
+            order=exch, event_type='filled', fill_price=50_000.0,
+            fill_qty=1.0, timestamp=0.0, pine_id=None, leg_type=LegType.CLOSE,
+        ))
+        engine.apply_async_events()
+
+        assert "Long" not in engine.active_intents
+        assert "Long" not in engine.pending_defensive_close
+    finally:
+        store.close()
+
+
+def __test_defensive_close_fill_writes_audit_event__(tmp_path):
+    """A ``'defensive_close_filled'`` audit event lands in the events
+    table on FILL — startup replay uses it to detect that a marker has
+    already settled after a process restart."""
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        engine.on_order_event(_fill_event(
+            'sell', qty=1.0, price=50_000.0,
+            pine_id="__pyne_defensive_close__coid-entry",
+            leg=LegType.CLOSE,
+            xchg_id='xchg-2',
+        ))
+        engine.apply_async_events()
+
+        rows = list(store._conn.execute(
+            "SELECT kind, intent_key, client_order_id FROM events "
+            "WHERE kind = 'defensive_close_filled'"
+        ))
+        assert len(rows) == 1
+        kind, intent_key, client_order_id = rows[0]
+        assert kind == 'defensive_close_filled'
+        assert intent_key == "__pyne_defensive_close__coid-entry"
+        assert client_order_id == 'coid-entry'
+    finally:
+        store.close()
+
+
+def __test_defensive_close_fill_is_idempotent__(tmp_path):
+    """A second FILL event for the same close finds no marker and is a
+    no-op — covers re-delivery scenarios (WS replay, manual FILL
+    injection in tests, polled-orders cycle racing the WS path)."""
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        fill = _fill_event(
+            'sell', qty=1.0, price=50_000.0,
+            pine_id="__pyne_defensive_close__coid-entry",
+            leg=LegType.CLOSE,
+            xchg_id='xchg-2',
+        )
+        engine.on_order_event(fill)
+        engine.apply_async_events()
+        assert "Long" not in engine.pending_defensive_close
+
+        # Replay the same FILL — marker is already gone, helper is a no-op.
+        engine.on_order_event(fill)
+        engine.apply_async_events()
+
+        rows = list(store._conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = 'defensive_close_filled'"
+        ))
+        # Exactly one audit event (the second FILL did not write a duplicate).
+        assert rows[0][0] == 1
+    finally:
+        store.close()
+
+
+def _seed_pending_marker_in_store(
+        ctx, *, position_coid: str, entry_id: str,
+        close_intent_key: str, close_order_ref: str | None,
+        pending_since: float,
+        residual_refs: list[str] | None = None,
+) -> None:
+    """Write a fully-formed defensive_close_pending payload onto the
+    parent entry row's extras column — used to simulate a marker that
+    survived from a prior process instance."""
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    marker = PendingDefensiveClose(
+        entry_id=entry_id,
+        close_intent_key=close_intent_key,
+        close_order_ref=close_order_ref,
+        pending_since=pending_since,
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0' + entry_id,
+            position_coid=position_coid,
+            position_side='buy',
+            qty=1.0,
+            symbol=SYMBOL,
+        ),
+    )
+    row = ctx.get_order(position_coid)
+    extras = dict(row.extras or {}) if row is not None else {}
+    extras['defensive_close_pending'] = marker.to_extras_dict()
+    ctx.upsert_order(position_coid, extras=extras)
+
+
+def __test_startup_replay_settled_drops_marker__(tmp_path):
+    """When a 'defensive_close_filled' audit event exists for the
+    marker's close_intent_key, startup replay drops the marker without
+    re-arming — the FILL settled in the prior instance, current
+    instance has nothing to wait on."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        _seed_pending_marker_in_store(
+            ctx, position_coid='coid-entry', entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-entry',
+            close_order_ref='xchg-2',
+            pending_since=_time.time(),
+        )
+        # Prior-instance audit event proving the FILL already settled.
+        ctx.log_event(
+            kind='defensive_close_filled',
+            intent_key='__pyne_defensive_close__coid-entry',
+            client_order_id='coid-entry',
+            payload={'entry_id': 'Long'},
+        )
+
+        b = MockBroker()
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        # Marker dropped both from memory and from extras.
+        assert 'Long' not in engine.pending_defensive_close
+        row = ctx.get_order('coid-entry')
+        assert 'defensive_close_pending' not in row.extras
+
+
+def __test_startup_replay_unsettled_rearms_marker_and_runs_residual_cancel__(
+        tmp_path,
+):
+    """A marker without a matching audit event is re-armed in-memory
+    AND the residual cancel loop is re-run via the plugin idempotency
+    contract — covers crashes between dispatch and FILL."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        pending_since = _time.time() - 5.0  # fresh enough to skip the timeout halt
+        _seed_pending_marker_in_store(
+            ctx, position_coid='coid-entry', entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-entry',
+            close_order_ref='xchg-2',
+            pending_since=pending_since,
+        )
+
+        b = MockBroker()
+        b.residual_refs_for_reject = ['residual-tp', 'residual-sl']
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        # Marker re-armed in-memory with the same fields.
+        marker = engine.pending_defensive_close.get('Long')
+        assert marker is not None
+        assert marker.close_intent_key == '__pyne_defensive_close__coid-entry'
+        assert marker.pending_since == pending_since
+
+        # Residual cancel loop replayed — both refs cancelled.
+        assert b.cancel_broker_order_calls == ['residual-tp', 'residual-sl']
+
+        # Extras marker still present (replay does not clear unsettled markers).
+        row = ctx.get_order('coid-entry')
+        assert 'defensive_close_pending' in row.extras
+
+
+def __test_startup_replay_idempotent_second_invocation__(tmp_path):
+    """A second invocation on the same state runs the residual cancel
+    again (idempotent by plugin contract) but does not double-register
+    the marker — supports the runner calling replay twice during
+    startup quirks (e.g. a manual mid-startup pause)."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        _seed_pending_marker_in_store(
+            ctx, position_coid='coid-entry', entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-entry',
+            close_order_ref='xchg-2',
+            pending_since=_time.time() - 5.0,
+        )
+
+        b = MockBroker()
+        b.residual_refs_for_reject = ['residual-tp']
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+        engine._replay_pending_defensive_closes()
+
+        assert len(engine.pending_defensive_close) == 1
+        # Residual cancelled twice — plugin contract guarantees this is safe.
+        assert b.cancel_broker_order_calls == ['residual-tp', 'residual-tp']
+
+
+def __test_startup_replay_drops_malformed_payload__(tmp_path):
+    """A malformed extras payload (manual DB tampering, schema-skew
+    after a bad migration) is logged + removed; the engine keeps going
+    instead of crashing on a deserialize error."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={
+                'kind': 'position',
+                'defensive_close_pending': {'garbage': True},  # malformed
+            },
+        )
+
+        b = MockBroker()
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        assert engine.pending_defensive_close == {}
+        row = ctx.get_order('coid-entry')
+        assert 'defensive_close_pending' not in row.extras
+
+
+def __test_startup_replay_parked_unresolved_defers_residual_cancel__(tmp_path):
+    """Parked-unresolved markers (close_order_ref=None, no fill, no audit)
+    must DEFER the residual cancel to the runtime parked-recovery path.
+
+    Cancelling residual TP/SL/partial-remainder orders during replay —
+    BEFORE :meth:`_verify_pending_dispatches` confirms the parked
+    defensive close actually landed on the exchange — would create an
+    unprotected-position window across restart. The dispatch-time path
+    explicitly gates residual cancel on ``dispatch_succeeded == True``;
+    replay must mirror that gate."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        _seed_pending_marker_in_store(
+            ctx, position_coid='coid-entry', entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-entry',
+            close_order_ref=None,  # parked-unresolved
+            pending_since=_time.time() - 5.0,
+        )
+
+        b = MockBroker()
+        b.residual_refs_for_reject = ['residual-tp', 'residual-sl']
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        # Marker re-armed in memory.
+        marker = engine.pending_defensive_close.get('Long')
+        assert marker is not None
+        assert marker.close_order_ref is None
+        # Residual cancel DEFERRED — no cancel calls during replay.
+        assert b.cancel_broker_order_calls == []
+        # Persisted marker untouched (no stamp of residual_cleanup_pending).
+        row = ctx.get_order('coid-entry')
+        payload = row.extras['defensive_close_pending']
+        assert payload.get('residual_cleanup_pending') in (False, None)
+
+
+def __test_startup_replay_parked_with_cleanup_pending_runs_residual_cancel__(
+        tmp_path,
+):
+    """A parked marker stamped ``residual_cleanup_pending=True`` by a
+    prior instance still runs the residual cancel on replay — the prior
+    instance already confirmed cleanup was due (the flag is only stamped
+    AFTER a known dispatch / recovery), so the replay must finish the
+    retry instead of stalling until the FILL lands."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        # Manually construct a marker with residual_cleanup_pending=True —
+        # the helper does not expose the field.
+        marker = PendingDefensiveClose(
+            entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-entry',
+            close_order_ref=None,
+            pending_since=_time.time() - 5.0,
+            reject_context=BracketAttachRejectContext(
+                intent_key='Bracket\0Long',
+                position_coid='coid-entry',
+                position_side='buy',
+                qty=1.0,
+                symbol=SYMBOL,
+            ),
+            residual_cleanup_pending=True,
+        )
+        row = ctx.get_order('coid-entry')
+        extras = dict(row.extras or {})
+        extras['defensive_close_pending'] = marker.to_extras_dict()
+        ctx.upsert_order('coid-entry', extras=extras)
+
+        b = MockBroker()
+        b.residual_refs_for_reject = ['residual-tp']
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0,
+            store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        # Residual cancel executed — the prior-instance flag overrides
+        # the parked-unresolved deferral.
+        assert b.cancel_broker_order_calls == ['residual-tp']
 
 
 def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):

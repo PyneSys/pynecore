@@ -458,6 +458,15 @@ class ScriptRunner:
                 self._order_sync_engine.run_event_stream(),
                 self._broker_event_loop,
             )
+        # Defensive-close pending markers from prior process instances
+        # must be re-armed (or dropped, if the FILL already settled)
+        # BEFORE the startup reconcile so the reconcile snapshot reflects
+        # the in-flight-close set the engine should preserve through
+        # ``_active_intents``. Without the replay a fresh process could
+        # treat a flat exchange as an external flatten and re-enter on
+        # the next bar against a position the previous instance was
+        # already closing defensively.
+        self._order_sync_engine._replay_pending_defensive_closes()
         self._order_sync_engine.reconcile()
 
     # === Order-processing dispatch =========================================

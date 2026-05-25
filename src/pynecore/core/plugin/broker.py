@@ -31,6 +31,7 @@ from pynecore.core.broker.models import CancelIntent, DispatchEnvelope
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import (
+        BracketAttachRejectContext,
         ExchangeOrder,
         ExchangePosition,
         ExchangeCapabilities,
@@ -83,6 +84,20 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     instance attribute on the plugin before the script runner starts.
     The class-level default is the strict fallback used by test paths
     that construct plugins without the CLI.
+    """
+
+    defensive_close_resolution_grace_s: float | None = None
+    """
+    Grace window (seconds) for a defensive close FILL to settle after
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._handle_bracket_attach_after_fill_reject`
+    dispatches it. The engine halts the run when a pending marker
+    survives this window — the missing FILL means an operator must
+    intervene.
+
+    ``None`` (default) uses the engine's built-in default
+    (``DEFENSIVE_CLOSE_RESOLUTION_GRACE_S``, currently 30 seconds).
+    Plugins on slow venues with multi-minute post-trade reporting
+    latency may override.
     """
 
     on_unexpected_cancel: str = "stop"
@@ -213,6 +228,81 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     async def execute_cancel_all(self, symbol: str | None = None) -> int:
         """Cancel all open orders.  Returns the count cancelled."""
         raise ExchangeCapabilityError("Bulk cancel not supported")
+
+    # === Defensive-close recovery (bracket attach reject) ===
+
+    # noinspection PyMethodMayBeStatic,PyUnusedLocal
+    def get_residual_orders_after_bracket_attach_reject(
+            self, context: 'BracketAttachRejectContext',
+    ) -> list[str]:
+        """Enumerate broker-side orders the engine must cancel as part of
+        defensive recovery after a bracket attach reject.
+
+        Called by the engine's defensive-close path (see
+        :class:`~pynecore.core.broker.exceptions.BracketAttachAfterFillRejectedError`
+        and the ``defensive-close-pending-lifecycle`` design dossier)
+        after the engine has dispatched the defensive close. The returned
+        broker-side refs are passed back one-by-one to
+        :meth:`cancel_broker_order_ref`.
+
+        Default implementation returns an empty list. Plugins that
+        raise :class:`BracketAttachAfterFillRejectedError` MUST override
+        this method when their execution model can leave residual
+        cancellable orders, namely:
+
+        - Residual unfilled portion of a partial-fill parent entry that
+          is NOT auto-cancelled by the exchange when the bracket attach
+          fails.
+        - Separate TP/SL order entities (when the exchange does not use
+          position-attached protective levels).
+
+        Implementations MUST be safe to call repeatedly with the same
+        context — startup replay invokes it again so terminal orders may
+        legitimately drop out of the list between calls.
+
+        :param context: Recovery context built from the raised
+            :class:`BracketAttachAfterFillRejectedError`.
+        :return: List of exchange-native order refs to cancel. Empty by
+            default; the engine treats an empty list as "no residual
+            cleanup required".
+        """
+        return []
+
+    # noinspection PyMethodMayBeStatic,PyUnusedLocal
+    async def cancel_broker_order_ref(self, ref: str) -> None:
+        """Cancel a broker-side order by its raw exchange ref.
+
+        Used by engine-internal recovery flows that operate on refs
+        outside the Pine intent system — currently the defensive-close
+        residual-cancel loop after a
+        :class:`~pynecore.core.broker.exceptions.BracketAttachAfterFillRejectedError`.
+
+        **Idempotency contract** (MUST be honoured by every plugin that
+        overrides this method):
+
+        - "not found" / "already cancelled" / "already filled" responses
+          from the exchange MUST be normalized to a successful no-op
+          return (NO exception).
+        - Transient connectivity failures MUST raise
+          :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError`
+          or
+          :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`
+          so the engine can retry on the next reconcile / restart.
+        - Any other exchange-side rejection (e.g.
+          :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`)
+          MUST propagate — the engine treats it as an operator-attention
+          condition and halts.
+
+        The default implementation raises :class:`NotImplementedError`
+        — plugins that return non-empty lists from
+        :meth:`get_residual_orders_after_bracket_attach_reject` MUST
+        also override this method.
+        """
+        raise NotImplementedError(
+            "cancel_broker_order_ref() must be overridden by plugins that "
+            "return non-empty lists from "
+            "get_residual_orders_after_bracket_attach_reject()"
+        )
 
     # === Modify (upsert/replace) ===
 

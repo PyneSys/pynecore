@@ -1333,6 +1333,33 @@ class RunContext:
                 ),
             )
 
+    def find_event_by_intent_key(
+            self, intent_key: str, kind: str,
+    ) -> bool:
+        """Return ``True`` iff at least one event with the given
+        ``intent_key`` and ``kind`` exists for this *logical* run.
+
+        Scoped to ``run_id``, not ``run_instance_id`` — the engine's
+        startup replay uses this to detect whether a defensive-close
+        FILL event was recorded in a *previous* process instance (whose
+        adopted orders carry over into the current run). A query
+        scoped to the current ``run_instance_id`` would always miss
+        cross-restart settlements and re-arm markers that are already
+        done.
+
+        The JOIN cost is amortised over the rare set of startup-replay
+        invocations; the ``runs.run_id`` lookup uses the existing
+        ``idx_runs_run_id`` index.
+        """
+        row = self._store._conn.execute(
+            "SELECT 1 FROM events AS e "
+            "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+            "WHERE r.run_id = ? AND e.intent_key = ? AND e.kind = ? "
+            "LIMIT 1",
+            (self.run_id, intent_key, kind),
+        ).fetchone()
+        return row is not None
+
     def iter_events_by_kind_since(
             self, kind: str, since_ts_ms: int,
     ) -> Iterator[dict]:
@@ -1362,6 +1389,51 @@ class RunContext:
                 yield json.loads(raw)
             except ValueError:
                 continue
+
+    def iter_events_by_kind_for_run_id(
+            self, kind: str,
+    ) -> Iterator[tuple[str | None, str | None, str | None, dict]]:
+        """Iterate events of a given ``kind`` across every run instance
+        sharing this logical ``run_id``.
+
+        Scoped to ``runs.run_id`` (not ``run_instance_id``) — the engine's
+        startup replay uses this to recover dedup state from
+        ``defensive_close_filled`` audit events written by prior process
+        instances. The ``find_event_by_intent_key`` helper only answers
+        "does any matching event exist?"; this iterator returns the
+        identifying columns + payload so callers can reseed in-memory
+        caches.
+
+        Yields ``(intent_key, client_order_id, exchange_order_id,
+        payload_dict)`` tuples in insertion order. Rows with malformed
+        payloads yield an empty dict (the column data is still
+        useful).
+        """
+        rows = self._store._conn.execute(
+            "SELECT e.intent_key, e.client_order_id, e.exchange_order_id, "
+            "       e.payload "
+            "FROM events AS e "
+            "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+            "WHERE r.run_id = ? AND e.kind = ? "
+            "ORDER BY e.ts_ms ASC",
+            (self.run_id, kind),
+        )
+        for row in rows:
+            raw = row['payload']
+            payload: dict = {}
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+            yield (
+                row['intent_key'],
+                row['client_order_id'],
+                row['exchange_order_id'],
+                payload,
+            )
 
     # --- Lifecycle --------------------------------------------------------
 

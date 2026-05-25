@@ -105,38 +105,62 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
     synthetic :class:`~pynecore.core.broker.models.CloseIntent` for the
     parent position, and dispatches that. The runner continues.
 
-    :ivar position_deal_id: Exchange-side identifier of the unprotected
-        open position.
+    Engine-side recovery uses a derived
+    :class:`~pynecore.core.broker.models.BracketAttachRejectContext` as
+    the formal hand-off to the plugin's
+    :meth:`~pynecore.core.plugin.broker.BrokerPlugin.get_residual_orders_after_bracket_attach_reject`
+    method — this exception is the *transport* (chained cause, message),
+    the context is the *contract* (data the engine needs to settle the
+    defensive close).
+
     :ivar position_coid: Client-order-id of the unprotected open position
-        (the parent ENTRY row in BrokerStore).
-    :ivar symbol: Trading symbol of the unprotected position.
+        (the parent ENTRY row in BrokerStore). Universal recovery key
+        across plugins — required.
     :ivar position_side: Side of the OPEN position (``"buy"`` for long,
         ``"sell"`` for short). The defensive close picks the opposite.
     :ivar qty: Quantity of the unprotected position (units the close
         intent must flatten).
+    :ivar symbol: Trading symbol of the unprotected position.
+    :ivar position_deal_id: Exchange-side identifier of the unprotected
+        open position, when the plugin can supply one. Broker-specific
+        (Capital.com deal id, IB permId, Bybit orderId, ...); optional —
+        recovery must not rely on it for correctness.
     :ivar from_entry: Pine ``strategy.entry`` id, when the bracket attach
         originated from a Pine ``strategy.exit``. Used for log
         correlation; not required for the close itself.
+    :ivar exit_id: Pine ``strategy.exit`` id when applicable.
+    :ivar filled_qty: Parent quantity already filled at the time of the
+        reject. ``None`` falls back to ``qty`` (conservative).
+    :ivar error_code: Exchange-side error code, if any.
+    :ivar error_message: Exchange-side error message, if any.
     """
 
     def __init__(
             self,
             message: str,
             *,
-            position_deal_id: str,
             position_coid: str,
             symbol: str,
             position_side: str,
             qty: float,
+            position_deal_id: str | None = None,
             from_entry: str | None = None,
+            exit_id: str | None = None,
+            filled_qty: float | None = None,
+            error_code: str | None = None,
+            error_message: str | None = None,
     ) -> None:
         super().__init__(message)
-        self.position_deal_id = position_deal_id
         self.position_coid = position_coid
         self.symbol = symbol
         self.position_side = position_side
         self.qty = qty
+        self.position_deal_id = position_deal_id
         self.from_entry = from_entry
+        self.exit_id = exit_id
+        self.filled_qty = filled_qty
+        self.error_code = error_code
+        self.error_message = error_message
 
 
 class ExchangeRateLimitError(BrokerError):
