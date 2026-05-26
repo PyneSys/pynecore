@@ -39,7 +39,14 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
-from pynecore.core.broker.idempotency import KIND_CLOSE
+from pynecore.core.broker.idempotency import (
+    KIND_CLOSE,
+    KIND_ENTRY,
+    KIND_EXIT_SL_PARTIAL,
+    KIND_EXIT_TP_PARTIAL,
+    KIND_EXIT_TRAIL_PARTIAL,
+    build_client_order_id,
+)
 from pynecore.core.broker.intent_builder import build_intents
 from pynecore.lib.log import (
     broker_info as _blog_info,
@@ -64,12 +71,42 @@ from pynecore.core.broker.models import (
     OcaPartialFillPolicy,
     OcaType,
     OrderEvent,
+    PartialQtyBracketExitMode,
     PendingDefensiveClose,
+)
+from pynecore.core.broker.native_failsafe_manager import (
+    FailsafeHealth,
+    FailsafeOwner,
+    NativeBracketSnapshot,
+    NativeFailsafeManager,
+)
+from pynecore.core.broker.software_partial_bracket_engine import (
+    PartialBracketLeg,
+    SoftwarePartialBracketEngine,
+    TickOffsetResolver,
 )
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
     PendingRecord,
     RunContext,
+)
+from pynecore.core.broker.store_helpers import (
+    EXTRAS_KEY_INTENT_PARTIAL_QTY,
+    EXTRAS_KEY_LEG_KIND,
+    EXTRAS_KEY_LEG_STATE,
+    EXTRAS_KEY_OCA_GROUP,
+    EXTRAS_KEY_OCA_TYPE,
+    EXTRAS_KEY_PARENT_ENTRY_DISPATCH_REF,
+    EXTRAS_KEY_PARENT_PINE_ENTRY_ID,
+    EXTRAS_KEY_TRIGGER_LEVEL,
+    EXTRAS_KEY_TRIGGER_OFFSET,
+    LEG_KIND_SL_PARTIAL,
+    LEG_KIND_TP_PARTIAL,
+    LEG_KIND_TRAIL_PARTIAL,
+    LEG_STATE_ACTIVE,
+    LEG_STATE_ARMED,
+    LEG_STATE_PENDING_ENTRY,
+    create_engine_trigger_partial_leg_row,
 )
 from pynecore.types.na import na_float
 
@@ -92,6 +129,39 @@ override the value via
 older than the grace window means the FILL we are waiting on has not
 arrived in time and the engine halts so an operator can investigate.
 """
+
+
+class _PartialBracketModifyDeferred(Exception):
+    """Internal control-flow signal raised by :meth:`OrderSyncEngine._dispatch_modify`
+    when an engine-trigger partial-bracket modify cannot be dispatched right now
+    (e.g. the §2.6.7 broker-native fail-safe gate blocks the replacement).
+
+    Caught by :meth:`OrderSyncEngine._diff_and_dispatch` to skip the
+    ``_active_intents[key] = intent`` promotion: the old legs are still armed
+    and the next sync must re-run the diff against the previous intent. Without
+    this signal the diff would treat Pine == active and never retry once the
+    fail-safe recovers, leaving the engine watching stale TP/SL/qty levels.
+
+    Module-private — never propagates outside :mod:`sync_engine`.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class _EngineTriggerLegSpec:
+    """Per-leg spec produced by :meth:`OrderSyncEngine._enumerate_engine_trigger_legs`.
+
+    Bundles the four leg attributes the engine-trigger partial bracket
+    dispatch needs to write a leg row and seed the in-memory
+    :class:`~pynecore.core.broker.software_partial_bracket_engine.PartialBracketLeg`.
+    All distance fields are normalised to price units (raw tick inputs
+    are multiplied by ``mintick`` before reaching here).
+    """
+    leg_kind: str
+    kind_code: str
+    trigger_level: float | None
+    trigger_offset: float | None
+    trail_activation_level: float | None = None
+    trail_activation_offset: float | None = None
 
 
 class OrderSyncEngine:
@@ -171,6 +241,34 @@ class OrderSyncEngine:
         caps = broker.get_capabilities()
         self._oca_cancel_native = caps.oca_cancel is CapabilityLevel.NATIVE
         self._tp_sl_bracket_native = caps.tp_sl_bracket is CapabilityLevel.NATIVE
+        # Capability cache for the partial-qty bracket dispatch switch.
+        # The companion ``partial_qty_bracket_exit_supports_pyramiding``
+        # flag is enforced once at startup by ``validate_at_startup``;
+        # the engine itself only needs the mode value at dispatch time.
+        self._partial_qty_bracket_exit_mode = caps.partial_qty_bracket_exit
+        # §2.6 broker-native fail-safe worst-SL manager (Slice A.7).
+        # Like the partial-bracket state machine it is always
+        # constructed — the dispatch path is the one that decides
+        # whether any parent gets registered for fail-safe tracking.
+        # The :attr:`_native_bracket_dispatcher` (set by the runner /
+        # plugin opt-in) is the bridge to the actual ``PUT /positions``
+        # call; without it, the manager still owns the state machine
+        # and emits events but no broker traffic is generated. Slice B
+        # wires the dispatcher on Capital.com.
+        self._native_failsafe_manager = NativeFailsafeManager(
+            event_sink=self._emit_broker_event,
+        )
+        self._native_bracket_dispatcher: (
+            Callable[[NativeBracketSnapshot], None] | None
+        ) = None
+        # Engine-trigger partial bracket state machine. The state
+        # machine itself is cheap to keep around (empty ledger when the
+        # mode is UNSUPPORTED), so it is constructed unconditionally —
+        # the dispatch switch decides whether it ever sees a leg.
+        self._partial_bracket_engine = SoftwarePartialBracketEngine(
+            store_ctx=store_ctx,
+            state_change_listener=self._on_partial_bracket_leg_state_change,
+        )
 
         self._active_intents: dict[str, Intent] = {}
         self._order_mapping: dict[str, list[str]] = {}
@@ -185,6 +283,19 @@ class OrderSyncEngine:
         self._interceptors: list[Callable[[Intent], InterceptorResult]] = []
         self._sync_count = 0
         self._current_bar_ts_ms: int = 0
+        # Set during ``__init__`` when the persisted partial-bracket leg
+        # ledger contains active rows: defers
+        # :meth:`_rehydrate_native_failsafe_from_replayed_legs` to the
+        # first :meth:`sync` call. ``_current_bar_ts_ms`` is still ``0``
+        # at construction time, so anchoring ``register_parent``'s
+        # ``degrading_since_ts_ms`` / ``recompute_worst_sl``'s
+        # ``last_desired_change_ts_ms`` here would let the first real
+        # :meth:`drive_native_failsafe` tick the stale window from epoch
+        # zero and immediately promote the freshly rehydrated state to
+        # ``DEGRADED`` — dropping the queued reattach PUT. Running the
+        # rehydrate after :meth:`sync` assigns a real ``bar_ts_ms``
+        # gives the stale-window timer a sane anchor.
+        self._pending_native_failsafe_rehydrate: bool = False
         # OCA groups already processed inside the current :meth:`sync` pass.
         # Cleared at the start of every sync so a fresh bar re-enables cascade,
         # but kept stable within the pass so two fills in the same group do
@@ -382,6 +493,38 @@ class OrderSyncEngine:
                     "broker state replay: %d envelope(s), %d pending verification(s)",
                     len(envelopes), len(pending),
                 )
+            # Rebuild the engine-trigger partial bracket ledger from
+            # persisted leg rows. Without this call a process restart
+            # with an active partial bracket leaves the in-memory
+            # ledger empty while the rows live on in SQLite — the
+            # WATCH phase would never re-arm them, and the dispatch
+            # guard would happily accept a duplicate bracket on the
+            # same parent. See the partial-qty bracket exit design
+            # dossier §3.5.
+            self._partial_bracket_engine.restart_replay()
+            # Rehydrate the broker-native fail-safe manager from the
+            # replayed legs. ``NativeFailsafeManager`` was just
+            # constructed empty, so without this call there is no
+            # ``NativeStopState`` for any parent that owned partial
+            # legs across the restart — the §2.6.7 worst-SL recompute
+            # path returns early, no broker-native stop snapshot is
+            # queued, and the degraded-state gates do not fire until a
+            # new leg transition happens. Walk the replayed legs and
+            # register each unique parent + trigger an immediate
+            # worst-SL recompute so the safety state machine reflects
+            # the persisted partial bracket.
+            #
+            # Defer the work to the first :meth:`sync`: at construction
+            # time ``_current_bar_ts_ms`` is still ``0``, and running
+            # rehydrate with that anchor would let the first real
+            # :meth:`drive_native_failsafe` tick the stale window from
+            # epoch zero and immediately demote the freshly rehydrated
+            # state to ``DEGRADED``. The deferred flag is only set when
+            # there is something to rehydrate (active legs present); a
+            # restart without partial brackets is a no-op.
+            self._pending_native_failsafe_rehydrate = any(
+                True for _ in self._partial_bracket_engine.iter_legs()
+            )
 
     # === Public API ===
 
@@ -616,6 +759,19 @@ class OrderSyncEngine:
             self._persisted_envelope_anchors = dict(envelopes)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
+        # Restart-replay native fail-safe rehydrate: deferred from
+        # ``__init__`` so ``_current_bar_ts_ms`` carries a real epoch-ms
+        # anchor before any :meth:`register_parent` /
+        # :meth:`recompute_worst_sl` call. Running it here — after the
+        # assignment above and before any state mutation — guarantees
+        # that the stale-window timer in :meth:`drive_native_failsafe`
+        # (called at the end of this ``sync``) measures from the bar
+        # timestamp, not from epoch zero, so the freshly rehydrated
+        # ``DEGRADING`` state stays in ``DEGRADING`` long enough for the
+        # queued reattach PUT to dispatch.
+        if self._pending_native_failsafe_rehydrate:
+            self._pending_native_failsafe_rehydrate = False
+            self._rehydrate_native_failsafe_from_replayed_legs()
         self._cancelled_oca_groups_this_sync.clear()
         # ``_defensively_closed_entries_this_sync`` is intentionally NOT
         # cleared here: :meth:`_handle_bracket_attach_after_fill_reject`
@@ -661,6 +817,14 @@ class OrderSyncEngine:
 
         self._diff_and_dispatch(dispatchable)
         self._cleanup_unused_adoption_markers()
+        # Drain native failsafe dispatches into the plugin dispatcher
+        # (§2.6 worst-SL drive loop). The manager accumulates snapshots
+        # via the leg state-change listener / ``recompute_worst_sl``;
+        # without this drain the broker-native stop would never get
+        # placed or refreshed in live runs. Idempotent — a no-op when
+        # no plugin dispatcher is installed or the manager has nothing
+        # queued.
+        self.drive_native_failsafe(now_ms=float(self._current_bar_ts_ms))
         # End-of-sync clear: the defensive-close markers populated during
         # this sync (whether by an ``apply_async_events`` drain on this
         # bar or by the in-line ``_drain_events`` above) have now been
@@ -2320,6 +2484,7 @@ class OrderSyncEngine:
                 self._drain_unapplied_defensive_close_partials(event.pine_id)
                 self._resolve_deferred_for_entry(event.pine_id)
                 self._amend_bracket_qty_for_entry_fill(event)
+                self._promote_pending_partial_bracket_legs(event)
             self._cascade_oca_cancel(event)
             # When a closing leg fully closes the position, drop the
             # entry + matching exit intents and clear Pine's order
@@ -2391,6 +2556,9 @@ class OrderSyncEngine:
                     "unexpected cancel for intent %s (%s)",
                     key, event,
                 )
+                self._abort_pending_partial_legs_for_dead_entry(
+                    key, reason='parent_cancelled',
+                )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
@@ -2414,6 +2582,9 @@ class OrderSyncEngine:
                     "order rejected for intent %s (%s)",
                     key, event,
                 )
+                self._abort_pending_partial_legs_for_dead_entry(
+                    key, reason='parent_rejected',
+                )
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
@@ -2421,6 +2592,60 @@ class OrderSyncEngine:
                 _blog_warning(
                     "order rejected (%s)", event,
                 )
+
+    def _abort_pending_partial_legs_for_dead_entry(
+            self, intent_key: str, *, reason: str,
+    ) -> None:
+        """Cancel ``pending_entry`` partial-bracket legs when the parent
+        entry never fills (cancel/reject terminal event).
+
+        An absolute-price ``strategy.exit`` issued before the parent fill
+        persists durable ``LEG_STATE_PENDING_ENTRY`` rows
+        (see :meth:`_dispatch_engine_trigger_partial_bracket`). The cancel
+        / reject branches that drop the entry intent + mapping must also
+        retire those legs, otherwise a later same-``from_entry`` reuse can
+        promote them against the wrong parent (different
+        ``parent_entry_dispatch_ref``) and dispatch closes / fail-safe PUTs
+        on the new position.
+
+        ``intent_key`` is whatever :meth:`_find_key_for_order_id` returned;
+        for entry intents that is the parent's ``pine_id`` (== the leg's
+        ``from_entry``). Exit / close keys carry a NUL separator and do
+        not match any leg's ``from_entry``, so this method becomes a
+        no-op on the exit / close branches.
+
+        The aborted legs leave behind their parent :class:`ExitIntent`
+        slot in :attr:`_active_intents` / :attr:`_order_mapping`. Without
+        retiring those slots here, a later sync that re-issues the same
+        entry under the same ``pine_id`` together with the same partial
+        ``strategy.exit`` would diff the still-active ExitIntent against
+        the freshly emitted one, see them as equal (dataclass equality on
+        identical params) and skip
+        :meth:`_dispatch_engine_trigger_partial_bracket` — the new
+        position would land without partial TP / SL protection. Drop
+        every ExitIntent whose ``from_entry`` matches the dying parent
+        so the next sync re-dispatches its legs.
+        """
+        intent = self._active_intents.get(intent_key)
+        if not isinstance(intent, EntryIntent):
+            return
+        self._partial_bracket_engine.abort_pending_legs_for_parent_never_arrived(
+            symbol=self._symbol,
+            from_entry=intent_key,
+            reason=reason,
+        )
+        # Drop any ExitIntent slots whose ``from_entry`` matches the
+        # dying parent. Collect first to avoid mutating ``_active_intents``
+        # during iteration.
+        exit_keys_to_drop = [
+            key for key, active in self._active_intents.items()
+            if isinstance(active, ExitIntent)
+            and active.from_entry == intent_key
+        ]
+        for exit_key in exit_keys_to_drop:
+            self._active_intents.pop(exit_key, None)
+            self._order_mapping.pop(exit_key, None)
+            self._drop_envelope(exit_key)
 
     def _drop_envelope(self, key: str) -> None:
         """Remove envelope state for ``key`` and persist a ``complete`` marker.
@@ -3238,6 +3463,62 @@ class OrderSyncEngine:
         :meth:`_handle_bracket_attach_after_fill_reject` — a follow-up
         invocation on the same id finds nothing to do.
         """
+        # §2.6.7 retire: capture any parent_entry_dispatch_ref still
+        # tracked under this entry id BEFORE the partial-bracket cascade
+        # evicts the legs (the manager keys on the parent COID, not on
+        # the Pine entry_id, so we have to fish the COID out of the
+        # leg ledger while it is still populated).
+        retired_refs: set[str] = set()
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.from_entry == closed_entry_id and leg.parent_entry_dispatch_ref:
+                retired_refs.add(leg.parent_entry_dispatch_ref)
+        # Also retire by the entry envelope's COID — covers the case
+        # where every partial leg already terminated naturally (no leg
+        # to walk above) but the failsafe state is still parked under
+        # the parent's engine-side COID.
+        parent_envelope = self._envelopes.get(closed_entry_id)
+        if parent_envelope is not None:
+            retired_refs.add(parent_envelope.client_order_id(KIND_ENTRY))
+        else:
+            # Restart path: ``_envelopes`` was repopulated only for parents
+            # that Pine has re-emitted in this run, but a parent entry that
+            # filled in an earlier run carries its COID-bearing state only
+            # in ``_persisted_envelope_anchors``. If every partial leg has
+            # also terminated before the parent flattens (so the leg walk
+            # above contributes nothing), we still must retire the
+            # ``NativeStopState`` keyed on the byte-identical
+            # ``KIND_ENTRY`` COID — otherwise a DEGRADING/DEGRADED state
+            # parked by the previous run blocks new entries on a symbol
+            # whose position is already flat (see :meth:`block_new_entry`
+            # / §2.6.7). Mirror the anchor-rebuild pattern used by every
+            # other restart-aware path that resolves a parent COID.
+            parent_anchor = self._persisted_envelope_anchors.get(closed_entry_id)
+            if parent_anchor is not None:
+                retired_refs.add(
+                    build_client_order_id(
+                        run_tag=self._run_tag,
+                        pine_id=closed_entry_id,
+                        bar_ts_ms=parent_anchor.bar_ts_ms,
+                        kind=KIND_ENTRY,
+                        retry_seq=parent_anchor.retry_seq,
+                    ),
+                )
+        for ref in retired_refs:
+            self._native_failsafe_manager.on_deal_id_disappeared(
+                ref, now_ms=float(self._current_bar_ts_ms),
+            )
+        # Cascade-cancel any active engine-trigger partial legs under
+        # this entry — the parent just flattened, so every leg's row
+        # must be marked ``cascaded_cancel_by_parent_close`` and the
+        # in-memory ledger purged. Without this, a proactive cleanup
+        # path (e.g. bracket-attach-after-fill defensive close) leaves
+        # the leg rows live until a later sync; they could be replayed
+        # after restart or matched against a new position reusing the
+        # same ``from_entry``.
+        self._partial_bracket_engine.cascade_cancel_by_parent_close(
+            symbol=self._symbol,
+            from_entry=closed_entry_id,
+        )
         # Entry intent + its mapping/envelope.
         self._active_intents.pop(closed_entry_id, None)
         self._order_mapping.pop(closed_entry_id, None)
@@ -3331,10 +3612,24 @@ class OrderSyncEngine:
         bracket_key: str | None = None
         bracket_intent: ExitIntent | None = None
         for key, intent in self._active_intents.items():
-            if isinstance(intent, ExitIntent) and intent.from_entry == pine_id:
-                bracket_key = key
-                bracket_intent = intent
-                break
+            if not isinstance(intent, ExitIntent):
+                continue
+            if intent.from_entry != pine_id:
+                continue
+            # Partial-qty (scale-out) brackets carry a script-declared
+            # qty that is intentionally smaller than the parent fill —
+            # e.g. ``strategy.exit(qty=2)`` against a 10-unit entry. The
+            # cumulative-fill amend path is designed for whole-row
+            # brackets whose qty should track the parent fill; applying
+            # it to a partial bracket would silently grow the scale-out
+            # to the parent fill size and close more than the strategy
+            # requested. The engine-trigger / reduce-only working order
+            # paths own the per-leg qty bookkeeping for partial brackets.
+            if intent.is_partial_qty_bracket:
+                continue
+            bracket_key = key
+            bracket_intent = intent
+            break
         if bracket_key is None or bracket_intent is None:
             return
 
@@ -3368,6 +3663,66 @@ class OrderSyncEngine:
         ))
         if overfill:
             self._emit_overfill_event(new_intent, entry_intent, filled_qty)
+
+    def _promote_pending_partial_bracket_legs(self, event: OrderEvent) -> None:
+        """Promote ``pending_entry`` partial-bracket legs on a parent fill.
+
+        Engine-trigger partial brackets dispatched against an unfilled
+        limit/stop parent are persisted as :data:`LEG_STATE_PENDING_ENTRY`
+        with a deliberate gate in :meth:`_dispatch_engine_trigger_partial_bracket`:
+        the leg cannot be ``armed`` until the parent is live in
+        ``open_trades``, otherwise :meth:`SoftwarePartialBracketEngine.on_price_tick`
+        would refuse the trigger via the ``parent_flat`` safety check.
+        That fill arrives here; without this promotion the legs sit in
+        ``pending_entry`` forever and the WATCH-phase tick handler skips
+        them (it only iterates armed legs), so the bracket never fires.
+
+        Idempotent: :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
+        is a no-op for legs already in ``armed`` (or any other) state, so
+        repeated ENTRY fills on the same ``pine_id`` (cumulative-partial
+        progression) do not double-promote.
+        """
+        pine_id = event.pine_id
+        if pine_id is None:
+            return
+        parent_trade = None
+        for trade in self._position.open_trades:
+            if trade.entry_id == pine_id:
+                parent_trade = trade
+                break
+        if parent_trade is None:
+            # Parent fill recorded but ``open_trades`` does not yet carry a
+            # row for ``pine_id`` (e.g. the no-FIFO terminal branch already
+            # closed it inside the same event). No live parent → no leg to
+            # promote against; the cascade-cancel path handles cleanup.
+            return
+        parent_sign = parent_trade.sign
+        if parent_sign > 0.0:
+            parent_side = 'long'
+        elif parent_sign < 0.0:
+            parent_side = 'short'
+        else:
+            return
+        fill_price = event.fill_price
+        if fill_price is None or fill_price <= 0.0:
+            # The engine resolves tick-offset legs against ``fill_price``;
+            # without it we cannot compute an absolute level. Absolute-price
+            # legs would still be promotable, but the on_parent_entry_filled
+            # path needs a usable ``fill_price`` for the trail-activation /
+            # tick-offset branches, so skip the whole promotion. A later
+            # FILL with a populated price (or the stale-grace timer) drives
+            # the recovery; meanwhile the WATCH phase keeps the legs
+            # ``pending_entry`` rather than firing against a missing price.
+            return
+        resolver = TickOffsetResolver(self._mintick)
+        self._partial_bracket_engine.on_parent_entry_filled(
+            symbol=self._symbol,
+            from_entry=pine_id,
+            fill_price=float(fill_price),
+            parent_side=parent_side,
+            parent_qty=parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size,
+            resolver=resolver,
+        )
 
     def _sync_pine_exit_qty(self, bracket: ExitIntent, new_qty: float) -> None:
         """Mutate the Pine-side exit :class:`Order` to match the amended qty.
@@ -3415,6 +3770,389 @@ class OrderSyncEngine:
             self._broker_event_sink(event)
         except Exception:  # pragma: no cover — defensive
             _log.exception("broker_event_sink raised for event %r", event)
+
+    # === §2.6 / §2.6.7 broker-native fail-safe wiring =====================
+
+    def set_native_bracket_dispatcher(
+            self,
+            dispatcher: 'Callable[[NativeBracketSnapshot], None] | None',
+    ) -> None:
+        """Inject the plugin-side hook that realises a desired native
+        bracket snapshot on the broker (PUT /positions/{dealId} on
+        Capital.com).
+
+        The dispatcher receives one :class:`NativeBracketSnapshot` per
+        call and must report the outcome back through
+        :meth:`record_native_bracket_put_success` /
+        :meth:`record_native_bracket_put_failure`. Without a registered
+        dispatcher the §2.6 fail-safe state machine still runs (worst-SL
+        recompute, ownership transitions, event emission) but no broker
+        traffic is generated — the model used by Slice A unit tests and
+        by Slice B until the Capital.com plugin opts in.
+        """
+        self._native_bracket_dispatcher = dispatcher
+
+    def record_native_bracket_put_success(
+            self,
+            parent_entry_dispatch_ref: str,
+            *,
+            generation: int,
+            now_ms: float,
+    ) -> None:
+        """Plugin-side hook: a PUT carrying ``generation`` returned 200."""
+        self._native_failsafe_manager.record_put_success(
+            parent_entry_dispatch_ref,
+            generation=generation,
+            now_ms=now_ms,
+        )
+
+    def record_native_bracket_put_failure(
+            self,
+            parent_entry_dispatch_ref: str,
+            *,
+            generation: int,
+            reason: str,
+            now_ms: float,
+    ) -> None:
+        """Plugin-side hook: a PUT carrying ``generation`` failed."""
+        self._native_failsafe_manager.record_put_failure(
+            parent_entry_dispatch_ref,
+            generation=generation,
+            reason=reason,
+            now_ms=now_ms,
+        )
+
+    def record_native_bracket_observed(
+            self,
+            parent_entry_dispatch_ref: str,
+            *,
+            stop_level: float | None,
+            profit_level: float | None,
+            trailing_stop: float | None,
+            now_ms: float,
+    ) -> None:
+        """Plugin-side hook: reconcile snapshot reports the broker-side
+        bracket levels for ``parent_entry_dispatch_ref``.
+
+        Drives the §2.6.7 ``DEGRADING → HEALTHY`` recovery transition: a
+        successful PUT only clears ``pending_put`` via
+        :meth:`record_native_bracket_put_success`; the actual confirmation
+        that the broker is now carrying the desired snapshot lands here.
+        Without this hook a restart-replayed parent registered with
+        ``pending_confirmation=True`` (so ``DEGRADING``) would stay
+        ``DEGRADING`` until the stale-window timer escalates to
+        ``DEGRADED``, blocking new entries / brackets until a manual
+        ``reset_to_engine``.
+
+        Plugins should call this once per reconcile pass for every parent
+        with an active engine-failsafe state, passing the broker's current
+        bracket triple (``stop_level``, ``profit_level``, ``trailing_stop``)
+        — pass ``None`` for fields the broker is not carrying.
+        """
+        self._native_failsafe_manager.on_native_bracket_observed(
+            parent_entry_dispatch_ref,
+            stop_level=stop_level,
+            profit_level=profit_level,
+            trailing_stop=trailing_stop,
+            now_ms=now_ms,
+        )
+
+    def _rehydrate_native_failsafe_from_replayed_legs(self) -> None:
+        """Seed :class:`NativeFailsafeManager` state from replayed legs.
+
+        Scheduled by ``__init__`` (via
+        ``_pending_native_failsafe_rehydrate``) and actually executed
+        at the top of the first :meth:`sync` once ``_current_bar_ts_ms``
+        has been set to a real bar timestamp. Walks the ledger,
+        deduplicates per ``parent_entry_dispatch_ref``, registers each
+        parent with the manager, and triggers the worst-SL recompute
+        so the §2.6 broker-native fail-safe state machine has an
+        accurate snapshot. ``parent_side`` is derived from the leg's
+        ``side`` field — the leg's recorded side is the CLOSE side, so
+        ``sell`` → parent LONG, ``buy`` → parent SHORT (see
+        :class:`PartialBracketLeg` docstring).
+
+        Without this seeding the §2.6.7 fail-safe path produces no
+        ``NativeStopState`` for the parent, the recompute path returns
+        early, and the broker-native stop snapshot stays absent until a
+        new leg transition happens — which can be too late if the
+        first post-restart bar already crosses a stop level.
+        """
+        seen: dict[str, tuple[str, str]] = {}
+        # Track parents whose replayed legs include at least one armed SL /
+        # trail contributor. TP-only brackets never seed a broker-native
+        # worst-SL, so registering them with ``pending_confirmation=True``
+        # would strand the state in ``DEGRADING`` forever: the subsequent
+        # ``recompute_worst_sl`` would compare ``None`` desired against
+        # the existing ``None`` desired and queue no PUT, leaving no
+        # confirmation path to flip the state back to ``HEALTHY``.
+        expects_native_sl: set[str] = set()
+        for leg in self._partial_bracket_engine.iter_legs():
+            ref = leg.parent_entry_dispatch_ref
+            if not ref or ref in seen:
+                continue
+            if leg.side == 'sell':
+                parent_side = 'long'
+            elif leg.side == 'buy':
+                parent_side = 'short'
+            else:
+                continue
+            seen[ref] = (leg.symbol, parent_side)
+        for leg in self._partial_bracket_engine.iter_legs():
+            ref = leg.parent_entry_dispatch_ref
+            if not ref or ref not in seen:
+                continue
+            if leg.leg_state not in LEG_STATE_ACTIVE:
+                continue
+            if leg.leg_kind == LEG_KIND_TP_PARTIAL:
+                # TP legs never contribute to the worst-SL set.
+                continue
+            if leg.leg_state == LEG_STATE_PENDING_ENTRY:
+                # Pre-fill SL/trail leg: no broker dealId exists yet, so the
+                # recompute below intentionally skips this leg (mirrors
+                # :meth:`_recompute_native_failsafe_for_parent`). Forcing
+                # ``pending_confirmation=True`` here would arm
+                # ``DEGRADING`` without queueing any PUT, so no
+                # :meth:`on_native_bracket_observed` snapshot can ever
+                # confirm the state back to ``HEALTHY`` — the stale
+                # window then escalates the parent to ``DEGRADED`` and
+                # later :meth:`on_parent_entry_filled` recomputes are
+                # rejected by :meth:`recompute_worst_sl` (``DEGRADED``
+                # early-returns), leaving the eventual fill without a
+                # broker-native fail-safe and poisoning the symbol-level
+                # entry gate. The leg's contribution is restored when
+                # :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
+                # promotes it to ``armed`` and fires the listener; at
+                # that point the live ``register_parent`` /
+                # ``recompute_worst_sl`` path takes over.
+                continue
+            # Currently armed (or higher) SL/trail leg signals that a
+            # broker-native SL is expected on this parent, so the
+            # restart-replay state must enter ``DEGRADING`` until the
+            # broker confirms the PUT.
+            expects_native_sl.add(ref)
+        if not seen:
+            return
+        # ``_current_bar_ts_ms`` is the first sync's bar timestamp:
+        # ``__init__`` defers this call via
+        # ``_pending_native_failsafe_rehydrate`` so the value below is a
+        # real epoch-ms anchor, not zero. That keeps the stale-window
+        # timer in :meth:`NativeFailsafeManager.tick_stale_window` from
+        # measuring against epoch zero and immediately demoting the
+        # freshly rehydrated state to ``DEGRADED``.
+        now_ms = float(self._current_bar_ts_ms)
+        for ref, (symbol, parent_side) in seen.items():
+            # Restart-replay safety (§2.6.7): the previous process may
+            # have transitioned this parent to ``DEGRADED`` / ``UNKNOWN``
+            # before crashing, but health and owner are NOT persisted in
+            # the leg rows — only the legs themselves are. Re-registering
+            # with the default ``HEALTHY`` + ``ENGINE_FAILSAFE`` would
+            # silently pass ``block_new_entry`` / ``block_new_partial_bracket``
+            # on the first post-restart bar, letting Pine add exposure
+            # before the next broker snapshot proves the native stop is
+            # actually in place. ``pending_confirmation=True`` starts the
+            # state in ``DEGRADING``: blocks for new entries / brackets
+            # stay armed until :meth:`on_native_bracket_observed` confirms
+            # the broker side, and the stale-window timer escalates to
+            # ``DEGRADED`` if no confirmation arrives. The worst-SL
+            # recompute below still queues a PUT so the broker stop is
+            # re-attached on the first sync — that PUT's snapshot is
+            # what eventually drives the ``DEGRADING → HEALTHY`` flip.
+            # Only force ``DEGRADING`` for parents whose replayed legs
+            # actually require a broker-native SL. A TP-only bracket has
+            # no native fail-safe stop the engine needs to confirm, so
+            # registering it as ``DEGRADING`` would permanently block
+            # new entries / brackets without any path to recovery (the
+            # recompute below queues no PUT, ``on_native_bracket_observed``
+            # never matches a non-existent stop). Such parents start
+            # ``HEALTHY`` immediately — the live path treats them the
+            # same way (``register_parent`` is called there without
+            # ``pending_confirmation``).
+            self._native_failsafe_manager.register_parent(
+                parent_entry_dispatch_ref=ref,
+                symbol=symbol,
+                parent_side=parent_side,
+                mintick=self._mintick,
+                pending_confirmation=ref in expects_native_sl,
+                now_ms=now_ms,
+            )
+            sl_levels: list[float] = []
+            for leg in self._partial_bracket_engine.iter_legs():
+                if leg.parent_entry_dispatch_ref != ref:
+                    continue
+                if leg.leg_state not in LEG_STATE_ACTIVE:
+                    continue
+                if leg.leg_state == LEG_STATE_PENDING_ENTRY:
+                    # Mirror the live-path guard in
+                    # :meth:`_recompute_native_failsafe_for_parent`: a
+                    # pending-entry leg has no broker dealId behind it
+                    # yet, so seeding its absolute SL into the manager
+                    # would queue a PUT for a phantom parent on the very
+                    # first post-restart sync. The leg's contribution
+                    # rejoins the set when ``on_parent_entry_filled``
+                    # promotes it to ``armed`` and fires the listener.
+                    continue
+                if leg.leg_kind == LEG_KIND_TP_PARTIAL:
+                    continue
+                if leg.trigger_level is None:
+                    # Pre-activation trail legs (§2.6.3): contribute the
+                    # planned post-activation initial stop derived from
+                    # ``trail_activation_level`` ± ``trigger_offset`` so
+                    # the broker-native fail-safe is armed before the
+                    # trail activates. Mirrors the live-path branch in
+                    # :meth:`_recompute_native_failsafe_for_parent`.
+                    if (leg.leg_kind == LEG_KIND_TRAIL_PARTIAL
+                            and leg.trail_activation_level is not None
+                            and leg.trigger_offset is not None):
+                        parent_long = leg.side == 'sell'
+                        planned = (leg.trail_activation_level - leg.trigger_offset) \
+                            if parent_long \
+                            else (leg.trail_activation_level + leg.trigger_offset)
+                        sl_levels.append(planned)
+                    continue
+                sl_levels.append(leg.trigger_level)
+            self._native_failsafe_manager.recompute_worst_sl(
+                parent_entry_dispatch_ref=ref,
+                active_sl_levels=sl_levels,
+                now_ms=now_ms,
+                trigger_kind='lifecycle',
+            )
+
+    def _on_partial_bracket_leg_state_change(
+            self,
+            leg: PartialBracketLeg,
+            old_state: str | None,
+            new_state: str,
+    ) -> None:
+        """Listener fired by :class:`SoftwarePartialBracketEngine` on every
+        leg-state mutation. Drives the §2.6 worst-SL recompute so the
+        broker-native fail-safe state machine sees every armed / triggered
+        / cancelled SL leg without coupling the partial-bracket engine to
+        the manager.
+
+        A call with ``old_state == new_state`` is a *level move* (trail
+        leg ``trigger_level`` shifted while the leg stayed armed); those
+        feed the §2.6.5 trail coalesce window. Genuine state transitions
+        bypass the throttle.
+        """
+        parent_ref = leg.parent_entry_dispatch_ref
+        if parent_ref is None:
+            return
+        trigger_kind = 'trail' if old_state == new_state else 'lifecycle'
+        self._recompute_native_failsafe_for_parent(
+            parent_ref, trigger_kind=trigger_kind,
+        )
+
+    def _recompute_native_failsafe_for_parent(
+            self,
+            parent_entry_dispatch_ref: str,
+            *,
+            trigger_kind: str = 'lifecycle',
+    ) -> None:
+        """Walk the active SL / trail legs for one parent and feed their
+        current trigger levels to the failsafe manager.
+
+        Only legs in :data:`LEG_STATE_ACTIVE` contribute — terminated
+        legs (triggered / cancelled / aborted) drop out of the worst-SL
+        set per §2.6.3. Trail legs contribute their current armed
+        ``trigger_level`` (post-activation) or their pre-activation
+        watch level (the latter is the *planned* worst, used so the
+        broker-native bracket is in place before activation).
+        """
+        manager = self._native_failsafe_manager
+        state = manager.get_state(parent_entry_dispatch_ref)
+        if state is None:
+            return
+        sl_levels: list[float] = []
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.parent_entry_dispatch_ref != parent_entry_dispatch_ref:
+                continue
+            if leg.leg_state not in LEG_STATE_ACTIVE:
+                # Terminal legs (triggered / cancelled / aborted) drop out
+                # of the worst-SL set per §2.6.3. The listener fires
+                # from :meth:`SoftwarePartialBracketEngine._transition`
+                # BEFORE the leg is evicted from the ledger, so the just-
+                # terminated leg is still iterable here with a non-ACTIVE
+                # state; including it would keep an obsolete broker-native
+                # stop level on the parent.
+                continue
+            if leg.leg_state == LEG_STATE_PENDING_ENTRY:
+                # The parent entry has not filled yet — there is no broker
+                # dealId for ``NativeFailsafeManager`` to target. Including
+                # the leg's absolute SL here would queue a PUT against a
+                # phantom parent and the dispatcher would fail / retry /
+                # degrade the state before the entry order even lands. The
+                # leg's contribution is restored when
+                # :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
+                # promotes it to ``armed`` and fires the listener again with
+                # ``trigger_kind='lifecycle'``.
+                continue
+            if leg.leg_kind == LEG_KIND_TP_PARTIAL:
+                continue  # TP not part of worst-SL set (§2.6.2)
+            level = leg.trigger_level
+            if level is None:
+                # Pre-activation trail legs (§2.6.3): no moving stop has
+                # been seeded yet, but the *planned* worst case is the
+                # post-activation initial stop derived from the
+                # activation level and the trailing offset
+                # (``activation - offset`` for a long parent,
+                # ``activation + offset`` for a short). Feeding that
+                # planned level keeps the broker-native fail-safe armed
+                # before the trail activates so a crash / network split
+                # during the pre-activation window cannot leave the
+                # parent unprotected. Once
+                # :meth:`SoftwarePartialBracketEngine._maybe_advance_trail`
+                # crosses the activation level it seeds ``trigger_level``
+                # and fires the listener again — the recompute then
+                # picks up the actual moving stop in this same loop.
+                if (leg.leg_kind == LEG_KIND_TRAIL_PARTIAL
+                        and leg.trail_activation_level is not None
+                        and leg.trigger_offset is not None):
+                    parent_long = leg.side == 'sell'
+                    planned = (leg.trail_activation_level - leg.trigger_offset) \
+                        if parent_long \
+                        else (leg.trail_activation_level + leg.trigger_offset)
+                    sl_levels.append(planned)
+                continue
+            sl_levels.append(level)
+        manager.recompute_worst_sl(
+            parent_entry_dispatch_ref=parent_entry_dispatch_ref,
+            active_sl_levels=sl_levels,
+            now_ms=float(self._current_bar_ts_ms),
+            trigger_kind=trigger_kind,
+        )
+
+    def drive_native_failsafe(self, *, now_ms: float) -> None:
+        """Drain the manager's pending dispatches into the plugin
+        dispatcher, and tick the stale-window state machine.
+
+        Called by the runner once per sync pass. Idempotent: a manager
+        with no pending dispatches and no degrading state is a no-op.
+        Released snapshots from the trail coalesce window (§2.6.5)
+        are also dispatched here.
+        """
+        manager = self._native_failsafe_manager
+        manager.tick_stale_window(now_ms=now_ms)
+        manager.flush_coalesced_trails(now_ms)
+        for snapshot in manager.pending_dispatch():
+            if self._native_bracket_dispatcher is None:
+                continue  # Slice A without plugin opt-in: state-only run
+            manager.mark_dispatch_in_flight(
+                snapshot.parent_entry_dispatch_ref, now_ms=now_ms,
+            )
+            try:
+                self._native_bracket_dispatcher(snapshot)
+            except Exception as e:  # pragma: no cover — defensive
+                _blog_warning(
+                    "native bracket dispatcher raised for %s: %s",
+                    snapshot.parent_entry_dispatch_ref, e,
+                )
+                manager.record_put_failure(
+                    snapshot.parent_entry_dispatch_ref,
+                    generation=snapshot.generation,
+                    reason=f'dispatcher-exception:{type(e).__name__}',
+                    now_ms=now_ms,
+                )
 
     def _record_halt(self, error: BrokerManualInterventionError) -> None:
         """Record a manual-intervention halt and emit the observability event.
@@ -3541,8 +4279,117 @@ class OrderSyncEngine:
         # existing dispatch behaviour.
         skipped_entry_ids_this_sync: set[str] = set()
 
+        # Cross-restart cleanup for orphan engine-trigger partial legs:
+        # :meth:`SoftwarePartialBracketEngine.restart_replay` rebuilds
+        # the leg ledger from persisted rows, but ``_active_intents``
+        # and ``_order_mapping`` start empty after a restart. The
+        # post-restart adoption branch below only re-anchors legs
+        # whose ``intent_key`` is still emitted by Pine THIS sync. If
+        # the strategy no longer issues that exit (script cancelled
+        # the bracket between the crash and the restart, or simply
+        # took a different branch), the legs remain armed in the
+        # state-machine ledger forever — neither the cancellation diff
+        # (it iterates ``_active_intents``) nor the new-intent diff
+        # (it iterates ``new_map``) covers this case, and once the
+        # price-tick WATCH wiring lands a script-cancelled bracket
+        # could still fire. Cancel any orphan leg whose intent_key
+        # appears in neither set BEFORE the diff loops run.
+        if (self._partial_qty_bracket_exit_mode
+                is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+            orphan_intent_keys: set[str] = set()
+            for leg in self._partial_bracket_engine.iter_legs():
+                ikey = leg.intent_key
+                if ikey in self._active_intents:
+                    continue
+                if ikey in new_map:
+                    continue
+                orphan_intent_keys.add(ikey)
+            for ikey in orphan_intent_keys:
+                _blog_info(
+                    "cancelling orphan engine-trigger partial legs for "
+                    "intent %r (not emitted by Pine after restart)", ikey,
+                )
+                self._partial_bracket_engine.cancel_legs_for_intent(
+                    ikey, reason='orphan_after_restart',
+                )
+                self._order_mapping.pop(ikey, None)
+                self._drop_envelope(ikey)
+
+            # Same-sync §12 #4 coexistence preflight: if THIS sync's
+            # ``new_map`` contains both a partial-qty bracket and a
+            # native whole-row exit on the same ``from_entry`` (distinct
+            # ``intent_key`` values), the dispatch order would decide
+            # which side wins — if the partial is iterated first, its
+            # leg rows are persisted and registered before the later
+            # whole-row dispatch raises, leaving the engine ledger in an
+            # invalid combined-bracket state. Detect the conflict here
+            # (before any leg row exists) and refuse BOTH conflicting
+            # intents this sync; the script must drop one or the other
+            # for the dispatch to proceed.
+            # Multiple partial exits can legitimately share the same
+            # ``from_entry`` (Pine scripts often issue several
+            # ``strategy.exit(id_n, from_entry=parent)`` calls). Collect
+            # every partial per ``from_entry`` so we cancel the entire
+            # set when a conflicting whole-row exit appears — keeping
+            # only the first via ``setdefault`` would let the remaining
+            # partials slip through the preflight and violate the §12
+            # #4 coexistence invariant.
+            partials_by_from_entry: dict[str, list[ExitIntent]] = {}
+            native_by_from_entry: dict[str, ExitIntent] = {}
+            for cand in new_map.values():
+                if not isinstance(cand, ExitIntent):
+                    continue
+                if cand.from_entry is None:
+                    continue
+                if cand.is_partial_qty_bracket:
+                    partials_by_from_entry.setdefault(
+                        cand.from_entry, [],
+                    ).append(cand)
+                else:
+                    native_by_from_entry.setdefault(cand.from_entry, cand)
+            conflicting_keys: set[str] = set()
+            for from_entry, partial_intents in partials_by_from_entry.items():
+                native_intent = native_by_from_entry.get(from_entry)
+                if native_intent is None:
+                    continue
+                partial_keys = [p.intent_key for p in partial_intents]
+                _blog_warning(
+                    "engine-trigger partial brackets %r conflict with "
+                    "native whole-row exit %r on the same from_entry "
+                    "%r in this sync; refusing the conflicting "
+                    "dispatches — the script must cancel one side "
+                    "before the other can attach",
+                    partial_keys,
+                    native_intent.intent_key,
+                    from_entry,
+                )
+                for p in partial_intents:
+                    conflicting_keys.add(p.intent_key)
+                conflicting_keys.add(native_intent.intent_key)
+            # Only pop conflict keys that are NOT already in
+            # ``_active_intents``. The cancellation loop below treats
+            # ``key in _active_intents and key not in new_map`` as a
+            # strategy-side cancel and dispatches ``_dispatch_cancel`` —
+            # popping an already-active bracket here would tear down
+            # the live broker-side protection the script never asked
+            # to cancel. The intent of the preflight is to refuse the
+            # NEW conflicting dispatch, not to flatten existing state.
+            for ikey in conflicting_keys:
+                if ikey in self._active_intents:
+                    continue
+                new_map.pop(ikey, None)
+
         for key in list(self._active_intents):
             if key not in new_map:
+                if key not in self._active_intents:
+                    # A prior iteration in this loop cancelled the parent
+                    # EntryIntent and :meth:`_dispatch_cancel_strict`
+                    # eagerly dropped its paired engine-trigger partial
+                    # ``ExitIntent`` slot (see the cleanup at the end of
+                    # that method). The exit is engine-internal — no
+                    # broker-side order exists to cancel — so simply
+                    # skip; the legs were retired in the same cleanup.
+                    continue
                 if key in self._pending_defensive_close:
                     # Parent entry has an in-flight defensive close —
                     # the marker deliberately keeps the entry in
@@ -3578,6 +4425,39 @@ class OrderSyncEngine:
                     # :meth:`_cleanup_position_tracking` drops the
                     # entry's bracket intents at close-fill time.
                     continue
+                # Cross-key native-to-engine partial conversion: the script
+                # removed a native whole-row exit AND added a partial-qty
+                # bracket on the SAME ``from_entry`` under a DIFFERENT
+                # ``strategy.exit`` id in this sync. The same-key conversion
+                # in :meth:`_dispatch_modify` uses
+                # :meth:`_dispatch_cancel_strict` so a timed-out cancel
+                # defers the new dispatch; the default cancel path here
+                # would instead swallow ``OrderDispositionUnknownError``,
+                # drop the mapping/envelope, and let the new-intents loop
+                # below arm engine-trigger legs while the broker may still
+                # hold the whole-row bracket live — violating the §12 #4
+                # coexistence invariant. Mirror the strict-cancel-with-
+                # retry semantics here: on a timed-out cancel, restore the
+                # OLD intent to ``_active_intents`` AND drop the new
+                # partial from ``new_map`` so the next sync re-diffs and
+                # retries the strict cancel (idempotent via the
+                # deterministic ``client_order_id``).
+                conflicting_partial_keys: list[str] = []
+                if (isinstance(old, ExitIntent)
+                        and not old.is_partial_qty_bracket
+                        and old.from_entry is not None
+                        and self._partial_qty_bracket_exit_mode
+                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                    conflicting_partial_keys = [
+                        cand_key
+                        for cand_key, cand in new_map.items()
+                        if (
+                            isinstance(cand, ExitIntent)
+                            and cand.is_partial_qty_bracket
+                            and cand.from_entry == old.from_entry
+                        )
+                    ]
+                needs_strict_cancel = bool(conflicting_partial_keys)
                 self._active_intents.pop(key)
                 # A still-parked modify for this key (Pine cancels while
                 # the previous amend's resolution is pending) is being
@@ -3586,7 +4466,24 @@ class OrderSyncEngine:
                 # so a late ``'rejected'`` resolution does not resurrect
                 # a cancelled key into ``_active_intents``.
                 self._modify_old_intents.pop(key, None)
-                self._dispatch_cancel(old)
+                if needs_strict_cancel:
+                    try:
+                        self._dispatch_cancel_strict(old)
+                    except OrderDispositionUnknownError as e:
+                        _blog_warning(
+                            "native-to-engine partial conversion deferred: "
+                            "strict cancel of %s timed out (%s); restoring "
+                            "old intent and dropping new partial bracket(s) "
+                            "%r so the next sync retries the cancel before "
+                            "engine-trigger legs are armed",
+                            old, e, conflicting_partial_keys,
+                        )
+                        self._active_intents[key] = old
+                        for partial_key in conflicting_partial_keys:
+                            new_map.pop(partial_key, None)
+                        continue
+                else:
+                    self._dispatch_cancel(old)
 
         for key, intent in new_map.items():
             if key not in self._active_intents:
@@ -3599,6 +4496,305 @@ class OrderSyncEngine:
                     # so subsequent modifies emit the same client_order_id.
                     self._build_envelope(intent)
                     self._active_intents[key] = intent
+                elif (isinstance(intent, ExitIntent)
+                        and intent.is_partial_qty_bracket
+                        and self._partial_qty_bracket_exit_mode
+                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER
+                        and self._partial_bracket_engine.has_active_legs_for_intent(
+                            intent.intent_key,
+                        )):
+                    # Cross-restart adoption for engine-trigger partial brackets.
+                    # ``restart_replay()`` repopulates the in-memory leg ledger
+                    # from persisted rows, but ``_active_intents`` and
+                    # ``_order_mapping`` start empty. Without this branch the
+                    # first post-restart sync would re-enter
+                    # :meth:`_dispatch_engine_trigger_partial_bracket`, where
+                    # the duplicate guard raises on the still-tracked legs.
+                    # Adopt the live legs instead: build the envelope, pin the
+                    # intent, and restore ``_order_mapping`` from the leg
+                    # ``coid``s so subsequent diffs treat the dispatch as live.
+                    #
+                    # Verify the persisted legs reference the CURRENT parent
+                    # entry dispatch before adopting. If the previous parent
+                    # closed while the bot was down and the script reuses the
+                    # same ``strategy.exit(id, from_entry)`` for a new entry,
+                    # the legs' ``parent_entry_dispatch_ref`` will not match
+                    # the freshly rebuilt parent envelope's ``KIND_ENTRY``
+                    # coid — adopting them would attach a stale partial close
+                    # to the wrong position. Cancel the orphan legs and let
+                    # the normal dispatch path arm a fresh bracket.
+                    #
+                    # Post-restart subtlety: ``_envelopes`` starts empty until
+                    # an intent for the parent key is rebuilt this sync, but
+                    # the common recovery path re-emits only the bracket
+                    # ``ExitIntent`` for an already-open parent (the entry
+                    # filled before the crash and the script no longer emits
+                    # it). Fall back to ``_persisted_envelope_anchors`` —
+                    # the anchor preserves ``bar_ts_ms`` / ``retry_seq`` and
+                    # ``self._run_tag`` is deterministic, so the rebuilt
+                    # ``KIND_ENTRY`` coid matches what the previous run
+                    # stored on each leg. Without this fallback every leg
+                    # would be classified stale even when the parent is the
+                    # original one.
+                    expected_parent_ref: str | None = None
+                    if intent.from_entry is not None:
+                        parent_envelope = self._envelopes.get(intent.from_entry)
+                        if parent_envelope is not None:
+                            expected_parent_ref = parent_envelope.client_order_id(
+                                KIND_ENTRY,
+                            )
+                        else:
+                            parent_anchor = self._persisted_envelope_anchors.get(
+                                intent.from_entry,
+                            )
+                            if parent_anchor is not None:
+                                expected_parent_ref = build_client_order_id(
+                                    run_tag=self._run_tag,
+                                    pine_id=intent.from_entry,
+                                    bar_ts_ms=parent_anchor.bar_ts_ms,
+                                    kind=KIND_ENTRY,
+                                    retry_seq=parent_anchor.retry_seq,
+                                )
+                    legs_for_intent = [
+                        leg for leg
+                        in self._partial_bracket_engine.iter_legs()
+                        if leg.intent_key == intent.intent_key
+                    ]
+                    stale_parent = (
+                        expected_parent_ref is None
+                        or any(
+                            leg.parent_entry_dispatch_ref != expected_parent_ref
+                            for leg in legs_for_intent
+                        )
+                    )
+                    if stale_parent:
+                        # §2.6.7 preflight: if the NEW parent's native fail-safe
+                        # is currently blocking new partial brackets
+                        # (DEGRADING / DEGRADED / UNKNOWN owner), cancelling
+                        # the replayed legs first would strip the only
+                        # protection on the existing position while
+                        # ``_dispatch_new`` raises :class:`OrderSkippedByPlugin`
+                        # and arms nothing. Leave the replayed legs intact
+                        # this sync; next sync re-enters this adoption branch
+                        # and retries once the manager flips out of the
+                        # blocking state (snapshot confirm / user reset).
+                        if (expected_parent_ref is not None
+                                and self._native_failsafe_manager
+                                .is_new_partial_bracket_blocked(
+                                    parent_entry_dispatch_ref=expected_parent_ref,
+                                )):
+                            _blog_warning(
+                                "engine-trigger partial bracket adoption "
+                                "deferred for intent %r: native fail-safe "
+                                "for new parent %r is blocking; keeping "
+                                "stale legs as residual protection until "
+                                "the state recovers",
+                                intent.intent_key,
+                                expected_parent_ref,
+                            )
+                            continue
+                        _blog_info(
+                            "cancelling stale engine-trigger partial legs "
+                            "for intent %r: parent dispatch ref mismatch "
+                            "(expected %r) — script re-used from_entry %r "
+                            "for a new parent",
+                            intent.intent_key,
+                            expected_parent_ref,
+                            intent.from_entry,
+                        )
+                        self._partial_bracket_engine.cancel_legs_for_intent(
+                            intent.intent_key,
+                            reason='stale_parent_after_restart',
+                        )
+                        self._order_mapping.pop(key, None)
+                        self._drop_envelope(key)
+                        # Fall through to the normal dispatch path so a fresh
+                        # bracket is armed against the new parent.
+                        try:
+                            self._dispatch_new(intent)
+                        except OrderSkippedByPlugin as e:
+                            _blog_warning("%s", e)
+                            continue
+                        self._active_intents[key] = intent
+                        continue
+                    # Completeness check: ``_dispatch_engine_trigger_partial_bracket``
+                    # writes one leg row per declared leg in a loop. If the
+                    # previous run crashed mid-loop, only some leg rows are
+                    # durable — restart_replay() loads whatever exists, and
+                    # adopting the partial set here would pin the intent with
+                    # a missing sibling that no path ever re-creates. Compare
+                    # the persisted ``leg_kind`` set against the kinds the
+                    # current intent would emit; on mismatch, cancel the
+                    # orphan legs and re-dispatch a fresh bracket so all
+                    # declared legs are armed.
+                    expected_specs = list(
+                        self._enumerate_engine_trigger_legs(intent)
+                    )
+                    expected_leg_kinds = {spec.leg_kind for spec in expected_specs}
+                    persisted_leg_kinds = {
+                        leg.leg_kind for leg in legs_for_intent
+                    }
+                    if expected_leg_kinds != persisted_leg_kinds:
+                        # §2.6.7 preflight: a blocking native fail-safe state
+                        # (DEGRADING / DEGRADED / UNKNOWN owner) would make
+                        # ``_dispatch_new`` raise :class:`OrderSkippedByPlugin`
+                        # after the cancel — leaving the parent without any
+                        # software protection. Keep the partial replayed
+                        # leg set in place this sync; the next sync re-enters
+                        # this branch once the state recovers and the fresh
+                        # bracket can be armed cleanly.
+                        if (expected_parent_ref is not None
+                                and self._native_failsafe_manager
+                                .is_new_partial_bracket_blocked(
+                                    parent_entry_dispatch_ref=expected_parent_ref,
+                                )):
+                            _blog_warning(
+                                "engine-trigger partial bracket adoption "
+                                "deferred for intent %r: persisted leg set "
+                                "%r differs from expected %r but native "
+                                "fail-safe for parent %r is blocking; "
+                                "keeping replayed legs as residual "
+                                "protection until the state recovers",
+                                intent.intent_key,
+                                sorted(persisted_leg_kinds),
+                                sorted(expected_leg_kinds),
+                                expected_parent_ref,
+                            )
+                            continue
+                        _blog_info(
+                            "cancelling incomplete engine-trigger partial "
+                            "legs for intent %r: persisted kinds %r do not "
+                            "match expected %r — likely a crash between "
+                            "leg-row writes; re-dispatching fresh bracket",
+                            intent.intent_key,
+                            sorted(persisted_leg_kinds),
+                            sorted(expected_leg_kinds),
+                        )
+                        self._partial_bracket_engine.cancel_legs_for_intent(
+                            intent.intent_key,
+                            reason='incomplete_leg_set_after_restart',
+                        )
+                        self._order_mapping.pop(key, None)
+                        self._drop_envelope(key)
+                        try:
+                            self._dispatch_new(intent)
+                        except OrderSkippedByPlugin as e:
+                            _blog_warning("%s", e)
+                            continue
+                        self._active_intents[key] = intent
+                        continue
+                    # Full-spec parity check: ``leg_kind`` parity alone does
+                    # not catch a Pine script that re-emits the same
+                    # ``intent_key`` with retuned TP/SL/trail levels or a
+                    # different ``qty``. Without this guard the persisted
+                    # legs (stale trigger levels, stale ``intent_partial_qty``)
+                    # would be adopted while ``_active_intents[key] = intent``
+                    # pins the NEW intent, so later diffs see no change and
+                    # the engine permanently watches the stale parameters.
+                    # Compare each persisted leg against its matching spec
+                    # by leg kind:
+                    # - TP/SL legs: ``trigger_level`` and ``trigger_offset``
+                    #   are static once dispatched, so the persisted values
+                    #   must equal the spec's.
+                    # - Trail legs: the dynamic stop (``trigger_level``)
+                    #   evolves at runtime, but ``trigger_offset`` (trail
+                    #   distance from high-water) and ``trail_activation_offset``
+                    #   (pre-fill activation distance) are stable across the
+                    #   leg's lifetime — compare those. ``trail_activation_level``
+                    #   is also compared, but only while the leg is still
+                    #   pre-activation (``leg.trail_activation_level`` is not
+                    #   ``None``) and the spec carries an absolute activation
+                    #   price (``spec.trail_activation_level`` is not ``None``):
+                    #   that is the only way to detect a Pine script that
+                    #   retunes ``trail_price`` to a different absolute level
+                    #   while keeping qty / offset / activation_offset stable.
+                    #   Once the trail has activated (the engine clears
+                    #   ``trail_activation_level`` after the activation tick),
+                    #   the field is dropped from the comparison so adoption
+                    #   does not spuriously cancel an in-flight trail.
+                    # In all cases, ``leg.intent_partial_qty`` must equal
+                    # the current ``intent.qty``.
+                    specs_by_kind = {
+                        spec.leg_kind: spec for spec in expected_specs
+                    }
+                    spec_mismatch = False
+                    for leg in legs_for_intent:
+                        spec = specs_by_kind.get(leg.leg_kind)
+                        if spec is None:  # pragma: no cover — kind-set parity ensured above
+                            spec_mismatch = True
+                            break
+                        if leg.intent_partial_qty != intent.qty:
+                            spec_mismatch = True
+                            break
+                        if leg.leg_kind == LEG_KIND_TRAIL_PARTIAL:
+                            if (leg.trigger_offset != spec.trigger_offset
+                                    or leg.trail_activation_offset
+                                    != spec.trail_activation_offset):
+                                spec_mismatch = True
+                                break
+                            if (leg.trail_activation_level is not None
+                                    and spec.trail_activation_level is not None
+                                    and leg.trail_activation_level
+                                    != spec.trail_activation_level):
+                                spec_mismatch = True
+                                break
+                        else:
+                            if (leg.trigger_level != spec.trigger_level
+                                    or leg.trigger_offset != spec.trigger_offset):
+                                spec_mismatch = True
+                                break
+                    if spec_mismatch:
+                        # §2.6.7 preflight: a blocking native fail-safe state
+                        # (DEGRADING / DEGRADED / UNKNOWN owner) would make
+                        # ``_dispatch_new`` raise :class:`OrderSkippedByPlugin`
+                        # after the cancel — leaving the parent without any
+                        # software protection. Keep the stale replayed legs
+                        # in place this sync; the next sync re-enters this
+                        # branch once the state recovers and the fresh
+                        # bracket can be armed cleanly.
+                        if (expected_parent_ref is not None
+                                and self._native_failsafe_manager
+                                .is_new_partial_bracket_blocked(
+                                    parent_entry_dispatch_ref=expected_parent_ref,
+                                )):
+                            _blog_warning(
+                                "engine-trigger partial bracket adoption "
+                                "deferred for intent %r: replayed leg spec "
+                                "differs from current intent but native "
+                                "fail-safe for parent %r is blocking; "
+                                "keeping stale legs as residual protection "
+                                "until the state recovers",
+                                intent.intent_key,
+                                expected_parent_ref,
+                            )
+                            continue
+                        _blog_info(
+                            "cancelling stale engine-trigger partial legs "
+                            "for intent %r: persisted leg spec differs from "
+                            "current intent (qty/trigger_level/trigger_offset/"
+                            "trail_activation_offset) — script retuned the "
+                            "bracket across the restart boundary; "
+                            "re-dispatching fresh bracket",
+                            intent.intent_key,
+                        )
+                        self._partial_bracket_engine.cancel_legs_for_intent(
+                            intent.intent_key,
+                            reason='stale_leg_spec_after_restart',
+                        )
+                        self._order_mapping.pop(key, None)
+                        self._drop_envelope(key)
+                        try:
+                            self._dispatch_new(intent)
+                        except OrderSkippedByPlugin as e:
+                            _blog_warning("%s", e)
+                            continue
+                        self._active_intents[key] = intent
+                        continue
+                    self._build_envelope(intent)
+                    self._active_intents[key] = intent
+                    self._order_mapping[key] = [
+                        leg.coid for leg in legs_for_intent
+                    ]
                 else:
                     if (isinstance(intent, ExitIntent)
                             and intent.from_entry is not None
@@ -3814,6 +5010,28 @@ class OrderSyncEngine:
                     _blog_warning("%s", e)
                     self._active_intents.pop(key, None)
                     continue
+                except _PartialBracketModifyDeferred:
+                    # Engine-trigger partial-bracket modify was deferred by the
+                    # §2.6.7 fail-safe gate inside ``_dispatch_modify`` — the
+                    # OLD legs are still armed and no replacement was
+                    # dispatched. Keep ``_active_intents[key]`` pointing at the
+                    # OLD intent so the next sync re-diffs and retries the
+                    # modify once the fail-safe recovers; promoting the slot to
+                    # ``intent`` here would make Pine == active and the retry
+                    # would never run.
+                    continue
+                except OrderDispositionUnknownError:
+                    # Native-to-engine partial-bracket conversion path
+                    # surfaces a timed-out strict cancel here. Leaving the
+                    # slot pointing at the OLD native intent forces the
+                    # next sync to re-diff and retry the conversion via
+                    # ``_dispatch_modify`` — the deterministic
+                    # ``client_order_id`` makes the broker-side cancel
+                    # idempotent. Promoting to ``intent`` (the new partial)
+                    # instead would mask the unfinished work because the
+                    # next diff would observe Pine == active and skip
+                    # arming the engine legs.
+                    continue
                 self._active_intents[key] = intent
             # else: unchanged — skip
 
@@ -3939,30 +5157,283 @@ class OrderSyncEngine:
     def _dispatch_new(self, intent: Intent) -> None:
         envelope = self._build_envelope(intent)
         _blog_info("dispatching %s", intent)
-        # A fresh entry dispatch for a previously neutralised parent
-        # pine_id is the script's explicit signal that the
-        # late-parent-ENTRY-fill window has closed (the prior parent
-        # was already settled by a no-FIFO defensive close, and the
-        # user script has knowingly re-armed the same entry name).
-        # Without this clear, every subsequent fill for the same pine
-        # id would be dropped by :meth:`_is_neutralised_parent_entry_fill`
-        # for the rest of the process, leaving :attr:`_position` flat
-        # while the broker holds the new open trade. The COID-keyed
-        # entries in :attr:`_neutralised_parent_entry_coids` are NOT
-        # cleared here — each COID is unique to a specific prior
-        # dispatch, so leaving them in place is a safe no-op against
-        # any later event (every fresh dispatch produces a new COID).
-        if (isinstance(intent, EntryIntent)
-                and intent.pine_id
-                and intent.pine_id in self._neutralised_parent_entry_pine_ids):
-            self._neutralised_parent_entry_pine_ids.discard(intent.pine_id)
         try:
             if isinstance(intent, EntryIntent):
+                # §2.6.7 gate: drop the entry signal when any parent on
+                # this symbol holds a degrading / degraded native
+                # fail-safe. The drop is permanent for this signal —
+                # the engine does NOT queue / replay (a Pine signal is
+                # valid for its emit bar/tick; rejaying later would
+                # open under different conditions than the script
+                # intended). Emits both the block event and the
+                # skipped-signal companion so downstream observability
+                # can distinguish "rejected" from "queued".
+                if self._native_failsafe_manager.block_new_entry(
+                        symbol=intent.symbol,
+                        pine_id=intent.pine_id,
+                        bar_ts_ms=self._current_bar_ts_ms,
+                ):
+                    # Drop the envelope we just built before raising. The
+                    # ``_build_envelope`` call at method entry already
+                    # persisted ``_envelopes[intent.intent_key]`` and the
+                    # SQLite envelope row keyed by ``bar_ts_ms`` /
+                    # ``retry_seq``. Without this cleanup the next sync
+                    # (or a restart-replay) for the same ``pine_id``
+                    # would re-use that anchor and rebuild the SAME
+                    # ``client_order_id`` from a stale bar timestamp,
+                    # contradicting the documented "no broker call, no
+                    # state retained" drop semantics for §2.6.7
+                    # block-new-entry skips. The intent never reached
+                    # the broker, so no idempotency anchor is needed —
+                    # a later re-emission must start with a fresh
+                    # envelope.
+                    self._drop_envelope(intent.intent_key)
+                    # Raise the same skip exception the caller already
+                    # handles for plugin-side declines so the entry is
+                    # not registered in :attr:`_active_intents` and gets
+                    # added to ``skipped_entry_ids_this_sync`` — both are
+                    # required for the documented §2.6.7 drop semantics
+                    # (later re-emissions of this signal must not be
+                    # treated as already active, and any same-sync
+                    # bracket pointing at this parent must be suppressed
+                    # as a skipped-parent dependent). Do NOT seed
+                    # ``_order_mapping[intent.intent_key] = []`` here: the
+                    # cross-restart adoption branch in :meth:`_diff_and_dispatch`
+                    # treats any key present in :attr:`_order_mapping` as
+                    # "broker already has this", which would skip
+                    # :meth:`_dispatch_new` for a later re-emission of the
+                    # same signal and leave the strategy believing the
+                    # entry is live while no broker order was ever sent.
+                    raise OrderSkippedByPlugin(
+                        f"Entry dispatch blocked by degraded native "
+                        f"fail-safe on {intent.symbol} "
+                        f"(pine_id={intent.pine_id!r}); signal dropped, "
+                        f"no broker call.",
+                        intent_key=intent.intent_key,
+                        reason="native_failsafe_blocked_entry",
+                        context={
+                            'symbol': intent.symbol,
+                            'pine_id': intent.pine_id,
+                            'bar_ts_ms': self._current_bar_ts_ms,
+                        },
+                    )
+                # A fresh entry dispatch for a previously neutralised
+                # parent pine_id is the script's explicit signal that
+                # the late-parent-ENTRY-fill window has closed (the
+                # prior parent was already settled by a no-FIFO
+                # defensive close, and the user script has knowingly
+                # re-armed the same entry name). Without this clear,
+                # every subsequent fill for the same pine id would be
+                # dropped by :meth:`_is_neutralised_parent_entry_fill`
+                # for the rest of the process, leaving :attr:`_position`
+                # flat while the broker holds the new open trade. Apply
+                # AFTER the §2.6.7 block gate so a blocked entry (no
+                # broker call) leaves the marker in place — a late fill
+                # from the prior parent must still be suppressed. The
+                # COID-keyed entries in
+                # :attr:`_neutralised_parent_entry_coids` are NOT
+                # cleared here — each COID is unique to a specific
+                # prior dispatch, so leaving them in place is a safe
+                # no-op against any later event (every fresh dispatch
+                # produces a new COID).
+                if (intent.pine_id
+                        and intent.pine_id
+                        in self._neutralised_parent_entry_pine_ids):
+                    self._neutralised_parent_entry_pine_ids.discard(
+                        intent.pine_id,
+                    )
                 orders = self._run_async(self._broker.execute_entry(envelope))
                 self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, ExitIntent):
-                orders = self._run_async(self._broker.execute_exit(envelope))
-                self._order_mapping[intent.intent_key] = [o.id for o in orders]
+                # Route engine-trigger partial brackets through the
+                # dedicated state-machine dispatch. The condition is
+                # deliberately conjunctive (mode AND intent flag) so a
+                # whole-row exit on a SOFTWARE_ENGINE_TRIGGER plugin
+                # still uses the native bracket dispatch — the engine
+                # only owns the partial slice. SOFTWARE_REDUCE_ONLY_ORDER
+                # is reserved for the future :meth:`_dispatch_reduce_only_order_partial_bracket`
+                # branch (Slice C, aggregated-position brokers).
+                if (intent.is_partial_qty_bracket
+                        and self._partial_qty_bracket_exit_mode
+                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                    self._dispatch_engine_trigger_partial_bracket(intent)
+                else:
+                    # Whole-row bracket on a SOFTWARE_ENGINE_TRIGGER broker
+                    # while engine-trigger partial legs are already tracked
+                    # for the same parent is the §12 #4 incompatibility:
+                    # a native full-row bracket and engine-trigger partial
+                    # legs cannot coexist on one position (the new state
+                    # machine has no path to keep them in sync; either side
+                    # filling would over-close or strand siblings). Refuse
+                    # the dispatch — the caller must cancel the existing
+                    # partial bracket first.
+                    #
+                    # Same-key conversion: when the persisted legs share
+                    # the SAME ``intent_key`` as the incoming whole-row
+                    # exit (cross-restart case where Pine swapped the
+                    # partial bracket for a full-row exit under the same
+                    # ``strategy.exit(id, from_entry)``), the orphan
+                    # cleanup at the top of :meth:`_diff_and_dispatch`
+                    # cannot drop those legs (key is present in
+                    # ``new_map``) and the kind-set adoption branch
+                    # skips this case (new intent is not
+                    # ``is_partial_qty_bracket``). Cancel the persisted
+                    # partial legs here so the conversion can land
+                    # instead of stranding the position with no
+                    # protection until manual cleanup.
+                    if (intent.from_entry is not None
+                            and self._partial_qty_bracket_exit_mode
+                            is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER
+                            and self._partial_bracket_engine
+                                .has_active_partial_bracket(
+                                    intent.symbol, intent.from_entry,
+                                )):
+                        if self._partial_bracket_engine.has_active_legs_for_intent(
+                                intent.intent_key):
+                            _blog_info(
+                                "converting engine-trigger partial bracket "
+                                "to native whole-row exit for intent %r: "
+                                "cancelling persisted partial legs before "
+                                "dispatching the replacement full-row exit",
+                                intent.intent_key,
+                            )
+                            self._partial_bracket_engine.cancel_legs_for_intent(
+                                intent.intent_key,
+                                reason='partial_to_whole_row_conversion',
+                            )
+                            # Cancelling the partial legs fired the
+                            # :meth:`_on_partial_bracket_leg_state_change`
+                            # listener which calls
+                            # :meth:`_recompute_native_failsafe_for_parent`.
+                            # If no other partial legs remain on this parent
+                            # the worst-SL recompute saw an empty set and
+                            # queued a ``stop_level=None`` clear snapshot —
+                            # which would, once the dispatcher is installed,
+                            # be flushed by :meth:`drive_native_failsafe` and
+                            # delete the native bracket we are about to
+                            # attach below. Retire the failsafe state for the
+                            # parent so the pending clear PUT is dropped and
+                            # the native bracket lives untouched. When other
+                            # partial intent_keys still hold legs on this
+                            # parent, the listener's recompute already
+                            # produced a non-empty snapshot and we must keep
+                            # the engine in charge.
+                            if not self._partial_bracket_engine \
+                                    .has_active_partial_bracket(
+                                        intent.symbol, intent.from_entry,
+                                    ):
+                                # Resolve the parent's deterministic
+                                # ``KIND_ENTRY`` COID. On the restart path the
+                                # parent's entry envelope is no longer in
+                                # ``_envelopes`` (the original dispatch was
+                                # retired when the entry filled in a previous
+                                # run), but the persisted leg rows still
+                                # reference the COID. Fall back to
+                                # ``_persisted_envelope_anchors`` so the
+                                # failsafe state for the replayed parent gets
+                                # retired and the empty-set worst-SL recompute
+                                # cannot leak a ``stop_level=None`` snapshot
+                                # that would clear the native bracket we are
+                                # about to attach.
+                                parent_entry_envelope = self._envelopes.get(
+                                    intent.from_entry,
+                                )
+                                parent_dispatch_ref: str | None = None
+                                if parent_entry_envelope is not None:
+                                    parent_dispatch_ref = (
+                                        parent_entry_envelope.client_order_id(
+                                            KIND_ENTRY,
+                                        )
+                                    )
+                                else:
+                                    parent_anchor = (
+                                        self._persisted_envelope_anchors.get(
+                                            intent.from_entry,
+                                        )
+                                    )
+                                    if parent_anchor is not None:
+                                        parent_dispatch_ref = build_client_order_id(
+                                            run_tag=self._run_tag,
+                                            pine_id=intent.from_entry,
+                                            bar_ts_ms=parent_anchor.bar_ts_ms,
+                                            kind=KIND_ENTRY,
+                                            retry_seq=parent_anchor.retry_seq,
+                                        )
+                                if parent_dispatch_ref is not None:
+                                    self._native_failsafe_manager.unregister_parent(
+                                        parent_dispatch_ref,
+                                    )
+                            self._order_mapping.pop(intent.intent_key, None)
+                            self._drop_envelope(intent.intent_key)
+                            envelope = self._build_envelope(intent)
+                        else:
+                            raise RuntimeError(
+                                "whole-row exit refuses: engine-trigger partial "
+                                "legs already tracked for "
+                                f"{intent.symbol!r}/{intent.from_entry!r}; the "
+                                "script must cancel the partial bracket before "
+                                "attaching a full-row exit.",
+                            )
+                    elif (intent.from_entry is not None
+                            and self._partial_qty_bracket_exit_mode
+                            is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                        # Cross-key partial → native conversion within ONE sync:
+                        # the cancel loop above already evicted the persisted
+                        # partial legs (old key ∉ ``new_map``), which fired the
+                        # leg-cancel listener and queued a ``stop_level=None``
+                        # PUT on the failsafe manager. The same-key conversion
+                        # guard above did not run because no active legs remain
+                        # under the NEW intent's key. Without retiring the
+                        # stale failsafe state here, the next
+                        # :meth:`drive_native_failsafe` would flush that clear
+                        # PUT and delete the native bracket we are about to
+                        # attach. Detect the leftover state by checking the
+                        # parent's KIND_ENTRY COID and unregister it before
+                        # ``execute_exit`` lands the replacement protection.
+                        parent_entry_envelope = self._envelopes.get(
+                            intent.from_entry,
+                        )
+                        parent_dispatch_ref: str | None = None
+                        if parent_entry_envelope is not None:
+                            parent_dispatch_ref = (
+                                parent_entry_envelope.client_order_id(
+                                    KIND_ENTRY,
+                                )
+                            )
+                        else:
+                            parent_anchor = (
+                                self._persisted_envelope_anchors.get(
+                                    intent.from_entry,
+                                )
+                            )
+                            if parent_anchor is not None:
+                                parent_dispatch_ref = build_client_order_id(
+                                    run_tag=self._run_tag,
+                                    pine_id=intent.from_entry,
+                                    bar_ts_ms=parent_anchor.bar_ts_ms,
+                                    kind=KIND_ENTRY,
+                                    retry_seq=parent_anchor.retry_seq,
+                                )
+                        if (parent_dispatch_ref is not None
+                                and self._native_failsafe_manager.get_state(
+                                    parent_dispatch_ref,
+                                ) is not None
+                                and not self._partial_bracket_engine
+                                .has_active_partial_bracket(
+                                    intent.symbol, intent.from_entry,
+                                )):
+                            _blog_info(
+                                "cross-key partial-to-native conversion: "
+                                "retiring stale failsafe state for parent %r "
+                                "(no remaining active legs) before attaching "
+                                "replacement whole-row exit %r",
+                                parent_dispatch_ref, intent.intent_key,
+                            )
+                            self._native_failsafe_manager.unregister_parent(
+                                parent_dispatch_ref,
+                            )
+                    orders = self._run_async(self._broker.execute_exit(envelope))
+                    self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, CloseIntent):
                 order = self._run_async(self._broker.execute_close(envelope))
                 self._order_mapping[intent.intent_key] = [order.id]
@@ -3996,6 +5467,388 @@ class OrderSyncEngine:
                 intent, type(e).__name__, e,
             )
             raise
+
+    def _dispatch_engine_trigger_partial_bracket(
+            self, intent: ExitIntent,
+    ) -> None:
+        """PERSIST-FIRST dispatch for a partial-qty engine-trigger bracket.
+
+        See the partial-qty bracket exit design dossier §3.1 for the
+        full lifecycle. The dispatch is split across three steps:
+
+        1. **Invariant guard.** A native full-row bracket on the same
+           parent is incompatible with the engine-trigger partial
+           legs we are about to register (§12 #4). If one is already
+           tracked the dispatch refuses to proceed — the caller is
+           expected to surface this as a script-level error rather
+           than silently coexisting with a duplicate bracket.
+
+        2. **PERSIST-FIRST.** One :func:`create_engine_trigger_partial_leg_row`
+           per declared leg (TP / SL / trail). Tick-deferred legs go
+           in as :data:`LEG_STATE_PENDING_ENTRY`; absolute-level legs
+           as :data:`LEG_STATE_ARMED`. The synthetic OCA group name
+           (``__partial_exit_{pine_id}_{from_entry}__``) is shared
+           across the trio so the cascade cancels every sibling when
+           any one fires.
+
+        3. **In-memory ledger handoff.** The persisted legs are
+           registered with :class:`SoftwarePartialBracketEngine`. The
+           caller (``_dispatch_new``) marks the intent_key in
+           ``_active_intents`` and ``_order_mapping`` so subsequent
+           diff cycles see the dispatch as live; no exchange-side
+           order is opened (the WATCH phase fires close intents later
+           when the price tick crosses a trigger).
+
+        Steps 4–7 of §3 (price-tick WATCH wiring, close-dispatch
+        action emitter, §2.6 worst-SL recompute, §2.6.7 fail-safe
+        ownership) are Slice B / Slice A.7+ work. The current method
+        is a complete skeleton: the legs are persisted, the state
+        machine ledger is correct, and the OCA cascade fires through
+        :meth:`SoftwarePartialBracketEngine.cascade_cancel_oca`. The
+        missing piece is the live price-tick callback on the
+        :class:`OrderSyncEngine`; until that lands no plugin
+        advertises :data:`PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER`,
+        so this branch is only ever reached by unit tests that wire
+        a stub broker with the mode set.
+        """
+        symbol = intent.symbol
+        from_entry = intent.from_entry
+        # Scope the duplicate-dispatch guard to ``intent_key`` —
+        # ``(pine_id, from_entry)``. Two scale-out exits on the same
+        # ``from_entry`` (TP1 / TP2 with different ``strategy.exit`` ids)
+        # are valid concurrent intents; the parent-wide
+        # :meth:`has_active_partial_bracket` is reserved for the
+        # native-vs-engine-partial coexistence invariant (§12 #4),
+        # checked elsewhere when a native bracket is about to attach.
+        if self._partial_bracket_engine.has_active_legs_for_intent(
+                intent.intent_key,
+        ):
+            raise RuntimeError(
+                "engine-trigger partial bracket dispatch refuses: "
+                f"active legs already tracked for intent "
+                f"{intent.intent_key!r} ({symbol!r}, from_entry "
+                f"{from_entry!r}); the diff path must cancel the "
+                "prior intent before re-dispatching.",
+            )
+
+        # Reciprocal §12 #4 invariant: a whole-row / native ExitIntent on
+        # the SAME ``from_entry`` (different ``pine_id``, distinct
+        # ``intent_key``) already attached at the broker cannot coexist
+        # with engine-trigger partial legs we are about to register —
+        # the new state machine has no path to keep them in sync, and
+        # either side filling would over-close or strand siblings. The
+        # opposite ordering (partial registered first, native attempted
+        # later) is caught at :meth:`_dispatch_new` via
+        # :meth:`SoftwarePartialBracketEngine.has_active_partial_bracket`;
+        # this branch closes the loop for partial-after-native.
+        for active in self._active_intents.values():
+            if not isinstance(active, ExitIntent):
+                continue
+            if active.from_entry != from_entry:
+                continue
+            if active.intent_key == intent.intent_key:
+                # The intent-key collision is already covered by the
+                # has_active_legs_for_intent guard above; a separate
+                # active entry with the same key would be a diff-loop
+                # bug, not a coexistence violation.
+                continue
+            if active.is_partial_qty_bracket:
+                # Two scale-out partials under the same parent are a
+                # supported Pine pattern (TP1 / TP2 with distinct exit
+                # ids); only NATIVE whole-row exits are incompatible.
+                continue
+            raise RuntimeError(
+                "engine-trigger partial bracket dispatch refuses: a "
+                "native whole-row ExitIntent is already active for "
+                f"{symbol!r}/{from_entry!r} (intent "
+                f"{active.intent_key!r}); the script must cancel the "
+                "full-row bracket before attaching a partial-qty "
+                "bracket on the same parent.",
+            )
+
+        envelope = self._build_envelope(intent)
+        parent_envelope = self._envelopes.get(from_entry)
+        if parent_envelope is not None:
+            parent_dispatch_ref = parent_envelope.client_order_id(KIND_ENTRY)
+        else:
+            # Restart path: after the parent entry filled in a previous
+            # run and its dispatch envelope was retired, ``_envelopes``
+            # is empty for ``from_entry`` while
+            # ``_persisted_envelope_anchors`` still carries the bar
+            # timestamp / retry seq needed to rebuild the deterministic
+            # ``KIND_ENTRY`` COID. The adoption path at
+            # :meth:`_partial_bracket_replay_adoption` already uses this
+            # fallback to identify stale legs; mirror it here so a
+            # replacement dispatch issued after cancelling stale legs
+            # can still locate the parent and arm the software bracket.
+            # Without this fallback the position would land without any
+            # protective bracket whenever the parent is already filled.
+            parent_anchor = self._persisted_envelope_anchors.get(from_entry)
+            if parent_anchor is None:
+                raise RuntimeError(
+                    "engine-trigger partial bracket dispatch refuses: no "
+                    f"parent envelope tracked for {from_entry!r} — the "
+                    "parent entry must be dispatched before its bracket.",
+                )
+            parent_dispatch_ref = build_client_order_id(
+                run_tag=self._run_tag,
+                pine_id=from_entry,
+                bar_ts_ms=parent_anchor.bar_ts_ms,
+                kind=KIND_ENTRY,
+                retry_seq=parent_anchor.retry_seq,
+            )
+
+        # §2.6.7 gate: a degrading / degraded broker-native fail-safe on
+        # this parent blocks *new* partial brackets. Engine close
+        # dispatches and intermediate leg triggers continue to flow —
+        # only new bracket attachments are refused, because attaching
+        # one would seed a new worst-SL the broker layer cannot
+        # currently realise (unbounded loss risk on the new leg).
+        #
+        # Soft-skip via :class:`OrderSkippedByPlugin` (the same vehicle
+        # the §2.6.7 block_new_entry path uses, see :meth:`_dispatch_new`):
+        # raising a raw :class:`RuntimeError` here would propagate through
+        # ``_dispatch_new`` (generic Exception branch re-raises) and abort
+        # ``_diff_and_dispatch`` for the whole symbol — a normal
+        # degraded-fail-safe condition would take down the rest of the
+        # sync loop. ``OrderSkippedByPlugin`` is caught at every
+        # ``_dispatch_new`` call site so only this single intent is
+        # dropped; later bars / a user reset re-evaluate the bracket
+        # against fresh state.
+        if self._native_failsafe_manager.block_new_partial_bracket(
+                parent_entry_dispatch_ref=parent_dispatch_ref,
+                symbol=symbol,
+                pine_id=intent.pine_id,
+                from_entry=from_entry,
+        ):
+            # Drop the envelope built above before raising. Same
+            # rationale as the §2.6.7 block-new-entry path in
+            # :meth:`_dispatch_new`: ``_build_envelope`` already
+            # persisted an anchor (``_envelopes`` + SQLite envelope
+            # row); a later re-emission of this partial bracket must
+            # be treated as a fresh signal rather than re-using the
+            # stale ``bar_ts_ms`` / ``retry_seq`` from a dispatch that
+            # never reached the broker.
+            self._drop_envelope(intent.intent_key)
+            raise OrderSkippedByPlugin(
+                "engine-trigger partial bracket dispatch refuses: native "
+                f"fail-safe state for parent {parent_dispatch_ref!r} is "
+                "degrading/degraded; user reset / set_risk is required "
+                "before attaching a new partial bracket on this parent.",
+                intent_key=intent.intent_key,
+                reason="native_failsafe_blocked_partial_bracket",
+                context={
+                    'symbol': symbol,
+                    'pine_id': intent.pine_id,
+                    'from_entry': from_entry,
+                    'parent_entry_dispatch_ref': parent_dispatch_ref,
+                },
+            )
+
+        # §2.6.7 ownership flip: register this parent under engine-failsafe.
+        # The desired worst-SL is seeded after the legs land in the
+        # ledger (the manager needs to see the per-leg trigger_level set
+        # in :meth:`SoftwarePartialBracketEngine.register_legs`).
+        parent_side = 'long' if intent.side == 'sell' else 'short'
+        self._native_failsafe_manager.register_parent(
+            parent_entry_dispatch_ref=parent_dispatch_ref,
+            symbol=symbol,
+            parent_side=parent_side,
+            mintick=self._mintick,
+        )
+
+        # The leg must stay in ``LEG_STATE_PENDING_ENTRY`` until the
+        # parent entry has filled — not just until tick-based offsets
+        # are resolved. With absolute ``limit`` / ``stop`` prices on a
+        # partial exit dispatched against an unfilled parent, the leg
+        # has no resolution dependency but the WATCH-phase safety check
+        # requires a live parent snapshot: if ``on_price_tick`` fires
+        # while the parent is still flat, ``_safety_check`` aborts the
+        # leg with ``parent_flat`` and the later parent fill has no
+        # bracket left to promote. Gate the pending/armed decision on
+        # *both* tick resolution AND parent presence in ``open_trades``.
+        parent_filled = any(
+            trade.entry_id == from_entry
+            for trade in self._position.open_trades
+        )
+        leg_state = (
+            LEG_STATE_PENDING_ENTRY
+            if (intent.has_unresolved_ticks or not parent_filled)
+            else LEG_STATE_ARMED
+        )
+        # Engine-trigger partial bracket siblings (TP / SL / trail under one
+        # ``strategy.exit``) are *intra-bracket* OCA: when one leg fires the
+        # others must cancel. The Pine layer (`strategy/__init__.py`) defaults
+        # the ``strategy.exit`` ``oca_type`` to ``reduce`` to control how this
+        # exit interacts with *other* exits (cross-bracket reduce-only), but
+        # that semantic does not apply between THIS bracket's own legs. With
+        # ``reduce`` preserved here, :meth:`SoftwarePartialBracketEngine.
+        # cascade_cancel_oca` would early-return on the triggered leg and
+        # leave the losing sibling armed — the design dossier mandates
+        # ``oca_type='cancel'`` for software partial brackets (§ partial-qty
+        # plan, "OCA reduce vs cancel"). Force ``cancel`` for the bracket
+        # legs regardless of the parent ``intent.oca_type``.
+        #
+        # The internal group must be private per ``(pine_id, from_entry)``:
+        # adopting the user-supplied ``intent.oca_name`` here would lump the
+        # engine-internal legs of two unrelated partial exits (any pair of
+        # ``strategy.exit`` calls the script tagged with the same OCA name)
+        # into one cascade-cancel group, so a TP fill on one bracket would
+        # tear down the other bracket's still-armed SL/TP and leave the
+        # remaining quantity unprotected. The user's cross-bracket OCA
+        # intent is preserved at the intent layer (parked ``ExitIntent``
+        # OCA name), not by aliasing the engine-internal group key.
+        oca_group = f"__partial_exit_{intent.pine_id}_{from_entry}__"
+        oca_type = OcaType.CANCEL.value
+
+        legs: list[PartialBracketLeg] = []
+        coids: list[str] = []
+        for spec in self._enumerate_engine_trigger_legs(intent):
+            coid = envelope.client_order_id(spec.kind_code)
+            if self._store_ctx is not None:
+                create_engine_trigger_partial_leg_row(
+                    self._store_ctx,
+                    coid=coid,
+                    symbol=symbol,
+                    side=intent.side,
+                    qty=intent.qty,
+                    intent_key=intent.intent_key,
+                    pine_entry_id=intent.pine_id,
+                    from_entry=from_entry,
+                    leg_kind=spec.leg_kind,
+                    leg_state=leg_state,
+                    parent_pine_entry_id=from_entry,
+                    parent_entry_dispatch_ref=parent_dispatch_ref,
+                    intent_partial_qty=intent.qty,
+                    trigger_level=spec.trigger_level,
+                    trigger_offset=spec.trigger_offset,
+                    trail_activation_level=spec.trail_activation_level,
+                    trail_activation_offset=spec.trail_activation_offset,
+                    oca_group=oca_group,
+                    oca_type=oca_type,
+                )
+            legs.append(PartialBracketLeg(
+                coid=coid,
+                symbol=symbol,
+                pine_id=intent.pine_id,
+                from_entry=from_entry,
+                leg_kind=spec.leg_kind,
+                leg_state=leg_state,
+                side=intent.side,
+                qty=intent.qty,
+                intent_key=intent.intent_key,
+                parent_pine_entry_id=from_entry,
+                parent_entry_dispatch_ref=parent_dispatch_ref,
+                intent_partial_qty=intent.qty,
+                trigger_level=spec.trigger_level,
+                trigger_offset=spec.trigger_offset,
+                trail_activation_level=spec.trail_activation_level,
+                trail_activation_offset=spec.trail_activation_offset,
+                oca_group=oca_group,
+                oca_type=oca_type,
+            ))
+            coids.append(coid)
+
+        if not legs:
+            raise RuntimeError(
+                "engine-trigger partial bracket dispatch refuses: "
+                f"intent {intent.intent_key!r} carries no bracket leg "
+                "(intent_builder set is_partial_qty_bracket=True with "
+                "no tp/sl/trail field — likely a builder regression).",
+            )
+
+        self._partial_bracket_engine.register_legs(legs)
+        self._order_mapping[intent.intent_key] = coids
+
+    def _enumerate_engine_trigger_legs(
+            self, intent: ExitIntent,
+    ) -> list['_EngineTriggerLegSpec']:
+        """Yield one :class:`_EngineTriggerLegSpec` per declared bracket leg.
+
+        - TP leg uses :data:`KIND_EXIT_TP_PARTIAL` and either
+          ``tp_price`` (absolute) or a deferred ``profit_ticks``
+          distance.
+        - SL leg uses :data:`KIND_EXIT_SL_PARTIAL` and either
+          ``sl_price`` (absolute) or a deferred ``loss_ticks``
+          distance.
+        - Trail leg uses :data:`KIND_EXIT_TRAIL_PARTIAL` plus
+          ``trail_price`` (activation level, absolute) /
+          ``trail_points_ticks`` (activation distance from entry, in
+          ticks — resolved at parent fill) and ``trail_offset``
+          (trailing distance from high-water mark, in ticks).
+
+        All tick-typed inputs (``profit_ticks`` / ``loss_ticks`` /
+        ``trail_points_ticks`` / ``trail_offset``) are multiplied by
+        ``self._mintick`` here so the leg row stores price units
+        consistently — the pending→armed resolver and WATCH-phase
+        recompute never need to re-multiply.
+
+        For trail legs the spec separates the two distances Pine's
+        ``strategy.exit(trail_price/trail_points, trail_offset)``
+        encodes: the activation level (when the trail starts to
+        follow) and the trailing offset (how far behind the high it
+        sits afterwards). The activation distance lives in
+        ``trail_activation_offset`` / ``trail_activation_level`` and
+        ``trigger_offset`` carries only the post-activation stop
+        offset, so a pre-activation tick cannot cross a stop seeded
+        from the activation distance.
+        """
+        rows: list[_EngineTriggerLegSpec] = []
+        if intent.tp_price is not None or intent.profit_ticks is not None:
+            tp_offset = (
+                float(intent.profit_ticks) * self._mintick
+                if intent.profit_ticks is not None else None
+            )
+            rows.append(_EngineTriggerLegSpec(
+                leg_kind=LEG_KIND_TP_PARTIAL,
+                kind_code=KIND_EXIT_TP_PARTIAL,
+                trigger_level=intent.tp_price,
+                trigger_offset=tp_offset,
+            ))
+        if intent.sl_price is not None or intent.loss_ticks is not None:
+            sl_offset = (
+                float(intent.loss_ticks) * self._mintick
+                if intent.loss_ticks is not None else None
+            )
+            rows.append(_EngineTriggerLegSpec(
+                leg_kind=LEG_KIND_SL_PARTIAL,
+                kind_code=KIND_EXIT_SL_PARTIAL,
+                trigger_level=intent.sl_price,
+                trigger_offset=sl_offset,
+            ))
+        # ``intent.trail_offset`` is the post-activation trailing
+        # distance, in TICKS (see :attr:`pynecore.lib.strategy.Order.trail_offset`,
+        # which is multiplied by ``syminfo.mintick`` at every comparison
+        # in the Pine simulator). ``trail_price`` is the absolute
+        # activation level (already in price units); ``trail_points_ticks``
+        # is the pre-fill activation distance from entry (in ticks) and
+        # is resolved into an activation level only after the parent
+        # entry fills.
+        trail_offset_ticks = intent.trail_offset
+        trail_level = intent.trail_price
+        trail_ticks = intent.trail_points_ticks
+        if trail_level is not None or trail_offset_ticks is not None or trail_ticks is not None:
+            resolved_trail_offset: float | None = (
+                float(trail_offset_ticks) * self._mintick
+                if trail_offset_ticks is not None else None
+            )
+            trail_activation_offset: float | None = (
+                float(trail_ticks) * self._mintick
+                if trail_ticks is not None else None
+            )
+            rows.append(_EngineTriggerLegSpec(
+                leg_kind=LEG_KIND_TRAIL_PARTIAL,
+                kind_code=KIND_EXIT_TRAIL_PARTIAL,
+                # The moving stop is initialised by
+                # :meth:`SoftwarePartialBracketEngine._maybe_advance_trail`
+                # the moment the activation level is crossed — we
+                # deliberately leave ``trigger_level`` unset here.
+                trigger_level=None,
+                trigger_offset=resolved_trail_offset,
+                trail_activation_level=trail_level,
+                trail_activation_offset=trail_activation_offset,
+            ))
+        return rows
 
     def _handle_bracket_attach_after_fill_reject(
             self, intent: Intent, e: BracketAttachAfterFillRejectedError,
@@ -5978,6 +7831,242 @@ class OrderSyncEngine:
             self._store_ctx.upsert_order(position_coid, extras=extras)
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
+        # Engine-trigger partial bracket exits never reach the broker —
+        # the leg rows are engine-internal. A modify must therefore
+        # cancel the prior legs through the state machine and re-emit
+        # the new intent as a fresh dispatch. The native ``modify_exit``
+        # path would otherwise call into the plugin for an order that
+        # was never sent. See the partial-qty bracket exit design
+        # dossier §3.3.
+        if (isinstance(old, ExitIntent)
+                and self._partial_bracket_engine.has_active_legs_for_intent(
+                    old.intent_key,
+                )):
+            # Preflight the §2.6.7 fail-safe gate on the parent before
+            # evicting the currently armed legs: if the broker-native
+            # fail-safe is degrading / degraded / owner-unknown,
+            # :meth:`_dispatch_engine_trigger_partial_bracket` would
+            # refuse the replacement and raise, leaving the parent with
+            # no software TP/SL protection at all. The intended policy
+            # (see dossier §2.6.7) is to keep servicing the existing
+            # legs while only blocking *new* bracket attachments — the
+            # already-armed legs are intermediate close dispatches and
+            # must continue to flow. Skip the modify on a gate hit and
+            # keep the prior legs in place; the next sync re-runs the
+            # diff and retries once the fail-safe recovers.
+            # Resolve the parent's deterministic ``KIND_ENTRY`` COID. On
+            # the restart path the parent's entry envelope is no longer
+            # in ``_envelopes`` (the original dispatch was retired when
+            # the entry filled in a previous run), but the persisted
+            # envelope anchor preserves ``bar_ts_ms`` / ``retry_seq`` so
+            # the COID rebuilt from ``_persisted_envelope_anchors`` is
+            # byte-identical to the previous run's. Without this
+            # fallback the §2.6.7 preflight below would silently treat
+            # every cross-restart modify as "no parent registered" and
+            # skip the fail-safe gate — :meth:`cancel_legs_for_intent`
+            # would then evict the existing protection while
+            # :meth:`_dispatch_new` may reject the replacement, leaving
+            # the parent without any software bracket.
+            parent_dispatch_ref: str | None = None
+            if new.from_entry is not None:
+                parent_entry_envelope = self._envelopes.get(new.from_entry)
+                if parent_entry_envelope is not None:
+                    parent_dispatch_ref = parent_entry_envelope.client_order_id(
+                        KIND_ENTRY,
+                    )
+                else:
+                    parent_anchor = self._persisted_envelope_anchors.get(
+                        new.from_entry,
+                    )
+                    if parent_anchor is not None:
+                        parent_dispatch_ref = build_client_order_id(
+                            run_tag=self._run_tag,
+                            pine_id=new.from_entry,
+                            bar_ts_ms=parent_anchor.bar_ts_ms,
+                            kind=KIND_ENTRY,
+                            retry_seq=parent_anchor.retry_seq,
+                        )
+            if (isinstance(new, ExitIntent)
+                    and new.is_partial_qty_bracket
+                    and self._partial_qty_bracket_exit_mode
+                    is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                if parent_dispatch_ref is not None:
+                    if self._native_failsafe_manager.is_new_partial_bracket_blocked(
+                            parent_entry_dispatch_ref=parent_dispatch_ref,
+                    ):
+                        _blog_warning(
+                            "engine-trigger partial bracket modify deferred for "
+                            "%s -> %s: fail-safe gate blocks the replacement; "
+                            "preserving the existing legs until the next sync "
+                            "(parent %r)",
+                            old, new, parent_dispatch_ref,
+                        )
+                        # Raise the deferred-modify signal so
+                        # :meth:`_diff_and_dispatch` keeps ``_active_intents[key]``
+                        # pointing at the OLD intent. A plain ``return`` here would
+                        # let the caller promote the slot to ``new``, causing the
+                        # next sync to observe Pine == active and skip the retry
+                        # forever (the engine would then watch stale TP/SL/qty
+                        # levels until the strategy emits a different intent).
+                        raise _PartialBracketModifyDeferred(
+                            "engine-trigger partial bracket modify deferred by "
+                            "§2.6.7 fail-safe gate"
+                        )
+            # Preflight the §12 #4 coexistence guard before evicting the
+            # currently armed legs. A whole-row exit replacement on a
+            # parent that still carries scale-out siblings under a
+            # different ``intent_key`` (TP1 / TP2 with distinct
+            # ``strategy.exit(id=...)``) would land in
+            # :meth:`_dispatch_new` → ``else`` branch at L5128 and raise
+            # ``RuntimeError`` because :meth:`has_active_partial_bracket`
+            # is still True (the sibling legs remain). The exception
+            # would propagate after :meth:`cancel_legs_for_intent`
+            # already evicted ``old``'s legs and
+            # :meth:`_drop_envelope` cleared ``old``'s envelope,
+            # leaving ``_active_intents[old.intent_key]`` pointing at
+            # the OLD intent while no software protection backs it.
+            # Refuse the modify here so the existing legs stay armed
+            # until the script either cancels the sibling brackets or
+            # re-emits a compatible partial-qty replacement.
+            if (isinstance(new, ExitIntent)
+                    and not new.is_partial_qty_bracket
+                    and new.from_entry is not None
+                    and self._partial_bracket_engine
+                        .has_sibling_active_legs(
+                            old.symbol,
+                            new.from_entry,
+                            exclude_intent_key=old.intent_key,
+                        )):
+                raise RuntimeError(
+                    "engine-trigger partial bracket modify refuses: "
+                    f"whole-row replacement for {old.intent_key!r} would "
+                    f"violate §12 #4 — scale-out sibling legs remain on "
+                    f"{old.symbol!r}/{new.from_entry!r}; the script must "
+                    "cancel the sibling partial brackets before promoting "
+                    "this slot to a whole-row exit.",
+                )
+            _blog_info("modifying engine-trigger partial bracket %s -> %s",
+                       old, new)
+            self._partial_bracket_engine.cancel_legs_for_intent(
+                old.intent_key, reason='intent_modified',
+            )
+            self._order_mapping.pop(old.intent_key, None)
+            self._drop_envelope(old.intent_key)
+            # When the replacement is itself an engine-trigger partial
+            # bracket the new legs will re-register the worst-SL via
+            # :meth:`_recompute_native_failsafe_for_parent`; let that
+            # path own the failsafe state. But when no other partial
+            # legs remain on this parent (e.g. the replacement is a
+            # whole-row exit, a close, or a partial bracket with
+            # different shape that leaves the parent's partial set
+            # empty for one tick), the listener above already queued a
+            # ``stop_level=None`` clear snapshot. The next
+            # :meth:`drive_native_failsafe` drain would then send that
+            # clear PUT and delete a native bracket that
+            # :meth:`_dispatch_new(new)` may have just attached
+            # (mirrors the same race the new-dispatch
+            # partial-to-whole-row conversion handles around L5020).
+            # Retire the failsafe state for this parent so the queued
+            # clear is dropped before the dispatch runs; the new path
+            # is then free to re-register if it arms partial legs.
+            if (new.from_entry is not None
+                    and parent_dispatch_ref is not None
+                    and not self._partial_bracket_engine
+                        .has_active_partial_bracket(
+                            old.symbol, new.from_entry,
+                        )):
+                self._native_failsafe_manager.unregister_parent(
+                    parent_dispatch_ref,
+                )
+            self._dispatch_new(new)
+            return
+
+        # Mirror the previous branch for the opposite transition:
+        # a native whole-row bracket was active and the strategy
+        # re-emitted the same ``intent_key`` as a partial-qty bracket
+        # (e.g. user added a ``qty`` to a ``strategy.exit`` line). The
+        # native ``modify_exit`` path would push the partial bracket
+        # to the plugin even though the broker mode declared partial
+        # brackets must be engine-triggered. Cancel the native bracket
+        # at the broker and re-dispatch through
+        # :meth:`_dispatch_engine_trigger_partial_bracket` instead.
+        if (isinstance(old, ExitIntent)
+                and isinstance(new, ExitIntent)
+                and new.is_partial_qty_bracket
+                and not old.is_partial_qty_bracket
+                and self._partial_qty_bracket_exit_mode
+                is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+            # Preflight the §12 #4 coexistence guard before evicting the
+            # currently armed native bracket. The symmetric direction
+            # (whole-row replacing scale-out siblings) already runs an
+            # equivalent ``has_sibling_active_legs`` preflight above; this
+            # branch needs the mirror for native siblings:
+            # :meth:`_dispatch_engine_trigger_partial_bracket` rejects the
+            # new partial bracket with ``RuntimeError`` when another
+            # native whole-row ``ExitIntent`` for the same ``from_entry``
+            # (different ``intent_key``) is still active in
+            # ``_active_intents``. Without this preflight, the strict
+            # cancel below would already have cancelled ``old`` at the
+            # broker and dropped its ``_order_mapping`` / envelope, leaving
+            # ``_active_intents[old.intent_key]`` pointing at a stale
+            # intent with no live broker order until the next sync.
+            # Refuse the conversion here so the existing native bracket
+            # stays live until the script cancels the sibling native
+            # exit and re-emits a compatible partial-qty replacement.
+            if new.from_entry is not None:
+                for active in self._active_intents.values():
+                    if not isinstance(active, ExitIntent):
+                        continue
+                    if active.intent_key == old.intent_key:
+                        continue
+                    if active.from_entry != new.from_entry:
+                        continue
+                    if active.is_partial_qty_bracket:
+                        continue
+                    raise RuntimeError(
+                        "native-to-engine partial bracket conversion "
+                        f"refuses: a native whole-row ExitIntent is "
+                        f"already active for {old.symbol!r}/"
+                        f"{new.from_entry!r} (intent "
+                        f"{active.intent_key!r}); the script must cancel "
+                        "the sibling native exit before promoting "
+                        f"{old.intent_key!r} to a partial-qty bracket.",
+                    )
+            _blog_info(
+                "converting native bracket to engine-trigger partial "
+                "bracket %s -> %s", old, new,
+            )
+            # Native cancel must complete cleanly before engine legs are
+            # armed: a timed-out cancel (``OrderDispositionUnknownError``)
+            # leaves the original whole-row bracket possibly live at the
+            # broker. Arming engine-trigger partial legs against the same
+            # parent in that state violates the §12 #4 coexistence
+            # invariant — the native fill and the engine triggers could
+            # both close size on the position. Drive the cancel through a
+            # strict path that propagates the unknown-disposition error;
+            # on timeout, do NOT park under the new engine-trigger
+            # intent's envelope (the parked coid would belong to the
+            # cancel, not the new partial dispatch — the verification
+            # bookkeeping would be mismatched and engine legs would
+            # never be armed even after the cancel resolves). Re-raise
+            # so :meth:`_diff_and_dispatch` leaves the OLD native
+            # intent in ``_active_intents``; the next sync re-runs the
+            # diff which calls back into this branch and retries the
+            # strict cancel (idempotent at the exchange via the
+            # deterministic ``client_order_id``).
+            try:
+                self._dispatch_cancel_strict(old)
+            except OrderDispositionUnknownError as e:
+                _blog_warning(
+                    "native-to-engine conversion deferred: cancel of %s "
+                    "timed out (%s); engine legs will not be armed until "
+                    "the next sync retries the cancel and observes the "
+                    "native bracket cleared",
+                    old, e,
+                )
+                raise
+            self._dispatch_new(new)
+            return
         old_env = self._build_envelope(old)
         new_env = self._build_envelope(new)
         _blog_info("modifying %s -> %s", old, new)
@@ -6014,6 +8103,61 @@ class OrderSyncEngine:
             raise
 
     def _dispatch_cancel(self, old: Intent) -> None:
+        # Default cancel path: ``OrderDispositionUnknownError`` is logged
+        # and swallowed — the next ``reconcile()`` pass observes whether
+        # the exchange-side order is still live, and a subsequent cancel
+        # attempt hits the same deterministic id (idempotent at the
+        # exchange). Callers that must NOT proceed when the cancel
+        # disposition is unknown should invoke
+        # :meth:`_dispatch_cancel_strict` instead.
+        try:
+            self._dispatch_cancel_strict(old)
+        except OrderDispositionUnknownError as e:
+            _blog_warning(
+                "cancel dispatch for %s timed out (coid=%s); "
+                "next reconcile will verify: %s",
+                old.intent_key, e.client_order_id, e,
+            )
+            self._order_mapping.pop(old.intent_key, None)
+            self._drop_envelope(old.intent_key)
+            # Strict path raised before reaching its post-cancel cleanup,
+            # so the engine-trigger partial-bracket cleanup tied to this
+            # entry (pending legs + parked partial ``ExitIntent`` slots)
+            # was skipped. Mirror it here — see the rationale block in
+            # :meth:`_dispatch_cancel_strict`.
+            self._retire_pending_partials_for_cancelled_entry(
+                old, reason='parent_cancelled_by_strategy_unknown',
+            )
+
+    def _dispatch_cancel_strict(self, old: Intent) -> None:
+        """Cancel a dispatched intent and propagate unknown-disposition errors.
+
+        Identical to :meth:`_dispatch_cancel` except a timed-out broker
+        cancel (:class:`OrderDispositionUnknownError`) is re-raised
+        rather than swallowed. Used by paths that arm replacement state
+        only after the original is provably gone — e.g. the native-to-
+        engine partial-bracket conversion, where leaving the native
+        bracket possibly live while engine legs are armed would violate
+        the §12 #4 coexistence invariant.
+        """
+        # Engine-trigger partial bracket exits are engine-internal: the
+        # leg rows were never sent to the broker, so a plugin
+        # ``execute_cancel`` call would target nothing. Cancel through
+        # the state machine instead — the cascade flips every active
+        # leg under this ``intent_key`` to
+        # :data:`LEG_STATE_CASCADED_CANCEL` and clears the engine-side
+        # mapping. See the partial-qty bracket exit design dossier §3.3.
+        if (isinstance(old, ExitIntent)
+                and self._partial_bracket_engine.has_active_legs_for_intent(
+                    old.intent_key,
+                )):
+            _blog_info("cancelling engine-trigger partial bracket %s", old)
+            self._partial_bracket_engine.cancel_legs_for_intent(
+                old.intent_key, reason='intent_cancelled',
+            )
+            self._order_mapping.pop(old.intent_key, None)
+            self._drop_envelope(old.intent_key)
+            return
         if isinstance(old, EntryIntent):
             cancel = CancelIntent(pine_id=old.pine_id, symbol=self._symbol)
         elif isinstance(old, ExitIntent):
@@ -6031,21 +8175,56 @@ class OrderSyncEngine:
         _blog_info("cancelling %s", cancel)
         try:
             self._run_async(self._broker.execute_cancel(cancel_envelope))
-        except OrderDispositionUnknownError as e:
-            # A timed-out cancel leaves the exchange-side order in ambiguous
-            # state. The next reconcile() pass observes whether the order is
-            # still live; if so, a subsequent cancel attempt hits the same
-            # deterministic id and the exchange treats it idempotently.
-            _blog_warning(
-                "cancel dispatch for %s timed out (coid=%s); "
-                "next reconcile will verify: %s",
-                old.intent_key, e.client_order_id, e,
-            )
         except BrokerManualInterventionError as e:
             self._record_halt(e)
             raise
         self._order_mapping.pop(old.intent_key, None)
         self._drop_envelope(old.intent_key)
+        self._retire_pending_partials_for_cancelled_entry(
+            old, reason='parent_cancelled_by_strategy',
+        )
+
+    def _retire_pending_partials_for_cancelled_entry(
+            self, old: Intent, *, reason: str,
+    ) -> None:
+        """Drop pending partial-bracket state after a parent-entry cancel.
+
+        Strategy-initiated parent-entry cancel: retire any engine-trigger
+        partial-bracket :data:`LEG_STATE_PENDING_ENTRY` legs and their
+        parked partial :class:`ExitIntent` slots tied to this entry. The
+        async ``cancelled`` event path (:meth:`_on_order_event`) calls
+        :meth:`_abort_pending_partial_legs_for_dead_entry`, but a
+        synchronous ``execute_cancel`` success — or a swallowed
+        :class:`OrderDispositionUnknownError` in
+        :meth:`_dispatch_cancel` — may never produce a later event with
+        a matching ``_order_mapping`` lookup (the mapping was just
+        popped). Without this eager cleanup the legs survive in
+        :data:`LEG_STATE_PENDING_ENTRY` and the still-active partial
+        :class:`ExitIntent` slot can promote against a future entry
+        reusing the same ``from_entry`` (attaching a stale partial close
+        to the wrong position) or short-circuit the duplicate guard in
+        :meth:`_dispatch_engine_trigger_partial_bracket`. Whole-row
+        native exits are intentionally left alone here — they are
+        independent broker-side orders that the outer cancel-diff loop
+        cancels separately when the script drops them from ``new_map``.
+        """
+        if not isinstance(old, EntryIntent):
+            return
+        self._partial_bracket_engine.abort_pending_legs_for_parent_never_arrived(
+            symbol=self._symbol,
+            from_entry=old.intent_key,
+            reason=reason,
+        )
+        partial_exit_keys_to_drop = [
+            key for key, active in self._active_intents.items()
+            if isinstance(active, ExitIntent)
+            and active.is_partial_qty_bracket
+            and active.from_entry == old.intent_key
+        ]
+        for exit_key in partial_exit_keys_to_drop:
+            self._active_intents.pop(exit_key, None)
+            self._order_mapping.pop(exit_key, None)
+            self._drop_envelope(exit_key)
 
     # === Async bridge ===
 

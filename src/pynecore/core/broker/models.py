@@ -48,6 +48,13 @@ __all__ = [
     'BracketReconstructedEvent',
     'ManualInterventionRequiredEvent',
     'ProtectionDegradedEvent',
+    'NativeFailsafeStateTransitionEvent',
+    'PartialBracketBlockedDegradedFailsafeEvent',
+    'EntryBlockedDegradedFailsafeEvent',
+    'EntrySkippedDueToDegradedFailsafeEvent',
+    'BrokerNativeFailsafeUnavailableEvent',
+    'BrokerNativeFailsafeExternalEditEvent',
+    'BrokerNativeFailsafeFullCloseEvent',
 ]
 
 
@@ -1236,6 +1243,98 @@ class ManualInterventionRequiredEvent(BrokerEvent):
     reason: str
     intent_key: str | None = None
     context: dict | None = None
+
+
+@dataclass
+class NativeFailsafeStateTransitionEvent(BrokerEvent):
+    """The §2.6.7 ``NativeStopState`` for ``parent_entry_dispatch_ref`` changed
+    health state.
+
+    Emitted on every ``healthy ↔ degrading ↔ degraded ↔ retired`` transition so
+    observability sinks see the full lifecycle, not only terminal failures.
+    """
+    parent_entry_dispatch_ref: str
+    symbol: str
+    from_state: str  # 'healthy' | 'degrading' | 'degraded' | 'retired'
+    to_state: str
+    reason: str
+
+
+@dataclass
+class PartialBracketBlockedDegradedFailsafeEvent(BrokerEvent):
+    """A new ``SOFTWARE_ENGINE_TRIGGER`` partial bracket dispatch was rejected
+    because the parent's ``NativeStopState`` is ``degrading`` / ``degraded``.
+
+    The engine still services *close* and *intermediate-leg* dispatches for the
+    same parent — only *new* partial brackets are blocked while the broker-native
+    fail-safe cannot be verified present.
+    """
+    parent_entry_dispatch_ref: str
+    symbol: str
+    pine_id: str
+    from_entry: str
+    health: str  # 'degrading' | 'degraded'
+
+
+@dataclass
+class EntryBlockedDegradedFailsafeEvent(BrokerEvent):
+    """A new ``strategy.entry`` on a symbol that has at least one
+    ``degrading`` / ``degraded`` ``NativeStopState`` was rejected (§2.6.7).
+
+    The script's signal is dropped rather than queued — see
+    :class:`EntrySkippedDueToDegradedFailsafeEvent` for the replay-policy
+    consequence.
+    """
+    symbol: str
+    pine_id: str
+    health: str  # 'degrading' | 'degraded'
+
+
+@dataclass
+class EntrySkippedDueToDegradedFailsafeEvent(BrokerEvent):
+    """Drop-semantics counterpart of
+    :class:`EntryBlockedDegradedFailsafeEvent`: the entry signal is NOT
+    queued and will NOT be replayed when the failsafe recovers (§2.6.7).
+    """
+    symbol: str
+    pine_id: str
+    bar_ts_ms: int
+
+
+@dataclass
+class BrokerNativeFailsafeUnavailableEvent(BrokerEvent):
+    """The native fail-safe stop on ``parent_entry_dispatch_ref`` has dropped
+    to ``degraded`` — the PUT retry budget is exhausted or the stale window
+    expired (§2.6). Until a user reset / ``set_risk`` arrives, the engine
+    will not re-issue native bracket amends for this parent.
+    """
+    parent_entry_dispatch_ref: str
+    symbol: str
+    reason: str
+
+
+@dataclass
+class BrokerNativeFailsafeExternalEditEvent(BrokerEvent):
+    """Snapshot diff detected ``actual_level != desired_level`` with no
+    pending PUT in flight (§2.6.7). Owner flipped to ``unknown`` — the
+    engine will not overwrite until the user explicitly resets ownership.
+    """
+    parent_entry_dispatch_ref: str
+    symbol: str
+    desired_level: float | None
+    actual_level: float | None
+
+
+@dataclass
+class BrokerNativeFailsafeFullCloseEvent(BrokerEvent):
+    """The broker-native worst-SL stop on the parent fired and closed the
+    full residual (§3.4 cascade). Every remaining engine-trigger partial
+    leg under this parent is cascaded into ``cascaded_cancel_by_native_sl``
+    (snapshot-driven, idempotent on ``dealId + generation``).
+    """
+    parent_entry_dispatch_ref: str
+    symbol: str
+    actual_level: float | None
 
 
 @dataclass

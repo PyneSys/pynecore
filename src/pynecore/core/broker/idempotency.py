@@ -43,6 +43,9 @@ __all__ = [
     'KIND_ENTRY',
     'KIND_EXIT_TP',
     'KIND_EXIT_SL',
+    'KIND_EXIT_TP_PARTIAL',
+    'KIND_EXIT_SL_PARTIAL',
+    'KIND_EXIT_TRAIL_PARTIAL',
     'KIND_CLOSE',
     'KIND_CANCEL',
     'KIND_MODIFY_ENTRY',
@@ -61,13 +64,22 @@ __all__ = [
 KIND_ENTRY: Final[str] = 'e'
 KIND_EXIT_TP: Final[str] = 't'
 KIND_EXIT_SL: Final[str] = 's'
+# Engine-trigger partial bracket leg kinds. Distinct lowercase codes —
+# uppercase variants would collide with the native TP / SL / modify-exit
+# codes on exchanges that case-normalise client ids, so the partial-bracket
+# legs (which own no exchange-side order while armed) get their own letters.
+KIND_EXIT_TP_PARTIAL: Final[str] = 'p'
+KIND_EXIT_SL_PARTIAL: Final[str] = 'q'
+KIND_EXIT_TRAIL_PARTIAL: Final[str] = 'l'
 KIND_CLOSE: Final[str] = 'c'
 KIND_CANCEL: Final[str] = 'x'
 KIND_MODIFY_ENTRY: Final[str] = 'n'
 KIND_MODIFY_EXIT: Final[str] = 'r'
 
 VALID_KINDS: Final[frozenset[str]] = frozenset({
-    KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL, KIND_CLOSE, KIND_CANCEL,
+    KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL,
+    KIND_EXIT_TP_PARTIAL, KIND_EXIT_SL_PARTIAL, KIND_EXIT_TRAIL_PARTIAL,
+    KIND_CLOSE, KIND_CANCEL,
     KIND_MODIFY_ENTRY, KIND_MODIFY_EXIT,
 })
 

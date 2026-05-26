@@ -48,7 +48,36 @@ __all__ = [
     'STATE_DISPOSITION_UNKNOWN',
     'STATE_CLOSING',
     'STATE_CANCEL_PENDING',
+    'STATE_PARTIAL_BRACKET_LEG',
     'PENDING_DISPATCH_STATES',
+    'LEG_KIND_TP_PARTIAL',
+    'LEG_KIND_SL_PARTIAL',
+    'LEG_KIND_TRAIL_PARTIAL',
+    'ENGINE_TRIGGER_LEG_KINDS',
+    'LEG_STATE_ARMED',
+    'LEG_STATE_PENDING_ENTRY',
+    'LEG_STATE_TRIGGERING',
+    'LEG_STATE_TRIGGERED',
+    'LEG_STATE_TRIGGERED_FAILED',
+    'LEG_STATE_TRIGGERED_UNKNOWN',
+    'LEG_STATE_ABORTED_PARENT_GONE',
+    'LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED',
+    'LEG_STATE_CASCADED_CANCEL',
+    'LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE',
+    'LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL',
+    'LEG_STATE_TERMINAL',
+    'LEG_STATE_ACTIVE',
+    'EXTRAS_KEY_LEG_KIND',
+    'EXTRAS_KEY_LEG_STATE',
+    'EXTRAS_KEY_TRIGGER_LEVEL',
+    'EXTRAS_KEY_TRIGGER_OFFSET',
+    'EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL',
+    'EXTRAS_KEY_TRAIL_ACTIVATION_OFFSET',
+    'EXTRAS_KEY_PARENT_ENTRY_DISPATCH_REF',
+    'EXTRAS_KEY_INTENT_PARTIAL_QTY',
+    'EXTRAS_KEY_PARENT_PINE_ENTRY_ID',
+    'EXTRAS_KEY_OCA_GROUP',
+    'EXTRAS_KEY_OCA_TYPE',
     'create_entry_order_row',
     'record_server_ref',
     'mark_confirmed_with_fill',
@@ -66,6 +95,9 @@ __all__ = [
     'mark_modify_completed',
     'mark_reconcile_filled',
     'mark_reconcile_terminal_close',
+    'create_engine_trigger_partial_leg_row',
+    'update_engine_trigger_partial_leg_state',
+    'iter_active_engine_trigger_partial_legs',
 ]
 
 
@@ -157,6 +189,16 @@ STATE_CLOSING = 'closing'
 # snapshot and retries the DELETEs that did not land.
 STATE_CANCEL_PENDING = 'cancel_pending'
 
+# ``orders.state`` marker for a synthetic engine-trigger partial bracket
+# leg row. The order lifecycle column does NOT track the engine-trigger
+# state machine — the actual leg phase (``armed`` → ``triggering`` →
+# ``triggered`` / ``cascaded_cancel`` / ...) lives under
+# :data:`EXTRAS_KEY_LEG_STATE`. This marker exists so the legacy
+# recovery / reconcile paths can short-circuit on these rows (they own
+# no exchange-side order; the engine state machine in
+# :mod:`software_partial_bracket_engine` owns them).
+STATE_PARTIAL_BRACKET_LEG = 'partial_bracket_leg'
+
 # States the recovery path must examine after a restart. ``submitted``
 # is here because a crash between the initial helper and the REST call
 # leaves the row in this state — same recovery semantics as
@@ -165,11 +207,115 @@ STATE_CANCEL_PENDING = 'cancel_pending'
 # phases once the matching ``resume_pending_dispatch`` branches exist
 # on the plugin side; until then the journal does not surface them to
 # the recovery loop.
+#
+# :data:`STATE_PARTIAL_BRACKET_LEG` is deliberately NOT a member —
+# engine-trigger leg rows are replayed by
+# :meth:`SoftwarePartialBracketEngine.restart_replay`, not by the
+# journal's resume hook.
 PENDING_DISPATCH_STATES: frozenset[str] = frozenset({
     STATE_SUBMITTED,
     STATE_SERVER_REF_SEEN,
     STATE_DISPOSITION_UNKNOWN,
 })
+
+
+# === Engine-trigger partial bracket leg constants ==========================
+
+# ``extras[EXTRAS_KEY_LEG_KIND]`` for the take-profit leg of an
+# engine-trigger partial bracket. The motor closes a strict subset of
+# the parent position at this price level.
+LEG_KIND_TP_PARTIAL = 'tp_partial'
+
+# ``extras[EXTRAS_KEY_LEG_KIND]`` for the stop-loss leg of an
+# engine-trigger partial bracket.
+LEG_KIND_SL_PARTIAL = 'sl_partial'
+
+# ``extras[EXTRAS_KEY_LEG_KIND]`` for the trailing-stop leg of an
+# engine-trigger partial bracket. The ``trigger_level`` for a trail
+# leg is recomputed by the engine on every favourable price move
+# from ``trigger_offset``.
+LEG_KIND_TRAIL_PARTIAL = 'trail_partial'
+
+# Set of leg kinds owned by the engine-trigger state machine —
+# reconciliation / replay paths key off membership here to identify
+# rows whose disposition is NOT the journal's responsibility.
+ENGINE_TRIGGER_LEG_KINDS: frozenset[str] = frozenset({
+    LEG_KIND_TP_PARTIAL,
+    LEG_KIND_SL_PARTIAL,
+    LEG_KIND_TRAIL_PARTIAL,
+})
+
+# ``extras[EXTRAS_KEY_LEG_STATE]`` values — the engine-trigger state
+# machine's current phase. See the partial-qty bracket exit design
+# dossier §3 for the full lifecycle diagram. ``armed`` is the steady
+# state where the motor watches WS price ticks; ``triggering`` is the
+# transient between trigger detection and the close dispatch landing;
+# ``triggered`` / ``triggered_failed`` / ``triggered_unknown`` are the
+# three close-dispatch outcomes. The ``aborted_*`` and ``cascaded_*``
+# branches are the terminal states for legs that the engine does not
+# fire (parent gone, OCA cancellation, broker-native SL hit).
+LEG_STATE_ARMED = 'armed'
+LEG_STATE_PENDING_ENTRY = 'pending_entry'
+LEG_STATE_TRIGGERING = 'triggering'
+LEG_STATE_TRIGGERED = 'triggered'
+LEG_STATE_TRIGGERED_FAILED = 'triggered_failed'
+LEG_STATE_TRIGGERED_UNKNOWN = 'triggered_unknown'
+LEG_STATE_ABORTED_PARENT_GONE = 'aborted_parent_gone'
+LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED = 'aborted_parent_never_arrived'
+LEG_STATE_CASCADED_CANCEL = 'cascaded_cancel'
+LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE = 'cascaded_cancel_by_parent_close'
+LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL = 'cascaded_cancel_by_native_sl'
+
+# Terminal states — the row is closed (``closed_ts_ms`` is set) and
+# the engine no longer owns it. Used by both
+# :func:`iter_active_engine_trigger_partial_legs` (to filter them out)
+# and the engine's audit emitters.
+LEG_STATE_TERMINAL: frozenset[str] = frozenset({
+    LEG_STATE_TRIGGERED,
+    LEG_STATE_ABORTED_PARENT_GONE,
+    LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED,
+    LEG_STATE_CASCADED_CANCEL,
+    LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE,
+    LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL,
+})
+
+# Active states — the row is alive and the engine state machine owns
+# the next transition. :data:`LEG_STATE_TRIGGERED_FAILED` and
+# :data:`LEG_STATE_TRIGGERED_UNKNOWN` are intermediate (the engine
+# retries / reconciles to either ``triggered`` or back to ``armed``).
+LEG_STATE_ACTIVE: frozenset[str] = frozenset({
+    LEG_STATE_ARMED,
+    LEG_STATE_PENDING_ENTRY,
+    LEG_STATE_TRIGGERING,
+    LEG_STATE_TRIGGERED_FAILED,
+    LEG_STATE_TRIGGERED_UNKNOWN,
+})
+
+# Canonical ``extras`` keys for an engine-trigger partial bracket leg
+# row. Defined as string constants so a typo at a call site fails the
+# import rather than producing silent dictionary divergence between
+# the persist helper and the recovery / iteration helpers.
+EXTRAS_KEY_LEG_KIND = 'leg_kind'
+EXTRAS_KEY_LEG_STATE = 'leg_state'
+EXTRAS_KEY_TRIGGER_LEVEL = 'trigger_level'
+EXTRAS_KEY_TRIGGER_OFFSET = 'trigger_offset'
+# Trailing-stop activation level (price units). While set, the trail
+# leg is in its pre-activation phase: the engine only watches whether
+# the current price has crossed this level. Cleared (set to ``None``)
+# the moment activation fires, at which point :data:`EXTRAS_KEY_TRIGGER_LEVEL`
+# starts carrying the moving stop level computed from
+# :data:`EXTRAS_KEY_TRIGGER_OFFSET`.
+EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL = 'trail_activation_level'
+# Pre-activation activation OFFSET in price units (i.e.
+# ``trail_points_ticks * mintick``). Present only on a trail leg
+# whose parent entry is still pending — at parent fill time the engine
+# resolves it to an absolute :data:`EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL`.
+EXTRAS_KEY_TRAIL_ACTIVATION_OFFSET = 'trail_activation_offset'
+EXTRAS_KEY_PARENT_ENTRY_DISPATCH_REF = 'parent_entry_dispatch_ref'
+EXTRAS_KEY_INTENT_PARTIAL_QTY = 'intent_partial_qty'
+EXTRAS_KEY_PARENT_PINE_ENTRY_ID = 'parent_pine_entry_id'
+EXTRAS_KEY_OCA_GROUP = 'oca_group'
+EXTRAS_KEY_OCA_TYPE = 'oca_type'
 
 
 # === Entry order row lifecycle =============================================
@@ -908,3 +1054,252 @@ def mark_reconcile_terminal_close(
     store.upsert_order(coid, **fields)
     if close_row:
         store.close_order(coid)
+
+
+# === Engine-trigger partial bracket leg helpers ============================
+
+def create_engine_trigger_partial_leg_row(
+        store: 'RunContext',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str,
+        pine_entry_id: str,
+        from_entry: str,
+        leg_kind: str,
+        leg_state: str,
+        parent_pine_entry_id: str,
+        parent_entry_dispatch_ref: str,
+        intent_partial_qty: float,
+        trigger_level: float | None = None,
+        trigger_offset: float | None = None,
+        trail_activation_level: float | None = None,
+        trail_activation_offset: float | None = None,
+        oca_group: str | None = None,
+        oca_type: str | None = None,
+        extra_payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist one engine-trigger partial bracket leg row.
+
+    The row carries no exchange-side order — the engine state machine
+    in :class:`~pynecore.core.broker.software_partial_bracket_engine.SoftwarePartialBracketEngine`
+    owns it. ``orders.state`` is set to :data:`STATE_PARTIAL_BRACKET_LEG`
+    so the journal / reconcile paths short-circuit on these rows; the
+    actual engine-trigger phase lives under
+    :data:`EXTRAS_KEY_LEG_STATE` and is updated via
+    :func:`update_engine_trigger_partial_leg_state`.
+
+    The function deliberately mirrors :func:`create_entry_order_row`'s
+    "insert-only" shape — the row is freshly written by the dispatch
+    path and never re-inserted by the same call site.
+
+    :param store: The active run context.
+    :param coid: The leg's canonical client-order-id. The engine
+        constructs this deterministically from ``(parent_dispatch_ref,
+        leg_kind)`` so a restart-mid-dispatch never produces two
+        rows for the same leg.
+    :param symbol: Exchange-side symbol.
+    :param side: ``'buy'`` / ``'sell'`` — the CLOSE side, opposite the
+        parent position direction.
+    :param qty: Partial-close quantity, already quantized to the
+        broker's lot step.
+    :param intent_key: The owning :class:`ExitIntent`'s diff key.
+    :param pine_entry_id: Pine ``strategy.exit(id=...)`` value, kept
+        for audit symmetry with non-leg rows.
+    :param from_entry: Pine ``strategy.exit(from_entry=...)`` — the
+        parent entry id the leg attaches to.
+    :param leg_kind: One of :data:`LEG_KIND_TP_PARTIAL`,
+        :data:`LEG_KIND_SL_PARTIAL`, :data:`LEG_KIND_TRAIL_PARTIAL`.
+    :param leg_state: Initial state — either :data:`LEG_STATE_ARMED`
+        (entry already filled, absolute trigger level known) or
+        :data:`LEG_STATE_PENDING_ENTRY` (entry pending, tick offsets
+        not yet resolved).
+    :param parent_pine_entry_id: Same as ``from_entry`` — kept
+        separately for clarity at recovery time.
+    :param parent_entry_dispatch_ref: The parent entry row's
+        ``client_order_id``. Used by reconciliation to guard against
+        a stale leg attaching to a new parent that happens to share
+        the same Pine entry id (the unique COID prevents that
+        confusion).
+    :param intent_partial_qty: Original :class:`ExitIntent.qty` —
+        kept separately from ``qty`` (which is the dispatched close
+        quantity) so the safety check can compare intent vs. live
+        parent qty at trigger time.
+    :param trigger_level: Absolute price the engine watches for to
+        fire the leg. ``None`` while the leg is ``pending_entry``.
+    :param trigger_offset: Trail offset (price units, not ticks) for
+        :data:`LEG_KIND_TRAIL_PARTIAL`. ``None`` for tp / sl legs.
+    :param oca_group: OCA group name the cascade-cancel keys on.
+    :param oca_type: OCA group type (``'cancel'`` for partial
+        brackets — TP filling cancels the SL and vice versa).
+    :param extra_payload: Additional plugin-specific extras to merge
+        into the row's ``extras``. Useful for journal anchors.
+    :raises ValueError: When ``leg_kind`` is not one of the three
+        canonical values, or ``leg_state`` is not ``armed`` /
+        ``pending_entry``.
+    """
+    if leg_kind not in ENGINE_TRIGGER_LEG_KINDS:
+        raise ValueError(
+            f"create_engine_trigger_partial_leg_row: leg_kind must be "
+            f"one of {sorted(ENGINE_TRIGGER_LEG_KINDS)}, got {leg_kind!r}"
+        )
+    if leg_state not in (LEG_STATE_ARMED, LEG_STATE_PENDING_ENTRY):
+        raise ValueError(
+            f"create_engine_trigger_partial_leg_row: leg_state must be "
+            f"{LEG_STATE_ARMED!r} or {LEG_STATE_PENDING_ENTRY!r}, "
+            f"got {leg_state!r}"
+        )
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_LEG_KIND: leg_kind,
+        EXTRAS_KEY_LEG_STATE: leg_state,
+        EXTRAS_KEY_TRIGGER_LEVEL: trigger_level,
+        EXTRAS_KEY_TRIGGER_OFFSET: trigger_offset,
+        EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL: trail_activation_level,
+        EXTRAS_KEY_TRAIL_ACTIVATION_OFFSET: trail_activation_offset,
+        EXTRAS_KEY_PARENT_PINE_ENTRY_ID: parent_pine_entry_id,
+        EXTRAS_KEY_PARENT_ENTRY_DISPATCH_REF: parent_entry_dispatch_ref,
+        EXTRAS_KEY_INTENT_PARTIAL_QTY: intent_partial_qty,
+        EXTRAS_KEY_OCA_GROUP: oca_group,
+        EXTRAS_KEY_OCA_TYPE: oca_type,
+    }
+    if extra_payload:
+        extras.update(extra_payload)
+    # Same-bar modify/cancel→recreate path: the prior leg row was
+    # closed by ``_dispatch_modify`` (which calls
+    # :meth:`RunContext.close_order` on the legs via
+    # :func:`update_engine_trigger_partial_leg_state` →
+    # ``cancel_legs_for_intent``). The fresh dispatch re-uses the
+    # same bar timestamp and retry sequence and therefore reaches
+    # this helper with the SAME ``coid``. ``upsert_order`` does not
+    # clear ``closed_ts_ms``, so without an explicit reopen the row
+    # stays out of ``iter_live_orders`` / ``iter_active_engine_trigger_partial_legs``
+    # after a restart and the bracket protection disappears. The
+    # call is a no-op when the row does not yet exist or is already
+    # live.
+    store.reopen_order(coid)
+    store.upsert_order(
+        coid,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        state=STATE_PARTIAL_BRACKET_LEG,
+        intent_key=intent_key,
+        pine_entry_id=pine_entry_id,
+        from_entry=from_entry,
+        extras=extras,
+    )
+
+
+def update_engine_trigger_partial_leg_state(
+        store: 'RunContext',
+        *,
+        coid: str,
+        new_leg_state: str,
+        trigger_level: float | None = None,
+        trigger_offset: float | None = None,
+        qty: float | None = None,
+        extras_patch: Mapping[str, Any] | None = None,
+        close_row: bool | None = None,
+) -> None:
+    """Transition an engine-trigger partial bracket leg row.
+
+    Three categories of state move call this helper:
+
+    - ``pending_entry`` → ``armed`` after the parent entry fills (the
+      caller resolves the tick offsets into absolute price levels and
+      passes them via ``trigger_level``).
+    - ``armed`` → ``triggering`` → ``triggered`` / ``triggered_failed``
+      / ``triggered_unknown`` along the close-dispatch path.
+    - ``armed`` → ``cascaded_cancel`` / ``aborted_*`` along the OCA
+      cascade, parent-gone abort, and broker-native fail-safe paths.
+
+    The function MUST be called with ``close_row=True`` for any
+    transition into :data:`LEG_STATE_TERMINAL` — the helper does NOT
+    infer terminality on its own because some intermediate states
+    (``triggered_failed``, ``triggered_unknown``) look terminal but
+    are retried by the engine in place.
+
+    :param store: The active run context.
+    :param coid: The leg row's client-order-id.
+    :param new_leg_state: Target value for
+        :data:`EXTRAS_KEY_LEG_STATE`. Must be one of the
+        :data:`LEG_STATE_*` constants.
+    :param trigger_level: When non-``None``, overwrites the leg's
+        absolute trigger price (used both for the pending→armed
+        promotion and for trail recompute moves).
+    :param trigger_offset: When non-``None``, overwrites the leg's
+        trail offset (rare; the engine's pricepath is to bump
+        ``trigger_level`` instead).
+    :param qty: When non-``None``, overwrites the leg row's ``qty``
+        column. The WATCH-phase safety check may cap the close
+        quantity below the originally-recorded ``intent_partial_qty``
+        when the parent has since been partially reduced; persisting
+        the capped value here keeps ``restart_replay`` from rebuilding
+        the leg with the stale, larger size.
+    :param extras_patch: Additional ``extras`` keys to merge before
+        the upsert — typically empty, used by audit-rich call sites
+        (e.g. failure-reason capture on ``triggered_failed``).
+    :param close_row: When ``True``, also calls
+        :meth:`RunContext.close_order` after the state update. The
+        engine sets this on every transition into
+        :data:`LEG_STATE_TERMINAL`.
+    :raises ValueError: When ``new_leg_state`` is not one of the
+        canonical :data:`LEG_STATE_*` values.
+    """
+    if new_leg_state not in (LEG_STATE_ACTIVE | LEG_STATE_TERMINAL):
+        raise ValueError(
+            f"update_engine_trigger_partial_leg_state: new_leg_state must be "
+            f"one of {sorted(LEG_STATE_ACTIVE | LEG_STATE_TERMINAL)}, "
+            f"got {new_leg_state!r}"
+        )
+    existing = store.get_order(coid)
+    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+    merged[EXTRAS_KEY_LEG_STATE] = new_leg_state
+    if trigger_level is not None:
+        merged[EXTRAS_KEY_TRIGGER_LEVEL] = trigger_level
+    if trigger_offset is not None:
+        merged[EXTRAS_KEY_TRIGGER_OFFSET] = trigger_offset
+    if extras_patch:
+        merged.update(extras_patch)
+    upsert_fields: dict[str, Any] = {'extras': merged}
+    if qty is not None:
+        upsert_fields['qty'] = qty
+    store.upsert_order(coid, **upsert_fields)
+    if close_row:
+        store.close_order(coid)
+
+
+def iter_active_engine_trigger_partial_legs(
+        store: 'RunContext',
+        *,
+        symbol: str | None = None,
+        from_entry: str | None = None,
+) -> Iterator['OrderRow']:
+    """Iterate live engine-trigger partial bracket leg rows.
+
+    Used by :meth:`SoftwarePartialBracketEngine.restart_replay` to
+    rebuild the in-memory leg ledger after a runner restart, and by
+    the cascade-cancel paths that need every leg attached to one
+    parent. Returns rows whose ``orders.state`` is
+    :data:`STATE_PARTIAL_BRACKET_LEG`, are not closed
+    (``closed_ts_ms IS NULL``), and whose
+    :data:`EXTRAS_KEY_LEG_STATE` is one of :data:`LEG_STATE_ACTIVE`
+    (terminal rows are filtered out even when ``close_order`` has
+    not yet flipped ``closed_ts_ms``).
+
+    :param store: The active run context.
+    :param symbol: Optional symbol filter — passed straight through
+        to :meth:`RunContext.iter_live_orders`.
+    :param from_entry: Optional Pine parent entry id filter — same
+        passthrough; the cascade-cancel callers use this to target
+        all legs of one parent.
+    """
+    for row in store.iter_live_orders(symbol=symbol, from_entry=from_entry):
+        if row.state != STATE_PARTIAL_BRACKET_LEG:
+            continue
+        leg_state = (row.extras or {}).get(EXTRAS_KEY_LEG_STATE)
+        if leg_state not in LEG_STATE_ACTIVE:
+            continue
+        yield row
