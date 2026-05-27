@@ -175,11 +175,11 @@ def plugin_info(
             # noinspection PyDataclass
             for f in dataclasses.fields(ex_caps):
                 value = getattr(ex_caps, f.name)
-                # ``ExchangeCapabilities`` mixes CapabilityLevel,
-                # PartialQtyBracketExitMode (both StrEnum) and plain ``bool``
-                # (e.g. ``partial_qty_bracket_exit_supports_pyramiding``).
-                # Render each shape on its own terms instead of assuming
-                # every field has a ``.value`` attribute.
+                # ``ExchangeCapabilities`` mixes :class:`CapabilityLevel`
+                # (StrEnum) and plain ``bool`` (e.g.
+                # ``partial_qty_bracket_exit_supports_pyramiding``). Render
+                # each shape on its own terms instead of assuming every
+                # field has a ``.value`` attribute.
                 if isinstance(value, StrEnum):
                     colour = level_color.get(value, "cyan")
                     display = value.value

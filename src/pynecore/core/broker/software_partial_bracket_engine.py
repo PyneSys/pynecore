@@ -4,8 +4,7 @@ Engine-side trigger state machine for partial-quantity bracket exits.
 This module owns the lifecycle of a partial-quantity TP / SL / trailing
 bracket that the *engine* watches and fires — as opposed to a native
 broker bracket attached to the parent ``dealId`` (covered by
-``execute_exit``) or a reduce-only working order placed on the book
-(``SOFTWARE_REDUCE_ONLY_ORDER``).
+``execute_exit``).
 
 The state machine and the persisted leg rows in :mod:`store_helpers`
 form one pair: the rows are the durable representation (PERSIST-FIRST),
@@ -24,7 +23,8 @@ ledger, the PERSIST-FIRST → ledger handoff, the cascade-cancel paths
 (OCA, parent close, broker-native SL), and the restart replay. The
 price-tick wiring from the live provider into
 :meth:`SoftwarePartialBracketEngine.on_price_tick` is added in Slice
-B once a plugin opts in by advertising ``SOFTWARE_ENGINE_TRIGGER``.
+B once a plugin opts in by advertising
+``partial_qty_bracket_exit = CapabilityLevel.SOFTWARE``.
 The §2.6 broker-native fail-safe worst-SL manager (Slice A.7 / A.8)
 and the close-dispatch action emitter (which calls back into the
 sync engine to issue :class:`CloseIntent`) are not yet wired —

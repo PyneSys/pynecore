@@ -40,7 +40,6 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeDegradedEvent,
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
-    PartialQtyBracketExitMode,
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.software_partial_bracket_engine import (
@@ -241,7 +240,7 @@ def __test_idempotent_restore_after_confirm_is_noop__():
 @dataclass
 class _MockBroker:
     """Minimal stand-in for :class:`BrokerPlugin` exercising only the
-    cancel pathway and the ``SOFTWARE_ENGINE_TRIGGER`` capability.
+    cancel pathway and the partial-qty-bracket SOFTWARE capability.
 
     Distinct knobs control the original ``execute_cancel`` (which can
     raise :class:`OrderDispositionUnknownError`) and the new
@@ -255,7 +254,7 @@ class _MockBroker:
     cancel_with_outcome_calls: list[DispatchEnvelope] = field(default_factory=list)
     cancel_calls: list[DispatchEnvelope] = field(default_factory=list)
     capabilities: ExchangeCapabilities = field(default_factory=lambda: ExchangeCapabilities(
-        partial_qty_bracket_exit=PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER,
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
     ))
 
     def get_capabilities(self) -> ExchangeCapabilities:

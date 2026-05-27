@@ -1,8 +1,8 @@
 """
 Broker-native fail-safe worst-SL manager (§2.6 + §2.6.7).
 
-The ``SOFTWARE_ENGINE_TRIGGER`` partial-bracket path keeps the engine in
-charge of every intermediate TP / SL / trailing leg, which means the parent
+The SOFTWARE partial-qty-bracket path keeps the engine in charge of
+every intermediate TP / SL / trailing leg, which means the parent
 position is *unprotected* whenever the engine itself is offline (process
 crash, network split, WS staleness). The §2.6 fail-safe complements the
 engine layer with a single broker-native ``stopLevel`` on the parent
@@ -777,8 +777,8 @@ class NativeFailsafeManager:
 
     def claim_user_native(self, parent_entry_dispatch_ref: str) -> None:
         """Mark a parent's bracket as user-managed (native full-row path
-        outside the ``SOFTWARE_ENGINE_TRIGGER`` capability). §2.6 does not
-        run for these parents."""
+        outside the SOFTWARE partial-qty-bracket capability). §2.6 does
+        not run for these parents."""
         state = self._states.get(parent_entry_dispatch_ref)
         if state is None:
             return
@@ -848,8 +848,8 @@ class NativeFailsafeManager:
             pine_id: str,
             from_entry: str,
     ) -> bool:
-        """Return ``True`` when a new ``SOFTWARE_ENGINE_TRIGGER`` partial
-        bracket dispatch for this parent must be rejected (§2.6.7).
+        """Return ``True`` when a new SOFTWARE partial-qty bracket
+        dispatch for this parent must be rejected (§2.6.7).
         Emits the structured block event when blocking.
 
         The gate blocks for two distinct conditions:

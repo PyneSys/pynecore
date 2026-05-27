@@ -26,7 +26,6 @@ __all__ = [
     'OcaType',
     'OcaPartialFillPolicy',
     'CapabilityLevel',
-    'PartialQtyBracketExitMode',
     'ExchangeOrder',
     'OrderEvent',
     'ExchangePosition',
@@ -169,62 +168,6 @@ class CapabilityLevel(StrEnum):
         return self is not CapabilityLevel.UNSUPPORTED
 
 
-class PartialQtyBracketExitMode(StrEnum):
-    """Mechanism a plugin uses to deliver partial-qty exit brackets.
-
-    A specialisation of :class:`CapabilityLevel` for the
-    :attr:`ExchangeCapabilities.partial_qty_bracket_exit` field only, because
-    the general :data:`~CapabilityLevel.SOFTWARE` value cannot disambiguate
-    the two software paths the order sync engine has to dispatch differently:
-
-    - :data:`UNSUPPORTED` — the plugin cannot attach a TP/SL/trailing leg to
-      a fraction of a position. ``strategy.exit(qty=N, from_entry='L', ...)``
-      with ``N < total_qty`` is rejected by
-      :func:`~pynecore.core.broker.validation.validate_at_startup` rather
-      than silently mis-hedging onto the whole row. Default for every
-      plugin.
-    - :data:`SOFTWARE_ENGINE_TRIGGER` — no parked broker order. The engine
-      arms an in-memory leg state machine per
-      ``strategy.exit`` call and dispatches a partial close via the plugin's
-      existing ``execute_close`` route when the price crosses the trigger
-      level. The plugin only needs the primitives it already has
-      (``execute_close`` partial-close, ``get_position``, WS quote feed).
-      Used by per-deal CFD brokers (Capital.com, IG, OANDA) where a
-      reduce-only flag is either absent or not submit-time guaranteed.
-    - :data:`SOFTWARE_REDUCE_ONLY_ORDER` — the plugin parks a reduce-only
-      working order at the trigger level and the exchange guarantees it can
-      only ever reduce the position, never open a new one. Used by
-      aggregated-position brokers with documented reduce-only semantics
-      (Bybit USDT-Perp, Binance Futures). Requires the three primitives
-      ``submit_reduce_only_working_order`` /
-      ``modify_reduce_only_working_order`` /
-      ``cancel_reduce_only_working_order``.
-    - :data:`NATIVE` — the exchange itself supports a partial-qty bracket
-      within a single position as a first-class primitive. Placeholder for
-      future plugins; no current broker delivers this.
-
-    The order sync engine matches on this enum to pick the dispatch path
-    (``_dispatch_engine_trigger_partial_bracket`` vs the reduce-only-order
-    path), so the explicit ENUM value carries the contract — no implicit
-    pairing with a companion field.
-    """
-    UNSUPPORTED = "unsupported"
-    SOFTWARE_ENGINE_TRIGGER = "software_engine_trigger"
-    SOFTWARE_REDUCE_ONLY_ORDER = "software_reduce_only_order"
-    NATIVE = "native"
-
-    @property
-    def is_supported(self) -> bool:
-        """``True`` for every mode except :data:`UNSUPPORTED`.
-
-        Mirrors :attr:`CapabilityLevel.is_supported` so
-        :func:`~pynecore.core.broker.validation.validate_at_startup` can
-        treat this field with the same ``capability.is_supported`` check it
-        uses for every other capability.
-        """
-        return self is not PartialQtyBracketExitMode.UNSUPPORTED
-
-
 # === Exchange state snapshots ===
 
 @dataclass
@@ -346,25 +289,18 @@ class ExchangeCapabilities:
 
     # Mechanism the plugin uses to deliver a partial-qty exit bracket
     # (``strategy.exit(qty=N, from_entry="L", ...)`` with ``N`` less than
-    # the full row qty entered under ``"L"``). Uses a dedicated
-    # :class:`PartialQtyBracketExitMode` ENUM rather than
-    # :class:`CapabilityLevel` because the order sync engine has to dispatch
-    # the two software paths differently:
-    #
-    # - ``SOFTWARE_ENGINE_TRIGGER``: no parked broker order; the engine arms
-    #   a per-leg state machine and triggers a partial close via the
-    #   existing ``execute_close`` route on price cross. Capital.com / IG /
-    #   OANDA path.
-    # - ``SOFTWARE_REDUCE_ONLY_ORDER``: the plugin parks a reduce-only
-    #   working order at the trigger level; broker guarantees it can only
-    #   reduce, never open. Bybit / Binance path (future Slice C).
-    # - ``NATIVE``: exchange supports partial-qty bracket inside a single
-    #   position. Placeholder; no current broker delivers this.
-    # - ``UNSUPPORTED``: validator rejects such scripts at startup rather
-    #   than silently covering the whole row.
-    partial_qty_bracket_exit: PartialQtyBracketExitMode = (
-        PartialQtyBracketExitMode.UNSUPPORTED
-    )
+    # the full row qty entered under ``"L"``).
+    # NATIVE = the exchange supports partial-qty bracket inside a single
+    # position as a first-class primitive (placeholder; no current broker
+    # delivers this).
+    # SOFTWARE = the plugin delivers the bracket without a single native
+    # call. The engine drives an in-memory leg state machine per
+    # ``strategy.exit`` and dispatches a partial close through the plugin's
+    # ``execute_close`` route when the trigger level is crossed. Used by
+    # per-deal CFD brokers (Capital.com, IG, OANDA).
+    # UNSUPPORTED = the validator rejects such scripts at startup rather
+    # than silently covering the whole row.
+    partial_qty_bracket_exit: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
     # Companion to :attr:`partial_qty_bracket_exit`. ``True`` declares that
     # the plugin can route a partial-qty bracket correctly even when the
@@ -518,11 +454,9 @@ class ExitIntent:
     # to the ``open_trades`` aggregate when the entry Order has been
     # cancelled / cleared. The order sync engine dispatches on this flag
     # together with ``caps.partial_qty_bracket_exit`` to pick between the
-    # native bracket path (NATIVE), the engine-side trigger state machine
-    # (``SOFTWARE_ENGINE_TRIGGER``) and the parked reduce-only
-    # working-order path (``SOFTWARE_REDUCE_ONLY_ORDER``). A bracket on
-    # the whole row keeps this ``False`` and falls back to the existing
-    # full-row path.
+    # native bracket path (NATIVE) and the engine-side trigger state
+    # machine (SOFTWARE). A bracket on the whole row keeps this ``False``
+    # and falls back to the existing full-row path.
     #
     # ``compare=False`` deliberately excludes the flag from
     # :meth:`__eq__` / :meth:`__hash__`: it is a *route selector* derived
@@ -1267,8 +1201,8 @@ class NativeFailsafeStateTransitionEvent(BrokerEvent):
 
 @dataclass
 class PartialBracketBlockedDegradedFailsafeEvent(BrokerEvent):
-    """A new ``SOFTWARE_ENGINE_TRIGGER`` partial bracket dispatch was rejected
-    because the parent's ``NativeStopState`` is ``degrading`` / ``degraded``.
+    """A new SOFTWARE partial-qty bracket dispatch was rejected because
+    the parent's ``NativeStopState`` is ``degrading`` / ``degraded``.
 
     The engine still services *close* and *intermediate-leg* dispatches for the
     same parent — only *new* partial brackets are blocked while the broker-native

@@ -76,7 +76,6 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeDegradedEvent,
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
-    PartialQtyBracketExitMode,
     PendingDefensiveClose,
 )
 from pynecore.core.broker.native_failsafe_manager import (
@@ -5123,7 +5122,7 @@ class OrderSyncEngine:
         # could still fire. Cancel any orphan leg whose intent_key
         # appears in neither set BEFORE the diff loops run.
         if (self._partial_qty_bracket_exit_mode
-                is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                is CapabilityLevel.SOFTWARE):
             orphan_intent_keys: set[str] = set()
             for leg in self._partial_bracket_engine.iter_legs():
                 ikey = leg.intent_key
@@ -5302,7 +5301,7 @@ class OrderSyncEngine:
                         and not old.is_partial_qty_bracket
                         and old.from_entry is not None
                         and self._partial_qty_bracket_exit_mode
-                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                        is CapabilityLevel.SOFTWARE):
                     conflicting_partial_keys = [
                         cand_key
                         for cand_key, cand in new_map.items()
@@ -5417,7 +5416,7 @@ class OrderSyncEngine:
                 elif (isinstance(intent, ExitIntent)
                         and intent.is_partial_qty_bracket
                         and self._partial_qty_bracket_exit_mode
-                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER
+                        is CapabilityLevel.SOFTWARE
                         and self._partial_bracket_engine.has_active_legs_for_intent(
                             intent.intent_key,
                         )):
@@ -6199,17 +6198,15 @@ class OrderSyncEngine:
                 # Route engine-trigger partial brackets through the
                 # dedicated state-machine dispatch. The condition is
                 # deliberately conjunctive (mode AND intent flag) so a
-                # whole-row exit on a SOFTWARE_ENGINE_TRIGGER plugin
-                # still uses the native bracket dispatch — the engine
-                # only owns the partial slice. SOFTWARE_REDUCE_ONLY_ORDER
-                # is reserved for the future :meth:`_dispatch_reduce_only_order_partial_bracket`
-                # branch (Slice C, aggregated-position brokers).
+                # whole-row exit on a SOFTWARE plugin still uses the
+                # native bracket dispatch — the engine only owns the
+                # partial slice.
                 if (intent.is_partial_qty_bracket
                         and self._partial_qty_bracket_exit_mode
-                        is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                        is CapabilityLevel.SOFTWARE):
                     self._dispatch_engine_trigger_partial_bracket(intent)
                 else:
-                    # Whole-row bracket on a SOFTWARE_ENGINE_TRIGGER broker
+                    # Whole-row bracket on a SOFTWARE broker
                     # while engine-trigger partial legs are already tracked
                     # for the same parent is the §12 #4 incompatibility:
                     # a native full-row bracket and engine-trigger partial
@@ -6234,7 +6231,7 @@ class OrderSyncEngine:
                     # protection until manual cleanup.
                     if (intent.from_entry is not None
                             and self._partial_qty_bracket_exit_mode
-                            is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER
+                            is CapabilityLevel.SOFTWARE
                             and self._partial_bracket_engine
                                 .has_active_partial_bracket(
                                     intent.symbol, intent.from_entry,
@@ -6327,7 +6324,7 @@ class OrderSyncEngine:
                             )
                     elif (intent.from_entry is not None
                             and self._partial_qty_bracket_exit_mode
-                            is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                            is CapabilityLevel.SOFTWARE):
                         # Cross-key partial → native conversion within ONE sync:
                         # the cancel loop above already evicted the persisted
                         # partial legs (old key ∉ ``new_map``), which fired the
@@ -6458,7 +6455,7 @@ class OrderSyncEngine:
         :meth:`SoftwarePartialBracketEngine.cascade_cancel_oca`. The
         missing piece is the live price-tick callback on the
         :class:`OrderSyncEngine`; until that lands no plugin
-        advertises :data:`PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER`,
+        advertises :data:`CapabilityLevel.SOFTWARE`,
         so this branch is only ever reached by unit tests that wire
         a stub broker with the mode set.
         """
@@ -8840,7 +8837,7 @@ class OrderSyncEngine:
             if (isinstance(new, ExitIntent)
                     and new.is_partial_qty_bracket
                     and self._partial_qty_bracket_exit_mode
-                    is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                    is CapabilityLevel.SOFTWARE):
                 if parent_dispatch_ref is not None:
                     if self._native_failsafe_manager.is_new_partial_bracket_blocked(
                             parent_entry_dispatch_ref=parent_dispatch_ref,
@@ -8946,7 +8943,7 @@ class OrderSyncEngine:
                 and new.is_partial_qty_bracket
                 and not old.is_partial_qty_bracket
                 and self._partial_qty_bracket_exit_mode
-                is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                is CapabilityLevel.SOFTWARE):
             # Preflight the §12 #4 coexistence guard before evicting the
             # currently armed native bracket. The symmetric direction
             # (whole-row replacing scale-out siblings) already runs an
@@ -9104,7 +9101,7 @@ class OrderSyncEngine:
             # See the cancel-tentative state design dossier.
             if (isinstance(old, EntryIntent)
                     and self._partial_qty_bracket_exit_mode
-                    is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                    is CapabilityLevel.SOFTWARE):
                 # Keep the original EntryIntent envelope in ``_envelopes``.
                 # A later ALREADY_FILLED resolution restores the parent and
                 # downstream code (e.g.
@@ -9127,7 +9124,7 @@ class OrderSyncEngine:
                 return
             # Non-partial-bracket cancel (CloseIntent never reaches here;
             # whole-row ExitIntent native cancel, or any EntryIntent in
-            # modes other than SOFTWARE_ENGINE_TRIGGER): keep the
+            # modes other than SOFTWARE partial bracket): keep the
             # original eager-retire semantics. The strict path raised
             # before reaching its post-cancel cleanup, so mirror the
             # mapping / envelope drop and the pending-partials cleanup
