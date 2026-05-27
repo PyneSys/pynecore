@@ -35,6 +35,21 @@ LIVE_TRANSITION = OHLCV(timestamp=-1, open=-1, high=-1, low=-1, close=-1, volume
 """Sentinel inserted between historical and live OHLCV data in the iterator."""
 
 
+def _close_price_or_none() -> float | None:
+    """Best-effort current bar close, ``None`` before any bar is ingested.
+
+    The runner rebinds ``lib.close`` to a float on every bar; at startup
+    (and during a pre-bar refresh window) it still holds the
+    :class:`~pynecore.types.source.Source` sentinel placeholder. Returning
+    ``None`` in that case lets the broker engine's partial-bracket WATCH
+    phase short-circuit cleanly until a real price lands.
+    """
+    val = getattr(lib, 'close', None)
+    if isinstance(val, (int, float)):
+        return float(val)
+    return None
+
+
 def import_script(script_path: Path) -> ModuleType:
     """
     Import the script
@@ -481,7 +496,10 @@ class ScriptRunner:
         arrived asynchronously through :meth:`BrokerPosition.record_fill`.
         """
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync(int(lib.last_bar_time))
+            self._order_sync_engine.sync(
+                int(lib.last_bar_time),
+                last_price=_close_price_or_none(),
+            )
             # Heartbeat the storage run on every sync — the RunContext
             # rate-limits internally to ``HEARTBEAT_INTERVAL_MS``, so the
             # actual UPDATE fires at most once per minute regardless of
@@ -497,7 +515,10 @@ class ScriptRunner:
         is the source of truth — magnification is irrelevant and the engine
         runs a plain sync."""
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync(int(lib.last_bar_time))
+            self._order_sync_engine.sync(
+                int(lib.last_bar_time),
+                last_price=_close_price_or_none(),
+            )
             if self._broker_store_ctx is not None:
                 self._broker_store_ctx.heartbeat()
         else:

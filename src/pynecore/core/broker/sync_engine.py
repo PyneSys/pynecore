@@ -36,6 +36,7 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
     ExchangeConnectionError,
+    ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -830,7 +831,7 @@ class OrderSyncEngine:
         self.raise_if_halted()
         self._drain_events()
 
-    def sync(self, bar_ts_ms: int) -> None:
+    def sync(self, bar_ts_ms: int, *, last_price: float | None = None) -> None:
         """Run one diff/dispatch cycle.
 
         Reads the Pine order book from ``position.entry_orders`` and
@@ -841,6 +842,13 @@ class OrderSyncEngine:
         :param bar_ts_ms: Current bar open timestamp in milliseconds — seeds
             every :class:`DispatchEnvelope` built in this cycle. The caller
             (typically the script runner) sources this from ``lib._time``.
+        :param last_price: Last observed price for the script's symbol —
+            sourced from ``lib.close`` at the call site. Drives the
+            engine-trigger partial-bracket WATCH phase
+            (:meth:`SoftwarePartialBracketEngine.on_price_tick`). ``None``
+            (the default) suppresses the WATCH phase this cycle, which is
+            the right behaviour for callers that have no price context yet
+            (e.g. startup before the first bar has been ingested).
         """
         # Surface a latched halt before any state mutation so an async halt
         # triggered from ``run_event_stream`` (e.g. an
@@ -938,6 +946,13 @@ class OrderSyncEngine:
 
         self._diff_and_dispatch(dispatchable)
         self._cleanup_unused_adoption_markers()
+        # Engine-trigger partial bracket WATCH phase. Fires before
+        # ``drive_native_failsafe`` so a leg that triggers in this
+        # tick can flip to ``triggered`` (and the OCA cascade can run)
+        # before the failsafe pass observes the new leg-state set —
+        # otherwise the worst-SL recompute would still see the now-fired
+        # leg as armed and emit a stale broker-native level for one bar.
+        self._drive_partial_bracket_triggers(last_price=last_price)
         # Drain native failsafe dispatches into the plugin dispatcher
         # (§2.6 worst-SL drive loop). The manager accumulates snapshots
         # via the leg state-change listener / ``recompute_worst_sl``;
@@ -3734,7 +3749,12 @@ class OrderSyncEngine:
             return
         self._cleanup_position_tracking(closed_entry_id)
 
-    def _cleanup_position_tracking(self, closed_entry_id: str) -> None:
+    def _cleanup_position_tracking(
+            self,
+            closed_entry_id: str,
+            *,
+            cascade_reason: str = 'parent_closed',
+    ) -> None:
         """Drop active intent + Pine order-book entries for ``closed_entry_id``.
 
         Cleans:
@@ -3806,6 +3826,7 @@ class OrderSyncEngine:
         self._partial_bracket_engine.cascade_cancel_by_parent_close(
             symbol=self._symbol,
             from_entry=closed_entry_id,
+            reason=cascade_reason,
         )
         # Entry intent + its mapping/envelope.
         self._active_intents.pop(closed_entry_id, None)
@@ -4980,6 +5001,345 @@ class OrderSyncEngine:
                     reason=f'dispatcher-exception:{type(e).__name__}',
                     now_ms=now_ms,
                 )
+
+    def _drive_partial_bracket_triggers(
+            self, *, last_price: float | None,
+    ) -> None:
+        """Engine-trigger partial bracket WATCH phase + close dispatch.
+
+        Drives the lifecycle step that owns:
+        :class:`SoftwarePartialBracketEngine` armed legs →
+        :meth:`SoftwarePartialBracketEngine.on_price_tick` →
+        synthetic :class:`CloseIntent` →
+        :meth:`_dispatch_new` →
+        :meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`
+        (or the failed / unknown settling variant). Runs from the tail
+        of :meth:`sync` after :meth:`_diff_and_dispatch` so the
+        in-memory ledger reflects every register / cancel / restart
+        replay mutation produced by this sync before any trigger
+        evaluates.
+
+        Skips when ``last_price`` is ``None`` (e.g. the runner has no
+        price context yet — startup before the first bar ingest) or
+        when the engine ledger is empty.
+
+        The parent live snapshot is refreshed via the broker plugin
+        on every call. :meth:`SoftwarePartialBracketEngine.on_price_tick`
+        already short-circuits to an empty result when the snapshot
+        comes back ``None`` so a transient connection blip surfaces
+        as "no triggers this tick" rather than a halt.
+        """
+        if last_price is None:
+            return
+        if not any(True for _ in self._partial_bracket_engine.iter_legs()):
+            return
+        # Snapshot refresh failures (connection blip, exchange 5xx, plugin
+        # timeout) must NOT propagate out of ``sync`` — every armed leg
+        # would skip its trigger evaluation and the next price tick has
+        # another chance. :meth:`SoftwarePartialBracketEngine.on_price_tick`
+        # already short-circuits when ``parent_snapshot is None``, so
+        # forward the failure as "no snapshot this tick" rather than
+        # turning a transient blip into a live-runner halt.
+        try:
+            parent_snapshot = self._run_async(
+                self._broker.get_position(self._symbol),
+            )
+        except Exception as e:
+            _blog_warning(
+                "partial-bracket trigger evaluation skipped: parent "
+                "snapshot refresh failed (%s: %s); re-evaluating on the "
+                "next price tick",
+                type(e).__name__, e,
+            )
+            return
+        # ``get_position`` returns ``None`` for a flat symbol on plugins that
+        # do not allocate a row until the first open (Capital.com, others);
+        # other plugins surface the same state as a concrete
+        # :class:`ExchangePosition` with ``side='flat'`` and ``size=0``. Both
+        # shapes mean "no live parent here" and must take the same cleanup
+        # path, otherwise :meth:`on_price_tick` would only retire legs whose
+        # triggers happen to cross this tick and the rest would linger.
+        # Two distinct situations land here and require opposite handling:
+        #
+        # * Parent has at least one ``armed`` (or ``triggering`` /
+        #   ``triggered_*``) leg → the parent was supposed to be open. A
+        #   no-position snapshot then means the position vanished (external/
+        #   manual close, broker-native fail-safe SL, …). Cascade-cancel
+        #   every active leg under that parent so non-crossing armed legs
+        #   cannot block a same-key bracket or fire against a reused entry
+        #   later. Routing through :meth:`on_price_tick` with a synthesised
+        #   flat snapshot would only retire legs whose triggers happened to
+        #   cross this tick; the rest would linger indefinitely.
+        # * Parent has only ``pending_entry`` or ``cancel_tentative`` legs →
+        #   the bracket was dispatched against a still-unfilled entry order,
+        #   or that entry's cancel disposition is still being resolved. In
+        #   both cases the plugin has not yet allocated a row precisely
+        #   BECAUSE the entry has not filled; killing the legs / dropping
+        #   the parent/exit mappings here would either leave the position
+        #   unprotected once the entry fills (pending) or strand the
+        #   cancel-retry loop in :meth:`_drive_cancel_tentative` (tentative).
+        #   Leave those parents alone — the pending→armed transition fires
+        #   on the ``ENTRY`` order event, not on a price tick, and the
+        #   cancel disposition resolution dissolves the tentative state.
+        parent_is_flat = parent_snapshot is None or (
+            parent_snapshot.side == 'flat' or parent_snapshot.size == 0
+        )
+        if parent_is_flat:
+            # ``get_position`` lag vs. local ledger: when a parent ENTRY
+            # event has just been drained on this same ``sync`` cycle the
+            # pending legs were promoted to :data:`LEG_STATE_ARMED` by
+            # :meth:`_promote_pending_partial_bracket_legs`, but the broker
+            # ``/positions`` snapshot can still return ``None`` for the
+            # newly-filled position (REST eventual consistency). Gating
+            # the cascade purely on ``parent_snapshot is None`` would
+            # then evict the freshly-armed bracket and leave the just-
+            # opened parent unprotected. Use the local
+            # :attr:`Position.open_trades` ledger — which is updated
+            # synchronously from order events before this WATCH phase
+            # runs — to filter the cascade to ``from_entry``s that
+            # really are gone from BOTH sides; defer the rest until a
+            # later sync sees a consistent snapshot.
+            locally_open_entry_ids: set[str] = {
+                trade.entry_id for trade in self._position.open_trades
+            }
+            from_entries_to_cascade: set[str] = set()
+            for leg in self._partial_bracket_engine.iter_legs():
+                if leg.symbol != self._symbol:
+                    continue
+                # ``PENDING_ENTRY`` legs are awaiting the parent ENTRY fill;
+                # ``CANCEL_TENTATIVE`` legs sit alongside an entry whose
+                # cancel disposition is still being resolved by
+                # :meth:`_drive_cancel_tentative` (the parent has no
+                # position yet either way). Cascading them here would drop
+                # the parent/exit mappings before the cancel-retry loop
+                # finishes and would not even close the legs, because
+                # neither state is "active" in the engine's sense.
+                if leg.leg_state in (
+                    LEG_STATE_PENDING_ENTRY, LEG_STATE_CANCEL_TENTATIVE,
+                ):
+                    continue
+                if leg.from_entry in locally_open_entry_ids:
+                    # Local parent still alive → REST snapshot lag.
+                    # Skip cascade for this ``from_entry`` and let the
+                    # next sync re-evaluate against a fresh snapshot.
+                    continue
+                from_entries_to_cascade.add(leg.from_entry)
+            # Route each truly-flat ``from_entry`` through the canonical
+            # parent-flat cleanup. :meth:`_cleanup_position_tracking`
+            # (a) retires :class:`NativeFailsafeManager` state for the
+            # parent entry COID via :meth:`on_deal_id_disappeared` — a
+            # plain manual leg cascade would skip this and let
+            # :meth:`drive_native_failsafe` dispatch a clear PUT against
+            # a disappeared deal (degrading/degraded), then block future
+            # entries on an already-flat symbol; (b) cascade-cancels the
+            # partial-bracket legs; (c) drops the entry intent + every
+            # exit intent under this ``from_entry`` from
+            # ``_active_intents`` / ``_order_mapping`` / ``_envelopes``;
+            # (d) wipes the matching :attr:`Position.entry_orders` and
+            # :attr:`Position.exit_orders` slots. Idempotent, so a
+            # subsequent sync that sees the same flat snapshot is a no-op.
+            for from_entry in from_entries_to_cascade:
+                self._cleanup_position_tracking(
+                    from_entry, cascade_reason='parent_flat_snapshot',
+                )
+            return
+        triggering = self._partial_bracket_engine.on_price_tick(
+            symbol=self._symbol,
+            last_price=last_price,
+            bid=None,
+            ask=None,
+            parent_snapshot=parent_snapshot,
+        )
+        for leg in triggering:
+            self._dispatch_partial_bracket_close(leg)
+
+    def _dispatch_partial_bracket_close(self, leg) -> None:
+        """Synthesise + dispatch one partial-bracket :class:`CloseIntent`.
+
+        Drives the :data:`LEG_STATE_TRIGGERING` leg through its
+        terminal settling step. The synthesised ``pine_id`` carries
+        the leg's identity coordinates so the dispatched intent
+        cannot collide with the script's own :class:`CloseIntent`
+        keys: ``__pyne_partial_trigger__{exit_pine_id}\0{from_entry}\0{leg_kind}``.
+        The ``\0`` (NUL) delimiter mirrors :attr:`CloseIntent.intent_key`
+        and is provably collision-free — Pine string literals (the only
+        source of ``pine_id`` / ``from_entry``) cannot contain NUL.
+
+        Outcome mapping (mirrors :meth:`_dispatch_new`'s exception
+        contract):
+
+        * Clean return AND the dispatch landed (``_order_mapping``
+          populated for ``synth_pine_id``) →
+          :meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`
+          flips the leg to :data:`LEG_STATE_TRIGGERED` and cascades the
+          OCA siblings.
+        * Clean return but the dispatch was parked by
+          :meth:`_dispatch_new` (it swallows
+          :class:`OrderDispositionUnknownError` and routes it to
+          :meth:`_park_pending` without re-raising) →
+          :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_unknown`
+          re-arms the leg so the next price tick re-evaluates against
+          the live snapshot; the parked close still resolves through
+          :meth:`_verify_pending_dispatches` if it actually landed.
+        * :class:`OrderSkippedByPlugin` →
+          :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`
+          re-arms the leg with the skip reason on the audit row.
+        * :class:`ExchangeOrderRejectedError` (including subclasses such
+          as :class:`InsufficientMarginError`) →
+          :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`
+          re-arms the leg with the broker reject reason. Without this
+          branch the generic ``Exception`` re-raise in
+          :meth:`_dispatch_new` would propagate out of the trigger loop,
+          aborting the current sync while the leg stays in
+          :data:`LEG_STATE_TRIGGERING` and OCA siblings remain reserved.
+        * :class:`BrokerManualInterventionError` propagates after
+          marking the leg failed — the engine is going to halt.
+        """
+        synth_pine_id = (
+            f"__pyne_partial_trigger__{leg.pine_id}\0"
+            f"{leg.from_entry}\0{leg.leg_kind}"
+        )
+        close_intent = CloseIntent(
+            pine_id=synth_pine_id,
+            symbol=leg.symbol,
+            side=leg.side,
+            qty=leg.qty,
+            immediately=True,
+            comment=(
+                f"engine-trigger partial bracket "
+                f"({leg.leg_kind} for {leg.pine_id!r} "
+                f"from_entry={leg.from_entry!r})"
+            ),
+        )
+        try:
+            self._dispatch_new(close_intent)
+        except OrderSkippedByPlugin as e:
+            # ``_dispatch_new`` built (and persisted via
+            # :class:`BrokerStore`) the envelope for ``synth_pine_id`` before
+            # the plugin declined. The dispatch never reached the broker, so
+            # the COID anchor cannot be the dedup key for a real in-flight
+            # order — leaving it in :attr:`_envelopes` would let a later
+            # re-trigger for the same ``(pine_id, from_entry, leg_kind)``
+            # rebuild the SAME ``client_order_id`` from a stale
+            # ``bar_ts_ms`` / ``retry_seq`` anchor (and the persisted row
+            # would survive a restart for the same collision). Drop the
+            # synth envelope in lockstep with the failed settling so the
+            # next dispatch starts with a fresh anchor.
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+            self._partial_bracket_engine.mark_trigger_dispatch_failed(
+                leg.key, reason=f'plugin_skipped:{e.reason}',
+            )
+            return
+        except BrokerManualInterventionError:
+            self._partial_bracket_engine.mark_trigger_dispatch_failed(
+                leg.key, reason='broker_manual_intervention',
+            )
+            raise
+        except ExchangeOrderRejectedError as e:
+            # The broker rejected the synthetic close (min-size, market-rule,
+            # insufficient-margin, ...). ``_dispatch_new`` re-raises through
+            # its generic ``Exception`` path, so without this branch the leg
+            # would stay in :data:`LEG_STATE_TRIGGERING` and OCA siblings
+            # would remain reserved while the current sync aborts. Settle
+            # the leg as failed and let the next price tick re-arm against
+            # a fresh parent snapshot. Drop the synth envelope for the same
+            # reason as the ``OrderSkippedByPlugin`` branch — the broker
+            # rejected the dispatch, so no live order owns the COID anchor;
+            # a later re-trigger must mint a fresh one instead of reusing
+            # the stale persisted anchor (and surviving a restart with it).
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+            self._partial_bracket_engine.mark_trigger_dispatch_failed(
+                leg.key, reason=f'broker_rejected:{type(e).__name__}',
+            )
+            return
+        except Exception as e:
+            # Any other dispatch-side failure (e.g.
+            # :class:`ExchangeConnectionError` raised by the broker plugin and
+            # re-raised through ``_dispatch_new``'s generic ``Exception``
+            # path) leaves the leg stuck in :data:`LEG_STATE_TRIGGERING` and
+            # reserves its OCA group as in-flight. Subsequent ticks then skip
+            # this leg and its siblings, so the bracket never retries until a
+            # restart replays the state machine. Settle the leg as unknown
+            # (the order may or may not have reached the exchange — the same
+            # semantics as :class:`OrderDispositionUnknownError`) so the next
+            # price tick re-evaluates against a fresh parent snapshot; the
+            # leg's :meth:`_safety_check` caps against the live parent size
+            # and prevents over-closing if the failed dispatch had in fact
+            # landed. Drop the synth envelope so a re-trigger mints a fresh
+            # idempotency anchor instead of reusing the stale one (and
+            # surviving a restart with it).
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+            self._partial_bracket_engine.mark_trigger_dispatch_unknown(
+                leg.key, reason=f'dispatch_failed:{type(e).__name__}',
+            )
+            raise
+        # ``_dispatch_new`` catches :class:`OrderDispositionUnknownError`
+        # internally and routes it to :meth:`_park_pending` without
+        # re-raising. On the clean-return path the dispatch can therefore
+        # be in one of two states: landed (``_order_mapping`` populated)
+        # or parked (no ``_order_mapping`` entry, COID stashed in
+        # ``_pending_verification``). Confirming the trigger on the
+        # parked path would evict the leg + OCA-cancel siblings even
+        # though the close was never acknowledged, leaving the parent
+        # unprotected if the parked close eventually resolves
+        # ``'rejected'``. Detect the park and re-arm the leg instead so
+        # the next price tick re-evaluates and ``_verify_pending_dispatches``
+        # can still reconcile the in-flight order if it did land.
+        if synth_pine_id not in self._order_mapping:
+            self._partial_bracket_engine.mark_trigger_dispatch_unknown(
+                leg.key, reason='dispatch_parked',
+            )
+            return
+        self._partial_bracket_engine.confirm_trigger_dispatched(
+            leg.key, close_pine_id=synth_pine_id,
+        )
+        # Retire the synthetic close identity now that the leg owns the
+        # dispatch. ``_order_mapping`` / ``_envelopes`` keyed on
+        # ``synth_pine_id`` are not consulted by any later engine path
+        # (the leg state machine tracks the close from here), but leaving
+        # them populated would let :meth:`_build_envelope` recycle the
+        # frozen ``client_order_id`` on the next trigger of the same
+        # ``(pine_id, from_entry, leg_kind)`` — and the persisted
+        # :class:`BrokerStore` rows would survive restart and collide
+        # with a fresh close command for the same logical leg. Drop both
+        # the live mapping and the persisted envelope/pending rows in
+        # lockstep via :meth:`_drop_envelope` (which also calls
+        # :meth:`storage.RunContext.record_complete`), and clear the
+        # ``_order_mapping`` entry so a stray ``cancelled`` /
+        # ``rejected`` event from the broker is treated as an external
+        # observation rather than re-targeting the retired leg.
+        self._order_mapping.pop(synth_pine_id, None)
+        self._drop_envelope(synth_pine_id)
+        # Retire the original partial ``ExitIntent`` once every active leg
+        # under its ``intent_key`` is gone. ``confirm_trigger_dispatched``
+        # flips the firing leg to :data:`LEG_STATE_TRIGGERED` and cascades
+        # the OCA siblings to :data:`LEG_STATE_CASCADED_CANCEL`; for a
+        # single-leg bracket (or any bracket whose siblings were already
+        # evicted) no active leg remains for ``leg.intent_key``. Leaving
+        # the parked ``ExitIntent`` in ``_active_intents`` / ``_order_mapping``
+        # would let a subsequent script-side cancel or modify on the same
+        # ``(pine_id, from_entry)`` slip past the engine-internal short-
+        # circuit (gated on :meth:`has_active_legs_for_intent`) and reach
+        # :meth:`_broker.execute_cancel` / ``execute_modify`` for an order
+        # that was never submitted — the ``_order_mapping`` entry holds
+        # the leg COIDs, not a real broker order id. Also drop the Pine
+        # ``exit_orders`` slot so the next bar's intent-builder treats the
+        # ``strategy.exit`` call as already-submitted (mirroring the
+        # broker-FILL path :meth:`_remove_pine_order_for_intent`); without
+        # that, an unchanged re-emission would re-arm a fresh bracket
+        # against the now-reduced parent quantity.
+        if not self._partial_bracket_engine.has_active_legs_for_intent(
+                leg.intent_key,
+        ):
+            self._active_intents.pop(leg.intent_key, None)
+            self._order_mapping.pop(leg.intent_key, None)
+            self._drop_envelope(leg.intent_key)
+            exit_orders = getattr(self._position, 'exit_orders', None)
+            if exit_orders is not None:
+                exit_orders.pop((leg.pine_id, leg.from_entry), None)
 
     def _record_halt(self, error: BrokerManualInterventionError) -> None:
         """Record a manual-intervention halt and emit the observability event.
@@ -6447,17 +6807,14 @@ class OrderSyncEngine:
            order is opened (the WATCH phase fires close intents later
            when the price tick crosses a trigger).
 
-        Steps 4–7 of §3 (price-tick WATCH wiring, close-dispatch
-        action emitter, §2.6 worst-SL recompute, §2.6.7 fail-safe
-        ownership) are Slice B / Slice A.7+ work. The current method
-        is a complete skeleton: the legs are persisted, the state
-        machine ledger is correct, and the OCA cascade fires through
-        :meth:`SoftwarePartialBracketEngine.cascade_cancel_oca`. The
-        missing piece is the live price-tick callback on the
-        :class:`OrderSyncEngine`; until that lands no plugin
-        advertises :data:`CapabilityLevel.SOFTWARE`,
-        so this branch is only ever reached by unit tests that wire
-        a stub broker with the mode set.
+        Steps 4–5 of §3 (price-tick WATCH wiring + close-dispatch
+        action emitter) run from
+        :meth:`_drive_partial_bracket_triggers` at the tail of every
+        :meth:`sync` cycle; the OCA cascade fires through
+        :meth:`SoftwarePartialBracketEngine.cascade_cancel_oca`
+        on the ``triggering → triggered`` settlement. The §2.6.7
+        fail-safe ownership work remains pending — see the design
+        dossier.
         """
         symbol = intent.symbol
         from_entry = intent.from_entry

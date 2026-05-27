@@ -18,18 +18,22 @@ it writes the leg rows, then hands them to this state machine via
 :meth:`SoftwarePartialBracketEngine.register_legs`. After that the
 machine owns the legs until a terminal state.
 
-Slice A scope (this commit): the state machine itself, the in-memory
-ledger, the PERSIST-FIRST → ledger handoff, the cascade-cancel paths
-(OCA, parent close, broker-native SL), and the restart replay. The
-price-tick wiring from the live provider into
-:meth:`SoftwarePartialBracketEngine.on_price_tick` is added in Slice
-B once a plugin opts in by advertising
-``partial_qty_bracket_exit = CapabilityLevel.SOFTWARE``.
-The §2.6 broker-native fail-safe worst-SL manager (Slice A.7 / A.8)
-and the close-dispatch action emitter (which calls back into the
-sync engine to issue :class:`CloseIntent`) are not yet wired —
-``on_price_tick`` records the safety-check outcome and reaches a
-``triggering`` state without firing a close. See the partial-qty
+Lifecycle ownership: the state machine itself, the in-memory ledger,
+the PERSIST-FIRST → ledger handoff, the cascade-cancel paths (OCA,
+parent close, broker-native SL), the restart replay, and the
+close-dispatch settling step
+(:meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`,
+:meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`,
+:meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_unknown`).
+The price-tick wiring runs from
+:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._drive_partial_bracket_triggers`
+at the tail of every sync cycle for plugins that advertise
+``partial_qty_bracket_exit = CapabilityLevel.SOFTWARE``: the sync
+engine refreshes the parent snapshot, calls
+:meth:`SoftwarePartialBracketEngine.on_price_tick`, synthesises a
+:class:`CloseIntent` for each triggering leg, and dispatches it
+through the regular ``_dispatch_new`` path before calling the
+matching settling method on the state machine. See the partial-qty
 bracket exit design dossier §3 for the full lifecycle.
 """
 from dataclasses import dataclass, field
@@ -62,6 +66,7 @@ from pynecore.core.broker.store_helpers import (
     LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE,
     LEG_STATE_LIVE,
     LEG_STATE_PENDING_ENTRY,
+    LEG_STATE_TRIGGERED,
     LEG_STATE_TRIGGERED_FAILED,
     LEG_STATE_TRIGGERED_UNKNOWN,
     LEG_STATE_TRIGGERING,
@@ -744,6 +749,114 @@ class SoftwarePartialBracketEngine:
             ok=True,
             reason='ok',
             effective_close_qty=effective_qty,
+        )
+
+    # === Close-dispatch settling ==========================================
+
+    def confirm_trigger_dispatched(
+            self,
+            leg_key: LegKey,
+            *,
+            close_pine_id: str,
+    ) -> list[PartialBracketLeg]:
+        """Settle a :data:`LEG_STATE_TRIGGERING` leg as fired.
+
+        Called by the sync engine immediately after the synthetic
+        :class:`CloseIntent` for ``leg`` has been dispatched to the
+        broker plugin. The leg moves to
+        :data:`LEG_STATE_TRIGGERED` (terminal, row closed) and the
+        OCA cascade fires for sibling legs sharing the same
+        :attr:`PartialBracketLeg.oca_group` with
+        :attr:`OcaType.CANCEL` semantics. ``close_pine_id`` is
+        the synthesised exit id stamped on the close envelope so the
+        cascade audit row can correlate the two.
+
+        :return: List of OCA siblings that were cascaded by this
+            settlement; empty if the leg has no OCA group or no
+            cancellable sibling. The triggered leg itself is not
+            included.
+        """
+        leg = self._legs.get(leg_key)
+        if leg is None or leg.leg_state != LEG_STATE_TRIGGERING:
+            return []
+        # Cascade FIRST while the triggered leg is still in the ledger —
+        # :meth:`cascade_cancel_oca` resolves the OCA group via
+        # ``self._legs[triggered_key]``, so a prior eviction would silently
+        # drop the cascade. The triggered leg's own state stays
+        # ``triggering`` for this call (siblings already in a terminal
+        # state are skipped by the cascade), and the final transition
+        # below flips it to :data:`LEG_STATE_TRIGGERED` and closes the row.
+        cascaded = self.cascade_cancel_oca(leg_key)
+        self._transition(
+            leg, LEG_STATE_TRIGGERED,
+            close_row=True,
+            extras_patch={'close_pine_id': close_pine_id},
+        )
+        return cascaded
+
+    def mark_trigger_dispatch_failed(
+            self,
+            leg_key: LegKey,
+            *,
+            reason: str,
+    ) -> None:
+        """Settle a :data:`LEG_STATE_TRIGGERING` leg as a hard failure.
+
+        Used when the close dispatch was rejected with an error the
+        engine cannot reasonably retry on its own (e.g.
+        :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin`
+        or a non-recoverable broker error that is NOT a network
+        ambiguity). The leg lands briefly in
+        :data:`LEG_STATE_TRIGGERED_FAILED` for the audit row, then
+        demotes back to :data:`LEG_STATE_ARMED` so the next price
+        tick re-evaluates against a fresh parent snapshot. Idempotent
+        no-op when the leg is not in :data:`LEG_STATE_TRIGGERING`.
+        """
+        leg = self._legs.get(leg_key)
+        if leg is None or leg.leg_state != LEG_STATE_TRIGGERING:
+            return
+        self._transition(
+            leg, LEG_STATE_TRIGGERED_FAILED,
+            close_row=False,
+            extras_patch={'trigger_failed_reason': reason},
+        )
+        self._transition(
+            leg, LEG_STATE_ARMED,
+            close_row=False,
+        )
+
+    def mark_trigger_dispatch_unknown(
+            self,
+            leg_key: LegKey,
+            *,
+            reason: str,
+    ) -> None:
+        """Settle a :data:`LEG_STATE_TRIGGERING` leg as a parked dispatch.
+
+        Used when the close dispatch raised
+        :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`
+        — the broker may or may not have accepted the order. The leg
+        lands briefly in :data:`LEG_STATE_TRIGGERED_UNKNOWN` for the
+        audit row, then demotes back to :data:`LEG_STATE_ARMED` so the
+        next price tick re-evaluates the trigger. The sync engine's
+        regular parked-dispatch resolution path (``_verify_pending_dispatches``)
+        will reconcile any in-flight close that did in fact land — the
+        re-armed leg's :meth:`_safety_check` caps against the live
+        parent size and avoids over-closing if the prior attempt
+        already reduced the position. Idempotent no-op when the leg
+        is not in :data:`LEG_STATE_TRIGGERING`.
+        """
+        leg = self._legs.get(leg_key)
+        if leg is None or leg.leg_state != LEG_STATE_TRIGGERING:
+            return
+        self._transition(
+            leg, LEG_STATE_TRIGGERED_UNKNOWN,
+            close_row=False,
+            extras_patch={'trigger_unknown_reason': reason},
+        )
+        self._transition(
+            leg, LEG_STATE_ARMED,
+            close_row=False,
         )
 
     # === OCA cascade ======================================================
