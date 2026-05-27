@@ -55,6 +55,11 @@ __all__ = [
     'BrokerNativeFailsafeUnavailableEvent',
     'BrokerNativeFailsafeExternalEditEvent',
     'BrokerNativeFailsafeFullCloseEvent',
+    'CancelDispositionOutcome',
+    'PartialBracketCancelTentativeStartedEvent',
+    'PartialBracketCancelTentativeResolvedEvent',
+    'PartialBracketCancelTentativeDegradedEvent',
+    'EntryDeferredCancelDispositionPendingEvent',
 ]
 
 
@@ -1335,6 +1340,107 @@ class BrokerNativeFailsafeFullCloseEvent(BrokerEvent):
     parent_entry_dispatch_ref: str
     symbol: str
     actual_level: float | None
+
+
+class CancelDispositionOutcome(StrEnum):
+    """Normalized outcome of a broker-side cancel attempt.
+
+    Returned by :meth:`BrokerPlugin.execute_cancel_with_outcome` and used by
+    the sync engine's ``reconcile()`` cancel-retry-loop to drive the
+    cancel-tentative state machine forward. The five outcomes encode the
+    only decision-relevant disposition categories — broker-specific status
+    strings, HTTP codes, and exception types are normalized into these by
+    each plugin's override.
+
+    See the cancel-tentative state design dossier §2.6 for the resolution
+    table that maps each outcome to a leg state transition.
+    """
+    # Broker explicitly confirmed the cancel landed (live order →
+    # cancelled, no fill). Sync engine: confirm-cancel-tentative,
+    # flip legs to ``aborted_parent_never_arrived``, drop mapping.
+    CANCEL_CONFIRMED = 'cancel_confirmed'
+    # Broker explicitly reported that the order had already filled
+    # before / during the cancel attempt (race lost). Sync engine:
+    # restore legs from ``cancel_tentative``, re-register parent.
+    ALREADY_FILLED = 'already_filled'
+    # Broker explicitly reported that the order can no longer be
+    # cancelled (e.g., past its execution window) AND that no fill
+    # occurred. Treated as ``CANCEL_CONFIRMED`` by the sync engine —
+    # the disposition is unambiguous, only the wording differs.
+    TOO_LATE_TO_CANCEL = 'too_late_to_cancel'
+    # A fresh ``execute_cancel`` round succeeded (i.e., the order was
+    # in fact still live and is now cancelled — distinct from
+    # CANCEL_CONFIRMED in that the *previous* attempt's disposition
+    # was unknown; this one is unambiguous). Treated as
+    # ``CANCEL_CONFIRMED`` by the sync engine.
+    STILL_OPEN = 'still_open'
+    # Plugin could not disambiguate (404 / not-found / timeout /
+    # ambiguous response). Sync engine: leg stays
+    # ``cancel_tentative``, retry on next reconcile until stale-grace.
+    UNKNOWN = 'unknown'
+
+
+@dataclass
+class PartialBracketCancelTentativeStartedEvent(BrokerEvent):
+    """A pending-entry partial bracket leg entered ``cancel_tentative``
+    because :meth:`BrokerPlugin.execute_cancel` raised
+    :class:`OrderDispositionUnknownError`.
+
+    The sync engine retains the order mapping and envelope; the
+    ``reconcile()`` cancel-retry-loop drives the leg to resolution within
+    the stale-grace window. See the cancel-tentative state design dossier.
+    """
+    intent_key: str
+    reason: str
+    since_ts_ms: int
+
+
+@dataclass
+class PartialBracketCancelTentativeResolvedEvent(BrokerEvent):
+    """A ``cancel_tentative`` leg has been resolved — either confirmed
+    cancelled (leg ``aborted_parent_never_arrived``) or restored (leg
+    back to ``pending_entry`` / ``armed``) following a broker disposition
+    outcome or a late parent fill event.
+
+    ``outcome`` reflects the resolution reason; ``via`` indicates which
+    code path delivered it (``reconcile_retry`` or ``order_event``).
+    """
+    intent_key: str
+    outcome: CancelDispositionOutcome
+    via: str  # 'reconcile_retry' | 'order_event'
+    duration_ms: int
+
+
+@dataclass
+class PartialBracketCancelTentativeDegradedEvent(BrokerEvent):
+    """The stale-grace deadline (default 10s) for a ``cancel_tentative``
+    intent expired without resolution.
+
+    The parent dispatch is promoted to ``DEGRADED_HALT``; the script's
+    further entries on the symbol are blocked until manual intervention
+    via :class:`ManualInterventionRequiredEvent`.
+    """
+    intent_key: str
+    symbol: str
+    since_ts_ms: int
+    stale_grace_ms: int
+
+
+@dataclass
+class EntryDeferredCancelDispositionPendingEvent(BrokerEvent):
+    """The diff-loop's adoption path saw a fresh ``EntryIntent`` whose
+    ``intent_key`` is currently in ``cancel_disposition_pending``.
+
+    The new intent is NOT dispatched and NOT adopted — the prior
+    dispatch's disposition is still unresolved, and an in-flight broker
+    state would create a double-life. The script's signal will retry on
+    the next ``sync()`` once the cancel disposition is resolved or
+    promoted to ``DEGRADED_HALT``.
+    """
+    intent_key: str
+    pine_id: str
+    symbol: str
+    since_ts_ms: int
 
 
 @dataclass

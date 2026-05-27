@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Callable, Iterable
 
 from pynecore.core.broker.models import OcaType
 from pynecore.core.broker.store_helpers import (
+    EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS,
     EXTRAS_KEY_INTENT_PARTIAL_QTY,
     EXTRAS_KEY_LEG_KIND,
     EXTRAS_KEY_LEG_STATE,
@@ -55,9 +56,11 @@ from pynecore.core.broker.store_helpers import (
     LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED,
     LEG_STATE_ACTIVE,
     LEG_STATE_ARMED,
+    LEG_STATE_CANCEL_TENTATIVE,
     LEG_STATE_CASCADED_CANCEL,
     LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL,
     LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE,
+    LEG_STATE_LIVE,
     LEG_STATE_PENDING_ENTRY,
     LEG_STATE_TRIGGERED_FAILED,
     LEG_STATE_TRIGGERED_UNKNOWN,
@@ -867,6 +870,191 @@ class SoftwarePartialBracketEngine:
             cleaned.append(leg)
         return cleaned
 
+    # === Cancel-tentative state machine ===================================
+
+    def mark_legs_cancel_tentative(
+            self,
+            parent_from_entry: str,
+            *,
+            reason: str,
+            now_ms: int,
+    ) -> list[PartialBracketLeg]:
+        """Flip every ``pending_entry`` leg of one parent to
+        ``cancel_tentative``.
+
+        Called by the sync engine's swallowed-unknown branch of
+        ``_dispatch_cancel`` when ``execute_cancel`` raises
+        :class:`OrderDispositionUnknownError` on a parent entry. The
+        legs stay live (the row's ``closed_ts_ms`` is not set) and are
+        excluded from worst-SL contribution / price-tick arming until
+        either the ``reconcile()`` cancel-retry-loop resolves the
+        disposition (→ :meth:`confirm_cancel_tentative` or
+        :meth:`restore_legs_from_cancel_tentative`) or the stale-grace
+        deadline expires (→ ``DEGRADED_HALT`` by the caller).
+
+        Already ``armed`` legs are NOT affected: per the dossier's leg-
+        trio atomicity invariant (:meth:`on_parent_entry_filled` flips
+        the whole trio atomically), ``ARMED + PENDING_ENTRY`` coexistence
+        under a single parent is structurally impossible while the parent
+        is still pending.
+
+        :param parent_from_entry: The parent ``EntryIntent.intent_key``
+            (≡ Pine ``from_entry`` on every child :class:`ExitIntent`).
+        :param reason: Audit reason recorded on the leg row's extras.
+        :param now_ms: Wall-clock timestamp (ms) marking entry into
+            the cancel-tentative state. Persisted under
+            :data:`EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS`; survives
+            restart so the stale-grace deadline can be rehydrated.
+        :return: List of legs that were transitioned.
+        """
+        flipped: list[PartialBracketLeg] = []
+        targets = [
+            leg for leg in self._legs.values()
+            if leg.from_entry == parent_from_entry
+            and leg.leg_state == LEG_STATE_PENDING_ENTRY
+        ]
+        for leg in targets:
+            self._transition(
+                leg, LEG_STATE_CANCEL_TENTATIVE,
+                close_row=False,
+                extras_patch={
+                    EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS: now_ms,
+                    'cancel_tentative_reason': reason,
+                },
+            )
+            flipped.append(leg)
+        return flipped
+
+    def restore_legs_from_cancel_tentative(
+            self,
+            parent_from_entry: str,
+            *,
+            parent_filled: bool,
+            reason: str,
+    ) -> list[PartialBracketLeg]:
+        """Reverse :meth:`mark_legs_cancel_tentative` for one parent.
+
+        Called when the cancel-retry-loop or a late parent FILL event
+        proves the parent is in fact alive (the cancel attempt that
+        timed out never actually landed). Legs return to
+        :data:`LEG_STATE_PENDING_ENTRY` when the parent is still pending
+        (no fill event observed yet) or directly to
+        :data:`LEG_STATE_ARMED` when the parent has filled
+        (``parent_filled=True``). In the armed case the caller is
+        responsible for re-registering the parent with the
+        ``NativeFailsafeManager``.
+
+        Idempotent: when no leg is in cancel-tentative for the parent
+        (e.g. because both the event-driven path and the reconcile-retry
+        path delivered the resolution on the same tick), the second
+        call is a no-op.
+
+        :param parent_from_entry: The parent ``EntryIntent.intent_key``
+            whose tentative legs are being restored.
+        :param parent_filled: When ``True``, restore to ``armed``
+            (the parent is filled, the leg should resume worst-SL
+            contribution and tick processing). When ``False``,
+            restore to ``pending_entry`` (parent still pending; the
+            next :meth:`on_parent_entry_filled` will promote).
+        :param reason: Audit reason recorded on the leg row's extras.
+        :return: List of legs that were transitioned. Empty if no
+            tentative leg matched the parent (idempotent no-op).
+        """
+        target_state = (
+            LEG_STATE_ARMED if parent_filled else LEG_STATE_PENDING_ENTRY
+        )
+        restored: list[PartialBracketLeg] = []
+        targets = [
+            leg for leg in self._legs.values()
+            if leg.from_entry == parent_from_entry
+            and leg.leg_state == LEG_STATE_CANCEL_TENTATIVE
+        ]
+        for leg in targets:
+            self._transition(
+                leg, target_state,
+                close_row=False,
+                extras_patch={
+                    EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS: None,
+                    'cancel_tentative_resolved_reason': reason,
+                },
+            )
+            restored.append(leg)
+        return restored
+
+    def confirm_cancel_tentative(
+            self,
+            parent_from_entry: str,
+            *,
+            reason: str,
+    ) -> list[PartialBracketLeg]:
+        """Resolve :meth:`mark_legs_cancel_tentative` forward for one parent.
+
+        Called when the cancel-retry-loop receives a
+        :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`,
+        :attr:`CancelDispositionOutcome.STILL_OPEN`, or
+        :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL` outcome,
+        or when a parent CANCELLED order event arrives for a parent
+        currently in cancel-tentative. The tentative legs are flipped
+        to :data:`LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED` (terminal)
+        and their rows are closed.
+
+        Idempotent: if no tentative leg matches the parent (because
+        a previous call already terminated them), this is a no-op.
+
+        :param parent_from_entry: The parent ``EntryIntent.intent_key``
+            whose tentative legs are being confirmed-cancelled.
+        :param reason: Audit reason recorded on the leg row's extras.
+        :return: List of legs that were transitioned. Empty if no
+            tentative leg matched (idempotent no-op).
+        """
+        confirmed: list[PartialBracketLeg] = []
+        targets = [
+            leg for leg in self._legs.values()
+            if leg.from_entry == parent_from_entry
+            and leg.leg_state == LEG_STATE_CANCEL_TENTATIVE
+        ]
+        for leg in targets:
+            self._transition(
+                leg, LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED,
+                close_row=True,
+                extras_patch={
+                    'abort_reason': reason,
+                    EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS: None,
+                },
+            )
+            confirmed.append(leg)
+        return confirmed
+
+    def iter_cancel_tentative_parents(self) -> set[str]:
+        """Snapshot of every distinct parent ``from_entry`` that currently
+        has at least one leg in :data:`LEG_STATE_CANCEL_TENTATIVE`.
+
+        Used by the sync engine's ``reconcile()`` cancel-retry-loop to
+        decide which parents still need disposition resolution. The
+        result is a set (not a list) so the caller can intersect /
+        difference against its shadow map without worrying about leg-
+        trio multiplicity.
+        """
+        return {
+            leg.from_entry for leg in self._legs.values()
+            if leg.leg_state == LEG_STATE_CANCEL_TENTATIVE
+        }
+
+    def has_cancel_tentative_legs(self, parent_from_entry: str) -> bool:
+        """Whether any leg under ``parent_from_entry`` is in
+        :data:`LEG_STATE_CANCEL_TENTATIVE`.
+
+        Quick check used by the sync engine's diff-loop refuse-and-defer
+        guard before the adoption branch — symmetric to
+        :meth:`has_active_legs_for_intent` but for the verification state
+        and parent-scoped (not intent-scoped).
+        """
+        for leg in self._legs.values():
+            if leg.from_entry == parent_from_entry \
+                    and leg.leg_state == LEG_STATE_CANCEL_TENTATIVE:
+                return True
+        return False
+
     # === Restart replay ===================================================
 
     def restart_replay(self) -> None:
@@ -1025,7 +1213,18 @@ def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:
             LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL, LEG_KIND_TRAIL_PARTIAL,
     ):
         return None
-    if leg_state not in LEG_STATE_ACTIVE:
+    # Accept every live state, including ``cancel_tentative``. The
+    # tentative row is still open (``closed_ts_ms IS NULL``) and the
+    # sync engine's cancel-retry loop drives its next transition — the
+    # in-memory ledger must therefore carry it so
+    # :meth:`SoftwarePartialBracketEngine.iter_cancel_tentative_parents`
+    # and the post-restart
+    # :meth:`OrderSyncEngine._rehydrate_cancel_tentative_from_replayed_legs`
+    # rehydrate can see it. The ``restart_replay`` only re-arms the three
+    # in-flight engine-owned states (``triggering`` / ``triggered_failed``
+    # / ``triggered_unknown``), so a tentative row loaded here stays
+    # tentative until the cancel-retry loop resolves it.
+    if leg_state not in LEG_STATE_LIVE:
         return None
     parent_pine_entry_id = extras.get(EXTRAS_KEY_PARENT_PINE_ENTRY_ID, '')
     parent_entry_dispatch_ref = extras.get(

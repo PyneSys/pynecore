@@ -56,10 +56,12 @@ from pynecore.lib.log import (
 from pynecore.core.broker.models import (
     BracketAttachRejectContext,
     BrokerEvent,
+    CancelDispositionOutcome,
     CancelIntent,
     CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
+    EntryDeferredCancelDispositionPendingEvent,
     EntryIntent,
     ExchangePosition,
     ExitIntent,
@@ -71,6 +73,9 @@ from pynecore.core.broker.models import (
     OcaPartialFillPolicy,
     OcaType,
     OrderEvent,
+    PartialBracketCancelTentativeDegradedEvent,
+    PartialBracketCancelTentativeResolvedEvent,
+    PartialBracketCancelTentativeStartedEvent,
     PartialQtyBracketExitMode,
     PendingDefensiveClose,
 )
@@ -91,6 +96,7 @@ from pynecore.core.broker.storage import (
     RunContext,
 )
 from pynecore.core.broker.store_helpers import (
+    EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS,
     EXTRAS_KEY_INTENT_PARTIAL_QTY,
     EXTRAS_KEY_LEG_KIND,
     EXTRAS_KEY_LEG_STATE,
@@ -105,6 +111,7 @@ from pynecore.core.broker.store_helpers import (
     LEG_KIND_TRAIL_PARTIAL,
     LEG_STATE_ACTIVE,
     LEG_STATE_ARMED,
+    LEG_STATE_CANCEL_TENTATIVE,
     LEG_STATE_PENDING_ENTRY,
     create_engine_trigger_partial_leg_row,
 )
@@ -119,6 +126,66 @@ __all__ = ['OrderSyncEngine']
 _log = logging.getLogger(__name__)
 
 Intent = EntryIntent | ExitIntent | CloseIntent
+
+CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
+"""Default stale-grace window (seconds) for cancel-tentative resolution.
+
+A pending-entry partial bracket leg may enter ``cancel_tentative`` when
+the broker returns :class:`OrderDispositionUnknownError` from
+``execute_cancel`` (network timeout / ambiguous response). The
+:meth:`OrderSyncEngine.reconcile` cancel-retry-loop drives the leg to
+resolution within this window via
+:meth:`BrokerPlugin.execute_cancel_with_outcome`. If the disposition
+remains :attr:`CancelDispositionOutcome.UNKNOWN` past the deadline,
+the engine promotes the parent to ``DEGRADED_HALT`` (the partial
+brackets cannot be safely re-armed against a parent whose live/dead
+status the engine cannot determine).
+
+The default of 10s is more aggressive than
+:data:`DEFENSIVE_CLOSE_RESOLUTION_GRACE_S` because the consequence is
+more direct (unprotected position vs. waiting for an in-flight close
+to settle). Config-tunable up to 30s for slow brokers via the
+constructor.
+"""
+
+
+def _coid_is_close(coid: str) -> bool:
+    """Return ``True`` when ``coid`` was minted for a :data:`KIND_CLOSE`
+    dispatch.
+
+    The canonical client-order-id format is
+    ``{run_tag}-{pid_hash}-{bar}-{kind}{retry}`` (see
+    :func:`pynecore.core.broker.idempotency.build_client_order_id`). The
+    last dash-separated segment starts with the kind character — checking
+    that single position is sufficient to distinguish a parked
+    ``execute_close`` from a parked ``execute_entry`` / ``execute_exit``
+    on the cross-restart pending-anchor recovery path.
+    """
+    tail = coid.rsplit('-', 1)
+    if len(tail) != 2 or not tail[1]:
+        return False
+    return tail[1][0] == KIND_CLOSE
+
+
+@dataclasses.dataclass
+class _CancelTentativeMeta:
+    """Per-``intent_key`` shadow-map entry tracking a cancel-tentative
+    disposition that has not yet been resolved.
+
+    ``since_ts_ms`` anchors the stale-grace deadline; ``retry_count``
+    and ``last_retry_ts_ms`` give the cancel-retry-loop the audit data
+    it needs to back off if the broker is consistently returning
+    :attr:`CancelDispositionOutcome.UNKNOWN`. Mirrored on the
+    persisted leg row's
+    :data:`EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS` so a restart can
+    rehydrate the deadline.
+    """
+    since_ts_ms: int
+    reason: str
+    retry_count: int = 0
+    last_retry_ts_ms: int | None = None
+    last_retry_outcome: CancelDispositionOutcome | None = None
+
 
 DEFENSIVE_CLOSE_RESOLUTION_GRACE_S = 30.0
 """Default grace window (seconds) for a defensive close FILL to settle.
@@ -218,6 +285,7 @@ class OrderSyncEngine:
             mintick: float = 0.01,
             oca_partial_fill_policy: OcaPartialFillPolicy = OcaPartialFillPolicy.FILL_CANCELS,
             broker_event_sink: Callable[[BrokerEvent], None] | None = None,
+            cancel_tentative_stale_grace_s: float = CANCEL_TENTATIVE_STALE_GRACE_S,
             store_ctx: RunContext | None = None,
     ) -> None:
         self._broker = broker
@@ -230,6 +298,7 @@ class OrderSyncEngine:
         self._mintick = mintick
         self._oca_partial_policy = oca_partial_fill_policy
         self._broker_event_sink = broker_event_sink
+        self._cancel_tentative_stale_grace_s = cancel_tentative_stale_grace_s
         self._store_ctx = store_ctx
         # Capabilities are declared once at plugin startup — cache the lookup
         # so the cascade-cancel fast path does not pay a method call per event.
@@ -296,6 +365,32 @@ class OrderSyncEngine:
         # rehydrate after :meth:`sync` assigns a real ``bar_ts_ms``
         # gives the stale-window timer a sane anchor.
         self._pending_native_failsafe_rehydrate: bool = False
+        # Cancel-tentative state machine shadow map. Keyed by
+        # ``intent_key``; each entry tracks one envelope whose broker
+        # cancel disposition is unresolved
+        # (:class:`OrderDispositionUnknownError` swallowed by
+        # :meth:`_dispatch_cancel`). The ``reconcile()`` cancel-retry-
+        # loop iterates this map every pass, re-invokes
+        # :meth:`BrokerPlugin.execute_cancel_with_outcome`, and resolves
+        # the entry to either a confirmed cancel (legs flip to
+        # ``aborted_parent_never_arrived``, mapping/envelope dropped)
+        # or a late-fill restore (legs return to ``pending_entry`` or
+        # ``armed``). The diff-loop's adoption branch refuses to adopt
+        # / dispatch any new intent whose key sits in this map — the
+        # prior dispatch's broker state is still ambiguous, and a
+        # parallel new dispatch would create a double-life. Stale-
+        # grace expiry promotes the parent to ``DEGRADED_HALT``.
+        self._cancel_disposition_pending: dict[str, _CancelTentativeMeta] = {}
+        # Deferred rehydrate flag — analogous to
+        # ``_pending_native_failsafe_rehydrate``. Set in ``__init__``
+        # when the persisted leg ledger contains any
+        # :data:`LEG_STATE_CANCEL_TENTATIVE` rows; cleared on the first
+        # :meth:`sync` after the shadow map is rebuilt from the leg
+        # extras (since_ts_ms / reason). Rebuilding at construction
+        # time is not viable because ``_current_bar_ts_ms`` is still
+        # ``0`` and the cancel-retry-loop's stale-grace timer would
+        # immediately expire against epoch zero.
+        self._pending_cancel_tentative_rehydrate: bool = False
         # OCA groups already processed inside the current :meth:`sync` pass.
         # Cleared at the start of every sync so a fresh bar re-enables cascade,
         # but kept stable within the pass so two fills in the same group do
@@ -379,6 +474,21 @@ class OrderSyncEngine:
         # polled-orders identity path used by
         # :meth:`_route_defensive_close_fill`.
         self._settled_defensive_close_client_order_ids: set[str] = set()
+
+        # Intent keys whose ``_order_mapping`` entry was seeded from a
+        # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
+        # The diff-loop adoption guard at :meth:`_diff_and_dispatch`
+        # otherwise excludes every :class:`CloseIntent` from adoption to
+        # avoid colliding with a stale parent-entry mapping left after an
+        # ``ALREADY_FILLED`` cancel-tentative resolution. That blanket
+        # exclusion is unsafe when the mapping itself originated from a
+        # parked ``execute_close``: the script's next ``strategy.close``
+        # would otherwise fall through to ``_dispatch_new`` and emit a
+        # second market close against the just-recovered broker close
+        # order. Membership unblocks adoption for the matching key
+        # exactly once; consumed by the adoption branch and cleared on
+        # any disposition that drops the close mapping.
+        self._recovered_close_anchor_keys: set[str] = set()
 
         # Neutralised parent-ENTRY identity cache. When the no-FIFO settle
         # branch in :meth:`_route_event` settles a defensive close while
@@ -524,6 +634,15 @@ class OrderSyncEngine:
             # restart without partial brackets is a no-op.
             self._pending_native_failsafe_rehydrate = any(
                 True for _ in self._partial_bracket_engine.iter_legs()
+            )
+            # Cancel-tentative shadow-map rehydrate: defer to the first
+            # :meth:`sync` so ``_current_bar_ts_ms`` is non-zero before
+            # the stale-grace timer runs. The flag is only set when the
+            # restart-replay surfaced at least one cancel-tentative leg
+            # (the engine's ``iter_cancel_tentative_intent_keys`` peek
+            # against the now-rehydrated ledger).
+            self._pending_cancel_tentative_rehydrate = bool(
+                self._partial_bracket_engine.iter_cancel_tentative_parents()
             )
 
     # === Public API ===
@@ -772,6 +891,9 @@ class OrderSyncEngine:
         if self._pending_native_failsafe_rehydrate:
             self._pending_native_failsafe_rehydrate = False
             self._rehydrate_native_failsafe_from_replayed_legs()
+        if self._pending_cancel_tentative_rehydrate:
+            self._pending_cancel_tentative_rehydrate = False
+            self._rehydrate_cancel_tentative_from_replayed_legs()
         self._cancelled_oca_groups_this_sync.clear()
         # ``_defensively_closed_entries_this_sync`` is intentionally NOT
         # cleared here: :meth:`_handle_bracket_attach_after_fill_reject`
@@ -892,6 +1014,13 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.record_unpark(coid)
             self._maybe_attach_defensive_close_ref(key, order.id)
+            # Tag close-park recoveries so the diff-loop adoption guard
+            # can adopt a re-emitted ``CloseIntent`` instead of falling
+            # through to ``_dispatch_new`` and emitting a duplicate
+            # market close. See the ``_persisted_pending_anchors`` loop
+            # below for the cross-restart counterpart.
+            if isinstance(envelope.intent, CloseIntent):
+                self._recovered_close_anchor_keys.add(key)
             _log.info(
                 "recovered pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, key,
@@ -907,6 +1036,14 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.record_unpark(coid)
             self._maybe_attach_defensive_close_ref(anchor.key, order.id)
+            # A close-park's COID encodes :data:`KIND_CLOSE` in its
+            # trailing kind+retry segment. Tag the seeded key so the
+            # diff-loop adoption guard can recognise the mapping as a
+            # genuine close anchor rather than a stale parent-entry
+            # leftover, allowing the script's re-emitted
+            # :class:`CloseIntent` to adopt instead of double-dispatching.
+            if _coid_is_close(coid):
+                self._recovered_close_anchor_keys.add(anchor.key)
             _log.info(
                 "recovered persisted pending dispatch %s -> exchange order %s "
                 "for intent %s", coid, order.id, anchor.key,
@@ -1284,6 +1421,16 @@ class OrderSyncEngine:
                     # intent via ``execute_*``.
                     self._active_intents.pop(key, None)
                     self._order_mapping.pop(key, None)
+                    # Drop the recovered-close-anchor tag in lockstep
+                    # with the mapping: a parked close that the
+                    # broker then rejected is terminally dead, so the
+                    # adoption exception must NOT survive into a
+                    # future EntryIntent reusing the same ``pine_id``
+                    # (see :meth:`_drop_envelope` for the same
+                    # invariant on the regular cleanup path; this
+                    # rejected-new-dispatch branch deliberately does
+                    # not call :meth:`_drop_envelope`).
+                    self._recovered_close_anchor_keys.discard(key)
                     # Defensive: a 'new' rejected record should never
                     # have left a modify rollback snapshot on the same
                     # key (snapshots are only stashed for kind='modify'
@@ -1608,9 +1755,49 @@ class OrderSyncEngine:
         # report the pre-fill size (often zero). Unconditional startup
         # adoption would then clobber the just-applied fill and let the
         # strategy think it is flat — re-entering on the next bar.
+        # Rehydrate the cancel-tentative shadow map BEFORE the event drain
+        # so that ``_route_event`` can resolve replayed FILL / cancelled
+        # events against tentative parents seeded from the prior process.
+        # Without this, the startup ``reconcile`` would drain those events
+        # against an empty ``_cancel_disposition_pending`` (the rehydrate
+        # otherwise only runs at the top of the first :meth:`sync`),
+        # missing the event-driven resolution and leaving the legs stuck
+        # until a later retry might resolve them incorrectly. Idempotent:
+        # the first-sync rehydrate gate clears the flag here so it does
+        # not run a second time.
+        if self._pending_cancel_tentative_rehydrate:
+            self._pending_cancel_tentative_rehydrate = False
+            self._rehydrate_cancel_tentative_from_replayed_legs()
         pre_drain_size = self._position.size
         self._drain_events()
         drained_mutated_position = self._position.size != pre_drain_size
+        # Cancel-tentative cancel-retry-loop: drives unresolved cancel
+        # dispositions to a terminal outcome (or to ``DEGRADED_HALT`` on
+        # stale-grace expiry). The drain above already gave every
+        # event-driven resolution path a chance to run; this pass is the
+        # idempotent fallback for parents whose broker never pushed an
+        # explicit cancelled / filled event after the original
+        # ``execute_cancel`` timed out. Runs even when the shadow map
+        # is empty (cheap no-op) so future-restart rehydrate paths flow
+        # through the same code as the steady-state case.
+        #
+        # Skip the retry on the startup ``reconcile`` (called from
+        # ``start_broker`` BEFORE the first :meth:`sync` assigns a
+        # real bar timestamp). At that point ``_current_bar_ts_ms`` is
+        # still ``0``, and the retry path's
+        # :meth:`_build_cancel_envelope` fallback (used when no
+        # ``CancelIntent`` envelope is retained — the typical
+        # restart-replay case) would mint a ``client_order_id`` from
+        # ``bar_ts_ms=0``. That COID differs from every later retry
+        # (which uses the real bar timestamp), breaking the broker's
+        # idempotency dedup and producing a bogus first attempt. The
+        # event-driven drain above still resolves cancel-tentative
+        # entries that have a queued FILL / ``cancelled``; truly
+        # silent parents wait for the next ``sync``-triggered reconcile
+        # (periodic) or a steady-state retry, both with a real
+        # ``bar_ts_ms`` anchor.
+        if self._current_bar_ts_ms > 0:
+            self._drive_cancel_tentative(now_ms=self._cancel_tentative_now_ms())
         # Retry residual cleanup for markers whose FILL already routed
         # but the bracket-reject residual cancel failed transiently. The
         # duplicate-fill cache is already seeded (so no second FILL can
@@ -2027,6 +2214,73 @@ class OrderSyncEngine:
         # need engine state) are emitted here.
         t = event.event_type
         if t in ('filled', 'partial'):
+            # Event-driven cancel-tentative restore: if a FILL (terminal
+            # or partial) belongs to a parent whose cancel disposition is
+            # currently unresolved, treat it as a broker-pushed
+            # :attr:`CancelDispositionOutcome.ALREADY_FILLED` resolution
+            # (the cancel attempt that timed out never actually landed).
+            # ``_clear_intent_cancel_disposition_pending`` flips the
+            # tentative legs back to ``pending_entry`` (then to ``armed``
+            # via the standard ``_promote_pending_partial_bracket_legs``
+            # below for ``ENTRY`` events), re-registers the parent with
+            # the §2.6 manager (``pending_confirmation=True``), and clears
+            # the shadow-map entry — without dropping ``_order_mapping``
+            # / envelope (the parent is in fact alive). The normal
+            # fill-routing path (record_fill, defensive-close inspection,
+            # etc.) runs immediately afterwards on the same event.
+            # Idempotent against a later ``reconcile()`` retry that also
+            # observes ``ALREADY_FILLED``.
+            #
+            # ``partial`` events MUST resolve cancel-tentative too. A
+            # partial fill leaves residual qty live on the broker, but
+            # the just-filled qty is now an open position that needs
+            # bracket protection (TP/SL) immediately — leaving the legs
+            # in ``LEG_STATE_CANCEL_TENTATIVE`` would let
+            # ``_promote_pending_partial_bracket_legs`` (called below for
+            # ``ENTRY`` events) skip them, and a subsequent broker
+            # ``cancelled`` event for the residual would then abort the
+            # legs as ``parent_never_arrived`` — leaving the live
+            # partial position unprotected. Resolving as
+            # ``ALREADY_FILLED`` here arms the legs against the partial
+            # fill price; the residual order remains in
+            # ``_order_mapping``.
+            #
+            # For ``partial`` events specifically, the script's original
+            # cancel intent is NOT obsolete: the broker still holds the
+            # unfilled residual qty live and could fill more, growing
+            # the position past what the just-armed legs cover. The
+            # script will not reissue a CancelIntent (from its view the
+            # cancel already went out), so we honor the script's intent
+            # by attempting a one-shot best-effort cancel of the
+            # residual here. On success, ``_order_mapping`` /
+            # ``_envelopes`` are cleaned by
+            # :meth:`_dispatch_cancel_strict`. On timeout
+            # (``OrderDispositionUnknownError``), we deliberately do NOT
+            # re-enter cancel-tentative — re-marking would flip the
+            # just-armed legs back to ``LEG_STATE_CANCEL_TENTATIVE``,
+            # defeating the protection we just established. Log a
+            # warning so the operator can intervene if the broker
+            # ultimately fills the residual against an unprotected
+            # position.
+            if event.order is not None:
+                _ct_key = self._find_key_for_order_id(event.order.id)
+                if (_ct_key is not None
+                        and _ct_key in self._cancel_disposition_pending):
+                    _blog_info(
+                        "cancel-tentative %r resolved by broker %s event",
+                        _ct_key, t,
+                    )
+                    self._clear_intent_cancel_disposition_pending(
+                        _ct_key,
+                        outcome=CancelDispositionOutcome.ALREADY_FILLED,
+                        via='order_event',
+                        now_ms=self._cancel_tentative_now_ms(),
+                        is_partial_fill=(t == 'partial'),
+                    )
+                    if t == 'partial':
+                        self._cancel_residual_after_partial_resolution(
+                            _ct_key,
+                        )
             # Reset the per-event FIFO closure cache. Populated below only
             # when :meth:`BrokerPosition.record_fill` actually walks FIFO
             # for this event; consumed by
@@ -2551,6 +2805,26 @@ class OrderSyncEngine:
             ):
                 return
             key = self._find_key_for_order_id(event.order.id)
+            if (key is not None
+                    and key in self._cancel_disposition_pending):
+                # Event-driven cancel-tentative confirm: the broker pushed
+                # a CANCELLED for a parent currently in cancel-tentative.
+                # Resolve forward (legs → aborted_parent_never_arrived,
+                # mapping / envelope / active_intents dropped) without
+                # running the eager-retire path below — the confirm helper
+                # owns the full cleanup. Idempotent against a follow-up
+                # ``reconcile()`` retry that may also see the outcome.
+                _blog_info(
+                    "cancel-tentative %r resolved by broker cancelled event",
+                    key,
+                )
+                self._clear_intent_cancel_disposition_pending(
+                    key,
+                    outcome=CancelDispositionOutcome.CANCEL_CONFIRMED,
+                    via='order_event',
+                    now_ms=self._cancel_tentative_now_ms(),
+                )
+                return
             if key is not None:
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
@@ -2681,6 +2955,21 @@ class OrderSyncEngine:
             if record.key == key
         ]:
             self._persisted_pending_anchors.pop(coid, None)
+        # Drop the recovered-close-anchor tag in lockstep with the
+        # envelope. The tag was seeded by
+        # :meth:`_verify_pending_dispatches` (or its persisted-anchor
+        # sibling) so the diff-loop adoption guard would let a
+        # re-emitted :class:`CloseIntent` adopt the parked broker
+        # order. Once the envelope/mapping for ``key`` is retired
+        # (fill, cancel, reject, or any other terminal cleanup), the
+        # tag must NOT outlive it — a future EntryIntent sharing the
+        # same ``pine_id`` could repopulate ``_order_mapping[key]``,
+        # and a subsequent CloseIntent for that ``pine_id`` would then
+        # silently adopt the entry's mapping under the close-anchor
+        # exception instead of dispatching a fresh market close.
+        # ``set.discard`` is O(1) and idempotent — safe to call for
+        # every retired key.
+        self._recovered_close_anchor_keys.discard(key)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 
@@ -4018,6 +4307,545 @@ class OrderSyncEngine:
                 trigger_kind='lifecycle',
             )
 
+    # === Cancel-tentative state machine ====================================
+
+    def _rehydrate_cancel_tentative_from_replayed_legs(self) -> None:
+        """Rebuild :attr:`_cancel_disposition_pending` from replayed legs.
+
+        Scheduled by ``__init__`` (via
+        ``_pending_cancel_tentative_rehydrate``) and executed at the top
+        of the startup :meth:`reconcile` BEFORE the first event drain so
+        that replayed FILL / cancelled events for tentative parents can
+        be resolved event-driven. (The first :meth:`sync` also calls
+        this as a defensive fallback, but the gate flag makes it a
+        no-op once reconcile has already rehydrated.) Walks the ledger
+        for legs in :data:`LEG_STATE_CANCEL_TENTATIVE`, deduplicates per
+        ``intent_key``, and re-anchors the stale-grace deadline from
+        the persisted :data:`EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS`.
+
+        Without this seeding the post-restart engine would observe the
+        tentative legs in its in-memory ledger (via ``restart_replay``)
+        but would never re-attempt the cancel disposition resolution —
+        the legs would survive the stale-grace window unobserved, and
+        the diff-loop adoption guard would never fire to defer a fresh
+        reissue.
+        """
+        tentative_parents: set[str] = set()
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.leg_state != LEG_STATE_CANCEL_TENTATIVE:
+                continue
+            parent_key = leg.from_entry
+            if parent_key in self._cancel_disposition_pending:
+                continue
+            since_ts_ms = leg.extras.get(EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS)
+            if since_ts_ms is None:
+                # Persisted CANCEL_TENTATIVE leg without an anchor
+                # timestamp — defensive fallback: stamp wall-clock now
+                # so the stale-grace timer still has a deadline in the
+                # same epoch as the comparison in
+                # :meth:`_drive_cancel_tentative`.
+                since_ts_ms = self._cancel_tentative_now_ms()
+            reason = leg.extras.get(
+                'cancel_tentative_reason', 'rehydrated_from_replay',
+            )
+            self._cancel_disposition_pending[parent_key] = _CancelTentativeMeta(
+                since_ts_ms=int(since_ts_ms),
+                reason=str(reason),
+            )
+            tentative_parents.add(parent_key)
+        # Seed ``_order_mapping`` for the tentative parents BEFORE the
+        # first event drain. The startup :meth:`reconcile` calls us
+        # before draining replayed broker events; the FILL / CANCELLED
+        # event-driven resolution paths in :meth:`_route_event` look the
+        # tentative parent up via :meth:`_find_key_for_order_id`, which
+        # iterates :attr:`_order_mapping`. Without this seeding the map
+        # is still empty at drain time (``_verify_pending_dispatches``
+        # — which would otherwise populate it from the open-orders poll
+        # — only runs at the start of the first :meth:`sync`), so the
+        # replayed event cannot be matched to its tentative parent and
+        # the disposition resolution falls through to the
+        # :meth:`_drive_cancel_tentative` retry path. Pulling the
+        # broker order_ids from the persisted ``orders`` table (each
+        # row carries ``intent_key`` and ``exchange_order_id``) gives
+        # the routing helpers a live mapping immediately. Engine-trigger
+        # partial legs are engine-internal and never have a broker-side
+        # order, so a missing row for the parent is simply a no-op.
+        if tentative_parents and self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+                if (row.intent_key is None
+                        or row.intent_key not in tentative_parents
+                        or not row.exchange_order_id):
+                    continue
+                current = self._order_mapping.setdefault(row.intent_key, [])
+                if row.exchange_order_id not in current:
+                    current.append(row.exchange_order_id)
+
+    def _mark_intent_cancel_disposition_pending(
+            self,
+            intent_key: str,
+            *,
+            reason: str,
+            now_ms: int,
+    ) -> None:
+        """Atomic two-level cancel-tentative entry.
+
+        Sets the envelope/intent-level :attr:`_cancel_disposition_pending`
+        flag AND flips every ``pending_entry`` leg of the trio to
+        :data:`LEG_STATE_CANCEL_TENTATIVE` via
+        :meth:`SoftwarePartialBracketEngine.mark_legs_cancel_tentative`.
+        Idempotent: if the entry already exists, the call is a no-op
+        (the original ``since_ts_ms`` is preserved so the stale-grace
+        deadline does not slip).
+
+        Emits :class:`PartialBracketCancelTentativeStartedEvent` for
+        audit / observability.
+        """
+        if intent_key in self._cancel_disposition_pending:
+            return
+        self._cancel_disposition_pending[intent_key] = _CancelTentativeMeta(
+            since_ts_ms=now_ms,
+            reason=reason,
+        )
+        # ``intent_key`` here is the parent ``EntryIntent.intent_key``,
+        # which equals ``leg.from_entry`` on every child partial bracket
+        # leg — so the engine API's parent-scoped flip uses the same
+        # value as the shadow-map key. The leg flip is a no-op when no
+        # partial bracket exists for the parent (entry without partial
+        # exits), which is the structural case where the shadow-map
+        # entry alone provides the refuse-and-defer guard.
+        self._partial_bracket_engine.mark_legs_cancel_tentative(
+            intent_key, reason=reason, now_ms=now_ms,
+        )
+        self._emit_broker_event(PartialBracketCancelTentativeStartedEvent(
+            intent_key=intent_key,
+            reason=reason,
+            since_ts_ms=now_ms,
+        ))
+
+    def _clear_intent_cancel_disposition_pending(
+            self,
+            intent_key: str,
+            *,
+            outcome: CancelDispositionOutcome,
+            via: str,
+            now_ms: int,
+            is_partial_fill: bool = False,
+    ) -> None:
+        """Resolve a cancel-tentative entry forward or backward.
+
+        Called from three sites:
+
+        - :meth:`_drive_cancel_tentative` on a non-``UNKNOWN`` outcome.
+        - :meth:`_on_order_event` FILL ag when a late parent fill
+          arrives for a tentative key (``via='order_event'``).
+        - :meth:`_on_order_event` cancelled ag when the broker pushes
+          a CANCELLED confirmation for a tentative key.
+
+        Acts according to the outcome:
+
+        - :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`,
+          :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL`,
+          :attr:`CancelDispositionOutcome.STILL_OPEN`:
+          confirm-cancel (legs → ``aborted_parent_never_arrived``;
+          mapping, envelope, active_intents dropped).
+        - :attr:`CancelDispositionOutcome.ALREADY_FILLED`:
+          restore (legs → ``armed``; parent re-registered with
+          ``NativeFailsafeManager`` ``pending_confirmation=True``;
+          mapping retained, envelope retained, active_intents removed
+          so the next diff-loop reissues / adopts).
+
+        :attr:`CancelDispositionOutcome.UNKNOWN` is NOT a resolution —
+        the caller handles it by bumping the retry counter and
+        returning without invoking this method.
+        """
+        meta = self._cancel_disposition_pending.pop(intent_key, None)
+        if meta is None:
+            return
+        duration_ms = max(0, now_ms - meta.since_ts_ms)
+        if outcome is CancelDispositionOutcome.ALREADY_FILLED:
+            # Restore to ``pending_entry`` rather than ``armed``: tentative
+            # legs born from a pending-parent dispatch carry only
+            # ``trigger_offset`` (tick distance), never an absolute
+            # ``trigger_level``. Promoting them straight to ``armed`` here
+            # would skip the trigger-offset → trigger-level resolution
+            # that :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
+            # owns, leaving them armed with ``trigger_level=None`` and
+            # therefore inert in the WATCH tick. Both reachable call paths
+            # (order-event FILL routing AND reconcile retry) get the legs
+            # promoted with a usable fill price below.
+            legs = self._partial_bracket_engine.restore_legs_from_cancel_tentative(
+                intent_key,
+                parent_filled=False,
+                reason='cancel_tentative_already_filled',
+            )
+            # Fire the OCA-cancel cascade BEFORE popping the active
+            # intent. :meth:`_cascade_oca_cancel_for_key` looks up the
+            # filled intent in :attr:`_active_intents` to discover its
+            # OCA group; dropping the slot first would leave every
+            # ``oca_type='cancel'`` sibling live exchange-side. The
+            # downstream :meth:`_route_event` call to
+            # :meth:`_cascade_oca_cancel` is a no-op via the in-sync
+            # idempotency set (:attr:`_cancelled_oca_groups_this_sync`).
+            # On the reconcile-retry path the slot may already be empty
+            # (no FILL event in this process) and the helper returns
+            # early — cheap, idempotent.
+            #
+            # Respect :data:`OcaPartialFillPolicy.FULL_FILL_ONLY` when
+            # the resolution was triggered by a ``partial`` fill event:
+            # the configured semantics keep OCA siblings live until a
+            # full fill arrives. Skipping the proactive cascade here
+            # (and not populating
+            # :attr:`_cancelled_oca_groups_this_sync`) lets the
+            # downstream :meth:`_cascade_oca_cancel(event)` enforce the
+            # policy gate uniformly; the eventual full fill will
+            # cascade through the normal path. ``is_partial_fill`` is
+            # ``False`` on the reconcile-retry caller (no event is
+            # available there, so we cannot distinguish partial from
+            # full and conservatively keep the legacy cascade).
+            skip_oca_cascade = (
+                is_partial_fill
+                and self._oca_partial_policy
+                is OcaPartialFillPolicy.FULL_FILL_ONLY
+            )
+            if not skip_oca_cascade:
+                self._cascade_oca_cancel_for_key(intent_key)
+            # Drop ``_active_intents[intent_key]`` so the next sync's
+            # diff-loop sees an empty slot and either reissues the script
+            # intent or adopts the retained mapping via the post-restart
+            # adoption branch (see :meth:`_diff_and_dispatch`). Without
+            # this pop, a stale ``EntryIntent`` reached via the
+            # cancel+reexecute modify path (see :class:`_PartialBracketModifyDeferred`)
+            # would remain in ``_active_intents``, so a script-emitted
+            # ``CloseIntent`` (or replacement) sharing the parent key
+            # would be classified as a modify of the already-filled
+            # entry instead of dispatching fresh. The retained mapping /
+            # envelope continue to anchor the parent's deterministic
+            # ``client_order_id`` for the upcoming dispatch.
+            self._active_intents.pop(intent_key, None)
+            # Order-event path (``via='order_event'``): the FILL routing
+            # block in :meth:`_route_event` runs us BEFORE
+            # :meth:`BrokerPosition.record_fill` updates ``open_trades``,
+            # so the parent is not yet in :attr:`_position.open_trades`
+            # here. The subsequent ``_promote_pending_partial_bracket_legs(event)``
+            # call later in the same FILL routing handles promotion with
+            # the event's ``fill_price``.
+            #
+            # Reconcile-retry path (``via='reconcile_retry'``): the parent
+            # fill event was processed in a prior tick (otherwise the
+            # broker would not be reporting ALREADY_FILLED), so the
+            # parent IS in ``open_trades``. Promote here explicitly using
+            # the trade's ``entry_price`` — there is no surrounding event
+            # to drive ``_promote_pending_partial_bracket_legs`` for us.
+            # If the lookup misses (race against an unprocessed FILL), the
+            # legs stay in ``pending_entry`` and the next FILL event drives
+            # the promotion naturally.
+            parent_trade = next(
+                (t for t in self._position.open_trades
+                 if t.entry_id == intent_key),
+                None,
+            )
+            if (parent_trade is not None
+                    and parent_trade.entry_price > 0.0):
+                parent_side_for_promotion = (
+                    'long' if parent_trade.sign > 0.0
+                    else 'short' if parent_trade.sign < 0.0
+                    else None
+                )
+                if parent_side_for_promotion is not None:
+                    self._partial_bracket_engine.on_parent_entry_filled(
+                        symbol=self._symbol,
+                        from_entry=intent_key,
+                        fill_price=float(parent_trade.entry_price),
+                        parent_side=parent_side_for_promotion,
+                        parent_qty=(
+                            parent_trade.size if parent_trade.size >= 0.0
+                            else -parent_trade.size
+                        ),
+                        resolver=TickOffsetResolver(self._mintick),
+                    )
+            # Re-register the parent with the §2.6 manager:
+            # ``pending_confirmation=True`` mirrors the restart-replay
+            # path's ``DEGRADING`` start until a broker snapshot
+            # confirms the desired SL is in place. Iterate the legs
+            # we just restored (each carries the
+            # :attr:`parent_entry_dispatch_ref` regardless of whether the
+            # subsequent promotion fired); the ``register_parent`` call
+            # is idempotent and the worst-SL recompute reads the
+            # in-memory ledger so it picks up any legs the explicit
+            # promotion above moved to ``armed``.
+            for leg in legs:
+                ref = leg.parent_entry_dispatch_ref
+                if not ref:
+                    continue
+                parent_side = (
+                    'long' if leg.side == 'sell'
+                    else 'short' if leg.side == 'buy'
+                    else None
+                )
+                if parent_side is None:
+                    continue
+                self._native_failsafe_manager.register_parent(
+                    parent_entry_dispatch_ref=ref,
+                    symbol=leg.symbol,
+                    parent_side=parent_side,
+                    mintick=self._mintick,
+                    pending_confirmation=True,
+                    now_ms=float(now_ms),
+                )
+                self._recompute_native_failsafe_for_parent(
+                    ref, trigger_kind='lifecycle',
+                )
+        else:
+            self._partial_bracket_engine.confirm_cancel_tentative(
+                intent_key,
+                reason=f'cancel_tentative_resolved_{outcome.value}',
+            )
+            self._order_mapping.pop(intent_key, None)
+            self._drop_envelope(intent_key)
+            self._active_intents.pop(intent_key, None)
+            # Drop any child partial-exit ExitIntent slots whose
+            # ``from_entry`` matches the resolved parent. Mirrors
+            # :meth:`_retire_pending_partials_for_cancelled_entry` so a
+            # later same-id entry re-dispatches its partial legs instead
+            # of seeing the stale ExitIntent as "already active" and
+            # short-circuiting :meth:`_dispatch_engine_trigger_partial_bracket`.
+            # ``confirm_cancel_tentative`` above closed the leg rows; this
+            # cleans up the envelope/intent-level shadow state the legs
+            # alone do not cover.
+            partial_exit_keys_to_drop = [
+                key for key, active in self._active_intents.items()
+                if isinstance(active, ExitIntent)
+                and active.is_partial_qty_bracket
+                and active.from_entry == intent_key
+            ]
+            for exit_key in partial_exit_keys_to_drop:
+                self._active_intents.pop(exit_key, None)
+                self._order_mapping.pop(exit_key, None)
+                self._drop_envelope(exit_key)
+        self._emit_broker_event(PartialBracketCancelTentativeResolvedEvent(
+            intent_key=intent_key,
+            outcome=outcome,
+            via=via,
+            duration_ms=duration_ms,
+        ))
+
+    @staticmethod
+    def _cancel_tentative_now_ms() -> int:
+        """Wall-clock anchor (ms) for the cancel-tentative stale-grace timer.
+
+        ``CANCEL_TENTATIVE_STALE_GRACE_S`` is a seconds-based timeout
+        and must therefore be measured against real elapsed time.
+        Using ``_current_bar_ts_ms`` (the bar-open timestamp) would
+        couple the deadline to the chart timeframe: on a 1-second
+        chart the grace expires roughly when intended, but on a
+        1-minute / 1-hour chart no retries inside the same bar age at
+        all, then the very next bar can immediately overflow a 10s
+        grace and halt after a single retry. ``time.time()`` matches
+        the defensive-close grace pattern (see
+        :meth:`_raise_if_stale_pending_defensive_close`) and survives
+        across restarts because the persisted leg-extras anchor is
+        compared in the same epoch.
+        """
+        return int(time.time() * 1000)
+
+    def _drive_cancel_tentative(self, *, now_ms: int) -> None:
+        """Idempotent cancel-retry loop driven by :meth:`reconcile`.
+
+        For each tentative entry, either:
+
+        - the stale-grace deadline has passed → promote to
+          ``DEGRADED_HALT`` via
+          :meth:`_handle_cancel_tentative_stale_grace_expiry`, OR
+        - re-invoke :meth:`BrokerPlugin.execute_cancel_with_outcome`
+          with the retained envelope and act on the outcome via
+          :meth:`_clear_intent_cancel_disposition_pending` (or bump
+          the retry counter on ``UNKNOWN``).
+
+        Snapshot the keys before iterating because the loop mutates
+        the shadow map on resolution. Skips envelopes that are no
+        longer retained (defensive — should not happen because
+        cancel-tentative explicitly preserves envelopes).
+
+        :param now_ms: Wall-clock anchor (epoch ms) for the
+            stale-grace comparison and ``last_retry_ts_ms`` bookkeeping;
+            callers obtain it via :meth:`_cancel_tentative_now_ms`.
+        """
+        if not self._cancel_disposition_pending:
+            return
+        stale_grace_ms = int(self._cancel_tentative_stale_grace_s * 1000)
+        for intent_key in list(self._cancel_disposition_pending):
+            meta = self._cancel_disposition_pending.get(intent_key)
+            if meta is None:
+                continue
+            if now_ms - meta.since_ts_ms >= stale_grace_ms:
+                self._handle_cancel_tentative_stale_grace_expiry(
+                    intent_key, meta, now_ms=now_ms,
+                )
+                continue
+            envelope = self._envelopes.get(intent_key)
+            # The cancel-retry loop must call ``execute_cancel_with_outcome``
+            # with a ``CancelIntent`` envelope (plugins assert on the intent
+            # type). The retained ``_envelopes[intent_key]`` slot deliberately
+            # keeps the ORIGINAL parent intent envelope so a later
+            # ALREADY_FILLED resolution can recover the parent's deterministic
+            # entry ``client_order_id`` (e.g. for
+            # :meth:`_dispatch_engine_trigger_partial_bracket`). Build a
+            # short-lived ``CancelIntent`` envelope on the fly for each
+            # retry instead of overwriting the slot; the ``intent_key`` of a
+            # parent entry equals its ``pine_id``, which is all
+            # ``CancelIntent`` needs together with the engine's symbol.
+            # The restart-replay rehydrate path
+            # (:meth:`_rehydrate_cancel_tentative_state`) follows the same
+            # contract: it only repopulates ``_cancel_disposition_pending``
+            # from leg extras and lets this rebuild produce a valid request.
+            if envelope is None or not isinstance(envelope.intent, CancelIntent):
+                cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
+                envelope = self._build_cancel_envelope(cancel)
+            meta.retry_count += 1
+            meta.last_retry_ts_ms = now_ms
+            try:
+                outcome = self._run_async(
+                    self._broker.execute_cancel_with_outcome(envelope),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except Exception as e:  # noqa: BLE001
+                _blog_warning(
+                    "cancel-tentative retry for %r raised %s; treating as UNKNOWN",
+                    intent_key, e,
+                )
+                meta.last_retry_outcome = CancelDispositionOutcome.UNKNOWN
+                continue
+            meta.last_retry_outcome = outcome
+            if outcome is CancelDispositionOutcome.UNKNOWN:
+                continue
+            self._clear_intent_cancel_disposition_pending(
+                intent_key,
+                outcome=outcome,
+                via='reconcile_retry',
+                now_ms=now_ms,
+            )
+
+    def _handle_cancel_tentative_stale_grace_expiry(
+            self,
+            intent_key: str,
+            meta: '_CancelTentativeMeta',
+            *,
+            now_ms: int,
+    ) -> None:
+        """Promote a stale cancel-tentative entry to ``DEGRADED_HALT``.
+
+        Called by :meth:`_drive_cancel_tentative` when ``now_ms -
+        since_ts_ms`` crosses the stale-grace window. Emits the
+        degraded event, drops the shadow map entry, and records a
+        :class:`BrokerManualInterventionError`-equivalent halt — the
+        partial brackets cannot be safely re-armed against a parent
+        whose live/dead status the engine cannot determine.
+        """
+        self._cancel_disposition_pending.pop(intent_key, None)
+        stale_grace_ms = int(self._cancel_tentative_stale_grace_s * 1000)
+        self._emit_broker_event(PartialBracketCancelTentativeDegradedEvent(
+            intent_key=intent_key,
+            symbol=self._symbol,
+            since_ts_ms=meta.since_ts_ms,
+            stale_grace_ms=stale_grace_ms,
+        ))
+        halt = BrokerManualInterventionError(
+            reason='partial_bracket_cancel_disposition_unresolved',
+            intent_key=intent_key,
+            context={
+                'since_ts_ms': meta.since_ts_ms,
+                'now_ms': now_ms,
+                'stale_grace_ms': stale_grace_ms,
+                'retry_count': meta.retry_count,
+                'last_retry_outcome': (
+                    meta.last_retry_outcome.value
+                    if meta.last_retry_outcome is not None
+                    else None
+                ),
+            },
+        )
+        self._record_halt(halt)
+
+    def _cancel_residual_after_partial_resolution(
+            self,
+            intent_key: str,
+    ) -> None:
+        """Best-effort cancel of the residual broker order after a
+        ``partial`` event resolved cancel-tentative as ``ALREADY_FILLED``.
+
+        The script issued a ``CancelIntent`` whose initial dispatch
+        timed out, so the parent entered cancel-tentative. The
+        subsequent ``partial`` event proves at least some of the entry
+        landed (legs are now armed against the partial fill), but the
+        broker still holds the unfilled residual qty live. The script
+        will not reissue a fresh cancel — from its view the original
+        cancel already left — so without this attempt the residual
+        could fill later and grow the position past the just-armed
+        leg protection.
+
+        One-shot semantics: we deliberately do NOT re-enter
+        cancel-tentative on timeout. Re-marking would flip the legs
+        we just armed back to ``LEG_STATE_CANCEL_TENTATIVE`` (via
+        :meth:`_mark_intent_cancel_disposition_pending`), undoing the
+        protection. If the broker times out, log a warning so an
+        operator can intervene; the next bar's ``reconcile`` will not
+        retry (no cancel-tentative state to drive), but the
+        deterministic ``client_order_id`` makes the call idempotent if
+        the strategy ever reuses the same parent ``pine_id`` and the
+        broker still honors the cancel.
+
+        :param intent_key: Parent ``EntryIntent.intent_key`` whose
+            residual order remains live in :attr:`_order_mapping` and
+            now needs an explicit cancel.
+        """
+        if intent_key not in self._order_mapping:
+            # Mapping already cleaned by a concurrent path (e.g. the
+            # broker pushed ``cancelled`` for the residual between the
+            # partial-event resolution and this helper).
+            return
+        cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
+        envelope = self._build_cancel_envelope(cancel)
+        try:
+            self._run_async(self._broker.execute_cancel(envelope))
+        except OrderDispositionUnknownError as e:
+            _blog_warning(
+                "residual cancel for %r after partial-event resolution "
+                "timed out (coid=%s); broker may still hold the unfilled "
+                "qty live — operator intervention may be required if the "
+                "residual fills against the partial position's leg "
+                "protection: %s",
+                intent_key, e.client_order_id, e,
+            )
+            return
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
+        except Exception as e:  # noqa: BLE001
+            _blog_warning(
+                "residual cancel for %r after partial-event resolution "
+                "raised %s; leaving mapping in place",
+                intent_key, e,
+            )
+            return
+        # Successful cancel — drop the order mapping so the next
+        # diff does not adopt the stale residual order id. The
+        # envelope / persisted anchor stay in place: the parent
+        # entry is still partially filled (open position), and a
+        # future ``strategy.exit`` attaching a fresh partial bracket
+        # on the same ``from_entry`` needs the envelope/anchor to
+        # rebuild ``parent_entry_dispatch_ref`` via the restart-path
+        # fallback in :meth:`_dispatch_engine_trigger_partial_bracket`.
+        # Calling :meth:`_drop_envelope` here would wipe both
+        # :attr:`_envelopes` AND :attr:`_persisted_envelope_anchors`,
+        # so the dispatch would later refuse with "no parent envelope
+        # tracked" and the new bracket would not arm. The envelope
+        # is retired via :meth:`_cleanup_closed_position` when the
+        # parent finally closes, matching the normal post-fill
+        # lifecycle.
+        self._order_mapping.pop(intent_key, None)
+
     def _on_partial_bracket_leg_state_change(
             self,
             leg: PartialBracketLeg,
@@ -4425,6 +5253,33 @@ class OrderSyncEngine:
                     # :meth:`_cleanup_position_tracking` drops the
                     # entry's bracket intents at close-fill time.
                     continue
+                if (isinstance(old, ExitIntent)
+                        and old.is_partial_qty_bracket
+                        and old.from_entry is not None
+                        and old.from_entry in self._cancel_disposition_pending):
+                    # Child engine-trigger partial-bracket ``ExitIntent``
+                    # whose parent is cancel-tentative. Both
+                    # :meth:`_mark_intent_cancel_disposition_pending` (parent
+                    # tentative entry) and the late-fill / cancel-confirmed
+                    # routing flip the parent's child legs to
+                    # ``LEG_STATE_CANCEL_TENTATIVE``, which is NOT in
+                    # :data:`LEG_STATE_ACTIVE`. The engine-internal cancel
+                    # shortcut in :meth:`_dispatch_cancel_strict` keys off
+                    # ``has_active_legs_for_intent`` and would therefore miss
+                    # those rows and fall through to ``execute_cancel`` on a
+                    # broker order that was never submitted. Defer the child
+                    # cancel until the parent's disposition resolves —
+                    # :meth:`_clear_intent_cancel_disposition_pending`
+                    # already retires every child partial-exit slot under
+                    # the resolved parent (CONFIRMED → child dropped;
+                    # ALREADY_FILLED → legs restored alongside the parent).
+                    _blog_warning(
+                        "child partial-bracket exit %r cancel deferred — "
+                        "parent %r is cancel-tentative; next reconcile "
+                        "will resolve the parent and retire the child",
+                        key, old.from_entry,
+                    )
+                    continue
                 # Cross-key native-to-engine partial conversion: the script
                 # removed a native whole-row exit AND added a partial-qty
                 # bracket on the SAME ``from_entry`` under a DIFFERENT
@@ -4487,15 +5342,78 @@ class OrderSyncEngine:
 
         for key, intent in new_map.items():
             if key not in self._active_intents:
-                if key in self._order_mapping:
+                # Refuse-and-defer guard for cancel-tentative parents.
+                # The shadow map is keyed by the parent
+                # ``EntryIntent.intent_key``; an ``EntryIntent`` reissue
+                # matches by ``key``, an ``ExitIntent`` on the same
+                # parent matches by ``intent.from_entry``, and a
+                # ``CloseIntent`` shares ``intent_key == pine_id`` with
+                # the parent ``EntryIntent`` so it matches by ``key``.
+                # While the disposition is unresolved we MUST NOT
+                # dispatch a fresh intent (a parallel broker state would
+                # double-life the parent) and MUST NOT adopt the
+                # retained mapping (it belongs to the prior dispatch
+                # under cancel-retry). The ``reconcile()`` cancel-retry-
+                # loop will resolve the disposition within stale-grace;
+                # until then the script's reissue defers and the audit
+                # event records each skip.
+                tentative_parent_key: str | None = None
+                if isinstance(intent, (EntryIntent, CloseIntent)):
+                    if key in self._cancel_disposition_pending:
+                        tentative_parent_key = key
+                elif (isinstance(intent, ExitIntent)
+                        and intent.from_entry is not None
+                        and intent.from_entry
+                        in self._cancel_disposition_pending):
+                    tentative_parent_key = intent.from_entry
+                if tentative_parent_key is not None:
+                    meta = self._cancel_disposition_pending[tentative_parent_key]
+                    _blog_warning(
+                        "intent %r deferred — prior cancel disposition on "
+                        "parent %r is unresolved (since_ts_ms=%s); next "
+                        "reconcile will attempt to resolve",
+                        key, tentative_parent_key, meta.since_ts_ms,
+                    )
+                    self._emit_broker_event(
+                        EntryDeferredCancelDispositionPendingEvent(
+                            intent_key=key,
+                            pine_id=intent.pine_id,
+                            symbol=self._symbol,
+                            since_ts_ms=meta.since_ts_ms,
+                        ),
+                    )
+                    continue
+                if key in self._order_mapping and (
+                        not isinstance(intent, CloseIntent)
+                        or key in self._recovered_close_anchor_keys):
                     # Cross-restart adoption: the persisted state recovered an
                     # exchange-side order for this intent (via
                     # _verify_pending_dispatches). Re-dispatching here would
                     # duplicate the order — instead, adopt the existing
                     # mapping and pin the envelope from the persisted anchor
                     # so subsequent modifies emit the same client_order_id.
+                    #
+                    # ``CloseIntent`` is excluded by default: its
+                    # ``intent_key`` equals the parent's ``pine_id``, so a
+                    # stale parent-entry mapping retained after an
+                    # ``ALREADY_FILLED`` cancel-tentative resolution (see
+                    # :meth:`_clear_intent_cancel_disposition_pending`)
+                    # collides with the close's key. Adoption would silently
+                    # pin the close to the filled parent's mapping without
+                    # dispatching the market close, leaving the position open
+                    # while the script believes it asked to flatten. The
+                    # exception is :attr:`_recovered_close_anchor_keys`: when
+                    # the mapping was seeded from a parked
+                    # ``execute_close`` (:meth:`_verify_pending_dispatches`
+                    # observed a :data:`KIND_CLOSE` COID), the mapping IS
+                    # the close's broker order — adopting prevents the
+                    # script's re-emitted ``CloseIntent`` from emitting a
+                    # second market close that races (or doubles) the
+                    # recovered one.
                     self._build_envelope(intent)
                     self._active_intents[key] = intent
+                    if isinstance(intent, CloseIntent):
+                        self._recovered_close_anchor_keys.discard(key)
                 elif (isinstance(intent, ExitIntent)
                         and intent.is_partial_qty_bracket
                         and self._partial_qty_bracket_exit_mode
@@ -4971,6 +5889,39 @@ class OrderSyncEngine:
                     # the active intent untouched; once the close FILL
                     # settles, :meth:`_cleanup_position_tracking` removes
                     # this slot and the next bar starts clean.
+                    continue
+                if (isinstance(intent, ExitIntent)
+                        and intent.from_entry is not None
+                        and intent.from_entry
+                        in self._cancel_disposition_pending):
+                    # Parent is mid cancel-tentative: its engine-trigger
+                    # partial legs were moved to ``LEG_STATE_CANCEL_TENTATIVE``
+                    # by :meth:`_dispatch_cancel`, so
+                    # :meth:`SoftwarePartialBracketEngine.has_active_legs_for_intent`
+                    # returns ``False`` and :meth:`_dispatch_modify`'s
+                    # engine-internal branch misses. A re-emitted same-key
+                    # bracket with retuned parameters would then fall through
+                    # to broker ``modify_exit`` for a bracket that was never
+                    # submitted (engine-trigger legs are engine-internal —
+                    # the broker has no order to amend). Defer the modify
+                    # until the cancel disposition resolves; the next sync
+                    # re-diffs from a coherent state (legs re-armed on
+                    # ``ALREADY_FILLED``, or slot dropped on confirm-cancel).
+                    meta = self._cancel_disposition_pending[intent.from_entry]
+                    _blog_warning(
+                        "intent %r modify deferred — parent %r is mid "
+                        "cancel-tentative (since_ts_ms=%s); next reconcile "
+                        "will attempt to resolve",
+                        key, intent.from_entry, meta.since_ts_ms,
+                    )
+                    self._emit_broker_event(
+                        EntryDeferredCancelDispositionPendingEvent(
+                            intent_key=key,
+                            pine_id=intent.pine_id,
+                            symbol=self._symbol,
+                            since_ts_ms=meta.since_ts_ms,
+                        ),
+                    )
                     continue
                 if (isinstance(intent, CloseIntent)
                         and (intent.pine_id
@@ -8080,6 +9031,27 @@ class OrderSyncEngine:
             else:
                 # CloseIntent or mismatched kinds — cancel + re-execute.
                 self._dispatch_cancel(old)
+                # If the cancel landed in cancel-tentative (default cancel
+                # path swallowed an ``OrderDispositionUnknownError`` and
+                # :meth:`_mark_intent_cancel_disposition_pending` was set),
+                # MUST NOT dispatch the replacement in the same sync — the
+                # original parent's disposition is still ambiguous and a
+                # fresh dispatch would race the original entry on a later
+                # ALREADY_FILLED resolution. Raise the deferred-modify
+                # signal so :meth:`_diff_and_dispatch` keeps the OLD intent
+                # in ``_active_intents`` and the next sync re-diffs after
+                # the cancel-retry loop resolves the disposition.
+                if old.intent_key in self._cancel_disposition_pending:
+                    _blog_warning(
+                        "modify %s -> %s deferred — cancel of %s left "
+                        "disposition pending; the replacement will be "
+                        "dispatched after the cancel-retry loop resolves",
+                        old, new, old.intent_key,
+                    )
+                    raise _PartialBracketModifyDeferred(
+                        "cancel+re-execute modify deferred — cancel "
+                        "disposition pending"
+                    )
                 self._dispatch_new(new)
         except OrderDispositionUnknownError as e:
             _blog_warning(
@@ -8118,13 +9090,50 @@ class OrderSyncEngine:
                 "next reconcile will verify: %s",
                 old.intent_key, e.client_order_id, e,
             )
+            # Parent entry cancel with engine-trigger partial brackets:
+            # enter cancel-tentative instead of the original eager retire.
+            # The retained ``_order_mapping`` and envelope are needed by
+            # the ``reconcile()`` cancel-retry-loop to re-invoke
+            # ``execute_cancel_with_outcome``; the per-parent leg flip
+            # excludes pending legs from worst-SL contribution / arming
+            # until the disposition resolves. The diff-loop's refuse-and-
+            # defer guard sees ``_cancel_disposition_pending[intent_key]``
+            # and refuses to dispatch / adopt a fresh intent on the same
+            # parent until ``_clear_intent_cancel_disposition_pending``
+            # runs (or stale-grace promotes the parent to DEGRADED_HALT).
+            # See the cancel-tentative state design dossier.
+            if (isinstance(old, EntryIntent)
+                    and self._partial_qty_bracket_exit_mode
+                    is PartialQtyBracketExitMode.SOFTWARE_ENGINE_TRIGGER):
+                # Keep the original EntryIntent envelope in ``_envelopes``.
+                # A later ALREADY_FILLED resolution restores the parent and
+                # downstream code (e.g.
+                # :meth:`_dispatch_engine_trigger_partial_bracket`) derives
+                # the deterministic ``KIND_ENTRY`` ``client_order_id`` from
+                # ``_envelopes[from_entry]``; replacing the slot with a
+                # ``CancelIntent`` envelope at the cancel bar's
+                # ``bar_ts_ms`` / ``retry_seq=0`` would yield a different
+                # COID than the original entry dispatch and attach
+                # leg / fail-safe state to a non-existent parent reference.
+                # The retry loop builds its own ``CancelIntent`` envelope
+                # on the fly each iteration (see
+                # :meth:`_drive_cancel_tentative`), so no persistent swap
+                # is needed to satisfy the plugin contract.
+                self._mark_intent_cancel_disposition_pending(
+                    old.intent_key,
+                    reason='parent_cancel_disposition_unknown',
+                    now_ms=self._cancel_tentative_now_ms(),
+                )
+                return
+            # Non-partial-bracket cancel (CloseIntent never reaches here;
+            # whole-row ExitIntent native cancel, or any EntryIntent in
+            # modes other than SOFTWARE_ENGINE_TRIGGER): keep the
+            # original eager-retire semantics. The strict path raised
+            # before reaching its post-cancel cleanup, so mirror the
+            # mapping / envelope drop and the pending-partials cleanup
+            # here — same as before this workstream.
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
-            # Strict path raised before reaching its post-cancel cleanup,
-            # so the engine-trigger partial-bracket cleanup tied to this
-            # entry (pending legs + parked partial ``ExitIntent`` slots)
-            # was skipped. Mirror it here — see the rationale block in
-            # :meth:`_dispatch_cancel_strict`.
             self._retire_pending_partials_for_cancelled_entry(
                 old, reason='parent_cancelled_by_strategy_unknown',
             )

@@ -65,8 +65,10 @@ __all__ = [
     'LEG_STATE_CASCADED_CANCEL',
     'LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE',
     'LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL',
+    'LEG_STATE_CANCEL_TENTATIVE',
     'LEG_STATE_TERMINAL',
     'LEG_STATE_ACTIVE',
+    'LEG_STATE_LIVE',
     'EXTRAS_KEY_LEG_KIND',
     'EXTRAS_KEY_LEG_STATE',
     'EXTRAS_KEY_TRIGGER_LEVEL',
@@ -78,6 +80,7 @@ __all__ = [
     'EXTRAS_KEY_PARENT_PINE_ENTRY_ID',
     'EXTRAS_KEY_OCA_GROUP',
     'EXTRAS_KEY_OCA_TYPE',
+    'EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS',
     'create_entry_order_row',
     'record_server_ref',
     'mark_confirmed_with_fill',
@@ -265,6 +268,19 @@ LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED = 'aborted_parent_never_arrived'
 LEG_STATE_CASCADED_CANCEL = 'cascaded_cancel'
 LEG_STATE_CASCADED_CANCEL_BY_PARENT_CLOSE = 'cascaded_cancel_by_parent_close'
 LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL = 'cascaded_cancel_by_native_sl'
+# Intermediate verification state for ``pending_entry`` legs whose
+# parent ``EntryIntent`` was cancelled but the broker's disposition is
+# **unknown** (network timeout, ambiguous response). The leg is
+# neither terminal nor active: it does not contribute to the
+# ``NativeFailsafeManager`` worst-SL set, does not arm on price ticks,
+# and is excluded from the diff-loop adoption path. The sync engine's
+# ``reconcile()`` cancel-retry-loop resolves it within the stale-grace
+# window (default 10s) by re-invoking ``execute_cancel_with_outcome``;
+# the outcome flips the leg to ``aborted_parent_never_arrived`` (on
+# ``CANCEL_CONFIRMED``) or back to ``pending_entry`` / ``armed`` (on
+# ``ALREADY_FILLED``). Stale-grace expiry promotes the parent to
+# ``DEGRADED_HALT``. See the cancel-tentative state design dossier.
+LEG_STATE_CANCEL_TENTATIVE = 'cancel_tentative'
 
 # Terminal states — the row is closed (``closed_ts_ms`` is set) and
 # the engine no longer owns it. Used by both
@@ -289,6 +305,19 @@ LEG_STATE_ACTIVE: frozenset[str] = frozenset({
     LEG_STATE_TRIGGERING,
     LEG_STATE_TRIGGERED_FAILED,
     LEG_STATE_TRIGGERED_UNKNOWN,
+})
+
+# Live states — every non-terminal leg state. Superset of
+# :data:`LEG_STATE_ACTIVE` that additionally includes
+# :data:`LEG_STATE_CANCEL_TENTATIVE`: a tentative leg's row is still
+# open (``closed_ts_ms IS NULL``) and must survive restart replay,
+# but the engine does NOT own its next transition — the sync engine's
+# cancel-retry-loop drives it via ``execute_cancel_with_outcome``.
+# Used by :func:`iter_active_engine_trigger_partial_legs` to include
+# tentative rows in restart rehydration, and by the leg-state update
+# validator to permit transitions into ``cancel_tentative``.
+LEG_STATE_LIVE: frozenset[str] = LEG_STATE_ACTIVE | frozenset({
+    LEG_STATE_CANCEL_TENTATIVE,
 })
 
 # Canonical ``extras`` keys for an engine-trigger partial bracket leg
@@ -316,6 +345,14 @@ EXTRAS_KEY_INTENT_PARTIAL_QTY = 'intent_partial_qty'
 EXTRAS_KEY_PARENT_PINE_ENTRY_ID = 'parent_pine_entry_id'
 EXTRAS_KEY_OCA_GROUP = 'oca_group'
 EXTRAS_KEY_OCA_TYPE = 'oca_type'
+# Wall-clock timestamp (ms) marking when this leg entered the
+# ``cancel_tentative`` state. Persisted on the leg row so that a
+# restart can rehydrate the sync engine's cancel-disposition shadow
+# map without losing the stale-grace deadline. Cleared the moment
+# the leg leaves ``cancel_tentative`` (either back to
+# ``pending_entry`` / ``armed`` on restore, or forward to
+# ``aborted_parent_never_arrived`` on confirmed cancel).
+EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS = 'cancel_tentative_since_ts_ms'
 
 
 # === Entry order row lifecycle =============================================
@@ -1248,10 +1285,10 @@ def update_engine_trigger_partial_leg_state(
     :raises ValueError: When ``new_leg_state`` is not one of the
         canonical :data:`LEG_STATE_*` values.
     """
-    if new_leg_state not in (LEG_STATE_ACTIVE | LEG_STATE_TERMINAL):
+    if new_leg_state not in (LEG_STATE_LIVE | LEG_STATE_TERMINAL):
         raise ValueError(
             f"update_engine_trigger_partial_leg_state: new_leg_state must be "
-            f"one of {sorted(LEG_STATE_ACTIVE | LEG_STATE_TERMINAL)}, "
+            f"one of {sorted(LEG_STATE_LIVE | LEG_STATE_TERMINAL)}, "
             f"got {new_leg_state!r}"
         )
     existing = store.get_order(coid)
@@ -1285,9 +1322,11 @@ def iter_active_engine_trigger_partial_legs(
     parent. Returns rows whose ``orders.state`` is
     :data:`STATE_PARTIAL_BRACKET_LEG`, are not closed
     (``closed_ts_ms IS NULL``), and whose
-    :data:`EXTRAS_KEY_LEG_STATE` is one of :data:`LEG_STATE_ACTIVE`
+    :data:`EXTRAS_KEY_LEG_STATE` is one of :data:`LEG_STATE_LIVE`
     (terminal rows are filtered out even when ``close_order`` has
-    not yet flipped ``closed_ts_ms``).
+    not yet flipped ``closed_ts_ms``). :data:`LEG_STATE_LIVE` includes
+    both engine-owned active states and the cancel-tentative
+    verification state.
 
     :param store: The active run context.
     :param symbol: Optional symbol filter — passed straight through
@@ -1300,6 +1339,6 @@ def iter_active_engine_trigger_partial_legs(
         if row.state != STATE_PARTIAL_BRACKET_LEG:
             continue
         leg_state = (row.extras or {}).get(EXTRAS_KEY_LEG_STATE)
-        if leg_state not in LEG_STATE_ACTIVE:
+        if leg_state not in LEG_STATE_LIVE:
             continue
         yield row

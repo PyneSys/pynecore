@@ -25,8 +25,13 @@ from pynecore.core.broker.exceptions import (
     BrokerError,
     ExchangeCapabilityError,
     ExchangeConnectionError,
+    OrderDispositionUnknownError,
 )
-from pynecore.core.broker.models import CancelIntent, DispatchEnvelope
+from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
+    CancelIntent,
+    DispatchEnvelope,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import RunContext
@@ -223,6 +228,69 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         audit and retry correlation — the actual exchange call typically
         references the existing order by its exchange-side id.
         """
+
+    async def execute_cancel_with_outcome(
+            self, envelope: 'DispatchEnvelope',
+    ) -> CancelDispositionOutcome:
+        """
+        Cancel pending order(s) and return a normalized disposition outcome.
+
+        Used by the sync engine's cancel-tentative state machine to drive
+        ``reconcile()``'s idempotent cancel-retry loop forward without
+        making broker-specific assumptions (e.g., what HTTP 404 means).
+        Each plugin override classifies its exchange-side responses into
+        the five :class:`CancelDispositionOutcome` categories.
+
+        The default implementation maps the existing :meth:`execute_cancel`
+        contract conservatively to
+        :attr:`CancelDispositionOutcome.UNKNOWN`:
+
+        - ``execute_cancel`` returns ``True`` →
+          :attr:`CancelDispositionOutcome.UNKNOWN`
+        - ``execute_cancel`` returns ``False`` →
+          :attr:`CancelDispositionOutcome.UNKNOWN`
+        - ``execute_cancel`` raises
+          :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError` →
+          :attr:`CancelDispositionOutcome.UNKNOWN`
+        - Any other exception propagates.
+
+        Both boolean outcomes collapse to ``UNKNOWN`` because the bool-only
+        :meth:`execute_cancel` contract cannot disambiguate the four terminal
+        cancel dispositions safely:
+
+        - ``True`` can mean a confirmed cancel OR a benign no-op (no live row
+          matched: the parent may have already filled, leaving an open
+          position the engine must keep tracking). Mapping ``True`` to
+          :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED` would let the
+          sync engine abort the partial-bracket legs of a freshly filled
+          parent — exactly the opposite of the intended safety behaviour.
+        - ``False`` means *"cancel did not land"* (still pending), the
+          opposite of the ``STILL_OPEN`` enum semantic, which the sync
+          engine treats like a confirmed cancel (legs aborted, mapping
+          dropped).
+
+        ``UNKNOWN`` keeps the cancel-tentative armed; the engine retries on
+        the next ``reconcile()`` (or resolves via a broker-pushed FILL /
+        CANCEL event in the meantime), so progress still happens.
+
+        ``CANCEL_CONFIRMED``, ``ALREADY_FILLED``, ``TOO_LATE_TO_CANCEL`` and
+        ``STILL_OPEN`` outcomes are reachable ONLY via plugin override — the
+        default cannot disambiguate them from the bool-only contract.
+        Plugins that can read the exchange's post-cancel disposition
+        (activity history, position diff) SHOULD override and emit the more
+        precise outcome.
+
+        :param envelope: Dispatch envelope around the
+            :class:`CancelIntent`; ``envelope.intent`` is the cancel
+            request, ``envelope.client_order_id(KIND_CANCEL)`` is the
+            audit-correlation id.
+        :return: Normalized cancel disposition outcome.
+        """
+        try:
+            await self.execute_cancel(envelope)
+        except OrderDispositionUnknownError:
+            return CancelDispositionOutcome.UNKNOWN
+        return CancelDispositionOutcome.UNKNOWN
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     async def execute_cancel_all(self, symbol: str | None = None) -> int:
