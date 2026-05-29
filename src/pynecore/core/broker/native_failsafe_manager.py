@@ -163,8 +163,42 @@ class NativeStopState:
     pending_trail_change_ts_ms: float | None = None
     pending_put: bool = False
     pending_retry: bool = False
+    # SL level the broker is still expected to legitimately carry while a
+    # freshly recomputed PUT is in flight and unconfirmed. ``recompute_worst_sl``
+    # (and the coalesced :meth:`flush_coalesced_trails` path) runs on the main
+    # thread and captures the OLD broker level here when a new un-dispatched
+    # batch begins (``_pending`` empty). A reconcile observation captured between
+    # syncs can still report this old level whether it was sampled BEFORE the
+    # queued PUT dispatches (snapshot still in ``_pending``) or AFTER dispatch but
+    # before the confirming poll (``mark_dispatch_in_flight`` /
+    # ``record_put_success`` already popped ``_pending``).
+    # :meth:`on_native_bracket_observed` exempts only that exact stale level — an
+    # observation diverging from BOTH the new desired and this pre-PUT level is an
+    # operator's manual broker-side edit and must flip ownership to UNKNOWN, not
+    # be silently overwritten by the queued PUT.
+    #
+    # ``None`` is a LEGITIMATE pre-PUT value (the very first PUT arms a stop where
+    # the broker carried no stop at all), so the value alone cannot signal whether
+    # an exemption is live. ``pre_put_active`` is the dedicated lifetime flag: set
+    # ``True`` the moment a baseline is captured (in either dispatch path) and
+    # cleared the moment a matching confirmation lands. The exemption gates on the
+    # flag, then matches the stored level — so a stale ``stop_level=None`` pre-PUT
+    # observation during a first-arm in-flight window is exempt instead of being
+    # misread as an external edit that strands the parent.
+    pre_put_sl_level: float | None = None
+    pre_put_active: bool = False
     # Empirical mintick for the symbol — needed by the trail step gate.
     mintick: float = 0.0
+    # ``minmove`` / ``pricescale`` reconstruct the mintick grid with the same
+    # integer math as Pine ``math.round_to_mintick`` (mintick == minmove /
+    # pricescale), so engine-computed worst-SL floats are snapped to the exact
+    # tick grid the broker stores its stop on before they are compared in
+    # :meth:`on_native_bracket_observed`. ``minmove`` is not always integral
+    # (e.g. mintick 0.025 yields minmove 2.5, pricescale 100). Both default to
+    # the "grid unknown" sentinel (``0``); :meth:`_round_to_tick` is a no-op
+    # until the engine passes real symbol values via :meth:`register_parent`.
+    minmove: float = 0.0
+    pricescale: int = 0
     # Stale-window override (None = use manager default).
     stale_window_ms: float | None = None
     # SL leg-kind set tracked for `degrading → healthy` recovery telemetry.
@@ -226,6 +260,8 @@ class NativeFailsafeManager:
             symbol: str,
             parent_side: str,
             mintick: float,
+            minmove: float = 0.0,
+            pricescale: int = 0,
             initial_profit_level: float | None = None,
             initial_trailing_stop: float | None = None,
             stale_window_ms: float | None = None,
@@ -264,6 +300,8 @@ class NativeFailsafeManager:
                 symbol=symbol,
                 parent_side=parent_side,
                 mintick=mintick,
+                minmove=minmove,
+                pricescale=pricescale,
                 stale_window_ms=stale_window_ms,
             )
             if pending_confirmation:
@@ -272,8 +310,11 @@ class NativeFailsafeManager:
             self._states[parent_entry_dispatch_ref] = state
         # Always refresh the coexisting desired fields so the next PUT
         # carries the full picture even if the plugin re-attached the TP.
-        state.desired_profit_level = initial_profit_level
-        state.desired_trailing_stop = initial_trailing_stop
+        # Snap to the tick grid so a later broker observation (also snapped in
+        # :meth:`on_native_bracket_observed`) confirms by exact compare rather
+        # than drifting by a sub-tick fraction.
+        state.desired_profit_level = self._round_to_tick(initial_profit_level, state)
+        state.desired_trailing_stop = self._round_to_tick(initial_trailing_stop, state)
         return state
 
     def unregister_parent(self, parent_entry_dispatch_ref: str) -> None:
@@ -339,6 +380,15 @@ class NativeFailsafeManager:
         else:
             new_desired = max(levels)
 
+        # Snap the engine-computed worst-SL to the symbol's tick grid before it
+        # becomes the desired level. The broker stores its stop on that grid,
+        # so an unrounded float would make every confirming observation
+        # mismatch by a sub-tick and falsely flip ownership / health. Snapping
+        # here also keeps the derived ``pre_put_sl_level`` /
+        # ``last_trail_dispatched_level`` (both sourced from ``desired_level``)
+        # on the grid for free.
+        new_desired = self._round_to_tick(new_desired, state)
+
         if self._levels_equal(new_desired, state.desired_level):
             return None
 
@@ -360,6 +410,23 @@ class NativeFailsafeManager:
             state.pending_trail_change_ts_ms = now_ms
             return None
 
+        # Capture the level the broker still carries before this PUT lands.
+        # Only at the start of a fresh batch — when no snapshot is queued for
+        # this ref AND no pre-PUT exemption is already live. ``_pending`` alone
+        # is not enough: :meth:`mark_dispatch_in_flight` pops the queued
+        # snapshot the moment the dispatcher takes it, so a follow-up recompute
+        # arriving after dispatch but before the confirming poll would re-enter
+        # this branch with the ref absent and overwrite ``pre_put_sl_level``
+        # with the previous (still-unconfirmed) ``desired_level`` — discarding
+        # the genuine broker baseline the first capture recorded. ``pre_put_active``
+        # is ``True`` for exactly as long as the broker may still carry that
+        # original level, so gating on ``not state.pre_put_active`` preserves
+        # the captured baseline across the whole in-flight window. The
+        # generation guard in :meth:`on_native_bracket_observed` uses this to
+        # tell a legitimately stale pre-PUT observation from an external edit.
+        if parent_entry_dispatch_ref not in self._pending and not state.pre_put_active:
+            state.pre_put_sl_level = state.desired_level
+            state.pre_put_active = True
         state.desired_level = new_desired
         state.generation += 1
         state.last_desired_change_ts_ms = now_ms
@@ -420,8 +487,35 @@ class NativeFailsafeManager:
                     and state.desired_level is not None):
                 step = abs(state.desired_level - state.last_trail_dispatched_level)
                 threshold = state.mintick * self._trail_step_threshold_ticks
-                if step < threshold:
+                # Round-at-source snaps every level onto the tick grid, so a
+                # genuine N-tick step is a difference of grid points that can
+                # land a sub-ULP below ``N * mintick`` (a 0.025-grid 1-tick move
+                # computes as 0.024999999999999994). Tolerate that with the same
+                # ``self._eps`` the manager uses for level equality, else a
+                # legitimate 1-tick trail tightening is dropped and the broker
+                # stop stays a tick too loose on a safety-critical stop.
+                if step < threshold - self._eps:
                     continue
+            # Capture the level the broker still carries before this coalesced
+            # PUT lands — the snapshot is built fresh from an empty ``_pending``
+            # (guard above), so this is a batch start and the broker baseline is
+            # the previously dispatched trail level. ``flush_coalesced_trails``
+            # clears ``pending_trail_change_ts_ms`` below, so the trail-coalesce
+            # exemption no longer covers a stale post-dispatch poll;
+            # ``pre_put_sl_level`` / ``pre_put_active`` carry that exemption
+            # instead, exactly as the immediate-recompute path does. Gate on
+            # ``not state.pre_put_active`` for the same reason
+            # :meth:`recompute_worst_sl` does: ``mark_dispatch_in_flight`` pops
+            # ``_pending`` the moment the dispatcher takes the earlier PUT, so a
+            # follow-up trail change can coalesce and reach this flush while the
+            # first PUT is still unconfirmed. Overwriting the baseline then would
+            # discard the genuine broker level the first capture recorded, and a
+            # stale observation of that original stop would match neither the new
+            # desired nor the clobbered baseline — flipping ownership to UNKNOWN
+            # despite no manual edit.
+            if not state.pre_put_active:
+                state.pre_put_sl_level = state.last_trail_dispatched_level
+                state.pre_put_active = True
             state.generation += 1
             state.immediate_attempts_remaining = self._put_max_attempts
             snapshot = self._build_snapshot(state)
@@ -665,6 +759,14 @@ class NativeFailsafeManager:
         state = self._states.get(parent_entry_dispatch_ref)
         if state is None:
             return
+        # Snap observed broker levels onto the tick grid the desired snapshot
+        # already lives on, so confirmation / external-edit detection compares
+        # like-for-like. The broker reports its stored, tick-aligned levels,
+        # but float round-tripping (JSON, unit conversion) can still perturb
+        # them by a sub-tick — without this an exact match would never land.
+        stop_level = self._round_to_tick(stop_level, state)
+        profit_level = self._round_to_tick(profit_level, state)
+        trailing_stop = self._round_to_tick(trailing_stop, state)
         state.actual_level = stop_level
         state.actual_profit_level = profit_level
         state.actual_trailing_stop = trailing_stop
@@ -688,6 +790,10 @@ class NativeFailsafeManager:
 
         if match:
             state.last_confirm_ts_ms = now_ms
+            # The broker now carries the desired level — the pre-PUT baseline
+            # is consumed and must not exempt a later mismatch.
+            state.pre_put_sl_level = None
+            state.pre_put_active = False
             if state.health is FailsafeHealth.DEGRADING:
                 # Clear the stale-window anchor: the next HEALTHY →
                 # DEGRADING cycle must re-anchor on the next first-failure.
@@ -714,6 +820,40 @@ class NativeFailsafeManager:
         # below), engine-throttled trail (covered next), or external edit
         # (owner flip).
         if state.pending_retry:
+            return
+        # A lifecycle / trail recompute may have already moved ``desired_level``
+        # and pushed a fresh PUT whose result the broker has not reflected back
+        # yet. While that PUT is unconfirmed the broker still legitimately
+        # carries the pre-PUT level, so an observation diverging from the new
+        # ``desired_level`` but equal to that pre-PUT level is stale, not an
+        # external edit — flipping ownership to UNKNOWN here would block future
+        # brackets until a manual reset. The reconcile thread can sample the
+        # broker either BEFORE the queued PUT dispatches (snapshot still in
+        # ``_pending``) OR after it dispatches but before the confirming poll
+        # arrives (``mark_dispatch_in_flight`` / ``record_put_success`` already
+        # popped ``_pending`` and cleared ``pending_put``). Both windows feed
+        # the same stale pre-PUT level, so gating on the queued snapshot's
+        # presence would leave the post-dispatch sample unprotected and strand
+        # the parent. The correct lifetime signal is ``pre_put_active``: it is
+        # set when either dispatch path (immediate recompute or coalesced trail
+        # flush) captures the broker baseline and cleared the moment a matching
+        # confirmation lands above, so it is ``True`` for exactly as long as the
+        # broker may still carry the old level. The flag — not
+        # ``pre_put_sl_level is not None`` — is the lifetime gate, because
+        # ``None`` is a legitimate pre-PUT level when the first PUT arms a stop
+        # the broker did not carry.
+        #
+        # The exemption must match the SPECIFIC level the broker still carries
+        # (``pre_put_sl_level``) and the unchanged TP / trailing (the recompute
+        # only moves the SL field). An observation diverging from BOTH the new
+        # desired and that pre-PUT level is an operator's manual broker-side
+        # edit; suppressing it here would let ``drive_native_failsafe`` dispatch
+        # the queued PUT and overwrite the manual edit instead of flipping
+        # ownership to UNKNOWN. Only the genuinely stale pre-PUT level is exempt.
+        if (state.pre_put_active
+                and self._levels_equal(stop_level, state.pre_put_sl_level)
+                and self._levels_equal(profit_level, state.desired_profit_level)
+                and self._levels_equal(trailing_stop, state.desired_trailing_stop)):
             return
         # §2.6.5 trail coalesce / step-threshold: when `recompute_worst_sl`
         # was called with ``trigger_kind='trail'`` and the dispatch was
@@ -751,6 +891,22 @@ class NativeFailsafeManager:
             return
         if state.owner is FailsafeOwner.ENGINE_FAILSAFE:
             state.owner = FailsafeOwner.UNKNOWN
+            # Ownership left the engine because the broker carries an operator's
+            # manual edit — the pre-PUT baseline is no longer meaningful. Clear
+            # the lifetime flag so a later ``reset_to_engine`` re-queue followed
+            # by an observation that happens to equal the now-stale
+            # ``pre_put_sl_level`` cannot be wrongly exempted.
+            state.pre_put_active = False
+            state.pre_put_sl_level = None
+            # Drop any snapshot a same-sync recompute queued but did not yet
+            # dispatch. The owner just flipped to UNKNOWN because the broker
+            # carries an operator's manual edit; the engine no longer owns the
+            # bracket, so it must not push the queued PUT. Leaving it in
+            # ``_pending`` would let the very next ``pending_dispatch()`` in
+            # this same ``drive_native_failsafe`` call (which does not filter
+            # by owner) realise the snapshot and overwrite the manual edit
+            # this guard exists to preserve.
+            self._pending.pop(parent_entry_dispatch_ref, None)
             self._emit(BrokerNativeFailsafeExternalEditEvent(
                 parent_entry_dispatch_ref=parent_entry_dispatch_ref,
                 symbol=state.symbol,
@@ -928,6 +1084,31 @@ class NativeFailsafeManager:
             generation=state.generation,
         )
 
+    def _round_to_tick(
+            self, level: float | None, state: NativeStopState,
+    ) -> float | None:
+        """Round a price level to the symbol's mintick grid.
+
+        Mirrors :func:`pynecore.lib.math.round_to_mintick` exactly — ties round
+        up, and the grid is reconstructed as ``int(level / mintick + 0.5) *
+        minmove / pricescale`` so awkward ticks (e.g. ``0.025`` →
+        ``minmove=2.5``, ``pricescale=100``) do not accumulate float drift. The
+        manager is symbol-agnostic — one instance serves many parents across
+        symbols — so it cannot read the process-global ``syminfo``; the grid
+        travels per state via :meth:`register_parent`.
+
+        :param level: Price level to snap, or ``None`` (passed through).
+        :param state: Per-parent state carrying the symbol's tick grid.
+        :returns: ``level`` snapped to the grid, or unchanged when the grid is
+            unknown (any factor still at the ``0`` sentinel) — which keeps
+            default-constructed / test states on their original exact levels.
+        """
+        if level is None:
+            return None
+        if state.mintick <= 0.0 or state.minmove <= 0.0 or state.pricescale <= 0:
+            return level
+        return int(level / state.mintick + 0.5) * state.minmove / state.pricescale
+
     def _levels_equal(self, a: float | None, b: float | None) -> bool:
         if a is None and b is None:
             return True
@@ -948,7 +1129,9 @@ class NativeFailsafeManager:
             return True
         step = abs(new_desired - state.last_trail_dispatched_level)
         threshold = state.mintick * self._trail_step_threshold_ticks
-        return step >= threshold
+        # See :meth:`flush_coalesced_trails`: tolerate sub-ULP float error so a
+        # genuine grid-snapped 1-tick move is not swallowed by the threshold.
+        return step >= threshold - self._eps
 
     def _transition(
             self, state: NativeStopState, new_health: FailsafeHealth, reason: str,

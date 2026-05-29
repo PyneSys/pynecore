@@ -244,6 +244,7 @@ def build_intents(
     intents: list[EntryIntent | ExitIntent | CloseIntent] = []
 
     qty_by_entry: dict[str, float] = {}
+    count_by_entry: dict[str, int] = {}
     if open_trades is not None:
         for trade in open_trades:
             entry_id = trade.entry_id
@@ -252,6 +253,7 @@ def build_intents(
             qty_by_entry[entry_id] = (
                 qty_by_entry.get(entry_id, 0.0) + abs(trade.size)
             )
+            count_by_entry[entry_id] = count_by_entry.get(entry_id, 0) + 1
 
     for order in _active(entry_orders.values()):
         intents.append(build_entry_intent(order, symbol))
@@ -264,23 +266,34 @@ def build_intents(
             intents.append(build_close_intent(order, symbol, is_close_all=False))
         else:
             from_entry = order.order_id or ""
-            # Script-intent first: the Pine declaration in
-            # ``entry_orders[from_entry]`` is the stable "what the script
-            # asked for" signal, and survives the fill (``record_fill``
-            # only touches ``open_trades``, never pops the entry Order).
-            # Falling back to ``open_trades`` would let broker fill noise
-            # (e.g. an overfill of 1.0 -> 1.2) flip the partial flag
-            # mid-lifecycle and trigger a spurious diff -> modify_exit
-            # dispatch — the flag must reflect script intent, not
-            # broker-actual state. ``open_trades`` is the fallback only
-            # when the entry Order is gone (cancelled / cleared);
-            # pyramiding+partial-bracket is blocked at the validator
-            # (``partial_qty_bracket_exit_supports_pyramiding=False``)
-            # until a per-plugin opt-in proves multi-row routing safe,
-            # so the "second strategy.entry overwrote the original"
-            # ambiguity does not arise on a supported path.
+            # ``parent_total_qty`` drives ``ExitIntent.is_partial_qty_bracket``
+            # (the partial-vs-whole-row dispatch). It is sourced by the open
+            # row count under ``from_entry``. This relies on a simulator
+            # invariant: ``build_intents`` reads ``SimPosition.open_trades``,
+            # where each Pine entry event is exactly one ``Trade`` row (the
+            # simulator has no split fills — an order fills in full when its
+            # condition is met).
+            #
+            #  * >1 row — pyramiding or repeated ``strategy.order`` under one
+            #    Pine id. ``entry_orders[from_entry]`` keeps only the LATEST
+            #    same-id row (``_add_order`` overwrites the dict slot), so the
+            #    declared size understates the parent and would misclassify a
+            #    partial exit as whole-row, mis-hedging the older legs. The
+            #    summed open qty is the only faithful total here — and it is
+            #    exactly what Pine's ``strategy.exit(qty=N, from_entry=...)``
+            #    measures N against.
+            #  * ==1 row — single-row: use the script-declared size. It is the
+            #    stable "what the script asked for" signal and survives the
+            #    fill (``record_fill`` only touches ``open_trades``, never pops
+            #    the entry Order), so a broker overfill/partial-fill cannot flip
+            #    the flag mid-lifecycle and trigger a spurious native<->partial
+            #    bracket cancel/re-arm.
+            #  * no declared entry left (cancelled / cleared) — fall back to the
+            #    actual open qty.
             declared_entry = entry_orders.get(from_entry)
-            if declared_entry is not None:
+            if count_by_entry.get(from_entry, 0) > 1:
+                parent_total_qty = qty_by_entry[from_entry]
+            elif declared_entry is not None:
                 parent_total_qty = abs(declared_entry.size)
             else:
                 parent_total_qty = qty_by_entry.get(from_entry, 0.0)

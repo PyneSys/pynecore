@@ -281,3 +281,55 @@ def __test_validate_accepts_partial_native_level__():
         reduce_only=CapabilityLevel.NATIVE,
     )
     assert validate_at_startup(reqs, caps) == []
+
+
+# === partial-qty bracket × pyramiding gate ===
+#
+# A partial-qty bracket needs the parent's TOTAL open qty to classify a
+# partial vs whole-row exit. When multiple rows share one Pine entry id
+# (pyramiding>1 or strategy.order()), a plugin that has not opted into
+# multi-row support is refused at startup. The gate keys solely on
+# ``caps.partial_qty_bracket_exit_supports_pyramiding``.
+
+def __test_validate_pyramiding_gate_rejects_partial_qty_bracket__():
+    reqs = ScriptRequirements(partial_qty_bracket_exit=True)
+    caps = ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+        partial_qty_bracket_exit_supports_pyramiding=False,
+    )
+    errors = validate_at_startup(reqs, caps, pyramiding=3)
+    assert len(errors) == 1
+    assert 'pyramiding' in errors[0]
+
+
+def __test_validate_pyramiding_gate_passes_when_plugin_opts_in__():
+    reqs = ScriptRequirements(partial_qty_bracket_exit=True)
+    caps = ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+        partial_qty_bracket_exit_supports_pyramiding=True,
+    )
+    assert validate_at_startup(reqs, caps, pyramiding=3) == []
+
+
+def __test_validate_strategy_order_gate_rejects_partial_qty_bracket__():
+    # strategy.order() is exempt from the pyramiding cap and can open
+    # multiple same-id rows even at pyramiding=1 — it trips the same gate.
+    reqs = ScriptRequirements(partial_qty_bracket_exit=True, strategy_order=True)
+    caps = ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+        partial_qty_bracket_exit_supports_pyramiding=False,
+    )
+    errors = validate_at_startup(reqs, caps, pyramiding=1)
+    assert len(errors) == 1
+    assert 'strategy.order' in errors[0]
+
+
+def __test_validate_pyramiding_one_row_partial_bracket_ok__():
+    # pyramiding=1 with no strategy.order() is single-row: always allowed,
+    # even when the plugin has not opted into multi-row support.
+    reqs = ScriptRequirements(partial_qty_bracket_exit=True)
+    caps = ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+        partial_qty_bracket_exit_supports_pyramiding=False,
+    )
+    assert validate_at_startup(reqs, caps, pyramiding=1) == []

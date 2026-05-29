@@ -443,6 +443,47 @@ def __test_external_stop_edit_flips_owner_to_unknown__():
     assert external[0].actual_level == 85.0
 
 
+def __test_second_recompute_in_flight_preserves_pre_put_baseline__():
+    """A recompute arriving after ``mark_dispatch_in_flight`` popped the
+    queued snapshot but before the confirming poll must not overwrite the
+    captured pre-PUT broker baseline. The first arm captured ``None`` (the
+    broker carried no stop yet); a stale poll still reporting ``None`` must
+    stay exempt, not flip ownership to UNKNOWN."""
+    manager, events = _make_manager()
+    _register_long(manager)
+    # First arm: broker carries no stop, so the pre-PUT baseline is None.
+    first = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.0],
+        now_ms=1000.0,
+    )
+    assert first is not None
+    state = manager.get_state(PARENT_REF)
+    assert state.pre_put_active is True
+    assert state.pre_put_sl_level is None
+    # The dispatcher takes the PUT in flight — the queued snapshot is popped.
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    # A tighter SL recompute arrives before any confirm. With the ref absent
+    # from ``_pending`` the legacy guard would overwrite the baseline with the
+    # still-unconfirmed 90.0; the ``pre_put_active`` gate must preserve None.
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[85.0],
+        now_ms=1020.0,
+    )
+    assert state.pre_put_sl_level is None
+    # A stale reconcile poll still reporting the original (absent) broker stop.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=None, profit_level=None,
+        trailing_stop=None, now_ms=1030.0,
+    )
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert not [
+        e for e in events
+        if isinstance(e, BrokerNativeFailsafeExternalEditEvent)
+    ]
+
+
 def __test_owner_unknown_blocks_engine_recompute__():
     """Once owner is `unknown`, recompute_worst_sl is a no-op."""
     manager, _ = _make_manager()
@@ -650,3 +691,257 @@ def __test_trail_move_outside_window_dispatched_on_flush__():
     released = manager.flush_coalesced_trails(now_ms=2000.0)
     assert len(released) == 1
     assert released[0].stop_level == 101.0
+
+
+def __test_second_flush_in_flight_preserves_pre_put_baseline__():
+    """A coalesced trail flush that fires while an earlier flushed PUT is
+    still unconfirmed must not overwrite the captured pre-PUT broker
+    baseline. ``mark_dispatch_in_flight`` pops the queued snapshot the
+    moment the dispatcher takes it, so a follow-up trail move can coalesce
+    and reach a second flush before the confirming poll arrives; the
+    ``pre_put_active`` gate must keep the ORIGINAL broker level so a stale
+    observation of it stays exempt instead of flipping ownership."""
+    manager, events = _make_manager(
+        trail_coalesce_window_ms=250.0, trail_step_threshold_ticks=1.0,
+    )
+    _register_long(manager)
+    # Initial trail dispatch lands and is confirmed: broker carries 100.0.
+    init = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[100.0],
+        now_ms=1000.0,
+        trigger_kind='trail',
+    )
+    assert init is not None
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=init.generation, now_ms=1020.0)
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=100.0, profit_level=None,
+        trailing_stop=None, now_ms=1030.0,
+    )
+    # First throttled trail move; flush captures the broker baseline (100.0)
+    # and dispatches 101.0. The dispatcher takes it in flight.
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[101.0],
+        now_ms=1100.0,
+        trigger_kind='trail',
+    )
+    released = manager.flush_coalesced_trails(now_ms=1400.0)
+    assert len(released) == 1
+    state = manager.get_state(PARENT_REF)
+    assert state.pre_put_active is True
+    assert state.pre_put_sl_level == 100.0
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1410.0)
+    # Second throttled trail move arrives before the 101.0 PUT confirms.
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[102.0],
+        now_ms=1500.0,
+        trigger_kind='trail',
+    )
+    # Second flush while still in flight: the legacy code overwrote the
+    # baseline with last_trail_dispatched_level (101.0); the gate keeps 100.0.
+    manager.flush_coalesced_trails(now_ms=1800.0)
+    assert state.pre_put_sl_level == 100.0
+    # A stale reconcile poll still reporting the ORIGINAL broker stop (100.0)
+    # must stay exempt — no external-edit flip.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=100.0, profit_level=None,
+        trailing_stop=None, now_ms=1850.0,
+    )
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert not [
+        e for e in events
+        if isinstance(e, BrokerNativeFailsafeExternalEditEvent)
+    ]
+
+
+# ---------------------------------------------------------------------
+# Mintick rounding (§2.6.3 / round-at-source)
+# ---------------------------------------------------------------------
+
+# 0.5 tick grid expressed as Pine ``mintick == minmove / pricescale``
+# (the provider's loop yields these for a 0.5 step).
+GRID_05 = dict(mintick=0.5, minmove=5.0, pricescale=10)
+# Awkward 0.025 tick (QM1!-style): minmove is fractional, pricescale a
+# power of ten — the integer reconstruction must stay drift-free.
+GRID_0025 = dict(mintick=0.025, minmove=2.5, pricescale=100)
+
+
+def _register_long_grid(
+        manager: NativeFailsafeManager,
+        *,
+        ref: str = PARENT_REF,
+        grid: dict[str, Any] = GRID_05,
+        **kwargs: Any,
+) -> None:
+    manager.register_parent(
+        parent_entry_dispatch_ref=ref,
+        symbol=SYMBOL,
+        parent_side='long',
+        **grid,
+        **kwargs,
+    )
+
+
+def __test_recompute_snaps_worst_sl_to_mintick_grid__():
+    """Off-grid worst-SL is snapped to the symbol's tick grid before it
+    becomes the desired level (round-at-source, ties up)."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager)
+    # 90.24 -> 90.0 (closer to 90.0); 90.25 is a tie that rounds up to 90.5.
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.24],
+        now_ms=1000.0,
+    )
+    assert snap is not None
+    assert snap.stop_level == 90.0
+    assert manager.get_state(PARENT_REF).desired_level == 90.0
+
+
+def __test_recompute_tie_rounds_up__():
+    """§ Pine round_to_mintick semantics: an exact half-tick rounds up."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.25],
+        now_ms=1000.0,
+    )
+    assert snap is not None
+    assert snap.stop_level == 90.5
+
+
+def __test_awkward_tick_rounds_without_float_drift__():
+    """A fractional ``minmove`` (0.025 tick) must land exactly on the grid,
+    not a sub-tick approximation — the integer reconstruction guarantees it."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager, grid=GRID_0025)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[10.037],
+        now_ms=1000.0,
+    )
+    assert snap is not None
+    assert snap.stop_level == 10.025
+    # Exactly on grid: dividing by the tick yields a whole number of ticks.
+    ticks = snap.stop_level / 0.025
+    assert abs(ticks - round(ticks)) < 1e-9
+
+
+def __test_observed_subtick_perturbation_confirms_as_match__():
+    """The core live-risk fix: a broker observation perturbed by a sub-tick
+    float fraction snaps to the desired grid level and confirms — instead of
+    diverging past the 1e-9 epsilon and falsely flipping ownership to UNKNOWN."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.0],
+        now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    # Broker echoes the stored stop, but float round-tripping perturbs it by
+    # ~3e-7 — well past the exact-compare epsilon.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0000003, profit_level=None,
+        trailing_stop=None, now_ms=2000.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert state.last_confirm_ts_ms == 2000.0
+
+
+def __test_genuine_external_edit_still_flips_with_grid_active__():
+    """Rounding must not mask a real manual edit: a stop moved to a different
+    grid point still flips ownership to UNKNOWN."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.0],
+        now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=85.0, profit_level=None,
+        trailing_stop=None, now_ms=3000.0,
+    )
+    assert manager.get_state(PARENT_REF).owner is FailsafeOwner.UNKNOWN
+
+
+def __test_no_grid_leaves_levels_unrounded__():
+    """Backward compatibility: with the grid factors at their ``0`` sentinel
+    (no symbol info), levels pass through unrounded."""
+    manager, _ = _make_manager()
+    _register_long(manager)  # mintick only, no minmove / pricescale
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[90.123456],
+        now_ms=1000.0,
+    )
+    assert snap is not None
+    assert snap.stop_level == 90.123456
+
+
+def __test_one_tick_trail_move_dispatches_on_awkward_grid__():
+    """Regression: round-at-source snaps trail levels onto the grid, so a
+    genuine 1-tick move is a float difference (0.075 - 0.05 ==
+    0.024999999999999994) that lands a sub-ULP below the 1-tick threshold.
+    The immediate step-threshold compare must tolerate that, else a real trail
+    tightening is silently dropped and the broker stop stays a tick too loose."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager, grid=GRID_0025)
+    # Seed and confirm the first trail level at 0.05.
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[0.05],
+        now_ms=1000.0,
+        trigger_kind='trail',
+    )
+    assert snap is not None
+    assert snap.stop_level == 0.05
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    # A genuine 1-tick-higher move, past the coalesce window, must dispatch.
+    snap2 = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[0.075],
+        now_ms=2000.0,
+        trigger_kind='trail',
+    )
+    assert snap2 is not None
+    assert snap2.stop_level == 0.075
+
+
+def __test_one_tick_trail_move_flushed_on_awkward_grid__():
+    """Regression (coalesce-flush mirror): a 1-tick trail move throttled into
+    the coalesce window must still be released by ``flush_coalesced_trails`` —
+    its step-threshold re-check must tolerate the same sub-ULP float error."""
+    manager, _ = _make_manager()
+    _register_long_grid(manager, grid=GRID_0025)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[0.05],
+        now_ms=1000.0,
+        trigger_kind='trail',
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    # 1-tick move INSIDE the coalesce window -> throttled (no immediate dispatch).
+    throttled = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF,
+        active_sl_levels=[0.075],
+        now_ms=1100.0,
+        trigger_kind='trail',
+    )
+    assert throttled is None
+    assert manager.pending_dispatch() == []
+    # Window expires -> flush must release the 1-tick move, not swallow it.
+    released = manager.flush_coalesced_trails(now_ms=2000.0)
+    assert len(released) == 1
+    assert released[0].stop_level == 0.075

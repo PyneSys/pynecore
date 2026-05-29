@@ -18,6 +18,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.lib.strategy import (
     Order,
+    Trade,
     _order_type_normal,
     _order_type_entry,
     _order_type_close,
@@ -48,6 +49,19 @@ def _close(id_, size) -> Order:
 def _close_all(size) -> Order:
     return Order(None, size, order_type=_order_type_close,
                  exit_id="Close position order")
+
+
+def _trade(entry_id, size) -> Trade:
+    return Trade(size=size, entry_id=entry_id, entry_bar_index=0,
+                 entry_time=0, entry_price=100.0, commission=0.0)
+
+
+def _bracket_exit(from_entry, size) -> Order:
+    return _exit(from_entry, size, "TP", limit=60_000.0, stop=45_000.0)
+
+
+def _only_exit(intents) -> ExitIntent:
+    return next(i for i in intents if isinstance(i, ExitIntent))
 
 
 # === Entry / Order ===
@@ -242,3 +256,61 @@ def __test_close_intent_rejects_reduce_only_false__():
             pine_id="L", symbol=SYMBOL, side="sell", qty=1.0,
             reduce_only=False,
         )
+
+
+# === Partial-qty bracket: parent-total sourcing (pyramiding vs single-row) ===
+#
+# ``build_intents`` reads the simulator ``SimPosition.open_trades`` — one
+# ``Trade`` row per Pine entry event (no split fills). The open row count under
+# a ``from_entry`` id therefore distinguishes pyramiding/strategy.order adds
+# (>1 row → summed parent qty) from a single entry (==1 row → script-declared
+# qty, immune to broker fill noise).
+
+def __test_pyramiding_partial_bracket_uses_summed_parent_qty__():
+    # Two same-id open_trades (pyramided to 2.0); the latest declared entry row
+    # is only 1.0. A bracket exit of qty 1.0 is partial against the AGGREGATE,
+    # not the declared-latest — proving the multi-row branch wins.
+    entry = {"L": _entry("L", 1.0)}
+    ex = {"L": _bracket_exit("L", -1.0)}
+    open_trades = [_trade("L", 1.0), _trade("L", 1.0)]
+    x = _only_exit(build_intents(entry, ex, SYMBOL, open_trades))
+    assert x.is_partial_qty_bracket is True
+
+
+def __test_pyramiding_whole_row_exit_is_not_partial__():
+    # Exit qty equals the summed parent (2.0) → whole-row, not partial.
+    entry = {"L": _entry("L", 1.0)}
+    ex = {"L": _bracket_exit("L", -2.0)}
+    open_trades = [_trade("L", 1.0), _trade("L", 1.0)]
+    x = _only_exit(build_intents(entry, ex, SYMBOL, open_trades))
+    assert x.is_partial_qty_bracket is False
+
+
+def __test_single_row_overfill_stays_whole_row__():
+    # One open_trade overfilled to 1.2 vs declared 1.0. A whole-row exit of the
+    # declared 1.0 must stay whole-row (declared wins on single-row), so broker
+    # fill noise cannot flip the flag and churn the native<->partial bracket.
+    entry = {"L": _entry("L", 1.0)}
+    ex = {"L": _bracket_exit("L", -1.0)}
+    open_trades = [_trade("L", 1.2)]
+    x = _only_exit(build_intents(entry, ex, SYMBOL, open_trades))
+    assert x.is_partial_qty_bracket is False
+
+
+def __test_single_row_partial_bracket_uses_declared_qty__():
+    # Single entry of 2.0, bracket exit of 1.0 → partial against declared 2.0.
+    entry = {"L": _entry("L", 2.0)}
+    ex = {"L": _bracket_exit("L", -1.0)}
+    open_trades = [_trade("L", 2.0)]
+    x = _only_exit(build_intents(entry, ex, SYMBOL, open_trades))
+    assert x.is_partial_qty_bracket is True
+
+
+def __test_partial_flag_false_without_bracket_leg__():
+    # A bare reduce (no TP/SL/trail) under pyramiding is never a partial-qty
+    # *bracket* — the flag gates bracket dispatch, not plain partial closes.
+    entry = {"L": _entry("L", 1.0)}
+    ex = {"L": _exit("L", -1.0, "X")}
+    open_trades = [_trade("L", 1.0), _trade("L", 1.0)]
+    x = _only_exit(build_intents(entry, ex, SYMBOL, open_trades))
+    assert x.is_partial_qty_bracket is False

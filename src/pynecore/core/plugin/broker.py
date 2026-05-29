@@ -16,7 +16,7 @@ design, in particular the rationale for the high-level intent API.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 
 from pynecore.core.plugin import ConfigT
@@ -164,6 +164,30 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
     ``upsert_order`` / ``log_event`` calls without receiving the context
     as a parameter on every broker API.  ``None`` during test paths or
     when persistence is off; plugin methods should guard accordingly.
+    """
+
+    native_failsafe_observed_sink: Callable[..., None] | None = None
+    """Optional §2.6.7 broker-native fail-safe recovery feed.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` installs a closure
+    that routes one broker-observed bracket triple into the Order Sync Engine's
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.record_native_bracket_observed`
+    (it supplies the engine's bar-clock ``now_ms``, so every fail-safe timestamp
+    stays on one clock). A plugin's reconcile pass calls this once per live
+    position so a parent stuck in ``DEGRADING`` (restart-replayed, or after a
+    PUT retry whose success report could not be confirmed directly) flips back
+    to ``HEALTHY`` once the broker is observed carrying the desired worst-SL.
+    Without the feed the stale-window timer escalates ``DEGRADING -> DEGRADED``,
+    blocking new entries / partial brackets until a manual ``reset_to_engine``.
+
+    The callee is keyed by ``parent_entry_dispatch_ref`` (the entry order's
+    ``client_order_id``) and the engine no-ops for refs it does not track, so
+    the plugin may feed every live position blindly without consulting the
+    fail-safe state. ``None`` when persistence is off or the runner has not
+    wired it (state-only test paths); the plugin must guard accordingly.
+
+    Signature: ``sink(parent_entry_dispatch_ref, *, stop_level, profit_level,
+    trailing_stop)`` — pass ``None`` for fields the broker is not carrying.
     """
 
     # === High-level order intents ===

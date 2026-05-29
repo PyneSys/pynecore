@@ -283,6 +283,8 @@ class OrderSyncEngine:
             execute_timeout: float = 30.0,
             reconcile_every_n_syncs: int = 0,
             mintick: float = 0.01,
+            minmove: float = 0.0,
+            pricescale: int = 0,
             oca_partial_fill_policy: OcaPartialFillPolicy = OcaPartialFillPolicy.FILL_CANCELS,
             broker_event_sink: Callable[[BrokerEvent], None] | None = None,
             cancel_tentative_stale_grace_s: float = CANCEL_TENTATIVE_STALE_GRACE_S,
@@ -296,6 +298,13 @@ class OrderSyncEngine:
         self._timeout = execute_timeout
         self._reconcile_every = reconcile_every_n_syncs
         self._mintick = mintick
+        # Tick-grid factors for the native fail-safe rounding (mintick ==
+        # minmove / pricescale). Sentinel ``0`` means "grid unknown" — the
+        # manager then leaves levels unrounded. Forwarded to
+        # ``register_parent`` so observed broker stops snap to the same grid
+        # the engine's worst-SL was computed on.
+        self._minmove = minmove
+        self._pricescale = pricescale
         self._oca_partial_policy = oca_partial_fill_policy
         self._broker_event_sink = broker_event_sink
         self._cancel_tentative_stale_grace_s = cancel_tentative_stale_grace_s
@@ -348,6 +357,17 @@ class OrderSyncEngine:
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
         self._event_queue: queue.Queue[OrderEvent] = queue.Queue()
+        # §2.6.7 broker-native fail-safe recovery feed. The plugin's reconcile
+        # pass runs on the broker event-loop thread and enqueues observed
+        # bracket triples here; they are applied to the manager on the MAIN
+        # thread in :meth:`drive_native_failsafe` (mirroring how ``_event_queue``
+        # marshals async fills). A plain ``queue.Queue`` is the thread-safe
+        # hand-off; direct cross-thread ``on_native_bracket_observed`` calls
+        # would race the main-thread ``recompute_worst_sl`` / ``tick_stale_window``.
+        # Tuple shape: ``(ref, stop_level, profit_level, trailing_stop)``.
+        self._native_bracket_observed_queue: queue.Queue[
+            tuple[str, float | None, float | None, float | None]
+        ] = queue.Queue()
         self._exchange_position: ExchangePosition | None = None
         self._interceptors: list[Callable[[Intent], InterceptorResult]] = []
         self._sync_count = 0
@@ -2844,6 +2864,32 @@ class OrderSyncEngine:
                     "unexpected cancel for intent %s (%s)",
                     key, event,
                 )
+                # §2.6.7: retire the parent's native fail-safe state BEFORE the
+                # teardown below evicts the legs / envelope used to resolve its
+                # COID — but ONLY when the cancelled order IS the parent entry
+                # AND that entry never filled. A cancelled child exit / close
+                # carries ``from_entry`` naming a still-open parent; retiring
+                # there would RETIRE a live parent's state and silently disable
+                # its broker-native fail-safe (``recompute_worst_sl`` no-ops on
+                # RETIRED). Equally, a CANCELLED for the unfilled residual of a
+                # PARTIALLY filled entry leaves ``_active_intents[key]`` an
+                # ``EntryIntent`` while the partial position is live and its
+                # legs are armed — retiring there strands that position without
+                # the broker-native SL. Gate on the entry intent having zero
+                # filled qty (``event.order.filled_qty <= 0``), mirroring
+                # ``_abort_pending_partial_legs_for_dead_entry`` (also a no-op
+                # for already-armed partial-fill legs). ``key`` is the matched
+                # entry intent's Pine id (``intent_key`` == ``pine_id`` for an
+                # ``EntryIntent``), which is exactly what
+                # ``_retire_native_failsafe_for_entry`` resolves on — use it
+                # directly. A broker-synthesized status event may carry only the
+                # exchange order id (``pine_id`` / ``from_entry`` both ``None``),
+                # so deriving the id from the event would pass ``''`` and leave a
+                # DEGRADING / DEGRADED state parked under the COID. Idempotent —
+                # no-op when no state is registered (the never-filled cancel case).
+                if (isinstance(self._active_intents.get(key), EntryIntent)
+                        and event.order.filled_qty <= 0.0):
+                    self._retire_native_failsafe_for_entry(key)
                 self._abort_pending_partial_legs_for_dead_entry(
                     key, reason='parent_cancelled',
                 )
@@ -2870,6 +2916,24 @@ class OrderSyncEngine:
                     "order rejected for intent %s (%s)",
                     key, event,
                 )
+                # §2.6.7: mirror the 'cancelled' branch — retire the parent's
+                # native fail-safe state before the teardown evicts its COID
+                # sources, but ONLY when the rejected order IS the parent entry
+                # AND that entry never filled. A rejected child exit / close
+                # names a still-open parent via ``from_entry``; retiring there
+                # would disable a live parent's fail-safe. A REJECTED for the
+                # unfilled residual of a partially filled entry likewise leaves
+                # the partial position live with armed legs — retiring there
+                # strands it without the broker-native SL. Gate on the entry
+                # intent having zero filled qty (``event.order.filled_qty <=
+                # 0``). ``key`` is the matched entry intent's Pine id — the
+                # exact id ``_retire_native_failsafe_for_entry`` resolves on —
+                # and is used directly so a broker-synthesized status event
+                # lacking ``pine_id`` / ``from_entry`` does not pass ``''`` and
+                # strand a parked state under the COID. Idempotent.
+                if (isinstance(self._active_intents.get(key), EntryIntent)
+                        and event.order.filled_qty <= 0.0):
+                    self._retire_native_failsafe_for_entry(key)
                 self._abort_pending_partial_legs_for_dead_entry(
                     key, reason='parent_rejected',
                 )
@@ -3749,6 +3813,58 @@ class OrderSyncEngine:
             return
         self._cleanup_position_tracking(closed_entry_id)
 
+    def _retire_native_failsafe_for_entry(self, closed_entry_id: str) -> None:
+        """Retire any §2.6.7 ``NativeStopState`` parked under ``closed_entry_id``.
+
+        The manager keys state on the parent entry COID, not the Pine entry id,
+        so resolve the COID three ways (union, idempotent):
+
+        - walk the leg ledger for legs still carrying
+          ``parent_entry_dispatch_ref`` under this entry (must run before the
+          partial-bracket cascade evicts them);
+        - the live entry envelope's ``KIND_ENTRY`` COID;
+        - the restart ``_persisted_envelope_anchors`` rebuild for a parent that
+          filled in an earlier run.
+
+        The latter two cover the case where every partial leg already
+        terminated (no leg to walk) but the state is still parked — without
+        them a ``DEGRADING`` / ``DEGRADED`` state strands and
+        :meth:`NativeFailsafeManager.block_new_entry` blocks new entries on an
+        already-flat symbol. ``on_deal_id_disappeared`` is a no-op for an
+        unknown / already-retired ref, so this is safe to call from the
+        never-filled cancel / reject paths too.
+        """
+        if not closed_entry_id:
+            return
+        retired_refs: set[str] = set()
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.from_entry == closed_entry_id and leg.parent_entry_dispatch_ref:
+                retired_refs.add(leg.parent_entry_dispatch_ref)
+        parent_envelope = self._envelopes.get(closed_entry_id)
+        if parent_envelope is not None:
+            retired_refs.add(parent_envelope.client_order_id(KIND_ENTRY))
+        else:
+            # Restart path: ``_envelopes`` was repopulated only for parents
+            # Pine re-emitted this run; a parent that filled in an earlier run
+            # carries its COID-bearing state only in
+            # ``_persisted_envelope_anchors``. Mirror the anchor-rebuild
+            # pattern used by every other restart-aware COID resolver.
+            parent_anchor = self._persisted_envelope_anchors.get(closed_entry_id)
+            if parent_anchor is not None:
+                retired_refs.add(
+                    build_client_order_id(
+                        run_tag=self._run_tag,
+                        pine_id=closed_entry_id,
+                        bar_ts_ms=parent_anchor.bar_ts_ms,
+                        kind=KIND_ENTRY,
+                        retry_seq=parent_anchor.retry_seq,
+                    ),
+                )
+        for ref in retired_refs:
+            self._native_failsafe_manager.on_deal_id_disappeared(
+                ref, now_ms=float(self._current_bar_ts_ms),
+            )
+
     def _cleanup_position_tracking(
             self,
             closed_entry_id: str,
@@ -3771,50 +3887,11 @@ class OrderSyncEngine:
         :meth:`_handle_bracket_attach_after_fill_reject` — a follow-up
         invocation on the same id finds nothing to do.
         """
-        # §2.6.7 retire: capture any parent_entry_dispatch_ref still
-        # tracked under this entry id BEFORE the partial-bracket cascade
-        # evicts the legs (the manager keys on the parent COID, not on
-        # the Pine entry_id, so we have to fish the COID out of the
-        # leg ledger while it is still populated).
-        retired_refs: set[str] = set()
-        for leg in self._partial_bracket_engine.iter_legs():
-            if leg.from_entry == closed_entry_id and leg.parent_entry_dispatch_ref:
-                retired_refs.add(leg.parent_entry_dispatch_ref)
-        # Also retire by the entry envelope's COID — covers the case
-        # where every partial leg already terminated naturally (no leg
-        # to walk above) but the failsafe state is still parked under
-        # the parent's engine-side COID.
-        parent_envelope = self._envelopes.get(closed_entry_id)
-        if parent_envelope is not None:
-            retired_refs.add(parent_envelope.client_order_id(KIND_ENTRY))
-        else:
-            # Restart path: ``_envelopes`` was repopulated only for parents
-            # that Pine has re-emitted in this run, but a parent entry that
-            # filled in an earlier run carries its COID-bearing state only
-            # in ``_persisted_envelope_anchors``. If every partial leg has
-            # also terminated before the parent flattens (so the leg walk
-            # above contributes nothing), we still must retire the
-            # ``NativeStopState`` keyed on the byte-identical
-            # ``KIND_ENTRY`` COID — otherwise a DEGRADING/DEGRADED state
-            # parked by the previous run blocks new entries on a symbol
-            # whose position is already flat (see :meth:`block_new_entry`
-            # / §2.6.7). Mirror the anchor-rebuild pattern used by every
-            # other restart-aware path that resolves a parent COID.
-            parent_anchor = self._persisted_envelope_anchors.get(closed_entry_id)
-            if parent_anchor is not None:
-                retired_refs.add(
-                    build_client_order_id(
-                        run_tag=self._run_tag,
-                        pine_id=closed_entry_id,
-                        bar_ts_ms=parent_anchor.bar_ts_ms,
-                        kind=KIND_ENTRY,
-                        retry_seq=parent_anchor.retry_seq,
-                    ),
-                )
-        for ref in retired_refs:
-            self._native_failsafe_manager.on_deal_id_disappeared(
-                ref, now_ms=float(self._current_bar_ts_ms),
-            )
+        # §2.6.7 retire: drop any NativeStopState parked under this entry id
+        # BEFORE the partial-bracket cascade evicts the legs (the leg-walk
+        # branch needs them populated). Idempotent / no-op when nothing is
+        # registered, so the never-filled cancel path can call it safely.
+        self._retire_native_failsafe_for_entry(closed_entry_id)
         # Cascade-cancel any active engine-trigger partial legs under
         # this entry — the parent just flattened, so every leg's row
         # must be marked ``cascaded_cancel_by_parent_close`` and the
@@ -4091,13 +4168,22 @@ class OrderSyncEngine:
         Capital.com).
 
         The dispatcher receives one :class:`NativeBracketSnapshot` per
-        call and must report the outcome back through
-        :meth:`record_native_bracket_put_success` /
-        :meth:`record_native_bracket_put_failure`. Without a registered
-        dispatcher the §2.6 fail-safe state machine still runs (worst-SL
-        recompute, ownership transitions, event emission) but no broker
-        traffic is generated — the model used by Slice A unit tests and
-        by Slice B until the Capital.com plugin opts in.
+        call and must be *synchronous from the engine's view*: it either
+        realises the snapshot and RETURNS (success) or RAISES (failure).
+        :meth:`drive_native_failsafe` records the outcome on the
+        dispatcher's behalf — ``record_put_success`` on a normal return,
+        ``record_put_failure`` on any exception — both carrying the
+        snapshot's ``generation`` and the drive's ``now_ms``. So the
+        dispatcher must NOT call those record hooks itself (the engine is
+        the single outcome owner, which avoids a double-decrement of the
+        retry budget on the failure path). The independent
+        :meth:`record_native_bracket_observed` recovery feed is still
+        plugin-driven, from the reconcile snapshot.
+
+        Without a registered dispatcher the §2.6 fail-safe state machine
+        still runs (worst-SL recompute, ownership transitions, event
+        emission) but no broker traffic is generated — the state-only
+        model used by unit tests until the plugin opts in.
         """
         self._native_bracket_dispatcher = dispatcher
 
@@ -4140,8 +4226,8 @@ class OrderSyncEngine:
             trailing_stop: float | None,
             now_ms: float,
     ) -> None:
-        """Plugin-side hook: reconcile snapshot reports the broker-side
-        bracket levels for ``parent_entry_dispatch_ref``.
+        """Apply an observed broker-side bracket snapshot **on the main
+        thread** for ``parent_entry_dispatch_ref``.
 
         Drives the §2.6.7 ``DEGRADING → HEALTHY`` recovery transition: a
         successful PUT only clears ``pending_put`` via
@@ -4153,10 +4239,13 @@ class OrderSyncEngine:
         ``DEGRADED``, blocking new entries / brackets until a manual
         ``reset_to_engine``.
 
-        Plugins should call this once per reconcile pass for every parent
-        with an active engine-failsafe state, passing the broker's current
-        bracket triple (``stop_level``, ``profit_level``, ``trailing_stop``)
-        — pass ``None`` for fields the broker is not carrying.
+        This mutates the manager's per-parent state, so it is NOT
+        thread-safe: the reconcile pass runs on the broker event-loop
+        thread and must use :meth:`enqueue_native_bracket_observed`
+        instead, which hands the snapshot to the main thread via the
+        observed queue (drained in :meth:`drive_native_failsafe`). This
+        direct entry point is for main-thread callers and tests that
+        control ``now_ms`` explicitly.
         """
         self._native_failsafe_manager.on_native_bracket_observed(
             parent_entry_dispatch_ref,
@@ -4165,6 +4254,72 @@ class OrderSyncEngine:
             trailing_stop=trailing_stop,
             now_ms=now_ms,
         )
+
+    def enqueue_native_bracket_observed(
+            self,
+            parent_entry_dispatch_ref: str,
+            *,
+            stop_level: float | None,
+            profit_level: float | None,
+            trailing_stop: float | None,
+    ) -> None:
+        """Thread-safe recovery feed for the broker reconcile loop.
+
+        The Capital.com plugin's ``_reconcile_snapshot`` runs on the broker
+        event-loop thread and calls this (via the runner-installed
+        ``native_failsafe_observed_sink``) once per live position. The
+        snapshot is queued and applied on the MAIN thread in
+        :meth:`drive_native_failsafe` — exactly the marshaling
+        ``run_event_stream`` uses for async fills — so the manager's
+        per-parent state is only ever mutated from one thread.
+
+        No ``now_ms`` parameter: the confirmation is timestamped with the
+        bar at which it is drained (the engine's current bar clock), which
+        also keeps every fail-safe timestamp on a single clock. Snapshots
+        for refs the manager does not track are dropped at drain time.
+        """
+        self._native_bracket_observed_queue.put((
+            parent_entry_dispatch_ref, stop_level, profit_level, trailing_stop,
+        ))
+
+    def _drain_native_bracket_observed(self, *, now_ms: float) -> None:
+        """Apply queued broker-observed snapshots (main thread).
+
+        Called at the top of :meth:`drive_native_failsafe`, BEFORE
+        ``tick_stale_window``, so a confirmation that landed since the last
+        sync flips ``DEGRADING → HEALTHY`` and prevents an unnecessary
+        escalation to ``DEGRADED`` — ``on_native_bracket_observed`` recovers
+        only from ``DEGRADING``, never from ``DEGRADED``.
+
+        The reconcile poll loop runs on the broker thread at its own cadence
+        and may enqueue several observations for the same parent between two
+        main-thread drives (the bar interval easily spans multiple polls).
+        Only the LAST observation per parent describes the broker's current
+        bracket; an earlier one carrying a pre-PUT level is stale. Applying
+        them FIFO would let that stale mismatch flip
+        ``ENGINE_FAILSAFE → UNKNOWN`` while the trailing match cannot restore
+        ownership (:meth:`NativeFailsafeManager.on_native_bracket_observed`
+        recovers ``DEGRADING → HEALTHY`` but never ``UNKNOWN → ENGINE_FAILSAFE``),
+        stranding the parent until a manual reset. Coalesce per ref first and
+        apply only the newest snapshot.
+        """
+        latest: dict[str, tuple[float | None, float | None, float | None]] = {}
+        while True:
+            try:
+                ref, stop_level, profit_level, trailing_stop = (
+                    self._native_bracket_observed_queue.get_nowait()
+                )
+            except queue.Empty:
+                break
+            latest[ref] = (stop_level, profit_level, trailing_stop)
+        for ref, (stop_level, profit_level, trailing_stop) in latest.items():
+            self._native_failsafe_manager.on_native_bracket_observed(
+                ref,
+                stop_level=stop_level,
+                profit_level=profit_level,
+                trailing_stop=trailing_stop,
+                now_ms=now_ms,
+            )
 
     def _rehydrate_native_failsafe_from_replayed_legs(self) -> None:
         """Seed :class:`NativeFailsafeManager` state from replayed legs.
@@ -4282,6 +4437,8 @@ class OrderSyncEngine:
                 symbol=symbol,
                 parent_side=parent_side,
                 mintick=self._mintick,
+                minmove=self._minmove,
+                pricescale=self._pricescale,
                 pending_confirmation=ref in expects_native_sl,
                 now_ms=now_ms,
             )
@@ -4609,6 +4766,8 @@ class OrderSyncEngine:
                     symbol=leg.symbol,
                     parent_side=parent_side,
                     mintick=self._mintick,
+                    minmove=self._minmove,
+                    pricescale=self._pricescale,
                     pending_confirmation=True,
                     now_ms=float(now_ms),
                 )
@@ -4980,6 +5139,11 @@ class OrderSyncEngine:
         are also dispatched here.
         """
         manager = self._native_failsafe_manager
+        # Apply broker-observed confirmations queued from the reconcile
+        # (broker-loop) thread BEFORE ticking the stale window, so a confirm
+        # that landed since the last sync flips DEGRADING -> HEALTHY and
+        # prevents an unnecessary escalation to DEGRADED.
+        self._drain_native_bracket_observed(now_ms=now_ms)
         manager.tick_stale_window(now_ms=now_ms)
         manager.flush_coalesced_trails(now_ms)
         for snapshot in manager.pending_dispatch():
@@ -4990,7 +5154,17 @@ class OrderSyncEngine:
             )
             try:
                 self._native_bracket_dispatcher(snapshot)
-            except Exception as e:  # pragma: no cover — defensive
+            except BrokerManualInterventionError as halt:
+                # A dispatcher raising the manual-intervention signal means
+                # automated execution can no longer continue safely (e.g. the
+                # plugin cannot resolve the parent/deal mapping). Treating it
+                # as a retryable PUT failure would let the strategy keep
+                # trading on an unsafe broker state, so record the terminal
+                # halt and re-raise — the same uniform contract every other
+                # dispatch path honours (see :meth:`run_event_stream`).
+                self._record_halt(halt)
+                raise
+            except Exception as e:
                 _blog_warning(
                     "native bracket dispatcher raised for %s: %s",
                     snapshot.parent_entry_dispatch_ref, e,
@@ -4999,6 +5173,19 @@ class OrderSyncEngine:
                     snapshot.parent_entry_dispatch_ref,
                     generation=snapshot.generation,
                     reason=f'dispatcher-exception:{type(e).__name__}',
+                    now_ms=now_ms,
+                )
+            else:
+                # Normal return == the PUT (and its confirm) succeeded. The
+                # engine is the single outcome owner (see
+                # :meth:`set_native_bracket_dispatcher`): record success here
+                # so the dispatcher stays a pure PUT-or-raise actuator and the
+                # failure path cannot be double-counted. ``record_put_success``
+                # only clears ``pending_put`` — the actual level confirmation
+                # arrives later via :meth:`record_native_bracket_observed`.
+                manager.record_put_success(
+                    snapshot.parent_entry_dispatch_ref,
+                    generation=snapshot.generation,
                     now_ms=now_ms,
                 )
 
@@ -6960,6 +7147,8 @@ class OrderSyncEngine:
             symbol=symbol,
             parent_side=parent_side,
             mintick=self._mintick,
+            minmove=self._minmove,
+            pricescale=self._pricescale,
         )
 
         # The leg must stay in ``LEG_STATE_PENDING_ENTRY`` until the

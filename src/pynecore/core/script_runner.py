@@ -373,6 +373,13 @@ class ScriptRunner:
                 run_tag=run_tag,
                 event_loop=broker_event_loop,
                 mintick=float(syminfo.mintick) if syminfo.mintick else 0.01,
+                # Tick-grid factors for the native fail-safe rounding
+                # (mintick == minmove / pricescale). Only forwarded when the
+                # symbol carries a real mintick; otherwise the ``0`` sentinel
+                # keeps the manager from snapping levels to the synthetic
+                # 0.01 fallback grid above.
+                minmove=float(syminfo.minmove) if syminfo.mintick else 0.0,
+                pricescale=int(syminfo.pricescale) if syminfo.mintick else 0,
                 store_ctx=broker_store_ctx,
                 # Mirror exchange position state every bar. The exchange is
                 # the source of truth — without per-sync reconciliation, an
@@ -387,6 +394,53 @@ class ScriptRunner:
             # event logging without having the context threaded through every
             # ``execute_*`` signature.
             broker_plugin.store_ctx = broker_store_ctx
+
+            # §2.6.7 native fail-safe actuator. The engine's
+            # ``drive_native_failsafe`` (run once per ``sync``) drains the
+            # worst-SL state machine into this dispatcher; without it the
+            # fail-safe is state-only and no protective stop is ever placed
+            # at the broker — for single-row partial brackets too. The
+            # dispatcher is a pure PUT-or-raise actuator: the engine records
+            # a put-success on a normal return and a put-failure on any
+            # exception (see ``OrderSyncEngine.set_native_bracket_dispatcher``),
+            # so this closure must not touch the record_* hooks. The plugin
+            # PUT is async and must run on the broker loop, so it is marshalled
+            # through the engine's own ``_run_async`` (identical loop + timeout
+            # to every other broker call). Only wired when the plugin actually
+            # provides the actuator — other plugins simply stay state-only.
+            _failsafe_publish = getattr(
+                broker_plugin, 'publish_native_failsafe_sl', None,
+            )
+            if _failsafe_publish is not None:
+                _engine = self._order_sync_engine
+
+                def _native_failsafe_dispatcher(snapshot):
+                    _engine._run_async(_failsafe_publish(snapshot))
+
+                self._order_sync_engine.set_native_bracket_dispatcher(
+                    _native_failsafe_dispatcher,
+                )
+
+            # §2.6.7 native fail-safe recovery feed (the reverse channel of
+            # the dispatcher above). The plugin's reconcile pass observes the
+            # broker-side bracket levels per live position; this sink routes
+            # them into the engine so a parent stuck in DEGRADING — a restart
+            # replay, or a PUT retry whose success the broker could not confirm
+            # directly — flips back to HEALTHY once the desired worst-SL is
+            # observed in place. Without it the stale-window timer escalates
+            # DEGRADING -> DEGRADED in seconds and blocks new entries / brackets
+            # until a manual reset. The reconcile pass runs on the broker
+            # event-loop thread, so the sink is the engine's thread-safe
+            # ``enqueue_native_bracket_observed`` (it queues; the main thread
+            # applies it in ``drive_native_failsafe``) — calling
+            # ``record_native_bracket_observed`` directly here would race the
+            # main-thread worst-SL machinery. Installed unconditionally: the
+            # attribute defaults to ``None`` on the base, plugins opt in by
+            # calling it, and the engine drops snapshots for refs it does not
+            # track at drain time.
+            broker_plugin.native_failsafe_observed_sink = (
+                self._order_sync_engine.enqueue_native_bracket_observed
+            )
 
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo

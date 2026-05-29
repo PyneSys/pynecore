@@ -43,6 +43,7 @@ from pynecore.core.broker.models import (
     LegType,
     InterceptorResult,
 )
+from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.lib.strategy import (
     Order,
     _order_type_entry,
@@ -3008,3 +3009,595 @@ def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
         engine.sync(fresh_bar_ts)
         assert len(b.entry_calls) == 1
         assert b.entry_calls[0].bar_ts_ms == fresh_bar_ts
+
+
+# === §2.6.7 native fail-safe dispatcher drive ===
+#
+# These pin the contract that ``drive_native_failsafe`` is the SINGLE owner
+# of the PUT outcome: it records a put-success on the dispatcher's normal
+# return and a put-failure on any exception, so the plugin dispatcher stays
+# a pure PUT-or-raise actuator and the retry budget cannot be double-counted.
+
+def __test_drive_native_failsafe_dispatches_and_records_success__():
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    snap = mgr.recompute_worst_sl(
+        parent_entry_dispatch_ref=ref, active_sl_levels=[95.0, 90.0],
+        now_ms=1000.0,
+    )
+    assert snap is not None and snap.stop_level == 90.0
+    received = []
+    engine.set_native_bracket_dispatcher(received.append)
+
+    engine.drive_native_failsafe(now_ms=1000.0)
+
+    # Dispatched exactly once with the worst-SL snapshot.
+    assert len(received) == 1
+    assert received[0].stop_level == 90.0
+    assert received[0].generation == snap.generation
+    # The else-branch recorded success: snapshot dropped + pending_put cleared
+    # (NOT left in-flight, which is what a missing success-record would leave).
+    assert mgr.pending_dispatch() == []
+    assert mgr.get_state(ref).pending_put is False
+    # A second drive does not re-dispatch — nothing is pending.
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert len(received) == 1
+
+
+def __test_drive_native_failsafe_records_single_failure_per_dispatch__():
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    calls = []
+
+    def _raising_dispatcher(snapshot):
+        calls.append(snapshot)
+        raise RuntimeError("PUT failed")
+
+    engine.set_native_bracket_dispatcher(_raising_dispatcher)
+
+    # Default retry budget is 3 and exactly ONE failure is recorded per drive
+    # (the engine wrapper is the sole failure owner; the dispatcher never
+    # records), so it takes 3 drives to exhaust the budget and degrade — a
+    # double-record would degrade after 2.
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+    # Re-dispatched on each drive (the failure path re-queues the snapshot).
+    assert len(calls) == 3
+
+
+def __test_drive_native_failsafe_dispatcher_manual_intervention_halts__():
+    """A dispatcher raising ``BrokerManualInterventionError`` is a terminal
+    halt, not a retryable PUT failure: the drive must record the halt and
+    re-raise instead of degrading the budget and letting the strategy
+    continue on an unsafe broker state."""
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+
+    def _halting_dispatcher(_snapshot):
+        raise BrokerManualInterventionError(
+            "cannot resolve parent dealId", intent_key=ref,
+        )
+
+    engine.set_native_bracket_dispatcher(_halting_dispatcher)
+
+    with pytest.raises(BrokerManualInterventionError):
+        engine.drive_native_failsafe(now_ms=1000.0)
+
+    # Halt latched (so the engine stops dispatching) and the fail-safe was
+    # NOT degraded as if a retryable PUT failure had occurred.
+    assert engine.halted is True
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+
+# === §2.6.7 native fail-safe observed recovery feed ===
+#
+# STEP 4: the reconcile-driven feed that ``record_native_bracket_observed``
+# routes into. A successful PUT clears ``pending_put`` but leaves the state
+# DEGRADING; only an observed snapshot matching the desired worst-SL flips it
+# back to HEALTHY. Without this feed the stale-window timer would escalate
+# DEGRADING -> DEGRADED and block new entries / brackets until a manual reset.
+
+def __test_record_native_bracket_observed_recovers_degrading_to_healthy__():
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    # Restart-replay registers the parent DEGRADING (health/owner were not
+    # persisted, so the broker-native stop cannot be assumed in place).
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    # PUT succeeds (dispatcher returns) — clears pending_put, but the broker
+    # side is not yet *confirmed* to carry the desired stop, so health holds.
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).pending_put is False
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+
+    # Reconcile observes the broker carrying the desired worst-SL -> HEALTHY.
+    engine.record_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None,
+        now_ms=2000.0,
+    )
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+
+def __test_record_native_bracket_observed_external_edit_flips_owner_unknown__():
+    # A mismatching observation (operator edited the stop at the broker) must
+    # flip ownership to UNKNOWN — the engine must NOT silently resend its now
+    # stale desired level over a manual edit. UNKNOWN also blocks new brackets
+    # until a user reset, same as DEGRADED.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+
+    engine.record_native_bracket_observed(
+        ref, stop_level=80.0, profit_level=None, trailing_stop=None,
+        now_ms=2000.0,
+    )
+    assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
+
+
+def __test_enqueue_native_bracket_observed_recovers_on_drive__():
+    # Thread-safe production path: the reconcile (broker-loop) thread enqueues;
+    # the MAIN thread applies it inside drive_native_failsafe, so the manager
+    # state is mutated from one thread only. Nothing is applied until the next
+    # drive drains the queue.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=1000.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)  # PUT lands, still DEGRADING
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+
+    # Enqueue the observed confirm — queued, not yet applied.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+
+    # The next drive drains the queue first -> HEALTHY.
+    engine.drive_native_failsafe(now_ms=2000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+
+def __test_drive_native_failsafe_drains_observed_before_stale_window__():
+    # The queued confirm must be applied BEFORE tick_stale_window: a confirm
+    # that lands after the stale window has elapsed must still recover the
+    # parent (DEGRADING -> HEALTHY), not lose the race to a DEGRADED escalation
+    # (on_native_bracket_observed recovers only from DEGRADING).
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=1000.0,
+                        stale_window_ms=100.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    # now_ms is 1000ms past degrading_since with a 100ms stale window: drained
+    # confirm wins because it runs first.
+    engine.drive_native_failsafe(now_ms=2000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+
+def __test_drive_native_failsafe_coalesces_observed_keeps_latest__():
+    # The reconcile (broker-loop) thread can enqueue several observations for
+    # one parent between two main-thread drives (the bar interval spans many
+    # polls). The drain must coalesce per ref and apply only the LATEST: a
+    # stale pre-PUT mismatch enqueued ahead of the fresh matching snapshot must
+    # NOT flip ENGINE_FAILSAFE -> UNKNOWN (which on_native_bracket_observed
+    # cannot undo from a later match), or the parent would strand until reset.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=1000.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)  # PUT lands, still DEGRADING
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+
+    # Poll 1 still saw the pre-PUT broker level (stale mismatch); poll 2 saw
+    # the desired worst-SL. Both queued before the next drive.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=80.0, profit_level=None, trailing_stop=None)
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    engine.drive_native_failsafe(now_ms=2000.0)
+    # Latest (matching) snapshot wins: ownership stays engine, state recovers.
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+
+def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
+    # The generation guard exempts an observation that diverges from the new
+    # desired level ONLY when it equals the level the broker still legitimately
+    # carries (the pre-PUT desired). An operator's manual broker-side edit
+    # observed BEFORE a same-sync recompute queued the next PUT diverges from
+    # BOTH the new desired and the pre-PUT level — it must flip ownership to
+    # UNKNOWN, not be silently overwritten by the queued PUT.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    # First worst-SL armed at 90.0, dispatched + confirmed HEALTHY/engine-owned.
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    engine.record_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None,
+        now_ms=1000.0,
+    )
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+    # Operator manually moves the broker stop to 70.0; the reconcile poll
+    # observes it and enqueues it (broker-loop thread).
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=70.0, profit_level=None, trailing_stop=None)
+    # Before the drain, a leg-driven recompute on this same sync moves the
+    # worst-SL to 85.0 and queues a fresh PUT (generation bumped, _pending set,
+    # PUT not yet dispatched). pre_put_sl_level captures the broker's old 90.0.
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[85.0], now_ms=2000.0)
+    assert mgr.get_state(ref).pre_put_sl_level == 90.0
+
+    # drive drains the queued 70.0 observation first: it matches neither the
+    # new desired (85.0) nor the pre-PUT level (90.0) -> external edit. The
+    # owner flips to UNKNOWN AND the queued 85.0 PUT must be dropped, never
+    # dispatched — dispatching it here would overwrite the operator's manual
+    # 70.0 edit the guard exists to preserve.
+    dispatched: list[float | None] = []
+    engine.set_native_bracket_dispatcher(
+        lambda snap: dispatched.append(snap.stop_level))
+    engine.drive_native_failsafe(now_ms=2000.0)
+    assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
+    assert dispatched == []
+
+
+def __test_drive_native_failsafe_stale_pre_put_after_dispatch_keeps_engine__():
+    # The pre-PUT exemption must survive the queued snapshot being popped on
+    # dispatch. The reconcile thread can sample the broker AFTER the fresh PUT
+    # dispatched (``mark_dispatch_in_flight`` / ``record_put_success`` already
+    # cleared ``_pending`` and ``pending_put``) but BEFORE the confirming poll
+    # arrives, so the lone observation still reports the old pre-PUT SL. Gating
+    # the exemption on the queued snapshot's presence would misread that stale
+    # sample as an external edit and flip ENGINE_FAILSAFE -> UNKNOWN, stranding
+    # the parent until manual reset. ``pre_put_sl_level`` (set at recompute,
+    # cleared on confirm) is the correct lifetime signal and keeps the parent
+    # engine-owned across this window.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    engine.record_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None,
+        now_ms=1000.0,
+    )
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+    # A leg-driven recompute moves the worst-SL to 85.0; THIS drive dispatches
+    # it (so ``_pending`` is popped and ``pending_put`` is cleared by the
+    # synchronous success record). pre_put_sl_level captures the broker's 90.0.
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[85.0], now_ms=2000.0)
+    assert mgr.get_state(ref).pre_put_sl_level == 90.0
+    dispatched: list[float | None] = []
+    engine.set_native_bracket_dispatcher(
+        lambda snap: dispatched.append(snap.stop_level))
+    engine.drive_native_failsafe(now_ms=2000.0)
+    assert dispatched == [85.0]
+    assert ref not in mgr._pending
+    assert mgr.get_state(ref).pending_put is False
+
+    # A reconcile poll that ran before the 85.0 PUT landed at the broker now
+    # enqueues the stale 90.0; the confirming 85.0 poll has not arrived yet.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    dispatched.clear()
+    engine.drive_native_failsafe(now_ms=3000.0)
+    # Stale pre-PUT sample is exempt: ownership stays engine, no spurious PUT.
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert dispatched == []
+
+    # The confirming poll lands -> HEALTHY and the pre-PUT baseline is consumed.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=85.0, profit_level=None, trailing_stop=None)
+    engine.drive_native_failsafe(now_ms=4000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    assert mgr.get_state(ref).pre_put_sl_level is None
+
+    # With the baseline cleared, a genuine edit back to 90.0 is no longer
+    # exempt and correctly flips ownership to UNKNOWN.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    engine.drive_native_failsafe(now_ms=5000.0)
+    assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
+
+
+def __test_drive_native_failsafe_first_arm_none_pre_put_keeps_engine__():
+    # The pre-PUT exemption must survive the FIRST arm, where the broker
+    # legitimately carries no stop at all. ``recompute_worst_sl`` records
+    # ``pre_put_sl_level = None`` (the old desired) on the first PUT, so a stale
+    # reconcile poll that still sees ``stop_level=None`` after the PUT dispatched
+    # but before the confirming poll lands must NOT be misread as an external
+    # edit. Gating the exemption on ``pre_put_sl_level is not None`` would skip
+    # it here (the value is a legitimate ``None``) and flip ENGINE_FAILSAFE ->
+    # UNKNOWN, stranding the freshly armed parent until manual reset. The
+    # dedicated ``pre_put_active`` lifetime flag keeps the parent engine-owned.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    # First worst-SL armed at 90.0; the broker carried no stop before, so the
+    # pre-PUT baseline is None while the lifetime flag is set.
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    assert mgr.get_state(ref).pre_put_sl_level is None
+    assert mgr.get_state(ref).pre_put_active is True
+    dispatched: list[float | None] = []
+    engine.set_native_bracket_dispatcher(
+        lambda snap: dispatched.append(snap.stop_level))
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert dispatched == [90.0]
+    assert ref not in mgr._pending
+    assert mgr.get_state(ref).pending_put is False
+
+    # A reconcile poll that ran before the 90.0 PUT landed still reports no
+    # broker stop (None); the confirming poll has not arrived yet.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=None, profit_level=None, trailing_stop=None)
+    dispatched.clear()
+    engine.drive_native_failsafe(now_ms=2000.0)
+    # Stale pre-PUT None sample is exempt: ownership stays engine, no spurious
+    # PUT, baseline still live.
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert dispatched == []
+    assert mgr.get_state(ref).pre_put_active is True
+
+    # The confirming 90.0 poll lands -> HEALTHY and the baseline is consumed.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None)
+    engine.drive_native_failsafe(now_ms=3000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    assert mgr.get_state(ref).pre_put_active is False
+    assert mgr.get_state(ref).pre_put_sl_level is None
+
+
+def __test_drive_native_failsafe_coalesced_flush_records_pre_put__():
+    # The trail-coalesce flush path (``flush_coalesced_trails``) dispatches a
+    # throttled trail PUT WITHOUT going through ``recompute_worst_sl``'s pre-PUT
+    # capture. It must still record the broker baseline (the previously
+    # dispatched trail level) and arm the lifetime flag — otherwise a stale
+    # reconcile poll that still sees the old broker level after the flushed PUT
+    # returns has no exemption (the trail-coalesce exemption was cleared with
+    # ``pending_trail_change_ts_ms``) and wrongly flips ENGINE_FAILSAFE ->
+    # UNKNOWN.
+    engine, _ = _mk_engine(MockBroker())
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    dispatched: list[float | None] = []
+    engine.set_native_bracket_dispatcher(
+        lambda snap: dispatched.append(snap.stop_level))
+
+    # Lifecycle arm at 90.0, confirmed HEALTHY/engine-owned.
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    engine.record_native_bracket_observed(
+        ref, stop_level=90.0, profit_level=None, trailing_stop=None,
+        now_ms=1000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+    # First trail move to 88.0 dispatches immediately (no prior trail dispatch
+    # timestamp) and is confirmed; this seeds last_trail_dispatched_level=88.0.
+    dispatched.clear()
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[88.0], now_ms=2000.0,
+                           trigger_kind='trail')
+    engine.drive_native_failsafe(now_ms=2000.0)
+    assert dispatched == [88.0]
+    engine.record_native_bracket_observed(
+        ref, stop_level=88.0, profit_level=None, trailing_stop=None,
+        now_ms=2000.0)
+    assert mgr.get_state(ref).last_trail_dispatched_level == 88.0
+
+    # Second trail move to 86.0 within the coalesce window is throttled (no PUT).
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[86.0], now_ms=2100.0,
+                           trigger_kind='trail')
+    assert mgr.get_state(ref).pending_trail_change_ts_ms == 2100.0
+    assert ref not in mgr._pending
+
+    # After the coalesce window elapses, drive flushes the throttled 86.0 PUT.
+    # The flush must capture the broker baseline (88.0) and arm the flag.
+    dispatched.clear()
+    engine.drive_native_failsafe(now_ms=2400.0)
+    assert dispatched == [86.0]
+    assert mgr.get_state(ref).pre_put_sl_level == 88.0
+    assert mgr.get_state(ref).pre_put_active is True
+    assert mgr.get_state(ref).pending_trail_change_ts_ms is None
+
+    # A stale poll that still saw 88.0 (before the 86.0 PUT landed) is exempt:
+    # it equals the recorded pre-PUT level, so ownership stays engine.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=88.0, profit_level=None, trailing_stop=None)
+    dispatched.clear()
+    engine.drive_native_failsafe(now_ms=3000.0)
+    assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert dispatched == []
+
+    # The confirming 86.0 poll lands -> HEALTHY and the baseline is consumed.
+    engine.enqueue_native_bracket_observed(
+        ref, stop_level=86.0, profit_level=None, trailing_stop=None)
+    engine.drive_native_failsafe(now_ms=4000.0)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    assert mgr.get_state(ref).pre_put_active is False
+
+
+# === §2.6.7 native fail-safe state retirement on parent cancel/close ===
+#
+# A parent whose position vanishes (external close, cancel, reject) must have
+# its NativeStopState retired — else a DEGRADING/DEGRADED state strands and
+# block_new_entry blocks the symbol indefinitely under non-halting
+# on_unexpected_cancel policies. The WATCH-phase flat-snapshot cascade only
+# retires from_entries that still have legs in the ledger (and early-returns on
+# an empty ledger), so a state that outlived its legs needs the cancel/reject
+# event handlers to retire it via _retire_native_failsafe_for_entry.
+
+def __test_retire_native_failsafe_for_entry_drops_parked_state__():
+    # The helper resolves the parent COID via the live entry envelope — the
+    # leg-less case the WATCH cascade misses — and retires the state.
+    engine, pos = _mk_engine(MockBroker())
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    coid = engine._envelopes["L"].client_order_id('e')
+    mgr = engine._native_failsafe_manager
+    mgr.register_parent(parent_entry_dispatch_ref=coid, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=float(BAR_TS))
+    assert mgr.get_state(coid).health is FailsafeHealth.DEGRADING
+
+    engine._retire_native_failsafe_for_entry("L")
+    assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
+
+
+def __test_unexpected_cancel_event_retires_native_failsafe_state__():
+    engine, pos = _mk_engine(MockBroker())
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    coid = engine._envelopes["L"].client_order_id('e')
+    deal_id = engine._order_mapping["L"][0]
+    mgr = engine._native_failsafe_manager
+    mgr.register_parent(parent_entry_dispatch_ref=coid, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=float(BAR_TS))
+    assert mgr.get_state(coid).health is FailsafeHealth.DEGRADING
+
+    cancelled = OrderEvent(
+        order=ExchangeOrder(
+            id=deal_id, symbol=SYMBOL, side='buy',
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=None, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id="L", from_entry=None,
+    )
+    engine._route_event(cancelled)
+    assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
+
+
+def __test_unexpected_cancel_without_pine_id_retires_native_failsafe_state__():
+    # A broker-synthesized cancel status event may carry only the exchange
+    # order id (``pine_id`` and ``from_entry`` both None). The cancel is still
+    # matched to the entry intent via ``_find_key_for_order_id``, so the parent's
+    # native fail-safe state must be retired using the matched ``key`` — deriving
+    # the id from the event would pass ``''`` and leave a DEGRADING / DEGRADED
+    # state parked under the COID, blocking the symbol indefinitely.
+    engine, pos = _mk_engine(MockBroker())
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    coid = engine._envelopes["L"].client_order_id('e')
+    deal_id = engine._order_mapping["L"][0]
+    mgr = engine._native_failsafe_manager
+    mgr.register_parent(parent_entry_dispatch_ref=coid, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=float(BAR_TS))
+    assert mgr.get_state(coid).health is FailsafeHealth.DEGRADING
+
+    cancelled = OrderEvent(
+        order=ExchangeOrder(
+            id=deal_id, symbol=SYMBOL, side='buy',
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=None, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id=None, from_entry=None,
+    )
+    engine._route_event(cancelled)
+    assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
+
+
+def __test_unexpected_reject_without_pine_id_retires_native_failsafe_state__():
+    # Mirror of the cancel case for the 'rejected' branch: a broker-synthesized
+    # reject carrying only the exchange order id must still retire the matched
+    # entry's native fail-safe state via the matched ``key``.
+    engine, pos = _mk_engine(MockBroker())
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    coid = engine._envelopes["L"].client_order_id('e')
+    deal_id = engine._order_mapping["L"][0]
+    mgr = engine._native_failsafe_manager
+    mgr.register_parent(parent_entry_dispatch_ref=coid, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0,
+                        pending_confirmation=True, now_ms=float(BAR_TS))
+    assert mgr.get_state(coid).health is FailsafeHealth.DEGRADING
+
+    rejected = OrderEvent(
+        order=ExchangeOrder(
+            id=deal_id, symbol=SYMBOL, side='buy',
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=None, stop_price=None,
+            average_fill_price=None, status=OrderStatus.REJECTED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='rejected', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id=None, from_entry=None,
+    )
+    engine._route_event(rejected)
+    assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
