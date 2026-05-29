@@ -320,8 +320,8 @@ class OrderSyncEngine:
         self._oca_cancel_native = caps.oca_cancel is CapabilityLevel.NATIVE
         self._tp_sl_bracket_native = caps.tp_sl_bracket is CapabilityLevel.NATIVE
         # Capability cache for the partial-qty bracket dispatch switch.
-        # The companion ``partial_qty_bracket_exit_supports_pyramiding``
-        # flag is enforced once at startup by ``validate_at_startup``;
+        # The companion ``partial_qty_bracket_exit_pyramiding`` level
+        # is enforced once at startup by ``validate_at_startup``;
         # the engine itself only needs the mode value at dispatch time.
         self._partial_qty_bracket_exit_mode = caps.partial_qty_bracket_exit
         # §2.6 broker-native fail-safe worst-SL manager (Slice A.7).

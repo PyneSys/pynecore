@@ -302,17 +302,21 @@ class ExchangeCapabilities:
     # than silently covering the whole row.
     partial_qty_bracket_exit: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
-    # Companion to :attr:`partial_qty_bracket_exit`. ``True`` declares that
-    # the plugin can route a partial-qty bracket correctly even when the
-    # script's ``pyramiding > 1`` (i.e. multiple parent positions share the
-    # Pine ``entry_id`` "L"). Aggregated-position brokers (Bybit netting,
-    # Binance Futures) can flip this on once they implement the bracket
-    # path; per-deal brokers (Capital.com, IG) leave it ``False`` until the
-    # multi-row reduction-order routing question is answered empirically
-    # (see ``partial-qty-bracket-exit-plan.md`` §9 #13). When ``False`` the
-    # validator rejects ``pyramiding > 1`` scripts that need
-    # partial-qty bracket support, regardless of the chosen mechanism.
-    partial_qty_bracket_exit_supports_pyramiding: bool = False
+    # Companion to :attr:`partial_qty_bracket_exit`: the level at which the
+    # plugin routes a partial-qty bracket correctly when multiple parent
+    # positions share one Pine ``entry_id`` "L" — the script's
+    # ``pyramiding > 1``, or ``strategy.order()`` (which can open multiple
+    # same-id rows even at ``pyramiding = 1``).
+    # NATIVE = the exchange routes the multi-row reduction as a first-class
+    # primitive (placeholder; no current broker delivers this).
+    # SOFTWARE = the plugin delivers it without a single native call — the
+    # engine drives one delta close against the summed parent and the
+    # exchange reduces the rows itself (e.g. Capital.com: server-side FIFO
+    # reduction, no client-side per-``dealId`` routing — §9 #13).
+    # UNSUPPORTED = the validator rejects ``pyramiding > 1`` /
+    # ``strategy.order()`` scripts that need partial-qty bracket support,
+    # rather than silently routing against just the latest row's quantity.
+    partial_qty_bracket_exit_pyramiding: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
     # === OCA cancel groups ===
     # NATIVE = the exchange tracks the OCA group and cancels siblings on

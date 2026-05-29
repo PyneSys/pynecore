@@ -34,7 +34,7 @@ def validate_at_startup(
         ``strategy.order()``, which is exempt from the pyramiding cap and
         can open multiple same-id rows on its own. ``pyramiding > 1`` or
         ``reqs.strategy_order=True`` activates the
-        :attr:`ExchangeCapabilities.partial_qty_bracket_exit_supports_pyramiding`
+        :attr:`ExchangeCapabilities.partial_qty_bracket_exit_pyramiding`
         gate: the intent builder's
         ``entry_orders[from_entry]`` lookup keys on a single Pine entry id
         and would silently use the latest row's quantity if multiple rows
@@ -83,7 +83,7 @@ def validate_at_startup(
         reqs.partial_qty_bracket_exit
         and caps.partial_qty_bracket_exit.is_supported
         and (pyramiding > 1 or reqs.strategy_order)
-        and not caps.partial_qty_bracket_exit_supports_pyramiding
+        and not caps.partial_qty_bracket_exit_pyramiding.is_supported
     ):
         if reqs.strategy_order and pyramiding <= 1:
             trigger = (

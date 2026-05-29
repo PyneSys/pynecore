@@ -289,13 +289,13 @@ def __test_validate_accepts_partial_native_level__():
 # partial vs whole-row exit. When multiple rows share one Pine entry id
 # (pyramiding>1 or strategy.order()), a plugin that has not opted into
 # multi-row support is refused at startup. The gate keys solely on
-# ``caps.partial_qty_bracket_exit_supports_pyramiding``.
+# ``caps.partial_qty_bracket_exit_pyramiding``.
 
 def __test_validate_pyramiding_gate_rejects_partial_qty_bracket__():
     reqs = ScriptRequirements(partial_qty_bracket_exit=True)
     caps = ExchangeCapabilities(
         partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
-        partial_qty_bracket_exit_supports_pyramiding=False,
+        partial_qty_bracket_exit_pyramiding=CapabilityLevel.UNSUPPORTED,
     )
     errors = validate_at_startup(reqs, caps, pyramiding=3)
     assert len(errors) == 1
@@ -306,7 +306,7 @@ def __test_validate_pyramiding_gate_passes_when_plugin_opts_in__():
     reqs = ScriptRequirements(partial_qty_bracket_exit=True)
     caps = ExchangeCapabilities(
         partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
-        partial_qty_bracket_exit_supports_pyramiding=True,
+        partial_qty_bracket_exit_pyramiding=CapabilityLevel.SOFTWARE,
     )
     assert validate_at_startup(reqs, caps, pyramiding=3) == []
 
@@ -317,7 +317,7 @@ def __test_validate_strategy_order_gate_rejects_partial_qty_bracket__():
     reqs = ScriptRequirements(partial_qty_bracket_exit=True, strategy_order=True)
     caps = ExchangeCapabilities(
         partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
-        partial_qty_bracket_exit_supports_pyramiding=False,
+        partial_qty_bracket_exit_pyramiding=CapabilityLevel.UNSUPPORTED,
     )
     errors = validate_at_startup(reqs, caps, pyramiding=1)
     assert len(errors) == 1
@@ -330,6 +330,6 @@ def __test_validate_pyramiding_one_row_partial_bracket_ok__():
     reqs = ScriptRequirements(partial_qty_bracket_exit=True)
     caps = ExchangeCapabilities(
         partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
-        partial_qty_bracket_exit_supports_pyramiding=False,
+        partial_qty_bracket_exit_pyramiding=CapabilityLevel.UNSUPPORTED,
     )
     assert validate_at_startup(reqs, caps, pyramiding=1) == []
