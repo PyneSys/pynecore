@@ -3250,12 +3250,13 @@ def __test_drive_native_failsafe_coalesces_observed_keeps_latest__():
 
 
 def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
-    # The generation guard exempts an observation that diverges from the new
-    # desired level ONLY when it equals the level the broker still legitimately
-    # carries (the pre-PUT desired). An operator's manual broker-side edit
-    # observed BEFORE a same-sync recompute queued the next PUT diverges from
-    # BOTH the new desired and the pre-PUT level — it must flip ownership to
-    # UNKNOWN, not be silently overwritten by the queued PUT.
+    # The outstanding-levels exemption covers an observation that diverges from
+    # the new desired level ONLY when it equals a level the broker still
+    # legitimately carries (the baseline or a dispatched level). An operator's
+    # manual broker-side edit observed BEFORE a same-sync recompute queued the
+    # next PUT diverges from BOTH the new desired and every outstanding entry —
+    # it must flip ownership to UNKNOWN, not be silently overwritten by the
+    # queued PUT.
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -3279,13 +3280,14 @@ def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
         ref, stop_level=70.0, profit_level=None, trailing_stop=None)
     # Before the drain, a leg-driven recompute on this same sync moves the
     # worst-SL to 85.0 and queues a fresh PUT (generation bumped, _pending set,
-    # PUT not yet dispatched). pre_put_sl_level captures the broker's old 90.0.
+    # PUT not yet dispatched). The outstanding baseline captures the broker's
+    # old 90.0 below the freshly dispatched 85.0.
     mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
                            active_sl_levels=[85.0], now_ms=2000.0)
-    assert mgr.get_state(ref).pre_put_sl_level == 90.0
+    assert [e.sl for e in mgr.get_state(ref).outstanding] == [90.0, 85.0]
 
     # drive drains the queued 70.0 observation first: it matches neither the
-    # new desired (85.0) nor the pre-PUT level (90.0) -> external edit. The
+    # new desired (85.0) nor any outstanding level (90.0) -> external edit. The
     # owner flips to UNKNOWN AND the queued 85.0 PUT must be dropped, never
     # dispatched — dispatching it here would overwrite the operator's manual
     # 70.0 edit the guard exists to preserve.
@@ -3297,17 +3299,17 @@ def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
     assert dispatched == []
 
 
-def __test_drive_native_failsafe_stale_pre_put_after_dispatch_keeps_engine__():
-    # The pre-PUT exemption must survive the queued snapshot being popped on
+def __test_drive_native_failsafe_stale_baseline_after_dispatch_keeps_engine__():
+    # The outstanding baseline must survive the queued snapshot being popped on
     # dispatch. The reconcile thread can sample the broker AFTER the fresh PUT
     # dispatched (``mark_dispatch_in_flight`` / ``record_put_success`` already
     # cleared ``_pending`` and ``pending_put``) but BEFORE the confirming poll
-    # arrives, so the lone observation still reports the old pre-PUT SL. Gating
+    # arrives, so the lone observation still reports the old baseline SL. Gating
     # the exemption on the queued snapshot's presence would misread that stale
     # sample as an external edit and flip ENGINE_FAILSAFE -> UNKNOWN, stranding
-    # the parent until manual reset. ``pre_put_sl_level`` (set at recompute,
-    # cleared on confirm) is the correct lifetime signal and keeps the parent
-    # engine-owned across this window.
+    # the parent until manual reset. The outstanding list (populated at
+    # recompute, cleared on confirm) keeps the parent engine-owned across this
+    # window.
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -3326,10 +3328,11 @@ def __test_drive_native_failsafe_stale_pre_put_after_dispatch_keeps_engine__():
 
     # A leg-driven recompute moves the worst-SL to 85.0; THIS drive dispatches
     # it (so ``_pending`` is popped and ``pending_put`` is cleared by the
-    # synchronous success record). pre_put_sl_level captures the broker's 90.0.
+    # synchronous success record). The outstanding baseline captures the
+    # broker's 90.0 below the freshly dispatched 85.0.
     mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
                            active_sl_levels=[85.0], now_ms=2000.0)
-    assert mgr.get_state(ref).pre_put_sl_level == 90.0
+    assert [e.sl for e in mgr.get_state(ref).outstanding] == [90.0, 85.0]
     dispatched: list[float | None] = []
     engine.set_native_bracket_dispatcher(
         lambda snap: dispatched.append(snap.stop_level))
@@ -3344,16 +3347,16 @@ def __test_drive_native_failsafe_stale_pre_put_after_dispatch_keeps_engine__():
         ref, stop_level=90.0, profit_level=None, trailing_stop=None)
     dispatched.clear()
     engine.drive_native_failsafe(now_ms=3000.0)
-    # Stale pre-PUT sample is exempt: ownership stays engine, no spurious PUT.
+    # Stale baseline sample is exempt: ownership stays engine, no spurious PUT.
     assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
     assert dispatched == []
 
-    # The confirming poll lands -> HEALTHY and the pre-PUT baseline is consumed.
+    # The confirming poll lands -> HEALTHY and the outstanding list is consumed.
     engine.enqueue_native_bracket_observed(
         ref, stop_level=85.0, profit_level=None, trailing_stop=None)
     engine.drive_native_failsafe(now_ms=4000.0)
     assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
-    assert mgr.get_state(ref).pre_put_sl_level is None
+    assert mgr.get_state(ref).outstanding == []
 
     # With the baseline cleared, a genuine edit back to 90.0 is no longer
     # exempt and correctly flips ownership to UNKNOWN.
@@ -3363,27 +3366,26 @@ def __test_drive_native_failsafe_stale_pre_put_after_dispatch_keeps_engine__():
     assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
 
 
-def __test_drive_native_failsafe_first_arm_none_pre_put_keeps_engine__():
-    # The pre-PUT exemption must survive the FIRST arm, where the broker
-    # legitimately carries no stop at all. ``recompute_worst_sl`` records
-    # ``pre_put_sl_level = None`` (the old desired) on the first PUT, so a stale
-    # reconcile poll that still sees ``stop_level=None`` after the PUT dispatched
-    # but before the confirming poll lands must NOT be misread as an external
-    # edit. Gating the exemption on ``pre_put_sl_level is not None`` would skip
+def __test_drive_native_failsafe_first_arm_none_baseline_keeps_engine__():
+    # The outstanding exemption must survive the FIRST arm, where the broker
+    # legitimately carries no stop at all. ``recompute_worst_sl`` records a
+    # baseline entry with ``sl=None`` (the old desired) on the first PUT, so a
+    # stale reconcile poll that still sees ``stop_level=None`` after the PUT
+    # dispatched but before the confirming poll lands must NOT be misread as an
+    # external edit. A model keyed on "is there a non-None baseline" would skip
     # it here (the value is a legitimate ``None``) and flip ENGINE_FAILSAFE ->
     # UNKNOWN, stranding the freshly armed parent until manual reset. The
-    # dedicated ``pre_put_active`` lifetime flag keeps the parent engine-owned.
+    # explicit baseline entry keeps the parent engine-owned.
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
     mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
                         parent_side='long', mintick=1.0)
     # First worst-SL armed at 90.0; the broker carried no stop before, so the
-    # pre-PUT baseline is None while the lifetime flag is set.
+    # baseline entry carries sl=None below the freshly dispatched 90.0.
     mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
                            active_sl_levels=[90.0], now_ms=1000.0)
-    assert mgr.get_state(ref).pre_put_sl_level is None
-    assert mgr.get_state(ref).pre_put_active is True
+    assert [e.sl for e in mgr.get_state(ref).outstanding] == [None, 90.0]
     dispatched: list[float | None] = []
     engine.set_native_bracket_dispatcher(
         lambda snap: dispatched.append(snap.stop_level))
@@ -3398,26 +3400,26 @@ def __test_drive_native_failsafe_first_arm_none_pre_put_keeps_engine__():
         ref, stop_level=None, profit_level=None, trailing_stop=None)
     dispatched.clear()
     engine.drive_native_failsafe(now_ms=2000.0)
-    # Stale pre-PUT None sample is exempt: ownership stays engine, no spurious
-    # PUT, baseline still live.
+    # Stale baseline None sample is exempt: ownership stays engine, no spurious
+    # PUT, the outstanding list still live.
     assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
     assert dispatched == []
-    assert mgr.get_state(ref).pre_put_active is True
+    assert [e.sl for e in mgr.get_state(ref).outstanding] == [None, 90.0]
 
-    # The confirming 90.0 poll lands -> HEALTHY and the baseline is consumed.
+    # The confirming 90.0 poll lands -> HEALTHY and the outstanding list is
+    # consumed.
     engine.enqueue_native_bracket_observed(
         ref, stop_level=90.0, profit_level=None, trailing_stop=None)
     engine.drive_native_failsafe(now_ms=3000.0)
     assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
-    assert mgr.get_state(ref).pre_put_active is False
-    assert mgr.get_state(ref).pre_put_sl_level is None
+    assert mgr.get_state(ref).outstanding == []
 
 
-def __test_drive_native_failsafe_coalesced_flush_records_pre_put__():
+def __test_drive_native_failsafe_coalesced_flush_records_baseline__():
     # The trail-coalesce flush path (``flush_coalesced_trails``) dispatches a
-    # throttled trail PUT WITHOUT going through ``recompute_worst_sl``'s pre-PUT
-    # capture. It must still record the broker baseline (the previously
-    # dispatched trail level) and arm the lifetime flag — otherwise a stale
+    # throttled trail PUT WITHOUT going through ``recompute_worst_sl``'s
+    # baseline capture. It must still record the broker baseline (the previously
+    # dispatched trail level) as an outstanding entry — otherwise a stale
     # reconcile poll that still sees the old broker level after the flushed PUT
     # returns has no exemption (the trail-coalesce exemption was cleared with
     # ``pending_trail_change_ts_ms``) and wrongly flips ENGINE_FAILSAFE ->
@@ -3465,12 +3467,11 @@ def __test_drive_native_failsafe_coalesced_flush_records_pre_put__():
     dispatched.clear()
     engine.drive_native_failsafe(now_ms=2400.0)
     assert dispatched == [86.0]
-    assert mgr.get_state(ref).pre_put_sl_level == 88.0
-    assert mgr.get_state(ref).pre_put_active is True
+    assert [e.sl for e in mgr.get_state(ref).outstanding] == [88.0, 86.0]
     assert mgr.get_state(ref).pending_trail_change_ts_ms is None
 
     # A stale poll that still saw 88.0 (before the 86.0 PUT landed) is exempt:
-    # it equals the recorded pre-PUT level, so ownership stays engine.
+    # it equals the recorded baseline level, so ownership stays engine.
     engine.enqueue_native_bracket_observed(
         ref, stop_level=88.0, profit_level=None, trailing_stop=None)
     dispatched.clear()
@@ -3478,12 +3479,13 @@ def __test_drive_native_failsafe_coalesced_flush_records_pre_put__():
     assert mgr.get_state(ref).owner is FailsafeOwner.ENGINE_FAILSAFE
     assert dispatched == []
 
-    # The confirming 86.0 poll lands -> HEALTHY and the baseline is consumed.
+    # The confirming 86.0 poll lands -> HEALTHY and the outstanding list is
+    # consumed.
     engine.enqueue_native_bracket_observed(
         ref, stop_level=86.0, profit_level=None, trailing_stop=None)
     engine.drive_native_failsafe(now_ms=4000.0)
     assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
-    assert mgr.get_state(ref).pre_put_active is False
+    assert mgr.get_state(ref).outstanding == []
 
 
 # === §2.6.7 native fail-safe state retirement on parent cancel/close ===

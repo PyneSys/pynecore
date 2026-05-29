@@ -443,15 +443,15 @@ def __test_external_stop_edit_flips_owner_to_unknown__():
     assert external[0].actual_level == 85.0
 
 
-def __test_second_recompute_in_flight_preserves_pre_put_baseline__():
-    """A recompute arriving after ``mark_dispatch_in_flight`` popped the
-    queued snapshot but before the confirming poll must not overwrite the
-    captured pre-PUT broker baseline. The first arm captured ``None`` (the
-    broker carried no stop yet); a stale poll still reporting ``None`` must
-    stay exempt, not flip ownership to UNKNOWN."""
+def __test_second_recompute_in_flight_preserves_outstanding_baseline__():
+    """A recompute arriving after ``mark_dispatch_in_flight`` popped the queued
+    snapshot but before the confirming poll must not lose the captured broker
+    baseline. The first arm captured ``None`` (the broker carried no stop yet);
+    a stale poll still reporting ``None`` must stay exempt via the outstanding
+    baseline, not flip ownership to UNKNOWN."""
     manager, events = _make_manager()
     _register_long(manager)
-    # First arm: broker carries no stop, so the pre-PUT baseline is None.
+    # First arm: broker carries no stop, so the baseline entry is None.
     first = manager.recompute_worst_sl(
         parent_entry_dispatch_ref=PARENT_REF,
         active_sl_levels=[90.0],
@@ -459,20 +459,24 @@ def __test_second_recompute_in_flight_preserves_pre_put_baseline__():
     )
     assert first is not None
     state = manager.get_state(PARENT_REF)
-    assert state.pre_put_active is True
-    assert state.pre_put_sl_level is None
-    # The dispatcher takes the PUT in flight — the queued snapshot is popped.
+    # Outstanding = [baseline(None), dispatched(90.0)].
+    assert [e.sl for e in state.outstanding] == [None, 90.0]
+    # The dispatcher takes the PUT in flight and the success is recorded, but
+    # the confirming snapshot has not arrived yet (``pending_put`` cleared,
+    # ``outstanding`` still carrying both the baseline and 90.0).
     manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
-    # A tighter SL recompute arrives before any confirm. With the ref absent
-    # from ``_pending`` the legacy guard would overwrite the baseline with the
-    # still-unconfirmed 90.0; the ``pre_put_active`` gate must preserve None.
+    manager.record_put_success(PARENT_REF, generation=first.generation, now_ms=1015.0)
+    # A tighter SL recompute queues behind, still unconfirmed. The batch is
+    # already in flight (``outstanding`` non-empty), so the baseline is
+    # preserved and 85.0 is appended below it.
     manager.recompute_worst_sl(
         parent_entry_dispatch_ref=PARENT_REF,
         active_sl_levels=[85.0],
         now_ms=1020.0,
     )
-    assert state.pre_put_sl_level is None
-    # A stale reconcile poll still reporting the original (absent) broker stop.
+    assert [e.sl for e in state.outstanding] == [None, 90.0, 85.0]
+    # A stale reconcile poll still reporting the original (absent) broker stop
+    # equals the baseline entry → exempt, no external-edit flip.
     manager.on_native_bracket_observed(
         PARENT_REF, stop_level=None, profit_level=None,
         trailing_stop=None, now_ms=1030.0,
@@ -518,6 +522,381 @@ def __test_user_reset_restores_engine_ownership_and_requeues__():
     pending = manager.pending_dispatch()
     assert len(pending) == 1
     assert pending[0].stop_level == 90.0
+
+
+def __test_user_reset_seeds_a_fresh_confirmation_cycle__():
+    """``reset_to_engine`` must re-arm the outstanding/confirmation tracking for
+    the PUT it re-queues, exactly like the recompute / flush dispatch paths.
+    Without it the reset PUT is invisible to ``tick_stale_window`` (an acked-
+    but-unconfirmed reset never times out) and a lagging pre-reset broker
+    observation would match no outstanding entry and falsely flip back to
+    UNKNOWN."""
+    manager, _ = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    state.owner = FailsafeOwner.UNKNOWN
+
+    manager.reset_to_engine(PARENT_REF, now_ms=5000.0)
+    # A fresh confirmation cycle is armed: one outstanding entry at the re-queued
+    # level, anchored at the reset timestamp.
+    assert [e.sl for e in state.outstanding] == [90.0]
+    assert state.outstanding_since_ts_ms == 5000.0
+    queued = manager.pending_dispatch()[0]
+    assert state.outstanding[0].generation == queued.generation
+
+    # The reset PUT is acked but the broker never confirms -> confirmation
+    # timeout fires (it would never fire with an empty outstanding list).
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=5010.0)
+    manager.record_put_success(PARENT_REF, generation=queued.generation, now_ms=5020.0)
+    manager.tick_stale_window(now_ms=11_000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason == 'confirmation-timeout'
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+
+
+def __test_user_reset_exempts_lagging_reset_level_poll__():
+    """After a reset re-queues the desired level, a lagging reconcile poll that
+    reports that very level must be a confirming observation, not an external
+    edit — the seeded outstanding entry exempts it."""
+    manager, events = _make_manager()
+    _register_long(manager)
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    state.owner = FailsafeOwner.UNKNOWN
+
+    manager.reset_to_engine(PARENT_REF, now_ms=5000.0)
+    queued = manager.pending_dispatch()[0]
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=5010.0)
+    manager.record_put_success(PARENT_REF, generation=queued.generation, now_ms=5020.0)
+
+    # A poll of the re-queued level lands: confirming, ownership stays ENGINE.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=5030.0,
+    )
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert not [e for e in events if isinstance(e, BrokerNativeFailsafeExternalEditEvent)]
+    assert state.outstanding == []  # latest desired confirmed -> list cleared
+
+
+# ---------------------------------------------------------------------
+# Outstanding-levels confirmation tracking (§2.6.7)
+# ---------------------------------------------------------------------
+
+def __test_intermediate_in_flight_level_is_exempt_not_external_edit__():
+    """Facet A: when the desired worst-SL moves more than once inside one
+    reconcile round-trip (95 -> 90 -> 85, both PUTs acked but neither observed
+    back), a lagging poll of the INTERMEDIATE 90 matches neither the latest
+    desired (85) nor the broker baseline (95). A single scalar slot would
+    misread it as an external edit and strand the parent; the outstanding list
+    keeps every dispatched level exempt."""
+    manager, events = _make_manager()
+    _register_long(manager)
+    # Confirm a baseline at 95.0 so the pre-burst broker level is X = 95.0.
+    first = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[95.0], now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1005.0)
+    manager.record_put_success(PARENT_REF, generation=first.generation, now_ms=1006.0)
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=95.0, profit_level=None, trailing_stop=None, now_ms=1010.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.outstanding == []  # confirmed -> list cleared
+
+    # Burst: 95 -> 90 -> 85, both PUTs dispatched + acked, neither confirmed.
+    g90 = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1020.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1021.0)
+    manager.record_put_success(PARENT_REF, generation=g90.generation, now_ms=1022.0)
+    g85 = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[85.0], now_ms=1023.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1024.0)
+    manager.record_put_success(PARENT_REF, generation=g85.generation, now_ms=1025.0)
+    # Outstanding = [baseline(95), dispatched(90), dispatched(85)].
+    assert [e.sl for e in state.outstanding] == [95.0, 90.0, 85.0]
+
+    # A lagging poll reports the intermediate 90.0: exempt, ownership intact.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=1030.0,
+    )
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert not [e for e in events if isinstance(e, BrokerNativeFailsafeExternalEditEvent)]
+    # The match prunes the baseline (95) the broker has provably moved past.
+    assert [e.sl for e in state.outstanding] == [90.0, 85.0]
+
+    # The confirming poll of the latest target (85) lands -> full confirm.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=85.0, profit_level=None, trailing_stop=None, now_ms=1040.0,
+    )
+    assert state.outstanding == []
+    assert state.last_confirm_ts_ms == 1040.0
+
+    # A genuine external edit after the list is cleared still flips to UNKNOWN.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=70.0, profit_level=None, trailing_stop=None, now_ms=1050.0,
+    )
+    assert state.owner is FailsafeOwner.UNKNOWN
+
+
+def __test_acked_but_unconfirmed_put_times_out_to_degraded__():
+    """Facet B: a PUT that is acked but whose level a reconcile snapshot never
+    reflects back must not keep the state HEALTHY forever. After the
+    confirmation-timeout window the state escalates to DEGRADED (reason
+    'confirmation-timeout') — WITHOUT flipping ownership to UNKNOWN and WITHOUT
+    re-dispatching — and a later confirming snapshot auto-recovers it."""
+    manager, events = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    state = manager.get_state(PARENT_REF)
+
+    # PUT acked, broker never confirms. Within the window: stays HEALTHY.
+    manager.tick_stale_window(now_ms=2000.0)
+    assert state.health is FailsafeHealth.HEALTHY
+
+    # Past the window (anchored at the batch start 1000.0): DEGRADED.
+    manager.tick_stale_window(now_ms=7000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason == 'confirmation-timeout'
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE  # never UNKNOWN
+    assert manager.pending_dispatch() == []  # no blind re-dispatch
+    unavail = [e for e in events if isinstance(e, BrokerNativeFailsafeUnavailableEvent)]
+    assert len(unavail) == 1
+    assert unavail[0].reason == 'confirmation-timeout'
+    transitions = [e for e in events if isinstance(e, NativeFailsafeStateTransitionEvent)]
+    assert transitions[-1].to_state == 'degraded'
+
+    # A confirmation that finally lands auto-recovers DEGRADED -> HEALTHY.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=8000.0,
+    )
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.degraded_reason is None
+
+
+def __test_put_failure_degraded_does_not_auto_recover_on_confirm__():
+    """A PUT-failure DEGRADED (``degraded_reason`` None) requires an explicit
+    user reset (§2.6.7); a confirming snapshot must NOT silently recover it,
+    unlike a confirmation-timeout DEGRADED."""
+    manager, _ = _make_manager(put_max_attempts=1, stale_window_ms=1_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    manager.record_put_failure(
+        PARENT_REF, generation=snap.generation, reason='rate-limit', now_ms=1010.0,
+    )
+    manager.tick_stale_window(now_ms=5000.0)
+    state = manager.get_state(PARENT_REF)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason is None
+    # A confirming observation does NOT auto-recover a PUT-failure DEGRADED.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=6000.0,
+    )
+    assert state.health is FailsafeHealth.DEGRADED
+
+
+def __test_confirmation_timeout_degraded_tracks_leg_cancel_in_memory__():
+    """A leg cancelled WHILE a confirmation-timeout DEGRADED is in force must
+    not be silently dropped. ``recompute_worst_sl`` still no-ops on dispatch
+    (the DEGRADED freeze forbids re-PUT), but for a confirmation-timeout
+    DEGRADED — where ownership never left the engine — it keeps the in-memory
+    ``desired_level`` tracking the live leg set, so a later reconcile of the
+    still-armed obsolete broker stop matches the CURRENT intent (``None``)
+    rather than a stale level and does NOT falsely auto-recover to HEALTHY."""
+    manager, _ = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    state = manager.get_state(PARENT_REF)
+
+    # Broker never confirms -> confirmation-timeout DEGRADED, broker carries 90.
+    manager.tick_stale_window(now_ms=7000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason == 'confirmation-timeout'
+    assert state.desired_level == 90.0
+
+    # The SL leg is cancelled during the timeout: no dispatch (freeze holds),
+    # but the in-memory desired now tracks "no stop wanted".
+    assert manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[], now_ms=7500.0,
+    ) is None
+    assert state.desired_level is None
+    assert manager.pending_dispatch() == []  # still frozen, no re-PUT
+
+    # The feed recovers and observes the still-armed obsolete 90: it now
+    # MISMATCHES the live desired (None), so the state holds DEGRADED instead
+    # of recovering to HEALTHY against a stop the strategy no longer wants.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=8000.0,
+    )
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE  # never flipped UNKNOWN
+
+    # A user reset re-seeds the (None) desired and queues the clear PUT that
+    # finally removes the stale broker stop.
+    manager.reset_to_engine(PARENT_REF, now_ms=9000.0)
+    assert state.health is FailsafeHealth.HEALTHY
+    queued = [
+        s for s in manager.pending_dispatch()
+        if s.parent_entry_dispatch_ref == PARENT_REF
+    ]
+    assert len(queued) == 1 and queued[0].stop_level is None
+
+
+def __test_confirmation_timeout_degraded_still_auto_recovers_unchanged_legs__():
+    """The in-memory tracking must NOT regress the legitimate auto-recovery:
+    when the leg set is UNCHANGED through a confirmation-timeout DEGRADED, a
+    later confirming snapshot of the (still-current) desired triple recovers
+    the state to HEALTHY exactly as before."""
+    manager, _ = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[80.0], now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    state = manager.get_state(PARENT_REF)
+    manager.tick_stale_window(now_ms=7000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+
+    # A redundant recompute with the same leg set keeps desired at 80.
+    manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[80.0], now_ms=7500.0,
+    )
+    assert state.desired_level == 80.0
+
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=80.0, profit_level=None, trailing_stop=None, now_ms=8000.0,
+    )
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.degraded_reason is None
+
+
+def __test_confirmation_timeout_degraded_with_manual_edit_does_not_auto_recover__():
+    """A confirmation-timeout DEGRADED whose broker stop is then manually edited
+    flips ownership to UNKNOWN (external-edit path) but keeps ``degraded_reason``.
+    A later observation that happens to equal the (still-current) desired triple
+    must NOT auto-recover to HEALTHY: ownership left the engine, so §2.6.7 requires
+    an explicit ``reset_to_engine``. Without the ownership guard on the recovery
+    branch the state would silently go HEALTHY while ``block_new_entry`` stops
+    blocking and ``recompute_worst_sl`` stays a no-op for non-engine ownership."""
+    manager, _ = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[80.0], now_ms=1000.0,
+    )
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=1020.0)
+    state = manager.get_state(PARENT_REF)
+    manager.tick_stale_window(now_ms=7000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason == 'confirmation-timeout'
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+
+    # Operator manually moves the broker stop -> external-edit path: owner UNKNOWN,
+    # reason intentionally untouched (it is a confirmation-timeout DEGRADED still).
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=75.0, profit_level=None, trailing_stop=None, now_ms=7500.0,
+    )
+    assert state.owner is FailsafeOwner.UNKNOWN
+    assert state.degraded_reason == 'confirmation-timeout'
+
+    # A later observation equal to the still-current desired (80) must NOT recover:
+    # ownership is UNKNOWN, recovery needs an explicit reset.
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=80.0, profit_level=None, trailing_stop=None, now_ms=8000.0,
+    )
+    assert state.health is FailsafeHealth.DEGRADED  # not auto-recovered
+    assert state.owner is FailsafeOwner.UNKNOWN
+    assert manager.block_new_entry(
+        symbol=SYMBOL, pine_id='pi00cafe', bar_ts_ms=8000,
+    ) is True
+
+    # Explicit reset restores engine ownership; recovery is now possible again.
+    manager.reset_to_engine(PARENT_REF, now_ms=8500.0)
+    assert state.owner is FailsafeOwner.ENGINE_FAILSAFE
+
+
+def __test_confirmation_timeout_never_fires_without_an_acked_put__():
+    """State-only run (no dispatcher ever acks the queued PUT): the confirmation
+    timeout must NOT fire. ``recompute_worst_sl`` arms ``outstanding`` (and the
+    anchor) at queue time, and a mere ``mark_dispatch_in_flight`` hand-off is not
+    acknowledgement — only a broker-acked PUT (``record_put_success``) means an
+    acked-but-unconfirmed broker stop exists. Escalating to DEGRADED before any
+    ack would wrongly block entries on a run that never confirmed broker traffic."""
+    manager, events = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    assert state.outstanding  # armed at queue time
+    assert state.batch_put_acked is False  # but nothing was ever acked
+
+    # Far past the window: the snapshot was never acked, so HEALTHY holds — even a
+    # bare hand-off (no ack) does not arm the window.
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=2000.0)
+    assert state.batch_put_acked is False
+    manager.tick_stale_window(now_ms=100_000.0)
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.degraded_reason is None
+    assert not [e for e in events if isinstance(e, BrokerNativeFailsafeUnavailableEvent)]
+
+    # Once a PUT is actually acked the window legitimately applies again.
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=100_010.0)
+    assert state.batch_put_acked is True
+    manager.tick_stale_window(now_ms=200_000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    assert state.degraded_reason == 'confirmation-timeout'
+
+
+def __test_failed_put_with_retries_left_does_not_confirmation_timeout__():
+    """A failed PUT (rate-limit / reject) with retry budget remaining must keep
+    the state HEALTHY and the retry queued. Because the broker never acked the
+    PUT, the confirmation-timeout path must NOT arm — even a ``tick_stale_window``
+    past ``stale_window_ms`` must leave the retry intact rather than promoting
+    straight to DEGRADED and bypassing the retry budget."""
+    manager, events = _make_manager(stale_window_ms=5_000.0)
+    _register_long(manager)
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0,
+    )
+    state = manager.get_state(PARENT_REF)
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1010.0)
+    # The PUT fails but retries remain (default budget is 3): state stays HEALTHY
+    # with the retry re-queued, and no PUT was ever acknowledged.
+    manager.record_put_failure(
+        PARENT_REF, generation=snap.generation, reason='rate-limit', now_ms=1020.0,
+    )
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.pending_retry is True
+    assert state.batch_put_acked is False
+    assert manager.pending_dispatch()  # the retry is still queued
+
+    # Far past the stale window: the failed PUT is owned by the retry budget, not
+    # the confirmation-timeout. The state must stay HEALTHY and the retry survive.
+    manager.tick_stale_window(now_ms=100_000.0)
+    assert state.health is FailsafeHealth.HEALTHY
+    assert state.degraded_reason is None
+    assert state.pending_retry is True
+    assert manager.pending_dispatch()
+    assert not [e for e in events if isinstance(e, BrokerNativeFailsafeUnavailableEvent)]
 
 
 # ---------------------------------------------------------------------
@@ -693,14 +1072,14 @@ def __test_trail_move_outside_window_dispatched_on_flush__():
     assert released[0].stop_level == 101.0
 
 
-def __test_second_flush_in_flight_preserves_pre_put_baseline__():
-    """A coalesced trail flush that fires while an earlier flushed PUT is
-    still unconfirmed must not overwrite the captured pre-PUT broker
-    baseline. ``mark_dispatch_in_flight`` pops the queued snapshot the
-    moment the dispatcher takes it, so a follow-up trail move can coalesce
-    and reach a second flush before the confirming poll arrives; the
-    ``pre_put_active`` gate must keep the ORIGINAL broker level so a stale
-    observation of it stays exempt instead of flipping ownership."""
+def __test_second_flush_in_flight_preserves_outstanding_baseline__():
+    """A coalesced trail flush that fires while an earlier flushed PUT is still
+    unconfirmed must not lose the captured broker baseline.
+    ``mark_dispatch_in_flight`` pops the queued snapshot the moment the
+    dispatcher takes it, so a follow-up trail move can coalesce and reach a
+    second flush before the confirming poll arrives; the outstanding baseline
+    must keep the ORIGINAL broker level so a stale observation of it stays
+    exempt instead of flipping ownership."""
     manager, events = _make_manager(
         trail_coalesce_window_ms=250.0, trail_step_threshold_ticks=1.0,
     )
@@ -720,7 +1099,8 @@ def __test_second_flush_in_flight_preserves_pre_put_baseline__():
         trailing_stop=None, now_ms=1030.0,
     )
     # First throttled trail move; flush captures the broker baseline (100.0)
-    # and dispatches 101.0. The dispatcher takes it in flight.
+    # and dispatches 101.0. The dispatcher takes it in flight and acks it, but
+    # the confirming snapshot has not arrived yet.
     manager.recompute_worst_sl(
         parent_entry_dispatch_ref=PARENT_REF,
         active_sl_levels=[101.0],
@@ -730,9 +1110,12 @@ def __test_second_flush_in_flight_preserves_pre_put_baseline__():
     released = manager.flush_coalesced_trails(now_ms=1400.0)
     assert len(released) == 1
     state = manager.get_state(PARENT_REF)
-    assert state.pre_put_active is True
-    assert state.pre_put_sl_level == 100.0
+    # Outstanding = [baseline(100.0), dispatched(101.0)].
+    assert [e.sl for e in state.outstanding] == [100.0, 101.0]
     manager.mark_dispatch_in_flight(PARENT_REF, now_ms=1410.0)
+    manager.record_put_success(
+        PARENT_REF, generation=released[0].generation, now_ms=1410.0,
+    )
     # Second throttled trail move arrives before the 101.0 PUT confirms.
     manager.recompute_worst_sl(
         parent_entry_dispatch_ref=PARENT_REF,
@@ -740,12 +1123,12 @@ def __test_second_flush_in_flight_preserves_pre_put_baseline__():
         now_ms=1500.0,
         trigger_kind='trail',
     )
-    # Second flush while still in flight: the legacy code overwrote the
-    # baseline with last_trail_dispatched_level (101.0); the gate keeps 100.0.
+    # Second flush while still in flight: the batch is non-empty so the
+    # original baseline (100.0) is preserved and 102.0 is appended below it.
     manager.flush_coalesced_trails(now_ms=1800.0)
-    assert state.pre_put_sl_level == 100.0
+    assert [e.sl for e in state.outstanding] == [100.0, 101.0, 102.0]
     # A stale reconcile poll still reporting the ORIGINAL broker stop (100.0)
-    # must stay exempt — no external-edit flip.
+    # equals the baseline entry → exempt, no external-edit flip.
     manager.on_native_bracket_observed(
         PARENT_REF, stop_level=100.0, profit_level=None,
         trailing_stop=None, now_ms=1850.0,

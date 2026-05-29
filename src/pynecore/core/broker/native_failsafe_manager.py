@@ -47,6 +47,7 @@ __all__ = [
     'FailsafeHealth',
     'FailsafeOwner',
     'NativeBracketSnapshot',
+    'OutstandingLevel',
     'NativeStopState',
     'NativeFailsafeManager',
     'TRAIL_COALESCE_WINDOW_MS_DEFAULT',
@@ -72,7 +73,20 @@ PUT_MAX_ATTEMPTS_DEFAULT: int = 3
 
 STALE_WINDOW_MS_DEFAULT: float = 30_000.0
 """§2.6.7 stale window. ``degrading`` states that do not confirm
-``actual_level == desired_level`` within this window flip to ``degraded``."""
+``actual_level == desired_level`` within this window flip to ``degraded``.
+
+Also the §2.6.7 confirmation-timeout window: a ``healthy`` state whose
+dispatched levels are never reflected back by a reconcile snapshot within
+this window flips to ``degraded`` (reason ``confirmation-timeout``). Same
+business question — "how long may we run without verified broker
+protection" — so the same default value is reused."""
+
+_OUTSTANDING_LEVELS_CAP: int = 256
+"""Hard backstop on the per-parent outstanding-levels list length. The list
+only grows via genuine new-desired dispatches (never retries), and the
+confirmation-timeout window freezes growth once it expires (``degraded`` makes
+``recompute_worst_sl`` a no-op), so in practice the cap is never reached — it
+exists purely to bound memory under a pathological, never-confirming churn."""
 
 
 # === Public types ========================================================
@@ -110,6 +124,32 @@ class NativeBracketSnapshot:
     profit_level: float | None
     trailing_stop: float | None
     generation: int
+
+
+@dataclass(frozen=True)
+class OutstandingLevel:
+    """One bracket triple the broker may legitimately be showing right now.
+
+    Capital.com ``PUT /positions/{dealId}`` returns no request-correlation
+    token, so a PUT is confirmed *only* by level-matching the next
+    ``GET /positions`` snapshot against a desired snapshot. When the desired
+    level moves more than once inside a single reconcile round-trip
+    (``X → 90 → 85``, every PUT acked but none yet observed back), a lagging
+    poll can report the intermediate ``90`` — which matches neither the latest
+    desired ``85`` nor the pre-PUT baseline ``X``. A single scalar baseline
+    slot therefore misreads that legitimately-stale observation as an external
+    edit and strands the parent (``owner=UNKNOWN``).
+
+    The fix tracks *every* dispatched level (plus the broker baseline as the
+    oldest entry) as a list of these triples, so any one of them exempts a
+    lagging observation. ``generation`` is the dispatch generation that
+    produced the level; ``dispatch_ts_ms`` is when it was queued.
+    """
+    sl: float | None
+    profit_level: float | None
+    trailing_stop: float | None
+    generation: int
+    dispatch_ts_ms: float
 
 
 @dataclass
@@ -163,30 +203,55 @@ class NativeStopState:
     pending_trail_change_ts_ms: float | None = None
     pending_put: bool = False
     pending_retry: bool = False
-    # SL level the broker is still expected to legitimately carry while a
-    # freshly recomputed PUT is in flight and unconfirmed. ``recompute_worst_sl``
-    # (and the coalesced :meth:`flush_coalesced_trails` path) runs on the main
-    # thread and captures the OLD broker level here when a new un-dispatched
-    # batch begins (``_pending`` empty). A reconcile observation captured between
-    # syncs can still report this old level whether it was sampled BEFORE the
-    # queued PUT dispatches (snapshot still in ``_pending``) or AFTER dispatch but
-    # before the confirming poll (``mark_dispatch_in_flight`` /
-    # ``record_put_success`` already popped ``_pending``).
-    # :meth:`on_native_bracket_observed` exempts only that exact stale level — an
-    # observation diverging from BOTH the new desired and this pre-PUT level is an
-    # operator's manual broker-side edit and must flip ownership to UNKNOWN, not
-    # be silently overwritten by the queued PUT.
+    # Every bracket triple the broker may legitimately be showing while one or
+    # more freshly dispatched PUTs are still unconfirmed (§2.6.7). The oldest
+    # entry is the broker baseline captured at batch start (what the broker
+    # carried before the first in-flight PUT); each subsequent entry is a level
+    # an actual dispatch queued. A reconcile observation that equals ANY entry
+    # is a legitimately stale sample — not an external edit — so it does not
+    # flip ownership to UNKNOWN. A single scalar slot could only remember one
+    # such level and misread the *intermediate* level of a ``X → 90 → 85``
+    # multi-move-in-flight burst as a manual edit, stranding a correctly
+    # protected parent. See :class:`OutstandingLevel`.
     #
-    # ``None`` is a LEGITIMATE pre-PUT value (the very first PUT arms a stop where
-    # the broker carried no stop at all), so the value alone cannot signal whether
-    # an exemption is live. ``pre_put_active`` is the dedicated lifetime flag: set
-    # ``True`` the moment a baseline is captured (in either dispatch path) and
-    # cleared the moment a matching confirmation lands. The exemption gates on the
-    # flag, then matches the stored level — so a stale ``stop_level=None`` pre-PUT
-    # observation during a first-arm in-flight window is exempt instead of being
-    # misread as an external edit that strands the parent.
-    pre_put_sl_level: float | None = None
-    pre_put_active: bool = False
+    # The list is pruned on every confirming observation (entries older than the
+    # matched generation can no longer be carried) and cleared outright when the
+    # broker confirms the latest desired triple or an external edit is detected.
+    outstanding: list[OutstandingLevel] = field(default_factory=list)
+    # Batch-start timestamp: set when ``outstanding`` goes empty → non-empty and
+    # left frozen across subsequent dispatches; reset to ``None`` only when the
+    # list is fully cleared (latest-desired confirm or external edit). This is
+    # the §2.6.7 confirmation-timeout anchor — it measures "how long has the
+    # current unconfirmed batch been outstanding". Anchoring on the *newest*
+    # dispatch would let churn (a strategy that re-dispatches faster than the
+    # broker confirms) slide the deadline forever; anchoring on the global
+    # ``last_confirm_ts_ms`` would instead punish a long-idle parent the instant
+    # it dispatches again. Batch-start is immune to both.
+    outstanding_since_ts_ms: float | None = None
+    # Has at least one PUT for the current outstanding batch been *acknowledged*
+    # by the broker? ``recompute_worst_sl`` arms ``outstanding`` (and the
+    # confirmation-timeout anchor) at *queue* time, before any dispatch, and
+    # :meth:`mark_dispatch_in_flight` hands the PUT to the dispatcher — but
+    # neither proves the broker actually stored the stop. The confirmation-timeout
+    # window must only arm once a PUT round-trip is ACKNOWLEDGED (the engine's
+    # :meth:`record_put_success`), because that is the first moment an
+    # acked-but-unconfirmed broker stop can exist. Gating on hand-off instead
+    # would arm the window for a *failed* PUT (rate-limit / reject): with retries
+    # still budgeted the state is legitimately HEALTHY, yet a later
+    # :meth:`tick_stale_window` would promote it straight to DEGRADED and drop the
+    # queued retry, bypassing the retry budget. Failed PUTs are governed solely by
+    # the retry budget → DEGRADING → DEGRADED machinery, never by this flag. In a
+    # state-only run (``set_native_bracket_dispatcher`` never called — unit tests,
+    # plugin not yet opted in) no PUT is ever sent or acked, so the timeout never
+    # fires. Set ``True`` in :meth:`record_put_success` and reset with the batch
+    # in :meth:`_clear_outstanding`.
+    batch_put_acked: bool = False
+    # Reason tag for a ``degraded`` state, used to scope automatic recovery. A
+    # PUT-failure ``degraded`` (``None``) requires an explicit user reset
+    # (§2.6.7). A confirmation-timeout ``degraded`` may instead recover to
+    # ``healthy`` on its own when a later reconcile snapshot finally confirms the
+    # latest desired triple — the broker protection is verified present again.
+    degraded_reason: str | None = None
     # Empirical mintick for the symbol — needed by the trail step gate.
     mintick: float = 0.0
     # ``minmove`` / ``pricescale`` reconstruct the mintick grid with the same
@@ -367,27 +432,40 @@ class NativeFailsafeManager:
             # A leg cancellation or trailing-level move arriving in this
             # window would otherwise re-queue a ``NativeBracketSnapshot`` and
             # overwrite the stop the operator may already have edited
-            # manually. Skip the recompute entirely; recovery re-seeds the
-            # desired snapshot from ``reset_to_engine``.
+            # manually. No dispatch happens here under any ``DEGRADED`` reason.
+            #
+            # A PUT-failure ``DEGRADED`` (``degraded_reason is None``) skips the
+            # recompute entirely — the broker may carry a manual operator edit
+            # the engine has no claim over, so even the in-memory ``desired``
+            # must stay frozen until ``reset_to_engine`` re-seeds it.
+            #
+            # A confirmation-timeout ``DEGRADED`` is different: ownership never
+            # left the engine (nobody edited the stop, the feed merely lagged),
+            # so the in-memory ``desired`` SHOULD keep tracking the current leg
+            # set even while dispatch stays frozen. Without this, a leg cancelled
+            # during the timeout leaves ``desired`` pinned at the now-obsolete
+            # level; a later reconcile observing the still-armed obsolete broker
+            # stop would then match that stale ``desired`` and auto-recover to
+            # ``HEALTHY`` (``on_native_bracket_observed``) — re-opening the symbol
+            # gate while a stop the strategy no longer wants stays armed at the
+            # broker, with no further leg event to clear it. Tracking ``desired``
+            # here makes the recovery match compare against the live intent, so a
+            # superseded broker level stays a mismatch and the state holds
+            # ``DEGRADED`` until ``reset_to_engine`` re-seeds and clears it. No
+            # generation bump / outstanding append / queue happens — those drive
+            # dispatch + confirmation, which the DEGRADED freeze forbids.
+            if state.degraded_reason == 'confirmation-timeout':
+                state.desired_level = self._worst_sl(state, active_sl_levels)
             return None
 
-        levels = list(active_sl_levels)
-        state.last_active_sl_count = len(levels)
-        if not levels:
-            new_desired: float | None = None
-        elif state.parent_side == 'long':
-            new_desired = min(levels)
-        else:
-            new_desired = max(levels)
-
         # Snap the engine-computed worst-SL to the symbol's tick grid before it
-        # becomes the desired level. The broker stores its stop on that grid,
-        # so an unrounded float would make every confirming observation
-        # mismatch by a sub-tick and falsely flip ownership / health. Snapping
-        # here also keeps the derived ``pre_put_sl_level`` /
-        # ``last_trail_dispatched_level`` (both sourced from ``desired_level``)
-        # on the grid for free.
-        new_desired = self._round_to_tick(new_desired, state)
+        # becomes the desired level (handled inside :meth:`_worst_sl`). The
+        # broker stores its stop on that grid, so an unrounded float would make
+        # every confirming observation mismatch by a sub-tick and falsely flip
+        # ownership / health. Snapping at source also keeps the derived
+        # ``outstanding`` baseline / ``last_trail_dispatched_level`` (both
+        # sourced from ``desired_level``) on the grid for free.
+        new_desired = self._worst_sl(state, active_sl_levels)
 
         if self._levels_equal(new_desired, state.desired_level):
             return None
@@ -410,29 +488,20 @@ class NativeFailsafeManager:
             state.pending_trail_change_ts_ms = now_ms
             return None
 
-        # Capture the level the broker still carries before this PUT lands.
-        # Only at the start of a fresh batch — when no snapshot is queued for
-        # this ref AND no pre-PUT exemption is already live. ``_pending`` alone
-        # is not enough: :meth:`mark_dispatch_in_flight` pops the queued
-        # snapshot the moment the dispatcher takes it, so a follow-up recompute
-        # arriving after dispatch but before the confirming poll would re-enter
-        # this branch with the ref absent and overwrite ``pre_put_sl_level``
-        # with the previous (still-unconfirmed) ``desired_level`` — discarding
-        # the genuine broker baseline the first capture recorded. ``pre_put_active``
-        # is ``True`` for exactly as long as the broker may still carry that
-        # original level, so gating on ``not state.pre_put_active`` preserves
-        # the captured baseline across the whole in-flight window. The
-        # generation guard in :meth:`on_native_bracket_observed` uses this to
-        # tell a legitimately stale pre-PUT observation from an external edit.
-        if parent_entry_dispatch_ref not in self._pending and not state.pre_put_active:
-            state.pre_put_sl_level = state.desired_level
-            state.pre_put_active = True
+        # Capture the level the broker still carries before this PUT lands —
+        # only at the start of a fresh batch (``outstanding`` empty). The
+        # baseline is the OLD ``desired_level`` (what the broker is showing
+        # right now) plus the unchanged coexisting TP / trailing. A follow-up
+        # recompute arriving while earlier PUTs are still unconfirmed leaves the
+        # baseline intact and simply appends its own level below.
+        self._note_batch_start(state, sl=state.desired_level, now_ms=now_ms)
         state.desired_level = new_desired
         state.generation += 1
         state.last_desired_change_ts_ms = now_ms
         state.immediate_attempts_remaining = self._put_max_attempts
         snapshot = self._build_snapshot(state)
         self._pending[parent_entry_dispatch_ref] = snapshot
+        self._append_outstanding(state, snapshot, now_ms=now_ms)
         if trigger_kind == 'trail':
             state.last_trail_dispatched_level = new_desired
             state.last_trail_dispatch_ts_ms = now_ms
@@ -501,25 +570,17 @@ class NativeFailsafeManager:
             # (guard above), so this is a batch start and the broker baseline is
             # the previously dispatched trail level. ``flush_coalesced_trails``
             # clears ``pending_trail_change_ts_ms`` below, so the trail-coalesce
-            # exemption no longer covers a stale post-dispatch poll;
-            # ``pre_put_sl_level`` / ``pre_put_active`` carry that exemption
-            # instead, exactly as the immediate-recompute path does. Gate on
-            # ``not state.pre_put_active`` for the same reason
-            # :meth:`recompute_worst_sl` does: ``mark_dispatch_in_flight`` pops
-            # ``_pending`` the moment the dispatcher takes the earlier PUT, so a
-            # follow-up trail change can coalesce and reach this flush while the
-            # first PUT is still unconfirmed. Overwriting the baseline then would
-            # discard the genuine broker level the first capture recorded, and a
-            # stale observation of that original stop would match neither the new
-            # desired nor the clobbered baseline — flipping ownership to UNKNOWN
-            # despite no manual edit.
-            if not state.pre_put_active:
-                state.pre_put_sl_level = state.last_trail_dispatched_level
-                state.pre_put_active = True
+            # exemption no longer covers a stale post-dispatch poll; the
+            # ``outstanding`` list carries that exemption instead, exactly as the
+            # immediate-recompute path does.
+            self._note_batch_start(
+                state, sl=state.last_trail_dispatched_level, now_ms=now_ms,
+            )
             state.generation += 1
             state.immediate_attempts_remaining = self._put_max_attempts
             snapshot = self._build_snapshot(state)
             self._pending[state.parent_entry_dispatch_ref] = snapshot
+            self._append_outstanding(state, snapshot, now_ms=now_ms)
             state.last_trail_dispatched_level = state.desired_level
             state.last_trail_dispatch_ts_ms = now_ms
             # Suppressed trail change has now shipped — clear the marker
@@ -548,6 +609,10 @@ class NativeFailsafeManager:
             return
         state.pending_put = True
         state.last_put_ts_ms = now_ms
+        # NOTE: the confirmation-timeout window is NOT armed here. Hand-off is not
+        # acknowledgement — a PUT can still fail (rate-limit / reject) and stay
+        # within the retry budget. ``batch_put_acked`` is set only once the broker
+        # actually acks the round-trip (see :meth:`record_put_success`).
         # Drop the queued snapshot now that the dispatcher has it in
         # flight. ``pending_dispatch()`` would otherwise keep returning
         # the same generation on every ``drive_native_failsafe`` tick
@@ -589,6 +654,11 @@ class NativeFailsafeManager:
         state.pending_retry = False
         state.last_failure_reason = None
         state.last_failure_ts_ms = None
+        # The broker acknowledged a PUT for the current outstanding batch, so the
+        # confirmation-timeout window legitimately applies from now on: there is a
+        # real acked-but-not-yet-reconciled broker stop that a snapshot must
+        # confirm within ``stale_window_ms`` (see :meth:`_tick_confirmation_timeout`).
+        state.batch_put_acked = True
         # Only drop the queued snapshot when the generation matches —
         # a newer desired might have queued behind it while this PUT was
         # in flight; that one must still be dispatched.
@@ -688,52 +758,30 @@ class NativeFailsafeManager:
         self._pending[parent_entry_dispatch_ref] = self._build_snapshot(state)
 
     def tick_stale_window(self, *, now_ms: float) -> None:
-        """Poll-tick driven ``degrading → degraded`` transition.
+        """Poll-tick driven ``→ degraded`` escalations (§2.6.7).
 
         Called periodically (once per sync, or once per reconcile poll).
-        Promotes any ``degrading`` state whose last desired change was
-        more than ``stale_window_ms`` ago without a snapshot confirmation.
+        Drives two independent escalations to ``degraded``:
+
+        - **DEGRADING → DEGRADED**: PUT retries are exhausted and no snapshot
+          has confirmed ``actual == desired`` within ``stale_window_ms``.
+        - **HEALTHY → DEGRADED (confirmation-timeout)**: the broker acked one or
+          more PUTs but a reconcile snapshot never reflected the latest desired
+          triple back within the window. Without this, an acked-but-never-
+          confirmed PUT keeps the state HEALTHY / engine-owned forever — a
+          silently dropped broker stop would violate the "bounded loss when
+          failsafe is verified present" guarantee. This escalation NEVER flips
+          ownership to UNKNOWN (nobody edited the stop) and NEVER blindly
+          re-dispatches (a broken feed proves nothing, and a re-PUT could clobber
+          a manual edit); it only engages the symbol-level gates until the
+          protection is verified present again (or a confirming snapshot
+          auto-recovers it via :meth:`on_native_bracket_observed`).
         """
         for state in list(self._states.values()):
-            if state.health is not FailsafeHealth.DEGRADING:
-                continue
-            window = state.stale_window_ms or self._stale_window_ms
-            # ``degrading_since_ts_ms`` is set when the state enters
-            # DEGRADING and stays frozen across subsequent retry failures
-            # so the timer measures "time since the failsafe started
-            # failing". The legacy ``last_failure_ts_ms`` fall-back covers
-            # states that were already DEGRADING before this field was
-            # introduced (persisted/restored state). Use ``is not None``
-            # rather than truthiness so a deterministic test/replay clock
-            # starting at ``0.0`` still anchors at the first failure
-            # instead of sliding forward on every retry.
-            if state.degrading_since_ts_ms is not None:
-                anchor = state.degrading_since_ts_ms
-            elif state.last_failure_ts_ms is not None:
-                anchor = state.last_failure_ts_ms
-            elif state.last_desired_change_ts_ms is not None:
-                anchor = state.last_desired_change_ts_ms
-            else:
-                continue
-            if (now_ms - anchor) < window:
-                continue
-            self._transition(state, FailsafeHealth.DEGRADED, 'stale-window expired')
-            # Once the stale window has expired, manual ``set_risk`` /
-            # ``reset_to_engine`` is required before the engine writes the
-            # broker-native stop again (§2.6.7). Leaving ``pending_retry``
-            # and the queued snapshot intact would let the very next
-            # ``drive_native_failsafe`` tick re-dispatch the same failed
-            # PUT — ``pending_dispatch()`` runs immediately after
-            # ``tick_stale_window`` — and ``record_put_failure`` would
-            # then re-queue it on every failure. Drop both so DEGRADED
-            # really blocks dispatch until the user resets.
-            state.pending_retry = False
-            self._pending.pop(state.parent_entry_dispatch_ref, None)
-            self._emit(BrokerNativeFailsafeUnavailableEvent(
-                parent_entry_dispatch_ref=state.parent_entry_dispatch_ref,
-                symbol=state.symbol,
-                reason=state.last_failure_reason or 'stale-window expired',
-            ))
+            if state.health is FailsafeHealth.DEGRADING:
+                self._tick_degrading_stale_window(state, now_ms=now_ms)
+            elif state.health is FailsafeHealth.HEALTHY and state.outstanding:
+                self._tick_confirmation_timeout(state, now_ms=now_ms)
 
     # --- Snapshot reconcile --------------------------------------------
 
@@ -790,15 +838,37 @@ class NativeFailsafeManager:
 
         if match:
             state.last_confirm_ts_ms = now_ms
-            # The broker now carries the desired level — the pre-PUT baseline
-            # is consumed and must not exempt a later mismatch.
-            state.pre_put_sl_level = None
-            state.pre_put_active = False
+            # The broker now carries the LATEST desired triple — every
+            # outstanding entry (baseline + all dispatched levels) is consumed
+            # and must not exempt a later mismatch. Clearing the list also
+            # resets the confirmation-timeout anchor.
+            self._clear_outstanding(state)
             if state.health is FailsafeHealth.DEGRADING:
                 # Clear the stale-window anchor: the next HEALTHY →
                 # DEGRADING cycle must re-anchor on the next first-failure.
                 state.degrading_since_ts_ms = None
                 self._transition(state, FailsafeHealth.HEALTHY, 'snapshot confirm')
+            elif (state.health is FailsafeHealth.DEGRADED
+                    and state.degraded_reason == 'confirmation-timeout'
+                    and state.owner is FailsafeOwner.ENGINE_FAILSAFE):
+                # A confirmation-timeout DEGRADED auto-recovers once the broker
+                # finally confirms the latest desired triple: the protection is
+                # verified present again, so no manual reset is required. A
+                # PUT-failure DEGRADED (``degraded_reason is None``) does NOT
+                # auto-recover — §2.6.7 keeps requiring an explicit user reset.
+                #
+                # The ownership guard is load-bearing: a confirmation-timeout
+                # DEGRADED whose broker stop was then manually edited takes the
+                # external-edit path below, which flips ``owner`` to UNKNOWN but
+                # leaves ``degraded_reason`` set. Without this guard a later
+                # observation that happens to equal the (stale) desired triple
+                # would recover the state to HEALTHY while ownership stays
+                # UNKNOWN — ``block_new_entry`` would stop blocking even though
+                # ``recompute_worst_sl`` is a no-op for non-engine ownership and
+                # the broker carries an operator's manual stop. UNKNOWN recovery
+                # requires an explicit ``reset_to_engine`` (§2.6.7).
+                state.degraded_reason = None
+                self._transition(state, FailsafeHealth.HEALTHY, 'confirmation recovered')
             # A queued retry whose desired level matches what the broker
             # is already carrying is a confirmed PUT we just couldn't
             # observe directly (the failure report was wrong, or the
@@ -822,38 +892,29 @@ class NativeFailsafeManager:
         if state.pending_retry:
             return
         # A lifecycle / trail recompute may have already moved ``desired_level``
-        # and pushed a fresh PUT whose result the broker has not reflected back
-        # yet. While that PUT is unconfirmed the broker still legitimately
-        # carries the pre-PUT level, so an observation diverging from the new
-        # ``desired_level`` but equal to that pre-PUT level is stale, not an
-        # external edit — flipping ownership to UNKNOWN here would block future
-        # brackets until a manual reset. The reconcile thread can sample the
-        # broker either BEFORE the queued PUT dispatches (snapshot still in
-        # ``_pending``) OR after it dispatches but before the confirming poll
-        # arrives (``mark_dispatch_in_flight`` / ``record_put_success`` already
-        # popped ``_pending`` and cleared ``pending_put``). Both windows feed
-        # the same stale pre-PUT level, so gating on the queued snapshot's
-        # presence would leave the post-dispatch sample unprotected and strand
-        # the parent. The correct lifetime signal is ``pre_put_active``: it is
-        # set when either dispatch path (immediate recompute or coalesced trail
-        # flush) captures the broker baseline and cleared the moment a matching
-        # confirmation lands above, so it is ``True`` for exactly as long as the
-        # broker may still carry the old level. The flag — not
-        # ``pre_put_sl_level is not None`` — is the lifetime gate, because
-        # ``None`` is a legitimate pre-PUT level when the first PUT arms a stop
-        # the broker did not carry.
+        # and pushed one or more fresh PUTs whose results the broker has not
+        # reflected back yet. While those are unconfirmed the broker still
+        # legitimately carries one of the dispatched levels — or the pre-PUT
+        # baseline — so an observation diverging from the new ``desired_level``
+        # but equal to ANY outstanding entry is stale, not an external edit.
+        # Flipping ownership to UNKNOWN here would block future brackets until a
+        # manual reset. A single ``X → 90 → 85`` burst within one reconcile
+        # round-trip acks all three before any is observed back; a lagging poll
+        # of the intermediate 90 equals neither the latest desired (85) nor the
+        # baseline (X), so only the full outstanding list — not one scalar slot
+        # — can exempt it.
         #
-        # The exemption must match the SPECIFIC level the broker still carries
-        # (``pre_put_sl_level``) and the unchanged TP / trailing (the recompute
-        # only moves the SL field). An observation diverging from BOTH the new
-        # desired and that pre-PUT level is an operator's manual broker-side
-        # edit; suppressing it here would let ``drive_native_failsafe`` dispatch
-        # the queued PUT and overwrite the manual edit instead of flipping
-        # ownership to UNKNOWN. Only the genuinely stale pre-PUT level is exempt.
-        if (state.pre_put_active
-                and self._levels_equal(stop_level, state.pre_put_sl_level)
-                and self._levels_equal(profit_level, state.desired_profit_level)
-                and self._levels_equal(trailing_stop, state.desired_trailing_stop)):
+        # The match must be on the FULL triple: the recompute only moves the SL,
+        # but a coexisting TP / trailing edit with the SL untouched is still a
+        # genuine external edit. On a match the broker has provably reached that
+        # dispatched level, so every entry older than the matched one can no
+        # longer be carried — prune them and keep the matched entry plus any
+        # newer ones (the latest desired may still be in flight behind it).
+        matched_idx = self._match_outstanding(
+            state, stop_level, profit_level, trailing_stop,
+        )
+        if matched_idx is not None:
+            del state.outstanding[:matched_idx]
             return
         # §2.6.5 trail coalesce / step-threshold: when `recompute_worst_sl`
         # was called with ``trigger_kind='trail'`` and the dispatch was
@@ -892,12 +953,12 @@ class NativeFailsafeManager:
         if state.owner is FailsafeOwner.ENGINE_FAILSAFE:
             state.owner = FailsafeOwner.UNKNOWN
             # Ownership left the engine because the broker carries an operator's
-            # manual edit — the pre-PUT baseline is no longer meaningful. Clear
-            # the lifetime flag so a later ``reset_to_engine`` re-queue followed
-            # by an observation that happens to equal the now-stale
-            # ``pre_put_sl_level`` cannot be wrongly exempted.
-            state.pre_put_active = False
-            state.pre_put_sl_level = None
+            # manual edit — the outstanding baseline / dispatched levels are no
+            # longer meaningful. Clear the list (and reset the confirmation-
+            # timeout anchor) so a later ``reset_to_engine`` re-queue followed by
+            # an observation that happens to equal a now-stale outstanding level
+            # cannot be wrongly exempted.
+            self._clear_outstanding(state)
             # Drop any snapshot a same-sync recompute queued but did not yet
             # dispatch. The owner just flipped to UNKNOWN because the broker
             # carries an operator's manual edit; the engine no longer owns the
@@ -965,9 +1026,29 @@ class NativeFailsafeManager:
         state.last_failure_reason = None
         state.last_failure_ts_ms = None
         state.degrading_since_ts_ms = None
+        # The user intervened, so any outstanding baseline / dispatched levels
+        # are no longer a reliable picture of the broker. Drop them (and the
+        # confirmation-timeout anchor / degraded reason) so the re-queued PUT
+        # below starts a fresh confirmation cycle.
+        self._clear_outstanding(state)
+        state.degraded_reason = None
         state.generation += 1
         state.last_desired_change_ts_ms = now_ms
-        self._pending[parent_entry_dispatch_ref] = self._build_snapshot(state)
+        snapshot = self._build_snapshot(state)
+        self._pending[parent_entry_dispatch_ref] = snapshot
+        # Seed the confirmation cycle for the re-queued PUT, mirroring
+        # :meth:`recompute_worst_sl` / :meth:`flush_coalesced_trails`. Without
+        # this the reset dispatch leaves ``outstanding`` empty, so
+        # :meth:`tick_stale_window` never arms the confirmation-timeout path for
+        # an acked-but-unconfirmed reset PUT (the state would stay HEALTHY with
+        # an unverified broker stop forever), and a lagging pre-reset broker
+        # observation arriving after the PUT succeeds matches no outstanding
+        # entry and falsely flips ownership straight back to UNKNOWN. The user
+        # intervened, so there is no trustworthy pre-reset broker baseline to
+        # carry — the only level the broker may legitimately show next is the one
+        # this reset dispatches, which ``_note_batch_start`` records (at the
+        # post-bump generation) while it sets the batch-start anchor.
+        self._note_batch_start(state, sl=state.desired_level, now_ms=now_ms)
         if state.health is not FailsafeHealth.HEALTHY:
             self._transition(state, FailsafeHealth.HEALTHY, 'user reset')
 
@@ -1073,6 +1154,25 @@ class NativeFailsafeManager:
 
     # --- Internals -----------------------------------------------------
 
+    def _worst_sl(
+            self, state: NativeStopState, active_sl_levels: Iterable[float],
+    ) -> float | None:
+        """Worst-SL across the active legs, snapped to the symbol's tick grid.
+
+        The *worst* stop is the loosest one still protecting the parent: the
+        lowest for a long, the highest for a short. An empty set means no leg
+        wants a stop, so the desired level is ``None`` (a clear). Records the
+        leg count for the ``degrading → healthy`` recovery telemetry and snaps
+        the result to the tick grid so a later broker observation (also snapped
+        in :meth:`on_native_bracket_observed`) confirms by exact compare.
+        """
+        levels = list(active_sl_levels)
+        state.last_active_sl_count = len(levels)
+        if not levels:
+            return None
+        worst = min(levels) if state.parent_side == 'long' else max(levels)
+        return self._round_to_tick(worst, state)
+
     def _build_snapshot(self, state: NativeStopState) -> NativeBracketSnapshot:
         return NativeBracketSnapshot(
             parent_entry_dispatch_ref=state.parent_entry_dispatch_ref,
@@ -1083,6 +1183,182 @@ class NativeFailsafeManager:
             trailing_stop=state.desired_trailing_stop,
             generation=state.generation,
         )
+
+    # --- Outstanding-levels bookkeeping (§2.6.7 confirmation tracking) --
+
+    def _note_batch_start(
+            self, state: NativeStopState, *, sl: float | None, now_ms: float,
+    ) -> None:
+        """Capture the broker baseline at the start of a fresh in-flight batch.
+
+        When ``outstanding`` is empty the broker is showing ``sl`` together with
+        the unchanged coexisting TP / trailing; record that triple as the oldest
+        outstanding entry (it stays exempt until a confirmation prunes it) and
+        anchor the confirmation-timeout window at ``now_ms``. Called before the
+        generation bump, so the baseline carries the generation the broker level
+        currently corresponds to. A no-op once the list is non-empty, so a
+        follow-up dispatch arriving while earlier PUTs are unconfirmed never
+        clobbers the genuine baseline.
+        """
+        if state.outstanding:
+            return
+        state.outstanding_since_ts_ms = now_ms
+        state.outstanding.append(OutstandingLevel(
+            sl=sl,
+            profit_level=state.desired_profit_level,
+            trailing_stop=state.desired_trailing_stop,
+            generation=state.generation,
+            dispatch_ts_ms=now_ms,
+        ))
+
+    def _append_outstanding(
+            self, state: NativeStopState, snapshot: NativeBracketSnapshot, *,
+            now_ms: float,
+    ) -> None:
+        """Record a freshly dispatched level as an outstanding entry."""
+        state.outstanding.append(OutstandingLevel(
+            sl=snapshot.stop_level,
+            profit_level=snapshot.profit_level,
+            trailing_stop=snapshot.trailing_stop,
+            generation=snapshot.generation,
+            dispatch_ts_ms=now_ms,
+        ))
+        self._compact_outstanding(state)
+
+    def _clear_outstanding(self, state: NativeStopState) -> None:
+        """Drop all outstanding entries and reset the confirmation-timeout
+        anchor — used on a latest-desired confirm, an external edit, and a
+        user reset."""
+        state.outstanding.clear()
+        state.outstanding_since_ts_ms = None
+        state.batch_put_acked = False
+
+    def _match_outstanding(
+            self,
+            state: NativeStopState,
+            stop_level: float | None,
+            profit_level: float | None,
+            trailing_stop: float | None,
+    ) -> int | None:
+        """Index of the HIGHEST-generation outstanding entry whose full triple
+        equals the observation, or ``None`` when none match.
+
+        Entries are appended in generation order, so the highest index is the
+        highest generation; returning the latest match lets the caller prune
+        every older entry the broker has provably moved past.
+        """
+        for i in range(len(state.outstanding) - 1, -1, -1):
+            entry = state.outstanding[i]
+            if (self._levels_equal(stop_level, entry.sl)
+                    and self._levels_equal(profit_level, entry.profit_level)
+                    and self._levels_equal(trailing_stop, entry.trailing_stop)):
+                return i
+        return None
+
+    def _compact_outstanding(self, state: NativeStopState) -> None:
+        """Cap the outstanding list length (memory backstop only).
+
+        Correctness comes from confirmation-driven pruning in
+        :meth:`on_native_bracket_observed` and from :meth:`tick_stale_window`
+        freezing growth once the confirmation-timeout window expires (``degraded``
+        makes :meth:`recompute_worst_sl` a no-op). This cap is never reached in
+        practice — it only bounds memory under a pathological never-confirming
+        churn. The newest entries (including the current desired target) are
+        kept; the oldest baseline is the first dropped, which is safe because by
+        the time the cap is hit the state is long since DEGRADED.
+        """
+        excess = len(state.outstanding) - _OUTSTANDING_LEVELS_CAP
+        if excess > 0:
+            del state.outstanding[:excess]
+
+    def _tick_degrading_stale_window(
+            self, state: NativeStopState, *, now_ms: float,
+    ) -> None:
+        """DEGRADING → DEGRADED once the PUT-failure stale window expires."""
+        window = state.stale_window_ms or self._stale_window_ms
+        # ``degrading_since_ts_ms`` is set when the state enters DEGRADING and
+        # stays frozen across subsequent retry failures so the timer measures
+        # "time since the failsafe started failing". The legacy
+        # ``last_failure_ts_ms`` fall-back covers states that were already
+        # DEGRADING before this field existed (persisted/restored state). Use
+        # ``is not None`` rather than truthiness so a deterministic test/replay
+        # clock starting at ``0.0`` still anchors at the first failure instead
+        # of sliding forward on every retry.
+        if state.degrading_since_ts_ms is not None:
+            anchor = state.degrading_since_ts_ms
+        elif state.last_failure_ts_ms is not None:
+            anchor = state.last_failure_ts_ms
+        elif state.last_desired_change_ts_ms is not None:
+            anchor = state.last_desired_change_ts_ms
+        else:
+            return
+        if (now_ms - anchor) < window:
+            return
+        self._transition(state, FailsafeHealth.DEGRADED, 'stale-window expired')
+        # Once the stale window has expired, manual ``set_risk`` /
+        # ``reset_to_engine`` is required before the engine writes the
+        # broker-native stop again (§2.6.7). Leaving ``pending_retry`` and the
+        # queued snapshot intact would let the very next ``drive_native_failsafe``
+        # tick re-dispatch the same failed PUT — ``pending_dispatch()`` runs
+        # immediately after ``tick_stale_window`` — and ``record_put_failure``
+        # would then re-queue it on every failure. Drop both so DEGRADED really
+        # blocks dispatch until the user resets.
+        state.pending_retry = False
+        self._pending.pop(state.parent_entry_dispatch_ref, None)
+        self._emit(BrokerNativeFailsafeUnavailableEvent(
+            parent_entry_dispatch_ref=state.parent_entry_dispatch_ref,
+            symbol=state.symbol,
+            reason=state.last_failure_reason or 'stale-window expired',
+        ))
+
+    def _tick_confirmation_timeout(
+            self, state: NativeStopState, *, now_ms: float,
+    ) -> None:
+        """HEALTHY → DEGRADED when dispatched levels go unconfirmed too long.
+
+        The anchor is the batch-start timestamp (``outstanding_since_ts_ms``),
+        not the newest dispatch: churn that re-dispatches faster than the broker
+        confirms must not slide the deadline forever, and a long-idle parent
+        must not be punished the instant it dispatches again. Only a confirming
+        snapshot of the latest desired triple clears the list and resets the
+        anchor, so the window genuinely measures "how long the current batch has
+        been unconfirmed".
+        """
+        if not state.batch_put_acked:
+            # No PUT for this batch has been acknowledged by the broker yet
+            # (state-only run, the queue not drained, a PUT still in flight, or a
+            # PUT that failed and is awaiting a budgeted retry). There is no
+            # acked-but-unconfirmed broker stop to time out — escalating now would
+            # wrongly DEGRADED-block entries (and a failed PUT with retries left
+            # is owned by the retry budget → DEGRADING path, not this one). Once
+            # :meth:`record_put_success` acks a PUT the window applies.
+            return
+        anchor = state.outstanding_since_ts_ms
+        if anchor is None:
+            return
+        window = state.stale_window_ms or self._stale_window_ms
+        if (now_ms - anchor) < window:
+            return
+        # Confirmation never arrived. Escalate to DEGRADED so the symbol-level
+        # gates engage — but DO NOT touch ownership (nobody edited the stop) and
+        # DO NOT re-dispatch (a broken / again-lagging feed proves nothing, and a
+        # blind re-PUT could clobber a manual edit). A later confirming snapshot
+        # auto-recovers this state in :meth:`on_native_bracket_observed`; the
+        # ``degraded_reason`` tag scopes that recovery so a PUT-failure DEGRADED
+        # still requires an explicit user reset.
+        state.degraded_reason = 'confirmation-timeout'
+        self._transition(state, FailsafeHealth.DEGRADED, 'confirmation-timeout')
+        # Defensively drop any queued snapshot so ``pending_dispatch()`` (which
+        # runs straight after this tick) cannot blind-re-dispatch. There is
+        # normally nothing queued here — the PUTs were acked — but a stray entry
+        # must not slip a PUT past the DEGRADED gate.
+        state.pending_retry = False
+        self._pending.pop(state.parent_entry_dispatch_ref, None)
+        self._emit(BrokerNativeFailsafeUnavailableEvent(
+            parent_entry_dispatch_ref=state.parent_entry_dispatch_ref,
+            symbol=state.symbol,
+            reason='confirmation-timeout',
+        ))
 
     def _round_to_tick(
             self, level: float | None, state: NativeStopState,
