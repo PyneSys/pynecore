@@ -2765,8 +2765,8 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param id: The identifier of the order
     :param direction: The direction of the trade (strategy.long or strategy.short)
     :param qty: The number of contracts/shares/lots/units to trade when the order fills
-    :param limit: The limit price of the order (creates limit or stop-limit order)
-    :param stop: The stop price of the order (creates stop or stop-limit order)
+    :param limit: The limit price of the order. With ``stop`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
+    :param stop: The stop price of the order. With ``limit`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
     :param oca_name: The name of the One-Cancels-All (OCA) group
     :param oca_type: Specifies how an unfilled order behaves when another order in the same OCA group executes
     :param comment: Additional notes on the filled order

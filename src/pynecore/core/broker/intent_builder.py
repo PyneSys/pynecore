@@ -58,8 +58,16 @@ def _side_from_size(size: float) -> str:
 
 
 def _infer_order_type(limit: float | None, stop: float | None) -> OrderType:
-    if limit is not None and stop is not None:
-        return OrderType.STOP_LIMIT
+    """Map a Pine entry's ``limit``/``stop`` prices to a broker order type.
+
+    Pine has no "stop-limit" entry. When BOTH prices are set the order is two
+    OCO legs: a LIMIT below the open (guaranteed-price pullback) and a STOP
+    above (market-on-rise). The sync engine realises the both-set case as a
+    native resting LIMIT plus a software price-watch on the stop side, so the
+    inferred type is LIMIT — both-set and limit-only share the same resting
+    leg. The ``EntryIntent`` still carries the ``stop`` price for the engine
+    to arm its watch.
+    """
     if limit is not None:
         return OrderType.LIMIT
     if stop is not None:

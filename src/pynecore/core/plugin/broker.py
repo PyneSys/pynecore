@@ -212,7 +212,13 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
         | no limit, no stop   | MARKET       | None     | None     |
         | limit only          | LIMIT        | price    | None     |
         | stop only           | STOP         | None     | trigger  |
-        | limit + stop        | STOP_LIMIT   | price    | trigger  |
+
+        A both-set Pine entry (``limit`` AND ``stop``) is not a stop-limit
+        order — Pine has none. The sync engine splits it into two OCO legs
+        before dispatch: the LIMIT leg arrives here as ``order_type=LIMIT``,
+        and if the stop side triggers the engine sends a separate
+        ``order_type=MARKET`` entry. The plugin therefore never receives a
+        single both-set order — only plain MARKET / LIMIT / STOP.
         """
 
     @abstractmethod

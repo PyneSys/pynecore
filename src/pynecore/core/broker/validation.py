@@ -46,10 +46,6 @@ def validate_at_startup(
         errors.append(
             "Script uses stop orders, but the exchange doesn't support them."
         )
-    if reqs.stop_limit_orders and not caps.stop_limit_order.is_supported:
-        errors.append(
-            "Script uses stop-limit orders, but the exchange doesn't support them."
-        )
     if reqs.tp_sl_bracket and not caps.tp_sl_bracket.is_supported:
         errors.append(
             "Script uses TP+SL exit brackets (OCA reduce), but the exchange "

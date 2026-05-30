@@ -76,7 +76,6 @@ class OrderType(StrEnum):
     MARKET = "market"
     LIMIT = "limit"
     STOP = "stop"
-    STOP_LIMIT = "stop_limit"
     TRAILING_STOP = "trailing_stop"
 
 
@@ -269,8 +268,13 @@ class ExchangeCapabilities:
     # SOFTWARE = plugin emulates it (e.g. a poll loop that converts a
     # client-side trigger price into a market submit). UNSUPPORTED rejects
     # scripts that use the corresponding Pine parameter.
+    #
+    # A both-set Pine entry (``strategy.entry(limit=, stop=)``) is NOT a
+    # single stop-limit primitive — it is two OCO legs. The broker layer
+    # places the LIMIT leg as a native resting order and arms the STOP leg
+    # as a software price-watch that fires a MARKET order, so no dedicated
+    # stop-limit capability is needed.
     stop_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
-    stop_limit_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
     # NATIVE = server-side trailing stop (e.g. Capital.com
     # ``trailingStop=true, stopDistance``). SOFTWARE = plugin tracks the
     # last extreme and amends the SL each tick / bar.
@@ -397,6 +401,18 @@ class EntryIntent:
     comment: str | None = None
     alert_message: str | None = None
     is_strategy_order: bool = False  # True if from strategy.order() (no pyramiding limit)
+    # ``True`` only on the synthetic MARKET intent the entry-stop engine
+    # dispatches when the STOP leg of a both-set Pine entry fires (see
+    # :class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`).
+    # The plugin uses it to pick
+    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY_STOP` — a distinct
+    # client-order-id from the native LIMIT leg's
+    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY` — so the stop-fired
+    # market and the just-cancelled limit never share an idempotency key (which
+    # would make the broker's local dedup skip the market POST). ``compare=False``
+    # keeps it out of the diff equality: it is a dispatch route selector derived
+    # by the engine, not Pine-level state the diff needs to sync.
+    stop_fired_market: bool = field(default=False, compare=False)
 
     @property
     def intent_key(self) -> str:
@@ -1077,7 +1093,6 @@ class ScriptRequirements:
     market_orders: bool = False
     limit_orders: bool = False
     stop_orders: bool = False
-    stop_limit_orders: bool = False
     tp_sl_bracket: bool = False  # strategy.exit() with BOTH limit+stop or profit+loss
     trailing_stop: bool = False
     strategy_order: bool = False  # strategy.order() — no pyramiding limit

@@ -74,6 +74,6 @@ def __test_script_requirements_defaults_all_false__():
     reqs = ScriptRequirements()
     assert not any([
         reqs.market_orders, reqs.limit_orders, reqs.stop_orders,
-        reqs.stop_limit_orders, reqs.tp_sl_bracket,
+        reqs.tp_sl_bracket,
         reqs.trailing_stop, reqs.strategy_order,
     ])

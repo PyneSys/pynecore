@@ -89,12 +89,15 @@ def __test_stop_entry__():
     assert i.stop == 49_000.0 and i.limit is None
 
 
-def __test_stop_limit_entry__():
+def __test_both_set_entry_infers_limit__():
+    # Pine has no stop-limit entry: a both-set order is two OCO legs. The
+    # native resting leg is the LIMIT, so the inferred order type is LIMIT;
+    # the intent still carries the stop price for the engine's software watch.
     intents = build_intents(
         {"L": _entry("L", 1.0, limit=50_000.0, stop=49_500.0)}, {}, SYMBOL,
     )
     i = intents[0]
-    assert i.order_type is OrderType.STOP_LIMIT
+    assert i.order_type is OrderType.LIMIT
     assert i.limit == 50_000.0 and i.stop == 49_500.0
 
 

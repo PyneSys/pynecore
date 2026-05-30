@@ -41,6 +41,8 @@ from typing import Final
 
 __all__ = [
     'KIND_ENTRY',
+    'KIND_ENTRY_STOP',
+    'KIND_ENTRY_STOP_WATCH',
     'KIND_EXIT_TP',
     'KIND_EXIT_SL',
     'KIND_EXIT_TP_PARTIAL',
@@ -62,6 +64,18 @@ __all__ = [
 # === Kind codes (single-character) =======================================
 
 KIND_ENTRY: Final[str] = 'e'
+# Market entry fired by the software price-watch on the STOP side of a both-set
+# Pine entry (``strategy.entry(limit=, stop=)``). Distinct from KIND_ENTRY so
+# the stop-fired MARKET and the native LIMIT leg of the same ``pine_id`` get
+# different client-order-ids — the engine persists this id before the POST so a
+# crash-restart can verify-before-resend and never double-open.
+KIND_ENTRY_STOP: Final[str] = 'b'
+# Storage-only client-order-id for the engine-internal entry-stop WATCH row
+# (no exchange order — the software state machine owns it, mirroring the
+# partial-bracket leg rows). Distinct from KIND_ENTRY_STOP ('b'), which is the
+# actual stop-fired MARKET order, so the watch row and the market order never
+# share an ``orders`` table primary key.
+KIND_ENTRY_STOP_WATCH: Final[str] = 'w'
 KIND_EXIT_TP: Final[str] = 't'
 KIND_EXIT_SL: Final[str] = 's'
 # Engine-trigger partial bracket leg kinds. Distinct lowercase codes —
@@ -77,7 +91,8 @@ KIND_MODIFY_ENTRY: Final[str] = 'n'
 KIND_MODIFY_EXIT: Final[str] = 'r'
 
 VALID_KINDS: Final[frozenset[str]] = frozenset({
-    KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL,
+    KIND_ENTRY, KIND_ENTRY_STOP, KIND_ENTRY_STOP_WATCH,
+    KIND_EXIT_TP, KIND_EXIT_SL,
     KIND_EXIT_TP_PARTIAL, KIND_EXIT_SL_PARTIAL, KIND_EXIT_TRAIL_PARTIAL,
     KIND_CLOSE, KIND_CANCEL,
     KIND_MODIFY_ENTRY, KIND_MODIFY_EXIT,

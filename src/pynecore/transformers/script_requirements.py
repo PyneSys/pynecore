@@ -29,7 +29,6 @@ __all__ = ['ScriptRequirementsTransformer']
 _FLAG_MARKET = 'market_orders'
 _FLAG_LIMIT = 'limit_orders'
 _FLAG_STOP = 'stop_orders'
-_FLAG_STOP_LIMIT = 'stop_limit_orders'
 _FLAG_BRACKET = 'tp_sl_bracket'
 _FLAG_TRAIL = 'trailing_stop'
 _FLAG_STRATEGY_ORDER = 'strategy_order'
@@ -104,7 +103,6 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             _FLAG_MARKET: False,
             _FLAG_LIMIT: False,
             _FLAG_STOP: False,
-            _FLAG_STOP_LIMIT: False,
             _FLAG_BRACKET: False,
             _FLAG_TRAIL: False,
             _FLAG_STRATEGY_ORDER: False,
@@ -163,9 +161,12 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
         if is_strategy_order:
             self._reqs[_FLAG_STRATEGY_ORDER] = True
         if has_limit and has_stop:
-            self._reqs[_FLAG_STOP_LIMIT] = True
+            # Pine has no stop-limit entry: a both-set order is two OCO legs.
+            # The broker layer rests the LIMIT leg natively and fires the STOP
+            # leg as a software price-watch → MARKET order, so the script needs
+            # both the limit and market capabilities (not a native stop entry).
             self._reqs[_FLAG_LIMIT] = True
-            self._reqs[_FLAG_STOP] = True
+            self._reqs[_FLAG_MARKET] = True
         elif has_limit:
             self._reqs[_FLAG_LIMIT] = True
         elif has_stop:

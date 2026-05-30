@@ -355,6 +355,76 @@ EXTRAS_KEY_OCA_TYPE = 'oca_type'
 EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS = 'cancel_tentative_since_ts_ms'
 
 
+# === Entry-stop watch constants ============================================
+
+# ``orders.state`` marker for a synthetic entry-stop WATCH row. A both-set
+# Pine entry (``strategy.entry(limit=, stop=)``) is two OCO legs: the LIMIT
+# leg rests natively as a working order, while the STOP leg is a software
+# price-watch that fires a MARKET order on the stop side. This row carries
+# NO exchange-side order (the native LIMIT and the eventual MARKET have their
+# own rows) — the :class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`
+# state machine owns it. Mirrors :data:`STATE_PARTIAL_BRACKET_LEG`: the
+# journal / reconcile paths short-circuit on these rows and the actual watch
+# phase lives under :data:`EXTRAS_KEY_ENTRY_STOP_STATE`.
+STATE_ENTRY_STOP_WATCH = 'entry_stop_watch'
+
+# ``extras[EXTRAS_KEY_ENTRY_STOP_STATE]`` values — the entry-stop watch state
+# machine's current phase. ``armed`` watches the price against the stop level
+# while the native LIMIT rests. ``cancel_pending`` is latched once the stop is
+# crossed: the engine cancels the native LIMIT and gates the market on the
+# cancel disposition. ``stop_market_pending`` is reached only after the LIMIT
+# cancel is CONFIRMED — the deterministic MARKET client-order-id is persisted
+# before the POST so a restart verifies-before-resends and never double-opens.
+# The three terminal states record which leg of the OCO won.
+ENTRY_STOP_STATE_ARMED = 'armed'
+ENTRY_STOP_STATE_CANCEL_PENDING = 'cancel_pending'
+ENTRY_STOP_STATE_MARKET_PENDING = 'stop_market_pending'
+ENTRY_STOP_STATE_LIMIT_WON = 'limit_won'
+ENTRY_STOP_STATE_STOP_WON = 'stop_won'
+ENTRY_STOP_STATE_ABORTED = 'aborted'
+
+# Terminal states — the row is closed and the engine no longer owns it.
+ENTRY_STOP_STATE_TERMINAL: frozenset[str] = frozenset({
+    ENTRY_STOP_STATE_LIMIT_WON,
+    ENTRY_STOP_STATE_STOP_WON,
+    ENTRY_STOP_STATE_ABORTED,
+})
+
+# Live states — the row is alive and the engine state machine drives the next
+# transition. ``cancel_pending`` and ``stop_market_pending`` are latched
+# intermediates: on restart the engine re-drives them deterministically
+# (re-issue the idempotent cancel / re-dispatch the idempotent market) rather
+# than re-evaluating the price.
+ENTRY_STOP_STATE_LIVE: frozenset[str] = frozenset({
+    ENTRY_STOP_STATE_ARMED,
+    ENTRY_STOP_STATE_CANCEL_PENDING,
+    ENTRY_STOP_STATE_MARKET_PENDING,
+})
+
+# Abortable states — an external cancel / reject of the native LIMIT leg may
+# retire the watch only here. Once the watch has committed to the stop side
+# (``stop_market_pending`` — the deterministic KIND_ENTRY_STOP market id is
+# already persisted and the MARKET is in flight), a delayed broker
+# cancelled/rejected ack for the now-cancelled LIMIT must NOT abort it; that
+# echo would corrupt the persist-first ledger and drop the verify-before-resend
+# watch on restart. ``stop_market_pending`` is therefore deliberately excluded.
+ENTRY_STOP_STATE_ABORTABLE: frozenset[str] = frozenset({
+    ENTRY_STOP_STATE_ARMED,
+    ENTRY_STOP_STATE_CANCEL_PENDING,
+})
+
+# Canonical ``extras`` keys for an entry-stop watch row.
+EXTRAS_KEY_ENTRY_STOP_STATE = 'entry_stop_state'
+# Absolute price the watch fires the market at (the Pine entry's ``stop``).
+EXTRAS_KEY_ENTRY_STOP_LEVEL = 'entry_stop_level'
+# The native LIMIT leg's client-order-id — the leg-scoped cancel target.
+EXTRAS_KEY_ENTRY_STOP_LIMIT_COID = 'entry_stop_limit_coid'
+# The stop-fired MARKET order's deterministic client-order-id. Persisted on
+# the transition into ``stop_market_pending`` (BEFORE the POST) so a restart
+# can verify-before-resend.
+EXTRAS_KEY_ENTRY_STOP_MARKET_COID = 'entry_stop_market_coid'
+
+
 # === Entry order row lifecycle =============================================
 
 def create_entry_order_row(
@@ -1340,5 +1410,165 @@ def iter_active_engine_trigger_partial_legs(
             continue
         leg_state = (row.extras or {}).get(EXTRAS_KEY_LEG_STATE)
         if leg_state not in LEG_STATE_LIVE:
+            continue
+        yield row
+
+
+# === Entry-stop watch helpers ==============================================
+
+def create_entry_stop_watch_row(
+        store: 'RunContext',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str,
+        pine_entry_id: str,
+        stop_level: float,
+        limit_coid: str,
+        entry_stop_state: str = ENTRY_STOP_STATE_ARMED,
+        extra_payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist one entry-stop watch row (PERSIST-FIRST).
+
+    The row carries no exchange-side order — the
+    :class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`
+    state machine owns it. ``orders.state`` is set to
+    :data:`STATE_ENTRY_STOP_WATCH` so the journal / reconcile paths
+    short-circuit on these rows; the watch phase lives under
+    :data:`EXTRAS_KEY_ENTRY_STOP_STATE` and is advanced via
+    :func:`update_entry_stop_watch_state`.
+
+    :param store: The active run context.
+    :param coid: The watch row's deterministic client-order-id — built from
+        the parent entry envelope with
+        :data:`~pynecore.core.broker.idempotency.KIND_ENTRY_STOP_WATCH`, so a
+        restart-mid-dispatch never produces two rows for one watch. Distinct
+        from the stop-fired MARKET order's id
+        (:data:`~pynecore.core.broker.idempotency.KIND_ENTRY_STOP`).
+    :param symbol: Exchange-side symbol.
+    :param side: The ENTRY side (``'buy'`` / ``'sell'``) — the direction the
+        stop-fired MARKET opens in, same as the native LIMIT leg.
+    :param qty: Entry quantity, already quantized to the broker's lot step.
+    :param intent_key: The owning :class:`EntryIntent`'s diff key (≡ pine_id).
+    :param pine_entry_id: The Pine ``strategy.entry(id=...)`` value.
+    :param stop_level: Absolute price the watch fires the MARKET at.
+    :param limit_coid: The native LIMIT leg's client-order-id — the
+        leg-scoped cancel target when the stop crosses.
+    :param entry_stop_state: Initial state, normally
+        :data:`ENTRY_STOP_STATE_ARMED`.
+    :param extra_payload: Additional extras to merge into the row.
+    :raises ValueError: When ``entry_stop_state`` is not a live state.
+    """
+    if entry_stop_state not in ENTRY_STOP_STATE_LIVE:
+        raise ValueError(
+            f"create_entry_stop_watch_row: entry_stop_state must be one of "
+            f"{sorted(ENTRY_STOP_STATE_LIVE)}, got {entry_stop_state!r}"
+        )
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_ENTRY_STOP_STATE: entry_stop_state,
+        EXTRAS_KEY_ENTRY_STOP_LEVEL: stop_level,
+        EXTRAS_KEY_ENTRY_STOP_LIMIT_COID: limit_coid,
+        EXTRAS_KEY_ENTRY_STOP_MARKET_COID: None,
+    }
+    if extra_payload:
+        extras.update(extra_payload)
+    store.reopen_order(coid)
+    store.upsert_order(
+        coid,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        state=STATE_ENTRY_STOP_WATCH,
+        intent_key=intent_key,
+        pine_entry_id=pine_entry_id,
+        extras=extras,
+    )
+
+
+def update_entry_stop_watch_state(
+        store: 'RunContext',
+        *,
+        coid: str,
+        new_state: str,
+        market_coid: str | None = None,
+        extras_patch: Mapping[str, Any] | None = None,
+        close_row: bool | None = None,
+        stop_level: float | None = None,
+        qty: float | None = None,
+        side: str | None = None,
+) -> None:
+    """Transition an entry-stop watch row.
+
+    :param store: The active run context.
+    :param coid: The watch row's client-order-id.
+    :param new_state: Target :data:`EXTRAS_KEY_ENTRY_STOP_STATE` value.
+    :param market_coid: When non-``None``, persists the stop-fired MARKET
+        order's deterministic client-order-id under
+        :data:`EXTRAS_KEY_ENTRY_STOP_MARKET_COID`. Written on the transition
+        into :data:`ENTRY_STOP_STATE_MARKET_PENDING`, BEFORE the POST, so a
+        restart can verify-before-resend.
+    :param extras_patch: Additional extras keys to merge before the upsert.
+    :param close_row: When ``True``, also calls
+        :meth:`RunContext.close_order` — set on every transition into
+        :data:`ENTRY_STOP_STATE_TERMINAL`.
+    :param stop_level: When non-``None``, overwrites the watch's fire level
+        under :data:`EXTRAS_KEY_ENTRY_STOP_LEVEL`. Used by the modify path to
+        re-sync the software STOP leg to an amended both-set entry.
+    :param qty: When non-``None``, overwrites the watch row's ``qty`` column
+        (the stop-fired MARKET size). Same modify-path use as ``stop_level``.
+    :param side: When non-``None``, overwrites the watch row's ``side`` column
+        (the entry direction). Same modify-path use as ``stop_level``.
+    :raises ValueError: When ``new_state`` is not a canonical value.
+    """
+    if new_state not in (ENTRY_STOP_STATE_LIVE | ENTRY_STOP_STATE_TERMINAL):
+        raise ValueError(
+            f"update_entry_stop_watch_state: new_state must be one of "
+            f"{sorted(ENTRY_STOP_STATE_LIVE | ENTRY_STOP_STATE_TERMINAL)}, "
+            f"got {new_state!r}"
+        )
+    existing = store.get_order(coid)
+    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+    merged[EXTRAS_KEY_ENTRY_STOP_STATE] = new_state
+    if market_coid is not None:
+        merged[EXTRAS_KEY_ENTRY_STOP_MARKET_COID] = market_coid
+    if stop_level is not None:
+        merged[EXTRAS_KEY_ENTRY_STOP_LEVEL] = stop_level
+    if extras_patch:
+        merged.update(extras_patch)
+    upsert_fields: dict[str, Any] = {'extras': merged}
+    if qty is not None:
+        upsert_fields['qty'] = qty
+    if side is not None:
+        upsert_fields['side'] = side
+    store.upsert_order(coid, **upsert_fields)
+    if close_row:
+        store.close_order(coid)
+
+
+def iter_active_entry_stop_watches(
+        store: 'RunContext',
+        *,
+        symbol: str | None = None,
+) -> Iterator['OrderRow']:
+    """Iterate live entry-stop watch rows.
+
+    Used by :meth:`SoftwareEntryStopEngine.restart_replay` to rebuild the
+    in-memory watch ledger after a runner restart. Returns rows whose
+    ``orders.state`` is :data:`STATE_ENTRY_STOP_WATCH`, are not closed, and
+    whose :data:`EXTRAS_KEY_ENTRY_STOP_STATE` is one of
+    :data:`ENTRY_STOP_STATE_LIVE` (terminal rows are filtered out even when
+    ``close_order`` has not yet flipped ``closed_ts_ms``).
+
+    :param store: The active run context.
+    :param symbol: Optional symbol filter — passed straight through to
+        :meth:`RunContext.iter_live_orders`.
+    """
+    for row in store.iter_live_orders(symbol=symbol):
+        if row.state != STATE_ENTRY_STOP_WATCH:
+            continue
+        watch_state = (row.extras or {}).get(EXTRAS_KEY_ENTRY_STOP_STATE)
+        if watch_state not in ENTRY_STOP_STATE_LIVE:
             continue
         yield row

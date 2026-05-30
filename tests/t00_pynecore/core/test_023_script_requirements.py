@@ -80,7 +80,11 @@ def __test_entry_with_stop_detects_stop_orders__():
     assert _get_requirements_keyword(tree) == {'stop_orders': True}
 
 
-def __test_entry_with_limit_and_stop_detects_stop_limit__():
+def __test_entry_with_limit_and_stop_detects_limit_and_market__():
+    # Pine has no stop-limit entry: a both-set order is two OCO legs. The LIMIT
+    # leg rests natively; the STOP leg is a software price-watch that fires a
+    # MARKET order on cross. So the script needs the limit and market
+    # capabilities — NOT a native stop entry.
     tree = _transform("""
         @script.strategy('S')
         def main():
@@ -88,7 +92,7 @@ def __test_entry_with_limit_and_stop_detects_stop_limit__():
     """)
     flags = _get_requirements_keyword(tree)
     assert flags == {
-        'limit_orders': True, 'stop_orders': True, 'stop_limit_orders': True,
+        'limit_orders': True, 'market_orders': True,
     }
 
 
@@ -229,13 +233,13 @@ def __test_validate_reports_missing_bracket__():
 
 def __test_validate_collects_all_missing_capabilities__():
     reqs = ScriptRequirements(
-        stop_orders=True, stop_limit_orders=True,
+        stop_orders=True,
         tp_sl_bracket=True, trailing_stop=True,
         exit_orders=True,
     )
     caps = ExchangeCapabilities()
     errors = validate_at_startup(reqs, caps)
-    assert len(errors) == 5
+    assert len(errors) == 4
 
 
 def __test_validate_rejects_exit_without_reduce_only_capability__():
