@@ -5276,7 +5276,9 @@ class OrderSyncEngine:
         pine_id = intent.intent_key
         if self._entry_stop_engine.has_watch(pine_id):
             return
-        if intent.stop is None:
+        # Both-set only: the watch's KIND_ENTRY leg is the native LIMIT, so a
+        # stop-only entry (no limit) must never arm one — it is a native STOP.
+        if intent.stop is None or intent.limit is None:
             return
         watch_coid = envelope.client_order_id(KIND_ENTRY_STOP_WATCH)
         limit_coid = envelope.client_order_id(KIND_ENTRY)
@@ -9832,7 +9834,16 @@ class OrderSyncEngine:
                 # cycles), so the watch's leg-scoped cancel target stays valid;
                 # only the fire level / size / side change. amend_watch self-
                 # guards (no watch -> no-op), so a plain entry modify is a no-op.
-                if new.stop is not None:
+                #
+                # The software STOP watch exists ONLY for a both-set entry
+                # (native LIMIT + software STOP price-watch). The discriminator
+                # is therefore both-set, NOT ``new.stop is not None``: a
+                # stop-only entry (stop set, no limit) is a native STOP and must
+                # never carry a software watch — keying on ``new.stop`` alone
+                # would arm/keep a watch whose KIND_ENTRY leg is a STOP, not the
+                # LIMIT the watch assumes, double-arming against the native STOP.
+                new_is_both_set = new.limit is not None and new.stop is not None
+                if new_is_both_set:
                     if self._entry_stop_engine.has_watch(new.intent_key):
                         self._entry_stop_engine.amend_watch(
                             new.intent_key,
@@ -9841,11 +9852,13 @@ class OrderSyncEngine:
                             side=new.side,
                         )
                     else:
-                        # limit-only -> both-set: the STOP leg is new this amend.
+                        # promoted to both-set this amend (from limit-only,
+                        # market, or stop-only): the STOP leg is new.
                         self._arm_entry_stop_watch(new, new_env)
                 elif self._entry_stop_engine.has_watch(new.intent_key):
-                    # both-set -> limit-only: the STOP leg is gone; retire the
-                    # watch so no market ever fires (no-op once it has already
+                    # demoted away from both-set (to limit-only, stop-only, or
+                    # market): the software STOP leg is gone; retire the watch
+                    # so no market ever fires (no-op once it has already
                     # committed to the stop side).
                     self._entry_stop_engine.mark_aborted(
                         new.intent_key, reason='entry_stop_removed_by_modify',

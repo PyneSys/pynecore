@@ -85,6 +85,26 @@ class _FakeBroker:
     async def execute_cancel(self, envelope) -> bool:
         return True
 
+    async def modify_entry(self, old_env, new_env) -> list[ExchangeOrder]:
+        intent = new_env.intent
+        self.entries.append((intent, new_env))
+        return [ExchangeOrder(
+            id=f"ex-{intent.pine_id}-{intent.order_type.value}",
+            symbol=intent.symbol,
+            side=intent.side,
+            order_type=intent.order_type,
+            qty=intent.qty,
+            filled_qty=0.0,
+            remaining_qty=0.0,
+            price=intent.limit,
+            stop_price=intent.stop,
+            average_fill_price=intent.limit or intent.stop or 1.18,
+            status=OrderStatus.OPEN,
+            timestamp=0.0,
+            fee=0.0,
+            fee_currency="USD",
+        )]
+
     async def get_position(self, symbol):
         return self.positions.get(symbol)
 
@@ -115,6 +135,24 @@ def _both_set_entry() -> EntryIntent:
     return EntryIntent(
         pine_id="Long", symbol=SYMBOL, side="buy", qty=1.0,
         order_type=OrderType.LIMIT, limit=1.16, stop=1.18,
+    )
+
+
+def _stop_only_entry() -> EntryIntent:
+    # Long stop-only: a NATIVE STOP entry (rise), no limit leg. This must NEVER
+    # carry a software entry-stop watch — the watch's KIND_ENTRY leg assumes a
+    # native LIMIT, and a watch here would double-arm against the native STOP.
+    return EntryIntent(
+        pine_id="Long", symbol=SYMBOL, side="buy", qty=1.0,
+        order_type=OrderType.STOP, limit=None, stop=1.18,
+    )
+
+
+def _limit_only_entry() -> EntryIntent:
+    # Long limit-only: a plain native LIMIT entry, no stop leg, no watch.
+    return EntryIntent(
+        pine_id="Long", symbol=SYMBOL, side="buy", qty=1.0,
+        order_type=OrderType.LIMIT, limit=1.16, stop=None,
     )
 
 
@@ -240,3 +278,81 @@ def __test_native_limit_fill_retires_watch__():
     # A later price cross has no armed watch -> no market.
     eng._drive_entry_stop_triggers(last_price=1.185)
     assert broker.entries == []
+
+
+# === modify keeps the software watch in lockstep with the both-set state =====
+
+def __test_arm_skips_stop_only_entry__():
+    # Direct guard: a stop-only entry (native STOP, no limit) must NOT arm a
+    # software watch — only a both-set entry (limit AND stop) does.
+    broker = _FakeBroker(_caps())
+    eng = _engine(broker)
+    intent = _stop_only_entry()
+    eng._active_intents[intent.intent_key] = intent
+    envelope = eng._build_envelope(intent)
+    eng._arm_entry_stop_watch(intent, envelope)
+    assert eng._entry_stop_engine.get_watch("Long") is None
+
+
+def __test_modify_limit_only_to_stop_only_does_not_arm_watch__():
+    # Regression: modifying a limit-only entry to stop-only (native STOP) must
+    # NOT arm a software watch alongside the native STOP. Keying the modify arm
+    # on ``new.stop is not None`` alone (the pre-fix bug) would double-arm here.
+    broker = _FakeBroker(_caps())
+    eng = _engine(broker)
+    old = _limit_only_entry()
+    eng._active_intents[old.intent_key] = old
+    eng._run_async(eng._broker.execute_entry(eng._build_envelope(old)))
+    assert eng._entry_stop_engine.get_watch("Long") is None
+
+    new = _stop_only_entry()
+    eng._dispatch_modify(old, new)
+
+    # No software watch armed -> a later cross fires no extra market.
+    assert eng._entry_stop_engine.get_watch("Long") is None
+    broker.entries.clear()
+    eng._drive_entry_stop_triggers(last_price=1.185)
+    assert broker.entries == []
+
+
+def __test_modify_both_set_to_stop_only_retires_watch__():
+    # Regression: demoting a both-set entry to stop-only removes the software
+    # STOP leg; the watch must retire so no market ever fires (the native STOP
+    # now owns the trigger).
+    broker = _FakeBroker(_caps())
+    eng = _engine(broker)
+    old = _both_set_entry()
+    _arm(eng, old)
+    assert eng._entry_stop_engine.get_watch("Long") is not None
+
+    new = _stop_only_entry()
+    eng._dispatch_modify(old, new)
+
+    watch = eng._entry_stop_engine.get_watch("Long")
+    assert watch is None or watch.state not in (
+        ENTRY_STOP_STATE_ARMED, ENTRY_STOP_STATE_CANCEL_PENDING,
+    )
+    broker.entries.clear()
+    eng._drive_entry_stop_triggers(last_price=1.185)
+    assert broker.entries == []  # software watch no longer fires
+
+
+def __test_modify_both_set_amends_watch_stop_level__():
+    # A both-set -> both-set modify with a new stop level amends the existing
+    # watch in place (no re-arm, no retire); the armed level tracks the change.
+    broker = _FakeBroker(_caps())
+    eng = _engine(broker)
+    old = _both_set_entry()
+    _arm(eng, old)
+
+    new = EntryIntent(
+        pine_id="Long", symbol=SYMBOL, side="buy", qty=1.0,
+        order_type=OrderType.LIMIT, limit=1.16, stop=1.20,
+    )
+    eng._active_intents[new.intent_key] = new
+    eng._dispatch_modify(old, new)
+
+    watch = eng._entry_stop_engine.get_watch("Long")
+    assert watch is not None
+    assert watch.state == ENTRY_STOP_STATE_ARMED
+    assert watch.stop_level == 1.20
