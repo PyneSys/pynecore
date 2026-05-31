@@ -5,7 +5,7 @@ from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from pynecore.core.plugin import override, ProviderError
+from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
@@ -119,13 +119,26 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @classmethod
     @override
-    def get_list_of_brokers(cls) -> list[str]:
-        """Return the exchange ids CCXT can serve (e.g. ``"binance"``, ``"bybit"``)."""
+    def get_list_of_brokers(cls) -> list[Broker]:
+        """Return the exchanges CCXT can serve, with their display names.
+
+        The id is the CCXT exchange id (e.g. ``"binance"``); the name is the
+        exchange's human-readable title (e.g. ``"Binance"``), read from a
+        throwaway instance — construction is offline and cheap (~100 exchanges
+        in a fraction of a second).
+        """
         try:
             import ccxt
         except ImportError:
             raise ImportError("CCXT is not installed. Please install it using `pip install ccxt`.")
-        return list(ccxt.exchanges)
+        brokers: list[Broker] = []
+        for exchange_id in ccxt.exchanges:
+            try:
+                name = getattr(ccxt, exchange_id)().name or ""
+            except Exception:  # noqa: BLE001 - a single bad exchange must not drop the list
+                name = ""
+            brokers.append(Broker(id=exchange_id, name=name))
+        return brokers
 
     @classmethod
     @override

@@ -21,6 +21,8 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from pynecore.core.plugin import Broker
+
 from .keyreader import Key, KeyOrChar, raw_terminal, read_key
 
 # Footer block is one line of help text inside a Panel (2 border lines).
@@ -33,19 +35,23 @@ _LIST_CHROME_LINES = 2
 class BrokerPicker:
     """Single-pane filterable list of broker / exchange ids.
 
-    :ivar selected: The chosen broker once :meth:`run` returns, else ``None``.
+    Each row shows the id selector and, when the provider supplies one, a
+    human-readable name in a second column. Filtering matches either column;
+    selection returns the chosen broker's id.
+
+    :ivar selected: The chosen broker id once :meth:`run` returns, else ``None``.
     """
 
-    def __init__(self, brokers: list[str], *, provider_name: str):
+    def __init__(self, brokers: list[Broker], *, provider_name: str):
         """
-        :param brokers: The broker / exchange ids to choose from.
+        :param brokers: The brokers / exchanges to choose from.
         :param provider_name: Provider name shown in the panel title.
         """
-        self.brokers: list[str] = list(brokers)
+        self.brokers: list[Broker] = list(brokers)
         self.provider_name = provider_name
 
         # View state.
-        self.filtered: list[str] = list(self.brokers)
+        self.filtered: list[Broker] = list(self.brokers)
         self.cursor: int = 0
         self.scroll_offset: int = 0
         self.filter_text: str = ''
@@ -70,7 +76,8 @@ class BrokerPicker:
     def _apply_filter(self) -> None:
         if self.filter_text:
             needle = self.filter_text.lower()
-            self.filtered = [b for b in self.brokers if needle in b.lower()]
+            self.filtered = [b for b in self.brokers
+                             if needle in b.id.lower() or needle in b.name.lower()]
         else:
             self.filtered = list(self.brokers)
         if self.cursor >= len(self.filtered):
@@ -109,9 +116,9 @@ class BrokerPicker:
         return result
 
     def _select_current(self) -> bool:
-        """Commit the highlighted broker and request exit."""
+        """Commit the highlighted broker's id and request exit."""
         if self.filtered:
-            self.selected = self.filtered[self.cursor]
+            self.selected = self.filtered[self.cursor].id
         return False
 
     def _handle_filter_key(self, key: KeyOrChar) -> bool:
@@ -187,13 +194,21 @@ class BrokerPicker:
         self._ensure_cursor_visible(list_height)
         end = self.scroll_offset + list_height
         visible = self.filtered[self.scroll_offset:end]
+        # Align the name column to the widest id in the full list so it stays
+        # put while scrolling/filtering; only pad when at least one name exists.
+        id_width = max((len(b.id) for b in self.brokers), default=0)
+        has_names = any(b.name for b in self.brokers)
         lines: list[Text] = []
         for i, broker in enumerate(visible):
             idx = self.scroll_offset + i
-            if idx == self.cursor:
-                lines.append(Text(f"> {broker}", style="bold reverse"))
+            if has_names:
+                label = f"{broker.id:<{id_width}}  {broker.name}".rstrip()
             else:
-                lines.append(Text(f"  {broker}"))
+                label = broker.id
+            if idx == self.cursor:
+                lines.append(Text(f"> {label}", style="bold reverse"))
+            else:
+                lines.append(Text(f"  {label}"))
         if not lines:
             lines.append(Text("  (no matches)", style="dim"))
         title_parts = [f"{self.provider_name} brokers "

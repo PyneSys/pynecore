@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, NamedTuple
 from abc import abstractmethod, ABCMeta
 from pathlib import Path
 from datetime import datetime
@@ -8,6 +8,18 @@ from pynecore.core.syminfo import SymInfo
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 
 from . import Plugin, ConfigT
+
+
+class Broker(NamedTuple):
+    """A selectable broker / exchange of a :attr:`~ProviderPlugin.multi_broker` provider.
+
+    :ivar id: The canonical selector used in the provider string and the saved
+        filename (e.g. ``"pepperstoneuk"``, ``"binance"``). Must be space-free.
+    :ivar name: A human-readable display name (e.g. ``"Pepperstone - Europe"``,
+        ``"Binance"``), or ``""`` when the provider exposes none.
+    """
+    id: str
+    name: str = ""
 
 
 class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
@@ -170,7 +182,7 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         self.ohlcv_file.close()
 
     @classmethod
-    def get_list_of_brokers(cls) -> list[str]:
+    def get_list_of_brokers(cls) -> list[Broker]:
         """
         Get the list of brokers/exchanges this provider can serve.
 
@@ -179,7 +191,8 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         CLI catches and reports gracefully. Implemented as a classmethod so it
         can answer ``--list-brokers`` without a symbol-bound instance.
 
-        :return: List of broker/exchange selector names.
+        :return: List of :class:`Broker` records (``id`` selector + optional
+            human-readable ``name``).
         :raises NotImplementedError: If the provider does not enumerate brokers.
         """
         raise NotImplementedError(

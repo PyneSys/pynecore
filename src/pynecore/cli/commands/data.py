@@ -219,8 +219,10 @@ def download(
             except ProviderError as e:
                 secho(f"Error: {e}", err=True, fg=colors.RED)
                 raise Exit(1)
-            for b in sorted(brokers):
-                print(b)
+            ordered = sorted(brokers)
+            id_width = max((len(b.id) for b in ordered), default=0)
+            for b in ordered:
+                print(f"{b.id:<{id_width}}  {b.name}".rstrip() if b.name else b.id)
             return
 
         # In string mode, derive broker/symbol/timeframe from the provider
