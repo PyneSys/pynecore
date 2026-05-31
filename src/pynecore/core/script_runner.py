@@ -8,7 +8,7 @@ from datetime import datetime, UTC
 from pynecore import lib
 from pynecore.lib.log import broker_info, ohlcv_info
 from pynecore.types.ohlcv import OHLCV
-from pynecore.core.syminfo import SymInfo
+from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core.var_snapshot import VarSnapshot
@@ -456,14 +456,17 @@ class ScriptRunner:
         # Pine ``format.mintick`` path in ``lib.string.tostring`` strips
         # trailing zeros and would jitter the width, which is why we don't
         # route through it here.
-        mintick = getattr(syminfo, 'mintick', 0) or 0
-        if mintick > 0:
-            tick_str = f"{mintick:.20f}".rstrip('0').rstrip('.')
-            self._price_decimals = (
-                len(tick_str.split('.')[1]) if '.' in tick_str else 0
-            )
-        else:
-            self._price_decimals = 2
+        #
+        # The decimal count comes from ``str(mintick)`` (Python's shortest
+        # round-trip repr), so ``0.05`` yields ``2`` without exposing float
+        # dust. ``pricescale`` cannot be used: for fractional tick grids the
+        # generated symbol info stores ``pricescale = round(1 / mintick)``
+        # with ``minmove = 1`` (e.g. ``mintick=0.05`` -> ``pricescale=20``),
+        # so ``len(str(pricescale)) - 1`` would under-count decimals. When
+        # ``mintick`` is missing/zero we fall back to 2 decimals (the broker
+        # path uses a synthetic ``0.01`` tick for the same case).
+        _mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
+        self._price_decimals = mintick_decimals(_mintick) if _mintick > 0 else 2
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 

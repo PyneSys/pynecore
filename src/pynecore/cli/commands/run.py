@@ -27,7 +27,7 @@ from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.lib.log import broker_info, broker_warning
-from pynecore.core.syminfo import SymInfo
+from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
@@ -969,19 +969,13 @@ def run(
                     'arrow': ' ',
                 }
 
-                # Derive fixed price decimals from ``syminfo.mintick`` so
-                # the spinner prices keep a constant width (``1.16830`` /
+                # Derive fixed price decimals from ``syminfo.mintick`` so the
+                # spinner prices keep a constant width (``1.16830`` /
                 # ``1.16837`` instead of ``1.1683`` / ``1.16837``). Matches
-                # the same computation in ScriptRunner for the OHLCV log.
-                _mintick = getattr(syminfo, 'mintick', 0) or 0
-                if _mintick > 0:
-                    _tick_str = f"{_mintick:.20f}".rstrip('0').rstrip('.')
-                    price_decimals = (
-                        len(_tick_str.split('.')[1])
-                        if '.' in _tick_str else 0
-                    )
-                else:
-                    price_decimals = 2
+                # the same computation in ScriptRunner for the OHLCV log,
+                # including the 2-decimal fallback for missing/zero mintick.
+                _mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
+                price_decimals = mintick_decimals(_mintick) if _mintick > 0 else 2
 
                 def _spinner_text() -> str:
                     bid = spinner_state['bid']

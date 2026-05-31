@@ -189,3 +189,29 @@ class SymInfo:
         # Write to file
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
+
+
+def mintick_decimals(mintick: float) -> int:
+    """
+    Number of decimal places implied by a symbol's ``mintick``.
+
+    Derived from ``str(mintick)`` (Python's shortest round-trip repr), so
+    ``0.05`` yields ``2`` and ``0.025`` yields ``3`` without exposing float
+    dust (``f"{0.05:.20f}"`` would be ``"0.05000000000000000278"``). This
+    mirrors the ``format.mintick`` logic in :mod:`pynecore.lib.string` and is
+    correct for fractional tick grids, where ``pricescale`` may be
+    ``round(1 / mintick)`` (e.g. ``20`` for ``0.05``) rather than a power of
+    ten.
+
+    :param mintick: The symbol's minimum tick size.
+    :return: Decimal place count, ``0`` for non-positive or integer ticks.
+    """
+    if not mintick or mintick <= 0:
+        return 0
+    tick_str = str(mintick)
+    if 'e' in tick_str or 'E' in tick_str:
+        # Scientific notation (very small ticks): expand without float dust.
+        tick_str = f"{mintick:.20f}".rstrip('0')
+    if '.' not in tick_str:
+        return 0
+    return len(tick_str.rstrip('0').split('.')[1])
