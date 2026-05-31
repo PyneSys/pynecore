@@ -87,6 +87,10 @@ class AppState:
     def config_dir(self):
         return self.workdir / "config"
 
+    @property
+    def cache_dir(self):
+        return self.workdir / "cache"
+
 
 app_state = AppState()
 

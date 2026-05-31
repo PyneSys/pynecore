@@ -219,6 +219,10 @@ def main(
     output_dir = Path(workdir) / 'output' / 'logs'
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create cache directory (machine-written runtime state: auth sessions, etc.)
+    cache_dir = Path(workdir) / 'cache'
+    cache_dir.mkdir(exist_ok=True)
+
     # Create config directory
     config_dir = Path(workdir) / 'config'
     config_dir.mkdir(exist_ok=True)

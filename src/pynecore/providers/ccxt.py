@@ -47,6 +47,12 @@ _PYNECORE_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({
     'symbol_map',
 })
 
+# Fallback tick size when an exchange exposes no usable price precision at all.
+# Eight decimals is the common crypto default; an over-fine tick only adds
+# display precision, while a too-coarse one would silently round away real
+# price moves, so erring fine is the safe direction.
+_DEFAULT_MINTICK: float = 1e-8
+
 
 def add_space_before_uppercase(s):
     return re.sub(r'(?<!^)([A-Z])', r' \1', s)
@@ -302,6 +308,56 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             session_ends.append(SymInfoSession(day=i, time=time(hour=23, minute=59, second=59)))
         return opening_hours, session_starts, session_ends
 
+    def _derive_mintick(self, market_details: dict) -> float:
+        """Derive the minimum price increment (tick size) for a market.
+
+        CCXT exposes price precision in three different ``precisionMode``
+        flavours, and not every exchange populates ``precision.price`` at all:
+
+        * ``TICK_SIZE`` -- ``precision.price`` already *is* the tick size.
+        * ``DECIMAL_PLACES`` -- ``precision.price`` is a decimal-place count.
+        * ``SIGNIFICANT_DIGITS`` -- ``precision.price`` cannot map to a fixed
+          tick (it depends on the price magnitude) and is often ``None`` (e.g.
+          bitvavo).
+
+        For the latter two we fall back to the raw ``info['tickSize']`` the
+        exchange ships, then to ``limits.price.min``, and finally to a
+        conservative default so symbol info never crashes on a missing or
+        ambiguous precision.
+
+        :param market_details: A CCXT market dict.
+        :return: The tick size as a positive float.
+        """
+        import ccxt
+
+        precision_price = market_details.get('precision', {}).get('price')
+        mode = self._client.precisionMode
+
+        if precision_price is not None:
+            if mode == ccxt.TICK_SIZE:
+                return float(precision_price)
+            if mode == ccxt.DECIMAL_PLACES:
+                return 10.0 ** -int(precision_price)
+            # SIGNIFICANT_DIGITS: not a fixed tick -- fall through to raw values.
+
+        for raw in (market_details.get('info', {}).get('tickSize'),
+                    market_details.get('limits', {}).get('price', {}).get('min')):
+            if raw is None:
+                continue
+            try:
+                tick = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if tick > 0.0:
+                return tick
+
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s: no usable price precision for %r; defaulting tick size to %g",
+            self._client.id, self.symbol, _DEFAULT_MINTICK,
+        )
+        return _DEFAULT_MINTICK
+
     @override
     def update_symbol_info(self) -> SymInfo:
         """Update symbol info from the exchange."""
@@ -321,13 +377,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         assert self.timeframe is not None
         opening_hours, session_starts, session_ends = self._create_24_7_sessions()
 
-        # Calculate minmove and pricescale from mintick
-        mintick = market_details['precision']['price']
-        minmove = mintick
-        pricescale = 1
-        while minmove < 1.0:
-            pricescale *= 10
-            minmove *= 10
+        # Derive pricescale from the tick size. ``round_to_mintick`` divides by
+        # pricescale directly and ignores minmove, so the tick must be an
+        # integer reciprocal and minmove must stay 1.
+        mintick = self._derive_mintick(market_details)
+        pricescale = max(1, int(round(1.0 / mintick)))
+        if abs(mintick * pricescale - 1.0) > 1e-9:
+            raise CCXTError(
+                f"{self._client.id}: price tick {mintick} for {self.symbol!r} "
+                f"is not an integer reciprocal; cannot derive pricescale."
+            )
+        minmove = 1
 
         try:
             ticker = market_details['info']['symbol']

@@ -245,13 +245,99 @@ def download(
             config = ensure_config(config_cls,
                                    app_state.config_dir / 'plugins' / f'{provider_name}.toml')
 
+        def _fetch_symbols(sym: str | None) -> "tuple[ProviderPlugin, list[str], Path | None]":
+            """Construct the provider for ``sym`` and, when it is a selector-only
+            value (the provider leaves ``self.symbol`` as ``None``), fetch its
+            symbol list for the TUI. Shown behind a spinner.
+
+            :return: ``(provider_instance, symbol_list, tui_ohlcv_dir)``.
+            """
+            slist: list[str] = []
+            tdir: Path | None = None
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                          transient=True) as progress:
+                progress.add_task(description="Fetching market data...", total=None)
+                if sym is None:
+                    inst: ProviderPlugin = provider_class(symbol=None, timeframe=timeframe,
+                                                          config=config)
+                    tdir = app_state.data_dir
+                else:
+                    inst = provider_class(symbol=sym, timeframe=timeframe,
+                                          ohlcv_dir=app_state.data_dir, config=config)
+                if inst.symbol is None and sys.stdin.isatty():
+                    slist = inst.get_list_of_symbols()
+                    tdir = app_state.data_dir
+            return inst, slist, tdir
+
+        def _browse_symbols(inst: "ProviderPlugin", slist: list[str], tdir: Path,
+                            *, can_go_back: bool) -> bool:
+            """Launch the symbol browser TUI for ``inst``.
+
+            :param can_go_back: When True, ESC returns to the broker picker
+                instead of quitting the command.
+            :return: True if the user asked to go back to the broker list.
+            """
+            from ..utils.symbol_browser import SymbolBrowser
+            browser = SymbolBrowser(
+                inst,
+                slist,
+                ohlcv_dir=tdir,
+                default_timeframe=timeframe,
+                default_from=_format_date_default(time_from, "continue"),
+                default_to=_format_date_default(time_to, "now"),
+                default_chunk_size=chunk_size,
+                can_go_back=can_go_back,
+            )
+            browser.run()
+            return browser.go_back
+
+        provider_instance: ProviderPlugin | None = None
+        symbols_list: list[str] = []
+        tui_ohlcv_dir: Path | None = None
+
+        # Multi-broker providers (CCXT, cTrader) need a broker chosen before a
+        # symbol can be browsed. When none was given and we're interactive, drop
+        # into a broker picker first, then the symbol browser. The two form a
+        # loop: ESC in the symbol browser returns to the broker list rather than
+        # exiting, and a failure opening the chosen broker (e.g. an exchange that
+        # needs API credentials) returns to the picker with the error shown so
+        # another broker can be tried. Only the picker itself exits the command.
+        if (provider_class.multi_broker and symbol is None
+                and not list_symbols and sys.stdin.isatty()):
+            try:
+                with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                              transient=True) as progress:
+                    progress.add_task(description="Fetching available brokers...", total=None)
+                    brokers = provider_class.get_list_of_brokers()
+            except (NotImplementedError, ProviderError) as e:
+                secho(f"Error: {e}", err=True, fg=colors.RED)
+                raise Exit(1)
+            from ..utils.broker_picker import BrokerPicker
+            display_name = getattr(provider_class, 'plugin_name', provider_name)
+            picker = BrokerPicker(sorted(brokers), provider_name=display_name)
+            while True:
+                chosen = picker.run()
+                if chosen is None:
+                    return
+                try:
+                    provider_instance, symbols_list, tui_ohlcv_dir = _fetch_symbols(chosen)
+                except (NotImplementedError, ProviderError) as e:
+                    picker.error = str(e)
+                    continue
+                picker.error = None
+                assert tui_ohlcv_dir is not None
+                if _browse_symbols(provider_instance, symbols_list, tui_ohlcv_dir,
+                                   can_go_back=True):
+                    continue
+                return
+
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:
             try:
                 with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                               transient=True) as progress:
                     progress.add_task(description="Fetching market data...", total=None)
-                    provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
+                    provider_instance = provider_class(symbol=symbol, config=config)
                     symbols = provider_instance.get_list_of_symbols()
             except (NotImplementedError, ProviderError) as e:
                 secho(f"Error: {e}", err=True, fg=colors.RED)
@@ -260,36 +346,13 @@ def download(
                 print(s)
             return
 
-        # Some providers (e.g. CCXT) accept a selector-only ``--symbol``
-        # (just the exchange name): the constructor recognises it and
-        # leaves ``self.symbol`` as ``None``. That signals "we know which
-        # backend but not which instrument yet" — drop into the TUI to
-        # let the user pick. Otherwise proceed to the download path.
-        #
-        # When entering the TUI we deliberately omit ``ohlcv_dir`` from
-        # the constructor: the base class asserts ``symbol and timeframe``
-        # whenever ``ohlcv_dir`` is truthy, so passing it with ``symbol=None``
-        # would crash. The wizard sets ``provider.ohlcv_path`` /
-        # ``ohlcv_file`` itself once the user picks a symbol + timeframe.
-        symbols_list: list[str] = []
-        tui_ohlcv_dir: Path | None = None
+        # Some providers (e.g. CCXT) accept a selector-only ``--symbol`` (just
+        # the exchange name): the constructor recognises it and leaves
+        # ``self.symbol`` as ``None``. That signals "we know which backend but
+        # not which instrument yet" — drop into the TUI to let the user pick.
+        # Otherwise proceed to the download path.
         try:
-            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
-                          transient=True) as progress:
-                progress.add_task(description="Fetching market data...", total=None)
-                if symbol is None:
-                    provider_instance: ProviderPlugin = provider_class(
-                        symbol=None, timeframe=timeframe, config=config,
-                    )
-                    tui_ohlcv_dir = app_state.data_dir
-                else:
-                    provider_instance = provider_class(
-                        symbol=symbol, timeframe=timeframe,
-                        ohlcv_dir=app_state.data_dir, config=config,
-                    )
-                if provider_instance.symbol is None and sys.stdin.isatty():
-                    symbols_list = provider_instance.get_list_of_symbols()
-                    tui_ohlcv_dir = app_state.data_dir
+            provider_instance, symbols_list, tui_ohlcv_dir = _fetch_symbols(symbol)
         except NotImplementedError as e:
             secho(f"Error: {e}", err=True, fg=colors.RED)
             secho("Pass a symbol explicitly with -s/--symbol.",
@@ -305,17 +368,9 @@ def download(
                       "(or use --list-symbols for non-interactive listing).",
                       err=True, fg=colors.RED)
                 raise Exit(1)
-            from ..utils.symbol_browser import SymbolBrowser
             assert tui_ohlcv_dir is not None
-            SymbolBrowser(
-                provider_instance,
-                symbols_list,
-                ohlcv_dir=tui_ohlcv_dir,
-                default_timeframe=timeframe,
-                default_from=_format_date_default(time_from, "continue"),
-                default_to=_format_date_default(time_to, "now"),
-                default_chunk_size=chunk_size,
-            ).run()
+            _browse_symbols(provider_instance, symbols_list, tui_ohlcv_dir,
+                            can_go_back=False)
             return
 
         # Download symbol info if not exists

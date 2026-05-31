@@ -152,12 +152,19 @@ class SymbolBrowser:
                  default_from: str = "continue",
                  default_to: str = "now",
                  default_chunk_size: int | None = None,
+                 can_go_back: bool = False,
                  max_cache: int = 200):
         self.provider = provider
         self.symbols: list[str] = list(symbols)
         self.ohlcv_dir = ohlcv_dir
         self.default_chunk_size = default_chunk_size
         self.max_cache = max_cache
+
+        # When launched from the multi-broker picker, ESC returns to the broker
+        # list instead of quitting the command. ``go_back`` records that intent
+        # for the caller; ``q`` still quits outright.
+        self.can_go_back = can_go_back
+        self.go_back: bool = False
 
         # View state.
         self.filtered: list[str] = list(self.symbols)
@@ -349,6 +356,8 @@ class SymbolBrowser:
                 return True
             return True
         if key is Key.ESC:
+            if self.can_go_back:
+                self.go_back = True
             return False
         if key is Key.ENTER:
             self._enter_wizard()
@@ -1017,6 +1026,8 @@ class SymbolBrowser:
             help_text = Text("Downloading... please wait", style="dim")
         else:
             parts = "Up Down: navigate  -  PgUp PgDn: jump 10  -  /: search  -  Enter: download  -  q: quit"
+            if self.can_go_back:
+                parts += "  -  Esc: back to brokers"
             help_text = Text(parts, style="dim")
             if self.dl_status is not None:
                 style = "green" if self.dl_status_ok else "red"
