@@ -49,6 +49,8 @@ from pynecore.core.broker.idempotency import (
     KIND_EXIT_TP_PARTIAL,
     KIND_EXIT_TRAIL_PARTIAL,
     build_client_order_id,
+    hash_pine_id,
+    parse_client_order_id,
 )
 from pynecore.core.broker.intent_builder import build_intents
 from pynecore.lib.log import (
@@ -632,6 +634,51 @@ class OrderSyncEngine:
         # ``_build_envelope`` would pop into a recycled ``client_order_id``.
         self._persisted_envelope_anchors: dict[str, EnvelopeRecord] = {}
         self._persisted_pending_anchors: dict[str, PendingRecord] = {}
+        # Reject-bumped retry anchors, keyed by ``intent_key``. A
+        # :meth:`_reanchor_envelope_after_reject` anchor exists ONLY to keep
+        # a *same-bar* retry from reusing the spent COID; it must not tie a
+        # later-bar re-emit of the (freshly re-evaluated) signal to the
+        # rejected bar's identity. The record carries the bumped
+        # ``bar_ts_ms`` / ``retry_seq`` so :meth:`_build_envelope` can discard
+        # it once the bar advances and mint a fresh current-bar COID instead.
+        #
+        # This map is the authoritative in-memory home of the bump: the
+        # bumped anchor is intentionally NOT journaled (a restart must
+        # re-evaluate the signal fresh — see
+        # :meth:`_reanchor_envelope_after_reject`), so ``store_ctx.replay()``
+        # at the start of every :meth:`sync` cannot reconstruct it. Without a
+        # dedicated re-seed step the start-of-cycle replay would overwrite
+        # ``_persisted_envelope_anchors`` and drop the bump before the next
+        # same-bar tick under ``calc_on_every_tick`` re-emits — the rebuild
+        # would then reuse ``retry_seq=0`` with the rejected bar's
+        # ``bar_ts_ms``, colliding with the spent COID. :meth:`sync` therefore
+        # re-applies the current-bar entries of this map onto
+        # ``_persisted_envelope_anchors`` after each replay. Kept in memory
+        # only: across a restart the same-bar window is gone and the rejected
+        # entry left no live order, so a re-emit is a clean fresh evaluation.
+        self._reject_anchor_bars: dict[str, EnvelopeRecord] = {}
+        # Restart best-effort adoption of live broker entry orders whose
+        # bumped ``client_order_id`` a crash dropped before
+        # :meth:`_persist_bumped_anchor_if_unjournaled` journaled it (the
+        # window between the broker ACK and the journal write). A reject
+        # DELETEs the ``retry_seq=0`` row, so after such a crash the journal
+        # holds NO anchor for the entry while a live working order sits at the
+        # broker under the ``retry_seq>0`` COID. :meth:`_build_envelope` would
+        # then mint a fresh ``retry_seq=0`` id — a different COID the plugin's
+        # ``get_open_orders`` dedup cannot match, risking a double-open.
+        #
+        # :meth:`_scan_live_entry_anchors_for_restart` runs once after a
+        # restart, reads ``get_open_orders``, and records each unambiguous
+        # entry working order this run owns (``run_tag`` match, entry kind)
+        # keyed by ``pid_hash`` -> ``(bar_ts_ms, retry_seq)``.
+        # :meth:`_build_envelope` then adopts the snapshot lazily and
+        # consume-once when the matching entry intent is next built — before
+        # that sync's dispatch — so the rebuilt COID is byte-identical to the
+        # live order and the plugin dedups instead of double-opening. Keyed by
+        # ``pid_hash`` (not ``pine_id``) because the COID hash is one-way; the
+        # builder forward-hashes ``intent.pine_id`` to match.
+        self._restart_live_entry_anchors: dict[str, tuple[int, int]] = {}
+        self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
@@ -930,6 +977,34 @@ class OrderSyncEngine:
             self._persisted_envelope_anchors = dict(envelopes)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
+        # Re-apply reject-bumped retry anchors that the wholesale replay above
+        # just dropped. These bumps are intentionally never journaled (a
+        # restart must re-evaluate the rejected signal fresh — see
+        # :meth:`_reanchor_envelope_after_reject`), so ``replay()`` cannot
+        # reconstruct them. Without this step a same-bar re-emit under
+        # ``calc_on_every_tick`` (which drives a fresh ``sync`` per tick) would
+        # find no anchor and rebuild ``retry_seq=0`` with the rejected bar's
+        # ``bar_ts_ms``, colliding with the spent COID the bump exists to
+        # avoid. Only current-bar bumps are restored: once the bar advances
+        # the same-bar window is over and the anchor is pruned, matching the
+        # later-bar discard the :meth:`_build_envelope` guard performs.
+        if self._reject_anchor_bars:
+            for key, bumped in list(self._reject_anchor_bars.items()):
+                if bumped.bar_ts_ms == bar_ts_ms:
+                    self._persisted_envelope_anchors[key] = bumped
+                else:
+                    # The bar advanced: the same-bar window is over, so this is
+                    # a fresh re-evaluation of the signal. Drop the bump from
+                    # both the in-memory anchor map and the journal so
+                    # :meth:`_build_envelope` mints a current-bar
+                    # ``retry_seq=0`` COID instead of inheriting the rejected
+                    # bar's identity (mirrors the later-bar discard the build
+                    # guard performs; needed here too because the no-store path
+                    # has no replay to clear ``_persisted_envelope_anchors``).
+                    del self._reject_anchor_bars[key]
+                    self._persisted_envelope_anchors.pop(key, None)
+                    if self._store_ctx is not None:
+                        self._store_ctx.record_complete(key)
         # Restart-replay native fail-safe rehydrate: deferred from
         # ``__init__`` so ``_current_bar_ts_ms`` carries a real epoch-ms
         # anchor before any :meth:`register_parent` /
@@ -962,6 +1037,24 @@ class OrderSyncEngine:
         # also called from contexts that don't pre-drain (e.g. tests, the
         # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
+        # One-time restart scan of live broker entry orders, so a bumped COID
+        # the crash window dropped before journaling can be adopted at build
+        # time (see :meth:`_scan_live_entry_anchors_for_restart` and
+        # :attr:`_restart_live_entry_anchors`). Runs before ``_diff_and_dispatch``
+        # so the snapshot is in place when the first post-restart entry
+        # envelope is built. On a connection error the sync is skipped (the
+        # flag stays unset) rather than letting a fresh entry dispatch mint a
+        # COID that would collide with the unrecognised live order.
+        if not self._restart_entry_scan_done and self._store_ctx is not None:
+            try:
+                self._scan_live_entry_anchors_for_restart()
+            except ExchangeConnectionError as e:
+                _blog_warning(
+                    "sync skipped before restart entry-anchor scan could "
+                    "complete (connection error: %s) — retrying next sync", e,
+                )
+                return
+            self._restart_entry_scan_done = True
         try:
             self._verify_pending_dispatches()
         except ExchangeConnectionError as e:
@@ -3087,6 +3180,74 @@ class OrderSyncEngine:
         self._recovered_close_anchor_keys.discard(key)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
+
+    def _reanchor_envelope_after_reject(self, key: str) -> None:
+        """Retire a rejected dispatch but keep a bumped retry anchor.
+
+        Unlike :meth:`_drop_envelope` — which is used when the intent never
+        reached the broker (the §2.6.7 block-new-entry / native-failsafe
+        drops), so the next attempt may safely reuse ``retry_seq=0`` — an
+        *exchange reject* means the COID was already spent: the broker saw
+        and refused it. A bare drop would reset the next
+        :meth:`_build_envelope` to ``retry_seq=0`` with the SAME
+        ``bar_ts_ms``, rebuilding the identical ``client_order_id`` (the id
+        is ``run_tag-pine-bar-kind+retry_seq``). A same-bar retry — which
+        live ``calc_on_every_tick`` syncing can trigger — would then collide
+        with the exchange's idempotency cache / local journal and be deduped
+        instead of treated as the fresh attempt the reject path intends.
+
+        So: read the current anchor (in-memory envelope first, then the
+        replayed persisted anchor), drop all the per-key state as usual,
+        then re-seed the in-memory ``_persisted_envelope_anchors`` with
+        ``retry_seq + 1`` so the next build mints a fresh COID on the same
+        bar.
+
+        The bumped anchor is **not** written back to the journal:
+        :meth:`_drop_envelope` already DELETEd the row (via
+        :meth:`storage.RunContext.record_complete`), and the bar scope that
+        bounds this anchor lives in :attr:`_reject_anchor_bars`, which is
+        in-memory only (see its declaration in ``__init__``). Persisting the
+        bumped anchor without its bar scope would let a restart replay revive
+        it as a plain anchor with no reject tag — :meth:`_build_envelope`
+        would then stamp a later-bar re-emit with the rejected bar's
+        ``bar_ts_ms`` and ``retry_seq + 1`` instead of minting a fresh
+        ``retry_seq=0`` COID. The same-bar window cannot survive a restart
+        anyway and the rejected entry left no live order, so a post-restart
+        re-emit is a clean fresh evaluation that deliberately gets a current
+        anchor.
+        """
+        envelope = self._envelopes.get(key)
+        if envelope is not None:
+            bar_ts_ms = envelope.bar_ts_ms
+            retry_seq = envelope.retry_seq
+        else:
+            anchor = self._persisted_envelope_anchors.get(key)
+            if anchor is not None:
+                bar_ts_ms = anchor.bar_ts_ms
+                retry_seq = anchor.retry_seq
+            else:
+                bar_ts_ms = self._current_bar_ts_ms
+                retry_seq = 0
+        self._drop_envelope(key)
+        next_retry_seq = retry_seq + 1
+        bumped = EnvelopeRecord(
+            key=key,
+            bar_ts_ms=bar_ts_ms,
+            retry_seq=next_retry_seq,
+        )
+        self._persisted_envelope_anchors[key] = bumped
+        # Record the bumped anchor in the dedicated in-memory map. This serves
+        # two roles: the bar scope lets :meth:`_build_envelope` discard the
+        # anchor once the bar advances (a later-bar re-emit must NOT inherit
+        # the rejected bar's COID identity), and the stored record lets
+        # :meth:`sync` re-apply the bump onto ``_persisted_envelope_anchors``
+        # after each start-of-cycle ``store_ctx.replay()`` — which would
+        # otherwise wipe it (the bump is intentionally never journaled, so
+        # ``replay()`` cannot reconstruct it). Both are in-memory only — the
+        # journal row was already DELETEd by ``_drop_envelope`` above and is
+        # intentionally not re-written, so a restart re-evaluates the signal
+        # fresh (see docstring and the :attr:`_reject_anchor_bars` comment).
+        self._reject_anchor_bars[key] = bumped
 
     def _find_key_for_order_id(self, order_id: str) -> str | None:
         for key, ids in self._order_mapping.items():
@@ -6876,13 +7037,44 @@ class OrderSyncEngine:
                 retry_seq=existing.retry_seq,
             )
         anchor = self._persisted_envelope_anchors.pop(intent.intent_key, None)
+        reject_anchor = self._reject_anchor_bars.get(intent.intent_key)
+        if (anchor is not None and reject_anchor is not None
+                and reject_anchor.bar_ts_ms != self._current_bar_ts_ms):
+            # A reject-bumped anchor only defends a same-bar retry. The bar
+            # advanced, so this is a fresh re-evaluation of the signal — drop
+            # the stale anchor (memory + journal row) and fall through to mint
+            # a current-bar COID with ``retry_seq=0``. Without this the build
+            # would stamp the new bar's order with the rejected bar's
+            # ``bar_ts_ms`` and ``retry_seq=1``.
+            self._reject_anchor_bars.pop(intent.intent_key, None)
+            if self._store_ctx is not None:
+                self._store_ctx.record_complete(intent.intent_key)
+            anchor = None
         if anchor is not None:
+            self._reject_anchor_bars.pop(intent.intent_key, None)
+            adopted = self._maybe_adopt_restart_entry_anchor(intent, anchor)
+            bar_ts_ms, retry_seq = (
+                adopted if adopted is not None
+                else (anchor.bar_ts_ms, anchor.retry_seq)
+            )
             envelope = DispatchEnvelope(
                 intent=intent,
                 run_tag=self._run_tag,
-                bar_ts_ms=anchor.bar_ts_ms,
-                retry_seq=anchor.retry_seq,
+                bar_ts_ms=bar_ts_ms,
+                retry_seq=retry_seq,
             )
+            self._envelopes[intent.intent_key] = envelope
+            return envelope
+        adopted = self._maybe_adopt_restart_entry_anchor(intent, None)
+        if adopted is not None:
+            bar_ts_ms, retry_seq = adopted
+            envelope = DispatchEnvelope(
+                intent=intent,
+                run_tag=self._run_tag,
+                bar_ts_ms=bar_ts_ms,
+                retry_seq=retry_seq,
+            )
+            # The adoption helper already journaled the recovered anchor.
             self._envelopes[intent.intent_key] = envelope
             return envelope
         envelope = DispatchEnvelope(
@@ -6899,6 +7091,165 @@ class OrderSyncEngine:
                 retry_seq=envelope.retry_seq,
             )
         return envelope
+
+    def _persist_bumped_anchor_if_unjournaled(
+            self, envelope: DispatchEnvelope,
+    ) -> None:
+        """Journal a reject-bumped envelope once the dispatch reaches the broker.
+
+        :meth:`_build_envelope` journals a fresh ``retry_seq=0`` dispatch at
+        build time, but the reject-bump consume path — and
+        :meth:`_reanchor_envelope_after_reject` itself — deliberately leave the
+        bumped anchor (``retry_seq > 0``) unjournaled: a retry that never
+        materialises must re-evaluate the signal fresh after a restart, and the
+        bar scope that bounds the bump lives only in the in-memory
+        :attr:`_reject_anchor_bars` (see that attribute's declaration and
+        :meth:`_reanchor_envelope_after_reject`'s docstring). That keeps the
+        non-materialised case correct, but it leaves a hole the moment the
+        bumped dispatch actually reaches the broker — a clean ``execute_*``
+        success, or an unknown-disposition park whose order may be live.
+
+        At that point the bumped ``client_order_id`` is real broker state and
+        MUST survive a restart: :meth:`_resolve_parent_opening_ref` and every
+        modify/cancel rebuild the parent COID from
+        :attr:`_persisted_envelope_anchors`, which is repopulated from the
+        journal on replay. Without this write a restart would reconstruct
+        ``retry_seq=0`` for a live order opened under ``retry_seq=1``, so the
+        native fail-safe retire and any amend/cancel would target the wrong
+        COID. Persisting here (an idempotent UPSERT on ``(run_id, key)``) lets a
+        materialised bumped entry share the normal entry envelope lifecycle —
+        retired at position close via :meth:`_drop_envelope`, re-rejected via
+        :meth:`_reanchor_envelope_after_reject` (which DELETEs the row again).
+
+        ``retry_seq == 0`` envelopes were already journaled at build time, so
+        this is a no-op for them; the store-write is intentionally unguarded,
+        matching the build-time :meth:`storage.RunContext.record_envelope` call
+        (a journal write failure is an infrastructure fault, not a recoverable
+        trading condition, and must surface rather than silently re-open the
+        restart hole).
+        """
+        if self._store_ctx is None or envelope.retry_seq == 0:
+            return
+        self._store_ctx.record_envelope(
+            key=envelope.intent.intent_key,
+            bar_ts_ms=envelope.bar_ts_ms,
+            retry_seq=envelope.retry_seq,
+        )
+
+    def _scan_live_entry_anchors_for_restart(self) -> None:
+        """Snapshot this run's live broker entry orders for restart adoption.
+
+        Reads ``get_open_orders`` once and records every entry working order
+        this run owns — its ``client_order_id`` parses cleanly, its
+        ``run_tag`` matches ours, and its kind is :data:`KIND_ENTRY` or
+        :data:`KIND_ENTRY_STOP` — into :attr:`_restart_live_entry_anchors`,
+        keyed by ``pid_hash`` -> ``(bar_ts_ms, retry_seq)``. Only the entry
+        working order is recoverable this way: position-attached bracket legs
+        never surface in ``get_open_orders`` (and are not entry kinds anyway),
+        so they stay out of scope — matching the residual documented when the
+        materialisation-time persist (:meth:`_persist_bumped_anchor_if_unjournaled`)
+        landed.
+
+        A ``pid_hash`` with more than one DISTINCT ``(bar_ts_ms, retry_seq)``
+        among its live orders is ambiguous — the engine never produces two
+        live working orders for one entry on the same run — so it is logged
+        and dropped rather than guessed at. The two legs of a both-set entry
+        (:data:`KIND_ENTRY` LIMIT + :data:`KIND_ENTRY_STOP` MARKET) share the
+        same pinned ``(bar_ts_ms, retry_seq)``, so they collapse to a single
+        tuple and are NOT ambiguous.
+
+        Propagates :class:`ExchangeConnectionError` to the caller in
+        :meth:`sync`, which skips the cycle and retries next sync so the scan
+        completes before any fresh entry dispatch can mint a colliding COID.
+        """
+        orders = self._run_async(self._broker.get_open_orders(self._symbol))
+        by_pid: dict[str, set[tuple[int, int]]] = {}
+        for order in orders:
+            coid = order.client_order_id
+            if not coid:
+                continue
+            parsed = parse_client_order_id(coid)
+            if (parsed is None
+                    or parsed.run_tag != self._run_tag
+                    or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
+                continue
+            by_pid.setdefault(parsed.pid_hash, set()).add(
+                (parsed.bar_ts_ms, parsed.retry_seq),
+            )
+        adopted: dict[str, tuple[int, int]] = {}
+        for pid_hash, anchors in by_pid.items():
+            if len(anchors) == 1:
+                adopted[pid_hash] = next(iter(anchors))
+            else:
+                _blog_warning(
+                    "restart entry-anchor scan: ambiguous live orders for "
+                    "pid_hash %s (%s) — skipping adoption, leaving them to "
+                    "reconcile", pid_hash, sorted(anchors),
+                )
+        self._restart_live_entry_anchors = adopted
+        if adopted:
+            _blog_info(
+                "restart entry-anchor scan: %d live entry order(s) available "
+                "for COID adoption", len(adopted),
+            )
+
+    def _maybe_adopt_restart_entry_anchor(
+            self, intent: Intent, current: EnvelopeRecord | None,
+    ) -> tuple[int, int] | None:
+        """Adopt a live broker entry order's pinned anchor at build time.
+
+        Consumes a :meth:`_scan_live_entry_anchors_for_restart` snapshot entry
+        when this entry intent's ``pid_hash`` matches a live broker working
+        order, so :meth:`_build_envelope` rebuilds the SAME bumped COID the
+        crash dropped instead of minting a colliding fresh id. Adoption is
+        constrained to current dispatchable :class:`EntryIntent`s — it never
+        invents intent; a live order matching no current entry stays in the
+        snapshot and is owned by reconcile.
+
+        ``current`` is the persisted journal anchor when one exists, else
+        ``None`` (the fresh-mint path):
+
+        - ``None`` (fresh mint): adopt the live order's anchor outright — the
+          journal lost it entirely (the reject DELETEd the ``retry_seq=0``
+          row), so the broker order is the only surviving identity.
+        - present anchor: adopt ONLY the same-bar higher retry (a second
+          same-bar reject bump that ACKed but crashed before journaling).
+          A lower/equal live retry, or a different bar, leaves the journal
+          authoritative — a bar advance always resets retry to ``0`` in the
+          engine, so a cross-bar higher live retry is a shape we never
+          produce and is treated as an orphan.
+
+        Journals the adopted anchor BEFORE popping the snapshot entry so a
+        ``record_envelope`` infrastructure failure leaves the snapshot intact
+        for the next retry rather than silently losing the recovered id.
+
+        :return: The ``(bar_ts_ms, retry_seq)`` to build with, or ``None`` to
+            keep the engine's own (fresh mint or persisted anchor).
+        """
+        if (not isinstance(intent, EntryIntent)
+                or not self._restart_live_entry_anchors):
+            return None
+        pid_hash = hash_pine_id(intent.pine_id)
+        adopted = self._restart_live_entry_anchors.get(pid_hash)
+        if adopted is None:
+            return None
+        bar_ts_ms, retry_seq = adopted
+        if current is not None and not (
+                bar_ts_ms == current.bar_ts_ms and retry_seq > current.retry_seq):
+            return None
+        if self._store_ctx is not None:
+            self._store_ctx.record_envelope(
+                key=intent.intent_key,
+                bar_ts_ms=bar_ts_ms,
+                retry_seq=retry_seq,
+            )
+        self._restart_live_entry_anchors.pop(pid_hash, None)
+        _blog_info(
+            "restart: adopted live entry order anchor for %s "
+            "(bar_ts_ms=%d retry_seq=%d)",
+            intent.pine_id, bar_ts_ms, retry_seq,
+        )
+        return bar_ts_ms, retry_seq
 
     def _build_cancel_envelope(self, cancel: CancelIntent) -> DispatchEnvelope:
         return DispatchEnvelope(
@@ -6966,6 +7317,13 @@ class OrderSyncEngine:
                     envelope.intent.intent_key, [],
                 ),
             )
+        # A parked dispatch may be live at the broker. If this envelope carries
+        # a reject bump (retry_seq > 0) it was NOT journaled at build time, and
+        # record_park only persists the literal COID into pending_verifications
+        # — not the anchor _resolve_parent_opening_ref / modify / cancel rebuild
+        # from on replay. Persist the bumped anchor too so an attached
+        # resolution after a restart reconstructs the correct COID.
+        self._persist_bumped_anchor_if_unjournaled(envelope)
         _log.warning(
             "dispatch for %s ended with unknown disposition "
             "(client_order_id=%s, kind=%s); will verify on next sync: %s",
@@ -7224,6 +7582,10 @@ class OrderSyncEngine:
             elif isinstance(intent, CloseIntent):
                 order = self._run_async(self._broker.execute_close(envelope))
                 self._order_mapping[intent.intent_key] = [order.id]
+            # The dispatch reached the broker. If this envelope carries a
+            # reject bump (retry_seq > 0) it was NOT journaled at build time —
+            # persist it now so the live order's bumped COID survives a restart.
+            self._persist_bumped_anchor_if_unjournaled(envelope)
             _blog_info(
                 "dispatched %s -> %s",
                 intent, self._order_mapping.get(intent.intent_key),
@@ -7248,6 +7610,49 @@ class OrderSyncEngine:
             # responsible for the warning + active-intents bookkeeping —
             # don't mislabel this as a dispatch failure.
             raise
+        except ExchangeOrderRejectedError as e:
+            # The exchange rejected the order outright — no parent fill (the
+            # ``BracketAttachAfterFillRejectedError`` branch above owns the
+            # fill-then-reject case). For an ENTRY this is non-terminal:
+            # nothing opened, so halting here would strand the bot on a
+            # condition that may clear on a later bar (insufficient margin /
+            # balance, a risk-engine veto, a transient venue rule). The
+            # plugin pre-empts the rejects it can compute pre-flight
+            # (min/max size) into :class:`OrderSkippedByPlugin`; funds /
+            # risk rejects can only be known after submission, so this is
+            # the engine-side safety net for them. Drop the envelope and
+            # re-anchor the retry on a bumped ``retry_seq`` so a same-bar
+            # re-attempt mints a FRESH idempotency anchor instead of
+            # reusing the spent COID — unlike the §2.6.7 drop above, the
+            # rejected order DID reach the broker, so its COID is now
+            # spent (an exchange idempotency cache / local journal would
+            # dedupe a retry that reused it). Then re-raise as the same
+            # skip vehicle the entry-dispatch call sites already handle
+            # — the intent stays out of ``_active_intents`` and is added
+            # to ``skipped_entry_ids_this_sync``, so the next bar
+            # re-evaluates the signal freely and any same-sync dependent
+            # bracket is suppressed. Non-entry intents (exit / close) keep
+            # the fatal contract: a protective order the exchange refuses
+            # is a real exposure that must surface, not be silently
+            # dropped.
+            if not isinstance(intent, EntryIntent):
+                _blog_error(
+                    "dispatch failed for %s: %s: %s",
+                    intent, type(e).__name__, e,
+                )
+                raise
+            self._reanchor_envelope_after_reject(intent.intent_key)
+            raise OrderSkippedByPlugin(
+                f"Entry {intent.intent_key} rejected by exchange "
+                f"({type(e).__name__}: {e}); signal dropped, bot continues.",
+                intent_key=intent.intent_key,
+                reason="broker_rejected_entry",
+                context={
+                    'symbol': intent.symbol,
+                    'pine_id': intent.pine_id,
+                    'reject_type': type(e).__name__,
+                },
+            ) from e
         except Exception as e:
             _blog_error(
                 "dispatch failed for %s: %s: %s",

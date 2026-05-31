@@ -36,10 +36,13 @@ that do not (Interactive Brokers, Deribit) dedup inside the plugin via a
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from typing import Final
 
 __all__ = [
+    'ParsedClientOrderId',
+    'parse_client_order_id',
     'KIND_ENTRY',
     'KIND_ENTRY_STOP',
     'KIND_ENTRY_STOP_WATCH',
@@ -210,3 +213,64 @@ def build_client_order_id(
             f"(got {len(result)}); retry_seq={retry_seq} overflows the budget",
         )
     return result
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ParsedClientOrderId:
+    """Structural decomposition of a canonical client-order-id.
+
+    The ``pine_id`` is irrecoverable — :func:`hash_pine_id` is one-way — so
+    :attr:`pid_hash` carries the 8-char hash instead. A caller that knows a
+    candidate ``pine_id`` matches by forward-hashing it
+    (``hash_pine_id(candidate) == parsed.pid_hash``).
+    """
+    run_tag: str
+    pid_hash: str
+    bar_ts_ms: int
+    kind: str
+    retry_seq: int
+
+
+def parse_client_order_id(coid: str) -> ParsedClientOrderId | None:
+    """Parse a canonical client-order-id back into its structural fields.
+
+    The inverse of :func:`build_client_order_id`, modulo the one-way
+    ``pine_id`` hash (see :class:`ParsedClientOrderId`). Used by the sync
+    engine's restart adoption path to recognise the bot's own live broker
+    orders from their echoed ``client_order_id`` and recover the
+    ``(bar_ts_ms, retry_seq)`` anchor a crash dropped before it was
+    journaled.
+
+    Best-effort and total: any input that does not match the
+    ``{run4}-{pid8}-{bar9}-{kind}{retry}`` shape — wrong dash count, wrong
+    field widths, an unknown ``kind`` code, or a non-base36 ``bar`` /
+    ``retry`` — yields ``None`` rather than raising, so a caller can pass an
+    externally-owned order's id straight through.
+
+    :param coid: The client-order-id to parse.
+    :return: The decomposed fields, or ``None`` when ``coid`` is not a
+        well-formed canonical id.
+    """
+    parts = coid.split('-')
+    if len(parts) != 4:
+        return None
+    run_tag, pid_hash, bar_b36, kind_retry = parts
+    if (len(run_tag) != RUN_TAG_WIDTH
+            or len(pid_hash) != PINE_ID_HASH_WIDTH
+            or len(bar_b36) != BAR_TS_WIDTH
+            or len(kind_retry) < 2):
+        return None
+    kind = kind_retry[0]
+    if kind not in VALID_KINDS:
+        return None
+    retry_b36 = kind_retry[1:]
+    base36 = set(_BASE36_DIGITS)
+    if not (set(bar_b36) <= base36 and set(retry_b36) <= base36):
+        return None
+    return ParsedClientOrderId(
+        run_tag=run_tag,
+        pid_hash=pid_hash,
+        bar_ts_ms=int(bar_b36, 36),
+        kind=kind,
+        retry_seq=int(retry_b36, 36),
+    )

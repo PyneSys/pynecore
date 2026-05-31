@@ -20,6 +20,8 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
     ExchangeConnectionError,
+    ExchangeOrderRejectedError,
+    InsufficientMarginError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -260,6 +262,604 @@ def __test_new_entry_dispatches_execute_entry__():
     assert b.entry_calls[0].intent.limit == 50_000.0
     assert engine.active_intents.keys() == {"L"}
     assert engine.order_mapping["L"] == ["xchg-1"]
+
+
+def __test_entry_exchange_reject_does_not_halt_and_retries__():
+    # An exchange reject on an ENTRY (e.g. a risk-engine veto / insufficient
+    # funds that the plugin cannot pre-empt pre-flight) must NOT kill the bot.
+    # The engine drops the signal for this sync and re-evaluates next bar.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError("Capital confirm REJECTED: RISK_CHECK")
+
+    # Does not propagate — the bot stays alive.
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    # Skipped: not registered as active, no order mapping retained.
+    assert "L" not in engine.active_intents
+    assert "L" not in engine.order_mapping
+
+    # Next sync re-attempts (broker no longer rejects) and the entry lands.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+    assert engine.active_intents.keys() == {"L"}
+
+
+def __test_entry_reject_same_bar_retry_bumps_retry_seq__():
+    # A same-bar retry after an exchange reject must mint a FRESH COID: same
+    # bar_ts_ms (the bar has not advanced) but a bumped retry_seq so it does
+    # not collide with the spent COID in the exchange idempotency cache.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError("Capital confirm REJECTED: RISK_CHECK")
+
+    engine.sync(BAR_TS)
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 2
+    rejected, retried = b.entry_calls
+    assert rejected.bar_ts_ms == retried.bar_ts_ms == BAR_TS
+    assert rejected.retry_seq == 0
+    assert retried.retry_seq == 1
+
+
+def __test_entry_reject_later_bar_reemit_mints_fresh_anchor__():
+    # When the entry is rejected on one bar but the strategy only re-emits it
+    # on a LATER bar, the bumped reject anchor must NOT carry over: the new
+    # bar's order is a fresh evaluation and must be stamped with the current
+    # bar's bar_ts_ms and retry_seq=0, not the rejected bar's stale identity.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError("Capital confirm REJECTED: RISK_CHECK")
+
+    engine.sync(BAR_TS)
+    assert "L" not in engine.active_intents
+
+    next_bar = BAR_TS + 60_000
+    engine.sync(next_bar)
+
+    assert len(b.entry_calls) == 2
+    rejected, reemit = b.entry_calls
+    assert rejected.bar_ts_ms == BAR_TS
+    assert reemit.bar_ts_ms == next_bar
+    assert reemit.retry_seq == 0
+    assert engine.active_intents.keys() == {"L"}
+
+
+def __test_entry_reject_same_bar_retry_bumps_retry_seq_with_store__(tmp_path):
+    # Same as ``__test_entry_reject_same_bar_retry_bumps_retry_seq__`` but with
+    # a persisted ``store_ctx`` configured — the normal live mode. The bumped
+    # reject anchor is intentionally never journaled (a restart must
+    # re-evaluate fresh), so the start-of-cycle ``store_ctx.replay()`` cannot
+    # reconstruct it. Without an explicit re-seed step the second same-bar
+    # ``sync`` would wipe the in-memory bump and rebuild ``retry_seq=0`` with
+    # the rejected bar's ``bar_ts_ms``, colliding with the spent COID. This
+    # regression guards that the same-bar retry still mints a FRESH COID
+    # (``retry_seq=1``) on the store-backed path.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        b.raise_on_next_entry = ExchangeOrderRejectedError(
+            "Capital confirm REJECTED: RISK_CHECK"
+        )
+
+        engine.sync(BAR_TS)
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 2
+        rejected, retried = b.entry_calls
+        assert rejected.bar_ts_ms == retried.bar_ts_ms == BAR_TS
+        assert rejected.retry_seq == 0
+        assert retried.retry_seq == 1
+
+
+def __test_entry_reject_later_bar_reemit_mints_fresh_anchor_with_store__(tmp_path):
+    # Store-backed twin of
+    # ``__test_entry_reject_later_bar_reemit_mints_fresh_anchor__``: once the
+    # bar advances, the re-seed step must prune the stale bump (memory +
+    # journal) so the later-bar re-emit is stamped with the CURRENT bar and
+    # ``retry_seq=0``, not the rejected bar's identity.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        b.raise_on_next_entry = ExchangeOrderRejectedError(
+            "Capital confirm REJECTED: RISK_CHECK"
+        )
+
+        engine.sync(BAR_TS)
+        assert "L" not in engine.active_intents
+
+        next_bar = BAR_TS + 60_000
+        engine.sync(next_bar)
+
+        assert len(b.entry_calls) == 2
+        rejected, reemit = b.entry_calls
+        assert rejected.bar_ts_ms == BAR_TS
+        assert reemit.bar_ts_ms == next_bar
+        assert reemit.retry_seq == 0
+        assert engine.active_intents.keys() == {"L"}
+
+
+def __test_entry_reject_then_materialized_retry_survives_restart__(tmp_path):
+    # A same-bar retry after an exchange reject mints retry_seq=1. The bumped
+    # anchor is deliberately NOT journaled at build time (a non-materialised
+    # retry must re-evaluate fresh after a restart). But once the retry
+    # MATERIALISES — execute_entry succeeds and the order is live under the
+    # retry_seq=1 COID — that identity MUST survive a restart: after replay,
+    # _resolve_parent_opening_ref and every modify/cancel rebuild the parent
+    # COID from _persisted_envelope_anchors. Without the materialisation-time
+    # persistence, a restart reconstructs retry_seq=0 and targets the wrong COID
+    # for the live order (native fail-safe retire / amend / cancel all miss).
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    identity = RunIdentity(
+        strategy_id="t025", symbol=SYMBOL, timeframe="60",
+        account_id="testbroker-demo", label=None,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(identity, script_source="src", script_path="t025.py")
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        b.raise_on_next_entry = ExchangeOrderRejectedError(
+            "Capital confirm REJECTED: RISK_CHECK"
+        )
+
+        engine.sync(BAR_TS)   # reject -> bump to retry_seq=1
+        engine.sync(BAR_TS)   # same-bar retry -> retry_seq=1 materialises (lands)
+
+        assert len(b.entry_calls) == 2
+        assert b.entry_calls[1].retry_seq == 1
+        assert engine.active_intents.keys() == {"L"}
+
+        # Simulate a process restart: end the live run instance, re-open the
+        # same logical run_id, and build a fresh engine that replays the store.
+        ctx.close()
+        ctx2 = store.open_run(identity, script_source="src", script_path="t025.py")
+        engine2 = OrderSyncEngine(
+            broker=MockBroker(),  # type: ignore[arg-type]
+            position=BrokerPosition(), symbol=SYMBOL,
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx2,
+        )
+
+        anchor = engine2._persisted_envelope_anchors.get("L")  # type: ignore[attr-defined]
+        assert anchor is not None
+        assert anchor.retry_seq == 1
+        assert anchor.bar_ts_ms == BAR_TS
+
+        # The real consumer: the parent COID rebuilt from the replayed anchor
+        # carries the bumped retry_seq, matching the live order's identity.
+        expected = build_client_order_id(
+            run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=1,
+        )
+        assert engine2._resolve_parent_opening_ref("L") == expected  # type: ignore[attr-defined]
+
+
+def __test_entry_reject_then_parked_retry_survives_restart__(tmp_path):
+    # Twin of the clean-success case for the unknown-disposition (park) path:
+    # the same-bar retry's execute_entry ends with OrderDispositionUnknownError,
+    # so the order MAY be live at the broker under the retry_seq=1 COID.
+    # record_park persists only the literal COID into pending_verifications, not
+    # the anchor that _resolve_parent_opening_ref rebuilds from. The bumped
+    # anchor must therefore also be journaled at park time so an attached
+    # resolution after a restart reconstructs the correct COID.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    identity = RunIdentity(
+        strategy_id="t025", symbol=SYMBOL, timeframe="60",
+        account_id="testbroker-demo", label=None,
+    )
+    bumped_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(identity, script_source="src", script_path="t025.py")
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        b.raise_on_next_entry = ExchangeOrderRejectedError(
+            "Capital confirm REJECTED: RISK_CHECK"
+        )
+
+        engine.sync(BAR_TS)   # reject -> bump to retry_seq=1
+        b.raise_on_next_entry = OrderDispositionUnknownError(
+            "simulated timeout", client_order_id=bumped_coid,
+        )
+        engine.sync(BAR_TS)   # same-bar retry -> retry_seq=1 parks (unknown)
+
+        assert len(b.entry_calls) == 2
+        assert b.entry_calls[1].retry_seq == 1
+        assert bumped_coid in engine.pending_verification
+
+        ctx.close()
+        ctx2 = store.open_run(identity, script_source="src", script_path="t025.py")
+        engine2 = OrderSyncEngine(
+            broker=MockBroker(),  # type: ignore[arg-type]
+            position=BrokerPosition(), symbol=SYMBOL,
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx2,
+        )
+
+        anchor = engine2._persisted_envelope_anchors.get("L")  # type: ignore[attr-defined]
+        assert anchor is not None
+        assert anchor.retry_seq == 1
+        assert anchor.bar_ts_ms == BAR_TS
+        assert engine2._resolve_parent_opening_ref("L") == bumped_coid  # type: ignore[attr-defined]
+
+
+def _live_working_order(coid: str, *, order_id: str = "live-1") -> ExchangeOrder:
+    """A broker-side OPEN entry working order carrying ``coid`` — the shape
+    Capital.com's ``get_open_orders`` surfaces (COID restored from its own
+    ref index)."""
+    return ExchangeOrder(
+        id=order_id, symbol=SYMBOL, side="buy",
+        order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+        remaining_qty=1.0, price=50_000.0, stop_price=None,
+        average_fill_price=None, status=OrderStatus.OPEN,
+        timestamp=0.0, fee=0.0, fee_currency="",
+        client_order_id=coid,
+    )
+
+
+def _restart_identity() -> "RunIdentity":  # noqa: F821 - local import in callers
+    from pynecore.core.broker.run_identity import RunIdentity
+    return RunIdentity(
+        strategy_id="t025", symbol=SYMBOL, timeframe="60",
+        account_id="testbroker-demo", label=None,
+    )
+
+
+def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
+    # The crash window Option C closes: a same-bar reject DELETEs the
+    # retry_seq=0 journal row, the bumped retry_seq=1 materialises at the
+    # broker, then the process crashes BEFORE the bump is journaled. On
+    # restart the journal holds NO anchor for "L", but the working order is
+    # live under the retry_seq=1 COID. Without adoption the engine would mint
+    # a fresh retry_seq=0 id (a different COID the plugin dedup cannot match)
+    # and double-open. The startup scan + build-time adoption must instead
+    # rebuild the exact live COID — even when the script re-emits the entry on
+    # a LATER bar than the one the order was placed on.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    bumped_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    later_bar = BAR_TS + 60_000
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [_live_working_order(bumped_coid)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(later_bar)  # script re-emits "L" on a later bar
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 1
+        assert b.entry_calls[0].client_order_id(KIND_ENTRY) == bumped_coid
+
+        # The adoption journaled the recovered anchor — a second restart keeps it.
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        engine2 = OrderSyncEngine(
+            broker=MockBroker(),  # type: ignore[arg-type]
+            position=BrokerPosition(), symbol=SYMBOL,
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx2,
+        )
+        anchor = engine2._persisted_envelope_anchors.get("L")  # type: ignore[attr-defined]
+        assert anchor is not None
+        assert anchor.bar_ts_ms == BAR_TS
+        assert anchor.retry_seq == 1
+
+
+def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
+    # A live order from a DIFFERENT run_tag must be ignored, and a brand-new
+    # entry with no live order must mint a fresh current-bar retry_seq=0 — the
+    # scan only adopts this run's own entry orders.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    foreign = build_client_order_id(
+        run_tag="zzzz", pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=3,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [_live_working_order(foreign)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 0
+
+
+def __test_restart_skips_ambiguous_live_entry_orders__(tmp_path):
+    # Two live orders for the same entry pid_hash with DISTINCT
+    # (bar_ts_ms, retry_seq) tuples are ambiguous — the engine never produces
+    # two live working orders for one entry, so adoption is skipped and the
+    # entry mints fresh rather than guessing.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    coid_a = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    coid_b = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS + 60_000,
+        kind=KIND_ENTRY, retry_seq=2,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [
+            _live_working_order(coid_a, order_id="live-a"),
+            _live_working_order(coid_b, order_id="live-b"),
+        ]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].retry_seq == 0
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+
+
+def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
+    # A both-set entry's KIND_ENTRY (LIMIT) and KIND_ENTRY_STOP (MARKET) legs
+    # share the SAME pinned (bar_ts_ms, retry_seq), so two live legs collapse
+    # to one distinct tuple and are NOT treated as ambiguous — the anchor is
+    # adopted.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import (
+        build_client_order_id, KIND_ENTRY, KIND_ENTRY_STOP,
+    )
+
+    coid_limit = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    coid_stop = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY_STOP, retry_seq=1,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [
+            _live_working_order(coid_limit, order_id="live-e"),
+            _live_working_order(coid_stop, order_id="live-b"),
+        ]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS + 60_000)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 1
+
+
+def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):
+    # If get_open_orders fails transiently during the scan, the sync is
+    # skipped (no fresh dispatch can mint a colliding COID) and the scan flag
+    # stays unset so the next sync retries. Once the broker recovers and the
+    # live order is visible, adoption proceeds.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    bumped_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("broker down")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)  # scan hits the connection error -> sync skipped
+
+        assert len(b.entry_calls) == 0
+        assert engine._restart_entry_scan_done is False  # type: ignore[attr-defined]
+
+        b.open_orders = [_live_working_order(bumped_coid)]
+        engine.sync(BAR_TS)  # broker recovered -> scan + adoption
+
+        assert engine._restart_entry_scan_done is True  # type: ignore[attr-defined]
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].retry_seq == 1
+
+
+def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
+    # Double-bump crash: the journal holds retry_seq=1, but a SECOND same-bar
+    # reject bumped to retry_seq=2 and that order ACKed at the broker before
+    # the crash. The same-bar higher live retry is authoritative over the
+    # journal anchor.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    coid2 = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=2,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1)
+        b = MockBroker()
+        b.open_orders = [_live_working_order(coid2)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 2
+
+
+def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
+    # A higher live retry on a DIFFERENT bar than the journal anchor is a shape
+    # the engine never produces (a bar advance resets retry to 0). It is treated
+    # as an orphan: the journal anchor stays authoritative, no adoption.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    cross_bar = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS + 60_000,
+        kind=KIND_ENTRY, retry_seq=2,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1)
+        b = MockBroker()
+        b.open_orders = [_live_working_order(cross_bar)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 1
+
+
+def __test_entry_insufficient_margin_does_not_halt__():
+    # InsufficientMarginError is a typed, non-terminal ExchangeOrderRejectedError
+    # subclass — same survive-and-retry handling as a plain reject.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = InsufficientMarginError("Capital reject: INSUFFICIENT_FUNDS")
+
+    engine.sync(BAR_TS)
+
+    assert "L" not in engine.active_intents
+
+
+def __test_exit_exchange_reject_still_halts__():
+    # The non-fatal handling is ENTRY-only. A plain exchange reject on a
+    # protective EXIT is a real exposure (the position is open, the bracket
+    # the broker refused leaves it unprotected) and must surface, not be
+    # silently dropped.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    b.raise_on_next_exit = ExchangeOrderRejectedError("Capital confirm REJECTED: X")
+
+    with pytest.raises(ExchangeOrderRejectedError):
+        engine.sync(BAR_TS)
 
 
 def __test_unchanged_entry_is_not_redispatched__():

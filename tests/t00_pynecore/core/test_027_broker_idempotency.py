@@ -20,10 +20,12 @@ from pynecore.core.broker.idempotency import (
     KIND_EXIT_SL,
     KIND_EXIT_TP,
     PINE_ID_HASH_WIDTH,
+    ParsedClientOrderId,
     RUN_TAG_WIDTH,
     VALID_KINDS,
     build_client_order_id,
     hash_pine_id,
+    parse_client_order_id,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 
@@ -312,3 +314,64 @@ def __test_kind_appears_literally_in_result__(kind, expected_suffix):
         run_tag='abcd', pine_id='L', bar_ts_ms=1, kind=kind,
     )
     assert out.endswith(expected_suffix)
+
+
+# === parse_client_order_id ===============================================
+
+
+def __test_parse_round_trips_build__():
+    """A built id parses back to its structural fields (pine_id is one-way)."""
+    coid = build_client_order_id(
+        run_tag='abcd', pine_id='Long', bar_ts_ms=1_700_000_000_000,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    parsed = parse_client_order_id(coid)
+    assert parsed == ParsedClientOrderId(
+        run_tag='abcd',
+        pid_hash=hash_pine_id('Long'),
+        bar_ts_ms=1_700_000_000_000,
+        kind=KIND_ENTRY,
+        retry_seq=1,
+    )
+
+
+def __test_parse_retry_seq_zero_and_high__():
+    for retry in (0, 1, 35, 36, 100):
+        coid = build_client_order_id(
+            run_tag='abcd', pine_id='L', bar_ts_ms=1, kind=KIND_ENTRY,
+            retry_seq=retry,
+        )
+        parsed = parse_client_order_id(coid)
+        assert parsed is not None
+        assert parsed.retry_seq == retry
+
+
+def __test_parse_bar_ts_zero__():
+    coid = build_client_order_id(
+        run_tag='abcd', pine_id='L', bar_ts_ms=0, kind=KIND_ENTRY,
+    )
+    parsed = parse_client_order_id(coid)
+    assert parsed is not None
+    assert parsed.bar_ts_ms == 0
+
+
+@pytest.mark.parametrize('bad', [
+    '',
+    'abcd',
+    'abcd-1234',
+    'abcd-12345678-000000001',          # missing kind+retry segment
+    'abc-12345678-000000001-e0',        # run_tag too short
+    'abcd-1234567-000000001-e0',        # pid_hash too short
+    'abcd-12345678-00000001-e0',        # bar too short (8 not 9)
+    'abcd-12345678-000000001-',         # empty kind+retry
+    'abcd-12345678-000000001-z0',       # unknown kind code
+    'abcd-12345678-00000000!-e0',       # non-base36 bar
+    'abcd-12345678-000000001-e!',       # non-base36 retry
+])
+def __test_parse_malformed_returns_none__(bad):
+    assert parse_client_order_id(bad) is None
+
+
+def __test_parse_externally_owned_id_returns_none__():
+    """A foreign exchange id that is not our canonical shape parses to None."""
+    assert parse_client_order_id('DEAL-REF-FROM-CAPITAL-1234') is None
