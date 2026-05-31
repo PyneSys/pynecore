@@ -74,6 +74,18 @@ class PluginNotFoundError(ImportError):
     """Raised when a requested plugin is not installed."""
 
 
+class ProviderError(Exception):
+    """Base class for *expected*, user-actionable data-provider failures.
+
+    Covers conditions a user can act on — missing/invalid credentials, a
+    connection that could not be opened, an unknown broker — as opposed to
+    programming errors. The ``pyne data`` CLI catches this (alongside
+    :class:`NotImplementedError`) on its listing/download paths and prints a
+    one-line ``Error: ...`` instead of a traceback. A plugin's own error
+    hierarchy should subclass it so those failures surface cleanly.
+    """
+
+
 def discover_plugins() -> dict[str, EntryPoint]:
     """
     Return all installed plugins.

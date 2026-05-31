@@ -12,7 +12,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
 
 from ..app import app, app_state
 from ...core.plugin import discover_plugins, load_plugin, PluginNotFoundError
-from ...core.plugin import ProviderPlugin
+from ...core.plugin import ProviderPlugin, ProviderError
 from ...core.provider_string import is_provider_string, parse_provider_string
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
@@ -216,6 +216,9 @@ def download(
                 secho(f"Provider '{provider_name}' does not support listing brokers.",
                       err=True, fg=colors.RED)
                 raise Exit(1)
+            except ProviderError as e:
+                secho(f"Error: {e}", err=True, fg=colors.RED)
+                raise Exit(1)
             for b in sorted(brokers):
                 print(b)
             return
@@ -250,7 +253,7 @@ def download(
                     progress.add_task(description="Fetching market data...", total=None)
                     provider_instance: ProviderPlugin = provider_class(symbol=symbol, config=config)
                     symbols = provider_instance.get_list_of_symbols()
-            except NotImplementedError as e:
+            except (NotImplementedError, ProviderError) as e:
                 secho(f"Error: {e}", err=True, fg=colors.RED)
                 raise Exit(1)
             for s in symbols:
@@ -291,6 +294,9 @@ def download(
             secho(f"Error: {e}", err=True, fg=colors.RED)
             secho("Pass a symbol explicitly with -s/--symbol.",
                   err=True, fg=colors.YELLOW)
+            raise Exit(1)
+        except ProviderError as e:
+            secho(f"Error: {e}", err=True, fg=colors.RED)
             raise Exit(1)
 
         if provider_instance.symbol is None:
@@ -416,6 +422,9 @@ def download(
                     # Start downloading
                     provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress, limit=chunk_size)
 
+    except ProviderError as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
+        raise Exit(1)
     except (ImportError, ValueError) as e:
         secho(str(e), err=True, fg=colors.RED)
         raise Exit(2)

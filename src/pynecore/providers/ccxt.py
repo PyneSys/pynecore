@@ -5,12 +5,24 @@ from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
 
-from pynecore.core.plugin import override
+from pynecore.core.plugin import override, ProviderError
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
 
-__all__ = ['CCXTProvider']
+__all__ = ['CCXTProvider', 'CCXTError']
+
+
+class CCXTError(ProviderError):
+    """Raised when a CCXT library call fails in a user-actionable way.
+
+    Wraps the underlying :class:`ccxt.BaseError` (and the unknown-exchange
+    ``AttributeError``) raised during client creation, market loading and
+    candle downloads so the ``pyne data`` CLI reports an exchange / network /
+    auth failure as a clean one-line error instead of a traceback. The live
+    streaming path is intentionally left unwrapped so its errors still reach
+    the :class:`LiveProviderPlugin` reconnect logic.
+    """
 
 _KNOWN_LIMITS = {
     'binance': 1000,
@@ -238,11 +250,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         self._exchange_config: dict[str, Any] = dict(exchange_config)
 
         # Create the CCXT client
-        self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
-            'enableRateLimit': True,
-            'adjustForTimeDifference': True,
-            **exchange_config
-        })
+        try:
+            self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
+                'enableRateLimit': True,
+                'adjustForTimeDifference': True,
+                **exchange_config
+            })
+        except AttributeError:
+            raise CCXTError(
+                f"Unknown exchange: {exchange_name!r}. Run "
+                f"`pyne data download ccxt --list-brokers` to see available exchanges."
+            ) from None
         if self.config and getattr(self.config, 'sandbox', False):
             try:
                 self._client.set_sandbox_mode(True)
@@ -257,7 +275,11 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
         """Get list of symbols."""
-        self._client.load_markets()
+        import ccxt
+        try:
+            self._client.load_markets()
+        except ccxt.BaseError as exc:
+            raise CCXTError(f"{self._client.id}: {exc}") from exc
         return self._client.symbols or []
 
     @staticmethod
@@ -283,9 +305,18 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     @override
     def update_symbol_info(self) -> SymInfo:
         """Update symbol info from the exchange."""
-        self._client.load_markets()
+        import ccxt
+        try:
+            self._client.load_markets()
+        except ccxt.BaseError as exc:
+            raise CCXTError(f"{self._client.id}: {exc}") from exc
         assert self._client.markets
-        market_details = self._client.markets[self.symbol]
+        try:
+            market_details = self._client.markets[self.symbol]
+        except KeyError:
+            raise CCXTError(
+                f"Unknown symbol {self.symbol!r} on {self._client.id}."
+            ) from None
 
         assert self.timeframe is not None
         opening_hours, session_starts, session_ends = self._create_24_7_sessions()
@@ -340,6 +371,8 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         :param on_progress: Optional callback to call on progress.
         :param limit: Override the automatic chunk size.
         """
+        import ccxt
+
         assert self.symbol is not None
         assert self.xchg_timeframe is not None
 
@@ -360,12 +393,15 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 if on_progress:
                     on_progress(tf)
 
-                res: list = self._client.fetch_ohlcv(
-                    symbol=self.symbol,
-                    limit=limit,
-                    timeframe=self.xchg_timeframe,
-                    since=self._client.parse8601(tf.isoformat())
-                )
+                try:
+                    res: list = self._client.fetch_ohlcv(
+                        symbol=self.symbol,
+                        limit=limit,
+                        timeframe=self.xchg_timeframe,
+                        since=self._client.parse8601(tf.isoformat())
+                    )
+                except ccxt.BaseError as exc:
+                    raise CCXTError(f"{self._client.id}: {exc}") from exc
 
                 if not res:
                     tf += timedelta(days=1)
