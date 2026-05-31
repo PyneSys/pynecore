@@ -155,16 +155,16 @@ To download sample data:
 pyne data download --help
 
 # Example: Download Bybit data (if supported)
-pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT" --timeframe 1D
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
 ```
 By default, PyneCore will download 1 year of data. You can change this by using the `--from` flag. It can specify a concrete date or if it is just a number, you can specify how many days back you want to download:
 
 ```bash
 # Download 100 days of data
-pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT" --timeframe 1D --from 100
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D --from 100
 
 # Download data from a specific date
-pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT" --timeframe 1D --from 2024-01-01
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D --from 2024-01-01
 ```
 
 You can also convert your existing CSV or JSON containing OHLCV data to the PyneCore's `.ohlcv` format:

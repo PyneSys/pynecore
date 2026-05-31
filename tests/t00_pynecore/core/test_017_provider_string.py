@@ -132,3 +132,66 @@ def __test_provider_string_frozen__():
     result = parse_provider_string("ccxt:BINANCE:BTC/USDT@1D")
     with pytest.raises(AttributeError):
         result.provider = "other"
+
+
+# --- multi_broker parsing ---
+
+def __test_parse_multi_broker_futures__():
+    """multi_broker splits the broker off a futures symbol"""
+    result = parse_provider_string("ccxt:BYBIT:BTC/USDT:USDT@1D", multi_broker=True)
+    assert result == ProviderString(
+        provider="ccxt", symbol="BTC/USDT:USDT", timeframe="1D", broker="BYBIT")
+
+
+def __test_parse_multi_broker_spot__():
+    """multi_broker splits the broker off a spot symbol"""
+    result = parse_provider_string("ccxt:BINANCE:ETH/USDT@4H", multi_broker=True)
+    assert result == ProviderString(
+        provider="ccxt", symbol="ETH/USDT", timeframe="4H", broker="BINANCE")
+
+
+def __test_parse_multi_broker_broker_only__():
+    """Broker-only string yields an empty symbol (for listing that broker)"""
+    result = parse_provider_string("ccxt:BYBIT", multi_broker=True)
+    assert result == ProviderString(
+        provider="ccxt", symbol="", timeframe=None, broker="BYBIT")
+
+
+def __test_parse_multi_broker_broker_only_with_timeframe__():
+    """Broker-only string keeps the timeframe and leaves the symbol empty"""
+    result = parse_provider_string("ccxt:BYBIT@1D", multi_broker=True)
+    assert result == ProviderString(
+        provider="ccxt", symbol="", timeframe="1D", broker="BYBIT")
+
+
+def __test_parse_multi_broker_empty_broker__():
+    """Empty broker segment raises ValueError"""
+    with pytest.raises(ValueError, match="Broker name is empty"):
+        parse_provider_string("ccxt::BTC/USDT@1D", multi_broker=True)
+
+
+def __test_parse_default_keeps_broker_in_symbol__():
+    """Without multi_broker the broker stays folded into the symbol, broker is None"""
+    result = parse_provider_string("ccxt:BYBIT:BTC/USDT:USDT@1D")
+    assert result.symbol == "BYBIT:BTC/USDT:USDT"
+    assert result.broker is None
+
+
+# --- provider_symbol property ---
+
+def __test_provider_symbol_multi_broker__():
+    """provider_symbol re-folds the broker into the symbol"""
+    result = parse_provider_string("ccxt:BYBIT:BTC/USDT:USDT@1D", multi_broker=True)
+    assert result.provider_symbol == "BYBIT:BTC/USDT:USDT"
+
+
+def __test_provider_symbol_broker_only__():
+    """provider_symbol of a broker-only string is just the broker"""
+    result = parse_provider_string("ccxt:BYBIT", multi_broker=True)
+    assert result.provider_symbol == "BYBIT"
+
+
+def __test_provider_symbol_single_broker__():
+    """provider_symbol of a single-broker provider is the symbol unchanged"""
+    result = parse_provider_string("capitalcom:EURUSD@1H")
+    assert result.provider_symbol == "EURUSD"

@@ -97,6 +97,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     plugin_name = "CCXT"
     Config = CCXTConfig
+    multi_broker = True
+
+    @classmethod
+    @override
+    def get_list_of_brokers(cls) -> list[str]:
+        """Return the exchange ids CCXT can serve (e.g. ``"binance"``, ``"bybit"``)."""
+        try:
+            import ccxt
+        except ImportError:
+            raise ImportError("CCXT is not installed. Please install it using `pip install ccxt`.")
+        return list(ccxt.exchanges)
 
     @classmethod
     @override

@@ -161,6 +161,8 @@ Provider string format: `provider:EXCHANGE:SYMBOL:SETTLE@TIMEFRAME`
 | `SETTLE`    | `USDT`      | Settlement currency (optional) |
 | `TIMEFRAME` | `1`         | TradingView timeframe format   |
 
+The `EXCHANGE` segment is the **broker** selector for multi-broker providers (CCXT covers 100+ exchanges); single-broker providers such as Capital.com omit it (`capitalcom:EURUSD@60`). The same provider string works with [`pyne data download`](./data.md), which can also list a provider's brokers via `--list-brokers`.
+
 The `-f` / `--from` option accepts a **negative integer** for relative bar count when using
 a provider string:
 

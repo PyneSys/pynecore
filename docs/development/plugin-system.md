@@ -243,6 +243,24 @@ out, users uncomment and edit what they need:
 The Generic type parameter (`ProviderPlugin[FooConfig]`) gives your IDE
 full type information on `self.config` — no more `object | None` warnings.
 
+#### Multi-broker providers
+
+A single provider plugin can serve many brokers/exchanges (CCXT reaches 100+). Declare it with the `multi_broker` class attribute and the provider string's broker segment is parsed for you:
+
+```python
+class FooProvider(ProviderPlugin[FooConfig]):
+    Config = FooConfig
+    multi_broker = True
+
+    @classmethod
+    @override
+    def get_list_of_brokers(cls) -> list[str]:
+        """Powers `pyne data download foo --list-brokers`."""
+        return ["broker-a", "broker-b"]
+```
+
+With `multi_broker = True`, a provider string like `foo:BROKER:SYMBOL@TF` is split so the segment after the provider name becomes the broker. The broker is then **re-folded into the symbol** before it reaches your plugin — your `__init__` receives `"BROKER:SYMBOL"` and splits it as needed, exactly how providers have always received their symbol, so existing parsing keeps working. The optional `get_list_of_brokers()` classmethod powers `--list-brokers`; leave it unimplemented (the default raises `NotImplementedError`) when the broker set can't be enumerated.
+
 ### BrokerPlugin — Order Execution
 
 A `BrokerPlugin` is a `LiveProviderPlugin` that can also **route orders** to an

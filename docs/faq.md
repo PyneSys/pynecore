@@ -83,7 +83,7 @@ pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT" --timeframe 1D
 You can also download data from supported providers:
 
 ```bash
-pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT" --timeframe 1D
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
 ```
 
 More providers could be added in the future by the community as plugins.

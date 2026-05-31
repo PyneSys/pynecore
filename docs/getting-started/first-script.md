@@ -93,7 +93,7 @@ Save this code to a file named `simple_ma.py` in your working directory's script
 This will download the OHLCV data for the BTC/USDT pair from Bybit and save it as `ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv` in your working directory's data/` folder:
 
 ```bash
-pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT"
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
 ```
 
 ## Running Your Script

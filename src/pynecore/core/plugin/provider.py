@@ -36,6 +36,12 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     fetch_all_by_default: bool = False
     """If True, fetch all available data when no start date is given (instead of 1 year)."""
 
+    multi_broker: bool = False
+    """If True, this provider serves many brokers/exchanges and the first segment
+    of the provider string after the provider name selects the broker
+    (e.g. ``ccxt:BYBIT:BTC/USDT:USDT`` → broker ``BYBIT``). Single-broker
+    providers leave this ``False`` and treat the whole string as the symbol."""
+
     @classmethod
     @abstractmethod
     def to_tradingview_timeframe(cls, timeframe: str) -> str:
@@ -162,6 +168,23 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self.ohlcv_file is not None
         self.ohlcv_file.close()
+
+    @classmethod
+    def get_list_of_brokers(cls) -> list[str]:
+        """
+        Get the list of brokers/exchanges this provider can serve.
+
+        Only meaningful for :attr:`multi_broker` providers. Optional — the
+        default raises :class:`NotImplementedError`, which the ``pyne data``
+        CLI catches and reports gracefully. Implemented as a classmethod so it
+        can answer ``--list-brokers`` without a symbol-bound instance.
+
+        :return: List of broker/exchange selector names.
+        :raises NotImplementedError: If the provider does not enumerate brokers.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not support listing brokers"
+        )
 
     @abstractmethod
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:

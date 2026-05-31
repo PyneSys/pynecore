@@ -11,8 +11,9 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
 from ..app import app, app_state
-from ...core.plugin import discover_plugins, load_plugin
+from ...core.plugin import discover_plugins, load_plugin, PluginNotFoundError
 from ...core.plugin import ProviderPlugin
+from ...core.provider_string import is_provider_string, parse_provider_string
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
 from ...core.ohlcv_file import OHLCVReader
@@ -29,27 +30,41 @@ app.add_typer(app_data, name="data")
 # Trick to avoid type checking errors
 if TYPE_CHECKING:
     DateOrDays: TypeAlias = datetime
-
-
-    class AvailableProvidersEnum(Enum):
-        ...
-
 else:
     # DateOrDays is either a datetime or a number of days
     DateOrDays = str
 
-    # Create an enum from plugins that are Provider subclasses
-    _provider_names = []
-    for _name, _ep in discover_plugins().items():
+
+def _list_provider_names() -> list[str]:
+    """Return the sorted names of all installed data-provider plugins."""
+    names = []
+    for name, ep in discover_plugins().items():
         try:
-            _cls = _ep.load()
-            if isinstance(_cls, type) and issubclass(_cls, ProviderPlugin):
-                _provider_names.append(_name)
+            cls = ep.load()
+            if isinstance(cls, type) and issubclass(cls, ProviderPlugin):
+                names.append(name)
         except Exception:  # noqa
             pass
-    AvailableProvidersEnum = Enum('Provider', {
-        name.upper(): name.lower() for name in sorted(_provider_names)
-    })
+    return sorted(names)
+
+
+def _resolve_provider_class(provider_name: str) -> type[ProviderPlugin]:
+    """
+    Load a data-provider plugin by name.
+
+    :param provider_name: Provider entry-point name (e.g. ``"ccxt"``).
+    :return: The provider plugin class.
+    :raises ValueError: If the name is unknown or refers to a non-provider
+        plugin. The caller's ``except (ImportError, ValueError)`` prints it.
+    """
+    try:
+        cls = load_plugin(provider_name)
+    except PluginNotFoundError:
+        names = ', '.join(_list_provider_names()) or '(none)'
+        raise ValueError(f"Unknown provider '{provider_name}'. Available providers: {names}")
+    if not (isinstance(cls, type) and issubclass(cls, ProviderPlugin)):
+        raise ValueError(f"Plugin '{provider_name}' is not a data provider.")
+    return cast(type[ProviderPlugin], cls)
 
 
 # Available output formats
@@ -143,14 +158,19 @@ def _format_date_default(value, fallback: str) -> str:
 
 @app_data.command()
 def download(
-        provider: AvailableProvidersEnum = Argument(..., case_sensitive=False, show_default=False,
-                                                    help="Data provider"),
+        provider: str = Argument(..., show_default=False,
+                                 help="Provider name (e.g. 'ccxt') or a full provider string "
+                                      "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D')"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
-                                    help="Symbol (e.g. BYBIT:BTC/USDT:USDT)"),
+                                    help="Symbol (e.g. BYBIT:BTC/USDT:USDT). Ignored when the "
+                                         "provider string already contains a symbol"),
         list_symbols: bool = Option(False, '--list-symbols', '-ls',
                                     help="List available symbols of the provider"),
+        list_brokers: bool = Option(False, '--list-brokers', '-lb',
+                                    help="List available brokers/exchanges of a multi-broker provider"),
         timeframe: str = Option('1D', '--timeframe', '-tf', callback=_typer_validate_timeframe,
-                                help="Timeframe in TradingView format (e.g., '1', '5S', '1D', '1W')"),
+                                help="Timeframe in TradingView format (e.g., '1', '5S', '1D', '1W'). "
+                                     "Ignored when the provider string contains an @timeframe"),
         time_from: DateOrDays = Option("continue", '--from', '-f',
                                        callback=_typer_parse_date_or_days, formats=[],
                                        metavar="[%Y-%m-%d|%Y-%m-%d %H:%M:%S|NUMBER]|continue",
@@ -173,17 +193,54 @@ def download(
 ):
     """
     Download historical OHLCV data
-    """
-    # Load provider class via plugin system
-    provider_class = cast(type[ProviderPlugin], load_plugin(provider.value))
 
+    The provider can be given either as a bare name plus ``-s``/``-tf`` flags
+    (``pyne data download ccxt -s BYBIT:BTC/USDT:USDT -tf 1D``) or as a single
+    provider string in the same syntax as ``pyne run``
+    (``pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D``). Both forms are equivalent.
+    """
     try:
         from ...core.config import ensure_config
+
+        # Resolve the provider plugin from either the bare name or the leading
+        # segment of a provider string.
+        string_mode = is_provider_string(provider)
+        provider_name = (provider.split(':', 1)[0] if string_mode else provider).lower()
+        provider_class = _resolve_provider_class(provider_name)
+
+        # --list-brokers needs only the provider plugin
+        if list_brokers:
+            try:
+                brokers = provider_class.get_list_of_brokers()
+            except NotImplementedError:
+                secho(f"Provider '{provider_name}' does not support listing brokers.",
+                      err=True, fg=colors.RED)
+                raise Exit(1)
+            for b in sorted(brokers):
+                print(b)
+            return
+
+        # In string mode, derive broker/symbol/timeframe from the provider
+        # string; the broker is re-folded into the symbol so multi-broker
+        # providers (which split it off internally) receive what they expect.
+        if string_mode:
+            ps = parse_provider_string(provider, multi_broker=provider_class.multi_broker)
+            if ps.symbol and symbol:
+                raise ValueError("Symbol given both in the provider string and via "
+                                 "-s/--symbol; use only one.")
+            resolved_symbol = ps.symbol or symbol
+            if ps.timeframe is not None:
+                timeframe = validate_timeframe(ps.timeframe)
+            if ps.broker:
+                symbol = f"{ps.broker}:{resolved_symbol}" if resolved_symbol else ps.broker
+            else:
+                symbol = resolved_symbol
+
         config = None
         config_cls: type | None = getattr(provider_class, 'Config', None)
         if config_cls is not None:
             config = ensure_config(config_cls,
-                                   app_state.config_dir / 'plugins' / f'{provider.value}.toml')
+                                   app_state.config_dir / 'plugins' / f'{provider_name}.toml')
 
         # If list_symbols is True, we show the available symbols then exit
         if list_symbols:

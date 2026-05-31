@@ -21,7 +21,7 @@ The Symbol Browser is the interactive two-pane TUI that `pyne data download` dro
 
 The browser opens automatically when:
 
-- you invoke `pyne data download PROVIDER` without `--symbol`, **and**
+- you invoke a provider without a symbol — a bare provider name or, for a multi-broker provider, a broker-only provider string — **and**
 - stdin is a real terminal (TTY).
 
 If stdin is piped or redirected, the command errors out with `Symbol is required (or use --list-symbols for non-interactive listing).` — the TUI is interactive-only.
@@ -33,8 +33,8 @@ pyne data download capitalcom
 # Same, but pre-fill the wizard's timeframe field with 15
 pyne data download capitalcom --timeframe 15
 
-# CCXT requires the exchange in the symbol slot to scope the symbol list
-pyne data download ccxt --symbol BINANCE
+# Multi-broker provider: name the broker to scope the symbol list
+pyne data download ccxt:BINANCE
 ```
 
 `--timeframe`, `--from` and `--to` from the command line are not enforced inside the TUI — they become the **defaults** of the wizard's matching fields and can be changed before submitting.
@@ -171,10 +171,10 @@ When the `From..To` window runs past the last available bar (typically into a we
 
 ### CCXT — symbol list scope
 
-CCXT supports 100+ exchanges; the symbol list is per-exchange. Pass the exchange name in the `--symbol` slot when opening the browser so the right list is fetched:
+CCXT supports 100+ exchanges; the symbol list is per-exchange. Name the broker in a broker-only provider string when opening the browser so the right list is fetched:
 
 ```bash
-pyne data download ccxt --symbol BINANCE
+pyne data download ccxt:BINANCE
 ```
 
 ## Troubleshooting

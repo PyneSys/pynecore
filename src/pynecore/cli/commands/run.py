@@ -6,6 +6,7 @@ import sys
 import tomllib
 
 from pathlib import Path
+from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC, tzinfo
 from typing import Any
 
@@ -246,13 +247,21 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     from pynecore.core.config import ensure_config
     from pynecore.lib.timeframe import in_seconds
 
-    ps = parse_provider_string(provider_str, require_timeframe=True)
-
-    # Load provider plugin
-    provider_class = load_plugin(ps.provider)
+    # Load the provider plugin first so we know whether it is multi-broker,
+    # which controls how the provider string is split (broker vs. symbol).
+    provider_name = provider_str.split(':', 1)[0].lower()
+    provider_class = load_plugin(provider_name)
     if not issubclass(provider_class, ProviderPlugin):
-        secho(f"Plugin '{ps.provider}' is not a data provider.", err=True, fg=colors.RED)
+        secho(f"Plugin '{provider_name}' is not a data provider.", err=True, fg=colors.RED)
         raise Exit(1)
+
+    ps = parse_provider_string(provider_str, require_timeframe=True,
+                               multi_broker=provider_class.multi_broker)
+    # Store the normalized (lowercased) provider name so that later
+    # case-sensitive ``load_plugin()`` lookups for security/auto-rate
+    # contexts succeed even when the user typed the provider in a
+    # different case (e.g. ``CCXT:...``).
+    ps = dc_replace(ps, provider=provider_name)
 
     # Default to -500 bars if --from not specified in provider mode
     if not time_from_str:
@@ -285,11 +294,12 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     config_cls: type | None = getattr(provider_class, 'Config', None)
     if config_cls is not None:
         config = ensure_config(config_cls,
-                               app_state.config_dir / 'plugins' / f'{ps.provider}.toml')
+                               app_state.config_dir / 'plugins' / f'{provider_name}.toml')
 
-    # Create provider instance
+    # Create provider instance. ``provider_symbol`` re-folds the broker into
+    # the symbol for multi-broker providers, which split it off internally.
     provider_instance: ProviderPlugin = provider_class(
-        symbol=ps.symbol, timeframe=ps.timeframe,
+        symbol=ps.provider_symbol, timeframe=ps.timeframe,
         ohlcv_dir=app_state.data_dir, config=config
     )
 

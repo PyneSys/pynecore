@@ -38,55 +38,87 @@ The `download` command allows you to fetch historical OHLCV data from various pr
 ### Basic Usage
 
 ```bash
-pyne data download PROVIDER [OPTIONS]
+pyne data download PROVIDER_STRING
 ```
 
-Where `PROVIDER` is one of the available data providers.
+A **provider string** packs the provider, the broker/exchange, the symbol and the
+timeframe into a single argument — the same syntax [`pyne run`](./run.md) uses:
 
-### Available Providers
-
-PyneCore currently supports the following data providers:
-- `ccxt`: CCXT library for accessing cryptocurrency exchanges
-- `capitalcom`: Capital.com market data
-
-To see which providers are available in your installation, use:
+```
+provider[:broker]:symbol[@timeframe]
+```
 
 ```bash
-pyne data download --help
+# CCXT, Bybit perpetual futures, daily candles
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
+
+# CCXT, Binance spot, 4-hour candles
+pyne data download ccxt:BINANCE:ETH/USDT@240
+
+# Capital.com (single-broker provider), EUR/USD, 1-hour candles
+pyne data download capitalcom:EURUSD@60
 ```
+
+| Part        | Example         | Description                                                                          |
+|-------------|-----------------|--------------------------------------------------------------------------------------|
+| `provider`  | `ccxt`          | Plugin name (entry point); case-insensitive                                          |
+| `broker`    | `BYBIT`         | Broker/exchange selector — multi-broker providers only (see note)                    |
+| `symbol`    | `BTC/USDT:USDT` | Instrument in the broker's native format                                             |
+| `timeframe` | `1D`            | TradingView timeframe (`1`, `5`, `60`, `1D`, `1W`, `1M`); optional, defaults to `1D` |
+
+> **Multi-broker providers.** Some providers reach many brokers/exchanges through a
+> single plugin — CCXT alone covers 100+ crypto exchanges. For these the segment
+> right after the provider name selects the broker (`ccxt:BYBIT:…`). Single-broker
+> providers such as Capital.com have no broker segment (`capitalcom:EURUSD@…`).
+
+To see which providers are installed, run `pyne plugin list` (provider plugins are tagged `[provider]`).
 
 ### Download Options
 
-- `--symbol`, `-s`: Symbol to download (e.g., "BINANCE:BTC/USDT" for CCXT)
-- `--timeframe`, `-tf`: Timeframe in TradingView format (1, 5, 15, 30, 60, 240, 1D, 1W)
 - `--from`, `-f`: Start date or days back from now, or 'continue' to resume last download
 - `--to`, `-t`: End date or days from start date
-- `--list-symbols`, `-ls`: List available symbols of the provider
+- `--list-brokers`, `-lb`: List the available brokers/exchanges of a multi-broker provider
+- `--list-symbols`, `-ls`: List the available symbols of the provider (or selected broker)
 - `--symbol-info`, `-si`: Show symbol information
 - `--force-save-info`, `-fi`: Force save symbol information
 - `--truncate`, `-tr`: Truncate file before downloading (all data will be lost)
+- `--chunk-size`, `-cs`: Bars per API request (overrides the provider's automatic limit)
+- `--symbol`, `-s` / `--timeframe`, `-tf`: Supply the symbol/timeframe separately instead of writing them into the provider string (see [Alternative form](#alternative-separate-provider-symbol-and-timeframe))
 
 ### Interactive Symbol Browser
 
-If you run `pyne data download PROVIDER` without `--symbol` on an interactive terminal, an interactive TUI opens for picking the symbol, timeframe and date range. See [Symbol Browser TUI](./symbol-browser.md) for the full key map, wizard behaviour and progress-strip details.
+If you run a provider without a symbol on an interactive terminal — either a bare provider name or a broker-only provider string — an interactive TUI opens for picking the symbol, timeframe and date range:
+
+```bash
+pyne data download ccxt:BYBIT     # browse a specific broker
+pyne data download capitalcom     # browse a single-broker provider
+```
+
+See [Symbol Browser TUI](./symbol-browser.md) for the full key map, wizard behaviour and progress-strip details.
+
+### Alternative: separate provider, symbol and timeframe
+
+The symbol and timeframe can also be passed as separate options instead of being written into the provider string — the provider name as the argument, the symbol via `--symbol`/`-s` and the timeframe via `--timeframe`/`-tf`. This is equivalent to a provider string; for a multi-broker provider the broker is written in front of the symbol:
+
+```bash
+# Equivalent to ccxt:BYBIT:BTC/USDT:USDT@1D
+pyne data download ccxt -s BYBIT:BTC/USDT:USDT -tf 1D
+```
 
 ### Download Examples
 
 ```bash
-# List all available symbols from CCXT provider
-pyne data download ccxt --list-symbols --symbol BYBIT  # Note, here we specify the exchange as symbol
+# Download Bitcoin daily data from CCXT/Bybit, continuing from the last download
+pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
 
-# Download Bitcoin daily data from CCXT, continuing from last download
-pyne data download ccxt --symbol "BINANCE:BTC/USDT" --timeframe "1D"
+# Download Binance spot ETH/USDT, last 90 days
+pyne data download ccxt:BINANCE:ETH/USDT@1D --from "90"
 
-# Download Forex 1-hour data from Capital.com for a specific date range
-pyne data download capitalcom --symbol "EURUSD" --timeframe "60" --from "2023-01-01" --to "2023-12-31"
-
-# Download data for the last 90 days
-pyne data download ccxt --symbol "BINANCE:ETH/USDT" --timeframe "1D" --from "90"
+# Download Capital.com EUR/USD 1-hour data for a specific range
+pyne data download capitalcom:EURUSD@60 --from "2023-01-01" --to "2023-12-31"
 
 # Truncate existing data and download everything again
-pyne data download ccxt --symbol "BINANCE:BTC/USDT" --timeframe "1D" --truncate
+pyne data download ccxt:BINANCE:BTC/USDT@1D --truncate
 ```
 
 ### Understanding Date Formats
@@ -122,20 +154,22 @@ When downloading data, PyneCore also fetches and stores symbol information in a 
 
 You can view this information with the `--symbol-info` flag:
 ```bash
-pyne data download ccxt --symbol "BINANCE:BTC/USDT" --timeframe "1D" --symbol-info
+pyne data download ccxt:BINANCE:BTC/USDT@1D --symbol-info
 ```
 
-### Listing Symbols
+### Listing Brokers and Symbols
 
-To list all available symbols for a provider, use:
+A multi-broker provider can list its brokers/exchanges:
+
 ```bash
-pyne data download PROVIDER --list-symbols
+pyne data download ccxt --list-brokers
 ```
 
-Some providers support multiple exchanges, such as CCXT. In this case, you need to specify the exchange name in the `--symbol` option:
+To list the tradable symbols, give a broker-only provider string (multi-broker) or just the provider name (single-broker):
 
 ```bash
-pyne data download ccxt --list-symbols --symbol BYBIT
+pyne data download ccxt:BYBIT --list-symbols    # symbols on Bybit
+pyne data download capitalcom --list-symbols     # Capital.com symbols
 ```
 
 
@@ -342,7 +376,7 @@ When working with large datasets, consider:
 
 The CCXT provider uses the [CCXT library](https://github.com/ccxt/ccxt) to connect to various cryptocurrency exchanges.
 
-Symbol format for CCXT: `EXCHANGE:BASE/QUOTE`, for example `BINANCE:BTC/USDT`.
+CCXT is a **multi-broker** provider: the broker segment of the provider string selects the exchange, e.g. `ccxt:BINANCE:BTC/USDT` or `ccxt:BYBIT:BTC/USDT:USDT` (the optional `:SETTLE` suffix marks a settled perpetual/future). List the exchanges with `pyne data download ccxt --list-brokers`.
 
 Available exchanges depend on the CCXT library, which supports 100+ cryptocurrency exchanges.
 
@@ -350,7 +384,7 @@ Available exchanges depend on the CCXT library, which supports 100+ cryptocurren
 
 The Capital.com provider connects to the Capital.com API for forex, stocks, indices, and more.
 
-Symbol format for Capital.com: `SYMBOL`, for example `EURUSD`.
+Capital.com is a single-broker provider, so there is no broker segment: `capitalcom:EURUSD@60` (or `capitalcom -s EURUSD -tf 60`).
 
 ## Troubleshooting
 

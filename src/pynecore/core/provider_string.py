@@ -8,8 +8,8 @@ Format::
 Examples::
 
     ccxt:BYBIT:BTC/USDT:USDT@1D       # CCXT, Bybit futures, daily
-    ccxt:BINANCE:ETH/USDT@4H          # CCXT, Binance spot, 4-hour
-    capitalcom:EURUSD@1H              # Capital.com, EURUSD, 1-hour
+    ccxt:BINANCE:ETH/USDT@240         # CCXT, Binance spot, 4-hour
+    capitalcom:EURUSD@60              # Capital.com, EURUSD, 1-hour
 
 The ``@timeframe`` suffix is only required in ``pyne run`` (the main data
 source).  In ``request.security()`` the timeframe is a separate parameter,
@@ -29,10 +29,34 @@ class ProviderString:
     """Plugin entry point name (e.g. ``"ccxt"``, ``"capitalcom"``)."""
 
     symbol: str
-    """Symbol in provider-specific format (e.g. ``"BYBIT:BTC/USDT:USDT"``)."""
+    """Symbol in provider-specific format (e.g. ``"BTC/USDT:USDT"``).
+
+    For multi-broker providers the broker prefix is split off into
+    :attr:`broker`, so this holds only the instrument; for single-broker
+    providers the whole symbol is kept verbatim. May be an empty string
+    for a broker-only string such as ``"ccxt:BYBIT"``.
+    """
 
     timeframe: str | None = None
     """Timeframe in TradingView format (e.g. ``"1D"``), or None if not specified."""
+
+    broker: str | None = None
+    """Broker / exchange selector for multi-broker providers (e.g. ``"BYBIT"``),
+    or ``None`` for single-broker providers."""
+
+    @property
+    def provider_symbol(self) -> str:
+        """Symbol in the form the provider plugin expects.
+
+        Multi-broker providers receive the broker folded back into the
+        symbol (``"BYBIT:BTC/USDT:USDT"``) and split it off internally; a
+        broker-only string yields just the broker so the provider can list
+        that broker's symbols. Single-broker providers get :attr:`symbol`
+        unchanged.
+        """
+        if self.broker:
+            return f"{self.broker}:{self.symbol}" if self.symbol else self.broker
+        return self.symbol
 
 
 def is_provider_string(value: str) -> bool:
@@ -53,12 +77,19 @@ def is_provider_string(value: str) -> bool:
     return True
 
 
-def parse_provider_string(value: str, *, require_timeframe: bool = False) -> ProviderString:
+def parse_provider_string(value: str, *, require_timeframe: bool = False,
+                          multi_broker: bool = False) -> ProviderString:
     """
     Parse a provider string into its components.
 
     :param value: The provider string (e.g. ``"ccxt:BYBIT:BTC/USDT:USDT@1D"``).
     :param require_timeframe: If True, raise ValueError when ``@timeframe`` is missing.
+    :param multi_broker: If True, treat the first segment after the provider name
+        as the broker/exchange selector (e.g. ``"BYBIT"``) and split it into
+        :attr:`ProviderString.broker`; the remainder is the symbol (which may be
+        empty for a broker-only string such as ``"ccxt:BYBIT"``). Callers learn
+        whether a provider is multi-broker from its ``multi_broker`` class
+        attribute.
     :return: A :class:`ProviderString` with the parsed components.
     :raises ValueError: If the string is malformed or timeframe is required but missing.
     """
@@ -97,10 +128,21 @@ def parse_provider_string(value: str, *, require_timeframe: bool = False) -> Pro
             )
         rest = symbol_part
 
+    broker: str | None = None
+    symbol = rest
+    if multi_broker:
+        broker, _, symbol = rest.partition(':')
+        if not broker:
+            raise ValueError(
+                f"Invalid provider string: '{value}'. "
+                f"Broker name is empty."
+            )
+
     if require_timeframe and timeframe is None:
         raise ValueError(
             f"Timeframe is required. Use '@' to specify it: "
             f"'{value}@<timeframe>' (e.g. '{value}@1D')"
         )
 
-    return ProviderString(provider=provider, symbol=rest, timeframe=timeframe)
+    return ProviderString(provider=provider, symbol=symbol,
+                          timeframe=timeframe, broker=broker)
