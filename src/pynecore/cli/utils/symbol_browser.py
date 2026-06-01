@@ -152,12 +152,14 @@ class SymbolBrowser:
                  default_from: str = "continue",
                  default_to: str = "now",
                  default_chunk_size: int | None = None,
+                 default_extra_data: bool = False,
                  can_go_back: bool = False,
                  max_cache: int = 200):
         self.provider = provider
         self.symbols: list[str] = list(symbols)
         self.ohlcv_dir = ohlcv_dir
         self.default_chunk_size = default_chunk_size
+        self.default_extra_data = default_extra_data
         self.max_cache = max_cache
 
         # When launched from the multi-broker picker, ESC returns to the broker
@@ -704,6 +706,7 @@ class SymbolBrowser:
                     resolved_from, resolved_to,
                     on_progress=None if fetch_all else on_progress,
                     limit=self.default_chunk_size,
+                    with_extra=self.default_extra_data,
                 )
 
                 # Write a fresh SymInfo TOML alongside the OHLCV — matches

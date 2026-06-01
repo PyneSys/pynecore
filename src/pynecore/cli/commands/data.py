@@ -190,6 +190,11 @@ def download(
                                              "Overrides automatic detection based on exchange limits. "
                                              "Useful for exchanges with timeframe-specific limits (e.g., Bitget 1w: 12). "
                                              "Lower values = slower but safer, higher values = faster but may hit API limits."),
+        extra_data: bool = Option(False, '--extra-data/--no-extra-data', '-ed',
+                                  help="Also download provider extra fields (ask/bid/spread) into a "
+                                       ".extra.csv sidecar. Off by default: extra fields cost extra "
+                                       "requests and slow every later backtest that loads them. "
+                                       "Ignored by providers that have no extra fields."),
 ):
     """
     Download historical OHLCV data
@@ -288,6 +293,7 @@ def download(
                 default_from=_format_date_default(time_from, "continue"),
                 default_to=_format_date_default(time_to, "now"),
                 default_chunk_size=chunk_size,
+                default_extra_data=extra_data,
                 can_go_back=can_go_back,
             )
             browser.run()
@@ -452,7 +458,8 @@ def download(
                         description="Downloading all available OHLCV data...",
                         total=None,
                     )
-                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=None, limit=chunk_size)
+                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=None,
+                                                     limit=chunk_size, with_extra=extra_data)
             else:
                 total_seconds = int((time_to - resolved_from).total_seconds())
 
@@ -477,7 +484,8 @@ def download(
                         progress.update(task, completed=elapsed_seconds)
 
                     # Start downloading
-                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress, limit=chunk_size)
+                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress,
+                                                     limit=chunk_size, with_extra=extra_data)
 
     except ProviderError as e:
         secho(f"Error: {e}", err=True, fg=colors.RED)

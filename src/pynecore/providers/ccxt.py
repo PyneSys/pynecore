@@ -435,7 +435,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
-                       limit: int | None = None):
+                       limit: int | None = None, with_extra: bool = False):
         """
         Download OHLCV data.
 
@@ -443,6 +443,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         :param time_to: The end time.
         :param on_progress: Optional callback to call on progress.
         :param limit: Override the automatic chunk size.
+        :param with_extra: Ignored; CCXT OHLCV has no extra per-bar fields.
         """
         import ccxt
 

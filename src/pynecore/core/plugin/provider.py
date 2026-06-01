@@ -258,7 +258,7 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     @abstractmethod
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
-                       limit: int | None = None):
+                       limit: int | None = None, with_extra: bool = False):
         """
         Download OHLCV data from the exchange.
 
@@ -268,6 +268,11 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         :param time_to: The end time.
         :param on_progress: Optional progress callback.
         :param limit: Override the automatic chunk size (number of bars per API request).
+        :param with_extra: When ``True``, also fetch and persist the provider's
+            extra per-bar fields (e.g. ask/bid/spread) to the ``.extra.csv``
+            sidecar. Off by default: the extra fields cost extra requests to
+            fetch and slow every later backtest that loads the sidecar, so they
+            are only produced on request. Providers without extra fields ignore it.
         """
 
     def load_ohlcv_data(self) -> OHLCVReader:
