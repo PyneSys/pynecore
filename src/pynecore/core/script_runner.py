@@ -18,9 +18,9 @@ from pynecore.core.plugin.live_provider import PluginSymbol
 
 if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
-    from zoneinfo import ZoneInfo  # noqa
+    from zoneinfo import ZoneInfo
     from pynecore.core.script import script
-    from pynecore.lib.strategy import Trade, SimPosition  # noqa
+    from pynecore.lib.strategy import Trade, SimPosition
     from pynecore.core.broker.position import BrokerPosition
     from pynecore.core.plugin.broker import BrokerPlugin
     from pynecore.core.plugin.live_provider import LiveProviderPlugin
