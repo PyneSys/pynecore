@@ -24,7 +24,7 @@ from .security_shm import (
 )
 
 if TYPE_CHECKING:
-    from multiprocessing import Process
+    from multiprocessing.process import BaseProcess
     from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
     from zoneinfo import ZoneInfo
@@ -91,7 +91,7 @@ _LIVENESS_POLL_SECONDS = 0.5
 def _wait_with_liveness(
     event: 'EventType',
     sec_id: str,
-    sec_processes: 'dict[str, Process] | None',
+    sec_processes: 'dict[str, BaseProcess] | None',
 ) -> None:
     """
     Wait for ``event`` while polling the owning security process for liveness.
@@ -230,7 +230,7 @@ def create_chart_protocol(
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
-    sec_processes: 'dict[str, Process] | None' = None,
+    sec_processes: 'dict[str, BaseProcess] | None' = None,
     auto_rate_sec_ids: frozenset[str] = frozenset(),
 ) -> tuple:
     """

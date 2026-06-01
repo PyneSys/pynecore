@@ -7,7 +7,7 @@ from datetime import datetime, UTC
 
 from pynecore import lib
 from pynecore.lib.log import broker_info, ohlcv_info, sim_info
-from pynecore.types.ohlcv import OHLCVπ
+from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
@@ -17,7 +17,7 @@ from pynecore.types import script_type
 from pynecore.core.plugin.live_provider import PluginSymbol
 
 if TYPE_CHECKING:
-    from multiprocessing import Process
+    from multiprocessing.process import BaseProcess
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
     from pynecore.lib.strategy import Trade, SimPosition  # noqa
@@ -166,15 +166,11 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
         lib.syminfo._size_round_factor = 1
 
 
-# noinspection PyUnusedLocal,PyProtectedMember
-def _reset_lib_vars(lib: ModuleType):
+# noinspection PyProtectedMember
+def _reset_lib_vars():
     """
     Reset lib variables to be able to run other scripts
-    :param lib:
-    :return:
     """
-    if TYPE_CHECKING:  # This is needed for the type checker to work
-        from .. import lib
     from ..types.source import Source
 
     lib.open = Source("open")
@@ -232,7 +228,7 @@ class ScriptRunner:
                  security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
                  magnifier_iter: Iterable[OHLCV] | None = None,
                  broker_plugin: 'BrokerPlugin | None' = None,
-                 broker_event_loop: Any = None,
+                 broker_event_loop: 'asyncio.AbstractEventLoop | None' = None,
                  broker_store_ctx: 'RunContext | None' = None,
                  log_ohlcv: bool = False,
                  chart_provider_name: str | None = None,
@@ -311,7 +307,7 @@ class ScriptRunner:
 
         # Set syminfo properties BEFORE importing the script
         # This ensures that timestamp() calls in default parameters use the correct timezone
-        _set_lib_syminfo_properties(syminfo, lib)
+        _set_lib_syminfo_properties(syminfo)
 
         # Set programmatic inputs before script import so they override .toml values
         if inputs:
@@ -330,7 +326,7 @@ class ScriptRunner:
         # Broker (live trading) mode setup.
         # Done before ohlcv_iter is consumed so the engine is ready before run_iter.
         self._broker_plugin: 'BrokerPlugin | None' = broker_plugin
-        self._broker_event_loop = broker_event_loop
+        self._broker_event_loop: 'asyncio.AbstractEventLoop | None' = broker_event_loop
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         self._engine_event_stream_future: Any = None
@@ -415,12 +411,13 @@ class ScriptRunner:
                 broker_plugin, 'publish_native_failsafe_sl', None,
             )
             if _failsafe_publish is not None:
-                _engine = self._order_sync_engine
+                _engine = cast('OrderSyncEngine', self._order_sync_engine)
 
+                # noinspection PyProtectedMember
                 def _native_failsafe_dispatcher(snapshot):
                     _engine._run_async(_failsafe_publish(snapshot))
 
-                self._order_sync_engine.set_native_bracket_dispatcher(
+                _engine.set_native_bracket_dispatcher(
                     _native_failsafe_dispatcher,
                 )
 
@@ -442,7 +439,7 @@ class ScriptRunner:
             # calling it, and the engine drops snapshots for refs it does not
             # track at drain time.
             broker_plugin.native_failsafe_observed_sink = (
-                self._order_sync_engine.enqueue_native_bracket_observed
+                cast('OrderSyncEngine', self._order_sync_engine).enqueue_native_bracket_observed
             )
 
         self.ohlcv_iter = ohlcv_iter
@@ -496,6 +493,7 @@ class ScriptRunner:
 
     # === Broker startup ====================================================
 
+    # noinspection PyProtectedMember
     def start_broker(self) -> None:
         """Start broker-side I/O after construction.
 
@@ -520,6 +518,7 @@ class ScriptRunner:
         """
         if self._order_sync_engine is None:
             return
+        engine = cast('OrderSyncEngine', self._order_sync_engine)
         # Plugin ``connect()`` (run during ``live_ohlcv_generator``) may have
         # mutated the ``envelopes`` / ``pending_verifications`` tables via
         # ``_retire_startup_orphans``. The engine cached both replays in its
@@ -527,11 +526,12 @@ class ScriptRunner:
         # first dispatch to avoid popping a stale ``bar_ts_ms`` that resurrects
         # a just-retired ``client_order_id`` onto a row whose ``closed_ts_ms``
         # is still set.
-        self._order_sync_engine.refresh_anchors_from_store()
-        if self._broker_event_loop is not None:
+        engine.refresh_anchors_from_store()
+        loop = self._broker_event_loop
+        if loop is not None:
             self._engine_event_stream_future = asyncio.run_coroutine_threadsafe(
-                self._order_sync_engine.run_event_stream(),
-                self._broker_event_loop,
+                engine.run_event_stream(),
+                loop,
             )
         # Defensive-close pending markers from prior process instances
         # must be re-armed (or dropped, if the FILL already settled)
@@ -541,8 +541,8 @@ class ScriptRunner:
         # treat a flat exchange as an external flatten and re-enter on
         # the next bar against a position the previous instance was
         # already closing defensively.
-        self._order_sync_engine._replay_pending_defensive_closes()
-        self._order_sync_engine.reconcile()
+        engine._replay_pending_defensive_closes()
+        engine.reconcile()
 
     # === Order-processing dispatch =========================================
 
@@ -556,7 +556,7 @@ class ScriptRunner:
         arrived asynchronously through :meth:`BrokerPosition.record_fill`.
         """
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync(
+            cast('OrderSyncEngine', self._order_sync_engine).sync(
                 int(lib.last_bar_time),
                 last_price=_close_price_or_none(),
             )
@@ -575,7 +575,7 @@ class ScriptRunner:
         is the source of truth — magnification is irrelevant and the engine
         runs a plain sync."""
         if self._order_sync_engine is not None:
-            self._order_sync_engine.sync(
+            cast('OrderSyncEngine', self._order_sync_engine).sync(
                 int(lib.last_bar_time),
                 last_price=_close_price_or_none(),
             )
@@ -628,7 +628,7 @@ class ScriptRunner:
     def broker_position_snapshot(self) -> 'Any | None':
         if self._order_sync_engine is None:
             return None
-        return self._order_sync_engine.exchange_position
+        return cast('OrderSyncEngine', self._order_sync_engine).exchange_position
 
     # noinspection PyProtectedMember
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
@@ -669,7 +669,7 @@ class ScriptRunner:
             reqs = getattr(self.script, '_broker_requirements', None)
             if reqs is not None:
                 pyramiding = int(getattr(self.script, 'pyramiding', 1) or 1)
-                errors = validate_at_startup(reqs, caps, pyramiding=pyramiding)
+                errors = validate_at_startup(cast('ScriptRequirements', reqs), caps, pyramiding=pyramiding)
                 if errors:
                     raise ExchangeCapabilityError(
                         "Script requirements not met by exchange:\n"
@@ -705,7 +705,7 @@ class ScriptRunner:
 
         # Update syminfo lib properties if needed
         if not self.update_syminfo_every_run:
-            _set_lib_syminfo_properties(self.syminfo, lib)
+            _set_lib_syminfo_properties(self.syminfo)
             self.tz = _parse_timezone(lib.syminfo.timezone)
 
         # Open plot writer if we have one
@@ -731,7 +731,7 @@ class ScriptRunner:
         sec_contexts: dict[str, dict] | None = getattr(
             self.script_module, '__security_contexts__', None
         )
-        sec_processes: 'dict[str, Process]' = {}
+        sec_processes: 'dict[str, BaseProcess]' = {}
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
         sec_sync_block = None
@@ -942,7 +942,7 @@ class ScriptRunner:
                     resolve_ctx = {
                         'symbol': symbol,
                         'timeframe': resolved_tf,
-                        'ignore_invalid_symbol': sec_contexts[sid].get(
+                        'ignore_invalid_symbol': cast('dict[str, dict]', sec_contexts)[sid].get(
                             'ignore_invalid_symbol', False
                         ),
                     }
@@ -1035,7 +1035,7 @@ class ScriptRunner:
                 if is_strat and self.script.use_bar_magnifier:
                     # Bar magnifier: accurate order fills at sub-bar resolution
                     yield from self._run_iter_magnified(
-                        lib, barstate, position, script_mod=script,
+                        barstate, position, script_mod=script,
                         is_strat=is_strat, on_progress=on_progress, string=string,
                     )
                     return
@@ -1071,6 +1071,7 @@ class ScriptRunner:
                 # ``currency=`` conversion looks up a freshly-written
                 # close from the rate-source ResultBlock instead of NaN.
                 if signal_rate_sources_fn is not None:
+                    # noinspection PyCallingNonCallable
                     signal_rate_sources_fn()
                 lib._lib_semaphore = True
                 for _title, main_func in registered_libraries:
@@ -1123,17 +1124,18 @@ class ScriptRunner:
                 if self._broker_mode:
                     self._process_orders(position)
                     return
-                old_fills = position._fill_counter
-                position.process_orders()
-                new_fills = position._fill_counter
+                sim = cast('SimPosition', position)
+                old_fills = sim._fill_counter
+                sim.process_orders()
+                new_fills = sim._fill_counter
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     function_isolation.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
-                    position.process_orders()
-                    new_fills = position._fill_counter
+                    sim.process_orders()
+                    new_fills = sim._fill_counter
 
             # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
@@ -1141,17 +1143,18 @@ class ScriptRunner:
                 if self._broker_mode:
                     self._process_orders(position)
                     return
-                old_fills = position._fill_counter
-                position.process_orders_magnified(sub_bars_list, aggregated_candle)
-                new_fills = position._fill_counter
+                sim = cast('SimPosition', position)
+                old_fills = sim._fill_counter
+                sim.process_orders_magnified(sub_bars_list, aggregated_candle)
+                new_fills = sim._fill_counter
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     function_isolation.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
-                    position.process_orders_magnified(sub_bars_list, aggregated_candle)
-                    new_fills = position._fill_counter
+                    sim.process_orders_magnified(sub_bars_list, aggregated_candle)
+                    new_fills = sim._fill_counter
 
             # --- Peek-ahead pattern: historical bars ---
             # LIVE_TRANSITION doubles as end-of-data sentinel → next() always returns OHLCV
@@ -1180,7 +1183,7 @@ class ScriptRunner:
 
                 # Update syminfo lib properties if needed
                 if self.update_syminfo_every_run:
-                    _set_lib_syminfo_properties(self.syminfo, lib)
+                    _set_lib_syminfo_properties(self.syminfo)
                     self.tz = _parse_timezone(lib.syminfo.timezone)
 
                 # Last bar detection
@@ -1219,7 +1222,7 @@ class ScriptRunner:
                 if (is_strat and position and not self._broker_mode
                         and not lib._strategy_suppressed
                         and self.script.process_orders_on_close):
-                    position.process_orders_at_close()
+                    cast('SimPosition', position).process_orders_at_close()
 
                 # Process deferred margin calls
                 if is_strat and position and not lib._strategy_suppressed:
@@ -1309,7 +1312,7 @@ class ScriptRunner:
                     # ``apply_async_events``), spilling a bogus OHLCV log line
                     # for a bar the bot is no longer trading.
                     if self._order_sync_engine is not None:
-                        self._order_sync_engine.raise_if_halted()
+                        cast('OrderSyncEngine', self._order_sync_engine).raise_if_halted()
 
                     candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
@@ -1423,7 +1426,7 @@ class ScriptRunner:
                             # script sees the updated ``position.size``
                             # immediately rather than one bar later.
                             if self._order_sync_engine is not None:
-                                self._order_sync_engine.apply_async_events()
+                                cast('OrderSyncEngine', self._order_sync_engine).apply_async_events()
                             # Risk management hooks (broker-side parity with
                             # the sim's ``process_orders`` rollover/halt block):
                             # mark-to-market the open P&L so the equity-based
@@ -1434,12 +1437,15 @@ class ScriptRunner:
                             # rules before the sync so the queued risk-close
                             # ships in the same dispatch cycle.
                             if is_strat and position:
-                                position.update_unrealized_pnl(float(lib.close))
-                                position._handle_bar_open_risk()
+                                bpos = cast('BrokerPosition', position)
+                                bpos.update_unrealized_pnl(float(lib.close))
+                                # noinspection PyProtectedMember
+                                bpos._handle_bar_open_risk()
                             lib._plot_data.clear()
                             _run_libs_and_main()
                             if is_strat and position:
-                                position._enforce_post_bar_risk()
+                                # noinspection PyProtectedMember
+                                cast('BrokerPosition', position)._enforce_post_bar_risk()
                                 self._process_orders(position)
                         else:
                             # Backtest: simulator first (fills the previous
@@ -1620,12 +1626,13 @@ class ScriptRunner:
                 self._engine_event_stream_future = None
 
             # Reset library variables
-            _reset_lib_vars(lib)
+            _reset_lib_vars()
             # Reset function isolation
             function_isolation.reset()
 
     # noinspection PyProtectedMember
-    def _run_iter_magnified(self, lib, barstate, position, script_mod, is_strat, on_progress, string):
+    def _run_iter_magnified(self, barstate, position, script_mod, is_strat, on_progress, string):
+        from .. import lib
         """
         Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
         resolution, execute script once per chart bar.
@@ -1833,7 +1840,7 @@ class ScriptRunner:
             if isinstance(entry, PluginSymbol):
                 if entry.time_from is None and self._time_from is not None:
                     entry = dc_replace(entry, time_from=self._time_from)
-                result[sec_id] = entry
+                result[sec_id] = cast('PluginSymbol', entry)
                 continue
             if entry is not None:
                 result[sec_id] = self._ensure_ohlcv_ext(entry)
@@ -1915,6 +1922,7 @@ class ScriptRunner:
             # ``ignore_invalid_symbol`` downgrade: some live providers (e.g.
             # CCXT) validate the exchange prefix in ``__init__`` and raise
             # before the symbol-info call ever runs.
+            # noinspection PyBroadException
             try:
                 provider = provider_cls(
                     symbol=entry.symbol,
@@ -2018,8 +2026,9 @@ class ScriptRunner:
             ``(native_symbol, syminfo)`` tuple if the provider exposes the
             currency pair (in either direction), else ``None``.
             """
-            pk = provider_cls.construct_pair_symbol(a, b)
+            pk = cast('type[LiveProviderPlugin]', provider_cls).construct_pair_symbol(a, b)
             ns = self._chart_provider_instance.resolve_symbol(pk)
+            # noinspection PyBroadException
             try:
                 tp = provider_cls(
                     symbol=ns,
@@ -2027,13 +2036,13 @@ class ScriptRunner:
                     ohlcv_dir=self._chart_ohlcv_dir(),
                     config=config,
                 )
-                si = tp.update_symbol_info()
+                pair_si = tp.update_symbol_info()
             except Exception:  # noqa: BLE001
                 return None
-            act = (si.basecurrency, si.currency)
+            act = (pair_si.basecurrency, pair_si.currency)
             if act != (a, b) and act != (b, a):
                 return None
-            return ns, si
+            return ns, pair_si
 
         for from_cur, to_cur in sorted(needed_pairs):
             # A prior iteration may have already spawned a rate source for
@@ -2096,7 +2105,7 @@ class ScriptRunner:
         ohlcv_path = getattr(self._chart_provider_instance, 'ohlcv_path', None)
         if ohlcv_path is None:
             return None
-        return Path(ohlcv_path).parent
+        return Path(cast('str | Path', ohlcv_path)).parent
 
     @staticmethod
     def _ensure_ohlcv_ext(path: str | Path) -> str:
