@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any
+from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import sys
@@ -6,8 +6,8 @@ from pathlib import Path
 from datetime import datetime, UTC
 
 from pynecore import lib
-from pynecore.lib.log import broker_info, ohlcv_info
-from pynecore.types.ohlcv import OHLCV
+from pynecore.lib.log import broker_info, ohlcv_info, sim_info
+from pynecore.types.ohlcv import OHLCVπ
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
@@ -20,10 +20,13 @@ if TYPE_CHECKING:
     from multiprocessing import Process
     from zoneinfo import ZoneInfo  # noqa
     from pynecore.core.script import script
-    from pynecore.lib.strategy import Trade, Position  # noqa
+    from pynecore.lib.strategy import Trade, SimPosition  # noqa
+    from pynecore.core.broker.position import BrokerPosition
     from pynecore.core.plugin.broker import BrokerPlugin
+    from pynecore.core.plugin.live_provider import LiveProviderPlugin
     from pynecore.core.broker.sync_engine import OrderSyncEngine
     from pynecore.core.broker.storage import RunContext
+    from pynecore.core.broker.models import ScriptRequirements
 
 __all__ = [
     'import_script',
@@ -136,13 +139,10 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
 
 
 # noinspection PyUnusedLocal
-def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
+def _set_lib_syminfo_properties(syminfo: SymInfo):
     """
     Set syminfo library properties from this object
     """
-    if TYPE_CHECKING:  # This is needed for the type checker to work
-        from .. import lib
-
     for slot_name in syminfo.__slots__:  # type: ignore
         value = getattr(syminfo, slot_name)
         if value is not None:
@@ -221,7 +221,7 @@ class ScriptRunner:
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
-                 'broker_balance')
+                 'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -335,6 +335,9 @@ class ScriptRunner:
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         self._engine_event_stream_future: Any = None
         self.broker_balance: dict[str, float] | None = None
+        # Identities of open SimPosition trades already announced via
+        # ``[SIM]`` logging — so each fill is narrated once in paper mode.
+        self._sim_logged_open_ids: set[int] = set()
         if broker_plugin is not None:
             from pynecore.core.broker.position import BrokerPosition
             from pynecore.core.broker.run_identity import RunIdentity
@@ -580,6 +583,36 @@ class ScriptRunner:
                 self._broker_store_ctx.heartbeat()
         else:
             position.process_orders_magnified(sub_bars, candle)
+
+    def _log_sim_fills(self, position) -> None:
+        """Narrate paper-trading fills in ``--live`` mode without a broker.
+
+        The :class:`SimPosition` fills orders locally and silently. This is the
+        simulator counterpart of the ``[BROKER]`` order narration: ``[SIM]``
+        lines so the operator sees entries and exits as they happen. Exits come
+        from ``new_closed_trades`` (refreshed by the simulator every bar);
+        entries are announced once per open trade, tracked by object identity.
+
+        :param position: The active :class:`SimPosition`.
+        """
+        d = self._price_decimals
+        for t in position.new_closed_trades:
+            side = "long" if t.size > 0 else "short"
+            sim_info(
+                "EXIT %s %s qty=%g entry=%.*f exit=%.*f pnl=%+.2f",
+                side, t.exit_id or t.entry_id or "", abs(t.size),
+                d, float(t.entry_price), d, float(t.exit_price), float(t.profit),
+            )
+        current_ids: set[int] = set()
+        for t in position.open_trades:
+            current_ids.add(id(t))
+            if id(t) not in self._sim_logged_open_ids:
+                side = "long" if t.size > 0 else "short"
+                sim_info(
+                    "ENTRY %s %s qty=%g @ %.*f",
+                    side, t.entry_id or "", abs(t.size), d, float(t.entry_price),
+                )
+        self._sim_logged_open_ids = current_ids
 
     def _process_deferred_margin_call(self, position) -> None:
         """Simulator-only. The exchange handles margin in broker mode, so
@@ -901,9 +934,9 @@ class ScriptRunner:
                     # HTF bars, so close[1] at the period boundary delivers the
                     # just-closed close.
                     sec_state.na_on_developing = (
-                        (not same_tf)
-                        and (not is_same_symbol)
-                        and sec_state.lookahead is Lookahead.ON
+                            (not same_tf)
+                            and (not is_same_symbol)
+                            and sec_state.lookahead is Lookahead.ON
                     )
                     # Resolve OHLCV path and spawn process
                     resolve_ctx = {
@@ -1426,6 +1459,13 @@ class ScriptRunner:
                                     else:
                                         self._process_orders(position)
 
+                            # Paper-trading narration: the simulator just
+                            # filled the previous bar's queued orders — log
+                            # them so live sim mode has the same per-fill
+                            # visibility as broker mode's ``[BROKER]`` lines.
+                            if is_strat and position:
+                                self._log_sim_fills(position)
+
                             lib._plot_data.clear()
                             _run_libs_and_main()
 
@@ -1827,9 +1867,9 @@ class ScriptRunner:
         return result
 
     def _prefetch_sec_syminfos(
-        self,
-        sec_data: 'dict[str, str | PluginSymbol | None]',
-        sec_contexts: dict | None = None,
+            self,
+            sec_data: 'dict[str, str | PluginSymbol | None]',
+            sec_contexts: dict | None = None,
     ) -> 'dict[str, str | PluginSymbol | None]':
         """Pre-fetch :class:`SymInfo` for every live-mode security context.
 
@@ -1896,11 +1936,11 @@ class ScriptRunner:
         return out
 
     def _autospawn_rate_sources(
-        self,
-        sec_contexts: dict,
-        static_contexts: dict,
-        sec_ohlcv_paths: 'dict[str, str | PluginSymbol | None]',
-        chart_tf: str,
+            self,
+            sec_contexts: dict,
+            static_contexts: dict,
+            sec_ohlcv_paths: 'dict[str, str | PluginSymbol | None]',
+            chart_tf: str,
     ) -> None:
         """Discover and spawn rate-source contexts for unresolved ``currency=X`` pairs.
 

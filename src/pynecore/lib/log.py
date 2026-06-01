@@ -6,7 +6,6 @@ from pathlib import Path
 
 from .string import format as _format
 from .. import lib
-from ..types import NA
 
 # Try to import rich, but don't fail if not available
 try:
@@ -19,6 +18,7 @@ except ImportError:
 __all__ = (
     'info', 'warning', 'error', 'logger', 'setup_security_file_log',
     'broker_info', 'broker_warning', 'broker_error', 'ohlcv_info',
+    'sim_info',
 )
 
 _security_logger: logging.Logger | None = None
@@ -37,14 +37,11 @@ def _resolve_log_time(record: logging.LogRecord) -> datetime:
     Either way the result is timezone-aware: ``syminfo.timezone`` if set,
     otherwise UTC — so the ``%z`` column is never blank.
     """
-    tz = getattr(getattr(lib, 'syminfo', None), 'timezone', None)
-    tz_valid = bool(tz) and not isinstance(tz, NA)
-    if lib._time:
-        if tz_valid:
-            return lib._get_dt(lib._time, tz)
-        return datetime.fromtimestamp(lib._time / 1000, UTC)
-    dt = datetime.fromtimestamp(record.created, UTC)
-    if tz_valid:
+    tz_raw = getattr(getattr(lib, 'syminfo', None), 'timezone', None)
+    tz: str | None = tz_raw if isinstance(tz_raw, str) and tz_raw else None
+    epoch = lib._time / 1000 if lib._time else record.created
+    dt = datetime.fromtimestamp(epoch, UTC)
+    if tz is not None:
         return dt.astimezone(lib._parse_timezone(tz))
     return dt
 
@@ -109,7 +106,7 @@ if rich:
 class PineLogFormatter(logging.Formatter):
     """Custom formatter that mimics Pine Script log format"""
 
-    def formatTime(self, record: logging.LogRecord, datefmt: str = None) -> str:
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         """Format the time using syminfo.timezone"""
         dt = _resolve_log_time(record)
 
@@ -297,3 +294,14 @@ def broker_error(message: str, *args: Any) -> None:
 def ohlcv_info(message: str, *args: Any) -> None:
     """Emit an INFO-level market-data line (``[OHLCV]`` tag)."""
     _emit_tagged(logging.INFO, "[OHLCV] ", message, args)
+
+
+def sim_info(message: str, *args: Any) -> None:
+    """Emit an INFO-level paper-trading event (``[SIM]`` tag).
+
+    The simulator counterpart to ``broker_info``: in ``--live`` mode without
+    ``--broker`` the :class:`SimPosition` fills orders locally, so there is no
+    ``OrderSyncEngine`` to narrate entries and exits. This gives the operator
+    the same per-fill visibility for paper trading.
+    """
+    _emit_tagged(logging.INFO, "[SIM] ", message, args)

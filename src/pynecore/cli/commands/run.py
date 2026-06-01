@@ -111,6 +111,25 @@ def _select_broker_balance(
     return currency, balance[currency]
 
 
+def _coerce_finite_float(value: Any) -> float | None:
+    """Coerce a dynamic position attribute to a finite float.
+
+    Returns ``None`` when the value is missing, non-numeric, or NaN — so the
+    spinner display logic can simply skip it rather than crash the live loop
+    on a stray type.
+
+    :param value: A loosely-typed attribute read via ``getattr``.
+    :return: The finite float value, or ``None``.
+    """
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None
+
+
 def _broker_metrics_text(
         position: Any,
         exchange_position: Any,
@@ -148,16 +167,10 @@ def _broker_metrics_text(
     elif position is not None:
         position_size = float(getattr(position, 'size', 0.0) or 0.0)
         if abs(position_size) > 1e-12:
-            avg_price = getattr(position, 'avg_price', None)
+            avg_price = _coerce_finite_float(getattr(position, 'avg_price', None))
             position_text = f"Pos [cyan]{position_size:g}[/]"
-            if avg_price is not None:
-                try:
-                    avg_price_float = float(avg_price)
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    if avg_price_float == avg_price_float and avg_price_float > 0.0:
-                        position_text += f" Entry [cyan]{avg_price_float:.{price_decimals}f}[/]"
+            if avg_price is not None and avg_price > 0.0:
+                position_text += f" Entry [cyan]{avg_price:.{price_decimals}f}[/]"
 
         unrealized = float(getattr(position, 'openprofit', 0.0) or 0.0)
         open_trades = list(getattr(position, 'open_trades', []) or [])
@@ -991,10 +1004,20 @@ def run(
                     bid = spinner_state['bid']
                     ask = spinner_state['ask']
                     d = price_decimals
+                    position_obj = getattr(runner.script, 'position', None)
+                    # Paper trading (``--live`` without ``--broker``) has no
+                    # broker balance, so synthesise one from the simulator's
+                    # equity — otherwise ``_broker_metrics_text`` bails early
+                    # and the spinner shows no position/PnL at all.
+                    balance = runner.broker_balance
+                    if balance is None and position_obj is not None:
+                        eq = _coerce_finite_float(getattr(position_obj, 'equity', None))
+                        if eq is not None:
+                            balance = {getattr(syminfo, 'currency', None) or '': eq}
                     metrics = _broker_metrics_text(
-                        getattr(runner.script, 'position', None),
+                        position_obj,
                         runner.broker_position_snapshot,
-                        runner.broker_balance,
+                        balance,
                         getattr(syminfo, 'currency', None),
                         d,
                         bid,
