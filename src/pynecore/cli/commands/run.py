@@ -962,6 +962,10 @@ def run(
                     last_historical_timestamp=time_to_ts,
                     shutdown_timeout=shutdown_timeout,
                     event_loop=broker_event_loop,
+                    # Broker mode: a warmup-connect failure must surface its
+                    # real cause here, not be masked by start_broker()'s
+                    # reconcile ("live connection not established").
+                    raise_on_connect_failure=broker_plugin is not None,
                 )
                 runner.ohlcv_iter = itertools.chain(runner.ohlcv_iter, live_iter)
 

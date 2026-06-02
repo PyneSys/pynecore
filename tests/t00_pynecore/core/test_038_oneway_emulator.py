@@ -1,0 +1,184 @@
+"""
+Unit tests for the one-way position emulator pure functions.
+
+Covers leg aggregation (single leg, same-direction weighted average,
+opposite-leg virtual-FIFO netting, net-flat, unrealized P&L sum), FIFO
+close-leg selection (ordering, partial split, exact cover, shortfall), and the
+reversal decomposition (pure add, full reversal, partial reduce, exact
+flatten).
+"""
+from pynecore.core.broker.emulator import (
+    LegClose,
+    aggregate_positions,
+    net_signed_qty,
+    plan_reversal,
+    select_legs_for_close,
+)
+from pynecore.core.broker.models import PositionLeg
+
+
+def _leg(leg_id: str, side: str, qty: float, price: float,
+         open_time: float, upnl: float = 0.0) -> PositionLeg:
+    return PositionLeg(
+        leg_id=leg_id, symbol="EURUSD", side=side, qty=qty,
+        entry_price=price, open_time=open_time, unrealized_pnl=upnl,
+    )
+
+
+# --- net_signed_qty ------------------------------------------------------
+
+def __test_net_signed_qty_mixed__():
+    legs = [_leg("1", "buy", 2.0, 1.10, 0.0),
+            _leg("2", "sell", 0.5, 1.11, 1.0)]
+    assert net_signed_qty(legs) == 1.5
+
+
+# --- aggregate_positions -------------------------------------------------
+
+def __test_aggregate_empty_is_none__():
+    assert aggregate_positions("EURUSD", []) is None
+
+
+def __test_aggregate_single_long_leg__():
+    pos = aggregate_positions("EURUSD", [_leg("1", "buy", 1.0, 1.2345, 0.0, upnl=3.0)])
+    assert pos is not None
+    assert pos.side == "long"
+    assert pos.size == 1.0
+    assert pos.entry_price == 1.2345
+    assert pos.unrealized_pnl == 3.0
+
+
+def __test_aggregate_single_short_leg__():
+    pos = aggregate_positions("EURUSD", [_leg("1", "sell", 2.0, 1.5, 0.0)])
+    assert pos is not None
+    assert pos.side == "short"
+    assert pos.size == 2.0
+    assert pos.entry_price == 1.5
+
+
+def __test_aggregate_same_direction_weighted_average__():
+    legs = [_leg("1", "buy", 1.0, 1.00, 0.0),
+            _leg("2", "buy", 3.0, 2.00, 1.0)]
+    pos = aggregate_positions("EURUSD", legs)
+    assert pos is not None
+    assert pos.side == "long"
+    assert pos.size == 4.0
+    # (1*1.00 + 3*2.00) / 4 = 1.75
+    assert abs(pos.entry_price - 1.75) < 1e-12
+
+
+def __test_aggregate_opposite_legs_virtual_fifo_net_long__():
+    # Oldest long 1.0 @1.00, newer long 2.0 @2.00, a short 1.0 offsets the
+    # OLDEST long (FIFO) → surviving 2.0 long @2.00.
+    legs = [_leg("1", "buy", 1.0, 1.00, 0.0),
+            _leg("2", "buy", 2.0, 2.00, 1.0),
+            _leg("3", "sell", 1.0, 1.50, 2.0)]
+    pos = aggregate_positions("EURUSD", legs)
+    assert pos is not None
+    assert pos.side == "long"
+    assert pos.size == 2.0
+    assert abs(pos.entry_price - 2.00) < 1e-12
+
+
+def __test_aggregate_net_flat_with_open_legs__():
+    legs = [_leg("1", "buy", 1.0, 1.00, 0.0, upnl=2.0),
+            _leg("2", "sell", 1.0, 1.10, 1.0, upnl=-1.0)]
+    pos = aggregate_positions("EURUSD", legs)
+    assert pos is not None
+    assert pos.side == "flat"
+    assert pos.size == 0.0
+    assert pos.entry_price == 0.0
+    # Residual gross P&L surfaced even though net is flat.
+    assert pos.unrealized_pnl == 1.0
+
+
+def __test_aggregate_unrealized_pnl_is_sum__():
+    legs = [_leg("1", "buy", 1.0, 1.00, 0.0, upnl=5.0),
+            _leg("2", "buy", 1.0, 1.20, 1.0, upnl=-2.0)]
+    pos = aggregate_positions("EURUSD", legs)
+    assert pos is not None
+    assert pos.unrealized_pnl == 3.0
+
+
+# --- select_legs_for_close -----------------------------------------------
+
+def __test_select_close_fifo_order__():
+    legs = [_leg("new", "buy", 5.0, 1.0, 10.0),
+            _leg("old", "buy", 5.0, 1.0, 1.0)]
+    closes, shortfall = select_legs_for_close(3.0, legs, "buy")
+    assert shortfall == 0.0
+    # Oldest first regardless of input order.
+    assert closes == (LegClose(leg_id="old", qty=3.0),)
+
+
+def __test_select_close_partial_split_across_legs__():
+    legs = [_leg("a", "buy", 2.0, 1.0, 0.0),
+            _leg("b", "buy", 2.0, 1.0, 1.0)]
+    closes, shortfall = select_legs_for_close(3.0, legs, "buy")
+    assert shortfall == 0.0
+    assert closes == (LegClose(leg_id="a", qty=2.0), LegClose(leg_id="b", qty=1.0))
+
+
+def __test_select_close_exact_cover__():
+    legs = [_leg("a", "buy", 2.0, 1.0, 0.0)]
+    closes, shortfall = select_legs_for_close(2.0, legs, "buy")
+    assert shortfall == 0.0
+    assert closes == (LegClose(leg_id="a", qty=2.0),)
+
+
+def __test_select_close_shortfall_when_underfunded__():
+    legs = [_leg("a", "buy", 1.0, 1.0, 0.0)]
+    closes, shortfall = select_legs_for_close(3.0, legs, "buy")
+    assert closes == (LegClose(leg_id="a", qty=1.0),)
+    assert abs(shortfall - 2.0) < 1e-12
+
+
+def __test_select_close_ignores_other_side__():
+    legs = [_leg("long", "buy", 5.0, 1.0, 0.0),
+            _leg("short", "sell", 5.0, 1.0, 1.0)]
+    closes, shortfall = select_legs_for_close(2.0, legs, "sell")
+    assert closes == (LegClose(leg_id="short", qty=2.0),)
+    assert shortfall == 0.0
+
+
+# --- plan_reversal -------------------------------------------------------
+
+def __test_plan_reversal_pure_add__():
+    legs = [_leg("1", "buy", 1.0, 1.0, 0.0)]
+    plan = plan_reversal("buy", 2.0, legs)
+    assert plan.closes == ()
+    assert plan.open_qty == 2.0
+    assert plan.open_side == "buy"
+
+
+def __test_plan_reversal_full_flip__():
+    # Long 2.0 open; Pine reverses to short 1.0 → combined sell qty 3.0.
+    legs = [_leg("a", "buy", 2.0, 1.0, 0.0)]
+    plan = plan_reversal("sell", 3.0, legs)
+    assert plan.closes == (LegClose(leg_id="a", qty=2.0),)
+    assert plan.open_qty == 1.0
+    assert plan.open_side == "sell"
+
+
+def __test_plan_reversal_partial_reduce_via_order__():
+    # Long 5.0 open; an opposite order of 2.0 only reduces, never flips.
+    legs = [_leg("a", "buy", 5.0, 1.0, 0.0)]
+    plan = plan_reversal("sell", 2.0, legs)
+    assert plan.closes == (LegClose(leg_id="a", qty=2.0),)
+    assert plan.open_qty == 0.0
+
+
+def __test_plan_reversal_exact_flatten__():
+    legs = [_leg("a", "buy", 2.0, 1.0, 0.0)]
+    plan = plan_reversal("sell", 2.0, legs)
+    assert plan.closes == (LegClose(leg_id="a", qty=2.0),)
+    assert plan.open_qty == 0.0
+
+
+def __test_plan_reversal_flip_across_multiple_legs_fifo__():
+    legs = [_leg("old", "buy", 1.0, 1.0, 1.0),
+            _leg("new", "buy", 1.0, 1.0, 2.0)]
+    plan = plan_reversal("sell", 3.0, legs)
+    assert plan.closes == (LegClose(leg_id="old", qty=1.0),
+                           LegClose(leg_id="new", qty=1.0))
+    assert plan.open_qty == 1.0

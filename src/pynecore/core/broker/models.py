@@ -29,6 +29,7 @@ __all__ = [
     'ExchangeOrder',
     'OrderEvent',
     'ExchangePosition',
+    'PositionLeg',
     'ExchangeCapabilities',
     'EntryIntent',
     'ExitIntent',
@@ -245,6 +246,43 @@ class ExchangePosition:
     liquidation_price: float | None
     leverage: float
     margin_mode: str  # "cross" | "isolated"
+
+
+@dataclass
+class PositionLeg:
+    """One raw open position ("leg") on a hedging-capable exchange.
+
+    A hedging account can hold several simultaneous positions for the same
+    symbol — each its own broker position id, opened by a single order. Pine
+    Script sees only one net one-way position per symbol, so the core
+    :mod:`~pynecore.core.broker.emulator` aggregates these legs for reads and
+    selects among them (oldest first) for reduce / close / reversal operations.
+
+    A plugin that opts into one-way emulation returns these via its
+    ``fetch_raw_positions`` transport primitive and performs ZERO aggregation
+    itself: on a hedging account it returns one leg per open broker position;
+    on a netting account it returns at most one.
+
+    :ivar leg_id: Broker-native position identifier (e.g. cTrader
+        ``positionId`` as a string), used to address the leg in ``close_leg``.
+    :ivar symbol: The Pine symbol this leg belongs to.
+    :ivar side: Direction that opened the leg — ``"buy"`` (long) or
+        ``"sell"`` (short). Matches :class:`ExchangeOrder` side wording.
+    :ivar qty: Open size in Pine units (always positive; ``side`` carries the
+        direction).
+    :ivar entry_price: Volume-weighted open price of the leg.
+    :ivar open_time: Leg open time (unix seconds). The FIFO close order is
+        derived from this, so it MUST be a stable, broker-reported value
+        (not a local wall clock) for replay determinism.
+    :ivar unrealized_pnl: Broker-reported mark-to-market P&L for this leg.
+    """
+    leg_id: str
+    symbol: str
+    side: str  # "buy" (long) | "sell" (short)
+    qty: float
+    entry_price: float
+    open_time: float
+    unrealized_pnl: float = 0.0
 
 
 @dataclass

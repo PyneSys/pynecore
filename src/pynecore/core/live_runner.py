@@ -274,6 +274,7 @@ def live_ohlcv_generator(
         shutdown_timeout: float = 120.0,
         event_loop: asyncio.AbstractEventLoop | None = None,
         engine_event_stream: Coroutine[Any, Any, Any] | None = None,
+        raise_on_connect_failure: bool = False,
 ) -> Generator[OHLCV, None, None]:
     """
     Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
@@ -311,6 +312,16 @@ def live_ohlcv_generator(
                                 ``OrderSyncEngine.run_event_stream()``) to run as a
                                 long-lived task alongside the OHLCV watcher. The engine
                                 receives its :class:`OrderEvent` stream this way.
+    :param raise_on_connect_failure: When True, a ``provider.connect()`` that
+                                fails fast during warmup is re-raised here, from
+                                the construction call, instead of being buffered
+                                for the first bar pull. Broker mode sets this so
+                                the real connect error surfaces before
+                                ``start_broker()`` can mask it with a generic
+                                "live connection not established" reconcile
+                                failure. Data-only callers (and the security
+                                ``LiveBarStreamer``) leave it False and keep the
+                                surface-through-the-iterator behaviour.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -337,6 +348,13 @@ def live_ohlcv_generator(
     # — see module docstring for why warmup must follow connect.
     connected_event = threading.Event()
     connect_timeout_seconds = 30.0
+    # Holds the exception from a fast-failing ``provider.connect()``. Appended
+    # before ``connected_event`` is set (so the construction-site read below
+    # synchronises on the event and observes it), letting the caller re-raise
+    # the real cause instead of returning a generator whose buffered error
+    # only surfaces on the first pull — too late, by which point
+    # ``start_broker()`` has masked it. See ``raise_on_connect_failure``.
+    connect_failure: list[BaseException] = []
 
     async def _graceful_shutdown():
         """Poll can_shutdown(), then disconnect. Respects shutdown_timeout."""
@@ -455,11 +473,15 @@ def live_ohlcv_generator(
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
                 await provider.connect()
-            except BaseException:
-                # Unblock the caller waiting on ``connected_event`` so the
-                # exception (already on bar_queue via the outer except) can
-                # surface through the iterator instead of hanging the
-                # ``connected_event.wait()`` for the full timeout.
+            except BaseException as connect_exc:
+                # Record the real cause, then unblock the caller waiting on
+                # ``connected_event``. The append happens-before ``set()``,
+                # which the caller synchronises on via ``.wait()``, so the
+                # construction-site re-raise (when ``raise_on_connect_failure``)
+                # observes it. The outer ``except`` still pushes it onto
+                # ``bar_queue`` so a post-warmup failure surfaces through the
+                # iterator instead of hanging the wait for the full timeout.
+                connect_failure.append(connect_exc)
                 connected_event.set()
                 raise
             watch_symbol = provider.normalize_symbol(symbol)
@@ -822,6 +844,22 @@ def live_ohlcv_generator(
             "any underlying error will surface on the first bar pull",
             connect_timeout_seconds,
         )
+    elif connect_failure and raise_on_connect_failure:
+        # connect() failed fast during warmup. Surface the REAL cause to the
+        # caller now, before it reaches start_broker() (whose reconcile would
+        # otherwise mask it). ``connected_event`` is set inside the connect
+        # except BEFORE ``_async_loop``'s finally has run, so the producer
+        # thread may still be draining ``_graceful_shutdown()`` (can_shutdown
+        # poll + disconnect) on the shared broker loop. ``_consumer`` is never
+        # created on this path, so nothing else will signal ``stop_event`` or
+        # join the thread — and the caller's teardown closes the broker loop
+        # right away, which would interrupt that pending shutdown and leak the
+        # half-open connection. Signal and join here so the teardown finishes
+        # while the loop is still alive.
+        stop_event.set()
+        join_timeout = (shutdown_timeout + 5.0) if shutdown_timeout > 0 else None
+        thread.join(timeout=join_timeout)
+        raise connect_failure[0]
 
     def _consumer() -> Generator[OHLCV, None, None]:
         in_warmup_catchup = True
