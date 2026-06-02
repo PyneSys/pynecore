@@ -128,6 +128,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_STOP_STATE_MARKET_PENDING,
     create_engine_trigger_partial_leg_row,
     create_entry_stop_watch_row,
+    iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
 
@@ -6184,6 +6185,15 @@ class OrderSyncEngine:
         # existing dispatch behaviour.
         skipped_entry_ids_this_sync: set[str] = set()
 
+        # Keys the §12 #4 coexistence preflight pops from ``new_map`` because a
+        # partial and a whole-row exit collide on the same ``from_entry`` THIS
+        # sync. Pine DID emit them — the dispatch is only deferred until the
+        # script drops one side — so the one-way orphan sweep below must NOT
+        # treat their re-asserted ownership rows as abandoned and tear down the
+        # live broker bracket (the preflight refuses the new dispatch, it does
+        # not flatten existing protection).
+        conflict_refused_keys: set[str] = set()
+
         # Cross-restart cleanup for orphan engine-trigger partial legs:
         # :meth:`SoftwarePartialBracketEngine.restart_replay` rebuilds
         # the leg ledger from persisted rows, but ``_active_intents``
@@ -6283,6 +6293,110 @@ class OrderSyncEngine:
                 if ikey in self._active_intents:
                     continue
                 new_map.pop(ikey, None)
+                conflict_refused_keys.add(ikey)
+
+        # Cross-restart cleanup for orphan one-way bracket ownerships:
+        # ``OneWayEmulator.restart_replay`` re-asserts the persist-first
+        # ownership ledger onto every still-open leg, but ``_active_intents``
+        # starts empty after a restart, so the cancellation diff below (it
+        # iterates ``_active_intents``) never sees an exit the script stopped
+        # emitting between the crash and the restart — its bracket would stay
+        # armed on the broker leg forever. This is the one-way analogue of the
+        # engine-trigger partial-leg orphan cleanup above. It also drains any
+        # ``clearing`` row a previously timed-out clear left behind (the row
+        # stays live until the re-clear confirms). Clear any ownership row whose
+        # ``intent_key`` is in neither ``_active_intents`` nor ``new_map`` (and
+        # was not just refused by the §12 #4 coexistence preflight, which pops
+        # the key from ``new_map`` even though Pine emitted it) BEFORE the diff
+        # loops run.
+        one_way_port = getattr(self._broker, 'position_port', None)
+        if one_way_port is not None and self._store_ctx is not None:
+            orphan_cancels: dict[str, CancelIntent] = {}
+            for row in iter_active_bracket_ownerships(
+                    self._store_ctx, symbol=self._symbol,
+            ):
+                ikey = row.intent_key
+                if (ikey is None or ikey in orphan_cancels
+                        or ikey in self._active_intents or ikey in new_map
+                        or ikey in conflict_refused_keys):
+                    continue
+                if row.pine_entry_id is None or row.from_entry is None:
+                    continue
+                orphan_cancels[ikey] = CancelIntent(
+                    pine_id=row.pine_entry_id,
+                    symbol=self._symbol,
+                    from_entry=row.from_entry,
+                )
+            for ikey, cancel in orphan_cancels.items():
+                _blog_info(
+                    "cancelling orphan one-way bracket for intent %r "
+                    "(not emitted by Pine after restart)", ikey,
+                )
+                try:
+                    self._run_async(
+                        self._one_way_emulator.run_exit_bracket_clear(
+                            self._build_cancel_envelope(cancel), one_way_port,
+                        ),
+                    )
+                except BrokerManualInterventionError as e:
+                    self._record_halt(e)
+                    raise
+                except (OrderDispositionUnknownError,
+                        ExchangeConnectionError) as e:
+                    # The clear did not confirm; the persist-first ``clearing``
+                    # row stays live so the next sync re-attempts it. Leave the
+                    # mapping/envelope in place — do not declare it cleared.
+                    _blog_warning(
+                        "orphan one-way bracket clear for %r did not confirm "
+                        "(%s) — retrying next sync", ikey, e,
+                    )
+                    continue
+                self._order_mapping.pop(ikey, None)
+                self._drop_envelope(ikey)
+
+            # The orphan sweep above only re-clears rows whose owning exit Pine
+            # stopped emitting (key absent from ``_active_intents``/``new_map``).
+            # A ``clearing`` row whose exit is STILL active — e.g. a dropped
+            # survivor-leg clear whose amend timed out, parking the exit and
+            # promoting it back into ``_active_intents`` — is skipped by that
+            # guard and would otherwise stay armed on the broker leg until the
+            # next restart's ``restart_replay``. Drain those per-sync: a
+            # ``clearing`` row is marked-for-removal, never wanted protection, so
+            # re-clearing it (idempotent amend-to-None) cannot tear down a live
+            # survivor bracket (those rows are ``active``, untouched).
+            try:
+                drained_keys = self._run_async(
+                    self._one_way_emulator.drain_clearing_rows(
+                        self._symbol, one_way_port,
+                    ),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except (OrderDispositionUnknownError,
+                    ExchangeConnectionError) as e:
+                _blog_warning(
+                    "draining one-way clearing rows did not confirm (%s) — "
+                    "retrying next sync", e,
+                )
+            else:
+                # The orphan sweep's direct clear, on an ``OrderDispositionUnknownError``,
+                # leaves the row ``clearing`` AND keeps ``_order_mapping`` /
+                # ``_envelopes`` for the key (its ``continue`` runs before the
+                # ``_drop_envelope`` the success path performs). If the drain above
+                # then releases that key's last ownership row, the engine state is
+                # orphaned: a later re-emission of the same exit would have
+                # ``_build_envelope`` reuse the stale anchor and rebuild the SAME
+                # attach coid, which an idempotent plugin dedups — the re-attach
+                # never arms and the position is left unprotected. Retire the
+                # in-memory state for every drained key Pine no longer emits, mirroring
+                # the direct-success path's ``_drop_envelope``. A still-emitted key
+                # (back in ``_active_intents`` / ``new_map``) keeps its envelope.
+                for key in drained_keys:
+                    if key in self._active_intents or key in new_map:
+                        continue
+                    self._order_mapping.pop(key, None)
+                    self._drop_envelope(key)
 
         for key in list(self._active_intents):
             if key not in new_map:

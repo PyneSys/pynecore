@@ -111,6 +111,12 @@ class MockBroker:
     amend_calls: list[tuple[str, float | None, float | None]] = field(
         default_factory=list,
     )
+    # Number of upcoming ``amend_bracket`` calls that raise
+    # ``OrderDispositionUnknownError`` (ambiguous timeout) before succeeding.
+    fail_amend_unknown_count: int = 0
+    # ``leg_id`` whose ``amend_bracket`` raises ``ExchangeConnectionError`` (a
+    # dropped link mid round-trip); ``None`` disables the hook.
+    fail_amend_conn_leg: str | None = None
 
     def get_capabilities(self) -> ExchangeCapabilities:
         return self.capabilities
@@ -234,6 +240,13 @@ class MockBroker:
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
                             trail_offset, coid):
         self.amend_calls.append((leg_id, tp_price, sl_price))
+        if self.fail_amend_conn_leg is not None and leg_id == self.fail_amend_conn_leg:
+            raise ExchangeConnectionError("amend link dropped")
+        if self.fail_amend_unknown_count > 0:
+            self.fail_amend_unknown_count -= 1
+            raise OrderDispositionUnknownError(
+                "amend timed out", client_order_id=coid,
+            )
 
 
 # === Helpers ===
@@ -4370,3 +4383,164 @@ def __test_one_way_replay_connection_error_retries_next_sync__():
     engine.sync(BAR_TS + 60_000)  # retried on the next sync
     assert len(calls) == 2
     assert engine._one_way_replay_done is True
+
+
+def _persist_bracket_ownership(ctx, *, leg_id="1", intent_key="X\0L",
+                               pine_id="X", from_entry="L"):
+    from pynecore.core.broker.store_helpers import create_bracket_ownership_row
+    create_bracket_ownership_row(
+        ctx, coid=f"bo-test:{leg_id}", symbol=SYMBOL, side="sell", qty=2.0,
+        intent_key=intent_key, pine_entry_id=pine_id, from_entry=from_entry,
+        leg_id=leg_id, attach_coid="t-attach",
+        tp_price=120.0, sl_price=90.0, trail_offset=None,
+    )
+
+
+def __test_orphan_one_way_bracket_cleared_after_restart__(tmp_path):
+    # F1: after a restart the persist-first bracket-ownership ledger is
+    # re-asserted, but ``_active_intents`` starts empty. An exit the script no
+    # longer emits is never seen by the cancellation diff (it iterates
+    # ``_active_intents``), so without an orphan sweep its bracket would stay
+    # armed on the leg forever. The diff's one-way orphan cleanup clears any
+    # ownership row whose intent is in neither ``_active_intents`` nor new_map.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._diff_and_dispatch([])  # Pine emits nothing -> the exit is orphan
+        assert ("1", None, None) in b.amend_calls  # bracket cleared to None
+        assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+
+
+def __test_active_one_way_bracket_not_orphan_swept__(tmp_path):
+    # The orphan sweep must spare an exit that is still live: a row whose
+    # intent_key is in ``_active_intents`` (or new_map) is never cleared.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=2.0, tp_price=120.0, sl_price=90.0)
+        engine._active_intents["X\0L"] = ex
+        engine._diff_and_dispatch([ex])  # still emitted -> in _active_intents + new_map
+        assert b.amend_calls == []  # neither cleared nor re-dispatched
+        assert any(r.intent_key == "X\0L"
+                   for r in iter_active_bracket_ownerships(ctx))  # still protected
+
+
+def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):
+    # The orphan sweep's DIRECT clear hits an ambiguous timeout: it leaves the
+    # row "clearing" and `continue`s BEFORE the success path's `_drop_envelope`,
+    # so the in-memory envelope/mapping for the orphan key survive. The per-sync
+    # drain then re-clears + releases that same row. Without dropping the
+    # envelope here, a later re-emission of the exit would have `_build_envelope`
+    # reuse the stale anchor and rebuild the SAME attach coid, which an
+    # idempotent plugin dedups -> the re-attach never arms. The drain must
+    # therefore retire the engine state for every key it released that Pine no
+    # longer emits, mirroring the direct-success path.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        # The direct orphan clear amend times out (1), the drain's re-clear lands.
+        b.fail_amend_unknown_count = 1
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Seed the engine state a prior in-session bracket dispatch would leave
+        # behind for this exit key (envelope + per-leg ownership mapping).
+        ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=2.0, tp_price=120.0, sl_price=90.0)
+        engine._build_envelope(ex)
+        engine._order_mapping["X\0L"] = ["bracket:1"]
+        assert "X\0L" in engine._envelopes
+        engine._diff_and_dispatch([])  # Pine emits nothing -> the exit is orphan
+        # Direct clear timed out then the drain re-cleared + released the row.
+        assert b.fail_amend_unknown_count == 0  # one failure consumed
+        assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+        # The stale engine state is retired so a re-emission mints a fresh coid.
+        assert "X\0L" not in engine._envelopes
+        assert "X\0L" not in engine._order_mapping
+
+
+def __test_drain_connection_failure_preserves_already_released_keys__(tmp_path):
+    # A multi-row drain releases the first clearing row (durably closed in the
+    # store, its key collected) and then the second leg's re-clear amend drops the
+    # link with ``ExchangeConnectionError``. If that exception escaped, the partial
+    # ``released`` set would be lost: the caller logs + retries but never retires
+    # the first key's envelope/mapping, so its row is gone from the store yet the
+    # stale anchor survives -> a later re-emission rebuilds the same attach coid an
+    # idempotent plugin dedups, leaving the leg unprotected. The drain must instead
+    # stop on the dropped link but still REPORT the keys it already released, and
+    # leave the unprocessed row ``clearing`` for the next sync to retry.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        BRACKET_OWN_STATE_CLEARING,
+        iter_active_bracket_ownerships,
+        update_bracket_ownership_state,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        # Two orphan exits, each owning one leg, both pre-marked ``clearing``.
+        _persist_bracket_ownership(ctx, leg_id="1", intent_key="A\0L",
+                                   pine_id="A", from_entry="L")
+        _persist_bracket_ownership(ctx, leg_id="2", intent_key="B\0M",
+                                   pine_id="B", from_entry="M")
+        for coid in ("bo-test:1", "bo-test:2"):
+            update_bracket_ownership_state(
+                ctx, coid=coid, new_state=BRACKET_OWN_STATE_CLEARING,
+            )
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 1.0), _pleg("2", "buy", 1.0)]
+        # Leg "2"'s re-clear amend drops the link; leg "1" is processed first.
+        b.fail_amend_conn_leg = "2"
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Seed the engine state a prior in-session dispatch would leave for both.
+        for pine_id, from_entry, key, coid in (
+            ("A", "L", "A\0L", "bracket:1"),
+            ("B", "M", "B\0M", "bracket:2"),
+        ):
+            ex = ExitIntent(pine_id=pine_id, from_entry=from_entry, symbol=SYMBOL,
+                            side="sell", qty=1.0, tp_price=120.0, sl_price=90.0)
+            engine._build_envelope(ex)
+            engine._order_mapping[key] = [coid]
+        # The drain must NOT propagate the connection error: it returns the
+        # already-released key so the engine can retire it.
+        drained = engine._run_async(
+            engine._one_way_emulator.drain_clearing_rows(SYMBOL, b),
+        )
+        assert drained == {"A\0L"}  # leg "1" released; leg "2" lost the link
+        live = list(iter_active_bracket_ownerships(ctx))
+        assert [r.intent_key for r in live] == ["B\0M"]  # leg "2" still clearing
+        # Engine retires the released key's stale anchor; the unfinished one stays.
+        for key in drained:
+            engine._order_mapping.pop(key, None)
+            engine._drop_envelope(key)
+        assert "A\0L" not in engine._envelopes
+        assert "A\0L" not in engine._order_mapping
+        assert "B\0M" in engine._envelopes  # still owns a live clearing row

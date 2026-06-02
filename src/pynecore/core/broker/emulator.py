@@ -36,6 +36,7 @@ __all__ = [
     'plan_reversal',
     'plan_leg_close_volumes',
     'legs_on_position_side',
+    'net_survivor_legs',
 ]
 
 # Quantities are in Pine units (fractional lots possible). Anything below this
@@ -301,3 +302,44 @@ def legs_on_position_side(
         key=lambda leg: (leg.open_time, leg.leg_id),
     )
     return side, survivors
+
+
+def net_survivor_legs(
+        legs: list[PositionLeg],
+) -> tuple[str, list[PositionLeg]]:
+    """Return the one-way side and only the legs that survive virtual-FIFO netting.
+
+    Like :func:`legs_on_position_side`, but on a *mixed* book (legs open on both
+    sides) it drops the oldest majority-side legs that the opposing legs
+    virtually FIFO-close, returning only the legs that actually make up the net
+    one-way position :func:`aggregate_positions` reports — a leg is kept iff any
+    of its volume survives the netting, oldest first. A clean one-way book (no
+    opposing legs) is unaffected: every majority leg survives, identical to
+    :func:`legs_on_position_side`. A net-flat book returns ``('flat', [])``.
+
+    Bracket replication uses this rather than :func:`legs_on_position_side` so a
+    protective stop is amended onto the net exposure only. A mixed book never
+    arises from the emulator itself (it FIFO-closes the opposing side before
+    opening), only from a pre-existing manual hedge or a crash-interrupted
+    reversal; there the gross majority legs exceed the net, and protecting all of
+    them would close more than the position and flip it to the minority side.
+    """
+    net = net_signed_qty(legs)
+    if abs(net) <= _QTY_EPS:
+        return 'flat', []
+    side = 'buy' if net > 0.0 else 'sell'
+    survivors = sorted(
+        (leg for leg in legs if leg.side == side),
+        key=lambda leg: (leg.open_time, leg.leg_id),
+    )
+    offset = sum(leg.qty for leg in legs if leg.side != side)
+    kept: list[PositionLeg] = []
+    for leg in survivors:
+        remaining = leg.qty
+        if offset > 0.0:
+            consumed = min(remaining, offset)
+            offset -= consumed
+            remaining -= consumed
+        if remaining > _QTY_EPS:
+            kept.append(leg)
+    return side, kept

@@ -12,6 +12,7 @@ from pynecore.core.broker.emulator import (
     aggregate_positions,
     legs_on_position_side,
     net_signed_qty,
+    net_survivor_legs,
     plan_leg_close_volumes,
     plan_reversal,
     select_legs_for_close,
@@ -228,3 +229,44 @@ def __test_legs_on_position_side_tie_break_by_leg_id__():
             _leg("a", "buy", 1.0, 1.11, 5.0)]
     _side, on_side = legs_on_position_side(legs)
     assert [leg.leg_id for leg in on_side] == ["a", "b"]
+
+
+# --- net_survivor_legs ---------------------------------------------------
+
+def __test_net_survivor_legs_drops_fully_consumed_majority_leg__():
+    # Mixed book net long 2: the opposing 1.0 sell virtually FIFO-closes the
+    # oldest buy leg, so only the two newest survive. legs_on_position_side
+    # would return all three gross legs (the F4 over-protection).
+    legs = [_leg("1", "buy", 1.0, 1.10, 0.0),
+            _leg("2", "buy", 1.0, 1.11, 1.0),
+            _leg("3", "buy", 1.0, 1.12, 2.0),
+            _leg("4", "sell", 1.0, 1.13, 3.0)]
+    side, survivors = net_survivor_legs(legs)
+    assert side == "buy"
+    assert [leg.leg_id for leg in survivors] == ["2", "3"]
+    # Contrast: the gross helper protects the consumed leg too.
+    assert [leg.leg_id for leg in legs_on_position_side(legs)[1]] == ["1", "2", "3"]
+
+
+def __test_net_survivor_legs_clean_book_matches_position_side__():
+    # No opposing legs -> identical to legs_on_position_side (the common case).
+    legs = [_leg("1", "buy", 2.0, 1.10, 0.0),
+            _leg("2", "buy", 1.0, 1.12, 1.0)]
+    assert net_survivor_legs(legs) == legs_on_position_side(legs)
+
+
+def __test_net_survivor_legs_partial_boundary_leg_survives__():
+    # The opposing 0.5 consumes only part of the oldest buy (2.0) -> it keeps
+    # 1.5 and survives; the bracket protects the net exposure including it.
+    legs = [_leg("1", "buy", 2.0, 1.10, 0.0),
+            _leg("2", "sell", 0.5, 1.11, 1.0),
+            _leg("3", "buy", 1.0, 1.12, 2.0)]
+    side, survivors = net_survivor_legs(legs)
+    assert side == "buy"
+    assert [leg.leg_id for leg in survivors] == ["1", "3"]
+
+
+def __test_net_survivor_legs_net_flat_is_empty__():
+    legs = [_leg("1", "buy", 1.0, 1.10, 0.0),
+            _leg("2", "sell", 1.0, 1.11, 1.0)]
+    assert net_survivor_legs(legs) == ("flat", [])

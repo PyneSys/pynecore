@@ -18,6 +18,7 @@ import pytest
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.models import (
@@ -37,7 +38,9 @@ from pynecore.core.broker.one_way_emulator import (
 )
 from pynecore.core.broker.storage import BrokerStore, RunContext, RunIdentity
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_CLEARING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
     create_close_leg_row,
     iter_active_bracket_ownerships,
     iter_active_close_legs,
@@ -52,11 +55,19 @@ class _FakePort:
             self, legs: list[PositionLeg], *,
             min_qty: float = 0.0, max_qty: float | None = None,
             fail_amend_leg: str | None = None,
+            fail_amend_unknown_leg: str | None = None,
     ) -> None:
         self._legs = list(legs)
         self._min_qty = min_qty
         self._max_qty = max_qty
         self._fail_amend_leg = fail_amend_leg
+        # Per-leg ambiguous-timeout: amend_bracket for THIS leg raises
+        # OrderDispositionUnknownError, modelling an independent broker round-trip
+        # that times out while the other legs amend cleanly.
+        self.fail_amend_unknown_leg = fail_amend_unknown_leg
+        # Toggle: when True, every amend_bracket raises the ambiguous-timeout
+        # error, modelling a clear whose disposition the broker never confirmed.
+        self.fail_amend_unknown = False
         self.closed: list[tuple[str, str, int, str]] = []
         self.placed: list[tuple[str, float]] = []
         self.amended: list[tuple[str, str, float | None, float | None, float | None, str]] = []
@@ -94,6 +105,10 @@ class _FakePort:
     ) -> None:
         if leg_id == self._fail_amend_leg:
             raise ExchangeOrderRejectedError(f"amend rejected for leg {leg_id}")
+        if self.fail_amend_unknown or leg_id == self.fail_amend_unknown_leg:
+            raise OrderDispositionUnknownError(
+                f"amend disposition unknown for leg {leg_id}", client_order_id=coid,
+            )
         self.amended.append((leg_id, side, tp_price, sl_price, trail_offset, coid))
 
 
@@ -387,6 +402,21 @@ def __test_run_exit_bracket_flat_skips__():
     assert port.amended == []
 
 
+def __test_run_exit_bracket_protects_only_net_survivor_legs__():
+    # Mixed book net long 2 (3 buys, 1 sell): the opposing sell virtually
+    # FIFO-closes the oldest buy, so the bracket is amended onto ONLY the two
+    # net-survivor legs — never the gross majority side, which on an SL hit
+    # would close 3 and flip the book to the minority short.
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0),
+                      _leg("12", "buy", 1.0, open_time=2.0),
+                      _leg("20", "sell", 1.0, open_time=3.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    assert res.legs == ("11", "12")  # oldest buy "10" consumed by the sell, dropped
+    assert [leg_id for leg_id, *_rest in port.amended] == ["11", "12"]
+
+
 def __test_clear_only_owns__(tmp_path):
     # THE regression test: a TP-exit and an SL-exit on the SAME legs. Cancelling
     # TP must clear ONLY TP's legs; SL's bracket must survive (the plugin's
@@ -467,6 +497,32 @@ def __test_bracket_ownership_persist_and_replay__(tmp_path):
     store.close()
 
 
+def __test_clear_timeout_leaves_clearing_row_then_replay_reclears__(tmp_path):
+    # F2: a bracket-clear whose amend times out (OrderDispositionUnknownError)
+    # must NOT leave the row "active" — that would make restart_replay re-assert
+    # the very bracket the script asked to cancel. Persist-first marks it
+    # "clearing"; the next restart re-CLEARS (amend to None) and releases it.
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    # The clear's amend times out: the row stays live in the "clearing" phase.
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
+    rows = list(iter_active_bracket_ownerships(ctx))
+    assert len(rows) == 1
+    assert rows[0].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == BRACKET_OWN_STATE_CLEARING
+    # Restart with a healthy broker: the clearing row re-clears (amend to None,
+    # NOT the original 1.20/1.00) and is released — the cancel is honoured.
+    port.fail_amend_unknown = False
+    port.amended.clear()
+    _run(eng.restart_replay(port))
+    assert _amended_levels(port) == [("10", None, None)]  # re-clear, not re-assert
+    assert list(iter_active_bracket_ownerships(ctx)) == []  # released
+    store.close()
+
+
 def __test_run_exit_bracket_midfan_reject_releases_only_unamended_row__(tmp_path):
     # Leg "10" amends OK, leg "11" rejects mid-fan. The reject surfaces as a
     # BracketAttachAfterFillRejectedError (open + unprotected position -> the
@@ -485,3 +541,77 @@ def __test_run_exit_bracket_midfan_reject_releases_only_unamended_row__(tmp_path
     assert [leg_id for leg_id, *_rest in port.amended] == ["10"]  # "11" never amended
     surviving = list(iter_active_bracket_ownerships(ctx))
     assert [row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID] for row in surviving] == ["10"]
+
+
+def __test_dropped_leg_clear_timeout_does_not_skip_survivor_amend__(tmp_path):
+    # F: run_exit_bracket pre-clears dropped survivor legs BEFORE amending the
+    # survivors. If that pre-clear times out (OrderDispositionUnknownError) the
+    # error MUST NOT abort the fan — the dispatch path would park it while
+    # promoting the new intent into _active_intents, so the next diff sees
+    # Pine == active, never re-runs the fan, and the survivors stay on STALE
+    # protection forever. The dropped row stays "clearing" for drain/replay to
+    # retry; the survivors get their NEW levels now.
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0),
+                      _leg("12", "buy", 1.0, open_time=2.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    # First attach protects all three buys.
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    assert {row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]
+            for row in iter_active_bracket_ownerships(ctx)} == {"10", "11", "12"}
+    # An opposing sell appears: virtual FIFO consumes the oldest buy "10", which
+    # now drops out of the survivor set on re-attach. The dropped leg's clear
+    # times out; the survivor amend on "11"/"12" must still land the new levels.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("11", "buy", 1.0, open_time=1.0),
+                   _leg("12", "buy", 1.0, open_time=2.0),
+                   _leg("20", "sell", 1.0, open_time=3.0)])
+    port.fail_amend_unknown_leg = "10"
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.30, sl=0.90), port))
+    # Survivors re-amended with the NEW levels despite the dropped-leg timeout.
+    assert res.legs == ("11", "12")
+    assert _amended_levels(port) == [("11", 1.30, 0.90), ("12", 1.30, 0.90)]
+    rows = {row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]: row
+            for row in iter_active_bracket_ownerships(ctx)}
+    # Dropped leg "10" stranded in "clearing" for drain_clearing_rows to retry.
+    assert rows["10"].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == BRACKET_OWN_STATE_CLEARING
+    # A healthy drain re-clears + releases the dropped row.
+    port.fail_amend_unknown_leg = None
+    _run(eng.drain_clearing_rows("EURUSD", port))
+    assert {row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]
+            for row in iter_active_bracket_ownerships(ctx)} == {"11", "12"}
+    store.close()
+
+
+def __test_restart_replay_clear_timeout_does_not_abort_startup__(tmp_path):
+    # F: _replay_bracket_one re-clears a "clearing" row at startup. If that
+    # re-clear times out (OrderDispositionUnknownError) it must NOT propagate —
+    # restart_replay runs inside a sync wrapper that only catches
+    # ExchangeConnectionError, so an ambiguous round-trip would abort startup.
+    # The row stays "clearing" for the next drain/replay to retry.
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    # Drive the row into "clearing" via a clear whose amend times out.
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
+    assert (list(iter_active_bracket_ownerships(ctx))[0]
+            .extras[EXTRAS_KEY_BRACKET_OWN_STATE] == BRACKET_OWN_STATE_CLEARING)
+    # Restart: the re-clear for leg "10" times out again — must NOT raise.
+    port.fail_amend_unknown = False
+    port.fail_amend_unknown_leg = "10"
+    _run(eng.restart_replay(port))  # no exception escapes
+    rows = list(iter_active_bracket_ownerships(ctx))
+    assert len(rows) == 1
+    assert rows[0].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == BRACKET_OWN_STATE_CLEARING
+    # A later healthy replay re-clears (amend to None) and releases the row.
+    port.fail_amend_unknown_leg = None
+    port.amended.clear()
+    _run(eng.restart_replay(port))
+    assert _amended_levels(port) == [("10", None, None)]
+    assert list(iter_active_bracket_ownerships(ctx)) == []
+    store.close()

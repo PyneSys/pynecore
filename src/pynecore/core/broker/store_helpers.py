@@ -114,11 +114,13 @@ __all__ = [
     'iter_active_close_legs',
     'STATE_BRACKET_OWN',
     'BRACKET_OWN_STATE_ACTIVE',
+    'BRACKET_OWN_STATE_CLEARING',
     'BRACKET_OWN_STATE_RELEASED',
     'BRACKET_OWN_STATE_LIVE',
     'EXTRAS_KEY_BRACKET_OWN_STATE',
     'EXTRAS_KEY_BRACKET_OWN_LEG_ID',
     'EXTRAS_KEY_BRACKET_OWN_ATTACH_COID',
+    'EXTRAS_KEY_BRACKET_OWN_CLEAR_COID',
     'EXTRAS_KEY_BRACKET_OWN_TP',
     'EXTRAS_KEY_BRACKET_OWN_SL',
     'EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET',
@@ -499,16 +501,25 @@ EXTRAS_KEY_CLOSE_LEG_VOLUME = 'close_leg_volume'
 STATE_BRACKET_OWN = 'bracket_own'
 
 # ``extras[EXTRAS_KEY_BRACKET_OWN_STATE]`` phases of one owned leg's bracket.
-# ``active`` — the bracket is replicated onto this leg (steady state, unlike the
-#   close-leg row there is no separate post-ack transition: the amend either
-#   landed or a clear/release follows). ``released`` — the bracket was cleared
-#   from this leg (terminal; the row is closed). ``restart_replay`` re-asserts
-#   ``active`` rows whose leg is still open and releases those whose leg vanished.
+# ``active`` — the bracket is replicated onto this leg (steady state). ``clearing``
+#   — a clear is in flight: the row is marked PERSIST-FIRST before the amend-to-
+#   clear, mirroring the close-leg ``pending`` -> ``dispatched`` two-phase, so an
+#   ambiguous (timed-out) clear re-runs the CLEAR on restart instead of
+#   re-asserting the original levels (which would resurrect a bracket the script
+#   cancelled). ``released`` — the bracket was cleared from this leg (terminal; the
+#   row is closed). ``restart_replay`` re-asserts ``active`` rows whose leg is
+#   still open, finishes ``clearing`` rows by re-clearing them, and releases any
+#   whose leg vanished.
 BRACKET_OWN_STATE_ACTIVE = 'active'
+BRACKET_OWN_STATE_CLEARING = 'clearing'
 BRACKET_OWN_STATE_RELEASED = 'released'
 
-# Live (non-terminal) bracket-ownership phases ``restart_replay`` re-asserts.
-BRACKET_OWN_STATE_LIVE: frozenset[str] = frozenset({BRACKET_OWN_STATE_ACTIVE})
+# Live (non-terminal) bracket-ownership phases ``restart_replay`` re-asserts /
+# finishes. ``clearing`` stays live so a clear interrupted by a crash or an
+# ambiguous timeout is resumed (re-cleared, then released), never left dangling.
+BRACKET_OWN_STATE_LIVE: frozenset[str] = frozenset(
+    {BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_CLEARING}
+)
 
 # Canonical ``extras`` keys for a bracket-ownership row.
 EXTRAS_KEY_BRACKET_OWN_STATE = 'bracket_own_state'
@@ -518,6 +529,13 @@ EXTRAS_KEY_BRACKET_OWN_LEG_ID = 'bracket_own_leg_id'
 # row coid is derived as ``f"{attach_coid}:{leg_id}"`` so a re-attach upserts the
 # SAME row and two different exits get disjoint coid namespaces.
 EXTRAS_KEY_BRACKET_OWN_ATTACH_COID = 'bracket_own_attach_coid'
+# The amend-to-clear dispatch coid (``KIND_CANCEL``) recorded PERSIST-FIRST when a
+# row enters ``clearing``, so a restart re-CLEARS under the SAME clear coid instead
+# of the attach coid. ``amend_bracket`` is idempotent on ``coid`` (the contract
+# permits a plugin to dedup a repeated coid), so replaying a clear under the attach
+# coid could be swallowed as a duplicate attach, leaving the bracket armed while the
+# row is released.
+EXTRAS_KEY_BRACKET_OWN_CLEAR_COID = 'bracket_own_clear_coid'
 # Pine-unit protective levels last replicated onto the leg (audit + modify diff).
 EXTRAS_KEY_BRACKET_OWN_TP = 'bracket_own_tp'
 EXTRAS_KEY_BRACKET_OWN_SL = 'bracket_own_sl'
@@ -1740,16 +1758,20 @@ def update_bracket_ownership_state(
     :param store: The active run context.
     :param coid: The ownership row's client-order-id.
     :param new_state: Target :data:`BRACKET_OWN_STATE_ACTIVE` /
-        :data:`BRACKET_OWN_STATE_RELEASED`.
+        :data:`BRACKET_OWN_STATE_CLEARING` / :data:`BRACKET_OWN_STATE_RELEASED`.
     :param close_row: When ``True``, also close the row (terminal).
     :param extras_patch: Additional extras to merge before the upsert.
     :raises ValueError: When ``new_state`` is not a canonical ownership state.
     """
-    if new_state not in (BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_RELEASED):
+    if new_state not in (
+            BRACKET_OWN_STATE_ACTIVE,
+            BRACKET_OWN_STATE_CLEARING,
+            BRACKET_OWN_STATE_RELEASED,
+    ):
         raise ValueError(
             f"update_bracket_ownership_state: new_state must be one of "
-            f"{{BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_RELEASED}}, "
-            f"got {new_state!r}"
+            f"{{BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_CLEARING, "
+            f"BRACKET_OWN_STATE_RELEASED}}, got {new_state!r}"
         )
     existing = store.get_order(coid)
     merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}

@@ -30,14 +30,16 @@ from typing import TYPE_CHECKING
 from pynecore.core.broker.emulator import (
     LegClose,
     aggregate_positions,
-    legs_on_position_side,
+    net_survivor_legs,
     plan_leg_close_volumes,
     plan_reversal,
     select_legs_for_close,
 )
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
+    ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
 )
 from pynecore.core.broker.idempotency import KIND_CANCEL, KIND_CLOSE, KIND_EXIT_SL
 from pynecore.core.broker.models import (
@@ -48,11 +50,14 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_CLEARING,
     BRACKET_OWN_STATE_RELEASED,
     CLOSE_LEG_STATE_DISPATCHED,
     EXTRAS_KEY_BRACKET_OWN_ATTACH_COID,
+    EXTRAS_KEY_BRACKET_OWN_CLEAR_COID,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_SL,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
     EXTRAS_KEY_BRACKET_OWN_TP,
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
     EXTRAS_KEY_CLOSE_LEG_ID,
@@ -292,15 +297,20 @@ class OneWayEmulator:
     async def run_exit_bracket(
             self, envelope: 'DispatchEnvelope', port: 'PositionPort',
     ) -> BracketFanResult:
-        """Replicate a Pine exit's bracket onto every position-side leg.
+        """Replicate a Pine exit's bracket onto the net-survivor position legs.
 
         Hedging venues carry protective levels per position, so a one-way bracket
         over a multi-leg position is delivered by amending the SAME
-        TP/SL/trailing onto each leg on the position side. Each leg is recorded
-        PERSIST-FIRST in the ownership index (keyed by the exit's ``intent_key``)
-        BEFORE its amend, so :meth:`run_exit_bracket_clear` later clears ONLY the
-        legs this exit owns and :meth:`restart_replay` can re-assert or release
-        them. A flat symbol is a non-halting skip.
+        TP/SL/trailing onto each leg that makes up the net one-way position. On a
+        mixed book (a manual hedge or a crash-interrupted reversal left opposing
+        legs open) only the legs that survive virtual-FIFO netting are protected
+        (:func:`net_survivor_legs`), never the gross majority side — amending the
+        whole majority side would close more than the net position when the stop
+        fires and flip it to the minority side. Each leg is recorded PERSIST-FIRST
+        in the ownership index (keyed by the exit's ``intent_key``) BEFORE its
+        amend, so :meth:`run_exit_bracket_clear` later clears ONLY the legs this
+        exit owns and :meth:`restart_replay` can re-assert or release them. A flat
+        symbol is a non-halting skip.
 
         Re-running it (a modify, or a re-attach after pyramiding) upserts the
         same per-leg rows idempotently: the row key is STABLE per (exit
@@ -315,9 +325,28 @@ class OneWayEmulator:
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
         legs = await port.fetch_raw_positions(intent.symbol)
-        side, on_side = legs_on_position_side(legs)
+        side, on_side = net_survivor_legs(legs)
         if side == 'flat' or not on_side:
             return BracketFanResult(legs=(), skipped=True)
+        survivors = {leg.leg_id for leg in on_side}
+        # A re-attach can narrow the survivor set: a manual hedge or an
+        # interrupted reversal opens an opposing leg that virtually FIFO-consumes
+        # the oldest majority leg, so :func:`net_survivor_legs` now drops a leg
+        # this exit owned on a prior attach. That leg is still PHYSICALLY open
+        # (only virtually netted) and still carries the broker bracket from the
+        # earlier attach; its ownership row would otherwise stay ``active`` and the
+        # restart pass would re-assert the stale stop, which on a hit closes more
+        # than the net exposure and flips the book. Clear + release those dropped
+        # legs FIRST: a survivor amend below can raise
+        # :class:`OrderDispositionUnknownError`, which the dispatch path parks
+        # while promoting the NEW intent into ``_active_intents`` — the next diff
+        # then sees Pine == active and never re-runs this fan, so a dropped-leg
+        # clear left AFTER the survivor loop would never get retried. The dropped
+        # set is disjoint from ``survivors`` (the clear skips survivor rows), so
+        # ordering it before the amend loop is otherwise behaviour-neutral.
+        await self._clear_dropped_survivor_legs(
+            envelope, intent, survivors=survivors, port=port,
+        )
         # Bar-varying dispatch coid (matches the plugin's per-leg amend anchor);
         # one per bracket attach, reused across its legs.
         attach_coid = envelope.client_order_id(KIND_EXIT_SL)
@@ -380,6 +409,158 @@ class OneWayEmulator:
             replicated.append(leg.leg_id)
         return BracketFanResult(legs=tuple(replicated), skipped=False)
 
+    async def _clear_dropped_survivor_legs(
+            self, envelope: 'DispatchEnvelope', intent: ExitIntent, *,
+            survivors: set[str], port: 'PositionPort',
+    ) -> None:
+        """Clear + release this exit's owned legs that fell out of the survivor set.
+
+        On a re-attach the net survivor set can shrink (an opposing leg now
+        virtually FIFO-consumes a leg this exit protected before). Each such leg is
+        still physically open and still carries the prior broker bracket, so its
+        active ownership row is cleared on the broker (amend-to-None) under a clear
+        coid distinct from the attach coid, then released — mirroring
+        :meth:`run_exit_bracket_clear` for the implicit drop. A ``*_NOT_FOUND``
+        race on a vanished leg is the port's benign no-op; the restart pass would
+        otherwise re-assert the stale stop.
+
+        An ambiguous clear (:class:`OrderDispositionUnknownError`) on a dropped
+        leg must NOT abort this call: :meth:`run_exit_bracket` runs the drop FIRST,
+        before the survivor amend loop, so propagating here would skip the NEW
+        protection on the surviving legs entirely — the dispatch path then parks
+        the error while promoting the new intent into ``_active_intents``, so the
+        next diff sees Pine == active, never re-runs the fan, and the survivors
+        stay on STALE TP/SL indefinitely. The drop is persist-first ``clearing``,
+        so leaving its row in that phase lets :meth:`drain_clearing_rows` (per
+        sync) and :meth:`restart_replay` retry the idempotent re-clear; the
+        survivor amend below proceeds with the new levels. This mirrors the
+        unknown-disposition handling in :meth:`drain_clearing_rows`.
+        """
+        if self._store_ctx is None:
+            return
+        clear_coid = envelope.client_order_id(KIND_CANCEL)
+        rows = list(iter_active_bracket_ownerships(
+            self._store_ctx, symbol=intent.symbol, from_entry=intent.from_entry,
+        ))
+        for row in rows:
+            if (row.intent_key or '') != intent.intent_key:
+                continue
+            leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            if leg_id is None or leg_id in survivors:
+                continue
+            update_bracket_ownership_state(
+                self._store_ctx, coid=row.client_order_id,
+                new_state=BRACKET_OWN_STATE_CLEARING,
+                extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: clear_coid},
+            )
+            try:
+                await port.amend_bracket(
+                    intent.symbol, leg_id, side=row.side,
+                    tp_price=None, sl_price=None, trail_offset=None,
+                    coid=clear_coid,
+                )
+            except OrderDispositionUnknownError:
+                # The clear did not confirm; leave the row ``clearing`` so
+                # ``drain_clearing_rows`` / ``restart_replay`` retry the
+                # idempotent re-clear, and DO NOT abort the survivor amend
+                # below — those legs need their new protection now.
+                continue
+            update_bracket_ownership_state(
+                self._store_ctx, coid=row.client_order_id,
+                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+            )
+
+    async def drain_clearing_rows(self, symbol: str, port: 'PositionPort') -> set[str]:
+        """Re-clear + release any ``clearing`` bracket-ownership rows in-session.
+
+        :meth:`_clear_dropped_survivor_legs` (and :meth:`run_exit_bracket_clear`)
+        mark a row ``clearing`` PERSIST-FIRST, then amend-to-None on the broker.
+        An ambiguous :class:`OrderDispositionUnknownError` on that amend leaves the
+        row stranded in ``clearing``: the dispatch path parks the exit and promotes
+        it into ``_active_intents``, so the next diff sees Pine == active and never
+        re-runs the owning fan, and the one-way orphan sweep skips active keys —
+        the stale leg stays armed until the next restart's :meth:`restart_replay`.
+
+        This drain closes that window. The engine calls it once per sync (after the
+        orphan sweep): every live ``clearing`` row is re-cleared under its persisted
+        clear coid and released, exactly like :meth:`_replay_bracket_one`'s clearing
+        branch but per-sync rather than restart-only. A ``clearing`` row is by
+        definition marked-for-removal, NEVER wanted protection, so re-clearing it is
+        always safe even while the owning exit is still active (its survivor legs
+        carry ``active`` rows, untouched here). A vanished leg's bracket is moot —
+        release the row. Amending to None is idempotent (an already-cleared leg
+        no-ops), so a re-clear that already landed is a broker no-op. A timeout on
+        the re-clear leaves the row ``clearing`` for the next sync to retry rather
+        than halting the bot.
+
+        Returns the set of ``intent_key`` values whose LAST surviving ownership row
+        the drain released this call. The engine drops the in-memory
+        envelope/mapping for any such key whose owning exit Pine no longer emits —
+        the orphan sweep's direct-clear timeout (``continue`` before
+        ``_drop_envelope``) leaves that engine state behind, and the drain
+        releasing the row here is the second half of the same retirement. Keys that
+        still carry an ``active`` row (a live exit's survivor legs) are excluded, so
+        a live bracket never loses its anchor.
+        """
+        if self._store_ctx is None:
+            return set()
+        rows = [
+            row
+            for row in iter_active_bracket_ownerships(self._store_ctx, symbol=symbol)
+            if (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
+            == BRACKET_OWN_STATE_CLEARING
+        ]
+        if not rows:
+            return set()
+        legs = await port.fetch_raw_positions(symbol)
+        live_ids = {leg.leg_id for leg in legs}
+        released: set[str] = set()
+        for row in rows:
+            extras = row.extras or {}
+            leg_id = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            if leg_id is not None and leg_id in live_ids:
+                try:
+                    await port.amend_bracket(
+                        symbol, leg_id, side=row.side,
+                        tp_price=None, sl_price=None, trail_offset=None,
+                        coid=extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
+                        or row.client_order_id,
+                    )
+                except OrderDispositionUnknownError:
+                    # Re-clear did not confirm; leave the row ``clearing`` so the
+                    # next sync retries it (idempotent amend-to-None). Halting here
+                    # would strand the bot on a recoverable broker round-trip.
+                    continue
+                except ExchangeConnectionError:
+                    # The connection dropped mid-drain. Earlier rows in this loop
+                    # may already be RELEASED (durably closed in the store) and
+                    # their keys collected in ``released``; if we let the exception
+                    # escape, that partial progress is lost — the caller logs +
+                    # retries but never runs the envelope/mapping retirement, so a
+                    # released row's stale anchor survives and a later re-emission
+                    # rebuilds the same attach coid an idempotent plugin dedups,
+                    # leaving the leg unprotected. Stop draining (the link is down)
+                    # but RETURN what was already released so the engine retires it;
+                    # this row stays ``clearing`` for the next sync to retry.
+                    break
+            update_bracket_ownership_state(
+                self._store_ctx, coid=row.client_order_id,
+                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+            )
+            if row.intent_key is not None:
+                released.add(row.intent_key)
+        # Only report a key whose every ownership row is now gone: a key still
+        # carrying an ``active`` row (a live exit's survivor legs) must keep its
+        # envelope, so the engine must not retire it.
+        if not released:
+            return released
+        still_owned = {
+            row.intent_key
+            for row in iter_active_bracket_ownerships(self._store_ctx, symbol=symbol)
+            if row.intent_key is not None
+        }
+        return released - still_owned
+
     @staticmethod
     def _ownership_coid(intent_key: str, leg_id: str) -> str:
         """Stable per-(exit, leg) bracket-ownership row key.
@@ -419,6 +600,20 @@ class OneWayEmulator:
             leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is None:
                 continue
+            # PERSIST-FIRST: mark the row ``clearing`` BEFORE the amend, so an
+            # ambiguous (timed-out) clear leaves a row that :meth:`restart_replay`
+            # re-CLEARS rather than re-asserting the original bracket — the
+            # close-leg ``pending`` -> ``dispatched`` two-phase applied to the
+            # clear. Without it a timed-out clear stays ``active`` and the next
+            # restart resurrects the bracket the script asked to cancel. Record the
+            # clear coid too, so the restart re-clears under the SAME clear coid —
+            # NOT the attach coid, which a coid-idempotent plugin could dedup as a
+            # repeat of the attach and swallow, leaving the bracket armed.
+            update_bracket_ownership_state(
+                self._store_ctx, coid=row.client_order_id,
+                new_state=BRACKET_OWN_STATE_CLEARING,
+                extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: cancel_coid},
+            )
             await port.amend_bracket(
                 intent.symbol, leg_id, side=row.side,
                 tp_price=None, sl_price=None, trail_offset=None,
@@ -507,12 +702,14 @@ class OneWayEmulator:
         )
 
     async def _replay_bracket_ownership(self, port: 'PositionPort') -> None:
-        """Re-assert / release active bracket-ownership rows (second replay pass).
+        """Re-assert / finish live bracket-ownership rows (second replay pass).
 
-        For every active ownership row: if its leg is still open, re-assert the
-        persisted bracket idempotently on the same per-leg coid (the broker
-        no-ops an unchanged amend); if the leg has vanished, the bracket it
-        carried is moot — release the orphan row so it leaves the live index.
+        For every live ownership row: if its leg is still open, an ``active`` row
+        is re-asserted idempotently on the same per-leg coid (the broker no-ops an
+        unchanged amend) while a ``clearing`` row (a clear a crash interrupted) is
+        finished by re-clearing then releasing it; if the leg has vanished, the
+        bracket it carried is moot — release the orphan row so it leaves the live
+        index.
         """
         rows = list(iter_active_bracket_ownerships(self._store_ctx))
         if not rows:
@@ -529,10 +726,38 @@ class OneWayEmulator:
     async def _replay_bracket_one(
             self, row, symbol: str, live_ids: set, port: 'PositionPort',
     ) -> None:
-        """Re-assert one bracket-ownership row, or release it if its leg is gone."""
+        """Re-assert / finish one bracket-ownership row, or release a vanished leg."""
         extras = row.extras or {}
         leg_id = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
         if leg_id is None or leg_id not in live_ids:
+            update_bracket_ownership_state(
+                self._store_ctx, coid=row.client_order_id,
+                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+            )
+            return
+        if extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) == BRACKET_OWN_STATE_CLEARING:
+            # A clear interrupted before it confirmed (crash or ambiguous
+            # timeout): finish it. Amending to None is idempotent — an already
+            # cleared leg no-ops — so re-clear then release, NEVER re-assert the
+            # original levels (that would resurrect a cancelled bracket). Re-clear
+            # under the persisted clear coid (NOT the attach coid): the contract
+            # lets a plugin dedup a repeated coid, so reusing the attach coid here
+            # could be swallowed as a duplicate attach, leaving the bracket armed.
+            try:
+                await port.amend_bracket(
+                    symbol, leg_id, side=row.side,
+                    tp_price=None, sl_price=None, trail_offset=None,
+                    coid=extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
+                    or row.client_order_id,
+                )
+            except OrderDispositionUnknownError:
+                # The re-clear did not confirm. ``restart_replay`` runs inside the
+                # sync startup wrapper, which only catches ``ExchangeConnectionError``;
+                # propagating this sibling error would abort startup on a recoverable
+                # ambiguous round-trip. Leave the row ``clearing`` (NOT released) so
+                # the next ``drain_clearing_rows`` / replay retries the idempotent
+                # re-clear, mirroring ``drain_clearing_rows``.
+                return
             update_bracket_ownership_state(
                 self._store_ctx, coid=row.client_order_id,
                 new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
