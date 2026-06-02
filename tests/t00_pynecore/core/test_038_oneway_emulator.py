@@ -10,7 +10,9 @@ flatten).
 from pynecore.core.broker.emulator import (
     LegClose,
     aggregate_positions,
+    legs_on_position_side,
     net_signed_qty,
+    plan_leg_close_volumes,
     plan_reversal,
     select_legs_for_close,
 )
@@ -182,3 +184,47 @@ def __test_plan_reversal_flip_across_multiple_legs_fifo__():
     assert plan.closes == (LegClose(leg_id="old", qty=1.0),
                            LegClose(leg_id="new", qty=1.0))
     assert plan.open_qty == 1.0
+
+
+# --- plan_leg_close_volumes ----------------------------------------------
+
+def __test_plan_leg_close_volumes_basic_fifo__():
+    closes = (LegClose("a", 2.0), LegClose("b", 1.0))
+    assert plan_leg_close_volumes(closes, lambda u: int(u)) == [("a", 2), ("b", 1)]
+
+
+def __test_plan_leg_close_volumes_carries_sub_grid_remainder__():
+    # Each 0.6-unit slice rounds to 0 on its own, but the running total reaches
+    # the grid on the second leg, so the owed volume lands there (not dropped).
+    closes = (LegClose("a", 0.6), LegClose("b", 0.6))
+    assert plan_leg_close_volumes(closes, lambda u: int(u)) == [("b", 1)]
+
+
+def __test_plan_leg_close_volumes_empty_below_grid__():
+    closes = (LegClose("a", 0.3),)
+    assert plan_leg_close_volumes(closes, lambda u: int(u)) == []
+
+
+# --- legs_on_position_side -----------------------------------------------
+
+def __test_legs_on_position_side_net_long_fifo__():
+    legs = [_leg("1", "buy", 2.0, 1.10, 0.0),
+            _leg("2", "sell", 0.5, 1.11, 1.0),
+            _leg("3", "buy", 1.0, 1.12, 2.0)]
+    side, on_side = legs_on_position_side(legs)
+    assert side == "buy"
+    assert [leg.leg_id for leg in on_side] == ["1", "3"]
+
+
+def __test_legs_on_position_side_net_flat_is_empty__():
+    legs = [_leg("1", "buy", 1.0, 1.10, 0.0),
+            _leg("2", "sell", 1.0, 1.11, 1.0)]
+    assert legs_on_position_side(legs) == ("flat", [])
+
+
+def __test_legs_on_position_side_tie_break_by_leg_id__():
+    # Equal open_time -> deterministic order by leg_id (replay-stable).
+    legs = [_leg("b", "buy", 1.0, 1.10, 5.0),
+            _leg("a", "buy", 1.0, 1.11, 5.0)]
+    _side, on_side = legs_on_position_side(legs)
+    assert [leg.leg_id for leg in on_side] == ["a", "b"]

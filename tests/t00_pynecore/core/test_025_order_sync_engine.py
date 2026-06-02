@@ -44,6 +44,7 @@ from pynecore.core.broker.models import (
     OrderType,
     LegType,
     InterceptorResult,
+    PositionLeg,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.lib.strategy import (
@@ -101,6 +102,15 @@ class MockBroker:
     raise_on_next_get_position: Exception | None = None
     capabilities: ExchangeCapabilities = field(default_factory=ExchangeCapabilities)
     _next_id: int = 0
+    # One-way emulation (hedging): set ``position_port = self`` + canned
+    # ``raw_legs`` to drive the engine through the core OneWayEmulator.
+    position_port: Any = None
+    raw_legs: list[PositionLeg] = field(default_factory=list)
+    close_leg_calls: list[tuple[str, int]] = field(default_factory=list)
+    place_leg_calls: list[float] = field(default_factory=list)
+    amend_calls: list[tuple[str, float | None, float | None]] = field(
+        default_factory=list,
+    )
 
     def get_capabilities(self) -> ExchangeCapabilities:
         return self.capabilities
@@ -202,6 +212,28 @@ class MockBroker:
                 yield event
 
         return _gen()
+
+    # --- PositionPort surface (one-way emulation; active only when
+    # ``position_port = self`` is set on the instance) ---
+    async def fetch_raw_positions(self, symbol):
+        return [leg for leg in self.raw_legs if leg.symbol == symbol]
+
+    async def get_volume_quantizer(self, symbol):
+        return lambda u: int(u)
+
+    async def close_leg(self, symbol, leg_id, volume, coid):
+        self.close_leg_calls.append((leg_id, volume))
+
+    async def reject_out_of_range(self, envelope, qty):
+        return None
+
+    async def place_leg(self, envelope, qty):
+        self.place_leg_calls.append(qty)
+        return [self._mk_order(envelope, 'e')]
+
+    async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
+                            trail_offset, coid):
+        self.amend_calls.append((leg_id, tp_price, sl_price))
 
 
 # === Helpers ===
@@ -4203,3 +4235,138 @@ def __test_unexpected_reject_without_pine_id_retires_native_failsafe_state__():
     )
     engine._route_event(rejected)
     assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
+
+
+# === One-way emulation routing (hedging, position_port set) ===============
+#
+# When ``broker.position_port`` is set the dispatch hub routes reducing /
+# closing / reversing / bracket intents through the core OneWayEmulator (per-leg
+# PositionPort primitives) instead of the single-position ``execute_*`` path.
+# These drive ``_dispatch_new`` directly to assert the routing + the synthetic
+# ``_order_mapping`` markers; the fan-out LOGIC itself is covered by test_039.
+
+
+def _pleg(leg_id, side, qty, *, open_time=0.0) -> PositionLeg:
+    return PositionLeg(
+        leg_id=leg_id, symbol=SYMBOL, side=side, qty=qty,
+        entry_price=100.0, open_time=open_time, unrealized_pnl=0.0,
+    )
+
+
+def __test_emulated_close_routes_through_position_port__():
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 2.0)]
+    engine, _pos = _mk_engine(b)
+    close = CloseIntent(pine_id="x", symbol=SYMBOL, side="sell", qty=2.0)
+    engine._dispatch_new(close)
+    # Fanned through the port, NOT execute_close; synthetic close-leg marker.
+    assert b.close_leg_calls == [("1", 2)]
+    assert b.close_calls == []
+    assert engine.order_mapping[close.intent_key] == ["close-leg:1"]
+
+
+def __test_emulated_exit_routes_through_position_port__():
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 1.0, open_time=1.0),
+                  _pleg("2", "buy", 1.0, open_time=2.0)]
+    engine, _pos = _mk_engine(b)
+    ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                    qty=2.0, tp_price=120.0, sl_price=90.0)
+    engine._dispatch_new(ex)
+    # Bracket replicated onto BOTH legs via the port, NOT execute_exit.
+    assert {leg_id for leg_id, _tp, _sl in b.amend_calls} == {"1", "2"}
+    assert b.exit_calls == []
+    assert set(engine.order_mapping[ex.intent_key]) == {"bracket:1", "bracket:2"}
+
+
+def __test_emulated_entry_reversal_routes_through_position_port__():
+    from pynecore.core.broker.models import EntryIntent
+    b = MockBroker()
+    b.position_port = b
+    # Short 2 leg; a combined buy 3 reverses -> close the short, open residual 1.
+    b.raw_legs = [_pleg("9", "sell", 2.0, open_time=1.0)]
+    engine, _pos = _mk_engine(b)
+    entry = EntryIntent(pine_id="L", symbol=SYMBOL, side="buy", qty=3.0,
+                        order_type=OrderType.MARKET)
+    engine._dispatch_new(entry)
+    assert b.close_leg_calls == [("9", 2)]  # opposing leg FIFO-closed
+    assert b.place_leg_calls == [1.0]       # residual opened via the port
+    assert b.entry_calls == []              # execute_entry NOT called
+
+
+def __test_emulated_close_below_grid_skips_non_halting__():
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 0.4)]  # int() quantizer floors 0.4 -> 0
+    engine, _pos = _mk_engine(b)
+    close = CloseIntent(pine_id="x", symbol=SYMBOL, side="sell", qty=0.4)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(close)
+    assert b.close_leg_calls == []  # nothing dispatched on a below-grid skip
+
+
+def __test_emulated_exit_flat_skips_non_halting__():
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = []  # flat: no legs to protect
+    engine, _pos = _mk_engine(b)
+    ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                    qty=2.0, sl_price=90.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(ex)
+    assert b.amend_calls == []  # nothing amended on a flat skip
+
+
+def __test_first_sync_drives_one_way_replay_when_emulating__():
+    b = MockBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    called: list = []
+    orig = engine._one_way_emulator.restart_replay
+
+    async def _spy(port):
+        called.append(port)
+        return await orig(port)
+
+    engine._one_way_emulator.restart_replay = _spy
+    engine.sync(BAR_TS)
+    assert called == [b]  # driven once, with the port
+    assert engine._one_way_replay_done is True
+    engine.sync(BAR_TS + 60_000)
+    assert len(called) == 1  # one-time only — not re-driven each sync
+
+
+def __test_first_sync_skips_one_way_replay_when_not_emulating__():
+    b = MockBroker()  # position_port stays None
+    engine, _pos = _mk_engine(b)
+    called: list = []
+
+    async def _spy(port):
+        called.append(port)
+
+    engine._one_way_emulator.restart_replay = _spy
+    engine.sync(BAR_TS)
+    assert called == []  # netting broker -> replay never driven
+    assert engine._one_way_replay_done is False
+
+
+def __test_one_way_replay_connection_error_retries_next_sync__():
+    b = MockBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    calls: list = []
+
+    async def _spy(port):
+        calls.append(port)
+        if len(calls) == 1:
+            raise ExchangeConnectionError("transient broker read failure")
+
+    engine._one_way_emulator.restart_replay = _spy
+    engine.sync(BAR_TS)  # first sync: replay errors -> sync bails, flag unset
+    assert engine._one_way_replay_done is False
+    assert len(calls) == 1
+    engine.sync(BAR_TS + 60_000)  # retried on the next sync
+    assert len(calls) == 2
+    assert engine._one_way_replay_done is True

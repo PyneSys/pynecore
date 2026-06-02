@@ -99,6 +99,7 @@ from pynecore.core.broker.software_entry_stop_engine import (
     EntryStopWatch,
     SoftwareEntryStopEngine,
 )
+from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
     PendingRecord,
@@ -367,6 +368,19 @@ class OrderSyncEngine:
         # native and a double-fill race is impossible. Constructed
         # unconditionally; armed only when a both-set entry is dispatched.
         self._entry_stop_engine = SoftwareEntryStopEngine(store_ctx=store_ctx)
+        # One-way emulation engine. Only ever DRIVEN when the broker plugin
+        # opts into hedging-mode emulation (``broker.position_port is not
+        # None``); for the common netting / one-way-native plugins the dispatch
+        # switch never touches it and the regular ``execute_*`` path runs
+        # unchanged. Constructed unconditionally (same store-only ctor as the
+        # sibling engines); its persist-first ledger + ``restart_replay`` own the
+        # per-leg close / bracket crash-safety.
+        self._one_way_emulator = OneWayEmulator(store_ctx=store_ctx)
+        # Set on the first ``sync`` (deferred like ``_restart_entry_scan_done``):
+        # ``OneWayEmulator.restart_replay`` is async and needs live broker reads
+        # via the port, so unlike the sync sibling replays it cannot run inline
+        # in ``__init__``.
+        self._one_way_replay_done: bool = False
 
         self._active_intents: dict[str, Intent] = {}
         self._order_mapping: dict[str, list[str]] = {}
@@ -1055,6 +1069,27 @@ class OrderSyncEngine:
                 )
                 return
             self._restart_entry_scan_done = True
+        # One-time one-way emulation restart replay: resume any per-leg close
+        # fan-out or bracket replication a crash interrupted. Driven here (not in
+        # __init__) because ``restart_replay`` is async and reads the live legs
+        # through the port, which is only live once the plugin's ``connect()``
+        # has set ``position_port`` and the broker session is up. Gated on the
+        # plugin having opted into emulation; a connection error retries on the
+        # next sync, exactly like the entry-anchor scan above. ``restart_replay``
+        # self-no-ops when ``store_ctx`` is None.
+        one_way_port = getattr(self._broker, 'position_port', None)
+        if not self._one_way_replay_done and one_way_port is not None:
+            try:
+                self._run_async(
+                    self._one_way_emulator.restart_replay(one_way_port),
+                )
+            except ExchangeConnectionError as e:
+                _blog_warning(
+                    "sync skipped before one-way emulation replay could "
+                    "complete (connection error: %s) — retrying next sync", e,
+                )
+                return
+            self._one_way_replay_done = True
         try:
             self._verify_pending_dispatches()
         except ExchangeConnectionError as e:
@@ -7333,6 +7368,12 @@ class OrderSyncEngine:
     def _dispatch_new(self, intent: Intent) -> None:
         envelope = self._build_envelope(intent)
         _blog_info("dispatching %s", intent)
+        # Non-None only when the plugin opted into hedging-mode one-way
+        # emulation; routes reducing / closing / reversing / bracket intents
+        # through the core OneWayEmulator instead of the plugin's execute_*.
+        # Read defensively: partial test doubles (and brokers predating the
+        # attribute) are treated as non-emulating.
+        port = getattr(self._broker, 'position_port', None)
         try:
             if isinstance(intent, EntryIntent):
                 # §2.6.7 gate: drop the entry signal when any parent on
@@ -7418,7 +7459,20 @@ class OrderSyncEngine:
                     self._neutralised_parent_entry_pine_ids.discard(
                         intent.pine_id,
                     )
-                orders = self._run_async(self._broker.execute_entry(envelope))
+                if port is not None:
+                    # Hedging-mode emulation: a Pine entry is decomposed over the
+                    # legs by the core engine — a MARKET reversal FIFO-closes the
+                    # opposing legs and opens only the residual, a pure add opens
+                    # the whole size, a resting LIMIT/STOP rests full-size (no
+                    # close at placement). run_reversal reads the legs and plans
+                    # internally, so the engine needs no net-position tracking; it
+                    # returns the opened order(s) — register their real ids.
+                    reversal = self._run_async(
+                        self._one_way_emulator.run_reversal(envelope, port),
+                    )
+                    orders = list(reversal.opened_orders)
+                else:
+                    orders = self._run_async(self._broker.execute_entry(envelope))
                 self._order_mapping[intent.intent_key] = [o.id for o in orders]
                 # Both-set Pine entry: the dispatch above placed the native
                 # LIMIT leg. Arm the software price-watch for the STOP leg so
@@ -7577,11 +7631,71 @@ class OrderSyncEngine:
                             self._native_failsafe_manager.unregister_parent(
                                 parent_dispatch_ref,
                             )
-                    orders = self._run_async(self._broker.execute_exit(envelope))
-                    self._order_mapping[intent.intent_key] = [o.id for o in orders]
+                    if port is not None:
+                        # Hedging-mode emulation: the one-way bracket is
+                        # replicated onto every position-side leg (persist-first
+                        # ownership index), not sent as a single whole-row order.
+                        bracket = self._run_async(
+                            self._one_way_emulator.run_exit_bracket(envelope, port),
+                        )
+                        if bracket.skipped:
+                            # Flat position (a close raced the exit): nothing to
+                            # protect. Surface the non-halting skip the same way a
+                            # below-grid plugin decline does, so the intent stays
+                            # out of ``_active_intents`` and the next bar
+                            # re-evaluates (run_exit_bracket is idempotent).
+                            raise OrderSkippedByPlugin(
+                                f"Exit {intent.intent_key} skipped: no open "
+                                f"position-side legs to attach a bracket to; "
+                                f"re-evaluating next bar.",
+                                intent_key=intent.intent_key,
+                                reason="no_position_to_protect",
+                                context={'symbol': intent.symbol,
+                                         'from_entry': intent.from_entry},
+                            )
+                        # Per-leg ownership markers (synthetic namespace so a leg
+                        # id can never collide with a real fill order id); the
+                        # bracket has no separate broker order to match.
+                        self._order_mapping[intent.intent_key] = [
+                            f"bracket:{leg_id}" for leg_id in bracket.legs
+                        ]
+                    else:
+                        orders = self._run_async(self._broker.execute_exit(envelope))
+                        self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, CloseIntent):
-                order = self._run_async(self._broker.execute_close(envelope))
-                self._order_mapping[intent.intent_key] = [order.id]
+                if port is not None:
+                    # Hedging-mode emulation: fan the close out FIFO across the
+                    # position-side legs (persist-first close-leg ledger). The
+                    # per-leg reduction FILLs flow back through the ordinary
+                    # natural-close path; the engine only needs a representative
+                    # handle here.
+                    fan = self._run_async(
+                        self._one_way_emulator.run_close(envelope, port),
+                    )
+                    if fan.skipped:
+                        # Whole close quantized below the broker volume grid —
+                        # non-halting skip, re-evaluated next bar.
+                        raise OrderSkippedByPlugin(
+                            f"Close {intent.intent_key} skipped: size "
+                            f"{intent.qty} below the broker volume grid; "
+                            f"re-evaluating next bar.",
+                            intent_key=intent.intent_key,
+                            reason="below_min_volume",
+                            context={'symbol': intent.symbol, 'qty': intent.qty},
+                        )
+                    if fan.shortfall > 0.0:
+                        _blog_warning(
+                            "one-way close for %s short by %s units (broker "
+                            "holds less than Pine believes); closed what was "
+                            "open, re-deriving from the net next reconcile",
+                            intent.intent_key, fan.shortfall,
+                        )
+                    self._order_mapping[intent.intent_key] = [
+                        f"close-leg:{leg_id}" for leg_id, _vol in fan.legs
+                    ]
+                else:
+                    order = self._run_async(self._broker.execute_close(envelope))
+                    self._order_mapping[intent.intent_key] = [order.id]
             # The dispatch reached the broker. If this envelope carries a
             # reject bump (retry_seq > 0) it was NOT journaled at build time —
             # persist it now so the live order's bumped COID survives a restart.
@@ -10269,8 +10383,32 @@ class OrderSyncEngine:
                         new.intent_key, reason='entry_stop_removed_by_modify',
                     )
             elif isinstance(new, ExitIntent) and isinstance(old, ExitIntent):
-                orders = self._run_async(self._broker.modify_exit(old_env, new_env))
-                self._order_mapping[new.intent_key] = [o.id for o in orders]
+                port = getattr(self._broker, 'position_port', None)
+                if port is not None:
+                    # Hedging-mode emulation: a bracket modify is an idempotent
+                    # re-attach of the NEW levels across the position-side legs —
+                    # the ownership rows upsert on their stable per-(exit, leg)
+                    # key, so no stale rows accrete and the amend overwrites the
+                    # old protection wholesale.
+                    bracket = self._run_async(
+                        self._one_way_emulator.run_exit_bracket(new_env, port),
+                    )
+                    if bracket.skipped:
+                        raise OrderSkippedByPlugin(
+                            f"Exit modify {new.intent_key} skipped: no open "
+                            f"position-side legs to attach a bracket to; "
+                            f"re-evaluating next bar.",
+                            intent_key=new.intent_key,
+                            reason="no_position_to_protect",
+                            context={'symbol': new.symbol,
+                                     'from_entry': new.from_entry},
+                        )
+                    self._order_mapping[new.intent_key] = [
+                        f"bracket:{leg_id}" for leg_id in bracket.legs
+                    ]
+                else:
+                    orders = self._run_async(self._broker.modify_exit(old_env, new_env))
+                    self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
                 # CloseIntent or mismatched kinds — cancel + re-execute.
                 self._dispatch_cancel(old)
@@ -10431,8 +10569,22 @@ class OrderSyncEngine:
             return
         cancel_envelope = self._build_cancel_envelope(cancel)
         _blog_info("cancelling %s", cancel)
+        port = getattr(self._broker, 'position_port', None)
         try:
-            self._run_async(self._broker.execute_cancel(cancel_envelope))
+            if port is not None and isinstance(old, ExitIntent):
+                # Hedging-mode emulation: a whole-row exit's bracket lives
+                # per-leg in the ownership index, not as a cancelable broker
+                # order. Clear ONLY the legs THIS exit owns (never the whole
+                # position side — the broadcast clear the ownership index
+                # fixes). An entry cancel (no ``from_entry``) is a working-order
+                # cancel and stays on the regular path.
+                self._run_async(
+                    self._one_way_emulator.run_exit_bracket_clear(
+                        cancel_envelope, port,
+                    ),
+                )
+            else:
+                self._run_async(self._broker.execute_cancel(cancel_envelope))
         except BrokerManualInterventionError as e:
             self._record_halt(e)
             raise

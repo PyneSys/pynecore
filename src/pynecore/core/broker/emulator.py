@@ -22,6 +22,7 @@ side is netted virtually-FIFO against the oldest majority legs, and the
 surviving side's volume-weighted price becomes the one-way entry price.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pynecore.core.broker.models import ExchangePosition, PositionLeg
@@ -33,6 +34,8 @@ __all__ = [
     'aggregate_positions',
     'select_legs_for_close',
     'plan_reversal',
+    'plan_leg_close_volumes',
+    'legs_on_position_side',
 ]
 
 # Quantities are in Pine units (fractional lots possible). Anything below this
@@ -223,3 +226,78 @@ def plan_reversal(
     if open_qty < _QTY_EPS:
         open_qty = 0.0
     return ReversalPlan(closes=closes, open_qty=open_qty, open_side=side)
+
+
+def plan_leg_close_volumes(
+        closes: tuple[LegClose, ...],
+        quantize: Callable[[float], int],
+) -> list[tuple[str, int]]:
+    """Fan a FIFO close plan out to per-leg broker-grid close volumes.
+
+    Quantizing each FIFO slice independently changes the total close size on the
+    broker's volume grid: a sub-grid slice rounds to ``0`` (an invalid empty
+    close that under-reduces the position) and a fractional-grid slice rounds UP
+    past what the leg holds. Snapping the *total* once is not enough either: if a
+    slice that carries part of the owed total quantizes to ``0`` on its own —
+    e.g. two 10-unit legs on a 1000-centi grid closing 15 units, where the
+    second 5-unit slice snaps to ``0`` — per-slice rounded volumes leave the
+    snapped total under-dispatched.
+
+    Instead a single running total is snapped via ``quantize``: each leg receives
+    the delta between the snapped cumulative close-through-this-leg and the
+    snapped cumulative through the previous leg, capped at the snapped grand
+    total. The sub-grid remainder a slice would have dropped is carried into the
+    next leg, so the dispatched volumes always sum to the same grand total the
+    single-position close path would use, every volume sits on the broker grid,
+    and no leg gets more than its own slice rounded up to the next grid step. Any
+    leg whose delta is zero is dropped (no zero-volume request is sent).
+
+    :param closes: FIFO close plan (oldest first); each ``qty`` is the slice to
+        take from that leg, in Pine units, never above the leg's open size.
+    :param quantize: Maps a Pine-unit quantity to the broker's integer volume
+        grid (e.g. cTrader centi-units snapped to ``stepVolume``). Owns the
+        broker-specific unit; the FIFO carry logic here stays unit-agnostic.
+    :return: ``(leg_id, volume)`` pairs to dispatch in FIFO order, each with the
+        broker-grid integer ``volume`` the per-leg close expects. ``leg_id``
+        stays the :class:`PositionLeg` string id; the transport casts it.
+    """
+    grand_total = quantize(sum(close.qty for close in closes))
+    out: list[tuple[str, int]] = []
+    cumulative_units = 0.0
+    dispatched = 0
+    for close in closes:
+        if dispatched >= grand_total:
+            break
+        cumulative_units += close.qty
+        snapped = min(quantize(cumulative_units), grand_total)
+        volume = snapped - dispatched
+        if volume <= 0:
+            continue
+        out.append((close.leg_id, volume))
+        dispatched = snapped
+    return out
+
+
+def legs_on_position_side(
+        legs: list[PositionLeg],
+) -> tuple[str, list[PositionLeg]]:
+    """Return the aggregate one-way side and the legs that make it up, FIFO.
+
+    The net signed size decides the side (``'buy'`` for a net-long one-way
+    position, ``'sell'`` for net-short); the returned legs are those on that
+    side, oldest first (FIFO by ``(open_time, leg_id)``) so bracket replication
+    and the fail-safe SL fan-out are replay-stable. A net-flat book (offsetting
+    legs summing to zero, or no legs at all) returns ``('flat', [])``.
+
+    Replaces the ``'buy' if side == 'long' else 'sell'`` + filter that bracket
+    replication, modify, clear, and fail-safe each used to inline.
+    """
+    net = net_signed_qty(legs)
+    if abs(net) <= _QTY_EPS:
+        return 'flat', []
+    side = 'buy' if net > 0.0 else 'sell'
+    survivors = sorted(
+        (leg for leg in legs if leg.side == side),
+        key=lambda leg: (leg.open_time, leg.leg_id),
+    )
+    return side, survivors

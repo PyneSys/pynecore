@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from pynecore.core.plugin import ConfigT
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
@@ -41,9 +41,109 @@ if TYPE_CHECKING:
         ExchangePosition,
         ExchangeCapabilities,
         OrderEvent,
+        PositionLeg,
     )
 
-__all__ = ['BrokerPlugin']
+__all__ = ['BrokerPlugin', 'PositionPort']
+
+
+class PositionPort(Protocol):
+    """Thin transport a one-way-emulating broker plugin exposes to core.
+
+    A hedging-mode account holds several broker positions ("legs") per symbol;
+    Pine sees a single *one-way* position. A plugin that opts into core one-way
+    emulation sets :attr:`BrokerPlugin.position_port` to an object (usually
+    ``self``) implementing these primitives. The core
+    :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` owns all
+    netting / FIFO / crash-replay logic and drives the plugin purely through
+    this surface — each method sends or reads exactly ONE broker entity.
+    Plugins that do not emulate (netting-native, or hedging-rejecting) leave
+    ``position_port`` ``None`` and the engine uses the regular ``execute_*``
+    path unchanged.
+
+    The surface grows per emulation feature (close, then reversal, then bracket
+    replication); only the methods a wired feature needs are required.
+    """
+
+    async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
+        """All open legs for ``symbol`` (any direction), oldest first. No
+        aggregation — the core emulator nets them."""
+        ...
+
+    async def get_volume_quantizer(self, symbol: str) -> Callable[[float], int]:
+        """A sync ``Pine-units -> broker-grid-int`` quantizer for ``symbol``.
+
+        Returned as a closure so the emulator can snap per-leg volumes in a
+        tight loop without an await each call; the plugin owns the broker unit
+        (e.g. cTrader centi-units snapped to ``stepVolume``).
+        """
+        ...
+
+    async def close_leg(
+            self, symbol: str, leg_id: str, volume: int, coid: str,
+    ) -> None:
+        """Send ONE reduce/close of ``volume`` (broker-grid units) on broker
+        leg ``leg_id`` under client-order-id ``coid``. The resulting fill
+        arrives on the regular order-event stream; this just dispatches."""
+        ...
+
+    async def reject_out_of_range(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> None:
+        """Raise the broker's non-halting volume-bounds skip
+        (:class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin`) when
+        ``qty`` (Pine units) is below the minimum or above the maximum tradable
+        size; return ``None`` when it is in range.
+
+        The core emulator calls this BEFORE a reversal's leg closes so an
+        out-of-range residual skips the whole reversal while that is still true,
+        never leaving the book half-reduced.
+        """
+        ...
+
+    async def place_leg(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> list[ExchangeOrder]:
+        """Open ONE order of ``qty`` (Pine units) for the envelope's
+        :class:`EntryIntent` — the residual leg of a reversal, or a plain add.
+        Returns the resulting :class:`ExchangeOrder`(s)."""
+        ...
+
+    async def amend_bracket(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            coid: str,
+    ) -> None:
+        """Replicate (or clear) a protective bracket on ONE broker leg.
+
+        Sets the take-profit / stop-loss / trailing levels of the exit's bracket
+        on broker leg ``leg_id`` under client-order-id ``coid``. Levels are in
+        PINE UNITS (absolute prices for ``tp_price`` / ``sl_price``, a price
+        distance for ``trail_offset``), exactly as the :class:`ExitIntent`
+        carries them — the plugin owns the conversion to its broker grid and any
+        broker-specific reduction (e.g. cTrader has no numeric trailing offset,
+        so the plugin seeds an absolute trailing anchor and a trailing flag).
+        ``side`` is the exit side, supplied because a trail-only bracket needs it
+        to place the initial anchor on the correct side.
+
+        Passing ``tp_price`` / ``sl_price`` / ``trail_offset`` all ``None``
+        CLEARS the bracket on that one leg: on venues like cTrader the protection
+        is a single position attribute that an amend overwrites wholesale, so an
+        empty amend wipes it. The core emulator drives this per leg from its
+        ownership index, so a clear touches only the legs the cancelled exit owns
+        (never the whole position side).
+
+        Must be idempotent on ``coid`` (a restart re-amend with the same levels
+        is a broker no-op) and must NOT halt the bot on a leg-already-gone race —
+        a ``*_NOT_FOUND`` response normalises to a benign return. A genuine
+        rejection propagates as
+        :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError` for
+        the caller to surface.
+        """
+        ...
 
 
 class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
@@ -188,6 +288,19 @@ class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
 
     Signature: ``sink(parent_entry_dispatch_ref, *, stop_level, profit_level,
     trailing_stop)`` — pass ``None`` for fields the broker is not carrying.
+    """
+
+    position_port: 'PositionPort | None' = None
+    """Optional one-way emulation transport (hedging-mode accounts).
+
+    When non-``None``, the Order Sync Engine routes reducing / closing and
+    reversing intents for this plugin through the core
+    :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` instead of
+    the plugin's ``execute_close`` / ``execute_entry``, so the per-leg FIFO
+    fan-out and its persist-first crash/replay live in core. The plugin sets
+    this (typically to ``self``) once it knows the account is hedging-mode; it
+    stays ``None`` for netting accounts and for plugins that do not emulate,
+    leaving their existing dispatch path untouched.
     """
 
     # === High-level order intents ===

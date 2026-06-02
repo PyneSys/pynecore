@@ -101,6 +101,30 @@ __all__ = [
     'create_engine_trigger_partial_leg_row',
     'update_engine_trigger_partial_leg_state',
     'iter_active_engine_trigger_partial_legs',
+    'STATE_CLOSE_LEG',
+    'CLOSE_LEG_STATE_PENDING',
+    'CLOSE_LEG_STATE_DISPATCHED',
+    'CLOSE_LEG_STATE_LIVE',
+    'EXTRAS_KEY_CLOSE_LEG_STATE',
+    'EXTRAS_KEY_CLOSE_LEG_ID',
+    'EXTRAS_KEY_CLOSE_PARENT_COID',
+    'EXTRAS_KEY_CLOSE_LEG_VOLUME',
+    'create_close_leg_row',
+    'update_close_leg_state',
+    'iter_active_close_legs',
+    'STATE_BRACKET_OWN',
+    'BRACKET_OWN_STATE_ACTIVE',
+    'BRACKET_OWN_STATE_RELEASED',
+    'BRACKET_OWN_STATE_LIVE',
+    'EXTRAS_KEY_BRACKET_OWN_STATE',
+    'EXTRAS_KEY_BRACKET_OWN_LEG_ID',
+    'EXTRAS_KEY_BRACKET_OWN_ATTACH_COID',
+    'EXTRAS_KEY_BRACKET_OWN_TP',
+    'EXTRAS_KEY_BRACKET_OWN_SL',
+    'EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET',
+    'create_bracket_ownership_row',
+    'update_bracket_ownership_state',
+    'iter_active_bracket_ownerships',
 ]
 
 
@@ -423,6 +447,81 @@ EXTRAS_KEY_ENTRY_STOP_LIMIT_COID = 'entry_stop_limit_coid'
 # the transition into ``stop_market_pending`` (BEFORE the POST) so a restart
 # can verify-before-resend.
 EXTRAS_KEY_ENTRY_STOP_MARKET_COID = 'entry_stop_market_coid'
+
+
+# === One-way emulation close-leg constants =================================
+
+# ``orders.state`` marker for a one-way emulation close-leg row. The row owns no
+# exchange-side order of its own — it records one leg of a ``CloseIntent`` fanned
+# FIFO across a hedging account's legs, so the
+# :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` can re-derive an
+# interrupted fan-out on restart. Like :data:`STATE_PARTIAL_BRACKET_LEG`, this
+# marker tells the journal / reconcile paths to short-circuit: the leg's close
+# FILL itself flows through the normal natural-close path, applied FIFO by
+# ``record_fill`` as a ``LegType.CLOSE``.
+STATE_CLOSE_LEG = 'close_leg'
+
+# ``extras[EXTRAS_KEY_CLOSE_LEG_STATE]`` phases of one fanned close leg.
+# ``pending`` — row persisted, the per-leg close has NOT been acked yet.
+# ``dispatched`` — the transport's ``close_leg`` returned without raising
+#   (terminal; the row is closed). ``restart_replay`` resumes only ``pending``
+#   legs (a crash before the ack) and reconciles each against the live legs
+#   before re-dispatching, so an already-executed close is never repeated.
+CLOSE_LEG_STATE_PENDING = 'pending'
+CLOSE_LEG_STATE_DISPATCHED = 'dispatched'
+
+# Live (non-terminal) close-leg phases ``restart_replay`` must resume.
+CLOSE_LEG_STATE_LIVE: frozenset[str] = frozenset({CLOSE_LEG_STATE_PENDING})
+
+# Canonical ``extras`` keys for a close-leg row.
+EXTRAS_KEY_CLOSE_LEG_STATE = 'close_leg_state'
+# Broker leg id (cTrader ``positionId``) this row closes.
+EXTRAS_KEY_CLOSE_LEG_ID = 'close_leg_id'
+# The owning CloseIntent dispatch's ``KIND_CLOSE`` client-order-id; the per-leg
+# coid is derived deterministically as ``f"{parent}:{leg_id}"`` so a
+# restart-mid-fan never produces two rows for one leg.
+EXTRAS_KEY_CLOSE_PARENT_COID = 'close_parent_coid'
+# Broker-grid integer volume dispatched for this leg (audit + replay residual).
+EXTRAS_KEY_CLOSE_LEG_VOLUME = 'close_leg_volume'
+
+
+# === One-way emulation bracket-ownership constants =========================
+
+# ``orders.state`` marker for a per-leg bracket-ownership row. Like
+# :data:`STATE_CLOSE_LEG`, the row owns no exchange order: it records that one
+# exit's native TP/SL/trailing bracket was replicated onto one broker leg of a
+# hedging position, so the
+# :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` can clear ONLY
+# the legs a given exit owns (the plugin's broadcast clear strips brackets a
+# different exit set) and re-assert / release them on restart. The marker tells
+# the journal / reconcile paths to short-circuit, exactly as the close-leg and
+# partial-bracket-leg markers do.
+STATE_BRACKET_OWN = 'bracket_own'
+
+# ``extras[EXTRAS_KEY_BRACKET_OWN_STATE]`` phases of one owned leg's bracket.
+# ``active`` — the bracket is replicated onto this leg (steady state, unlike the
+#   close-leg row there is no separate post-ack transition: the amend either
+#   landed or a clear/release follows). ``released`` — the bracket was cleared
+#   from this leg (terminal; the row is closed). ``restart_replay`` re-asserts
+#   ``active`` rows whose leg is still open and releases those whose leg vanished.
+BRACKET_OWN_STATE_ACTIVE = 'active'
+BRACKET_OWN_STATE_RELEASED = 'released'
+
+# Live (non-terminal) bracket-ownership phases ``restart_replay`` re-asserts.
+BRACKET_OWN_STATE_LIVE: frozenset[str] = frozenset({BRACKET_OWN_STATE_ACTIVE})
+
+# Canonical ``extras`` keys for a bracket-ownership row.
+EXTRAS_KEY_BRACKET_OWN_STATE = 'bracket_own_state'
+# Broker leg id (cTrader ``positionId``) this exit's bracket is replicated onto.
+EXTRAS_KEY_BRACKET_OWN_LEG_ID = 'bracket_own_leg_id'
+# The owning exit's bracket-attach dispatch coid (``KIND_EXIT_SL``); the per-leg
+# row coid is derived as ``f"{attach_coid}:{leg_id}"`` so a re-attach upserts the
+# SAME row and two different exits get disjoint coid namespaces.
+EXTRAS_KEY_BRACKET_OWN_ATTACH_COID = 'bracket_own_attach_coid'
+# Pine-unit protective levels last replicated onto the leg (audit + modify diff).
+EXTRAS_KEY_BRACKET_OWN_TP = 'bracket_own_tp'
+EXTRAS_KEY_BRACKET_OWN_SL = 'bracket_own_sl'
+EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET = 'bracket_own_trail_offset'
 
 
 # === Entry order row lifecycle =============================================
@@ -1410,6 +1509,283 @@ def iter_active_engine_trigger_partial_legs(
             continue
         leg_state = (row.extras or {}).get(EXTRAS_KEY_LEG_STATE)
         if leg_state not in LEG_STATE_LIVE:
+            continue
+        yield row
+
+
+# === One-way emulation close-leg helpers ===================================
+
+def create_close_leg_row(
+        store: 'RunContext',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str,
+        pine_entry_id: str,
+        parent_close_coid: str,
+        leg_id: str,
+        leg_volume: int,
+        extra_payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist one one-way emulation close-leg row (PERSIST-FIRST).
+
+    Written by :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator`
+    BEFORE it dispatches the leg's close, so a crash mid-fan-out leaves a durable
+    record of which legs were owed. The row carries no exchange order — its
+    ``orders.state`` is :data:`STATE_CLOSE_LEG` so the journal / reconcile paths
+    short-circuit on it; the leg's close FILL arrives on the normal order-event
+    stream and is applied FIFO by ``record_fill`` as a ``LegType.CLOSE``.
+
+    The ``coid`` is the parent CloseIntent's coid suffixed with the broker leg id
+    (``f"{parent_close_coid}:{leg_id}"``), so a restart that re-runs the same
+    dispatch upserts the SAME row rather than duplicating it.
+
+    :param store: The active run context.
+    :param coid: The leg row's deterministic client-order-id.
+    :param symbol: Exchange-side symbol.
+    :param side: The close side (opposite the position direction being reduced).
+    :param qty: The Pine-unit quantity this leg closes (its FIFO slice).
+    :param intent_key: The owning :class:`CloseIntent`'s diff key.
+    :param pine_entry_id: The owning ``strategy.close(id=...)`` value, for audit.
+    :param parent_close_coid: The CloseIntent dispatch's ``KIND_CLOSE`` coid.
+    :param leg_id: Broker leg id (cTrader ``positionId``) this row closes.
+    :param leg_volume: Broker-grid integer volume dispatched for the leg.
+    :param extra_payload: Additional plugin-specific extras to merge.
+    """
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_CLOSE_LEG_STATE: CLOSE_LEG_STATE_PENDING,
+        EXTRAS_KEY_CLOSE_LEG_ID: leg_id,
+        EXTRAS_KEY_CLOSE_PARENT_COID: parent_close_coid,
+        EXTRAS_KEY_CLOSE_LEG_VOLUME: leg_volume,
+    }
+    if extra_payload:
+        extras.update(extra_payload)
+    # A restart-mid-fan re-dispatch reaches this helper with the SAME derived
+    # coid; reopen so the re-persisted row rejoins the live set (upsert_order
+    # does not clear ``closed_ts_ms`` on its own). No-op when the row is absent
+    # or already live.
+    store.reopen_order(coid)
+    store.upsert_order(
+        coid,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        state=STATE_CLOSE_LEG,
+        intent_key=intent_key,
+        pine_entry_id=pine_entry_id,
+        extras=extras,
+    )
+
+
+def update_close_leg_state(
+        store: 'RunContext',
+        *,
+        coid: str,
+        new_state: str,
+        close_row: bool = False,
+        extras_patch: Mapping[str, Any] | None = None,
+) -> None:
+    """Transition a close-leg row's :data:`EXTRAS_KEY_CLOSE_LEG_STATE`.
+
+    Set ``close_row=True`` for the terminal :data:`CLOSE_LEG_STATE_DISPATCHED`
+    transition (the per-leg close acked), which also calls
+    :meth:`RunContext.close_order` so the row leaves
+    :func:`iter_active_close_legs`'s live set.
+
+    :param store: The active run context.
+    :param coid: The leg row's client-order-id.
+    :param new_state: Target :data:`CLOSE_LEG_STATE_PENDING` /
+        :data:`CLOSE_LEG_STATE_DISPATCHED`.
+    :param close_row: When ``True``, also close the row (terminal).
+    :param extras_patch: Additional extras to merge before the upsert.
+    :raises ValueError: When ``new_state`` is not a canonical close-leg state.
+    """
+    if new_state not in (CLOSE_LEG_STATE_PENDING, CLOSE_LEG_STATE_DISPATCHED):
+        raise ValueError(
+            f"update_close_leg_state: new_state must be one of "
+            f"{{CLOSE_LEG_STATE_PENDING, CLOSE_LEG_STATE_DISPATCHED}}, "
+            f"got {new_state!r}"
+        )
+    existing = store.get_order(coid)
+    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+    merged[EXTRAS_KEY_CLOSE_LEG_STATE] = new_state
+    if extras_patch:
+        merged.update(extras_patch)
+    store.upsert_order(coid, extras=merged)
+    if close_row:
+        store.close_order(coid)
+
+
+def iter_active_close_legs(
+        store: 'RunContext',
+        *,
+        symbol: str | None = None,
+) -> Iterator['OrderRow']:
+    """Iterate live (pending) close-leg rows for restart replay.
+
+    Returns rows whose ``orders.state`` is :data:`STATE_CLOSE_LEG`, are not
+    closed, and whose :data:`EXTRAS_KEY_CLOSE_LEG_STATE` is in
+    :data:`CLOSE_LEG_STATE_LIVE` — a fan-out leg whose close was persisted but
+    never acked. :meth:`OneWayEmulator.restart_replay` reconciles each against
+    the live broker legs before re-dispatching.
+
+    :param store: The active run context.
+    :param symbol: Optional symbol filter, passed to
+        :meth:`RunContext.iter_live_orders`.
+    """
+    for row in store.iter_live_orders(symbol=symbol):
+        if row.state != STATE_CLOSE_LEG:
+            continue
+        leg_state = (row.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_STATE)
+        if leg_state not in CLOSE_LEG_STATE_LIVE:
+            continue
+        yield row
+
+
+# === One-way emulation bracket-ownership helpers ===========================
+
+def create_bracket_ownership_row(
+        store: 'RunContext',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str,
+        pine_entry_id: str,
+        from_entry: str,
+        leg_id: str,
+        attach_coid: str,
+        tp_price: float | None,
+        sl_price: float | None,
+        trail_offset: float | None,
+        extra_payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist one per-leg bracket-ownership row (PERSIST-FIRST).
+
+    Written by :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator`
+    BEFORE it amends an exit's TP/SL/trailing bracket onto one hedging leg, so a
+    crash mid-replication leaves a durable record of exactly which legs this exit
+    protects. The row carries no exchange order — its ``orders.state`` is
+    :data:`STATE_BRACKET_OWN` so the journal / reconcile paths short-circuit; the
+    leg's protective FILL (if it fires) arrives on the normal order-event stream.
+
+    The ``coid`` is the exit's bracket-attach coid suffixed with the broker leg
+    id (``f"{attach_coid}:{leg_id}"``), so a re-attach upserts the SAME row and
+    two different exits (distinct attach coids) own disjoint coid namespaces. The
+    ``from_entry`` is written to its own column so the clear path can pre-filter
+    the live set cheaply via :meth:`RunContext.iter_live_orders`.
+
+    :param store: The active run context.
+    :param coid: The ownership row's deterministic client-order-id.
+    :param symbol: Exchange-side symbol.
+    :param side: The exit (bracket) side.
+    :param qty: The owning :class:`ExitIntent`'s quantity, for audit.
+    :param intent_key: The owning :class:`ExitIntent`'s diff key
+        (``f"{pine_id}\\0{from_entry}"``), matched by the clear path.
+    :param pine_entry_id: The owning ``strategy.exit(id=...)`` value.
+    :param from_entry: The exit's parent entry id (its own column for filtering).
+    :param leg_id: Broker leg id (cTrader ``positionId``) the bracket is on.
+    :param attach_coid: The exit's ``KIND_EXIT_SL`` bracket-attach coid.
+    :param tp_price: Pine-unit take-profit level last replicated (or ``None``).
+    :param sl_price: Pine-unit stop-loss level last replicated (or ``None``).
+    :param trail_offset: Pine-unit trailing offset last replicated (or ``None``).
+    :param extra_payload: Additional plugin-specific extras to merge.
+    """
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_BRACKET_OWN_STATE: BRACKET_OWN_STATE_ACTIVE,
+        EXTRAS_KEY_BRACKET_OWN_LEG_ID: leg_id,
+        EXTRAS_KEY_BRACKET_OWN_ATTACH_COID: attach_coid,
+        EXTRAS_KEY_BRACKET_OWN_TP: tp_price,
+        EXTRAS_KEY_BRACKET_OWN_SL: sl_price,
+        EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET: trail_offset,
+    }
+    if extra_payload:
+        extras.update(extra_payload)
+    # A re-attach (modify, or restart re-assert) reaches this helper with the
+    # SAME derived coid; reopen so the re-persisted row rejoins the live set
+    # (upsert_order does not clear ``closed_ts_ms`` on its own). No-op when the
+    # row is absent or already live.
+    store.reopen_order(coid)
+    store.upsert_order(
+        coid,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        state=STATE_BRACKET_OWN,
+        intent_key=intent_key,
+        pine_entry_id=pine_entry_id,
+        from_entry=from_entry,
+        extras=extras,
+    )
+
+
+def update_bracket_ownership_state(
+        store: 'RunContext',
+        *,
+        coid: str,
+        new_state: str,
+        close_row: bool = False,
+        extras_patch: Mapping[str, Any] | None = None,
+) -> None:
+    """Transition a bracket-ownership row's :data:`EXTRAS_KEY_BRACKET_OWN_STATE`.
+
+    Set ``close_row=True`` for the terminal :data:`BRACKET_OWN_STATE_RELEASED`
+    transition (the bracket cleared from this leg), which also calls
+    :meth:`RunContext.close_order` so the row leaves
+    :func:`iter_active_bracket_ownerships`'s live set.
+
+    :param store: The active run context.
+    :param coid: The ownership row's client-order-id.
+    :param new_state: Target :data:`BRACKET_OWN_STATE_ACTIVE` /
+        :data:`BRACKET_OWN_STATE_RELEASED`.
+    :param close_row: When ``True``, also close the row (terminal).
+    :param extras_patch: Additional extras to merge before the upsert.
+    :raises ValueError: When ``new_state`` is not a canonical ownership state.
+    """
+    if new_state not in (BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_RELEASED):
+        raise ValueError(
+            f"update_bracket_ownership_state: new_state must be one of "
+            f"{{BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_RELEASED}}, "
+            f"got {new_state!r}"
+        )
+    existing = store.get_order(coid)
+    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+    merged[EXTRAS_KEY_BRACKET_OWN_STATE] = new_state
+    if extras_patch:
+        merged.update(extras_patch)
+    store.upsert_order(coid, extras=merged)
+    if close_row:
+        store.close_order(coid)
+
+
+def iter_active_bracket_ownerships(
+        store: 'RunContext',
+        *,
+        symbol: str | None = None,
+        from_entry: str | None = None,
+) -> Iterator['OrderRow']:
+    """Iterate live (active) bracket-ownership rows.
+
+    Returns rows whose ``orders.state`` is :data:`STATE_BRACKET_OWN`, are not
+    closed, and whose :data:`EXTRAS_KEY_BRACKET_OWN_STATE` is in
+    :data:`BRACKET_OWN_STATE_LIVE`. The clear path filters further by
+    ``intent_key`` to touch only the legs a specific exit owns; the restart pass
+    re-asserts every active row against the live broker legs.
+
+    :param store: The active run context.
+    :param symbol: Optional symbol filter, passed to
+        :meth:`RunContext.iter_live_orders`.
+    :param from_entry: Optional parent-entry filter, passed to
+        :meth:`RunContext.iter_live_orders` (the indexed ``from_entry`` column).
+    """
+    for row in store.iter_live_orders(symbol=symbol, from_entry=from_entry):
+        if row.state != STATE_BRACKET_OWN:
+            continue
+        own_state = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
+        if own_state not in BRACKET_OWN_STATE_LIVE:
             continue
         yield row
 
