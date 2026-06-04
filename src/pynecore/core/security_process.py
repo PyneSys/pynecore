@@ -401,7 +401,7 @@ def security_process_main(
     from ..types.ohlcv import OHLCV
 
     # Set syminfo BEFORE importing the script
-    _set_lib_syminfo_properties(syminfo, lib)
+    _set_lib_syminfo_properties(syminfo)
 
     # Parse timezone
     from pynecore.lib import _parse_timezone
