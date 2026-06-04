@@ -27,7 +27,8 @@ from . import timeframe as timeframe_module
 from . import session as session_module
 
 from pynecore.core.overload import overload
-from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone
+from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
+    TimezoneNotFoundError
 from ..core.resampler import Resampler
 
 __all__ = [
@@ -584,6 +585,10 @@ def time(timeframe: str | None = None, session: str | None = None, timezone: str
             return bar_time
         else:
             return NA(int)
+    except TimezoneNotFoundError:
+        # A missing/unresolvable timezone is a configuration error: surface it with
+        # the actionable message instead of silently treating every bar as closed.
+        raise
     except Exception:  # noqa
         # Error during session validation
         return NA(int)
@@ -658,6 +663,10 @@ def time_close(timeframe: str | None = None, session: str | None = None, timezon
             return bar_close_time
         else:
             return NA(int)
+    except TimezoneNotFoundError:
+        # A missing/unresolvable timezone is a configuration error: surface it with
+        # the actionable message instead of silently treating every bar as closed.
+        raise
     except Exception:  # noqa
         # Error during session validation
         return NA(int)
