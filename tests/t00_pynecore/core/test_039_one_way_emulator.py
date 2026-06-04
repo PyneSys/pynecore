@@ -21,6 +21,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
+from pynecore.core.broker.idempotency import KIND_CLOSE
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -42,8 +43,10 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_STATE,
     create_close_leg_row,
+    create_residual_open_row,
     iter_active_bracket_ownerships,
     iter_active_close_legs,
+    iter_active_residual_opens,
 )
 
 
@@ -56,11 +59,21 @@ class _FakePort:
             min_qty: float = 0.0, max_qty: float | None = None,
             fail_amend_leg: str | None = None,
             fail_amend_unknown_leg: str | None = None,
+            fail_place_leg: Exception | None = None,
+            fail_close_leg: Exception | None = None,
     ) -> None:
         self._legs = list(legs)
         self._min_qty = min_qty
         self._max_qty = max_qty
         self._fail_amend_leg = fail_amend_leg
+        # When set, place_leg raises this exception instead of recording the
+        # placement — models a residual entry the exchange rejects (definitive)
+        # or whose disposition is ambiguous.
+        self._fail_place_leg = fail_place_leg
+        # When set, close_leg raises this exception instead of recording the
+        # close — models a reversal's FIFO close leg the exchange rejects
+        # (definitive) or whose disposition is ambiguous.
+        self._fail_close_leg = fail_close_leg
         # Per-leg ambiguous-timeout: amend_bracket for THIS leg raises
         # OrderDispositionUnknownError, modelling an independent broker round-trip
         # that times out while the other legs amend cleanly.
@@ -84,6 +97,8 @@ class _FakePort:
         return lambda u: int(u)
 
     async def close_leg(self, symbol: str, leg_id: str, volume: int, coid: str) -> None:
+        if self._fail_close_leg is not None:
+            raise self._fail_close_leg
         self.closed.append((symbol, leg_id, volume, coid))
 
     async def reject_out_of_range(self, envelope: DispatchEnvelope, qty: float) -> None:
@@ -95,6 +110,8 @@ class _FakePort:
             )
 
     async def place_leg(self, envelope: DispatchEnvelope, qty: float):
+        if self._fail_place_leg is not None:
+            raise self._fail_place_leg
         self.placed.append((envelope.intent.symbol, qty))
         return ["order"]
 
@@ -614,4 +631,231 @@ def __test_restart_replay_clear_timeout_does_not_abort_startup__(tmp_path):
     _run(eng.restart_replay(port))
     assert _amended_levels(port) == [("10", None, None)]
     assert list(iter_active_bracket_ownerships(ctx)) == []
+    store.close()
+
+
+# === Reversal residual-open replay (2.7) ================================
+
+def _seed_residual(ctx, *, entry_coid, qty=2.0, side="buy"):
+    create_residual_open_row(
+        ctx, coid="rev:residual", symbol="EURUSD", side=side, qty=qty,
+        intent_key="Long", pine_entry_id="Long", entry_coid=entry_coid,
+        run_tag="t000", bar_ts_ms=1000, retry_seq=0,
+    )
+
+
+def __test_reversal_creates_then_clears_residual_breadcrumb__(tmp_path):
+    # A real reversal (close the opposing short, open the residual long) writes
+    # the persist-first breadcrumb before the closes and discharges it once
+    # place_leg has persisted the residual entry row.
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert _dispatched(port) == [("20", 1)]
+    assert port.placed == [("EURUSD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_reversal_pure_reduce_writes_no_breadcrumb__(tmp_path):
+    # An order smaller than the opposing exposure is a pure reduce: no residual
+    # opens, so no breadcrumb is ever persisted.
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "sell", 3.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_pure_add_writes_no_breadcrumb__(tmp_path):
+    # A pure add (no opposing legs, no close owed) opens the whole size but must
+    # NOT persist a residual breadcrumb: re-opening it from a crash would bypass
+    # the next sync's Pine re-evaluation and resurrect an unwanted entry. Only a
+    # genuine reversal (closes actually dispatched) earns a breadcrumb. Asserting
+    # on the breadcrumb ROW (not just the live iterator) catches the prior bug
+    # where a pure add created-then-cleared a residual row in the happy path.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 2.0)
+    residual_coid = f"{env.client_order_id(KIND_CLOSE)}:residual"
+    port = _FakePort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_reversal(env, port))
+    assert port.placed == [("EURUSD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    assert ctx.get_order(residual_coid) is None
+    store.close()
+
+
+def __test_restart_replay_redispatches_residual_when_entry_absent__(tmp_path):
+    # Crash after the closes landed but before place_leg persisted the residual
+    # entry row: the breadcrumb survives and replay re-opens the residual.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    port = _FakePort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))
+    assert port.placed == [("EURUSD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
+    # The residual entry row already exists (place_leg's persist-first write
+    # landed): the entry path owns it, so replay must NOT re-open — only clear.
+    store, ctx = _make_store(tmp_path)
+    ctx.upsert_order("entry-present", symbol="EURUSD", side="buy", qty=2.0,
+                     state="confirmed", pine_entry_id="Long")
+    _seed_residual(ctx, entry_coid="entry-present", qty=2.0)
+    port = _FakePort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))
+    assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_reversal_clears_breadcrumb_on_definitive_entry_reject__(tmp_path):
+    # The residual place_leg is definitively rejected by the exchange after the
+    # closes already landed: the dispatch path turns this into a non-halting skip,
+    # so the breadcrumb must be discharged here — leaving it live would let a
+    # later restart re-open a residual the exchange rejected and Pine never
+    # re-signalled.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0)
+    residual_coid = f"{env.client_order_id(KIND_CLOSE)}:residual"
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_place_leg=ExchangeOrderRejectedError("insufficient margin"),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(ExchangeOrderRejectedError):
+        _run(eng.run_reversal(env, port))
+    # Closes still landed; the breadcrumb is discharged (closed) so no stale
+    # residual replays after restart.
+    assert _dispatched(port) == [("20", 2)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    breadcrumb = ctx.get_order(residual_coid)
+    assert breadcrumb is not None and breadcrumb.closed_ts_ms is not None
+    store.close()
+
+
+def __test_reversal_keeps_breadcrumb_on_ambiguous_entry_failure__(tmp_path):
+    # An ambiguous place_leg failure (disposition unknown) leaves the residual's
+    # fate unknown: the breadcrumb MUST survive so restart_replay can reconcile
+    # and re-dispatch / clear it. A definitive-reject clear must NOT swallow it.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0)
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_place_leg=OrderDispositionUnknownError(
+            "residual timed out", client_order_id="residual-coid",
+        ),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(env, port))
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    store.close()
+
+
+def __test_reversal_clears_breadcrumb_on_definitive_close_reject__(tmp_path):
+    # A FIFO close leg is DEFINITIVELY rejected: the fan-out raises before the
+    # residual place_leg ever runs. _dispatch_new turns this reject into a
+    # non-halting skip for the entry, so the breadcrumb must be discharged here —
+    # leaving it live would let a later restart re-close + re-open a reversal the
+    # exchange already rejected and Pine never re-signalled.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0)
+    residual_coid = f"{env.client_order_id(KIND_CLOSE)}:residual"
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_close_leg=ExchangeOrderRejectedError("close rejected"),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(ExchangeOrderRejectedError):
+        _run(eng.run_reversal(env, port))
+    assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    breadcrumb = ctx.get_order(residual_coid)
+    assert breadcrumb is not None and breadcrumb.closed_ts_ms is not None
+    store.close()
+
+
+def __test_reversal_keeps_breadcrumb_on_ambiguous_close_failure__(tmp_path):
+    # An ambiguous FIFO close leg (disposition unknown) leaves the close — and
+    # thus a possibly-owed residual — unresolved: the breadcrumb MUST survive so
+    # restart_replay reconciles it against the then-known leg state. A
+    # definitive-reject clear must NOT swallow the ambiguous case.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0)
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_close_leg=OrderDispositionUnknownError(
+            "close timed out", client_order_id="close-coid",
+        ),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(env, port))
+    assert port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    store.close()
+
+
+def __test_restart_replay_closes_opposing_legs_before_residual__(tmp_path):
+    # Crash in the window AFTER the breadcrumb but BEFORE the FIFO closes landed:
+    # the opposing legs are still live and no close-leg rows were persisted, so
+    # _replay_close_legs has nothing to re-dispatch. Replaying the residual on top
+    # of the still-open opposing legs would over-expose the book — the residual
+    # replay must FIFO-close every still-live opposing leg before the open.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=1.0, side="buy")
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))
+    assert _dispatched(port) == [("20", 2)]
+    assert port.placed == [("EURUSD", 1.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_clears_breadcrumb_on_definitive_residual_reject__(tmp_path):
+    # The residual re-open is definitively rejected during replay. restart_replay
+    # runs inside the sync startup wrapper, which only catches
+    # ExchangeConnectionError, so the reject must NOT propagate (that would abort
+    # startup and re-arm the same rejected residual every sync). The breadcrumb is
+    # discharged so the residual the exchange refused never replays again.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    port = _FakePort(
+        [], fail_place_leg=ExchangeOrderRejectedError("insufficient margin"),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))  # no exception escapes
+    assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    breadcrumb = ctx.get_order("rev:residual")
+    assert breadcrumb is not None and breadcrumb.closed_ts_ms is not None
+    store.close()
+
+
+def __test_restart_replay_keeps_breadcrumb_on_ambiguous_residual_failure__(tmp_path):
+    # An ambiguous residual re-open (disposition unknown) during replay leaves the
+    # open's fate unknown. The breadcrumb MUST survive so the next sync's replay
+    # reconciles it, and the error must NOT propagate — propagating would abort
+    # startup on a recoverable round-trip.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    port = _FakePort(
+        [], fail_place_leg=OrderDispositionUnknownError(
+            "residual timed out", client_order_id="rev:residual",
+        ),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))  # no exception escapes
+    assert port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
     store.close()

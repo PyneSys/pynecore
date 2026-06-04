@@ -41,10 +41,16 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
 )
-from pynecore.core.broker.idempotency import KIND_CANCEL, KIND_CLOSE, KIND_EXIT_SL
+from pynecore.core.broker.idempotency import (
+    KIND_CANCEL,
+    KIND_CLOSE,
+    KIND_ENTRY,
+    KIND_EXIT_SL,
+)
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
+    DispatchEnvelope,
     EntryIntent,
     ExitIntent,
     OrderType,
@@ -63,16 +69,22 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
     EXTRAS_KEY_CLOSE_LEG_ID,
     EXTRAS_KEY_CLOSE_LEG_VOLUME,
+    EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS,
+    EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
+    EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ,
+    EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG,
+    clear_residual_open_row,
     create_bracket_ownership_row,
     create_close_leg_row,
+    create_residual_open_row,
     iter_active_bracket_ownerships,
     iter_active_close_legs,
+    iter_active_residual_opens,
     update_bracket_ownership_state,
     update_close_leg_state,
 )
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.models import DispatchEnvelope
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.plugin.broker import PositionPort
 
@@ -238,16 +250,78 @@ class OneWayEmulator:
         preflight_qty = plan.open_qty if plan.open_qty > 0.0 else intent.qty
         await port.reject_out_of_range(envelope, preflight_qty)
         parent_coid = envelope.client_order_id(KIND_CLOSE)
+        # Persist-first residual-open breadcrumb BEFORE the closes: a crash
+        # after the closes land but before ``place_leg`` persists the residual
+        # entry row would otherwise leave the book reduced with the residual
+        # open lost — neither the close-leg replay nor the entry journal owns
+        # it. ``restart_replay`` reconciles this against the residual entry row
+        # and re-dispatches only if that row never landed. Only a genuine
+        # reversal needs it: a pure add (no opposing legs, ``plan.closes``
+        # empty) leaves the book intact, so re-opening it on restart would
+        # bypass the next sync's Pine re-evaluation and resurrect an entry the
+        # strategy may no longer want. The breadcrumb is gated on closes being
+        # actually owed, never on a positive ``open_qty`` alone.
+        residual_coid = f"{parent_coid}:residual"
+        wrote_breadcrumb = bool(plan.closes) and plan.open_qty > 0.0
+        if wrote_breadcrumb and self._store_ctx is not None:
+            create_residual_open_row(
+                self._store_ctx,
+                coid=residual_coid,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=plan.open_qty,
+                intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id,
+                entry_coid=envelope.client_order_id(KIND_ENTRY),
+                run_tag=envelope.run_tag,
+                bar_ts_ms=envelope.bar_ts_ms,
+                retry_seq=envelope.retry_seq,
+            )
         dispatched: list[tuple[str, int]] = []
         if plan.closes:
-            dispatched = await self._fan_out_closes(
-                plan.closes, symbol=intent.symbol, side=intent.side,
-                intent_key=intent.intent_key, pine_id=intent.pine_id,
-                parent_coid=parent_coid, port=port,
-            )
+            try:
+                dispatched = await self._fan_out_closes(
+                    plan.closes, symbol=intent.symbol, side=intent.side,
+                    intent_key=intent.intent_key, pine_id=intent.pine_id,
+                    parent_coid=parent_coid, port=port,
+                )
+            except ExchangeOrderRejectedError:
+                # A close leg was DEFINITIVELY refused — the fan-out raised
+                # before the residual ``place_leg`` ran, so the residual never
+                # opened. ``_dispatch_new`` turns this reject into a non-halting
+                # skip for the entry (signal dropped, bot continues), so the
+                # breadcrumb must be discharged here exactly as the residual
+                # reject path below does: leaving it live would let a later
+                # restart replay re-close + re-open a reversal the exchange
+                # already rejected and Pine never re-signalled. An ambiguous
+                # ``OrderDispositionUnknownError`` (caught by the broader
+                # ``BrokerError`` contract, not here) leaves the close's fate —
+                # and thus a possibly-owed residual — unknown, so its breadcrumb
+                # must survive for restart reconciliation and is left intact.
+                if wrote_breadcrumb and self._store_ctx is not None:
+                    clear_residual_open_row(self._store_ctx, residual_coid)
+                raise
         opened_orders: tuple = ()
         if plan.open_qty > 0.0:
-            opened_orders = tuple(await port.place_leg(envelope, plan.open_qty))
+            try:
+                opened_orders = tuple(await port.place_leg(envelope, plan.open_qty))
+            except ExchangeOrderRejectedError:
+                # The exchange definitively refused the residual entry — nothing
+                # opened. The dispatch path turns this into a non-halting skip
+                # (signal dropped, bot continues), so the breadcrumb must be
+                # discharged here: leaving it live would let a later restart
+                # replay re-open a residual the exchange already rejected and Pine
+                # never re-signalled. Only a DEFINITIVE reject clears it — an
+                # ambiguous ``OrderDispositionUnknownError`` / connection error
+                # leaves the open's fate unknown, so its breadcrumb must survive
+                # for restart reconciliation and is left intact (re-raised).
+                if wrote_breadcrumb and self._store_ctx is not None:
+                    clear_residual_open_row(self._store_ctx, residual_coid)
+                raise
+            if wrote_breadcrumb and self._store_ctx is not None:
+                # The residual entry row is now persisted (persist-first inside
+                # ``place_leg``) and dispatched — the breadcrumb is discharged.
+                clear_residual_open_row(self._store_ctx, residual_coid)
         return ReversalFanResult(
             closes=tuple(dispatched), open_qty=plan.open_qty,
             opened_orders=opened_orders,
@@ -645,15 +719,19 @@ class OneWayEmulator:
     async def restart_replay(self, port: 'PositionPort') -> None:
         """Resume any close-leg fan-out or bracket replication a crash interrupted.
 
-        Called once at startup. Two independent passes: pending close-leg rows
+        Called once at startup. Three ordered passes: pending close-leg rows
         are reconciled against the live legs and the residual re-dispatched (an
-        already-settled leg is never re-closed); active bracket-ownership rows
-        are re-asserted on still-open legs (idempotent on the per-leg coid) and
+        already-settled leg is never re-closed); THEN reversal residual-open
+        breadcrumbs are reconciled (the closes are now resolved, so a still-owed
+        residual is safely re-opened) and the open re-dispatched only when its
+        own entry row never landed; THEN active bracket-ownership rows are
+        re-asserted on still-open legs (idempotent on the per-leg coid) and
         released when their leg has vanished.
         """
         if self._store_ctx is None:
             return
         await self._replay_close_legs(port)
+        await self._replay_residual_opens(port)
         await self._replay_bracket_ownership(port)
 
     async def _replay_close_legs(self, port: 'PositionPort') -> None:
@@ -705,6 +783,94 @@ class OneWayEmulator:
             self._store_ctx, coid=row.client_order_id,
             new_state=CLOSE_LEG_STATE_DISPATCHED, close_row=True,
         )
+
+    async def _replay_residual_opens(self, port: 'PositionPort') -> None:
+        """Re-dispatch any reversal residual-open a crash left un-persisted.
+
+        Runs AFTER :meth:`_replay_close_legs`, so the reversal's FIFO closes are
+        already reconciled and re-opening the residual cannot race them. For each
+        live breadcrumb: if the residual's own entry row already exists, the
+        ``place_leg`` persist-first write landed and the entry journal / startup
+        recovery own it — just clear the breadcrumb; otherwise rebuild the
+        dispatch envelope and re-open the residual under the SAME deterministic
+        ``KIND_ENTRY`` coid (a duplicate is therefore impossible at the exchange
+        dedup), then clear it.
+        """
+        if self._store_ctx is None:
+            return
+        for row in list(iter_active_residual_opens(self._store_ctx)):
+            await self._replay_residual_one(row, port)
+
+    async def _replay_residual_one(self, row, port: 'PositionPort') -> None:
+        """Reconcile + (if needed) re-dispatch one residual-open breadcrumb."""
+        if self._store_ctx is None:
+            return
+        extras = row.extras or {}
+        entry_coid: str | None = extras.get(EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID)
+        if (entry_coid is not None
+                and self._store_ctx.get_order(entry_coid) is not None):
+            # ``place_leg`` reached its persist-first entry-row write before the
+            # crash — the open is durable and owned by the entry path. Discharge.
+            clear_residual_open_row(self._store_ctx, row.client_order_id)
+            return
+        # The residual open never persisted (persist-first guarantees the entry
+        # row precedes any wire send, so its absence proves no dispatch happened —
+        # re-opening cannot double-open). The breadcrumb is written BEFORE the
+        # FIFO closes, so a crash in that window can also leave the opposing legs
+        # un-closed AND their close-leg rows un-persisted — ``_replay_close_legs``
+        # then has nothing to re-dispatch. Re-opening the residual on top of those
+        # still-live opposing legs would over-expose the book. Reconcile against
+        # the live legs first: a genuine reversal (positive residual) fully
+        # consumes the opposing exposure, so every still-live opposing leg is an
+        # owed close — FIFO-close them under the SAME deterministic parent coid
+        # (idempotent at the exchange dedup) before the residual open.
+        run_tag = extras.get(EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG)
+        bar_ts_ms = extras.get(EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS)
+        retry_seq = extras.get(EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ)
+        assert isinstance(run_tag, str)
+        assert isinstance(bar_ts_ms, int)
+        assert isinstance(retry_seq, int)
+        opposing_side = 'sell' if row.side == 'buy' else 'buy'
+        live_legs = await port.fetch_raw_positions(row.symbol)
+        owed_closes = tuple(
+            LegClose(leg_id=leg.leg_id, qty=leg.qty)
+            for leg in live_legs
+            if leg.side == opposing_side and leg.qty > 0.0
+        )
+        if owed_closes:
+            parent_coid = row.client_order_id.removesuffix(':residual')
+            await self._fan_out_closes(
+                owed_closes, symbol=row.symbol, side=row.side,
+                intent_key=row.intent_key or row.pine_entry_id or '',
+                pine_id=row.pine_entry_id or '', parent_coid=parent_coid, port=port,
+            )
+        envelope = DispatchEnvelope(
+            intent=EntryIntent(
+                pine_id=row.pine_entry_id, symbol=row.symbol, side=row.side,
+                qty=row.qty, order_type=OrderType.MARKET,
+            ),
+            run_tag=run_tag, bar_ts_ms=bar_ts_ms, retry_seq=retry_seq,
+        )
+        try:
+            await port.place_leg(envelope, row.qty)
+        except ExchangeOrderRejectedError:
+            # The exchange definitively refused the residual entry — nothing
+            # opened. ``restart_replay`` runs inside the sync startup wrapper,
+            # which only catches ``ExchangeConnectionError`` (sync_engine), so
+            # propagating here would abort startup and the breadcrumb would
+            # survive un-cleared, retrying the same rejected residual on every
+            # later sync. Discharge the breadcrumb and stop: the residual the
+            # exchange rejected and Pine never re-signalled must not re-open.
+            clear_residual_open_row(self._store_ctx, row.client_order_id)
+            return
+        except OrderDispositionUnknownError:
+            # The residual entry's fate is unknown (ambiguous round-trip). Leave
+            # the breadcrumb live so the next sync's replay / drain reconciles it
+            # against the then-known leg state, but do NOT propagate — that would
+            # abort startup on a recoverable round-trip, mirroring the bracket
+            # re-clear path above.
+            return
+        clear_residual_open_row(self._store_ctx, row.client_order_id)
 
     async def _replay_bracket_ownership(self, port: 'PositionPort') -> None:
         """Re-assert / finish live bracket-ownership rows (second replay pass).

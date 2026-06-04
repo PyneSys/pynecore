@@ -112,6 +112,14 @@ __all__ = [
     'create_close_leg_row',
     'update_close_leg_state',
     'iter_active_close_legs',
+    'STATE_RESIDUAL_OPEN',
+    'EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID',
+    'EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG',
+    'EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS',
+    'EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ',
+    'create_residual_open_row',
+    'iter_active_residual_opens',
+    'clear_residual_open_row',
     'STATE_BRACKET_OWN',
     'BRACKET_OWN_STATE_ACTIVE',
     'BRACKET_OWN_STATE_CLEARING',
@@ -500,6 +508,32 @@ EXTRAS_KEY_CLOSE_LEG_ID = 'close_leg_id'
 EXTRAS_KEY_CLOSE_PARENT_COID = 'close_parent_coid'
 # Broker-grid integer volume dispatched for this leg (audit + replay residual).
 EXTRAS_KEY_CLOSE_LEG_VOLUME = 'close_leg_volume'
+
+
+# === One-way emulation residual-open constants =============================
+
+# ``orders.state`` marker for a reversal's residual-OPEN intent. Like
+# :data:`STATE_CLOSE_LEG`, the row owns no exchange order and the journal /
+# reconcile / startup-recovery paths short-circuit on it (they only act on
+# ``submitted`` / ``confirmed`` / ``closing`` / ``rejected`` rows). It is a
+# persist-first breadcrumb written by
+# :meth:`~pynecore.core.broker.one_way_emulator.OneWayEmulator.run_reversal`
+# BEFORE the FIFO closes, so a crash in the window between the closes landing
+# and the residual ``place_leg`` persisting its own entry row does not lose the
+# residual open. :meth:`OneWayEmulator.restart_replay` reconciles it against the
+# residual entry row (re-dispatching the open only when that row never landed)
+# and then clears it.
+STATE_RESIDUAL_OPEN = 'residual_open'
+
+# Canonical ``extras`` keys for a residual-open row. The deterministic
+# ``KIND_ENTRY`` coid of the residual ``place_leg`` (existence proves the open
+# already entered the persist-first entry path / 2.x recovery), plus the
+# envelope fields needed to rebuild the dispatch on replay (the residual is
+# always a MARKET entry; the early resting-order branch never persists one).
+EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID = 'residual_open_entry_coid'
+EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG = 'residual_open_run_tag'
+EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS = 'residual_open_bar_ts_ms'
+EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ = 'residual_open_retry_seq'
 
 
 # === One-way emulation bracket-ownership constants =========================
@@ -1681,6 +1715,94 @@ def iter_active_close_legs(
         if leg_state not in CLOSE_LEG_STATE_LIVE:
             continue
         yield row
+
+
+# === One-way emulation residual-open helpers ===============================
+
+def create_residual_open_row(
+        store: 'RunContext',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str,
+        pine_entry_id: str,
+        entry_coid: str,
+        run_tag: str,
+        bar_ts_ms: int,
+        retry_seq: int,
+) -> None:
+    """Persist a reversal's residual-OPEN breadcrumb (PERSIST-FIRST).
+
+    Written by :meth:`~pynecore.core.broker.one_way_emulator.OneWayEmulator.run_reversal`
+    BEFORE the FIFO closes, so a crash in the window between the closes landing
+    and the residual :meth:`PositionPort.place_leg` persisting its own entry row
+    leaves a durable record that an open is owed. The row owns no exchange order —
+    its ``orders.state`` is :data:`STATE_RESIDUAL_OPEN`, so the journal /
+    reconcile / startup-recovery paths short-circuit on it.
+    :meth:`OneWayEmulator.restart_replay` reconciles it against the residual entry
+    row (keyed on ``entry_coid``) and re-dispatches the open only when that row
+    never landed, then clears this breadcrumb.
+
+    The ``coid`` is the reversal's ``KIND_CLOSE`` parent coid suffixed
+    ``":residual"``, so a restart re-run upserts the SAME row.
+
+    :param store: The active run context.
+    :param coid: The breadcrumb row's deterministic client-order-id.
+    :param symbol: Exchange-side symbol.
+    :param side: The residual open's side (the entry's own direction).
+    :param qty: The residual open quantity (Pine units).
+    :param intent_key: The owning :class:`EntryIntent`'s diff key.
+    :param pine_entry_id: The owning ``strategy.entry(id=...)`` value.
+    :param entry_coid: The residual ``place_leg``'s deterministic ``KIND_ENTRY``
+        coid — its presence on replay proves the open already persisted.
+    :param run_tag: Dispatch envelope run tag (to rebuild the envelope on replay).
+    :param bar_ts_ms: Dispatch envelope bar timestamp.
+    :param retry_seq: Dispatch envelope retry sequence.
+    """
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID: entry_coid,
+        EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG: run_tag,
+        EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS: bar_ts_ms,
+        EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ: retry_seq,
+    }
+    store.reopen_order(coid)
+    store.upsert_order(
+        coid,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        state=STATE_RESIDUAL_OPEN,
+        intent_key=intent_key,
+        pine_entry_id=pine_entry_id,
+        extras=extras,
+    )
+
+
+def clear_residual_open_row(store: 'RunContext', coid: str) -> None:
+    """Finalise a residual-open breadcrumb once the open is durable / replayed."""
+    store.close_order(coid)
+
+
+def iter_active_residual_opens(
+        store: 'RunContext',
+        *,
+        symbol: str | None = None,
+) -> Iterator['OrderRow']:
+    """Iterate live residual-open breadcrumbs for restart replay.
+
+    Returns rows whose ``orders.state`` is :data:`STATE_RESIDUAL_OPEN` and which
+    are not yet closed — a reversal whose residual open was recorded but whose
+    durability (its own entry row) the crash may have pre-empted.
+
+    :param store: The active run context.
+    :param symbol: Optional symbol filter, passed to
+        :meth:`RunContext.iter_live_orders`.
+    """
+    for row in store.iter_live_orders(symbol=symbol):
+        if row.state == STATE_RESIDUAL_OPEN:
+            yield row
 
 
 # === One-way emulation bracket-ownership helpers ===========================
