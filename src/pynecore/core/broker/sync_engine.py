@@ -764,6 +764,7 @@ class OrderSyncEngine:
         envelopes, pending = self._store_ctx.replay()
         self._persisted_envelope_anchors = dict(envelopes)
         self._persisted_pending_anchors = self._unresolved_pending(pending)
+        self._prune_orphaned_pending(pending)
 
     @staticmethod
     def _unresolved_pending(
@@ -805,6 +806,48 @@ class OrderSyncEngine:
             for coid, record in pending.items()
             if record.resolution is None
         }
+
+    def _prune_orphaned_pending(
+            self, pending: dict[str, PendingRecord],
+    ) -> None:
+        """Drop in-memory parked dispatches whose persisted park row is gone.
+
+        ``_pending_verification`` is populated only at the park site
+        (:meth:`_park_pending`), which always pairs the in-memory insert
+        with a ``record_park`` row. For a store-backed run every *live*
+        parked dispatch therefore has a matching ``pending_verifications``
+        row — the in-memory map is a subset of the persisted set.
+
+        The inverse does not self-heal on its own. A plugin that confirms
+        a parked dispatch out-of-band — e.g. a MARKET / already-filled
+        order whose fill ``get_open_orders`` never re-surfaces — calls
+        :meth:`~pynecore.core.broker.storage.RunContext.record_unpark`,
+        which DELETEs the persisted row but cannot reach this in-memory
+        map (plugins hold no engine reference). A key fully retired
+        through :meth:`_drop_envelope` / ``record_complete`` leaves the
+        same residue. Without reconciliation the stale entry survives
+        every in-process reconnect, keeps the
+        :meth:`_verify_pending_dispatches` short-circuit permanently
+        false, and forces a spurious ``get_open_orders`` round-trip on
+        every subsequent sync.
+
+        Reconciling against the freshly replayed ``pending`` map closes
+        the gap: a coid absent from the replay no longer has a persisted
+        park row, so its in-memory envelope is dead weight and is dropped.
+        The raw (pre-:meth:`_unresolved_pending`) map is passed in
+        deliberately — a plugin-resolved ``'attached'`` / ``'rejected'``
+        row is kept in SQLite and must not be read as vanished here;
+        :meth:`_consume_plugin_resolutions` still owns its in-memory pop.
+        """
+        if not self._pending_verification:
+            return
+        for coid in list(self._pending_verification):
+            if coid not in pending:
+                del self._pending_verification[coid]
+                _log.info(
+                    "self-healed orphaned parked dispatch %s: persisted "
+                    "park row gone (recovery-confirmed or retired)", coid,
+                )
 
     @property
     def active_intents(self) -> dict[str, Intent]:
@@ -982,6 +1025,7 @@ class OrderSyncEngine:
             envelopes, pending = self._store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
+            self._prune_orphaned_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
         # Re-apply reject-bumped retry anchors that the wholesale replay above
         # just dropped. These bumps are intentionally never journaled (a

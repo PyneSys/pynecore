@@ -973,6 +973,103 @@ def __test_plugin_resolution_repark_same_coid_clears_attached_dedup__(
         ctx.close()
 
 
+# === Recovery-confirm self-heal (record_unpark orphan) =====================
+
+
+def __test_record_unpark_self_heals_orphaned_in_memory_pending__(
+        tmp_path: Path,
+) -> None:
+    """A plugin recovery-confirm (``record_unpark``) of a MARKET /
+    already-filled order deletes only the persisted park row; the engine
+    must self-heal its in-memory ``_pending_verification`` entry against
+    the replayed set instead of stranding it across reconnects.
+
+    Models the cTrader ``_confirm_recovered_entry`` path: it calls
+    ``store_ctx.record_unpark(coid)`` for a fill ``get_open_orders`` never
+    re-surfaces, so neither the ``get_open_orders`` match in
+    :meth:`OrderSyncEngine._verify_pending_dispatches` nor a
+    ``record_resolution`` consume can ever clear the in-memory park. The
+    reconnect handshake (:meth:`refresh_anchors_from_store`) re-replays
+    the anchors and must drop the now-rowless entry.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos, coid = _park_entry(broker, ctx)
+
+        # Recovery-confirm out-of-band: only the persisted row is deleted.
+        ctx.record_unpark(coid)
+        _envelopes, pending = ctx.replay()
+        assert coid not in pending, (
+            "record_unpark must delete the persisted park row"
+        )
+        assert coid in engine.pending_verification, (
+            "the in-memory park is still stranded until the self-heal runs"
+        )
+
+        # In-process reconnect handshake re-replays the anchors.
+        engine.refresh_anchors_from_store()
+
+        assert coid not in engine.pending_verification, (
+            "self-heal must drop the in-memory park whose persisted row "
+            "record_unpark deleted"
+        )
+        ctx.close()
+
+
+def __test_sync_self_heals_orphaned_in_memory_pending__(
+        tmp_path: Path,
+) -> None:
+    """The start-of-sync wholesale re-replay self-heals an orphaned
+    in-memory park too — not only the explicit reconnect handshake.
+
+    A filled MARKET order never echoes in ``get_open_orders``
+    (``broker.open_orders`` stays empty), so the
+    :meth:`OrderSyncEngine._verify_pending_dispatches` match path cannot
+    clear the park; the per-sync reconciliation must.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos, coid = _park_entry(broker, ctx)
+
+        ctx.record_unpark(coid)
+        engine.sync(BAR_TS + 60_000)
+
+        assert coid not in engine.pending_verification, (
+            "the per-sync re-replay must drop the orphaned in-memory park"
+        )
+        _envelopes, pending = ctx.replay()
+        assert pending == {}
+        ctx.close()
+
+
+def __test_legitimate_park_survives_reconnect_replay__(
+        tmp_path: Path,
+) -> None:
+    """A still-pending park whose persisted row is intact must NOT be
+    pruned by the self-heal — the reconciliation only drops entries the
+    persisted set no longer backs.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos, coid = _park_entry(broker, ctx)
+
+        # No record_unpark: the dispatch is still genuinely pending.
+        engine.refresh_anchors_from_store()
+
+        assert coid in engine.pending_verification, (
+            "a park with a live persisted row must survive the self-heal"
+        )
+        _envelopes, pending = ctx.replay()
+        assert coid in pending
+        ctx.close()
+
+
 def __test_plugin_resolution_same_key_rejected_dominates_attached__(
         tmp_path: Path,
 ) -> None:
