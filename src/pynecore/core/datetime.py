@@ -1,7 +1,8 @@
 import re
+import sys
 from zoneinfo import ZoneInfo
 from datetime import datetime, UTC
-from functools import lru_cache
+from functools import cache, lru_cache
 from ..lib import syminfo
 
 # Standard formats for non-ISO dates
@@ -46,6 +47,61 @@ def normalize_timezone(datestring: str) -> str:
     return datestring
 
 
+# Matches UTC/GMT±HHMM offset forms with optional colon: "UTC-5", "GMT+0530", "+05:30"
+_OFFSET_RE = re.compile(r'^(UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2})?)?$')
+
+
+class TimezoneNotFoundError(ValueError):
+    """
+    Raised when a timezone string cannot be resolved to a ``ZoneInfo``.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` handlers keep
+    working, but is a distinct type so callers (e.g. :func:`pynecore.lib.time`)
+    can surface it as an actionable error instead of silently degrading to ``na``.
+    """
+
+
+@cache
+def _timezone_db_available() -> bool:
+    """
+    Return whether an IANA timezone database is reachable on this system.
+
+    Probes a canonical zone name. On Windows without the ``tzdata`` package and
+    without a system zoneinfo database, even standard names fail to resolve.
+
+    :return: True if standard IANA names can be resolved
+    """
+    try:
+        ZoneInfo("America/New_York")
+        return True
+    except Exception:  # noqa - any failure means the database is unusable
+        return False
+
+
+def _missing_timezone_message(timezone: str) -> str:
+    """
+    Build an actionable error message for an unresolved timezone when the IANA
+    database is missing.
+
+    :param timezone: The timezone string that could not be resolved
+    :return: Multi-line, platform-aware error message
+    """
+    lines = [
+        f"Timezone {timezone!r} could not be resolved: the IANA timezone database "
+        "is not available on this system.",
+        "",
+        "Install it with:",
+        "    pip install tzdata",
+    ]
+    if sys.platform.startswith("win"):
+        lines += [
+            "",
+            "Windows has no built-in timezone database, so the 'tzdata' package is "
+            "required. PyneCore's [cli] and [all] installs include it automatically.",
+        ]
+    return "\n".join(lines)
+
+
 @lru_cache(maxsize=128)
 def parse_timezone(timezone: str | None) -> ZoneInfo:
     """
@@ -66,26 +122,28 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
     try:
         try:
             return ZoneInfo(timezone)  # type: ignore
-        except TypeError:  # It should not be possible
+        except TypeError:  # timezone is None and syminfo has none -> default to UTC
             return ZoneInfo('UTC')
     except KeyError:
-        # Check if this is a timezone data issue with common timezones
-        if timezone in ('UTC', 'GMT', 'EST', 'PST', 'CST', 'MST'):
-            raise ValueError(
-                f"Timezone '{timezone}' not found. This typically means the IANA timezone database is missing.\n\n"
-                "To fix this, install the tzdata package:\n"
-                "  pip install tzdata\n\n"
-                "Note: This is most common on Windows, as it doesn't include timezone data by default.\n"
-                "If you installed PyneCore with [cli] or [all] options, tzdata should already be included."
-            )
+        # ZoneInfoNotFoundError is a KeyError subclass: the name is not in the IANA
+        # database. UTC/GMT±HHMM offset forms are parsed below; any other name is an
+        # IANA name whose lookup genuinely failed.
         pass
 
-    # Parse UTC/GMT±HHMM format with optional colon
-    match = re.match(r'^(UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2})?)?$', timezone)  # type: ignore
-    if not match:
-        raise ValueError(
-            f"Invalid timezone format: {timezone}. "
-            "Use IANA name (e.g. 'America/New_York') or UTC/GMT±HHMM format (e.g. 'UTC-5', 'GMT+0530')"
+    # ZoneInfo raised KeyError, which only happens for a string key (None/NA raise
+    # TypeError, handled above), so timezone is a str from here on.
+    assert isinstance(timezone, str)
+
+    # Parse UTC/GMT±HHMM offset format with optional colon
+    match = _OFFSET_RE.match(timezone)
+    if match is None:
+        # Not an offset form -> the timezone name could not be resolved. The most
+        # common cause is a missing IANA database (Windows ships none by default).
+        if not _timezone_db_available():
+            raise TimezoneNotFoundError(_missing_timezone_message(timezone))
+        raise TimezoneNotFoundError(
+            f"Unknown timezone {timezone!r}. Use a valid IANA name "
+            "(e.g. 'America/New_York') or a UTC/GMT±HHMM offset (e.g. 'UTC-5', 'GMT+0530')."
         )
 
     prefix, sign, hours, minutes = match.groups()
