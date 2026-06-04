@@ -636,6 +636,37 @@ class OneWayEmulator:
         }
         return released - still_owned
 
+    async def drain_residual_opens(self, symbol: str, port: 'PositionPort') -> None:
+        """Reconcile any live reversal residual-open breadcrumb per sync (in-session).
+
+        The restart counterpart :meth:`_replay_residual_opens` reconciles these
+        breadcrumbs once at startup, but the engine latches that replay after the
+        first sync (``_one_way_replay_done``). Two paths leave a breadcrumb live
+        mid-session: :meth:`run_reversal`'s residual ``place_leg`` raising
+        :class:`OrderDispositionUnknownError` (the open's fate unknown, so the
+        breadcrumb is intentionally NOT discharged), and :meth:`_replay_residual_one`
+        hitting the same on its own re-dispatch. Without this drain such a breadcrumb
+        would wait for the NEXT process restart before being reconciled.
+
+        This closes that window. The engine calls it once per sync (alongside
+        :meth:`drain_clearing_rows`), reconciling every live breadcrumb for
+        ``symbol`` through the SAME :meth:`_replay_residual_one` path restart replay
+        uses: if the residual's persist-first entry row already landed the breadcrumb
+        is simply discharged (the entry / recovery path owns the open), otherwise the
+        residual is re-opened under its deterministic ``KIND_ENTRY`` coid — a
+        duplicate is impossible at the exchange dedup, so a per-sync re-dispatch
+        cannot double-open. A still-ambiguous re-dispatch leaves the row live for the
+        next sync to retry rather than halting the bot, mirroring
+        :meth:`drain_clearing_rows`. A successful in-session reversal discharges its
+        own breadcrumb synchronously, so this only ever sees genuinely unresolved
+        rows. Scoped to ``symbol`` (the engine owns one symbol); a breadcrumb for
+        another symbol is that engine's drain to reconcile.
+        """
+        if self._store_ctx is None:
+            return
+        for row in list(iter_active_residual_opens(self._store_ctx, symbol=symbol)):
+            await self._replay_residual_one(row, port)
+
     @staticmethod
     def _ownership_coid(intent_key: str, leg_id: str) -> str:
         """Stable per-(exit, leg) bracket-ownership row key.

@@ -6436,6 +6436,31 @@ class OrderSyncEngine:
                     self._order_mapping.pop(key, None)
                     self._drop_envelope(key)
 
+            # Reconcile any reversal residual-open breadcrumb a crash or an
+            # ambiguous round-trip left live. ``restart_replay`` discharges these
+            # once at startup, but it is one-shot (latched above), so a breadcrumb
+            # stranded mid-session — ``run_reversal``'s residual ``place_leg`` or the
+            # replay's own re-dispatch returning ``OrderDispositionUnknownError`` —
+            # would otherwise wait for the next restart. Drain it per-sync, exactly
+            # like the clearing-row drain: the re-open is idempotent on its
+            # deterministic entry coid, so a re-dispatch cannot double-open, and an
+            # ambiguous retry leaves the row live rather than halting the bot.
+            try:
+                self._run_async(
+                    self._one_way_emulator.drain_residual_opens(
+                        self._symbol, one_way_port,
+                    ),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except (OrderDispositionUnknownError,
+                    ExchangeConnectionError) as e:
+                _blog_warning(
+                    "draining one-way residual opens did not confirm (%s) — "
+                    "retrying next sync", e,
+                )
+
         for key in list(self._active_intents):
             if key not in new_map:
                 if key not in self._active_intents:

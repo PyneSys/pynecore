@@ -859,3 +859,88 @@ def __test_restart_replay_keeps_breadcrumb_on_ambiguous_residual_failure__(tmp_p
     assert port.placed == []
     assert len(list(iter_active_residual_opens(ctx))) == 1
     store.close()
+
+
+# === Reversal residual-open per-sync drain (2.10) =======================
+
+def __test_drain_residual_opens_reconciles_breadcrumb_restart_left_stranded__(tmp_path):
+    # End-to-end: an ambiguous residual re-open during restart_replay leaves the
+    # breadcrumb live (the 2.7 contract). restart_replay is one-shot — the engine
+    # latches _one_way_replay_done after the first sync — so without a per-sync
+    # drain that stranded breadcrumb would wait for the NEXT process restart.
+    # drain_residual_opens reconciles it in-session: once the round-trip is healthy
+    # the residual is re-opened and the breadcrumb discharged, no restart required.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    eng = OneWayEmulator(store_ctx=ctx)
+    # First sync: restart_replay's residual re-open times out ambiguously; the
+    # breadcrumb survives and restart_replay will not retry it again.
+    ambiguous = _FakePort(
+        [], fail_place_leg=OrderDispositionUnknownError(
+            "residual timed out", client_order_id="rev:residual",
+        ),
+    )
+    _run(eng.restart_replay(ambiguous))
+    assert ambiguous.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    # Later sync, healthy broker: the per-sync drain re-opens the residual and
+    # discharges the breadcrumb.
+    healthy = _FakePort([])
+    _run(eng.drain_residual_opens("EURUSD", healthy))
+    assert healthy.placed == [("EURUSD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_drain_residual_opens_keeps_breadcrumb_on_ambiguous_retry__(tmp_path):
+    # The per-sync drain's own re-open is ALSO ambiguous: the breadcrumb must stay
+    # live for the next sync to retry, and the error must NOT escape the drain —
+    # halting on a recoverable round-trip would strand the bot. Mirrors
+    # drain_clearing_rows' leave-live-and-retry contract.
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    port = _FakePort(
+        [], fail_place_leg=OrderDispositionUnknownError(
+            "residual still timing out", client_order_id="rev:residual",
+        ),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.drain_residual_opens("EURUSD", port))  # no exception escapes
+    assert port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    store.close()
+
+
+def __test_drain_residual_opens_discharges_when_entry_row_exists__(tmp_path):
+    # The residual's persist-first entry row already landed (the live dispatch's
+    # place_leg wrote it before the ambiguous send). The drain must DISCHARGE the
+    # breadcrumb WITHOUT re-opening — the entry / recovery path owns the order, so a
+    # re-open would double-open.
+    store, ctx = _make_store(tmp_path)
+    ctx.upsert_order("entry-present", symbol="EURUSD", side="buy", qty=2.0,
+                     state="confirmed", pine_entry_id="Long")
+    _seed_residual(ctx, entry_coid="entry-present", qty=2.0)
+    port = _FakePort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.drain_residual_opens("EURUSD", port))
+    assert port.placed == []  # entry path owns the open; no re-dispatch
+    assert list(iter_active_residual_opens(ctx)) == []  # breadcrumb discharged
+    store.close()
+
+
+def __test_drain_residual_opens_is_symbol_scoped__(tmp_path):
+    # The per-sync drain is per-symbol (the engine owns one symbol). A live
+    # breadcrumb for a DIFFERENT symbol must be left untouched — that symbol's own
+    # engine drains it. (restart_replay is global; the per-sync drain is scoped.)
+    store, ctx = _make_store(tmp_path)
+    create_residual_open_row(
+        ctx, coid="rev:residual", symbol="GBPUSD", side="buy", qty=2.0,
+        intent_key="Long", pine_entry_id="Long", entry_coid="entry-missing",
+        run_tag="t000", bar_ts_ms=1000, retry_seq=0,
+    )
+    port = _FakePort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.drain_residual_opens("EURUSD", port))  # different symbol
+    assert port.placed == []  # the GBPUSD breadcrumb is not this symbol's concern
+    assert len(list(iter_active_residual_opens(ctx))) == 1  # still live
+    store.close()
