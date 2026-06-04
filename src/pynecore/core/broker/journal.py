@@ -332,6 +332,11 @@ ReconcileReason = Literal[
     'missing_pending_grace_expired',
     'unexpected_cancel_cascade',
     'bracket_natural_close_followup',
+    # kind='terminal_close' — startup in-flight recovery (persist-first crash
+    # recovery): a pending dispatch row read terminal from the order history,
+    # or a still-unknown row retired after the evidence-gated TTL.
+    'recovered_in_flight_terminal',
+    'recovered_abandoned_unknown',
 ]
 
 # Terminal states the reconcile path may land a row in. ``'confirmed'`` is
