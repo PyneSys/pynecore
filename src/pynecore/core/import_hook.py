@@ -8,13 +8,91 @@ from pathlib import Path
 
 
 def _cache_from_source(source_path: Path) -> Path:
-    """Return the __pycache__/*.pyc path for a given .py source path."""
-    tag = sys.implementation.cache_tag
-    return source_path.parent / "__pycache__" / f"{source_path.stem}.{tag}.pyc"
+    """Return the cached ``.pyc`` path CPython uses for a given ``.py`` source.
+
+    Delegates to :func:`importlib.util.cache_from_source` instead of hand-building
+    ``<dir>/__pycache__/<stem>.<tag>.pyc`` so the result matches CPython exactly:
+    it honours ``sys.pycache_prefix`` / ``PYTHONPYCACHEPREFIX`` (which mirrors the
+    cache under a separate tree rather than a sibling ``__pycache__``) and the
+    active optimization level (``.opt-1`` / ``.opt-2`` under ``-O`` / ``-OO``).
+    Stale-bytecode invalidation must target the exact file CPython reads back, so
+    a mismatch here would silently leave the cache untouched and the bug unfixed.
+
+    :param source_path: Path to the ``.py`` source file.
+    :return: Path to the corresponding cached bytecode file.
+    """
+    return Path(importlib.util.cache_from_source(str(source_path)))
+
+
+_transform_pipeline_mtime: float | None = None
+
+
+def _get_transform_pipeline_mtime() -> float:
+    """Return the newest mtime among the files that define the AST transform output.
+
+    The bytecode cached for an ``@pyne`` module is only valid for the transform
+    pipeline that produced it, but CPython validates a ``.pyc`` solely against its
+    source ``.py`` mtime/size. A PyneCore upgrade therefore leaves a user script's
+    cached bytecode stale (old transform shape) while the source stays untouched.
+    Comparing the cached ``.pyc`` against this timestamp catches that: ``pip``
+    rewrites package files with a fresh mtime on upgrade, and edits bump it in an
+    editable checkout. ``module_properties.json`` is included because it shapes the
+    transform output yet has no bytecode of its own.
+
+    :return: Newest mtime of the import hook and every file under ``transformers/``.
+    """
+    global _transform_pipeline_mtime
+    if _transform_pipeline_mtime is None:
+        files = [Path(__file__)]  # this module pins the transformer pipeline order
+        transformers_dir = Path(__file__).parent.parent / "transformers"
+        try:
+            files.extend(p for p in transformers_dir.iterdir() if p.is_file())
+        except OSError:
+            pass
+        mtimes: list[float] = []
+        for f in files:
+            try:
+                mtimes.append(f.stat().st_mtime)
+            except OSError:
+                pass
+        _transform_pipeline_mtime = max(mtimes) if mtimes else 0.0
+    return _transform_pipeline_mtime
 
 
 class PyneLoader(importlib.machinery.SourceFileLoader):
     """Loader that handles AST transformation"""
+
+    def get_code(self, fullname: str):
+        """Drop transformed bytecode left over from an older transform pipeline.
+
+        CPython validates a cached ``.pyc`` only against the source ``.py`` mtime
+        and size, so a PyneCore upgrade that changes the transform output (e.g. a
+        builtin moving from a module property to a plain variable) keeps executing
+        the obsolete bytecode while the unchanged source masks the staleness. For
+        ``@pyne`` modules we additionally invalidate any ``.pyc`` older than the
+        transform pipeline itself, forcing ``source_to_code`` to run again.
+
+        :param fullname: Fully-qualified module name being loaded.
+        :return: The compiled code object (re-transformed if the cache was stale).
+        """
+        source_path = self.get_filename(fullname)
+        try:
+            with open(source_path, 'rb') as f:
+                head = f.read(256)
+        except OSError:
+            head = b''
+
+        # Only transformed modules carry a pipeline-dependent cache; restrict the
+        # invalidation to them so unrelated packages keep their bytecode untouched.
+        if re.search(rb'@pyne(\s|$)', head):
+            pyc_path = _cache_from_source(Path(source_path))
+            try:
+                if pyc_path.stat().st_mtime < _get_transform_pipeline_mtime():
+                    pyc_path.unlink()
+            except OSError:
+                pass  # no cached bytecode, or a read-only cache dir: nothing to drop
+
+        return super().get_code(fullname)
 
     # noinspection PyMethodOverriding
     def source_to_code(self, data: bytes | str, path: str, *, _optimize: int = -1):
