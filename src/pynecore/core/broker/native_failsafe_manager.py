@@ -623,6 +623,7 @@ class NativeFailsafeManager:
         # one is needed.
         self._pending.pop(parent_entry_dispatch_ref, None)
 
+    # noinspection PyUnusedLocal
     def record_put_success(
             self,
             parent_entry_dispatch_ref: str,
@@ -975,6 +976,7 @@ class NativeFailsafeManager:
                 actual_level=stop_level,
             ))
 
+    # noinspection PyUnusedLocal
     def on_deal_id_disappeared(
             self, parent_entry_dispatch_ref: str, *, now_ms: float,
     ) -> None:
@@ -1173,6 +1175,7 @@ class NativeFailsafeManager:
         worst = min(levels) if state.parent_side == 'long' else max(levels)
         return self._round_to_tick(worst, state)
 
+    # noinspection PyMethodMayBeStatic
     def _build_snapshot(self, state: NativeStopState) -> NativeBracketSnapshot:
         return NativeBracketSnapshot(
             parent_entry_dispatch_ref=state.parent_entry_dispatch_ref,
@@ -1186,6 +1189,7 @@ class NativeFailsafeManager:
 
     # --- Outstanding-levels bookkeeping (§2.6.7 confirmation tracking) --
 
+    # noinspection PyMethodMayBeStatic
     def _note_batch_start(
             self, state: NativeStopState, *, sl: float | None, now_ms: float,
     ) -> None:
@@ -1225,6 +1229,7 @@ class NativeFailsafeManager:
         ))
         self._compact_outstanding(state)
 
+    # noinspection PyMethodMayBeStatic
     def _clear_outstanding(self, state: NativeStopState) -> None:
         """Drop all outstanding entries and reset the confirmation-timeout
         anchor — used on a latest-desired confirm, an external edit, and a
@@ -1255,6 +1260,7 @@ class NativeFailsafeManager:
                 return i
         return None
 
+    # noinspection PyMethodMayBeStatic
     def _compact_outstanding(self, state: NativeStopState) -> None:
         """Cap the outstanding list length (memory backstop only).
 
@@ -1360,6 +1366,7 @@ class NativeFailsafeManager:
             reason='confirmation-timeout',
         ))
 
+    # noinspection PyMethodMayBeStatic
     def _round_to_tick(
             self, level: float | None, state: NativeStopState,
     ) -> float | None:

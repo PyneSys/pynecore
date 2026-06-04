@@ -529,7 +529,7 @@ class ExitIntent:
     is_partial_qty_bracket: bool = field(default=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.reduce_only is not True:
+        if not self.reduce_only:
             raise ValueError(
                 "ExitIntent.reduce_only must be True — one-way Pine semantics. "
                 "Hedge-mode intents belong on a future HedgeBrokerPlugin subclass."
@@ -589,7 +589,7 @@ class CloseIntent:
     reduce_only: bool = True
 
     def __post_init__(self) -> None:
-        if self.reduce_only is not True:
+        if not self.reduce_only:
             raise ValueError(
                 "CloseIntent.reduce_only must be True — one-way Pine semantics."
             )
@@ -1041,7 +1041,7 @@ class PendingDefensiveClose:
                 f"PendingDefensiveClose.pre_close_position_size must be "
                 f"numeric or None: {data!r}"
             )
-        fifo_closed_entry_ids_raw = data.get('fifo_closed_entry_ids', ())
+        fifo_closed_entry_ids_raw = data.get('fifo_closed_entry_ids', [])
         if not isinstance(fifo_closed_entry_ids_raw, (list, tuple)):
             raise ValueError(
                 f"PendingDefensiveClose.fifo_closed_entry_ids must be "

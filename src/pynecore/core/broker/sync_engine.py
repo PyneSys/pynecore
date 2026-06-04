@@ -29,8 +29,8 @@ import itertools
 import logging
 import queue
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
@@ -85,8 +85,6 @@ from pynecore.core.broker.models import (
     PendingDefensiveClose,
 )
 from pynecore.core.broker.native_failsafe_manager import (
-    FailsafeHealth,
-    FailsafeOwner,
     NativeBracketSnapshot,
     NativeFailsafeManager,
 )
@@ -107,15 +105,6 @@ from pynecore.core.broker.storage import (
 )
 from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS,
-    EXTRAS_KEY_INTENT_PARTIAL_QTY,
-    EXTRAS_KEY_LEG_KIND,
-    EXTRAS_KEY_LEG_STATE,
-    EXTRAS_KEY_OCA_GROUP,
-    EXTRAS_KEY_OCA_TYPE,
-    EXTRAS_KEY_PARENT_ENTRY_DISPATCH_REF,
-    EXTRAS_KEY_PARENT_PINE_ENTRY_ID,
-    EXTRAS_KEY_TRIGGER_LEVEL,
-    EXTRAS_KEY_TRIGGER_OFFSET,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
     LEG_KIND_TRAIL_PARTIAL,
@@ -134,11 +123,13 @@ from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
-    from pynecore.core.plugin.broker import BrokerPlugin
+    from pynecore.core.plugin.broker import BrokerPlugin, PositionPort
 
 __all__ = ['OrderSyncEngine']
 
 _log = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 Intent = EntryIntent | ExitIntent | CloseIntent
 
@@ -1078,7 +1069,7 @@ class OrderSyncEngine:
         # plugin having opted into emulation; a connection error retries on the
         # next sync, exactly like the entry-anchor scan above. ``restart_replay``
         # self-no-ops when ``store_ctx`` is None.
-        one_way_port = getattr(self._broker, 'position_port', None)
+        one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
                 self._run_async(
@@ -2212,6 +2203,7 @@ class OrderSyncEngine:
                 )
                 return
 
+        # noinspection PyShadowingNames
         def _signed_close_delta(
                 marker: PendingDefensiveClose, magnitude: float,
         ) -> float | None:
@@ -2747,7 +2739,7 @@ class OrderSyncEngine:
                 # :attr:`_position` carrying the un-applied partial qty
                 # while the broker is flat.
                 matched_id = self._match_pending_defensive_close(event)
-                if self._position.size != 0.0:
+                if self._position.size != 0.0 and event.order is not None:
                     signed_delta = (fill_qty if event.order.side == "buy"
                                     else -fill_qty)
                     self._position.size += signed_delta
@@ -3393,7 +3385,7 @@ class OrderSyncEngine:
         filled_intent = self._active_intents.get(filled_key)
         if filled_intent is None:
             return
-        oca_name = getattr(filled_intent, 'oca_name', None)
+        oca_name: str | None = getattr(filled_intent, 'oca_name', None)
         oca_type = getattr(filled_intent, 'oca_type', None)
         if not oca_name or oca_type != OcaType.CANCEL.value:
             return
@@ -3426,11 +3418,11 @@ class OrderSyncEngine:
         intent from the stale entry and re-dispatches onto the now-cancelled
         exchange state.
         """
-        entry_orders = getattr(self._position, 'entry_orders', None)
-        exit_orders = getattr(self._position, 'exit_orders', None)
-        if isinstance(intent, EntryIntent) and entry_orders is not None:
+        entry_orders = self._position.entry_orders
+        exit_orders = self._position.exit_orders
+        if isinstance(intent, EntryIntent):
             entry_orders.pop(intent.pine_id, None)
-        elif isinstance(intent, ExitIntent) and exit_orders is not None:
+        elif isinstance(intent, ExitIntent):
             exit_orders.pop((intent.pine_id, intent.from_entry), None)
 
     def _drain_unapplied_defensive_close_partials(
@@ -4184,16 +4176,15 @@ class OrderSyncEngine:
                 self._order_mapping.pop(key, None)
                 self._drop_envelope(key)
         # Pine-side order dicts.
-        entry_orders = getattr(self._position, 'entry_orders', None)
-        exit_orders = getattr(self._position, 'exit_orders', None)
-        if entry_orders is not None:
-            entry_orders.pop(closed_entry_id, None)
-        if exit_orders is not None:
-            for ex_key in list(exit_orders.keys()):
-                if isinstance(ex_key, tuple) and ex_key[1] == closed_entry_id:
-                    exit_orders.pop(ex_key, None)
+        entry_orders = self._position.entry_orders
+        exit_orders = self._position.exit_orders
+        entry_orders.pop(closed_entry_id, None)
+        for ex_key in list(exit_orders.keys()):
+            if ex_key[1] == closed_entry_id:
+                exit_orders.pop(ex_key, None)
 
-    def _filled_intent_key(self, event: OrderEvent) -> str | None:
+    @staticmethod
+    def _filled_intent_key(event: OrderEvent) -> str | None:
         """Resolve a fill event to the ``intent_key`` of the owning intent.
 
         Exits track identity as ``(pine_id, from_entry)``; entries / closes
@@ -4372,7 +4363,7 @@ class OrderSyncEngine:
             from_entry=pine_id,
             fill_price=float(fill_price),
             parent_side=parent_side,
-            parent_qty=parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size,
+            parent_qty=float(parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size),
             resolver=resolver,
         )
 
@@ -4385,9 +4376,7 @@ class OrderSyncEngine:
         against the amended active intent, and emits a *second* ``modify_exit``
         back to the original qty — undoing the partial-fill cascade we just did.
         """
-        exit_orders = getattr(self._position, 'exit_orders', None)
-        if exit_orders is None:
-            return
+        exit_orders = self._position.exit_orders
         order = exit_orders.get((bracket.pine_id, bracket.from_entry))
         if order is None:
             return
@@ -4418,6 +4407,7 @@ class OrderSyncEngine:
         if self._broker_event_sink is None:
             _log.info("broker event (no sink): %r", event)
             return
+        # noinspection PyBroadException
         try:
             self._broker_event_sink(event)
         except Exception:  # pragma: no cover — defensive
@@ -5000,7 +4990,7 @@ class OrderSyncEngine:
                         from_entry=intent_key,
                         fill_price=float(parent_trade.entry_price),
                         parent_side=parent_side_for_promotion,
-                        parent_qty=(
+                        parent_qty=float(
                             parent_trade.size if parent_trade.size >= 0.0
                             else -parent_trade.size
                         ),
@@ -5820,6 +5810,7 @@ class OrderSyncEngine:
             # later sync sees a consistent snapshot.
             locally_open_entry_ids: set[str] = {
                 trade.entry_id for trade in self._position.open_trades
+                if trade.entry_id is not None
             }
             from_entries_to_cascade: set[str] = set()
             for leg in self._partial_bracket_engine.iter_legs():
@@ -6056,9 +6047,7 @@ class OrderSyncEngine:
             self._active_intents.pop(leg.intent_key, None)
             self._order_mapping.pop(leg.intent_key, None)
             self._drop_envelope(leg.intent_key)
-            exit_orders = getattr(self._position, 'exit_orders', None)
-            if exit_orders is not None:
-                exit_orders.pop((leg.pine_id, leg.from_entry), None)
+            self._position.exit_orders.pop((leg.pine_id, leg.from_entry), None)
 
     def _record_halt(self, error: BrokerManualInterventionError) -> None:
         """Record a manual-intervention halt and emit the observability event.
@@ -6088,6 +6077,11 @@ class OrderSyncEngine:
 
     # === Tick resolution ===
 
+    @overload
+    def _resolve_ticks(self, intent: ExitIntent) -> ExitIntent: ...
+    @overload
+    def _resolve_ticks(self, intent: Intent) -> Intent: ...
+
     def _resolve_ticks(self, intent: Intent) -> Intent:
         if not isinstance(intent, ExitIntent) or not intent.has_unresolved_ticks:
             return intent
@@ -6101,7 +6095,7 @@ class OrderSyncEngine:
     ) -> tuple[float | None, float]:
         for trade in self._position.open_trades:
             if trade.entry_id == from_entry:
-                return trade.entry_price, trade.sign
+                return float(trade.entry_price), trade.sign
         return None, 0.0
 
     def _ticks_to_prices(
@@ -6309,7 +6303,7 @@ class OrderSyncEngine:
         # was not just refused by the §12 #4 coexistence preflight, which pops
         # the key from ``new_map`` even though Pine emitted it) BEFORE the diff
         # loops run.
-        one_way_port = getattr(self._broker, 'position_port', None)
+        one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if one_way_port is not None and self._store_ctx is not None:
             orphan_cancels: dict[str, CancelIntent] = {}
             for row in iter_active_bracket_ownerships(
@@ -7487,7 +7481,7 @@ class OrderSyncEngine:
         # through the core OneWayEmulator instead of the plugin's execute_*.
         # Read defensively: partial test doubles (and brokers predating the
         # attribute) are treated as non-emulating.
-        port = getattr(self._broker, 'position_port', None)
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
         try:
             if isinstance(intent, EntryIntent):
                 # §2.6.7 gate: drop the entry signal when any parent on
@@ -8854,7 +8848,7 @@ class OrderSyncEngine:
             if position_coid:
                 self._neutralised_parent_entry_coids.add(position_coid)
         for row in self._store_ctx.iter_live_orders():
-            payload = row.extras.get('defensive_close_pending')
+            payload: dict[str, Any] | None = row.extras.get('defensive_close_pending')
             if payload is None:
                 continue
             try:
@@ -9007,6 +9001,8 @@ class OrderSyncEngine:
                 settled_position_coid = (
                     marker.reject_context.position_coid
                 )
+                if settled_position_coid is None:
+                    continue
                 settled_row = self._store_ctx.get_order(
                     settled_position_coid,
                 )
@@ -9498,6 +9494,7 @@ class OrderSyncEngine:
                     key=abs,
                 )
 
+        # noinspection PyShadowingNames
         def _marker_delta(marker: PendingDefensiveClose) -> float | None:
             """Signed delta a filled close for ``marker`` would apply to
             :attr:`_position.size`. ``None`` for an unrecognised side.
@@ -10051,9 +10048,9 @@ class OrderSyncEngine:
                 # commission / openprofit-derived equity until restart.
                 # Same canonical pattern as
                 # :meth:`Position.record_fill_close`.
-                self._position.open_commission = sum(
+                self._position.open_commission = float(sum(
                     t.commission for t in self._position.open_trades
-                )
+                ))
         # FIFO-aware cleanup targets. Mirror
         # :meth:`_route_defensive_close_fill`'s logic: clean intents for
         # every entry id whose trade was fully consumed AND no longer has
@@ -10269,7 +10266,7 @@ class OrderSyncEngine:
             # :meth:`_dispatch_new` may reject the replacement, leaving
             # the parent without any software bracket.
             parent_dispatch_ref: str | None = None
-            if new.from_entry is not None:
+            if isinstance(new, ExitIntent):
                 parent_dispatch_ref = self._resolve_parent_opening_ref(
                     new.from_entry,
                 )
@@ -10356,7 +10353,7 @@ class OrderSyncEngine:
             # Retire the failsafe state for this parent so the queued
             # clear is dropped before the dispatch runs; the new path
             # is then free to re-register if it arms partial legs.
-            if (new.from_entry is not None
+            if (isinstance(new, ExitIntent)
                     and parent_dispatch_ref is not None
                     and not self._partial_bracket_engine
                         .has_active_partial_bracket(
@@ -10475,8 +10472,7 @@ class OrderSyncEngine:
                 # never carry a software watch — keying on ``new.stop`` alone
                 # would arm/keep a watch whose KIND_ENTRY leg is a STOP, not the
                 # LIMIT the watch assumes, double-arming against the native STOP.
-                new_is_both_set = new.limit is not None and new.stop is not None
-                if new_is_both_set:
+                if new.limit is not None and new.stop is not None:
                     if self._entry_stop_engine.has_watch(new.intent_key):
                         self._entry_stop_engine.amend_watch(
                             new.intent_key,
@@ -10497,7 +10493,7 @@ class OrderSyncEngine:
                         new.intent_key, reason='entry_stop_removed_by_modify',
                     )
             elif isinstance(new, ExitIntent) and isinstance(old, ExitIntent):
-                port = getattr(self._broker, 'position_port', None)
+                port: PositionPort | None = getattr(self._broker, 'position_port', None)
                 if port is not None:
                     # Hedging-mode emulation: a bracket modify is an idempotent
                     # re-attach of the NEW levels across the position-side legs —
@@ -10683,7 +10679,7 @@ class OrderSyncEngine:
             return
         cancel_envelope = self._build_cancel_envelope(cancel)
         _blog_info("cancelling %s", cancel)
-        port = getattr(self._broker, 'position_port', None)
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
         try:
             if port is not None and isinstance(old, ExitIntent):
                 # Hedging-mode emulation: a whole-row exit's bracket lives
@@ -10752,7 +10748,7 @@ class OrderSyncEngine:
 
     # === Async bridge ===
 
-    def _run_async(self, coro):
+    def _run_async(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Run a broker coroutine synchronously from the engine's thread.
 
         In production the engine shares an event loop with the live

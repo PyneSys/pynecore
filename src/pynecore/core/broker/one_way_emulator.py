@@ -48,6 +48,7 @@ from pynecore.core.broker.models import (
     EntryIntent,
     ExitIntent,
     OrderType,
+    PositionLeg,
 )
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
@@ -445,7 +446,7 @@ class OneWayEmulator:
         for row in rows:
             if (row.intent_key or '') != intent.intent_key:
                 continue
-            leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            leg_id: str | None = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is None or leg_id in survivors:
                 continue
             update_bracket_ownership_state(
@@ -517,7 +518,7 @@ class OneWayEmulator:
         released: set[str] = set()
         for row in rows:
             extras = row.extras or {}
-            leg_id = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            leg_id: str | None = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is not None and leg_id in live_ids:
                 try:
                     await port.amend_bracket(
@@ -597,7 +598,7 @@ class OneWayEmulator:
         for row in rows:
             if not self._owns(row, intent):
                 continue
-            leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            leg_id: str | None = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is None:
                 continue
             # PERSIST-FIRST: mark the row ``clearing`` BEFORE the amend, so an
@@ -665,6 +666,8 @@ class OneWayEmulator:
         the grid) so an already-partly-closed leg is never over-reduced. The
         natural-close fill dedup guards the fill side.
         """
+        if self._store_ctx is None:
+            return
         pending = list(iter_active_close_legs(self._store_ctx))
         if not pending:
             return
@@ -679,13 +682,15 @@ class OneWayEmulator:
                 await self._replay_one(row, symbol, live_by_id, quantize, port)
 
     async def _replay_one(
-            self, row, symbol: str, live_by_id: dict, quantize, port: 'PositionPort',
+            self, row, symbol: str, live_by_id: dict[str, PositionLeg], quantize, port: 'PositionPort',
     ) -> None:
         """Reconcile + (if needed) re-dispatch one pending close-leg row."""
+        if self._store_ctx is None:
+            return
         extras = row.extras or {}
-        leg_id = extras.get(EXTRAS_KEY_CLOSE_LEG_ID)
+        leg_id: str | None = extras.get(EXTRAS_KEY_CLOSE_LEG_ID)
         live_leg = live_by_id.get(leg_id) if leg_id is not None else None
-        if live_leg is None:
+        if live_leg is None or leg_id is None:
             # Leg vanished — the close landed before the crash. Finalise only.
             update_close_leg_state(
                 self._store_ctx, coid=row.client_order_id,
@@ -711,6 +716,8 @@ class OneWayEmulator:
         bracket it carried is moot — release the orphan row so it leaves the live
         index.
         """
+        if self._store_ctx is None:
+            return
         rows = list(iter_active_bracket_ownerships(self._store_ctx))
         if not rows:
             return
@@ -727,8 +734,10 @@ class OneWayEmulator:
             self, row, symbol: str, live_ids: set, port: 'PositionPort',
     ) -> None:
         """Re-assert / finish one bracket-ownership row, or release a vanished leg."""
+        if self._store_ctx is None:
+            return
         extras = row.extras or {}
-        leg_id = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+        leg_id: str | None = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
         if leg_id is None or leg_id not in live_ids:
             update_bracket_ownership_state(
                 self._store_ctx, coid=row.client_order_id,

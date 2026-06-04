@@ -25,11 +25,11 @@ from pynecore.core.broker.models import (
     OcaType,
     OrderType,
 )
+# noinspection PyProtectedMember
 from pynecore.lib.strategy import (
     Order,
     Trade,
     _order_type_normal,
-    _order_type_close,
 )
 from pynecore.types.na import NA
 
@@ -114,7 +114,7 @@ def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
     return EntryIntent(
         pine_id=order.order_id or "",
         symbol=symbol,
-        side=_side_from_size(order.size),
+        side=_side_from_size(float(order.size)),
         qty=abs(order.size),
         order_type=_infer_order_type(order.limit, order.stop),
         limit=order.limit,
@@ -141,6 +141,8 @@ def build_exit_intent(
     **alongside** empty ``tp_price``/``sl_price`` fields; the sync engine
     resolves them on the corresponding entry fill event.
 
+    :param order: The Pine ``strategy.exit`` :class:`Order` to translate.
+    :param symbol: Exchange symbol the resulting :class:`ExitIntent` targets.
     :param parent_total_qty: total open qty currently associated with the
         ``from_entry`` Pine id — used to set
         :attr:`ExitIntent.is_partial_qty_bracket` when the script asks for a
@@ -181,7 +183,7 @@ def build_exit_intent(
         pine_id=order.exit_id or "",
         from_entry=order.order_id or "",
         symbol=symbol,
-        side=_side_from_size(order.size),
+        side=_side_from_size(float(order.size)),
         qty=exit_qty,
         tp_price=tp_price,
         sl_price=sl_price,
@@ -212,7 +214,7 @@ def build_close_intent(order: Order, symbol: str, *, is_close_all: bool) -> Clos
     return CloseIntent(
         pine_id=pine_id,
         symbol=symbol,
-        side=_side_from_size(order.size),
+        side=_side_from_size(float(order.size)),
         qty=abs(order.size),
         immediately=False,
         comment=_na_to_none(order.comment),
@@ -298,11 +300,11 @@ def build_intents(
             #    bracket cancel/re-arm.
             #  * no declared entry left (cancelled / cleared) — fall back to the
             #    actual open qty.
-            declared_entry = entry_orders.get(from_entry)
+            declared_entry: Order | None = entry_orders.get(from_entry)
             if count_by_entry.get(from_entry, 0) > 1:
                 parent_total_qty = qty_by_entry[from_entry]
             elif declared_entry is not None:
-                parent_total_qty = abs(declared_entry.size)
+                parent_total_qty = abs(float(declared_entry.size))
             else:
                 parent_total_qty = qty_by_entry.get(from_entry, 0.0)
             intents.append(build_exit_intent(

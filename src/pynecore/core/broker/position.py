@@ -16,8 +16,9 @@ from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
-    from pynecore.lib import direction
-    from pynecore.lib.strategy import Order, QtyType
+    from pynecore.lib.strategy import direction
+    from pynecore.lib.strategy import Order
+    from pynecore.types.strategy import QtyType
     from pynecore.core.broker.models import OrderEvent
 
 __all__ = ['BrokerPosition']
@@ -176,13 +177,14 @@ class BrokerPosition(PositionBase):
         :meth:`_enforce_post_bar_risk`.
         """
         order.bar_index = int(lib.bar_index)
+        # noinspection PyProtectedMember
         from pynecore.lib.strategy import (
             _order_type_close, _order_type_entry, _order_type_normal,
         )
         if order.order_type in (_order_type_entry, _order_type_normal):
             if self._is_intraday_filled_cap_reached():
                 return
-            adjusted = self._adjust_for_max_position_size(order.size, order.sign)
+            adjusted = self._adjust_for_max_position_size(float(order.size), order.sign)
             if adjusted is None:
                 return
             order.size = adjusted
@@ -196,6 +198,7 @@ class BrokerPosition(PositionBase):
     def _remove_order(self, order: 'Order') -> None:
         """Cancel an order locally."""
         order.cancelled = True
+        # noinspection PyProtectedMember
         from pynecore.lib.strategy import _order_type_close
         if order.order_type == _order_type_close:
             self.exit_orders.pop((order.exit_id, order.order_id), None)
@@ -358,7 +361,7 @@ class BrokerPosition(PositionBase):
         else:
             self.eventrades += 1
 
-        self.open_commission = sum(t.commission for t in self.open_trades)
+        self.open_commission = float(sum(t.commission for t in self.open_trades))
 
         return self.sign != old_sign
 
@@ -394,6 +397,7 @@ class BrokerPosition(PositionBase):
         Falls back to initial capital before the first
         :meth:`update_unrealized_pnl` (or fill) primes ``max_equity``.
         """
+        # noinspection PyProtectedMember
         initial = float(lib._script.initial_capital)
         if self.max_equity == -float("inf"):
             return initial
@@ -465,6 +469,7 @@ class BrokerPosition(PositionBase):
         observes the cleared books plus the queued close and dispatches
         accordingly.
         """
+        # noinspection PyProtectedMember
         from pynecore.lib.strategy import Order, _order_type_close
         self.entry_orders.clear()
         self.exit_orders.clear()

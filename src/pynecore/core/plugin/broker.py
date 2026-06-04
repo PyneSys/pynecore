@@ -17,10 +17,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
-from pynecore.core.plugin import ConfigT
-from pynecore.core.plugin.live_provider import LiveProviderPlugin
+from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.broker.exceptions import (
     BrokerError,
     ExchangeCapabilityError,
@@ -146,7 +145,10 @@ class PositionPort(Protocol):
         ...
 
 
-class BrokerPlugin(LiveProviderPlugin[ConfigT], ABC):
+BrokerConfigT = TypeVar('BrokerConfigT', bound=LiveProviderConfig)
+
+
+class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     """
     High-level order execution layer.
 

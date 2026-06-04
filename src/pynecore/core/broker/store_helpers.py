@@ -127,6 +127,21 @@ __all__ = [
     'create_bracket_ownership_row',
     'update_bracket_ownership_state',
     'iter_active_bracket_ownerships',
+    'ENTRY_STOP_STATE_ARMED',
+    'ENTRY_STOP_STATE_CANCEL_PENDING',
+    'ENTRY_STOP_STATE_MARKET_PENDING',
+    'create_entry_stop_watch_row',
+    'ENTRY_STOP_STATE_ABORTABLE',
+    'ENTRY_STOP_STATE_ABORTED',
+    'ENTRY_STOP_STATE_LIMIT_WON',
+    'ENTRY_STOP_STATE_LIVE',
+    'ENTRY_STOP_STATE_STOP_WON',
+    'EXTRAS_KEY_ENTRY_STOP_LEVEL',
+    'EXTRAS_KEY_ENTRY_STOP_LIMIT_COID',
+    'EXTRAS_KEY_ENTRY_STOP_MARKET_COID',
+    'EXTRAS_KEY_ENTRY_STOP_STATE',
+    'iter_active_entry_stop_watches',
+    'update_entry_stop_watch_state',
 ]
 
 
@@ -1355,6 +1370,12 @@ def create_engine_trigger_partial_leg_row(
         fire the leg. ``None`` while the leg is ``pending_entry``.
     :param trigger_offset: Trail offset (price units, not ticks) for
         :data:`LEG_KIND_TRAIL_PARTIAL`. ``None`` for tp / sl legs.
+    :param trail_activation_level: Absolute activation price for a
+        :data:`LEG_KIND_TRAIL_PARTIAL` leg. ``None`` for tp / sl legs
+        or while the leg is ``pending_entry``.
+    :param trail_activation_offset: Activation offset (price units) for
+        a trail leg, resolved to an absolute level once the parent fill
+        price is known. ``None`` for tp / sl legs.
     :param oca_group: OCA group name the cascade-cancel keys on.
     :param oca_type: OCA group type (``'cancel'`` for partial
         brackets — TP filling cancels the SL and vice versa).

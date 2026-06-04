@@ -75,7 +75,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.models import ExchangePosition, ExitIntent
+    from pynecore.core.broker.models import ExchangePosition
     from pynecore.core.broker.storage import OrderRow, RunContext
 
 
@@ -83,6 +83,7 @@ __all__ = [
     'PartialBracketLeg',
     'PartialBracketSafetyVerdict',
     'SoftwarePartialBracketEngine',
+    'TickOffsetResolver',
 ]
 
 
@@ -141,7 +142,7 @@ class PartialBracketLeg:
 
     @property
     def key(self) -> LegKey:
-        return (self.pine_id, self.from_entry, self.leg_kind)
+        return self.pine_id, self.from_entry, self.leg_kind
 
 
 @dataclass(frozen=True)
@@ -452,6 +453,8 @@ class SoftwarePartialBracketEngine:
         sync engine's responsibility (Slice B wiring); this method
         owns only the state-machine bookkeeping.
 
+        :param symbol: Exchange symbol whose armed legs are checked this
+            tick; legs belonging to other symbols are skipped.
         :param last_price: Last traded price. Used for trail recompute
             and as the default trigger comparison source.
         :param bid: Best bid; long-side TP and short-side SL compare
@@ -553,6 +556,7 @@ class SoftwarePartialBracketEngine:
                 reserved_oca_groups.add(leg.oca_group)
         return triggering
 
+    # noinspection PyMethodMayBeStatic
     def _is_triggered(
             self,
             leg: PartialBracketLeg,
@@ -689,6 +693,7 @@ class SoftwarePartialBracketEngine:
             # the §2.6 failsafe manager needs the new contribution.
             self._state_change_listener(leg, leg.leg_state, leg.leg_state)
 
+    # noinspection PyMethodMayBeStatic
     def _safety_check(
             self,
             leg: PartialBracketLeg,
@@ -1300,6 +1305,7 @@ class TickOffsetResolver:
     def __init__(self, mintick: float) -> None:
         self._mintick = mintick
 
+    # noinspection PyMethodMayBeStatic
     def resolve(
             self,
             leg: PartialBracketLeg,
@@ -1320,8 +1326,8 @@ class TickOffsetResolver:
 
 def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:
     extras = row.extras or {}
-    leg_kind = extras.get(EXTRAS_KEY_LEG_KIND)
-    leg_state = extras.get(EXTRAS_KEY_LEG_STATE)
+    leg_kind = extras.get(EXTRAS_KEY_LEG_KIND, '')
+    leg_state = extras.get(EXTRAS_KEY_LEG_STATE, '')
     if leg_kind not in (
             LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL, LEG_KIND_TRAIL_PARTIAL,
     ):

@@ -26,7 +26,6 @@ documented in ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-
 """
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from time import time as epoch_time
 from typing import Any, Literal, Protocol, TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import (
@@ -39,8 +38,6 @@ from pynecore.core.broker.models import (
     EntryIntent,
     ExchangeOrder,
     ExitIntent,
-    OrderStatus,
-    OrderType,
 )
 from pynecore.core.broker.store_helpers import (
     KIND_CANCEL,
@@ -1557,7 +1554,7 @@ class DispatchJournal:
                 extra: dict[str, Any] = {}
                 if outcome.recovery_path is not None:
                     extra['recovery_path'] = outcome.recovery_path
-                applied = (outcome.recovery_context or {}).get(
+                applied: list[str] | None = (outcome.recovery_context or {}).get(
                     'applied_target_coids'
                 ) if outcome.recovery_context is not None else None
                 if applied is not None:

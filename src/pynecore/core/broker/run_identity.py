@@ -28,6 +28,7 @@ import json
 from dataclasses import dataclass
 from typing import Final
 
+# noinspection PyProtectedMember
 from pynecore.core.broker.idempotency import RUN_TAG_WIDTH, _to_base36
 
 __all__ = [

@@ -330,11 +330,11 @@ class SoftwareEntryStopEngine:
 
 def _watch_from_row(row: 'OrderRow') -> EntryStopWatch | None:
     extras = row.extras or {}
-    state = extras.get(EXTRAS_KEY_ENTRY_STOP_STATE)
+    state = extras.get(EXTRAS_KEY_ENTRY_STOP_STATE, '')
     if state not in ENTRY_STOP_STATE_LIVE:
         return None
-    stop_level = extras.get(EXTRAS_KEY_ENTRY_STOP_LEVEL)
-    limit_coid = extras.get(EXTRAS_KEY_ENTRY_STOP_LIMIT_COID)
+    stop_level: float | None = extras.get(EXTRAS_KEY_ENTRY_STOP_LEVEL)
+    limit_coid: str | None = extras.get(EXTRAS_KEY_ENTRY_STOP_LIMIT_COID)
     if stop_level is None or limit_coid is None:
         return None
     return EntryStopWatch(

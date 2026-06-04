@@ -28,6 +28,8 @@ def validate_at_startup(
     Safety-first: better to refuse to start than to fail on the first
     unexpected bar in live trading.
 
+    :param reqs: The running script's :class:`ScriptRequirements`.
+    :param caps: The plugin's advertised :class:`ExchangeCapabilities`.
     :param pyramiding: ``strategy(pyramiding=...)`` from the running script;
         ``1`` (the default) means single-row, where the partial-qty bracket
         path is always safe — *unless* the script also calls

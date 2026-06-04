@@ -360,7 +360,8 @@ class BrokerStore:
         # mode is not what it looks like at first glance — the default
         # behaviour is to start an implicit BEGIN before DML and close
         # it on the next commit. That fits our needs.
-        self._conn = sqlite3.connect(
+        # noinspection PyTypeChecker
+        self._conn: sqlite3.Connection = sqlite3.connect(
             str(self._path),
             isolation_level="",
             check_same_thread=False,
@@ -746,6 +747,7 @@ class BrokerStore:
 
 # === RunContext ============================================================
 
+# noinspection PyProtectedMember
 @dataclass
 class RunContext:
     """Context object for one concrete running run.
@@ -789,6 +791,7 @@ class RunContext:
                 (self.run_id, key, bar_ts_ms, retry_seq, now),
             )
 
+    # noinspection SqlResolve
     def record_park(
             self, coid: str, key: str, *, kind: str = 'new',
             order_ids: list[str] | None = None,
@@ -805,6 +808,9 @@ class RunContext:
         exactly the wrong outcome, since the new park exists precisely
         because the exchange-side state is unknown.
 
+        :param coid: The dispatch's ``client_order_id`` — the broker-side
+            idempotency key the park row is anchored on.
+        :param key: The ``intent_key`` this parked dispatch belongs to.
         :param kind: ``'new'`` (default) when the parked dispatch was an
             ``execute_*`` call (new order), ``'modify'`` when it was a
             ``modify_entry`` / ``modify_exit``. The value is overwritten
@@ -815,6 +821,11 @@ class RunContext:
             (kind='new') or to keep the original mapping and only drop
             the envelope (kind='modify' — the original exchange order is
             still live).
+        :param order_ids: The ``_order_mapping[key]`` snapshot captured at
+            park time (the exchange order IDs), persisted as a JSON array
+            so a post-restart modify-rejected resolution can recover them
+            and avoid a duplicate ``execute_*`` dispatch. Defaults to an
+            empty list.
         """
         if kind not in ('new', 'modify'):
             raise ValueError(
@@ -847,6 +858,7 @@ class RunContext:
                 (self.run_id, coid),
             )
 
+    # noinspection SqlResolve
     def record_resolution(self, coid: str, resolution: str) -> None:
         """Record a plugin-resolved disposition for a parked COID.
 
@@ -868,6 +880,8 @@ class RunContext:
         idempotent (the already-attached leg is re-emitted with the
         same parameters and is a no-op at the broker).
 
+        :param coid: The parent ``client_order_id`` whose parked dispatch
+            disposition is being recorded.
         :param resolution: ``'attached'`` if the dispatch landed at the
             broker (engine keeps the ``_active_intents`` entry),
             ``'rejected'`` if it definitely did not (engine drops the
@@ -914,6 +928,7 @@ class RunContext:
                 (self.run_id, key),
             )
 
+    # noinspection SqlResolve
     def replay(
             self,
     ) -> tuple[dict[str, EnvelopeRecord], dict[str, PendingRecord]]:
@@ -958,6 +973,7 @@ class RunContext:
 
         return envelopes, pending
 
+    # noinspection SqlResolve
     def iter_pending_resolutions(self) -> list[PendingRecord]:
         """Fetch parked rows that the plugin has already resolved.
 
@@ -1378,7 +1394,7 @@ class RunContext:
         rows = self._store._conn.execute(
             "SELECT payload FROM events "
             "WHERE run_instance_id = ? AND kind = ? AND ts_ms >= ? "
-            "ORDER BY ts_ms ASC",
+            "ORDER BY ts_ms",
             (self.run_instance_id, kind, since_ts_ms),
         )
         for row in rows:
@@ -1415,7 +1431,7 @@ class RunContext:
             "FROM events AS e "
             "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
             "WHERE r.run_id = ? AND e.kind = ? "
-            "ORDER BY e.ts_ms ASC",
+            "ORDER BY e.ts_ms",
             (self.run_id, kind),
         )
         for row in rows:
