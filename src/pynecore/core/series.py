@@ -310,7 +310,7 @@ class ReadOnlySeriesView(Generic[T]):
         return f"ReadOnlySeriesView({list(self)})"
 
 
-__series_function_vars__ = {'create_series': ['__series_create_series_series__']}
+__series_function_vars__ = {'inline_series': ['__series_create_series_series__']}
 __series_create_series_series__: SeriesImpl = SeriesImpl()
 
 
