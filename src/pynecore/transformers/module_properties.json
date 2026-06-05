@@ -1,6 +1,12 @@
 {
   "lib": {
+    "ask": {
+      "type": "variable"
+    },
     "bar_index": {
+      "type": "variable"
+    },
+    "bid": {
       "type": "variable"
     },
     "close": {

@@ -38,6 +38,7 @@ __all__ = [
     # Variables
     'bar_index', 'last_bar_index', 'last_bar_time',
     'open', 'high', 'low', 'close', 'volume',
+    'bid', 'ask',
     'hl2', 'hlc3', 'ohlc4', 'hlcc4',
 
     # Functions / objects
@@ -79,6 +80,9 @@ high: float = Source("high")
 low: float = Source("low")
 close: float = Source("close")
 volume: float = Source("volume")
+
+bid: float = Source("bid")
+ask: float = Source("ask")
 
 hl2: float = Source("hl2")
 hlc3: float = Source("hlc3")
