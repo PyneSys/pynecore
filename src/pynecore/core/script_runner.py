@@ -8,6 +8,7 @@ from datetime import datetime, UTC
 from pynecore import lib
 from pynecore.lib.log import broker_info, ohlcv_info, sim_info
 from pynecore.types.ohlcv import OHLCV
+from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
@@ -129,6 +130,11 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.volume = ohlcv.volume
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
+    # Pine's ``bid``/``ask`` only carry real values on the ``"1T"`` (tick) feed; on every
+    # other timeframe TradingView reports ``na``. PyneCore does not support tick data, so
+    # they are always ``na`` — matching TV behaviour on bar timeframes.
+    lib.bid = lib.ask = na_float
+
     lib.hl2 = (lib.high + lib.low) / 2.0
     lib.hlc3 = (lib.high + lib.low + lib.close) / 3.0
     lib.ohlc4 = (lib.open + lib.high + lib.low + lib.close) / 4.0
@@ -178,6 +184,8 @@ def _reset_lib_vars():
     lib.low = Source("low")
     lib.close = Source("close")
     lib.volume = Source("volume")
+    lib.bid = Source("bid")
+    lib.ask = Source("ask")
     lib.hl2 = Source("hl2")
     lib.hlc3 = Source("hlc3")
     lib.ohlc4 = Source("ohlc4")

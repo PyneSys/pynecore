@@ -4,6 +4,7 @@ from typing import cast
 # Builtin price series that are always global (declared in main, not nested functions)
 BUILTIN_PRICE_SERIES = frozenset({
     'open', 'high', 'low', 'close', 'volume',
+    'bid', 'ask',
     'hl2', 'hlc3', 'ohlc4', 'hlcc4'
 })
 
