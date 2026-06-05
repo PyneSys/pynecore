@@ -12,7 +12,7 @@ import sys
 import math as _math
 
 from functools import lru_cache
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 from pynecore.types.source import Source
 
@@ -57,7 +57,7 @@ __all__ = [
 
     # Module properties
     'dayofmonth', 'dayofweek', 'hour', 'minute', 'month', 'second', 'weekofyear', 'year',
-    'time', 'time_close', 'timenow', 'na',
+    'time', 'time_close', 'time_tradingday', 'timenow', 'na',
 ]
 
 #
@@ -607,6 +607,42 @@ def timenow():
     """
     # Get current UTC time and convert to milliseconds since Unix epoch
     return int(datetime.now(UTC).timestamp() * 1000)
+
+
+# noinspection PyProtectedMember
+@module_property
+def time_tradingday() -> PyneInt:
+    """
+    The beginning time of the trading day the current bar belongs to, as a UNIX
+    timestamp in milliseconds. It is 00:00 UTC of the calendar date — expressed in
+    the exchange timezone — on which the bar's trading session ends.
+
+    For symbols whose session crosses midnight (e.g. forex and futures overnight
+    sessions) a bar at or after the session start belongs to the next calendar day's
+    trading day, matching TradingView. For symbols whose session stays within a
+    single calendar day (stocks, 24/7 crypto) it is simply 00:00 UTC of the bar's
+    exchange-timezone date.
+
+    :return: UNIX time in milliseconds of 00:00 UTC on the trading day's date
+    """
+    local_dt = _datetime  # already expressed in the exchange timezone
+    trade_date = local_dt.date()
+
+    # Roll into the next trading day when the bar sits in the evening portion of an
+    # overnight session — one that ends at or before its own start (crosses midnight)
+    # and does not begin exactly at midnight (which is a plain calendar day).
+    weekday = local_dt.weekday()
+    bar_time = local_dt.time()
+    for day, start, end in syminfo._opening_hours:
+        if day != weekday:
+            continue
+        starts_at_midnight = start.hour == 0 and start.minute == 0 and start.second == 0
+        is_overnight = end <= start and not starts_at_midnight
+        if is_overnight and bar_time >= start:
+            trade_date += timedelta(days=1)
+            break
+
+    return int(datetime(trade_date.year, trade_date.month, trade_date.day, tzinfo=UTC).timestamp() * 1000)
 
 
 @module_property
