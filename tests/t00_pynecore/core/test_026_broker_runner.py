@@ -219,6 +219,7 @@ def _write_script(tmp_path: Path, code: str) -> Path:
 
 
 def __test_broker_mode_swaps_position_to_broker_position__(tmp_path):
+    """Broker mode swaps ``script.position`` to ``BrokerPosition`` and wires the sync engine."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
     script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
@@ -234,7 +235,9 @@ def __test_broker_mode_swaps_position_to_broker_position__(tmp_path):
 
 
 def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
-    """A pre-existing exchange position is adopted into ``BrokerPosition``
+    """Startup reconcile adopts a pre-existing exchange position into ``BrokerPosition``.
+
+    A pre-existing exchange position is adopted into ``BrokerPosition``
     before the script runs, so a flat-only entry condition does NOT re-fire
     and double up. Without the startup reconcile call, the script sees
     ``position_size == 0`` after a process restart and dispatches a fresh
@@ -284,6 +287,7 @@ def __test_startup_validation_rejects_incompatible_script__(tmp_path):
 
 
 def __test_startup_validation_accepts_compatible_script__(tmp_path):
+    """A bracket script runs without raising when the plugin declares all required capabilities."""
     # The bracket script needs tp_sl_bracket, stop_order AND reduce_only —
     # the last one because strategy.exit implies reduce-only semantics.
     plugin = MockBrokerPlugin(
@@ -307,6 +311,7 @@ def __test_startup_validation_accepts_compatible_script__(tmp_path):
 
 
 def __test_market_entry_dispatches_execute_entry__(tmp_path):
+    """A market ``strategy.entry`` dispatches one ``execute_entry`` with matching side/qty/type."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
     script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
@@ -327,7 +332,9 @@ def __test_market_entry_dispatches_execute_entry__(tmp_path):
 
 
 def __test_close_dispatches_execute_close__(tmp_path):
-    """``strategy.close`` only emits an order when there is an open position;
+    """``strategy.close`` dispatches ``execute_close`` only after a real fill opens the position.
+
+    ``strategy.close`` only emits an order when there is an open position;
     in broker mode that requires a real exchange fill first."""
     # ``strategy.close`` triggers the ``exit_orders`` requirement, which the
     # validator pairs with ``caps.reduce_only``.
@@ -392,6 +399,7 @@ def __test_close_dispatches_execute_close__(tmp_path):
 
 
 def __test_order_event_fill_updates_broker_position__(tmp_path):
+    """A filled ``OrderEvent`` updates ``BrokerPosition`` size and records the open trade."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
     script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
@@ -442,7 +450,9 @@ def __test_order_event_fill_updates_broker_position__(tmp_path):
 
 
 def __test_unchanged_intent_not_redispatched__(tmp_path):
-    """A pending limit entry that Pine re-emits bar-after-bar must not
+    """A pending limit entry re-emitted every bar dispatches execute_entry only once.
+
+    A pending limit entry that Pine re-emits bar-after-bar must not
     trigger repeated execute_entry calls."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
     script_path = _write_script(tmp_path, textwrap.dedent('''\
@@ -470,7 +480,9 @@ def __test_unchanged_intent_not_redispatched__(tmp_path):
 
 
 def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
-    """With ``calc_on_every_tick=True`` in broker+live mode, an order queued
+    """With ``calc_on_every_tick=True`` in broker+live mode, an intra-bar order fires next tick.
+
+    With ``calc_on_every_tick=True`` in broker+live mode, an order queued
     on intra-bar tick N must dispatch via the sync engine on tick N+1, not
     only at bar close.
 
@@ -560,7 +572,9 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
 
 
 def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
-    """Bad credentials on get_balance() must abort startup with
+    """Bad credentials on get_balance() abort startup with AuthenticationError, sending no order.
+
+    Bad credentials on get_balance() must abort startup with
     AuthenticationError — before any order is sent."""
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(),

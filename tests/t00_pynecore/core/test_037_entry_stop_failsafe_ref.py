@@ -110,11 +110,13 @@ def _persist_stop_position(ctx: RunContext, stop_ref: str) -> None:
 # === _resolve_parent_opening_ref ========================================
 
 def __test_resolve_returns_none_when_parent_untracked__():
+    """Resolver returns ``None`` when no store context tracks the parent entry."""
     eng = _engine(None)
     assert eng._resolve_parent_opening_ref("Long") is None
 
 
 def __test_resolve_returns_kind_entry_when_no_stop_row__(tmp_path):
+    """Resolver returns the ``KIND_ENTRY`` id when no stop position row exists."""
     # Limit-won (or not-yet-resolved) entry: the position opened — if at all —
     # under the native LIMIT's KIND_ENTRY id; no KIND_ENTRY_STOP row exists.
     store, ctx = _make_store(tmp_path)
@@ -125,6 +127,7 @@ def __test_resolve_returns_kind_entry_when_no_stop_row__(tmp_path):
 
 
 def __test_resolve_returns_kind_entry_stop_when_stop_row_present__(tmp_path):
+    """Resolver returns the ``KIND_ENTRY_STOP`` id once a stop position row is persisted."""
     # Stop-won: the stop-fired MARKET persisted a position row under the
     # deterministic KIND_ENTRY_STOP id; the resolver must reflect it.
     store, ctx = _make_store(tmp_path)
@@ -138,6 +141,7 @@ def __test_resolve_returns_kind_entry_stop_when_stop_row_present__(tmp_path):
 
 
 def __test_resolve_kind_entry_stop_survives_restart__(tmp_path):
+    """Resolver rebuilds the ``KIND_ENTRY_STOP`` id from the anchor alone after a restart."""
     # Restart-fragility guard: after a restart only the persisted envelope
     # anchor survives (the entry-stop watch row is terminal-filtered once the
     # stop won). The resolver must still rebuild the SAME KIND_ENTRY_STOP id
@@ -158,6 +162,7 @@ def __test_resolve_kind_entry_stop_survives_restart__(tmp_path):
 
 
 def __test_resolve_kind_entry_on_restart_without_stop_row__(tmp_path):
+    """Resolver rebuilds the ``KIND_ENTRY`` id from the anchor on restart with no stop row."""
     # Restart, limit-won: no KIND_ENTRY_STOP row -> rebuild the KIND_ENTRY id.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
@@ -175,6 +180,7 @@ def __test_resolve_kind_entry_on_restart_without_stop_row__(tmp_path):
 # === retire path keyed on the opening ref ===============================
 
 def __test_retire_clears_stop_won_state_under_kind_entry_stop_ref__(tmp_path):
+    """Retire resolves the ``KIND_ENTRY_STOP`` ref and marks its fail-safe state RETIRED."""
     # End-to-end of the F3 bug: the reconcile feed registers the fail-safe
     # state under the KIND_ENTRY_STOP id (the id the position opened under).
     # On close, _retire_native_failsafe_for_entry must resolve THAT id and
@@ -204,6 +210,7 @@ def __test_retire_clears_stop_won_state_under_kind_entry_stop_ref__(tmp_path):
 
 
 def __test_retire_clears_limit_won_state_under_kind_entry_ref__(tmp_path):
+    """Retire resolves the ``KIND_ENTRY`` ref and marks its fail-safe state RETIRED."""
     # Mirror for the limit-won case: no stop row, state registered under
     # KIND_ENTRY, retire resolves KIND_ENTRY and clears it.
     store, ctx = _make_store(tmp_path)

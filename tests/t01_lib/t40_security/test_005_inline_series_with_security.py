@@ -22,7 +22,9 @@ def main():
 
 
 def __test_inline_series_with_security__(csv_reader, runner, log):
-    """Issue #61: a main-body inline_series must not corrupt a request.security()
+    """A main-body inline_series must not corrupt a request.security() inline_series (issue #61).
+
+    Issue #61: a main-body inline_series must not corrupt a request.security()
     expression's own inline_series delivery."""
     from pynecore.types.na import NA
 

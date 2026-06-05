@@ -232,7 +232,9 @@ def __test_restart_completed_intent_does_not_replay__(tmp_path: Path) -> None:
 def __test_restart_recovers_parked_dispatch_via_get_open_orders__(
         tmp_path: Path,
 ) -> None:
-    """A dispatch parked before restart is re-registered on the next
+    """A dispatch parked before restart is re-registered without re-dispatch.
+
+    A dispatch parked before restart is re-registered on the next
     sync via the open-orders view, without a re-dispatch.
     """
     db = tmp_path / "broker.sqlite"
@@ -348,7 +350,9 @@ def _park_entry(broker: _MockBroker, ctx: RunContext) -> tuple[
 def __test_plugin_resolution_attached_clears_park_keeps_intent__(
         tmp_path: Path,
 ) -> None:
-    """A ``'attached'`` resolution removes the in-memory parked envelope
+    """An ``'attached'`` resolution clears the parked envelope but keeps the intent.
+
+    A ``'attached'`` resolution removes the in-memory parked envelope
     but keeps the active intent — the dispatch landed, no re-dispatch
     needed.
 
@@ -398,7 +402,9 @@ def __test_plugin_resolution_attached_clears_park_keeps_intent__(
 def __test_plugin_resolution_rejected_clears_intent_for_redispatch__(
         tmp_path: Path,
 ) -> None:
-    """A ``'rejected'`` resolution clears both the parked envelope and the
+    """A ``'rejected'`` resolution clears the park and intent so the next sync re-dispatches.
+
+    A ``'rejected'`` resolution clears both the parked envelope and the
     active intent so the next sync re-dispatches the original Pine intent
     against the broker.
 
@@ -430,7 +436,9 @@ def __test_plugin_resolution_rejected_clears_intent_for_redispatch__(
 def __test_plugin_resolution_attached_post_restart_does_not_redispatch__(
         tmp_path: Path,
 ) -> None:
-    """Cross-restart attached: ``_active_intents`` is empty after the
+    """Cross-restart attached: the resolution consumer adopts instead of re-dispatching.
+
+    Cross-restart attached: ``_active_intents`` is empty after the
     process bounce, so without an adoption marker
     :meth:`_diff_and_dispatch` would re-issue the bracket on the first
     post-restart sync — duplicating a position-attached protective leg
@@ -481,7 +489,9 @@ def __test_plugin_resolution_attached_post_restart_does_not_redispatch__(
 def __test_plugin_resolution_late_rejected_after_attached_flips__(
         tmp_path: Path,
 ) -> None:
-    """An ``'attached'`` consume must NOT delete the persisted row —
+    """An ``'attached'`` consume keeps the persisted row so a late ``'rejected'`` can flip it.
+
+    An ``'attached'`` consume must NOT delete the persisted row —
     otherwise a late ``'rejected'`` write (per-leg bracket resolver,
     slow plugin re-evaluation) finds zero rows and the engine never
     learns the leg is missing.
@@ -551,7 +561,9 @@ def __test_plugin_resolution_late_rejected_after_attached_flips__(
 def __test_plugin_resolution_modify_rejected_preserves_active_intent__(
         tmp_path: Path,
 ) -> None:
-    """A parked **modify** dispatch whose plugin resolution arrives as
+    """A parked-modify ``'rejected'`` preserves ``_active_intents`` / ``_order_mapping``.
+
+    A parked **modify** dispatch whose plugin resolution arrives as
     ``'rejected'`` must NOT clear ``_active_intents`` /
     ``_order_mapping`` for the same key. The ORIGINAL exchange order
     is still alive on the broker — only the amend failed to apply.
@@ -647,7 +659,9 @@ def __test_plugin_resolution_modify_rejected_preserves_active_intent__(
 def __test_plugin_resolution_modify_rejected_restores_pre_modify_active_intent__(
         tmp_path: Path,
 ) -> None:
-    """Going through the real ``_dispatch_modify`` path: a timed-out
+    """A real-path modify-rejected restores the pre-modify ``_active_intents`` and re-emits.
+
+    Going through the real ``_dispatch_modify`` path: a timed-out
     amend lands in ``_park_pending`` AND ``_diff_and_dispatch`` then
     promotes ``_active_intents[key]`` to the NEW intent. If the plugin
     later resolves the parked modify as ``'rejected'``, simply preserving
@@ -844,7 +858,9 @@ def __test_plugin_resolution_modify_rejected_restores_pre_modify_active_intent__
 def __test_plugin_resolution_modify_rejected_then_pine_cancels_does_not_resurrect_intent__(
         tmp_path: Path,
 ) -> None:
-    """Cleanup invariant: a parked modify whose resolution is still
+    """A late modify-rejected after a Pine cancel must not resurrect the cancelled key.
+
+    Cleanup invariant: a parked modify whose resolution is still
     pending when Pine drops the intent (cancel) must NOT resurrect the
     cancelled key into ``_active_intents`` once the late ``'rejected'``
     arrives. The rollback snapshot is keyed by ``intent_key``; without
@@ -908,7 +924,9 @@ def __test_plugin_resolution_modify_rejected_then_pine_cancels_does_not_resurrec
 def __test_plugin_resolution_repark_same_coid_clears_attached_dedup__(
         tmp_path: Path,
 ) -> None:
-    """If a COID was already consumed as ``'attached'`` and the same
+    """Re-parking a COID clears the ``_consumed_attached_coids`` dedup so re-attach isn't skipped.
+
+    If a COID was already consumed as ``'attached'`` and the same
     ``client_order_id`` is parked again in the same engine instance
     (legitimate modify/retry timeout), a later ``'attached'``
     resolution write must NOT be skipped by the in-memory
@@ -979,7 +997,9 @@ def __test_plugin_resolution_repark_same_coid_clears_attached_dedup__(
 def __test_record_unpark_self_heals_orphaned_in_memory_pending__(
         tmp_path: Path,
 ) -> None:
-    """A plugin recovery-confirm (``record_unpark``) of a MARKET /
+    """A reconnect handshake self-heals an in-memory park whose ``record_unpark`` dropped its row.
+
+    A plugin recovery-confirm (``record_unpark``) of a MARKET /
     already-filled order deletes only the persisted park row; the engine
     must self-heal its in-memory ``_pending_verification`` entry against
     the replayed set instead of stranding it across reconnects.
@@ -1021,7 +1041,9 @@ def __test_record_unpark_self_heals_orphaned_in_memory_pending__(
 def __test_sync_self_heals_orphaned_in_memory_pending__(
         tmp_path: Path,
 ) -> None:
-    """The start-of-sync wholesale re-replay self-heals an orphaned
+    """The start-of-sync re-replay also self-heals an orphaned in-memory park.
+
+    The start-of-sync wholesale re-replay self-heals an orphaned
     in-memory park too — not only the explicit reconnect handshake.
 
     A filled MARKET order never echoes in ``get_open_orders``
@@ -1049,7 +1071,9 @@ def __test_sync_self_heals_orphaned_in_memory_pending__(
 def __test_legitimate_park_survives_reconnect_replay__(
         tmp_path: Path,
 ) -> None:
-    """A still-pending park whose persisted row is intact must NOT be
+    """A still-pending park with an intact persisted row survives the self-heal.
+
+    A still-pending park whose persisted row is intact must NOT be
     pruned by the self-heal — the reconciliation only drops entries the
     persisted set no longer backs.
     """
@@ -1073,7 +1097,9 @@ def __test_legitimate_park_survives_reconnect_replay__(
 def __test_plugin_resolution_same_key_rejected_dominates_attached__(
         tmp_path: Path,
 ) -> None:
-    """Two rows can share an ``intent_key`` (per-leg bracket resolver,
+    """For two same-key rows, ``'rejected'`` dominates ``'attached'`` regardless of order.
+
+    Two rows can share an ``intent_key`` (per-leg bracket resolver,
     or a restart that finds an older 'attached' alongside a newer
     'rejected' row from a retry storm). When a snapshot returns BOTH a
     ``'rejected'`` and an ``'attached'`` row for the same key,
@@ -1152,7 +1178,9 @@ def __test_plugin_resolution_same_key_rejected_dominates_attached__(
 def __test_plugin_resolution_attached_no_pine_intent_clears_stale_marker__(
         tmp_path: Path,
 ) -> None:
-    """Cross-restart attached + Pine intent gone: ``_order_mapping`` and
+    """Cross-restart attached with no Pine intent drops the stale empty adoption marker.
+
+    Cross-restart attached + Pine intent gone: ``_order_mapping`` and
     the persisted envelope anchor must NOT keep an empty adoption marker.
 
     Scenario: a bracket dispatch was parked, the plugin's snapshot
@@ -1218,7 +1246,9 @@ def __test_plugin_resolution_attached_no_pine_intent_clears_stale_marker__(
 def __test_attached_no_pine_intent_cleanup_deletes_persisted_envelope_row__(
         tmp_path: Path,
 ) -> None:
-    """The cleanup-no-intent path must also DELETE the SQLite
+    """The cleanup-no-intent path also DELETEs the persisted ``envelopes`` row.
+
+    The cleanup-no-intent path must also DELETE the SQLite
     ``envelopes`` row; otherwise a *future* process restart replays
     the stale anchor through :meth:`_build_envelope` and reuses the
     old ``client_order_id`` for a genuinely fresh order.
@@ -1288,7 +1318,9 @@ def __test_attached_no_pine_intent_cleanup_deletes_persisted_envelope_row__(
 def __test_plugin_resolution_rejected_post_restart_uses_fresh_envelope__(
         tmp_path: Path,
 ) -> None:
-    """Cross-restart rejected: the replayed envelope anchor must be
+    """Cross-restart rejected discards the replayed anchor so the retry gets a fresh COID.
+
+    Cross-restart rejected: the replayed envelope anchor must be
     discarded so :meth:`_build_envelope` allocates a fresh
     ``client_order_id`` for the retry. Reusing the rejected dispatch's
     COID would let any broker that retains idempotency state for failed
@@ -1334,7 +1366,9 @@ def __test_plugin_resolution_rejected_post_restart_uses_fresh_envelope__(
 
 
 def __test_crashed_run_is_cleaned_on_next_open_run__(tmp_path: Path) -> None:
-    """SIGKILL simulation: the first run never calls ctx.close(), its
+    """A crashed run with a stale heartbeat is closed on the next ``open_run``.
+
+    SIGKILL simulation: the first run never calls ctx.close(), its
     heartbeat ages out, and the next ``open_run`` automatically closes
     it and starts a fresh instance.
     """
@@ -1495,7 +1529,9 @@ pytestmark_cap = pytest.mark.skipif(
 def __test_integration_capitalcom_entry_confirm_persists_deal_id_and_maps_order__(
         tmp_path: Path,
 ) -> None:
-    """LIMIT entry dispatched through the engine → plugin's PERSIST-FIRST
+    """A LIMIT entry commits the deal_id ref and maps the exchange id in one sync.
+
+    LIMIT entry dispatched through the engine → plugin's PERSIST-FIRST
     chain commits the deal_id ref and the engine's order_mapping reflects
     the exchange id in a single sync cycle.
 
@@ -1542,7 +1578,9 @@ def __test_integration_capitalcom_entry_confirm_persists_deal_id_and_maps_order_
 def __test_integration_capitalcom_parked_dispatch_recovers_and_unparks__(
         tmp_path: Path,
 ) -> None:
-    """POST timeout parks the dispatch; a subsequent recovery pass + a new
+    """A POST-timeout park is recovered and unparked via ``get_open_orders`` without re-POSTing.
+
+    POST timeout parks the dispatch; a subsequent recovery pass + a new
     engine sync unpark it via ``get_open_orders`` without re-POSTing.
 
     Same run_instance throughout — the current architecture scopes
@@ -1641,7 +1679,9 @@ def __test_integration_capitalcom_parked_dispatch_recovers_and_unparks__(
 def __test_integration_capitalcom_full_roundtrip_entry_bracket_tp_fill__(
         tmp_path: Path,
 ) -> None:
-    """MARKET entry + bracket exit through the engine → plugin attaches
+    """A MARKET entry + bracket exit attaches the bracket to the confirmed entry in one sync.
+
+    MARKET entry + bracket exit through the engine → plugin attaches
     the bracket to the just-confirmed entry row inside a single sync cycle.
 
     The engine dispatches the entry intent first, which flips the row to
@@ -1709,7 +1749,9 @@ def __test_integration_capitalcom_full_roundtrip_entry_bracket_tp_fill__(
 def __test_modify_rejected_after_restart_does_not_duplicate_order__(
         tmp_path: Path,
 ) -> None:
-    """After a process restart, a modify-rejected resolution must not
+    """A modify-rejected after restart adopts the live order instead of duplicating it.
+
+    After a process restart, a modify-rejected resolution must not
     cause the engine to re-dispatch the intent via ``execute_*``,
     which would create a SECOND order alongside the still-live original.
 
@@ -1803,7 +1845,9 @@ def __test_modify_rejected_after_restart_does_not_duplicate_order__(
 def __test_modify_rejected_after_restart_recovers_ids_from_modify_row__(
         tmp_path: Path,
 ) -> None:
-    """Multi-record group: when ``pending_verifications`` holds both an
+    """Post-restart recovery reads order IDs from the ``modify`` row, not the empty attached one.
+
+    Multi-record group: when ``pending_verifications`` holds both an
     older ``attached`` row from the original ``new`` dispatch (parked
     before ``_order_mapping`` existed → ``order_ids=[]``) AND a
     ``modify`` row resolved as ``'rejected'`` carrying the snapshot of

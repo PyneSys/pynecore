@@ -48,6 +48,8 @@ def _make_syminfo(period: str = '1'):
 # noinspection PyShadowingNames
 def __test_cancel_by_entry_id_does_not_cascade_to_exits__(script_path, module_key):
     """
+    Both TP1 and TP2 fire because cancel("Long") after the entry filled is a no-op for exits.
+
     Both TP1 and TP2 must fire — cancel("Long") on bar 2 is a no-op (entry already
     filled, no pending entry to cancel; exits NOT cascade-cancelled per TV).
     """

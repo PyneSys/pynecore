@@ -49,6 +49,7 @@ def _make_syminfo(period: str = '1'):
 def __test_cancel_by_exit_id_removes_only_tp1__(script_path, module_key):
     """
     After cancelling TP1 by its exit id on bar 2, only TP2 (limit 120) must fire.
+
     Buggy code path: cancel was no-op, TP1 (limit 110) still fires on bar 3 high=115,
     producing 2 trades instead of 1.
     """

@@ -57,11 +57,13 @@ def __test_build_is_deterministic_across_calls__():
 
 
 def __test_hash_pine_id_is_deterministic__():
+    """``hash_pine_id`` returns the same hash for repeated calls on equal input."""
     assert hash_pine_id('Long') == hash_pine_id('Long')
     assert hash_pine_id('TP/Long') == hash_pine_id('TP/Long')
 
 
 def __test_make_run_tag_is_deterministic__():
+    """The run tag is identical for repeated derivations from the same script source."""
     assert _make_run_tag('strategy("x")\nplot(close)') == _make_run_tag('strategy("x")\nplot(close)')
 
 
@@ -82,12 +84,14 @@ def __test_result_fits_30_char_budget__():
 
 
 def __test_hash_pine_id_is_exactly_expected_width__():
+    """``hash_pine_id`` output is always ``PINE_ID_HASH_WIDTH`` chars, for any input length."""
     assert len(hash_pine_id('')) == PINE_ID_HASH_WIDTH
     assert len(hash_pine_id('Long')) == PINE_ID_HASH_WIDTH
     assert len(hash_pine_id('x' * 10_000)) == PINE_ID_HASH_WIDTH
 
 
 def __test_make_run_tag_is_exactly_expected_width__():
+    """The run tag is always ``RUN_TAG_WIDTH`` chars, for any script-source length."""
     assert len(_make_run_tag('')) == RUN_TAG_WIDTH
     assert len(_make_run_tag('strategy("x")')) == RUN_TAG_WIDTH
     assert len(_make_run_tag('y' * 100_000)) == RUN_TAG_WIDTH
@@ -108,12 +112,14 @@ def __test_bar_ts_is_exactly_expected_width__():
 
 
 def __test_different_kind_different_id__():
+    """Each ``kind`` yields a distinct id, so all ``VALID_KINDS`` map to unique results."""
     base = dict(run_tag='abcd', pine_id='Long', bar_ts_ms=1_700_000_000_000)
     ids = {build_client_order_id(**base, kind=k) for k in VALID_KINDS}
     assert len(ids) == len(VALID_KINDS)
 
 
 def __test_different_pine_id_different_id__():
+    """A different ``pine_id`` produces a different id with all other inputs equal."""
     kwargs = dict(run_tag='abcd', bar_ts_ms=1_700_000_000_000, kind=KIND_ENTRY)
     a = build_client_order_id(**kwargs, pine_id='Long')
     b = build_client_order_id(**kwargs, pine_id='Short')
@@ -121,6 +127,7 @@ def __test_different_pine_id_different_id__():
 
 
 def __test_different_bar_ts_different_id__():
+    """A different ``bar_ts_ms`` produces a different id with all other inputs equal."""
     kwargs = dict(run_tag='abcd', pine_id='Long', kind=KIND_ENTRY)
     a = build_client_order_id(**kwargs, bar_ts_ms=1_700_000_000_000)
     b = build_client_order_id(**kwargs, bar_ts_ms=1_700_000_060_000)
@@ -128,6 +135,7 @@ def __test_different_bar_ts_different_id__():
 
 
 def __test_different_run_tag_different_id__():
+    """A different ``run_tag`` produces a different id with all other inputs equal."""
     kwargs = dict(pine_id='Long', bar_ts_ms=1_700_000_000_000, kind=KIND_ENTRY)
     a = build_client_order_id(run_tag='abcd', **kwargs)
     b = build_client_order_id(run_tag='efgh', **kwargs)
@@ -135,6 +143,7 @@ def __test_different_run_tag_different_id__():
 
 
 def __test_retry_seq_changes_id__():
+    """A different ``retry_seq`` changes the id, surfacing as the trailing base36 digit."""
     kwargs = dict(
         run_tag='abcd', pine_id='Long', bar_ts_ms=1_700_000_000_000, kind=KIND_ENTRY,
     )
@@ -189,6 +198,7 @@ def __test_no_collision_across_1000_bar_combinations__():
     'ab_d',      # contains underscore
 ])
 def __test_build_rejects_bad_run_tag__(bad_run_tag):
+    """A ``run_tag`` of wrong length or with disallowed characters raises ``ValueError``."""
     with pytest.raises(ValueError, match='run_tag'):
         build_client_order_id(
             run_tag=bad_run_tag,
@@ -200,6 +210,7 @@ def __test_build_rejects_bad_run_tag__(bad_run_tag):
 
 @pytest.mark.parametrize('bad_kind', ['', 'entry', 'E', 'exit', 'z'])
 def __test_build_rejects_bad_kind__(bad_kind):
+    """A ``kind`` outside ``VALID_KINDS`` raises ``ValueError``."""
     with pytest.raises(ValueError, match='kind'):
         build_client_order_id(
             run_tag='abcd',
@@ -210,6 +221,7 @@ def __test_build_rejects_bad_kind__(bad_kind):
 
 
 def __test_build_rejects_negative_bar_ts__():
+    """A negative ``bar_ts_ms`` raises ``ValueError``."""
     with pytest.raises(ValueError, match='bar_ts_ms'):
         build_client_order_id(
             run_tag='abcd',
@@ -220,6 +232,7 @@ def __test_build_rejects_negative_bar_ts__():
 
 
 def __test_build_rejects_negative_retry_seq__():
+    """A negative ``retry_seq`` raises ``ValueError``."""
     with pytest.raises(ValueError, match='retry_seq'):
         build_client_order_id(
             run_tag='abcd',
@@ -281,6 +294,7 @@ def __test_unicode_pine_id_is_accepted__():
 
 
 def __test_bar_ts_zero_is_accepted__():
+    """A ``bar_ts_ms`` of 0 is accepted and encodes as nine zeros in the bar segment."""
     out = build_client_order_id(
         run_tag='abcd', pine_id='Long', bar_ts_ms=0, kind=KIND_ENTRY,
     )
@@ -310,6 +324,7 @@ def __test_format_is_lowercase_ascii__():
     (KIND_CANCEL, 'x0'),
 ])
 def __test_kind_appears_literally_in_result__(kind, expected_suffix):
+    """Each ``kind`` ends the id with its expected one-char code plus the retry digit."""
     out = build_client_order_id(
         run_tag='abcd', pine_id='L', bar_ts_ms=1, kind=kind,
     )
@@ -336,6 +351,7 @@ def __test_parse_round_trips_build__():
 
 
 def __test_parse_retry_seq_zero_and_high__():
+    """Parsing recovers the original ``retry_seq`` across the base36 1-to-2 digit boundary."""
     for retry in (0, 1, 35, 36, 100):
         coid = build_client_order_id(
             run_tag='abcd', pine_id='L', bar_ts_ms=1, kind=KIND_ENTRY,
@@ -347,6 +363,7 @@ def __test_parse_retry_seq_zero_and_high__():
 
 
 def __test_parse_bar_ts_zero__():
+    """Parsing an id built with ``bar_ts_ms=0`` recovers a ``bar_ts_ms`` of 0."""
     coid = build_client_order_id(
         run_tag='abcd', pine_id='L', bar_ts_ms=0, kind=KIND_ENTRY,
     )
@@ -369,6 +386,7 @@ def __test_parse_bar_ts_zero__():
     'abcd-12345678-000000001-e!',       # non-base36 retry
 ])
 def __test_parse_malformed_returns_none__(bad):
+    """A structurally malformed id (bad segment lengths, codes, or charset) parses to ``None``."""
     assert parse_client_order_id(bad) is None
 
 

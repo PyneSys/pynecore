@@ -66,6 +66,7 @@ def _fill(side: str, qty: float, price: float, *,
 
 
 def __test_record_fill_opens_long__():
+    """A buy fill opens a long with matching size, ``avg_price`` and one open trade."""
     p = BrokerPosition()
     assert not p.record_fill(_fill("buy", 2.0, 50_000.0, fee=1.0))
     assert p.size == 2.0
@@ -77,6 +78,7 @@ def __test_record_fill_opens_long__():
 
 
 def __test_record_fill_adds_to_long_updates_avg_price__():
+    """Adding to a long recomputes ``avg_price`` as the size-weighted average."""
     p = BrokerPosition()
     p.record_fill(_fill("buy", 1.0, 40_000.0))
     p.record_fill(_fill("buy", 3.0, 48_000.0))
@@ -87,6 +89,7 @@ def __test_record_fill_adds_to_long_updates_avg_price__():
 
 
 def __test_record_fill_full_close_realizes_profit__():
+    """Fully closing a long realizes profit into ``netprofit`` and counts a win."""
     p = BrokerPosition()
     p.record_fill(_fill("buy", 1.0, 40_000.0))
     flipped = p.record_fill(_fill("sell", 1.0, 42_000.0, pine_id="TP",
@@ -143,6 +146,7 @@ def __test_record_fill_side_flip_in_single_event__():
 
 
 def __test_update_unrealized_pnl_marks_to_market__():
+    """Marking to market sets ``openprofit`` and rolls it into ``equity``."""
     p = BrokerPosition()
     p.record_fill(_fill("buy", 2.0, 40_000.0))
     p.update_unrealized_pnl(45_000.0)
@@ -153,6 +157,7 @@ def __test_update_unrealized_pnl_marks_to_market__():
 
 
 def __test_record_liquidation_closes_everything__():
+    """Liquidation flattens the position and books the loss as ``netprofit``."""
     p = BrokerPosition()
     p.record_fill(_fill("buy", 2.0, 50_000.0))
     liq = _fill("sell", 2.0, 45_000.0, pine_id="LIQ", leg=LegType.CLOSE)

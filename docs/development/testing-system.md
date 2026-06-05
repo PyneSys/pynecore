@@ -61,6 +61,28 @@ This unique approach allows:
 - The PyneCore system to use its own functionality for its own tests
 - Tests to run in exactly the same environment as real user code
 
+## Test Docstring Convention
+
+Every `__test_*__` function is documented by its docstring, and the test runner (the `pytest-spec` integration configured in `conftest.py`) prints that documentation next to the test result. To keep the output readable, the docstring follows a strict layout:
+
+1. **First line — a concise one-line summary.** This is the *only* line shown in the test runner output. Keep it short and self-contained: it must read as a complete description of what the test guards, not as the opening fragment of a longer sentence.
+2. **One blank line.**
+3. **Optional detailed description.** Any number of paragraphs explaining the rationale, the invariant under test, the phases of the scenario, etc. This is documentation for whoever reads or maintains the test; it never appears in the runner output.
+
+```python
+def __test_modify_rejected_restores_pre_modify_active_intent__(tmp_path):
+    """Rejected modify restores the pre-modify active intent so the next diff re-emits modify_entry.
+
+    Preserving the slot would leave it pointing at the NEW intent, so the
+    next sync would see Pine == active, the diff would stay silent, and the
+    exchange order would be stranded on the OLD parameters. The rejected
+    branch restores the snapshot stashed by ``_park_pending(..., old_intent=old)``.
+    """
+    ...
+```
+
+The runner only renders the first line. `conftest.py` truncates the summary to that first line explicitly, so a docstring whose summary accidentally wraps onto a second line still produces one clean line — but write the summary to fit on one line regardless, because a wrapped summary is silently cut off mid-sentence.
+
 ## Test Categories and Types
 
 Tests are organized into several main categories, each with its own verification methodology:

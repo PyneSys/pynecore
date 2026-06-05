@@ -40,7 +40,9 @@ def __test_na_key_returns_na__():
 
 
 def __test_na_float_key_returns_na__():
-    """math.abs(NA[int]) yields NA[float]; subscript with NA[float] must still return na.
+    """Subscript with an NA[float] key must return na (math.abs(NA[int]) yields NA[float]).
+
+    math.abs(NA[int]) yields NA[float]; subscript with NA[float] must still return na.
     This is the exact case that crashed ict_entry_v2 — ta.highestbars(...) returns na on
     early bars, math.abs propagates as NA[float], and the resulting bar_index[NA[float]]
     used to raise TypeError."""
@@ -69,7 +71,9 @@ def __test_negative_int_key_returns_na__():
 
 
 def __test_negative_int_repro_from_issue_57__():
-    """Exact pattern from issue #57: ``close[hist_p - j - 1]`` where the runtime
+    """Issue #57 pattern ``close[hist_p - j - 1]`` evaluating to a negative integer returns na.
+
+    Exact pattern from issue #57: ``close[hist_p - j - 1]`` where the runtime
     expression evaluates to a negative integer must return na."""
     s = _populate([1.0, 2.0, 3.0, 4.0, 5.0])
     hist_p = 0

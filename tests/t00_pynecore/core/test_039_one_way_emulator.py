@@ -152,6 +152,7 @@ def _run(coro):
 # === run_close — pure orchestration (store_ctx=None) ====================
 
 def __test_run_close_fans_out_fifo__():
+    """``run_close`` fans the close volume across long legs in FIFO order."""
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -162,6 +163,7 @@ def __test_run_close_fans_out_fifo__():
 
 
 def __test_run_close_partial_targets_oldest_leg__():
+    """A partial close reduces only the oldest leg, leaving the rest open."""
     port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
                       _leg("11", "buy", 2.0, open_time=1.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -171,6 +173,7 @@ def __test_run_close_partial_targets_oldest_leg__():
 
 
 def __test_run_close_short_reduces_sell_legs__():
+    """A ``side='buy'`` close reduces the sell legs, closing a short position."""
     # CloseIntent.side='buy' closes a short -> the legs to reduce are the sells.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -179,6 +182,7 @@ def __test_run_close_short_reduces_sell_legs__():
 
 
 def __test_run_close_flat_is_noop__():
+    """Closing a flat book dispatches no orders and returns an empty result."""
     port = _FakePort([])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_close(_close_env("sell", 1.0), port))
@@ -187,6 +191,7 @@ def __test_run_close_flat_is_noop__():
 
 
 def __test_run_close_below_grid_skips_without_order__():
+    """A close below the broker minimum is skipped with no order dispatched."""
     port = _FakePort([_leg("10", "buy", 0.4, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_close(_close_env("sell", 0.4), port))
@@ -195,6 +200,7 @@ def __test_run_close_below_grid_skips_without_order__():
 
 
 def __test_run_close_shortfall_surfaced_not_halted__():
+    """When the broker holds less than owed, close what is open and report the shortfall."""
     # Broker holds less than Pine believes: close what is open, report the rest.
     port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -221,6 +227,7 @@ def _make_store(tmp_path) -> tuple[BrokerStore, RunContext]:
 
 
 def __test_run_close_persists_and_finalises_leg_rows__(tmp_path):
+    """``run_close`` persists each close-leg row and finalises them all on success."""
     store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
@@ -248,6 +255,7 @@ def _pending_leg_row(ctx, *, leg_id, volume, qty):
 
 
 def __test_restart_replay_redispatches_still_open_leg__(tmp_path):
+    """Restart replay re-dispatches a pending close leg that is still open on the broker."""
     # Crash sim: a pending close-leg row whose dispatch never acked; the leg is
     # still open on the broker -> replay re-dispatches and finalises it.
     store, ctx = _make_store(tmp_path)
@@ -261,6 +269,7 @@ def __test_restart_replay_redispatches_still_open_leg__(tmp_path):
 
 
 def __test_restart_replay_finalises_vanished_leg_without_redispatch__(tmp_path):
+    """Restart replay finalises a vanished close leg without re-dispatching it."""
     # The leg is GONE (the close landed before the crash) -> no re-dispatch.
     store, ctx = _make_store(tmp_path)
     _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
@@ -273,6 +282,7 @@ def __test_restart_replay_finalises_vanished_leg_without_redispatch__(tmp_path):
 
 
 def __test_restart_replay_redispatches_only_residual_for_partly_closed_leg__(tmp_path):
+    """Restart replay re-dispatches only the still-open residual of a partly-closed leg."""
     # The leg was partly closed before the crash: only 1.0 of the owed 3 remains
     # open -> re-dispatch min(persisted 3, live 1) = 1, never the full 3.
     store, ctx = _make_store(tmp_path)
@@ -285,6 +295,7 @@ def __test_restart_replay_redispatches_only_residual_for_partly_closed_leg__(tmp
 
 
 def __test_restart_replay_is_idempotent__(tmp_path):
+    """Running restart replay twice dispatches the close leg exactly once."""
     store, ctx = _make_store(tmp_path)
     _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
@@ -307,6 +318,7 @@ def _entry_env(side, qty, *, symbol="EURUSD", pine_id="Long",
 
 
 def __test_run_reversal_pure_add_opens_only__():
+    """A reversal with no opposing legs closes nothing and opens the whole size."""
     # No opposing legs -> nothing to close, open the whole size.
     port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -317,6 +329,7 @@ def __test_run_reversal_pure_add_opens_only__():
 
 
 def __test_run_reversal_flip_closes_opposing_then_opens_residual__():
+    """A flipping reversal closes the opposing legs, then opens the residual size."""
     # Short 2.0, buy 3.0 -> close the 2.0 sell leg, open the 1.0 long residual.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -327,6 +340,7 @@ def __test_run_reversal_flip_closes_opposing_then_opens_residual__():
 
 
 def __test_run_reversal_exact_flatten_opens_nothing__():
+    """An exact-flatten reversal closes the opposing legs and opens nothing."""
     # Short 2.0, buy 2.0 -> close the sell leg, open nothing.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -337,6 +351,7 @@ def __test_run_reversal_exact_flatten_opens_nothing__():
 
 
 def __test_run_reversal_below_min_residual_skips_whole_reversal__():
+    """A below-minimum residual makes the pre-flight skip the reversal before any close lands."""
     # Residual 1.0 is below the broker minimum -> the pre-flight raises BEFORE
     # any close lands, so the book is never left half-reduced.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)], min_qty=2.0)
@@ -347,6 +362,7 @@ def __test_run_reversal_below_min_residual_skips_whole_reversal__():
 
 
 def __test_run_reversal_persists_close_leg_rows__(tmp_path):
+    """A reversal persists its FIFO close-leg rows and finalises them on success."""
     store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=ctx)
@@ -358,6 +374,7 @@ def __test_run_reversal_persists_close_leg_rows__(tmp_path):
 
 
 def __test_run_reversal_resting_limit_rests_without_closing_opposing__():
+    """A LIMIT reversal rests at full size without closing the opposing legs at placement."""
     # A LIMIT reversal opposing an open short must NOT close the short at
     # placement — it rests full-size; decomposition happens only on fill.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
@@ -371,6 +388,7 @@ def __test_run_reversal_resting_limit_rests_without_closing_opposing__():
 
 
 def __test_run_reversal_resting_stop_rests_without_closing_opposing__():
+    """A STOP reversal rests at full size without closing the opposing legs at placement."""
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_reversal(
@@ -402,6 +420,7 @@ def _amended_levels(port: _FakePort) -> list[tuple[str, float | None, float | No
 
 
 def __test_run_exit_bracket_replicates_across_legs__():
+    """``run_exit_bracket`` replicates the same bracket onto every leg in FIFO order."""
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -412,6 +431,7 @@ def __test_run_exit_bracket_replicates_across_legs__():
 
 
 def __test_run_exit_bracket_flat_skips__():
+    """``run_exit_bracket`` on a flat book skips, amending no legs."""
     port = _FakePort([])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", sl=1.00), port))
@@ -420,6 +440,7 @@ def __test_run_exit_bracket_flat_skips__():
 
 
 def __test_run_exit_bracket_protects_only_net_survivor_legs__():
+    """The bracket is amended onto only the net-survivor legs, not the gross majority side."""
     # Mixed book net long 2 (3 buys, 1 sell): the opposing sell virtually
     # FIFO-closes the oldest buy, so the bracket is amended onto ONLY the two
     # net-survivor legs — never the gross majority side, which on an SL hit
@@ -435,6 +456,7 @@ def __test_run_exit_bracket_protects_only_net_survivor_legs__():
 
 
 def __test_clear_only_owns__(tmp_path):
+    """Clearing one exit wipes only its own legs; a co-located exit's bracket survives."""
     # THE regression test: a TP-exit and an SL-exit on the SAME legs. Cancelling
     # TP must clear ONLY TP's legs; SL's bracket must survive (the plugin's
     # broadcast clear strips both).
@@ -458,6 +480,7 @@ def __test_clear_only_owns__(tmp_path):
 
 
 def __test_two_exits_distinct_ownership__(tmp_path):
+    """Two exits with different pine_ids get distinct intent_keys and attach coids."""
     # Different pine_ids -> different attach coids -> disjoint coid namespaces +
     # distinct intent_keys, which is what makes the scoped clear work.
     store, ctx = _make_store(tmp_path)
@@ -472,6 +495,7 @@ def __test_two_exits_distinct_ownership__(tmp_path):
 
 
 def __test_clear_all_by_pine_id_when_from_entry_none__(tmp_path):
+    """A cancel with ``from_entry=None`` clears every exit sharing the pine_id, leaving others."""
     # A cancel-all (from_entry None) drops every exit sharing the pine_id, across
     # from_entry values, and leaves a different pine_id untouched.
     store, ctx = _make_store(tmp_path)
@@ -488,6 +512,7 @@ def __test_clear_all_by_pine_id_when_from_entry_none__(tmp_path):
 
 
 def __test_clear_pure_path_is_noop__():
+    """The ownership-aware clear is a no-op without a persisted store (``store_ctx=None``)."""
     # Ownership-aware clear needs the persisted index: store_ctx=None -> no-op.
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
@@ -497,6 +522,7 @@ def __test_clear_pure_path_is_noop__():
 
 
 def __test_bracket_ownership_persist_and_replay__(tmp_path):
+    """Restart replay releases the orphan ownership row and re-asserts the surviving leg."""
     # Crash sim: a bracket replicated onto two legs, then one leg vanishes. The
     # restart pass releases the orphan row and re-asserts the surviving leg.
     store, ctx = _make_store(tmp_path)
@@ -515,6 +541,7 @@ def __test_bracket_ownership_persist_and_replay__(tmp_path):
 
 
 def __test_clear_timeout_leaves_clearing_row_then_replay_reclears__(tmp_path):
+    """A clear whose amend times out marks the row clearing; restart re-clears and releases it."""
     # F2: a bracket-clear whose amend times out (OrderDispositionUnknownError)
     # must NOT leave the row "active" — that would make restart_replay re-assert
     # the very bracket the script asked to cancel. Persist-first marks it
@@ -541,6 +568,7 @@ def __test_clear_timeout_leaves_clearing_row_then_replay_reclears__(tmp_path):
 
 
 def __test_run_exit_bracket_midfan_reject_releases_only_unamended_row__(tmp_path):
+    """A mid-fan amend reject releases only the unamended leg's row, keeping the attached one."""
     # Leg "10" amends OK, leg "11" rejects mid-fan. The reject surfaces as a
     # BracketAttachAfterFillRejectedError (open + unprotected position -> the
     # engine flattens defensively, not halts). Leg "11"'s persist-first
@@ -561,6 +589,7 @@ def __test_run_exit_bracket_midfan_reject_releases_only_unamended_row__(tmp_path
 
 
 def __test_dropped_leg_clear_timeout_does_not_skip_survivor_amend__(tmp_path):
+    """A dropped leg's clear timeout does not abort the fan; survivors still get new levels."""
     # F: run_exit_bracket pre-clears dropped survivor legs BEFORE amending the
     # survivors. If that pre-clear times out (OrderDispositionUnknownError) the
     # error MUST NOT abort the fan — the dispatch path would park it while
@@ -603,6 +632,7 @@ def __test_dropped_leg_clear_timeout_does_not_skip_survivor_amend__(tmp_path):
 
 
 def __test_restart_replay_clear_timeout_does_not_abort_startup__(tmp_path):
+    """A re-clear timeout during restart replay does not abort startup; the row stays clearing."""
     # F: _replay_bracket_one re-clears a "clearing" row at startup. If that
     # re-clear times out (OrderDispositionUnknownError) it must NOT propagate —
     # restart_replay runs inside a sync wrapper that only catches
@@ -645,6 +675,7 @@ def _seed_residual(ctx, *, entry_coid, qty=2.0, side="buy"):
 
 
 def __test_reversal_creates_then_clears_residual_breadcrumb__(tmp_path):
+    """A real reversal writes the residual breadcrumb before closing and discharges it on open."""
     # A real reversal (close the opposing short, open the residual long) writes
     # the persist-first breadcrumb before the closes and discharges it once
     # place_leg has persisted the residual entry row.
@@ -659,6 +690,7 @@ def __test_reversal_creates_then_clears_residual_breadcrumb__(tmp_path):
 
 
 def __test_reversal_pure_reduce_writes_no_breadcrumb__(tmp_path):
+    """A pure reduce (smaller than opposing exposure) opens nothing and writes no breadcrumb."""
     # An order smaller than the opposing exposure is a pure reduce: no residual
     # opens, so no breadcrumb is ever persisted.
     store, ctx = _make_store(tmp_path)
@@ -671,6 +703,7 @@ def __test_reversal_pure_reduce_writes_no_breadcrumb__(tmp_path):
 
 
 def __test_pure_add_writes_no_breadcrumb__(tmp_path):
+    """A pure add opens the whole size but persists no residual breadcrumb row."""
     # A pure add (no opposing legs, no close owed) opens the whole size but must
     # NOT persist a residual breadcrumb: re-opening it from a crash would bypass
     # the next sync's Pine re-evaluation and resurrect an unwanted entry. Only a
@@ -690,6 +723,7 @@ def __test_pure_add_writes_no_breadcrumb__(tmp_path):
 
 
 def __test_restart_replay_redispatches_residual_when_entry_absent__(tmp_path):
+    """Restart replay re-opens the residual when its entry row never persisted."""
     # Crash after the closes landed but before place_leg persisted the residual
     # entry row: the breadcrumb survives and replay re-opens the residual.
     store, ctx = _make_store(tmp_path)
@@ -703,6 +737,7 @@ def __test_restart_replay_redispatches_residual_when_entry_absent__(tmp_path):
 
 
 def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
+    """Restart replay only clears the breadcrumb when the residual entry row already exists."""
     # The residual entry row already exists (place_leg's persist-first write
     # landed): the entry path owns it, so replay must NOT re-open — only clear.
     store, ctx = _make_store(tmp_path)
@@ -718,6 +753,7 @@ def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
 
 
 def __test_reversal_clears_breadcrumb_on_definitive_entry_reject__(tmp_path):
+    """A definitively-rejected residual entry discharges the breadcrumb after the closes land."""
     # The residual place_leg is definitively rejected by the exchange after the
     # closes already landed: the dispatch path turns this into a non-halting skip,
     # so the breadcrumb must be discharged here — leaving it live would let a
@@ -743,6 +779,7 @@ def __test_reversal_clears_breadcrumb_on_definitive_entry_reject__(tmp_path):
 
 
 def __test_reversal_keeps_breadcrumb_on_ambiguous_entry_failure__(tmp_path):
+    """An ambiguous residual entry failure keeps the breadcrumb live for replay to reconcile."""
     # An ambiguous place_leg failure (disposition unknown) leaves the residual's
     # fate unknown: the breadcrumb MUST survive so restart_replay can reconcile
     # and re-dispatch / clear it. A definitive-reject clear must NOT swallow it.
@@ -762,6 +799,7 @@ def __test_reversal_keeps_breadcrumb_on_ambiguous_entry_failure__(tmp_path):
 
 
 def __test_reversal_clears_breadcrumb_on_definitive_close_reject__(tmp_path):
+    """A definitively-rejected FIFO close leg discharges the breadcrumb before any residual."""
     # A FIFO close leg is DEFINITIVELY rejected: the fan-out raises before the
     # residual place_leg ever runs. _dispatch_new turns this reject into a
     # non-halting skip for the entry, so the breadcrumb must be discharged here —
@@ -785,6 +823,7 @@ def __test_reversal_clears_breadcrumb_on_definitive_close_reject__(tmp_path):
 
 
 def __test_reversal_keeps_breadcrumb_on_ambiguous_close_failure__(tmp_path):
+    """An ambiguous FIFO close leg keeps the breadcrumb live for replay to reconcile."""
     # An ambiguous FIFO close leg (disposition unknown) leaves the close — and
     # thus a possibly-owed residual — unresolved: the breadcrumb MUST survive so
     # restart_replay reconciles it against the then-known leg state. A
@@ -806,6 +845,7 @@ def __test_reversal_keeps_breadcrumb_on_ambiguous_close_failure__(tmp_path):
 
 
 def __test_restart_replay_closes_opposing_legs_before_residual__(tmp_path):
+    """Residual replay FIFO-closes every still-live opposing leg before opening the residual."""
     # Crash in the window AFTER the breadcrumb but BEFORE the FIFO closes landed:
     # the opposing legs are still live and no close-leg rows were persisted, so
     # _replay_close_legs has nothing to re-dispatch. Replaying the residual on top
@@ -823,6 +863,7 @@ def __test_restart_replay_closes_opposing_legs_before_residual__(tmp_path):
 
 
 def __test_restart_replay_clears_breadcrumb_on_definitive_residual_reject__(tmp_path):
+    """A definitive residual reject in replay discharges the breadcrumb, not aborting startup."""
     # The residual re-open is definitively rejected during replay. restart_replay
     # runs inside the sync startup wrapper, which only catches
     # ExchangeConnectionError, so the reject must NOT propagate (that would abort
@@ -843,6 +884,7 @@ def __test_restart_replay_clears_breadcrumb_on_definitive_residual_reject__(tmp_
 
 
 def __test_restart_replay_keeps_breadcrumb_on_ambiguous_residual_failure__(tmp_path):
+    """An ambiguous residual re-open in replay keeps the breadcrumb live, not aborting startup."""
     # An ambiguous residual re-open (disposition unknown) during replay leaves the
     # open's fate unknown. The breadcrumb MUST survive so the next sync's replay
     # reconciles it, and the error must NOT propagate — propagating would abort
@@ -864,6 +906,7 @@ def __test_restart_replay_keeps_breadcrumb_on_ambiguous_residual_failure__(tmp_p
 # === Reversal residual-open per-sync drain (2.10) =======================
 
 def __test_drain_residual_opens_reconciles_breadcrumb_restart_left_stranded__(tmp_path):
+    """The per-sync drain re-opens a residual that one-shot restart replay left stranded."""
     # End-to-end: an ambiguous residual re-open during restart_replay leaves the
     # breadcrumb live (the 2.7 contract). restart_replay is one-shot — the engine
     # latches _one_way_replay_done after the first sync — so without a per-sync
@@ -893,6 +936,7 @@ def __test_drain_residual_opens_reconciles_breadcrumb_restart_left_stranded__(tm
 
 
 def __test_drain_residual_opens_keeps_breadcrumb_on_ambiguous_retry__(tmp_path):
+    """An ambiguous drain re-open keeps the breadcrumb live and never escapes the drain."""
     # The per-sync drain's own re-open is ALSO ambiguous: the breadcrumb must stay
     # live for the next sync to retry, and the error must NOT escape the drain —
     # halting on a recoverable round-trip would strand the bot. Mirrors
@@ -912,6 +956,7 @@ def __test_drain_residual_opens_keeps_breadcrumb_on_ambiguous_retry__(tmp_path):
 
 
 def __test_drain_residual_opens_discharges_when_entry_row_exists__(tmp_path):
+    """The drain discharges the breadcrumb without re-opening when the entry row already exists."""
     # The residual's persist-first entry row already landed (the live dispatch's
     # place_leg wrote it before the ambiguous send). The drain must DISCHARGE the
     # breadcrumb WITHOUT re-opening — the entry / recovery path owns the order, so a
@@ -929,6 +974,7 @@ def __test_drain_residual_opens_discharges_when_entry_row_exists__(tmp_path):
 
 
 def __test_drain_residual_opens_is_symbol_scoped__(tmp_path):
+    """The per-sync drain is symbol-scoped, leaving a different symbol's breadcrumb untouched."""
     # The per-sync drain is per-symbol (the engine owns one symbol). A live
     # breadcrumb for a DIFFERENT symbol must be left untouched — that symbol's own
     # engine drains it. (restart_replay is global; the per-sync drain is scoped.)

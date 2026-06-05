@@ -289,7 +289,9 @@ def __test_symbol_provider_detection_from_csv_content_no_hints__(tmp_path):
 
 
 def __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path):
-    """End-to-end: convert_to_ohlcv on a Databento CSV without filename hints
+    """convert_to_ohlcv on a hint-less Databento CSV picks symbol/provider from CSV content.
+
+    End-to-end: convert_to_ohlcv on a Databento CSV without filename hints
     must pick up symbol from the `symbol` column and provider from `ts_event`."""
     from pynecore.core.syminfo import SymInfo
     csv_path = tmp_path / "glbx-mdp3-20220103-20220104.ohlcv-1m.csv"

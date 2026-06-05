@@ -24,7 +24,9 @@ def main():
 
 
 def __test_lookahead_modes_historical_equivalence__(csv_reader, runner, log):
-    """In historical/backtest mode all three lookahead modes are functionally
+    """Historically off / last_closed / on agree on ``close`` (all give the last-closed bar).
+
+    In historical/backtest mode all three lookahead modes are functionally
     equivalent for ``close`` — they all produce the most-recently-closed
     security bar value. ``lookahead_on`` historically falls back to
     ``lookahead_off`` semantics (no developing exposure) because the
@@ -62,7 +64,9 @@ def __test_lookahead_modes_historical_equivalence__(csv_reader, runner, log):
 
 
 def __test_get_confirmed_time_on_live_returns_current_period__(log):
-    """Live ``Lookahead.ON`` targets the CONTAINING (developing) period so the
+    """Live ``Lookahead.ON`` targets the developing period; off/historical target the closed one.
+
+    Live ``Lookahead.ON`` targets the CONTAINING (developing) period so the
     subprocess steps into the open HTF bar. Historical/off/last_closed target
     the previously closed period.
     """
@@ -146,7 +150,9 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
 
 
 def __test_lookahead_on_setup_initializes_aggregator__(log):
-    """``lookahead_on`` is now supported: setup_security_states populates a
+    """setup_security_states gives a ``Lookahead.ON`` state an HTFAggregator, starting historical.
+
+    ``lookahead_on`` is now supported: setup_security_states populates a
     Lookahead.ON state with an HTFAggregator for the developing-bar
     transport. Historical mode keeps closed-only semantics until
     ``state.is_live`` flips at LIVE_TRANSITION.
@@ -181,7 +187,9 @@ def __test_lookahead_on_setup_initializes_aggregator__(log):
 
 
 def __test_cross_symbol_lookahead_on_sec_read_returns_na__(log):
-    """Cross-symbol HTF + ``Lookahead.ON``: the chart-side ``__sec_read__``
+    """Cross-symbol HTF + ``Lookahead.ON``: ``__sec_read__`` reads ``na`` mid-period.
+
+    Cross-symbol HTF + ``Lookahead.ON``: the chart-side ``__sec_read__``
     returns ``na`` (= the default passed in) while the containing HTF bar
     is open. On the first chart bar of a fresh HTF period (``new_period``
     flag set by ``__sec_signal__``) the read returns the just-closed
@@ -246,7 +254,9 @@ def __test_cross_symbol_lookahead_on_sec_read_returns_na__(log):
 
 
 def __test_live_htf_transport_covers_all_lookahead_modes__(log):
-    """All lookahead modes (OFF / LAST_CLOSED / ON) get an ``HTFAggregator``
+    """Same-symbol HTF gets an ``HTFAggregator`` for every lookahead mode; cross-symbol does not.
+
+    All lookahead modes (OFF / LAST_CLOSED / ON) get an ``HTFAggregator``
     on same-symbol HTF contexts — the live closed-bar transport drives every
     HTF security context, not just ``Lookahead.ON``. Cross-symbol HTF stays
     aggregator-less (chart OHLCV would be the wrong instrument); cross-symbol

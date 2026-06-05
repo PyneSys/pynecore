@@ -1,6 +1,7 @@
 from typing import cast, Protocol, Callable, Iterable, Any, Generator
 from typing import TYPE_CHECKING
 import ast
+import re
 import sys
 import os
 import pytest
@@ -104,6 +105,42 @@ def pytest_configure(config: pytest.Config):
         self._first_triggered = True
 
     psp._print_description = _print_description
+
+    # Only the first docstring line is shown as the spec summary in the test
+    # runner output. By convention every test docstring starts with a concise
+    # one-line summary, then a blank line, then the detailed description; the
+    # detail is documentation for readers and must never leak into the output.
+    # Trimming here (instead of relying on the blank line) keeps the output
+    # one line per test even when a docstring's first paragraph wraps.
+    #
+    # Docstrings are written in reStructuredText (Sphinx). Inline RST markup
+    # renders as literal noise in a terminal (``foo`` -> "``foo``",
+    # :meth:`bar` -> ":meth:`bar`"), so it is stripped for display only — the
+    # docstrings themselves stay valid RST. Order matters: strip cross-reference
+    # roles first (they use single backticks), then double, then single ticks.
+    _rst_role = re.compile(r':[\w+.-]+:`([^`]*)`')
+    _rst_double = re.compile(r'``([^`]+)``')
+    _rst_single = re.compile(r'`([^`]+)`')
+
+    def _clean_rst(text):
+        text = _rst_role.sub(r'\1', text)
+        text = _rst_double.sub(r'\1', text)
+        text = _rst_single.sub(r'\1', text)
+        return text
+
+    def _get_docstring_summary(report, test_name, parameters):
+        summary = getattr(report, "docstring_summary", [])
+        if summary:
+            return [_clean_rst(summary[0]) + parameters]
+        # No docstring: fall back to the prettified test name. Strip the
+        # category-indent '#' markers that pytest_collection_modifyitems embeds
+        # in the nodeid, otherwise they leak into the output as '########'.
+        name = re.sub(r'^[#\s]+', '', test_name)
+        name = re.sub(r'^test\s+', '', name)
+        name = name[:1].upper() + name[1:] if name else test_name
+        return [name]
+
+    psp._get_docstring_summary = _get_docstring_summary
 
     ### Set logging ###
 

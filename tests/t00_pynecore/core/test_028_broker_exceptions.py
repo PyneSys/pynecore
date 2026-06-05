@@ -29,16 +29,19 @@ from pynecore.core.broker.models import (
 # === AuthenticationError ===
 
 def __test_authentication_error_is_broker_error__():
+    """``AuthenticationError`` is a subclass of ``BrokerError``."""
     exc = AuthenticationError("Invalid API key")
     assert isinstance(exc, BrokerError)
 
 
 def __test_authentication_error_reason_defaults_to_message__():
+    """``AuthenticationError.reason`` defaults to the message when none is given."""
     exc = AuthenticationError("API key revoked")
     assert exc.reason == "API key revoked"
 
 
 def __test_authentication_error_reason_can_be_distinct__():
+    """An explicit ``reason`` differs from the message yet appears in ``str(exc)``."""
     exc = AuthenticationError(
         "Broker authentication failed at startup — cannot begin trading: bad key",
         reason="bad key",
@@ -50,6 +53,7 @@ def __test_authentication_error_reason_can_be_distinct__():
 # === InsufficientMarginError ===
 
 def __test_insufficient_margin_is_rejected_error__():
+    """``InsufficientMarginError`` is a rejected-order error carrying its ``order``."""
     order = ExchangeOrder(
         id="1", symbol="BTCUSDT", side="buy", order_type=OrderType.MARKET,
         qty=10.0, filled_qty=0.0, remaining_qty=10.0,
@@ -73,6 +77,7 @@ def __test_insufficient_margin_typed_match__():
 # === BracketAttachAfterFillRejectedError ===
 
 def __test_bracket_attach_after_fill_rejected_is_typed_subclass__():
+    """``BracketAttachAfterFillRejectedError`` subclasses ``ExchangeOrderRejectedError``."""
     exc = BracketAttachAfterFillRejectedError(
         "rejected",
         position_deal_id='deal-1', position_coid='coid-1',
@@ -83,7 +88,9 @@ def __test_bracket_attach_after_fill_rejected_is_typed_subclass__():
 
 
 def __test_bracket_attach_after_fill_rejected_carries_position_context__():
-    """The sync engine reads these fields to build the defensive
+    """Position-context fields survive construction unchanged.
+
+    The sync engine reads these fields to build the defensive
     CloseIntent — they must survive construction unchanged."""
     exc = BracketAttachAfterFillRejectedError(
         "rejected",
@@ -100,7 +107,9 @@ def __test_bracket_attach_after_fill_rejected_carries_position_context__():
 
 
 def __test_bracket_attach_after_fill_rejected_from_entry_optional__():
-    """``from_entry`` is informational — recovery dispatches do not
+    """``from_entry`` defaults to None and is omittable.
+
+    ``from_entry`` is informational — recovery dispatches do not
     require it (CloseIntent has no from_entry field)."""
     exc = BracketAttachAfterFillRejectedError(
         "rejected",
@@ -111,7 +120,9 @@ def __test_bracket_attach_after_fill_rejected_from_entry_optional__():
 
 
 def __test_bracket_attach_after_fill_rejected_position_deal_id_optional__():
-    """Cross-broker recovery key is ``position_coid``; ``position_deal_id``
+    """``position_deal_id`` is omittable, defaulting to None.
+
+    Cross-broker recovery key is ``position_coid``; ``position_deal_id``
     is plugin-specific (Capital.com deal id, IB permId, Bybit orderId) and
     may not exist for every plugin — must be omittable."""
     exc = BracketAttachAfterFillRejectedError(
@@ -123,7 +134,9 @@ def __test_bracket_attach_after_fill_rejected_position_deal_id_optional__():
 
 
 def __test_bracket_attach_after_fill_rejected_optional_diagnostic_fields__():
-    """Plugins may surface filled qty + error code/message + exit id for
+    """Optional diagnostic fields carry through when set, else default to None.
+
+    Plugins may surface filled qty + error code/message + exit id for
     operator diagnostics. All optional, default to None."""
     exc = BracketAttachAfterFillRejectedError(
         "rejected",
@@ -151,8 +164,10 @@ def __test_bracket_attach_after_fill_rejected_optional_diagnostic_fields__():
 # === BracketAttachRejectContext ===
 
 def __test_bracket_attach_reject_context_from_exit_intent__():
-    """For an ExitIntent the entry id falls back to ``intent.from_entry``
-    when the exception omits it."""
+    """For an ExitIntent the entry id falls back to ``intent.from_entry``.
+
+    The fallback applies when the exception omits the entry id.
+    """
     from pynecore.core.broker.models import BracketAttachRejectContext, ExitIntent
     err = BracketAttachAfterFillRejectedError(
         "rejected",
@@ -172,8 +187,10 @@ def __test_bracket_attach_reject_context_from_exit_intent__():
 
 
 def __test_bracket_attach_reject_context_from_entry_intent__():
-    """For an EntryIntent the entry id falls back to ``intent.pine_id``
-    when the exception omits it."""
+    """For an EntryIntent the entry id falls back to ``intent.pine_id``.
+
+    The fallback applies when the exception omits the entry id.
+    """
     from pynecore.core.broker.models import (
         BracketAttachRejectContext, EntryIntent, OrderType,
     )
@@ -191,7 +208,9 @@ def __test_bracket_attach_reject_context_from_entry_intent__():
 
 
 def __test_bracket_attach_reject_context_exception_from_entry_wins__():
-    """When the exception supplies ``from_entry`` it overrides the
+    """Exception-supplied ``from_entry`` overrides the intent fallback.
+
+    When the exception supplies ``from_entry`` it overrides the
     intent fallback (plugin knows best, e.g. partial-fill remainder)."""
     from pynecore.core.broker.models import BracketAttachRejectContext, ExitIntent
     err = BracketAttachAfterFillRejectedError(
@@ -209,7 +228,9 @@ def __test_bracket_attach_reject_context_exception_from_entry_wins__():
 
 
 def __test_bracket_attach_reject_context_carries_optional_diagnostics__():
-    """Optional fields pass through ``getattr(..., None)`` — when set on
+    """Optional diagnostic fields set on the exception show up on the context.
+
+    Optional fields pass through ``getattr(..., None)`` — when set on
     the exception they show up on the context."""
     from pynecore.core.broker.models import BracketAttachRejectContext, ExitIntent
     err = BracketAttachAfterFillRejectedError(
@@ -233,7 +254,9 @@ def __test_bracket_attach_reject_context_carries_optional_diagnostics__():
 # === BracketAttachRejectContext (de)serialize ===
 
 def __test_bracket_attach_reject_context_roundtrip__():
-    """Full field set round-trips losslessly through to_dict/from_dict —
+    """Full field set round-trips losslessly through to_dict/from_dict.
+
+    Full field set round-trips losslessly through to_dict/from_dict —
     the path used by BrokerStore extras serialization."""
     from pynecore.core.broker.models import BracketAttachRejectContext
     import json
@@ -257,7 +280,9 @@ def __test_bracket_attach_reject_context_roundtrip__():
 
 
 def __test_bracket_attach_reject_context_from_dict_rejects_missing_required__():
-    """Required-field absence raises ValueError so the engine can
+    """from_dict raises ValueError when a required field is missing.
+
+    Required-field absence raises ValueError so the engine can
     log+skip instead of crashing."""
     from pynecore.core.broker.models import BracketAttachRejectContext
     import pytest as _pytest
@@ -281,6 +306,7 @@ def __test_bracket_attach_reject_context_from_dict_rejects_wrong_type__():
 
 
 def __test_bracket_attach_reject_context_from_dict_rejects_non_dict__():
+    """``from_dict`` raises ValueError when given a non-dict payload."""
     from pynecore.core.broker.models import BracketAttachRejectContext
     import pytest as _pytest
     with _pytest.raises(ValueError):
@@ -290,7 +316,9 @@ def __test_bracket_attach_reject_context_from_dict_rejects_non_dict__():
 # === PendingDefensiveClose ===
 
 def __test_pending_defensive_close_roundtrip__():
-    """Full marker round-trips through to_extras_dict / from_extras_dict
+    """Full marker round-trips through to_extras_dict / from_extras_dict.
+
+    Full marker round-trips through to_extras_dict / from_extras_dict
     including the nested context."""
     from pynecore.core.broker.models import (
         BracketAttachRejectContext, PendingDefensiveClose,
@@ -314,7 +342,9 @@ def __test_pending_defensive_close_roundtrip__():
 
 
 def __test_pending_defensive_close_close_order_ref_may_be_none__():
-    """close_order_ref is allowed to be None (position-attached close
+    """close_order_ref is allowed to be None and survives the round-trip.
+
+    close_order_ref is allowed to be None (position-attached close
     plugins never surface a ref)."""
     from pynecore.core.broker.models import (
         BracketAttachRejectContext, PendingDefensiveClose,
@@ -334,7 +364,9 @@ def __test_pending_defensive_close_close_order_ref_may_be_none__():
 
 
 def __test_pending_defensive_close_from_extras_dict_rejects_malformed__():
-    """Missing/incorrect fields raise ValueError so the engine's startup
+    """from_extras_dict raises ValueError on malformed input.
+
+    Missing/incorrect fields raise ValueError so the engine's startup
     replay can log+skip instead of crashing."""
     from pynecore.core.broker.models import PendingDefensiveClose
     import pytest as _pytest
@@ -361,6 +393,7 @@ def __test_pending_defensive_close_from_extras_dict_rejects_malformed__():
 # === AuthenticationFailedEvent ===
 
 def __test_authentication_failed_event_is_broker_event__():
+    """``AuthenticationFailedEvent`` is a ``BrokerEvent`` exposing its ``reason``."""
     evt = AuthenticationFailedEvent(reason="Invalid API key")
     assert isinstance(evt, BrokerEvent)
     assert evt.reason == "Invalid API key"
@@ -378,16 +411,19 @@ def _map(raw: Exception):
 
 
 def __test_map_exception_maps_connection_error__():
+    """``_map_exception`` maps a stdlib ``ConnectionError`` to ``ExchangeConnectionError``."""
     mapped = _map(ConnectionError("peer closed"))
     assert isinstance(mapped, ExchangeConnectionError)
     assert "peer closed" in str(mapped)
 
 
 def __test_map_exception_returns_none_for_unknown__():
+    """``_map_exception`` returns None for an unrecognised exception type."""
     assert _map(ValueError("no idea")) is None
 
 
 def __test_map_exception_connection_error_without_message__():
+    """A message-less ``ConnectionError`` maps to a "Connection lost" ExchangeConnectionError."""
     mapped = _map(ConnectionError())
     assert isinstance(mapped, ExchangeConnectionError)
     assert str(mapped) == "Connection lost"
@@ -396,7 +432,9 @@ def __test_map_exception_connection_error_without_message__():
 # === Defensive-close plugin contract ===
 
 def __test_broker_plugin_default_residuals_is_empty_list__():
-    """Plugins that never raise BracketAttachAfterFillRejectedError
+    """Default get_residual_orders_after_bracket_attach_reject returns [].
+
+    Plugins that never raise BracketAttachAfterFillRejectedError
     (or do but have no residuals to cancel — Capital.com's
     full-row position-attached bracket) inherit a no-op default."""
     from pynecore.core.plugin.broker import BrokerPlugin
@@ -412,7 +450,9 @@ def __test_broker_plugin_default_residuals_is_empty_list__():
 
 
 def __test_broker_plugin_default_cancel_broker_order_ref_raises__():
-    """The default ``cancel_broker_order_ref`` raises NotImplementedError
+    """Default ``cancel_broker_order_ref`` raises NotImplementedError.
+
+    The default ``cancel_broker_order_ref`` raises NotImplementedError
     — plugins that return non-empty residual lists MUST override."""
     import asyncio
     from pynecore.core.plugin.broker import BrokerPlugin
@@ -427,7 +467,9 @@ def __test_broker_plugin_default_cancel_broker_order_ref_raises__():
 
 
 def __test_broker_plugin_idempotency_contract_documented__():
-    """The plugin contract for ``cancel_broker_order_ref`` is part of
+    """``cancel_broker_order_ref`` docstring documents the idempotency contract.
+
+    The plugin contract for ``cancel_broker_order_ref`` is part of
     the docstring — engine recovery flows rely on plugins normalising
     not-found / already-cancelled / already-filled exchange responses
     to a successful no-op."""

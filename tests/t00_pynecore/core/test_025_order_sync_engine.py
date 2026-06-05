@@ -296,6 +296,7 @@ def _fill_event(side: str, qty: float, price: float, *,
 
 
 def __test_new_entry_dispatches_execute_entry__():
+    """A fresh entry intent dispatches ``execute_entry`` and registers active tracking."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -310,6 +311,7 @@ def __test_new_entry_dispatches_execute_entry__():
 
 
 def __test_entry_exchange_reject_does_not_halt_and_retries__():
+    """An entry exchange reject does not halt the bot; the next sync re-attempts."""
     # An exchange reject on an ENTRY (e.g. a risk-engine veto / insufficient
     # funds that the plugin cannot pre-empt pre-flight) must NOT kill the bot.
     # The engine drops the signal for this sync and re-evaluates next bar.
@@ -333,6 +335,7 @@ def __test_entry_exchange_reject_does_not_halt_and_retries__():
 
 
 def __test_entry_reject_same_bar_retry_bumps_retry_seq__():
+    """A same-bar retry after a reject keeps ``bar_ts_ms`` but bumps ``retry_seq`` to 1."""
     # A same-bar retry after an exchange reject must mint a FRESH COID: same
     # bar_ts_ms (the bar has not advanced) but a bumped retry_seq so it does
     # not collide with the spent COID in the exchange idempotency cache.
@@ -352,6 +355,7 @@ def __test_entry_reject_same_bar_retry_bumps_retry_seq__():
 
 
 def __test_entry_reject_later_bar_reemit_mints_fresh_anchor__():
+    """A later-bar re-emit after a reject is stamped with the current bar and ``retry_seq=0``."""
     # When the entry is rejected on one bar but the strategy only re-emits it
     # on a LATER bar, the bumped reject anchor must NOT carry over: the new
     # bar's order is a fresh evaluation and must be stamped with the current
@@ -376,6 +380,7 @@ def __test_entry_reject_later_bar_reemit_mints_fresh_anchor__():
 
 
 def __test_entry_reject_same_bar_retry_bumps_retry_seq_with_store__(tmp_path):
+    """Store-backed same-bar reject retry still mints ``retry_seq=1`` despite replay re-seed."""
     # Same as ``__test_entry_reject_same_bar_retry_bumps_retry_seq__`` but with
     # a persisted ``store_ctx`` configured — the normal live mode. The bumped
     # reject anchor is intentionally never journaled (a restart must
@@ -426,6 +431,7 @@ def __test_entry_reject_same_bar_retry_bumps_retry_seq_with_store__(tmp_path):
 
 
 def __test_entry_reject_later_bar_reemit_mints_fresh_anchor_with_store__(tmp_path):
+    """Store-backed later-bar re-emit prunes the stale bump and stamps the current bar."""
     # Store-backed twin of
     # ``__test_entry_reject_later_bar_reemit_mints_fresh_anchor__``: once the
     # bar advances, the re-seed step must prune the stale bump (memory +
@@ -476,6 +482,7 @@ def __test_entry_reject_later_bar_reemit_mints_fresh_anchor_with_store__(tmp_pat
 
 
 def __test_entry_reject_then_materialized_retry_survives_restart__(tmp_path):
+    """A materialised ``retry_seq=1`` entry persists its anchor so a restart rebuilds its COID."""
     # A same-bar retry after an exchange reject mints retry_seq=1. The bumped
     # anchor is deliberately NOT journaled at build time (a non-materialised
     # retry must re-evaluate fresh after a restart). But once the retry
@@ -539,6 +546,7 @@ def __test_entry_reject_then_materialized_retry_survives_restart__(tmp_path):
 
 
 def __test_entry_reject_then_parked_retry_survives_restart__(tmp_path):
+    """A parked ``retry_seq=1`` entry journals its anchor so a restart rebuilds the COID."""
     # Twin of the clean-success case for the unknown-disposition (park) path:
     # the same-bar retry's execute_entry ends with OrderDispositionUnknownError,
     # so the order MAY be live at the broker under the retry_seq=1 COID.
@@ -620,6 +628,7 @@ def _restart_identity() -> "RunIdentity":  # noqa: F821 - local import in caller
 
 
 def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
+    """On restart with no journal anchor, the scan adopts the live entry order's COID."""
     # The crash window Option C closes: a same-bar reject DELETEs the
     # retry_seq=0 journal row, the bumped retry_seq=1 materialises at the
     # broker, then the process crashes BEFORE the bump is journaled. On
@@ -671,6 +680,7 @@ def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
 
 
 def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
+    """The restart scan ignores a foreign run_tag order and mints fresh for a brand-new entry."""
     # A live order from a DIFFERENT run_tag must be ignored, and a brand-new
     # entry with no live order must mint a fresh current-bar retry_seq=0 — the
     # scan only adopts this run's own entry orders.
@@ -701,6 +711,7 @@ def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
 
 
 def __test_restart_skips_ambiguous_live_entry_orders__(tmp_path):
+    """Two live entry orders with distinct ``(bar, retry_seq)`` are ambiguous, so no adoption."""
     # Two live orders for the same entry pid_hash with DISTINCT
     # (bar_ts_ms, retry_seq) tuples are ambiguous — the engine never produces
     # two live working orders for one entry, so adoption is skipped and the
@@ -739,6 +750,7 @@ def __test_restart_skips_ambiguous_live_entry_orders__(tmp_path):
 
 
 def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
+    """Both-set entry legs share one ``(bar, retry_seq)`` tuple, so the anchor is adopted."""
     # A both-set entry's KIND_ENTRY (LIMIT) and KIND_ENTRY_STOP (MARKET) legs
     # share the SAME pinned (bar_ts_ms, retry_seq), so two live legs collapse
     # to one distinct tuple and are NOT treated as ambiguous — the anchor is
@@ -779,6 +791,7 @@ def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
 
 
 def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):
+    """A scan ``get_open_orders`` failure skips the sync and retries adoption next sync."""
     # If get_open_orders fails transiently during the scan, the sync is
     # skipped (no fresh dispatch can mint a colliding COID) and the scan flag
     # stays unset so the next sync retries. Once the broker recovers and the
@@ -816,6 +829,7 @@ def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):
 
 
 def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
+    """A higher same-bar live retry is adopted over a lower journaled anchor."""
     # Double-bump crash: the journal holds retry_seq=1, but a SECOND same-bar
     # reject bumped to retry_seq=2 and that order ACKed at the broker before
     # the crash. The same-bar higher live retry is authoritative over the
@@ -848,6 +862,7 @@ def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
 
 
 def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
+    """A cross-bar higher live retry is an orphan; the journal anchor stays authoritative."""
     # A higher live retry on a DIFFERENT bar than the journal anchor is a shape
     # the engine never produces (a bar advance resets retry to 0). It is treated
     # as an orphan: the journal anchor stays authoritative, no adoption.
@@ -879,6 +894,7 @@ def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
 
 
 def __test_entry_insufficient_margin_does_not_halt__():
+    """An ``InsufficientMarginError`` on an entry is non-fatal, same as a plain reject."""
     # InsufficientMarginError is a typed, non-terminal ExchangeOrderRejectedError
     # subclass — same survive-and-retry handling as a plain reject.
     b = MockBroker()
@@ -892,6 +908,7 @@ def __test_entry_insufficient_margin_does_not_halt__():
 
 
 def __test_exit_exchange_reject_still_halts__():
+    """An exchange reject on a protective exit surfaces and halts, unlike an entry reject."""
     # The non-fatal handling is ENTRY-only. A plain exchange reject on a
     # protective EXIT is a real exposure (the position is open, the bracket
     # the broker refused leaves it unprotected) and must surface, not be
@@ -908,6 +925,7 @@ def __test_exit_exchange_reject_still_halts__():
 
 
 def __test_unchanged_entry_is_not_redispatched__():
+    """An unchanged entry across two syncs is dispatched only once."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -919,6 +937,7 @@ def __test_unchanged_entry_is_not_redispatched__():
 
 
 def __test_modified_entry_dispatches_modify_entry__():
+    """A changed entry limit dispatches ``modify_entry`` with the envelope identity preserved."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -938,6 +957,7 @@ def __test_modified_entry_dispatches_modify_entry__():
 
 
 def __test_removed_entry_dispatches_cancel__():
+    """An entry removed from the position dict dispatches a cancel and clears tracking."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -953,7 +973,9 @@ def __test_removed_entry_dispatches_cancel__():
 
 
 def __test_cancel_all_orders_dispatches_cancel_for_every_active_intent__():
-    """``Pine strategy.cancel_all()`` clears the position dicts; the engine
+    """``cancel_all()`` clears the position dicts and dispatches a cancel per tracked intent.
+
+    ``Pine strategy.cancel_all()`` clears the position dicts; the engine
     must then dispatch one cancel per previously tracked intent. Regression
     for the broker-mode crash where ``cancel_all()`` touched a non-existent
     ``orderbook`` attribute and bailed before any cancel went out."""
@@ -976,6 +998,7 @@ def __test_cancel_all_orders_dispatches_cancel_for_every_active_intent__():
 
 
 def __test_close_intent_dispatches_execute_close__():
+    """A Pine close order dispatches ``execute_close`` with the opposite side."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
@@ -991,6 +1014,7 @@ def __test_close_intent_dispatches_execute_close__():
 
 
 def __test_exit_with_prices_dispatches_execute_exit__():
+    """An exit with explicit TP/SL prices dispatches ``execute_exit`` carrying those levels."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.exit_orders[("TP", "L")] = _exit_order(
@@ -1008,6 +1032,7 @@ def __test_exit_with_prices_dispatches_execute_exit__():
 
 
 def __test_exit_with_ticks_without_entry_is_deferred__():
+    """A tick-based exit with no entry fill yet is deferred, never reaching the plugin."""
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
     pos.exit_orders[("TP", "L")] = _exit_order(
@@ -1023,6 +1048,7 @@ def __test_exit_with_ticks_without_entry_is_deferred__():
 
 
 def __test_entry_fill_resolves_deferred_exit__():
+    """A long entry fill resolves the deferred tick exit to absolute TP-above/SL-below prices."""
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
     pos.exit_orders[("TP", "L")] = _exit_order(
@@ -1046,6 +1072,7 @@ def __test_entry_fill_resolves_deferred_exit__():
 
 
 def __test_short_entry_fill_reverses_tick_direction__():
+    """A short entry fill resolves tick exits with TP below and SL above the entry price."""
     b = MockBroker()
     engine, pos = _mk_engine(b, mintick=1.0)
     pos.exit_orders[("TP", "S")] = _exit_order(
@@ -1106,6 +1133,7 @@ def __test_pyramiding_two_tick_exits_same_from_entry_no_collision__():
 
 
 def __test_interceptor_rejects_intent__():
+    """A registered interceptor that rejects an intent blocks dispatch and tracking."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -1121,6 +1149,7 @@ def __test_interceptor_rejects_intent__():
 
 
 def __test_interceptor_modifies_qty__():
+    """A registered interceptor that halves the qty changes the dispatched intent's quantity."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
@@ -1141,6 +1170,7 @@ def __test_interceptor_modifies_qty__():
 
 
 def __test_run_event_stream_queues_all_events__():
+    """``run_event_stream`` queues every watched event so the next sync drains them end-to-end."""
     b = MockBroker()
     b.streamed_events = [
         _fill_event("buy", qty=1.0, price=50_000.0,
@@ -1162,6 +1192,7 @@ def __test_run_event_stream_queues_all_events__():
 
 
 def __test_run_event_stream_handles_not_implemented__():
+    """``run_event_stream`` returns cleanly when ``watch_orders`` raises NotImplementedError."""
     b = MockBroker()
     b.watch_orders_impl = "not_implemented"
     engine, pos = _mk_engine(b)
@@ -1171,7 +1202,9 @@ def __test_run_event_stream_handles_not_implemented__():
 
 
 def __test_run_event_stream_handles_async_gen_not_implemented__():
-    """A plugin's ``watch_orders`` may raise NotImplementedError from the
+    """NotImplementedError from the async-gen body is handled like one raised from the outer call.
+
+    A plugin's ``watch_orders`` may raise NotImplementedError from the
     generator body rather than from the outer call — the engine must treat
     both the same way."""
     b = MockBroker()
@@ -1212,7 +1245,9 @@ def __test_dispatch_passes_deterministic_client_order_id__():
 
 
 def __test_retry_within_same_bar_reuses_client_order_id__():
-    """A second dispatch attempt in the same bar yields the same CO-ID so the
+    """A second dispatch attempt in the same bar yields the same CO-ID so the exchange can dedup it.
+
+    A second dispatch attempt in the same bar yields the same CO-ID so the
     exchange can dedup the duplicate."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
@@ -1337,6 +1372,7 @@ def __test_verify_pending_connection_error_keeps_pending__():
 
 
 def __test_reconcile_adopts_exchange_position_size__():
+    """``reconcile`` adopts the exchange position's size, price, and PnL over the local view."""
     b = MockBroker()
     b.position = ExchangePosition(
         symbol=SYMBOL, side="long", size=2.0, entry_price=50_000.0,
@@ -1408,7 +1444,9 @@ def __test_reconcile_clears_open_trades_when_exchange_flat__():
 
 
 def __test_reconcile_pending_defensive_close_within_grace_does_not_halt__():
-    """A fresh pending marker (pending_since within the grace window)
+    """A fresh pending marker within the grace window does NOT halt — the close FILL is in flight.
+
+    A fresh pending marker (pending_since within the grace window)
     must NOT halt — the close FILL is legitimately in flight."""
     b = MockBroker()
     b.position = None
@@ -1433,7 +1471,9 @@ def __test_reconcile_pending_defensive_close_within_grace_does_not_halt__():
 
 
 def __test_reconcile_pending_defensive_close_past_grace_halts__():
-    """A pending marker older than the grace window halts the run when
+    """A past-grace pending marker halts the run when the broker still reports the position open.
+
+    A pending marker older than the grace window halts the run when
     the broker still reports the position open — the FILL we are
     waiting on is not coming and the close was not silently completed
     server-side."""
@@ -1472,7 +1512,9 @@ def __test_reconcile_pending_defensive_close_past_grace_halts__():
 
 
 def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
-    """A pending marker past the grace window does NOT halt when the
+    """A past-grace pending marker does NOT halt when the broker snapshot already shows flat.
+
+    A pending marker past the grace window does NOT halt when the
     broker snapshot already shows the position flat — the close did
     settle, only the FILL event has not yet been queued (long restart
     gap, poll-based broker)."""
@@ -1515,7 +1557,9 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
 
 
 def __test_reconcile_pending_defensive_close_oldest_drives_halt__():
-    """When multiple markers exist, the OLDEST one drives the halt
+    """When multiple stale markers exist, the OLDEST one drives the halt message.
+
+    When multiple markers exist, the OLDEST one drives the halt
     message — so operator triage starts from the longest-stuck close."""
     from pynecore.core.broker.sync_engine import (
         DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
@@ -1563,7 +1607,9 @@ def __test_reconcile_pending_defensive_close_oldest_drives_halt__():
 
 
 def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_reduced__():
-    """With pyramiding/multi-entry, a successful defensive close for one
+    """Past-grace marker settles when pyramiding-reduced broker size matches pre-close minus qty.
+
+    With pyramiding/multi-entry, a successful defensive close for one
     entry reduces — but does not flatten — the netted aggregate position.
     The stale-grace path must accept "broker matches engine's pre-close
     view minus the closed entry's qty" as proof the close filled, instead
@@ -1617,7 +1663,9 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_
 
 
 def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__():
-    """Pyramiding extension must NOT accept arbitrary leftover qty. If
+    """Pyramiding still halts when the broker's leftover qty mismatches the aggregate marker qty.
+
+    Pyramiding extension must NOT accept arbitrary leftover qty. If
     the broker's reduction does not match the stale markers' aggregate
     qty, the run must still halt — the deviation could mean the close
     did not fill or an unrelated fill arrived."""
@@ -1656,7 +1704,9 @@ def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__()
 
 
 def __test_no_fifo_defensive_close_fill_preserves_pyramiding_size__():
-    """When the engine has an adopted aggregate position (size != 0, no
+    """No-FIFO defensive-close FILL on an adopted aggregate shrinks the position by qty, not flat.
+
+    When the engine has an adopted aggregate position (size != 0, no
     open_trades) — for example pyramiding after a restart — and a
     defensive close FILL for one entry arrives via the no-FIFO routing
     branch, the in-memory position must shrink by the close's qty rather
@@ -1702,7 +1752,9 @@ def __test_no_fifo_defensive_close_fill_preserves_pyramiding_size__():
 
 
 def __test_no_fifo_defensive_close_fill_flattens_single_entry__():
-    """The original single-entry no-FIFO defensive close path must still
+    """Single-entry no-FIFO defensive close FILL still flattens the position to zero.
+
+    The original single-entry no-FIFO defensive close path must still
     flatten the position. With ``pos.size == 1.0`` and a 1.0 close FILL,
     the signed-delta logic naturally lands at zero (regression guard for
     the historic flatten behaviour)."""
@@ -1739,7 +1791,9 @@ def __test_no_fifo_defensive_close_fill_flattens_single_entry__():
 
 
 def __test_reconcile_plugin_override_grace_window__():
-    """A plugin can extend the grace window via the
+    """A plugin can extend the grace window via ``defensive_close_resolution_grace_s``.
+
+    A plugin can extend the grace window via the
     ``defensive_close_resolution_grace_s`` class attribute — useful for
     slow venues with multi-minute post-trade reporting latency."""
     from pynecore.core.broker.sync_engine import (
@@ -1829,7 +1883,9 @@ def __test_periodic_reconcile_clears_state_on_external_flatten__():
 
 
 def __test_periodic_reconcile_does_not_adopt_size_increase__():
-    """Mid-operation reconcile MUST NOT adopt a size increase the engine
+    """Periodic reconcile MUST NOT adopt a size increase not yet seen via ``record_fill``.
+
+    Mid-operation reconcile MUST NOT adopt a size increase the engine
     has not yet seen via ``record_fill``.
 
     Race scenario: a market entry the engine just dispatched fills
@@ -1884,7 +1940,9 @@ def __test_sync_skips_periodic_reconcile_connection_error__():
 
 
 def __test_periodic_reconcile_skips_clear_while_close_in_flight__():
-    """Reconcile must not clear the position while a bot-dispatched close
+    """Periodic reconcile must not clear the position while a bot-dispatched close is in flight.
+
+    Reconcile must not clear the position while a bot-dispatched close
     is in flight.
 
     Race scenario: bar N dispatches ``execute_close``; the broker flattens
@@ -1921,8 +1979,7 @@ def __test_periodic_reconcile_skips_clear_while_close_in_flight__():
 
 
 def __test_reconcile_does_not_warn_on_tracked_orders_missing_from_exchange__(caplog):
-    """Regression: ``reconcile()`` must not diff ``_order_mapping`` against
-    ``get_open_orders``.
+    """Regression: ``reconcile()`` must not diff ``_order_mapping`` against ``get_open_orders``.
 
     On brokers like Capital.com a Pine entry becomes an exchange-side
     *position* (not a working order) and the bracket lives as
@@ -2412,7 +2469,9 @@ def _closing_fill_event(side: str, qty: float, price: float, *,
 
 
 def __test_natural_close_cleans_entry_and_exit_intents__():
-    """SL fill that brings position size to 0 must wipe the entry
+    """SL fill to flat wipes the entry intent, exit intent, and matching Pine-side dict entries.
+
+    SL fill that brings position size to 0 must wipe the entry
     intent, the exit intent, and the matching Pine-side dict entries —
     otherwise Pine re-emits a stale exit on the next bar and the engine
     fires a pointless ``modify_exit`` against a closed position.
@@ -2459,7 +2518,9 @@ def __test_natural_close_cleans_entry_and_exit_intents__():
 
 
 def __test_natural_close_partial_fill_does_not_cleanup__():
-    """A partial closing fill that does NOT bring size to 0 must keep
+    """A partial closing fill that does not reach flat keeps the entry/exit intents intact.
+
+    A partial closing fill that does NOT bring size to 0 must keep
     the entry/exit intents intact so the remainder can still close.
     """
     b = MockBroker()
@@ -2525,7 +2586,9 @@ def _bracket_reject_error(
 
 
 def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
-    """The plugin raises :class:`BracketAttachAfterFillRejectedError`
+    """Bracket attach reject dispatches a defensive close, skips the exit intent, and does not halt.
+
+    The plugin raises :class:`BracketAttachAfterFillRejectedError`
     after a parent fill committed but the protective bracket attach was
     rejected. The sync engine must:
 
@@ -2563,7 +2626,9 @@ def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
 
 
 def __test_bracket_reject_short_position_close_side_is_buy__():
-    """Symmetry guard: a short parent must be closed with a 'buy'
+    """Bracket-reject defensive close of a short parent uses a 'buy' market order.
+
+    Symmetry guard: a short parent must be closed with a 'buy'
     market order. Easy to flip accidentally because the *exit* intent's
     side ('buy' for short SL/TP) and the *position* side ('sell') are
     inverses."""
@@ -2593,7 +2658,9 @@ def __test_bracket_reject_short_position_close_side_is_buy__():
 
 
 def __test_bracket_reject_defensive_close_timeout_does_not_halt__():
-    """Defensive close itself parks (timeout) — at worst the position
+    """A parked (timed-out) defensive close does not escalate to a halt.
+
+    Defensive close itself parks (timeout) — at worst the position
     stays open until the next reconcile. Don't escalate to halt."""
     b = MockBroker()
     b.raise_on_next_exit = _bracket_reject_error()
@@ -2621,7 +2688,9 @@ def __test_bracket_reject_defensive_close_timeout_does_not_halt__():
 
 
 def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
-    """Defensive close fails with an unexpected exception (not park, not
+    """An unexpected defensive-close failure escalates to manual intervention and records the halt.
+
+    Defensive close fails with an unexpected exception (not park, not
     skip, not already a manual-intervention) — escalate to manual
     intervention and record the halt so the runner stops gracefully."""
     b = MockBroker()
@@ -2647,7 +2716,9 @@ def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
 def __test_bracket_reject_defensive_close_stamps_natural_close_on_entry__(
         tmp_path,
 ):
-    """After a successful defensive close, the parent entry row must
+    """A successful defensive close stamps ``extras['natural_close_at']`` on the parent entry row.
+
+    After a successful defensive close, the parent entry row must
     be stamped with ``extras['natural_close_at']`` so the plugin-side
     reconciler skips missing-pending accounting.
 
@@ -2720,7 +2791,9 @@ def __test_bracket_reject_defensive_close_stamps_natural_close_on_entry__(
 def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
         tmp_path,
 ):
-    """When the defensive close itself parks (timeout), the position
+    """A parked (timed-out) defensive close does NOT stamp ``natural_close_at`` on the parent.
+
+    When the defensive close itself parks (timeout), the position
     may still be open — DO NOT stamp ``natural_close_at`` because
     that would mask a legitimately stuck position from the reconciler.
     """
@@ -2779,7 +2852,9 @@ def __test_bracket_reject_defensive_close_park_does_not_stamp_natural_close__(
 def __test_bracket_reject_defensive_close_pending_state_set_before_dispatch__(
         tmp_path,
 ):
-    """The engine arms a :class:`PendingDefensiveClose` marker on the
+    """:class:`PendingDefensiveClose` is armed on the parent entry id before the close dispatch.
+
+    The engine arms a :class:`PendingDefensiveClose` marker on the
     parent entry id BEFORE the synthetic close dispatches.
 
     This is the load-bearing invariant of the defensive-close pending
@@ -2854,7 +2929,9 @@ def __test_bracket_reject_defensive_close_pending_state_set_before_dispatch__(
 def __test_bracket_reject_defensive_close_cleanup_deferred_to_fill__(
         tmp_path,
 ):
-    """``_active_intents`` + Pine ``entry_orders`` / ``exit_orders``
+    """Parent intent and Pine order state survive the defensive close; cleanup defers to fill.
+
+    ``_active_intents`` + Pine ``entry_orders`` / ``exit_orders``
     state for the parent stay PUT immediately after the defensive
     close dispatches — cleanup is deferred to the FILL handler so
     :meth:`reconcile` cannot misclassify the flat broker snapshot as
@@ -2923,7 +3000,9 @@ def __test_bracket_reject_defensive_close_cleanup_deferred_to_fill__(
 def __test_bracket_reject_skips_sibling_exit_for_same_from_entry_in_diff_loop__(
         tmp_path,
 ):
-    """When :meth:`_diff_and_dispatch` iterates a precomputed ``new_map``
+    """Bracket-reject recovery skips sibling exits for the same ``from_entry`` in the diff loop.
+
+    When :meth:`_diff_and_dispatch` iterates a precomputed ``new_map``
     and the first bracket exit for an entry triggers the
     :class:`BracketAttachAfterFillRejectedError` recovery, sibling exits
     that reference the same ``from_entry`` later in the same loop MUST
@@ -3017,7 +3096,9 @@ def __test_bracket_reject_skips_sibling_exit_for_same_from_entry_in_diff_loop__(
 
 
 def __test_bracket_reject_marker_survives_apply_async_events_to_sync__(tmp_path):
-    """The ``_defensively_closed_entries_this_sync`` guard must remain
+    """The defensively-closed-entries guard survives the apply_async_events -> script -> sync cycle.
+
+    The ``_defensively_closed_entries_this_sync`` guard must remain
     valid across the apply_async_events -> script -> sync cycle.
 
     Scenario: a tick-deferred bracket exit waits for the parent entry
@@ -3139,7 +3220,9 @@ def _bracket_reject_scenario(tmp_path, mock_broker=None):
 
 
 def __test_defensive_close_fill_runs_deferred_cleanup__(tmp_path):
-    """When the defensive close FILL arrives via the WS path (pine_id
+    """A defensive close FILL via the WS path runs the deferred parent-entry cleanup.
+
+    When the defensive close FILL arrives via the WS path (pine_id
     matches the synthetic close_intent_key), the engine runs the
     deferred parent-entry cleanup that the dispatch-time path now
     skips."""
@@ -3170,7 +3253,9 @@ def __test_defensive_close_fill_runs_deferred_cleanup__(tmp_path):
 
 
 def __test_defensive_close_fill_matched_by_order_ref__(tmp_path):
-    """A polled-orders FILL event without ``pine_id`` still routes to
+    """Polled FILL without ``pine_id`` routes to defensive-close cleanup via ``close_order_ref``.
+
+    A polled-orders FILL event without ``pine_id`` still routes to
     the defensive-close cleanup via ``close_order_ref`` match."""
     store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
     try:
@@ -3197,7 +3282,9 @@ def __test_defensive_close_fill_matched_by_order_ref__(tmp_path):
 
 
 def __test_defensive_close_fill_writes_audit_event__(tmp_path):
-    """A ``'defensive_close_filled'`` audit event lands in the events
+    """A defensive close FILL writes a ``'defensive_close_filled'`` audit event to the events table.
+
+    A ``'defensive_close_filled'`` audit event lands in the events
     table on FILL — startup replay uses it to detect that a marker has
     already settled after a process restart."""
     store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
@@ -3224,7 +3311,9 @@ def __test_defensive_close_fill_writes_audit_event__(tmp_path):
 
 
 def __test_defensive_close_fill_is_idempotent__(tmp_path):
-    """A second FILL event for the same close finds no marker and is a
+    """A second defensive close FILL finds no marker and is a no-op (idempotent re-delivery).
+
+    A second FILL event for the same close finds no marker and is a
     no-op — covers re-delivery scenarios (WS replay, manual FILL
     injection in tests, polled-orders cycle racing the WS path)."""
     store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
@@ -3284,7 +3373,9 @@ def _seed_pending_marker_in_store(
 
 
 def __test_startup_replay_settled_drops_marker__(tmp_path):
-    """When a 'defensive_close_filled' audit event exists for the
+    """Startup replay drops a marker without re-arming when a matching settled audit event exists.
+
+    When a 'defensive_close_filled' audit event exists for the
     marker's close_intent_key, startup replay drops the marker without
     re-arming — the FILL settled in the prior instance, current
     instance has nothing to wait on."""
@@ -3337,7 +3428,9 @@ def __test_startup_replay_settled_drops_marker__(tmp_path):
 def __test_startup_replay_unsettled_rearms_marker_and_runs_residual_cancel__(
         tmp_path,
 ):
-    """A marker without a matching audit event is re-armed in-memory
+    """Startup replay re-arms an unsettled marker in-memory and re-runs the residual cancel loop.
+
+    A marker without a matching audit event is re-armed in-memory
     AND the residual cancel loop is re-run via the plugin idempotency
     contract — covers crashes between dispatch and FILL."""
     from pynecore.core.broker.storage import BrokerStore
@@ -3390,7 +3483,9 @@ def __test_startup_replay_unsettled_rearms_marker_and_runs_residual_cancel__(
 
 
 def __test_startup_replay_idempotent_second_invocation__(tmp_path):
-    """A second invocation on the same state runs the residual cancel
+    """A second replay re-runs the residual cancel but does not double-register the marker.
+
+    A second invocation on the same state runs the residual cancel
     again (idempotent by plugin contract) but does not double-register
     the marker — supports the runner calling replay twice during
     startup quirks (e.g. a manual mid-startup pause)."""
@@ -3435,7 +3530,9 @@ def __test_startup_replay_idempotent_second_invocation__(tmp_path):
 
 
 def __test_startup_replay_drops_malformed_payload__(tmp_path):
-    """A malformed extras payload (manual DB tampering, schema-skew
+    """Startup replay logs and drops a malformed extras payload instead of crashing.
+
+    A malformed extras payload (manual DB tampering, schema-skew
     after a bad migration) is logged + removed; the engine keeps going
     instead of crashing on a deserialize error."""
     from pynecore.core.broker.storage import BrokerStore
@@ -3473,7 +3570,9 @@ def __test_startup_replay_drops_malformed_payload__(tmp_path):
 
 
 def __test_startup_replay_parked_unresolved_defers_residual_cancel__(tmp_path):
-    """Parked-unresolved markers (close_order_ref=None, no fill, no audit)
+    """A parked-unresolved marker defers the residual cancel to the runtime parked-recovery path.
+
+    Parked-unresolved markers (close_order_ref=None, no fill, no audit)
     must DEFER the residual cancel to the runtime parked-recovery path.
 
     Cancelling residual TP/SL/partial-remainder orders during replay —
@@ -3531,7 +3630,9 @@ def __test_startup_replay_parked_unresolved_defers_residual_cancel__(tmp_path):
 def __test_startup_replay_parked_with_cleanup_pending_runs_residual_cancel__(
         tmp_path,
 ):
-    """A parked marker stamped ``residual_cleanup_pending=True`` by a
+    """A parked marker with ``residual_cleanup_pending=True`` runs the residual cancel on replay.
+
+    A parked marker stamped ``residual_cleanup_pending=True`` by a
     prior instance still runs the residual cancel on replay — the prior
     instance already confirmed cleanup was due (the flag is only stamped
     AFTER a known dispatch / recovery), so the replay must finish the
@@ -3664,6 +3765,7 @@ def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
 # a pure PUT-or-raise actuator and the retry budget cannot be double-counted.
 
 def __test_drive_native_failsafe_dispatches_and_records_success__():
+    """``drive_native_failsafe`` dispatches the worst-SL once and records the PUT success."""
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -3693,6 +3795,7 @@ def __test_drive_native_failsafe_dispatches_and_records_success__():
 
 
 def __test_drive_native_failsafe_records_single_failure_per_dispatch__():
+    """A raising dispatcher records exactly one PUT failure per drive, degrading after 3."""
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -3723,7 +3826,9 @@ def __test_drive_native_failsafe_records_single_failure_per_dispatch__():
 
 
 def __test_drive_native_failsafe_dispatcher_manual_intervention_halts__():
-    """A dispatcher raising ``BrokerManualInterventionError`` is a terminal
+    """A dispatcher ``BrokerManualInterventionError`` records the halt and re-raises, not degrades.
+
+    A dispatcher raising ``BrokerManualInterventionError`` is a terminal
     halt, not a retryable PUT failure: the drive must record the halt and
     re-raise instead of degrading the budget and letting the strategy
     continue on an unsafe broker state."""
@@ -3760,6 +3865,7 @@ def __test_drive_native_failsafe_dispatcher_manual_intervention_halts__():
 # DEGRADING -> DEGRADED and block new entries / brackets until a manual reset.
 
 def __test_record_native_bracket_observed_recovers_degrading_to_healthy__():
+    """An observed broker stop matching the desired worst-SL flips DEGRADING back to HEALTHY."""
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -3787,6 +3893,7 @@ def __test_record_native_bracket_observed_recovers_degrading_to_healthy__():
 
 
 def __test_record_native_bracket_observed_external_edit_flips_owner_unknown__():
+    """A mismatching observed stop (operator edit) flips fail-safe ownership to UNKNOWN."""
     # A mismatching observation (operator edited the stop at the broker) must
     # flip ownership to UNKNOWN — the engine must NOT silently resend its now
     # stale desired level over a manual edit. UNKNOWN also blocks new brackets
@@ -3810,6 +3917,7 @@ def __test_record_native_bracket_observed_external_edit_flips_owner_unknown__():
 
 
 def __test_enqueue_native_bracket_observed_recovers_on_drive__():
+    """An enqueued observed confirm is applied only when the next drive drains the queue."""
     # Thread-safe production path: the reconcile (broker-loop) thread enqueues;
     # the MAIN thread applies it inside drive_native_failsafe, so the manager
     # state is mutated from one thread only. Nothing is applied until the next
@@ -3837,6 +3945,7 @@ def __test_enqueue_native_bracket_observed_recovers_on_drive__():
 
 
 def __test_drive_native_failsafe_drains_observed_before_stale_window__():
+    """A queued confirm drained before the stale window still recovers DEGRADING to HEALTHY."""
     # The queued confirm must be applied BEFORE tick_stale_window: a confirm
     # that lands after the stale window has elapsed must still recover the
     # parent (DEGRADING -> HEALTHY), not lose the race to a DEGRADED escalation
@@ -3863,6 +3972,7 @@ def __test_drive_native_failsafe_drains_observed_before_stale_window__():
 
 
 def __test_drive_native_failsafe_coalesces_observed_keeps_latest__():
+    """The drain coalesces observations per ref and applies only the latest snapshot."""
     # The reconcile (broker-loop) thread can enqueue several observations for
     # one parent between two main-thread drives (the bar interval spans many
     # polls). The drain must coalesce per ref and apply only the LATEST: a
@@ -3895,6 +4005,7 @@ def __test_drive_native_failsafe_coalesces_observed_keeps_latest__():
 
 
 def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
+    """A manual edit matching no outstanding level flips UNKNOWN and drops the queued PUT."""
     # The outstanding-levels exemption covers an observation that diverges from
     # the new desired level ONLY when it equals a level the broker still
     # legitimately carries (the baseline or a dispatched level). An operator's
@@ -3945,6 +4056,7 @@ def __test_drive_native_failsafe_manual_edit_before_recompute_flips_unknown__():
 
 
 def __test_drive_native_failsafe_stale_baseline_after_dispatch_keeps_engine__():
+    """A stale post-dispatch baseline observation is exempt, keeping the parent engine-owned."""
     # The outstanding baseline must survive the queued snapshot being popped on
     # dispatch. The reconcile thread can sample the broker AFTER the fresh PUT
     # dispatched (``mark_dispatch_in_flight`` / ``record_put_success`` already
@@ -4012,6 +4124,7 @@ def __test_drive_native_failsafe_stale_baseline_after_dispatch_keeps_engine__():
 
 
 def __test_drive_native_failsafe_first_arm_none_baseline_keeps_engine__():
+    """A first-arm ``None`` baseline observation is exempt, keeping the parent engine-owned."""
     # The outstanding exemption must survive the FIRST arm, where the broker
     # legitimately carries no stop at all. ``recompute_worst_sl`` records a
     # baseline entry with ``sl=None`` (the old desired) on the first PUT, so a
@@ -4061,6 +4174,7 @@ def __test_drive_native_failsafe_first_arm_none_baseline_keeps_engine__():
 
 
 def __test_drive_native_failsafe_coalesced_flush_records_baseline__():
+    """A coalesced trail flush records the broker baseline, exempting a later stale poll."""
     # The trail-coalesce flush path (``flush_coalesced_trails``) dispatches a
     # throttled trail PUT WITHOUT going through ``recompute_worst_sl``'s
     # baseline capture. It must still record the broker baseline (the previously
@@ -4144,6 +4258,7 @@ def __test_drive_native_failsafe_coalesced_flush_records_baseline__():
 # event handlers to retire it via _retire_native_failsafe_for_entry.
 
 def __test_retire_native_failsafe_for_entry_drops_parked_state__():
+    """``_retire_native_failsafe_for_entry`` resolves the parent COID and retires the state."""
     # The helper resolves the parent COID via the live entry envelope — the
     # leg-less case the WATCH cascade misses — and retires the state.
     engine, pos = _mk_engine(MockBroker())
@@ -4161,6 +4276,7 @@ def __test_retire_native_failsafe_for_entry_drops_parked_state__():
 
 
 def __test_unexpected_cancel_event_retires_native_failsafe_state__():
+    """An unexpected cancel event for an entry retires that parent's native fail-safe state."""
     engine, pos = _mk_engine(MockBroker())
     pos.entry_orders["L"] = _entry_order("L", 1.0)
     engine.sync(BAR_TS)
@@ -4188,6 +4304,7 @@ def __test_unexpected_cancel_event_retires_native_failsafe_state__():
 
 
 def __test_unexpected_cancel_without_pine_id_retires_native_failsafe_state__():
+    """A pine_id-less cancel matched by order id still retires the entry's fail-safe state."""
     # A broker-synthesized cancel status event may carry only the exchange
     # order id (``pine_id`` and ``from_entry`` both None). The cancel is still
     # matched to the entry intent via ``_find_key_for_order_id``, so the parent's
@@ -4221,6 +4338,7 @@ def __test_unexpected_cancel_without_pine_id_retires_native_failsafe_state__():
 
 
 def __test_unexpected_reject_without_pine_id_retires_native_failsafe_state__():
+    """A pine_id-less reject matched by order id still retires the entry's fail-safe state."""
     # Mirror of the cancel case for the 'rejected' branch: a broker-synthesized
     # reject carrying only the exchange order id must still retire the matched
     # entry's native fail-safe state via the matched ``key``.
@@ -4267,6 +4385,7 @@ def _pleg(leg_id, side, qty, *, open_time=0.0) -> PositionLeg:
 
 
 def __test_emulated_close_routes_through_position_port__():
+    """With a position_port set, a close fans through ``close_leg`` not ``execute_close``."""
     b = MockBroker()
     b.position_port = b
     b.raw_legs = [_pleg("1", "buy", 2.0)]
@@ -4280,6 +4399,7 @@ def __test_emulated_close_routes_through_position_port__():
 
 
 def __test_emulated_exit_routes_through_position_port__():
+    """With a position_port set, an exit replicates its bracket onto each leg, not execute_exit."""
     b = MockBroker()
     b.position_port = b
     b.raw_legs = [_pleg("1", "buy", 1.0, open_time=1.0),
@@ -4295,6 +4415,7 @@ def __test_emulated_exit_routes_through_position_port__():
 
 
 def __test_emulated_entry_reversal_routes_through_position_port__():
+    """An emulated reversal closes the opposing leg via the port and opens the residual qty."""
     from pynecore.core.broker.models import EntryIntent
     b = MockBroker()
     b.position_port = b
@@ -4310,6 +4431,7 @@ def __test_emulated_entry_reversal_routes_through_position_port__():
 
 
 def __test_emulated_close_below_grid_skips_non_halting__():
+    """An emulated close quantized below the grid raises ``OrderSkippedByPlugin``, no dispatch."""
     b = MockBroker()
     b.position_port = b
     b.raw_legs = [_pleg("1", "buy", 0.4)]  # int() quantizer floors 0.4 -> 0
@@ -4321,6 +4443,7 @@ def __test_emulated_close_below_grid_skips_non_halting__():
 
 
 def __test_emulated_exit_flat_skips_non_halting__():
+    """An emulated exit with no legs raises ``OrderSkippedByPlugin`` and amends nothing."""
     b = MockBroker()
     b.position_port = b
     b.raw_legs = []  # flat: no legs to protect
@@ -4333,6 +4456,7 @@ def __test_emulated_exit_flat_skips_non_halting__():
 
 
 def __test_first_sync_drives_one_way_replay_when_emulating__():
+    """The first sync drives the one-way restart replay once when a position_port is set."""
     b = MockBroker()
     b.position_port = b
     engine, _pos = _mk_engine(b)
@@ -4352,6 +4476,7 @@ def __test_first_sync_drives_one_way_replay_when_emulating__():
 
 
 def __test_first_sync_skips_one_way_replay_when_not_emulating__():
+    """A netting broker (no position_port) never drives the one-way restart replay."""
     b = MockBroker()  # position_port stays None
     engine, _pos = _mk_engine(b)
     called: list = []
@@ -4366,6 +4491,7 @@ def __test_first_sync_skips_one_way_replay_when_not_emulating__():
 
 
 def __test_one_way_replay_connection_error_retries_next_sync__():
+    """A one-way replay connection error bails the sync and retries on the next sync."""
     b = MockBroker()
     b.position_port = b
     engine, _pos = _mk_engine(b)
@@ -4397,6 +4523,7 @@ def _persist_bracket_ownership(ctx, *, leg_id="1", intent_key="X\0L",
 
 
 def __test_orphan_one_way_bracket_cleared_after_restart__(tmp_path):
+    """After restart, the orphan sweep clears a bracket Pine no longer emits and frees its row."""
     # F1: after a restart the persist-first bracket-ownership ledger is
     # re-asserted, but ``_active_intents`` starts empty. An exit the script no
     # longer emits is never seen by the cancellation diff (it iterates
@@ -4421,6 +4548,7 @@ def __test_orphan_one_way_bracket_cleared_after_restart__(tmp_path):
 
 
 def __test_active_one_way_bracket_not_orphan_swept__(tmp_path):
+    """The orphan sweep spares a bracket whose intent is still emitted, keeping the row live."""
     # The orphan sweep must spare an exit that is still live: a row whose
     # intent_key is in ``_active_intents`` (or new_map) is never cleared.
     from pynecore.core.broker.storage import BrokerStore
@@ -4445,6 +4573,7 @@ def __test_active_one_way_bracket_not_orphan_swept__(tmp_path):
 
 
 def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):
+    """An orphan clear that times out then re-clears via drain retires the stale envelope."""
     # The orphan sweep's DIRECT clear hits an ambiguous timeout: it leaves the
     # row "clearing" and `continue`s BEFORE the success path's `_drop_envelope`,
     # so the in-memory envelope/mapping for the orphan key survive. The per-sync
@@ -4485,6 +4614,7 @@ def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):
 
 
 def __test_drain_connection_failure_preserves_already_released_keys__(tmp_path):
+    """A drain hitting a dropped link reports the keys already released, leaving rest clearing."""
     # A multi-row drain releases the first clearing row (durably closed in the
     # store, its key collected) and then the second leg's re-clear amend drops the
     # link with ``ExchangeConnectionError``. If that exception escaped, the partial

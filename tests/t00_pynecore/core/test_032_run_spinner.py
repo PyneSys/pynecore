@@ -12,6 +12,7 @@ from pynecore.cli.commands.run import (
 
 
 def __test_exchange_display_time_uses_exchange_timezone__():
+    """``_exchange_display_time`` converts a UTC timestamp to the exchange's local wall time."""
     timestamp = int(datetime(2026, 5, 12, 15, 49, tzinfo=UTC).timestamp())
 
     display_time = _exchange_display_time(timestamp, ZoneInfo("America/New_York"))
@@ -20,6 +21,7 @@ def __test_exchange_display_time_uses_exchange_timezone__():
 
 
 def __test_exchange_clock_column_omits_year_and_uses_current_time__(monkeypatch):
+    """``ExchangeClockColumn`` renders current exchange time as ``Live — MM-DD HH:MM:SS``."""
     timestamp = datetime(2026, 5, 12, 15, 49, tzinfo=UTC).timestamp()
     monkeypatch.setattr(run_command.time, "time", lambda: timestamp)
 
@@ -29,12 +31,14 @@ def __test_exchange_clock_column_omits_year_and_uses_current_time__(monkeypatch)
 
 
 def __test_elapsed_column_formats_tenths__():
+    """``CustomTimeElapsedColumn`` formats elapsed seconds as ``HH:MM:SS.t`` with tenths."""
     rendered = CustomTimeElapsedColumn().render(SimpleNamespace(elapsed=3723.456))
 
     assert rendered.plain == "01:02:03.5"
 
 
 def __test_broker_metrics_text_uses_bid_for_long_unrealized_pnl__():
+    """``_broker_metrics_text`` prices a long position's unrealized PnL against the bid."""
     position = SimpleNamespace(
         size=2.0,
         avg_price=100.0,
@@ -56,6 +60,7 @@ def __test_broker_metrics_text_uses_bid_for_long_unrealized_pnl__():
 
 
 def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
+    """``_broker_metrics_text`` prices a short position's unrealized PnL against the ask."""
     position = SimpleNamespace(
         size=-3.0,
         avg_price=100.0,
@@ -77,6 +82,7 @@ def __test_broker_metrics_text_uses_ask_for_short_unrealized_pnl__():
 
 
 def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
+    """``_broker_metrics_text`` shows only equity when flat with no open trades."""
     position = SimpleNamespace(
         size=0.0,
         avg_price=0.0,
@@ -95,6 +101,7 @@ def __test_broker_metrics_text_uses_position_openprofit_without_open_trades__():
 
 
 def __test_broker_metrics_text_prefers_exchange_position_snapshot__():
+    """``_broker_metrics_text`` favors the exchange position snapshot over the local position."""
     position = SimpleNamespace(
         size=0.0,
         avg_price=0.0,
@@ -122,6 +129,7 @@ def __test_broker_metrics_text_prefers_exchange_position_snapshot__():
 
 
 def __test_broker_metrics_text_signs_short_exchange_position__():
+    """``_broker_metrics_text`` renders a short exchange position with a negated size."""
     exchange_position = SimpleNamespace(
         side="short",
         size=25.0,

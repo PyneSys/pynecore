@@ -49,6 +49,7 @@ class MinimalConfig:
 
 
 def __test_format_value_str__():
+    """``format_value`` quotes strings and escapes embedded quotes and backslashes."""
     assert format_value("hello") == '"hello"'
     assert format_value("") == '""'
     assert format_value('has "quotes"') == '"has \\"quotes\\""'
@@ -143,22 +144,26 @@ def __test_mlstr_field_round_trip__(tmp_path: Path):
 
 
 def __test_format_value_int__():
+    """``format_value`` renders integers, including zero and negatives, as bare numbers."""
     assert format_value(0) == "0"
     assert format_value(42) == "42"
     assert format_value(-7) == "-7"
 
 
 def __test_format_value_float__():
+    """``format_value`` renders floats while keeping ``0.0`` from collapsing to ``0``."""
     assert format_value(3.14) == "3.14"
     assert format_value(0.0) == "0.0"
 
 
 def __test_format_value_bool__():
+    """``format_value`` renders booleans as lowercase TOML ``true``/``false``."""
     assert format_value(True) == "true"
     assert format_value(False) == "false"
 
 
 def __test_extract_field_docs__():
+    """``extract_field_docs`` maps each field name to its trailing docstring."""
     docs = extract_field_docs(SampleConfig)
     assert docs["api_key"] == "API key for the service"
     assert docs["timeout"] == "Request timeout in seconds"
@@ -167,6 +172,7 @@ def __test_extract_field_docs__():
 
 
 def __test_extract_field_docs_missing__():
+    """``extract_field_docs`` returns an empty dict when no fields have docstrings."""
     @dataclass
     class NoDocs:
         x: int = 0

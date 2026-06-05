@@ -341,7 +341,7 @@ def _seed_parent_intent_and_leg(
 
 
 def __test_dispatch_cancel_unknown_disposition_enters_cancel_tentative__():
-    """``_dispatch_cancel`` swallow ag → shadow-map populated + leg flipped.
+    """``_dispatch_cancel`` swallows the unknown disposition → shadow-map populated + leg flipped.
 
     Mapping and envelope are RETAINED (the reconcile retry needs them);
     the diff-loop's adoption check sees the tentative flag and defers.
@@ -379,7 +379,9 @@ def __test_dispatch_cancel_unknown_disposition_enters_cancel_tentative__():
 
 
 def __test_dispatch_cancel_strict_remains_unaffected__():
-    """``_dispatch_cancel_strict`` continues to raise
+    """``_dispatch_cancel_strict`` still raises and sets no cancel-tentative state.
+
+    ``_dispatch_cancel_strict`` continues to raise
     ``OrderDispositionUnknownError`` — no cancel-tentative state set."""
     broker = _MockBroker(
         raise_on_cancel=[OrderDispositionUnknownError(
@@ -395,7 +397,9 @@ def __test_dispatch_cancel_strict_remains_unaffected__():
 
 
 def __test_diff_loop_defers_reissue_while_cancel_tentative__():
-    """A fresh EntryIntent on a tentative parent ⇒ defer + audit event,
+    """A fresh EntryIntent on a tentative parent defers with an audit event and no broker dispatch.
+
+    A fresh EntryIntent on a tentative parent ⇒ defer + audit event,
     no broker dispatch."""
     events: list[BrokerEvent] = []
     broker = _MockBroker()
@@ -477,7 +481,9 @@ def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
 
 
 def __test_dispatch_cancel_unknown_preserves_entry_envelope__():
-    """Cancel-tentative entry must KEEP the original ``EntryIntent`` envelope
+    """Cancel-tentative entry keeps the original ``EntryIntent`` envelope in ``_envelopes``.
+
+    Cancel-tentative entry must KEEP the original ``EntryIntent`` envelope
     in ``_envelopes``. A later ALREADY_FILLED resolution recovers the
     parent and downstream dispatchers (e.g.
     ``_dispatch_engine_trigger_partial_bracket``) compute the deterministic
@@ -500,7 +506,9 @@ def __test_dispatch_cancel_unknown_preserves_entry_envelope__():
 
 
 def __test_reconcile_rebuilds_cancel_envelope_when_missing__():
-    """If the retained envelope is the original (non-cancel) intent — the
+    """Cancel-retry rebuilds a ``CancelIntent`` envelope when only the original intent was retained.
+
+    If the retained envelope is the original (non-cancel) intent — the
     case after restart-replay rehydrate, which repopulates the shadow map
     from leg extras but never the ``_envelopes`` map — the cancel-retry
     loop must rebuild a ``CancelIntent`` envelope on the fly rather than
@@ -526,7 +534,9 @@ def __test_reconcile_rebuilds_cancel_envelope_when_missing__():
 
 
 def __test_reconcile_resolved_drops_child_partial_exit_slots__():
-    """When a parent cancel-tentative resolves as CANCEL_CONFIRMED, every
+    """CANCEL_CONFIRMED retires every child partial-exit ``ExitIntent`` slot tied to the parent.
+
+    When a parent cancel-tentative resolves as CANCEL_CONFIRMED, every
     child partial-exit ``ExitIntent`` slot tied to that parent's
     ``from_entry`` must be retired alongside the parent. Otherwise a
     later same-id entry sees the stale exit as already active and skips
@@ -563,7 +573,9 @@ def __test_reconcile_resolved_drops_child_partial_exit_slots__():
 
 
 def __test_leg_from_row_accepts_cancel_tentative_state__():
-    """``_leg_from_row`` MUST load ``cancel_tentative`` rows so that
+    """``_leg_from_row`` loads ``cancel_tentative`` rows so restart-replay rebuilds them.
+
+    ``_leg_from_row`` MUST load ``cancel_tentative`` rows so that
     :meth:`SoftwarePartialBracketEngine.restart_replay` rebuilds them
     in the in-memory ledger after a process restart.
 
@@ -616,7 +628,9 @@ def __test_leg_from_row_accepts_cancel_tentative_state__():
 
 
 def __test_clear_already_filled_resolves_trigger_level_via_open_trades__():
-    """ALREADY_FILLED resolution from the reconcile-retry path must
+    """ALREADY_FILLED promotes legs via ``pending_entry`` → ``armed`` so ``trigger_level`` resolves.
+
+    ALREADY_FILLED resolution from the reconcile-retry path must
     promote tentative legs through the normal ``pending_entry`` → ``armed``
     promotion so ``trigger_level`` is resolved from ``trigger_offset``
     against the parent's fill price.
@@ -681,7 +695,9 @@ def __test_clear_already_filled_resolves_trigger_level_via_open_trades__():
 
 
 def __test_clear_already_filled_leaves_pending_when_parent_not_in_open_trades__():
-    """Reconcile-retry ALREADY_FILLED resolution must NOT leave the legs
+    """ALREADY_FILLED keeps legs in ``pending_entry`` while the parent fill is not in open_trades.
+
+    Reconcile-retry ALREADY_FILLED resolution must NOT leave the legs
     in armed-without-trigger_level when the parent fill event has not
     yet been routed. Instead the legs stay in ``pending_entry`` so the
     subsequent FILL event's natural

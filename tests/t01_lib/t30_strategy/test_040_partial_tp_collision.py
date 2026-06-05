@@ -52,6 +52,8 @@ def _make_syminfo(period: str = '1'):
 # noinspection PyShadowingNames
 def __test_two_exits_same_from_entry_both_fire__(script_path, module_key):
     """
+    Two same-``from_entry`` partial TPs (110 and 120, qty 1 each) both fire as distinct trades.
+
     Two strategy.exit() calls with same from_entry, different ids and qty each = 1
     must produce two distinct closed trades — one at limit 110, one at limit 120.
 

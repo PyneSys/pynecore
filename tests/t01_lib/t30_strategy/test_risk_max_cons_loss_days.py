@@ -45,6 +45,8 @@ def _make_syminfo(period: str = '1D'):
 # noinspection PyShadowingNames
 def __test_max_cons_loss_days_halts_after_three_losing_days__(script_path, module_key):
     """
+    After 3 consecutive losing days the halt must fire and close the short.
+
     Short opened bar 0; price rises every day → equity drops every day. After
     3 consecutive losing days the halt must fire and close the short.
 

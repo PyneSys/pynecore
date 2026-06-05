@@ -56,6 +56,7 @@ def _watch(
 # === In-memory state machine ============================================
 
 def __test_register_and_query__():
+    """A registered watch is found by ``has_watch``, ``get_watch`` and ``iter_watches``."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     w = _watch()
     eng.register_watch(w)
@@ -65,12 +66,14 @@ def __test_register_and_query__():
 
 
 def __test_register_rejects_terminal_state__():
+    """Registering a watch already in a terminal state raises ``ValueError``."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     with pytest.raises(ValueError):
         eng.register_watch(_watch(state=ENTRY_STOP_STATE_STOP_WON))
 
 
 def __test_register_rejects_duplicate__():
+    """Registering a second watch with the same pine id raises ``ValueError``."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())
     with pytest.raises(ValueError):
@@ -78,6 +81,7 @@ def __test_register_rejects_duplicate__():
 
 
 def __test_stop_crossed_long_fires_on_rise__():
+    """A long watch's stop fires at or above its level, not below it."""
     # A long both-set entry's STOP sits ABOVE the open and fires when price
     # rises to it.
     w = _watch(side="buy", stop_level=1.18)
@@ -87,6 +91,7 @@ def __test_stop_crossed_long_fires_on_rise__():
 
 
 def __test_stop_crossed_short_fires_on_fall__():
+    """A short watch's stop fires at or below its level, not above it."""
     # A short both-set entry's STOP sits BELOW the open and fires when price
     # falls to it.
     w = _watch(side="sell", stop_level=1.10)
@@ -96,6 +101,7 @@ def __test_stop_crossed_short_fires_on_fall__():
 
 
 def __test_begin_cancel_armed_to_cancel_pending__():
+    """``begin_cancel`` moves an armed watch into ``cancel_pending``."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())
     w = eng.begin_cancel("Long")
@@ -104,12 +110,14 @@ def __test_begin_cancel_armed_to_cancel_pending__():
 
 
 def __test_begin_cancel_noop_when_not_armed__():
+    """``begin_cancel`` returns ``None`` when the watch is not armed."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch(state=ENTRY_STOP_STATE_CANCEL_PENDING))
     assert eng.begin_cancel("Long") is None
 
 
 def __test_confirm_fire_persists_market_coid_and_advances__():
+    """Confirming the cancel advances to ``market_pending`` and stores the market coid."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch(state=ENTRY_STOP_STATE_CANCEL_PENDING))
     w = eng.confirm_limit_cancelled_fire_market("Long", market_coid="mkt-1")
@@ -119,6 +127,7 @@ def __test_confirm_fire_persists_market_coid_and_advances__():
 
 
 def __test_confirm_fire_noop_when_not_cancel_pending__():
+    """Confirming the cancel returns ``None`` when the watch is not ``cancel_pending``."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())  # armed
     assert eng.confirm_limit_cancelled_fire_market(
@@ -126,6 +135,7 @@ def __test_confirm_fire_noop_when_not_cancel_pending__():
 
 
 def __test_mark_stop_won_terminal_and_evicts__():
+    """``mark_stop_won`` settles a ``market_pending`` watch and evicts it from the ledger."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch(state=ENTRY_STOP_STATE_MARKET_PENDING))
     w = eng.mark_stop_won("Long")
@@ -134,6 +144,7 @@ def __test_mark_stop_won_terminal_and_evicts__():
 
 
 def __test_mark_stop_won_noop_when_not_market_pending__():
+    """``mark_stop_won`` is a no-op on an armed watch and leaves it tracked."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())  # armed
     assert eng.mark_stop_won("Long") is None
@@ -141,6 +152,7 @@ def __test_mark_stop_won_noop_when_not_market_pending__():
 
 
 def __test_mark_limit_won_from_armed_terminal__():
+    """``mark_limit_won`` settles an armed watch to ``limit_won`` and evicts it."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())
     w = eng.mark_limit_won("Long", reason="native_limit_filled")
@@ -149,6 +161,7 @@ def __test_mark_limit_won_from_armed_terminal__():
 
 
 def __test_mark_limit_won_from_cancel_pending_terminal__():
+    """A limit filled during ``cancel_pending`` wins the OCO: watch settles to ``limit_won``."""
     # The hard gate: a LIMIT that filled while we were cancelling it wins the
     # OCO; no market may fire.
     eng = SoftwareEntryStopEngine(store_ctx=None)
@@ -159,6 +172,7 @@ def __test_mark_limit_won_from_cancel_pending_terminal__():
 
 
 def __test_mark_aborted_terminal__():
+    """``mark_aborted`` settles an armed watch and evicts it from the ledger."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     eng.register_watch(_watch())
     w = eng.mark_aborted("Long", reason="strategy_cancel")
@@ -167,6 +181,7 @@ def __test_mark_aborted_terminal__():
 
 
 def __test_mark_aborted_noop_once_committed_to_stop__():
+    """Once in ``market_pending``, ``mark_aborted`` is a no-op and the watch still stop-wins."""
     # Once the watch has committed to the stop side (stop_market_pending), a
     # delayed broker cancelled/rejected ack for the OCO's own now-cancelled
     # native LIMIT must NOT abort it — that echo would evict a watch whose
@@ -189,6 +204,7 @@ def __test_mark_aborted_noop_once_committed_to_stop__():
 
 
 def __test_mark_helpers_noop_when_absent__():
+    """All ``mark_*`` helpers return ``None`` for an unknown pine id."""
     eng = SoftwareEntryStopEngine(store_ctx=None)
     assert eng.mark_limit_won("nope", reason="x") is None
     assert eng.mark_aborted("nope", reason="x") is None
@@ -213,6 +229,7 @@ def _make_store(tmp_path: Path) -> tuple[BrokerStore, RunContext]:
 
 
 def __test_persist_and_replay_armed_watch__(tmp_path):
+    """Replay restores a persisted armed watch with its stop level and limit coid intact."""
     store, ctx = _make_store(tmp_path)
     create_entry_stop_watch_row(
         ctx,
@@ -238,6 +255,7 @@ def __test_persist_and_replay_armed_watch__(tmp_path):
 
 
 def __test_latched_cancel_pending_survives_replay__(tmp_path):
+    """A latched ``cancel_pending`` watch survives replay rather than re-arming."""
     # A crash after the stop crossed but before the cancel resolved must
     # resume in cancel_pending (NOT re-armed) so the sync engine re-drives the
     # idempotent cancel-then-fire gate regardless of the current price.
@@ -260,6 +278,7 @@ def __test_latched_cancel_pending_survives_replay__(tmp_path):
 
 
 def __test_latched_market_pending_survives_replay_with_coid__(tmp_path):
+    """A latched ``market_pending`` watch survives replay carrying its market coid."""
     # A crash after the cancel was confirmed but before the market settled
     # must resume in stop_market_pending carrying the deterministic market
     # coid, so the re-fire reuses the same id and the broker dedups it.
@@ -283,6 +302,7 @@ def __test_latched_market_pending_survives_replay_with_coid__(tmp_path):
 
 
 def __test_terminal_watch_filtered_on_replay__(tmp_path):
+    """A settled watch closes its row and is not resurrected by replay."""
     # A won/aborted watch closes its row; replay must not resurrect it.
     store, ctx = _make_store(tmp_path)
     eng = SoftwareEntryStopEngine(store_ctx=ctx)
@@ -302,6 +322,7 @@ def __test_terminal_watch_filtered_on_replay__(tmp_path):
 
 
 def __test_persisted_state_string_matches__(tmp_path):
+    """The persisted extras carry the armed state string and a null market coid."""
     # Guard the persisted extras key/value so a rename can't silently break
     # restart replay.
     store, ctx = _make_store(tmp_path)

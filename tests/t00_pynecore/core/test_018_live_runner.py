@@ -161,7 +161,7 @@ def __test_live_generator_empty_stream__():
 
 
 def __test_live_generator_emits_transition_sentinel__():
-    """live_ohlcv_generator yields exactly one LIVE_TRANSITION sentinel between catch-up and live phases"""
+    """live_ohlcv_generator yields one LIVE_TRANSITION sentinel between catch-up and live."""
     updates = [_make_ohlcv(1000, is_closed=True), _make_ohlcv(2000, is_closed=True)]
     provider = MockLiveProvider(updates)
 

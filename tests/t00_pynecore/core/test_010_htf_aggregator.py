@@ -14,6 +14,7 @@ def _ms(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
 
 
 def __test_first_chart_bar_starts_developing__(log):
+    """First chart bar opens a new developing HTF bar with no closed bar yet."""
     agg = HTFAggregator("60", _UTC)
     ts = _ms(2026, 5, 21, 10, 30)
     is_new, dev, closed = agg.update(
@@ -29,6 +30,7 @@ def __test_first_chart_bar_starts_developing__(log):
 
 
 def __test_accumulates_within_same_period__(log):
+    """Chart bars in the same period keep the first open, extend high/low, and sum volume."""
     agg = HTFAggregator("60", _UTC)
     base = _ms(2026, 5, 21, 10, 0)
     agg.update(base + 0,           1.0, 1.2, 0.9, 1.1, 10.0)
@@ -47,6 +49,7 @@ def __test_accumulates_within_same_period__(log):
 
 
 def __test_period_boundary_emits_closed_then_starts_fresh__(log):
+    """Crossing a period boundary emits the closed HTF bar and starts a fresh developing one."""
     agg = HTFAggregator("60", _UTC)
     # Hour 10
     agg.update(_ms(2026, 5, 21, 10, 0),  1.0, 1.2, 0.9, 1.1, 10.0)
@@ -70,6 +73,7 @@ def __test_period_boundary_emits_closed_then_starts_fresh__(log):
 
 
 def __test_current_property_returns_state__(log):
+    """``current`` is None before any update and after reset, else the developing bar."""
     agg = HTFAggregator("60", _UTC)
     assert agg.current is None
     agg.update(_ms(2026, 5, 21, 10, 0), 1.0, 1.0, 1.0, 1.0, 1.0)
@@ -80,6 +84,7 @@ def __test_current_property_returns_state__(log):
 
 
 def __test_daily_timeframe_uses_tz_for_boundary__(log):
+    """Daily period start is computed in the configured timezone, not UTC midnight."""
     # NY tz: a 2026-05-21 09:30 NY bar belongs to 2026-05-21 00:00 NY day.
     ny = ZoneInfo("America/New_York")
     agg = HTFAggregator("1D", ny)
@@ -95,7 +100,9 @@ def __test_daily_timeframe_uses_tz_for_boundary__(log):
 
 
 def __test_intra_bar_updates_do_not_inflate_volume__(log):
-    """Live providers (CCXT et al.) emit repeated updates for the same chart
+    """Cumulative intra-bar volume contributes once per chart bar, not once per tick.
+
+    Live providers (CCXT et al.) emit repeated updates for the same chart
     bar carrying the running cumulative candle volume. The aggregator must
     deduplicate these so the HTF developing/closed volume reflects one
     contribution per chart bar, not one per tick.

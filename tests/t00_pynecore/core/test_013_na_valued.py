@@ -26,7 +26,7 @@ def __test_valued_na_are_singletons__():
 
 
 def __test_valued_na_are_instances_of_NA__():
-    """isinstance(x, NA) stays True for valued singletons — lib-internal NA-skip guards must keep working"""
+    """isinstance(x, NA) is True for valued singletons, so NA-skip guards keep working."""
     assert isinstance(na_inf, NA)
     assert isinstance(na_neg_inf, NA)
     assert isinstance(na_nan, NA)

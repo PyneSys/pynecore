@@ -50,6 +50,8 @@ def _make_syminfo(period: str = '1'):
 # noinspection PyShadowingNames
 def __test_max_drawdown_halts_and_blocks_re_entry__(script_path, module_key):
     """
+    A breached ``max_drawdown`` closes the long, sets ``risk_halt_trading``, and blocks re-entry.
+
     Drawdown of $200 (20% of $1000 equity) on bar 2 must trigger
     ``strategy.risk.max_drawdown(100, cash)``: the open long is closed at the
     bar's close price, ``risk_halt_trading`` becomes True, and the bar 4

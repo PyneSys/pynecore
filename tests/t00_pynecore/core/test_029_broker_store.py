@@ -129,6 +129,7 @@ def __test_wal_mode_enabled__(tmp_path: Path) -> None:
 
 
 def __test_open_run_inserts_runs_row_and_returns_context__(tmp_path: Path) -> None:
+    """``open_run`` inserts an active ``runs`` row and returns its ``RunContext``."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -148,6 +149,7 @@ def __test_open_run_inserts_runs_row_and_returns_context__(tmp_path: Path) -> No
 
 
 def __test_open_run_with_label_includes_suffix__(tmp_path: Path) -> None:
+    """A run ``label`` appends a ``#label`` suffix to ``run_id`` and changes the ``run_tag``."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx_a = _open_run(store, label="a")
         assert ctx_a.run_id.endswith("#a")
@@ -268,6 +270,7 @@ def __test_live_runs_view_excludes_stale__(tmp_path: Path) -> None:
 
 
 def __test_replay_round_trip_envelope_and_pending__(tmp_path: Path) -> None:
+    """``replay`` returns recorded envelopes and parked pending records keyed by intent/coid."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
@@ -286,6 +289,7 @@ def __test_replay_round_trip_envelope_and_pending__(tmp_path: Path) -> None:
 
 
 def __test_record_complete_drops_envelope_and_pending__(tmp_path: Path) -> None:
+    """``record_complete`` clears the intent's envelope and all of its pending records."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
@@ -298,6 +302,7 @@ def __test_record_complete_drops_envelope_and_pending__(tmp_path: Path) -> None:
 
 
 def __test_record_unpark_drops_only_that_coid__(tmp_path: Path) -> None:
+    """``record_unpark`` removes only the named coid, leaving the envelope and other pendings."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0)
@@ -323,7 +328,9 @@ def __test_record_envelope_upsert_on_retry_seq_bump__(tmp_path: Path) -> None:
 
 def __test_record_resolution_rejected_is_sticky_against_attached__(
         tmp_path: Path) -> None:
-    """``'rejected'`` is sticky: a later ``'attached'`` write must not
+    """A later ``'attached'`` ``record_resolution`` must not overwrite a sticky ``'rejected'``.
+
+    ``'rejected'`` is sticky: a later ``'attached'`` write must not
     overwrite it. Bracket scenario: the TP and SL legs each call
     ``record_resolution`` for the same parent COID. If the TP is
     ``'rejected'`` and the SL is ``'attached'``, an order-dependent
@@ -353,7 +360,9 @@ def __test_record_resolution_rejected_is_sticky_against_attached__(
 
 def __test_record_resolution_attached_then_rejected_flips_to_rejected__(
         tmp_path: Path) -> None:
-    """Reverse order: SL ``'attached'`` → TP ``'rejected'``. Here
+    """A later ``'rejected'`` ``record_resolution`` overwrites an earlier ``'attached'``.
+
+    Reverse order: SL ``'attached'`` → TP ``'rejected'``. Here
     ``'attached'`` is written first and the later ``'rejected'``
     overwrites it. Guarantees that whatever order leg resolutions
     arrive in, the final state is ``'rejected'`` whenever any leg is
@@ -373,7 +382,9 @@ def __test_record_resolution_attached_then_rejected_flips_to_rejected__(
 
 def __test_record_resolution_attached_then_attached_stays_attached__(
         tmp_path: Path) -> None:
-    """Two consecutive ``'attached'`` writes are idempotent — the final
+    """Two consecutive ``'attached'`` ``record_resolution`` writes are idempotent.
+
+    Two consecutive ``'attached'`` writes are idempotent — the final
     state stays ``'attached'``. (TP attached + SL attached = bracket
     fully attached.)"""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
@@ -390,7 +401,9 @@ def __test_record_resolution_attached_then_attached_stays_attached__(
 
 def __test_record_park_resets_stale_resolution_on_repark__(
         tmp_path: Path) -> None:
-    """When the same ``(run_id, client_order_id)`` is re-parked, the
+    """Re-parking the same ``(run_id, client_order_id)`` clears the previous ``resolution`` to NULL.
+
+    When the same ``(run_id, client_order_id)`` is re-parked, the
     previous ``'attached'`` (or any) ``resolution`` is *cleared* (reset
     to NULL). Otherwise a modify/retry timeout that re-parks the same
     coid would keep the old ``'attached'`` decision and the next
@@ -452,6 +465,7 @@ def __test_replay_isolated_per_run_instance__(tmp_path: Path) -> None:
 
 
 def __test_upsert_order_new_then_update__(tmp_path: Path) -> None:
+    """``upsert_order`` inserts a new order, then a state update leaves other fields intact."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
 
@@ -482,6 +496,7 @@ def __test_upsert_order_new_then_update__(tmp_path: Path) -> None:
 
 
 def __test_upsert_order_requires_core_fields_for_new_row__(tmp_path: Path) -> None:
+    """``upsert_order`` raises ``ValueError`` when a new row omits required core fields."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         with pytest.raises(ValueError, match="missing required fields"):
@@ -508,6 +523,7 @@ def __test_add_ref_and_find_by_ref_round_trip__(tmp_path: Path) -> None:
 
 
 def __test_close_order_cascades_delete_refs__(tmp_path: Path) -> None:
+    """``close_order`` marks the order closed and cascade-deletes its ``order_refs`` aliases."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.upsert_order(
@@ -528,7 +544,9 @@ def __test_close_order_cascades_delete_refs__(tmp_path: Path) -> None:
 
 
 def __test_reopen_order_clears_closed_ts_ms_and_logs_event__(tmp_path: Path) -> None:
-    """``reopen_order`` nulls ``closed_ts_ms`` and writes an
+    """``reopen_order`` nulls ``closed_ts_ms`` and writes an ``order_reopened`` event.
+
+    ``reopen_order`` nulls ``closed_ts_ms`` and writes an
     ``order_reopened`` event. A previously closed row can come back to
     the live range (e.g. a bracket leg COID that ``close_order`` had
     closed after an earlier REJECTED attach, and now a fresh protective
@@ -574,7 +592,9 @@ def __test_reopen_order_clears_closed_ts_ms_and_logs_event__(tmp_path: Path) -> 
 
 
 def __test_reopen_order_no_op_on_unknown_or_already_open_row__(tmp_path: Path) -> None:
-    """``reopen_order`` does not raise on an unknown client_order_id or
+    """``reopen_order`` is a silent no-op on an unknown or already-open ``client_order_id``.
+
+    ``reopen_order`` does not raise on an unknown client_order_id or
     on an already-open row: it returns silently and writes no audit
     event.
     """
@@ -596,6 +616,7 @@ def __test_reopen_order_no_op_on_unknown_or_already_open_row__(tmp_path: Path) -
 
 
 def __test_iter_live_orders_filters_closed__(tmp_path: Path) -> None:
+    """``iter_live_orders`` excludes orders that have been closed."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         for coid in ("a", "b", "c"):
@@ -609,6 +630,7 @@ def __test_iter_live_orders_filters_closed__(tmp_path: Path) -> None:
 
 
 def __test_iter_live_orders_symbol_filter__(tmp_path: Path) -> None:
+    """``iter_live_orders(symbol=...)`` returns only orders for the requested symbol."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.upsert_order(
@@ -642,6 +664,7 @@ def __test_set_risk_preserves_unset_fields__(tmp_path: Path) -> None:
 
 
 def __test_extras_round_trip_preserves_dict__(tmp_path: Path) -> None:
+    """An order's ``extras`` dict round-trips through JSON, preserving nested and unicode values."""
     payload = {
         "deal_reference": "o_abc",
         "working_order": True,
@@ -663,6 +686,7 @@ def __test_extras_round_trip_preserves_dict__(tmp_path: Path) -> None:
 
 
 def __test_log_event_written_with_payload__(tmp_path: Path) -> None:
+    """``log_event`` writes an events row with its kind, coid, intent key and JSON payload."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.log_event(
@@ -724,6 +748,7 @@ def __test_heartbeat_rate_limited__(tmp_path: Path) -> None:
 
 
 def __test_close_run_sets_ended_ts_ms__(tmp_path: Path) -> None:
+    """Closing a ``RunContext`` stamps the run's ``ended_ts_ms`` (was NULL while active)."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         assert store._conn.execute(
@@ -740,6 +765,7 @@ def __test_close_run_sets_ended_ts_ms__(tmp_path: Path) -> None:
 
 
 def __test_close_idempotent__(tmp_path: Path) -> None:
+    """Calling ``RunContext.close`` a second time is a no-op and does not raise."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         ctx.close()

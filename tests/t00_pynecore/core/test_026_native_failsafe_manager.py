@@ -59,6 +59,7 @@ def _register_long(
 # ---------------------------------------------------------------------
 
 def __test_register_parent_starts_healthy_with_engine_failsafe_ownership__():
+    """A freshly registered parent starts ``healthy`` and owned by the engine fail-safe."""
     manager, _ = _make_manager()
     _register_long(manager)
     state = manager.get_state(PARENT_REF)
@@ -68,6 +69,7 @@ def __test_register_parent_starts_healthy_with_engine_failsafe_ownership__():
 
 
 def __test_register_parent_is_idempotent_for_same_ref__():
+    """Re-registering the same ref preserves the existing state and updates the desired level."""
     manager, _ = _make_manager()
     _register_long(manager)
     first = manager.get_state(PARENT_REF)
@@ -84,6 +86,7 @@ def __test_register_parent_is_idempotent_for_same_ref__():
 
 
 def __test_invalid_parent_side_rejected__():
+    """Registering a parent with an invalid ``parent_side`` raises ``ValueError``."""
     manager, _ = _make_manager()
     with pytest.raises(ValueError):
         manager.register_parent(
@@ -113,6 +116,7 @@ def __test_long_worst_sl_is_minimum_of_active_levels__():
 
 
 def __test_short_worst_sl_is_maximum_of_active_levels__():
+    """§2.6.3: short parent worst-SL = max(level) across active SL legs."""
     manager, _ = _make_manager()
     manager.register_parent(
         parent_entry_dispatch_ref=PARENT_REF,
@@ -209,7 +213,9 @@ def __test_worst_sl_jumps_on_intermediate_leg_triggered__():
 # ---------------------------------------------------------------------
 
 def __test_snapshot_carries_coexisting_tp_and_trailing__():
-    """Full-replacement PUT semantics: every snapshot includes the
+    """Every worst-SL snapshot carries the coexisting TP and trailing-stop fields.
+
+    Full-replacement PUT semantics: every snapshot includes the
     desired TP and trailing-stop fields so they survive the worst-SL
     update."""
     manager, _ = _make_manager()
@@ -237,6 +243,7 @@ def __test_snapshot_carries_coexisting_tp_and_trailing__():
 # ---------------------------------------------------------------------
 
 def __test_record_put_success_clears_pending_for_matching_generation__():
+    """A PUT success for the matching generation clears the pending dispatch and flag."""
     manager, _ = _make_manager()
     _register_long(manager)
     snap = manager.recompute_worst_sl(
@@ -253,7 +260,9 @@ def __test_record_put_success_clears_pending_for_matching_generation__():
 
 
 def __test_record_put_success_stale_generation_keeps_newer_pending__():
-    """A newer desired snapshot queued while the older PUT was in flight
+    """A stale-generation PUT success keeps the newer pending snapshot queued.
+
+    A newer desired snapshot queued while the older PUT was in flight
     must survive when the older PUT acks."""
     manager, _ = _make_manager()
     _register_long(manager)
@@ -351,6 +360,7 @@ def __test_degrading_blocks_new_partial_bracket__():
 
 
 def __test_healthy_state_does_not_block__():
+    """A healthy parent does not block a new partial bracket."""
     manager, _ = _make_manager()
     _register_long(manager)
     blocked = manager.block_new_partial_bracket(
@@ -444,7 +454,9 @@ def __test_external_stop_edit_flips_owner_to_unknown__():
 
 
 def __test_second_recompute_in_flight_preserves_outstanding_baseline__():
-    """A recompute arriving after ``mark_dispatch_in_flight`` popped the queued
+    """A recompute while a dispatched PUT is in flight preserves the outstanding baseline.
+
+    A recompute arriving after ``mark_dispatch_in_flight`` popped the queued
     snapshot but before the confirming poll must not lose the captured broker
     baseline. The first arm captured ``None`` (the broker carried no stop yet);
     a stale poll still reporting ``None`` must stay exempt via the outstanding
@@ -504,7 +516,9 @@ def __test_owner_unknown_blocks_engine_recompute__():
 
 
 def __test_user_reset_restores_engine_ownership_and_requeues__():
-    """User reset (set_risk(disable) + reset_to_engine) clears the owner
+    """User reset restores engine-failsafe ownership and re-queues the desired level.
+
+    User reset (set_risk(disable) + reset_to_engine) clears the owner
     back to engine-failsafe and re-queues the current desired level."""
     manager, _ = _make_manager()
     _register_long(manager)
@@ -525,7 +539,9 @@ def __test_user_reset_restores_engine_ownership_and_requeues__():
 
 
 def __test_user_reset_seeds_a_fresh_confirmation_cycle__():
-    """``reset_to_engine`` must re-arm the outstanding/confirmation tracking for
+    """``reset_to_engine`` seeds a fresh outstanding/confirmation cycle for the re-queued PUT.
+
+    ``reset_to_engine`` must re-arm the outstanding/confirmation tracking for
     the PUT it re-queues, exactly like the recompute / flush dispatch paths.
     Without it the reset PUT is invisible to ``tick_stale_window`` (an acked-
     but-unconfirmed reset never times out) and a lagging pre-reset broker
@@ -558,7 +574,9 @@ def __test_user_reset_seeds_a_fresh_confirmation_cycle__():
 
 
 def __test_user_reset_exempts_lagging_reset_level_poll__():
-    """After a reset re-queues the desired level, a lagging reconcile poll that
+    """After a reset, a lagging poll of the re-queued level confirms instead of flipping owner.
+
+    After a reset re-queues the desired level, a lagging reconcile poll that
     reports that very level must be a confirming observation, not an external
     edit — the seeded outstanding entry exempts it."""
     manager, events = _make_manager()
@@ -588,7 +606,9 @@ def __test_user_reset_exempts_lagging_reset_level_poll__():
 # ---------------------------------------------------------------------
 
 def __test_intermediate_in_flight_level_is_exempt_not_external_edit__():
-    """Facet A: when the desired worst-SL moves more than once inside one
+    """A lagging poll of an intermediate in-flight level is exempt, not an external edit.
+
+    Facet A: when the desired worst-SL moves more than once inside one
     reconcile round-trip (95 -> 90 -> 85, both PUTs acked but neither observed
     back), a lagging poll of the INTERMEDIATE 90 matches neither the latest
     desired (85) nor the broker baseline (95). A single scalar slot would
@@ -647,7 +667,9 @@ def __test_intermediate_in_flight_level_is_exempt_not_external_edit__():
 
 
 def __test_acked_but_unconfirmed_put_times_out_to_degraded__():
-    """Facet B: a PUT that is acked but whose level a reconcile snapshot never
+    """An acked-but-unconfirmed PUT times out to DEGRADED, keeping engine ownership.
+
+    Facet B: a PUT that is acked but whose level a reconcile snapshot never
     reflects back must not keep the state HEALTHY forever. After the
     confirmation-timeout window the state escalates to DEGRADED (reason
     'confirmation-timeout') — WITHOUT flipping ownership to UNKNOWN and WITHOUT
@@ -686,7 +708,9 @@ def __test_acked_but_unconfirmed_put_times_out_to_degraded__():
 
 
 def __test_put_failure_degraded_does_not_auto_recover_on_confirm__():
-    """A PUT-failure DEGRADED (``degraded_reason`` None) requires an explicit
+    """A PUT-failure DEGRADED does not auto-recover on a confirming snapshot.
+
+    A PUT-failure DEGRADED (``degraded_reason`` None) requires an explicit
     user reset (§2.6.7); a confirming snapshot must NOT silently recover it,
     unlike a confirmation-timeout DEGRADED."""
     manager, _ = _make_manager(put_max_attempts=1, stale_window_ms=1_000.0)
@@ -709,7 +733,9 @@ def __test_put_failure_degraded_does_not_auto_recover_on_confirm__():
 
 
 def __test_confirmation_timeout_degraded_tracks_leg_cancel_in_memory__():
-    """A leg cancelled WHILE a confirmation-timeout DEGRADED is in force must
+    """A confirmation-timeout DEGRADED tracks a leg cancel in-memory without re-PUT.
+
+    A leg cancelled WHILE a confirmation-timeout DEGRADED is in force must
     not be silently dropped. ``recompute_worst_sl`` still no-ops on dispatch
     (the DEGRADED freeze forbids re-PUT), but for a confirmation-timeout
     DEGRADED — where ownership never left the engine — it keeps the in-memory
@@ -760,7 +786,9 @@ def __test_confirmation_timeout_degraded_tracks_leg_cancel_in_memory__():
 
 
 def __test_confirmation_timeout_degraded_still_auto_recovers_unchanged_legs__():
-    """The in-memory tracking must NOT regress the legitimate auto-recovery:
+    """A confirmation-timeout DEGRADED still auto-recovers when the leg set is unchanged.
+
+    The in-memory tracking must NOT regress the legitimate auto-recovery:
     when the leg set is UNCHANGED through a confirmation-timeout DEGRADED, a
     later confirming snapshot of the (still-current) desired triple recovers
     the state to HEALTHY exactly as before."""
@@ -789,7 +817,9 @@ def __test_confirmation_timeout_degraded_still_auto_recovers_unchanged_legs__():
 
 
 def __test_confirmation_timeout_degraded_with_manual_edit_does_not_auto_recover__():
-    """A confirmation-timeout DEGRADED whose broker stop is then manually edited
+    """A confirmation-timeout DEGRADED with a manual edit (owner UNKNOWN) does not auto-recover.
+
+    A confirmation-timeout DEGRADED whose broker stop is then manually edited
     flips ownership to UNKNOWN (external-edit path) but keeps ``degraded_reason``.
     A later observation that happens to equal the (still-current) desired triple
     must NOT auto-recover to HEALTHY: ownership left the engine, so §2.6.7 requires
@@ -834,7 +864,9 @@ def __test_confirmation_timeout_degraded_with_manual_edit_does_not_auto_recover_
 
 
 def __test_confirmation_timeout_never_fires_without_an_acked_put__():
-    """State-only run (no dispatcher ever acks the queued PUT): the confirmation
+    """The confirmation timeout never fires until a PUT is actually acked.
+
+    State-only run (no dispatcher ever acks the queued PUT): the confirmation
     timeout must NOT fire. ``recompute_worst_sl`` arms ``outstanding`` (and the
     anchor) at queue time, and a mere ``mark_dispatch_in_flight`` hand-off is not
     acknowledgement — only a broker-acked PUT (``record_put_success``) means an
@@ -867,7 +899,9 @@ def __test_confirmation_timeout_never_fires_without_an_acked_put__():
 
 
 def __test_failed_put_with_retries_left_does_not_confirmation_timeout__():
-    """A failed PUT (rate-limit / reject) with retry budget remaining must keep
+    """A failed PUT with retries left stays HEALTHY and does not confirmation-timeout.
+
+    A failed PUT (rate-limit / reject) with retry budget remaining must keep
     the state HEALTHY and the retry queued. Because the broker never acked the
     PUT, the confirmation-timeout path must NOT arm — even a ``tick_stale_window``
     past ``stale_window_ms`` must leave the retry intact rather than promoting
@@ -904,6 +938,7 @@ def __test_failed_put_with_retries_left_does_not_confirmation_timeout__():
 # ---------------------------------------------------------------------
 
 def __test_deal_id_disappear_retires_state__():
+    """A disappeared deal id retires the state, and a repeated call is idempotent."""
     manager, events = _make_manager()
     _register_long(manager)
     manager.recompute_worst_sl(
@@ -924,6 +959,7 @@ def __test_deal_id_disappear_retires_state__():
 
 
 def __test_retired_state_does_not_block_new_partial_bracket__():
+    """A retired parent does not block a new partial bracket."""
     manager, _ = _make_manager()
     _register_long(manager)
     manager.on_deal_id_disappeared(PARENT_REF, now_ms=5000.0)
@@ -941,6 +977,7 @@ def __test_retired_state_does_not_block_new_partial_bracket__():
 # ---------------------------------------------------------------------
 
 def __test_new_entry_blocked_when_any_symbol_state_is_degrading__():
+    """A new entry is blocked when any parent on its symbol is degrading, emitting both events."""
     manager, events = _make_manager(put_max_attempts=1)
     _register_long(manager)
     snap = manager.recompute_worst_sl(
@@ -963,6 +1000,7 @@ def __test_new_entry_blocked_when_any_symbol_state_is_degrading__():
 
 
 def __test_new_entry_on_different_symbol_not_blocked__():
+    """A new entry on a different symbol is not blocked by a degrading parent."""
     manager, _ = _make_manager(put_max_attempts=1)
     _register_long(manager)
     snap = manager.recompute_worst_sl(
@@ -980,7 +1018,9 @@ def __test_new_entry_on_different_symbol_not_blocked__():
 
 
 def __test_entry_gate_picks_worst_health_per_symbol__():
-    """When several parents on the same symbol are degraded, the block
+    """The entry gate surfaces the worst health per symbol (`degraded` over `degrading`).
+
+    When several parents on the same symbol are degraded, the block
     event surfaces `degraded`, not `degrading`."""
     manager, events = _make_manager(put_max_attempts=1, stale_window_ms=1_000.0)
     _register_long(manager, ref='ref-1')
@@ -1073,7 +1113,9 @@ def __test_trail_move_outside_window_dispatched_on_flush__():
 
 
 def __test_second_flush_in_flight_preserves_outstanding_baseline__():
-    """A coalesced trail flush that fires while an earlier flushed PUT is still
+    """A second trail flush while a flushed PUT is in flight preserves the outstanding baseline.
+
+    A coalesced trail flush that fires while an earlier flushed PUT is still
     unconfirmed must not lose the captured broker baseline.
     ``mark_dispatch_in_flight`` pops the queued snapshot the moment the
     dispatcher takes it, so a follow-up trail move can coalesce and reach a
@@ -1169,7 +1211,9 @@ def _register_long_grid(
 
 
 def __test_recompute_snaps_worst_sl_to_mintick_grid__():
-    """Off-grid worst-SL is snapped to the symbol's tick grid before it
+    """Recompute snaps the worst-SL to the symbol's mintick grid before it becomes desired.
+
+    Off-grid worst-SL is snapped to the symbol's tick grid before it
     becomes the desired level (round-at-source, ties up)."""
     manager, _ = _make_manager()
     _register_long_grid(manager)
@@ -1198,7 +1242,9 @@ def __test_recompute_tie_rounds_up__():
 
 
 def __test_awkward_tick_rounds_without_float_drift__():
-    """A fractional ``minmove`` (0.025 tick) must land exactly on the grid,
+    """An awkward fractional tick (0.025) rounds onto the grid without float drift.
+
+    A fractional ``minmove`` (0.025 tick) must land exactly on the grid,
     not a sub-tick approximation — the integer reconstruction guarantees it."""
     manager, _ = _make_manager()
     _register_long_grid(manager, grid=GRID_0025)
@@ -1215,7 +1261,9 @@ def __test_awkward_tick_rounds_without_float_drift__():
 
 
 def __test_observed_subtick_perturbation_confirms_as_match__():
-    """The core live-risk fix: a broker observation perturbed by a sub-tick
+    """A sub-tick-perturbed broker observation snaps to the grid and confirms as a match.
+
+    The core live-risk fix: a broker observation perturbed by a sub-tick
     float fraction snaps to the desired grid level and confirms — instead of
     diverging past the 1e-9 epsilon and falsely flipping ownership to UNKNOWN."""
     manager, _ = _make_manager()
@@ -1239,7 +1287,9 @@ def __test_observed_subtick_perturbation_confirms_as_match__():
 
 
 def __test_genuine_external_edit_still_flips_with_grid_active__():
-    """Rounding must not mask a real manual edit: a stop moved to a different
+    """With the grid active, a genuine external edit still flips ownership to UNKNOWN.
+
+    Rounding must not mask a real manual edit: a stop moved to a different
     grid point still flips ownership to UNKNOWN."""
     manager, _ = _make_manager()
     _register_long_grid(manager)
@@ -1258,7 +1308,9 @@ def __test_genuine_external_edit_still_flips_with_grid_active__():
 
 
 def __test_no_grid_leaves_levels_unrounded__():
-    """Backward compatibility: with the grid factors at their ``0`` sentinel
+    """With no grid factors (``0`` sentinel), levels pass through unrounded.
+
+    Backward compatibility: with the grid factors at their ``0`` sentinel
     (no symbol info), levels pass through unrounded."""
     manager, _ = _make_manager()
     _register_long(manager)  # mintick only, no minmove / pricescale
@@ -1272,7 +1324,9 @@ def __test_no_grid_leaves_levels_unrounded__():
 
 
 def __test_one_tick_trail_move_dispatches_on_awkward_grid__():
-    """Regression: round-at-source snaps trail levels onto the grid, so a
+    """A 1-tick trail move on an awkward grid dispatches despite sub-ULP float error.
+
+    Regression: round-at-source snaps trail levels onto the grid, so a
     genuine 1-tick move is a float difference (0.075 - 0.05 ==
     0.024999999999999994) that lands a sub-ULP below the 1-tick threshold.
     The immediate step-threshold compare must tolerate that, else a real trail
@@ -1302,7 +1356,9 @@ def __test_one_tick_trail_move_dispatches_on_awkward_grid__():
 
 
 def __test_one_tick_trail_move_flushed_on_awkward_grid__():
-    """Regression (coalesce-flush mirror): a 1-tick trail move throttled into
+    """A 1-tick trail move on an awkward grid is still released by the coalesce flush.
+
+    Regression (coalesce-flush mirror): a 1-tick trail move throttled into
     the coalesce window must still be released by ``flush_coalesced_trails`` —
     its step-threshold re-check must tolerate the same sub-ULP float error."""
     manager, _ = _make_manager()

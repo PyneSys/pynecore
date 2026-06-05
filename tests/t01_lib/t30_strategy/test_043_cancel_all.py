@@ -41,7 +41,9 @@ def _make_syminfo(period: str = '1'):
 
 # noinspection PyShadowingNames
 def __test_cancel_all_removes_every_pending_entry__(script_path, module_key):
-    """After ``cancel_all()`` on bar 1, neither stop entry must fill, even
+    """``cancel_all()`` on bar 1 prevents both pending stop entries from ever filling.
+
+    After ``cancel_all()`` on bar 1, neither stop entry must fill, even
     though bar 2's high=125 would trigger both stops (110 and 120). Buggy
     code path: pending orders survive, two trades open."""
     import sys

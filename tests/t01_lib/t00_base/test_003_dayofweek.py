@@ -41,7 +41,7 @@ def __test_dayofweek_function_matches_named_constant_for_every_weekday__():
 
 
 def __test_issue_56_friday_and_saturday_not_swapped__():
-    """Reporter's exact bars: Friday must match dayofweek.friday, Saturday must match dayofweek.saturday."""
+    """Reporter's bars: Friday matches dayofweek.friday, Saturday matches dayofweek.saturday."""
     ts_fri = int(datetime(2024, 6, 14, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
     assert dayofweek(ts_fri) == dayofweek.friday
     assert dayofweek(ts_fri) != dayofweek.saturday

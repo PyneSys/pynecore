@@ -374,6 +374,7 @@ def __test_journal_full_close_happy_path__(tmp_path: Path) -> None:
 
 def __test_journal_full_close_submit_timeout_marks_disposition_unknown__(
         tmp_path: Path) -> None:
+    """Full close: submit timeout re-raises and marks the row disposition-unknown."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -460,6 +461,7 @@ def __test_journal_partial_close_happy_path__(tmp_path: Path) -> None:
 
 def __test_journal_partial_close_submit_reject_marks_rejected__(
         tmp_path: Path) -> None:
+    """Partial close: submit reject re-raises and marks the row rejected."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -489,6 +491,7 @@ def __test_journal_partial_close_submit_reject_marks_rejected__(
 
 
 def __test_run_close_rejects_unknown_kind__(tmp_path: Path) -> None:
+    """``run_close`` raises ``ValueError`` naming an unknown close ``kind``."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -580,6 +583,7 @@ def __test_journal_cancel_noop_when_no_targets__(tmp_path: Path) -> None:
 
 
 def __test_journal_cancel_already_gone_path__(tmp_path: Path) -> None:
+    """Cancel records ``reason_path='already_gone'`` when the target was already cleared."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -609,6 +613,7 @@ def __test_journal_cancel_already_gone_path__(tmp_path: Path) -> None:
 
 
 def __test_journal_cancel_audit_event_sequence__(tmp_path: Path) -> None:
+    """Cancel emits ``dispatch_submitted`` -> ``confirmed`` -> ``order_closed`` in order."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -640,6 +645,7 @@ def __test_journal_cancel_audit_event_sequence__(tmp_path: Path) -> None:
 # === Modify entry path tests ==============================================
 
 def __test_journal_modify_entry_happy_path__(tmp_path: Path) -> None:
+    """Modify entry: amend confirms the new level and closes the command row."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -689,6 +695,7 @@ def __test_journal_modify_entry_happy_path__(tmp_path: Path) -> None:
 
 
 def __test_journal_modify_entry_reject_marks_rejected__(tmp_path: Path) -> None:
+    """Modify entry: amend reject re-raises and marks the command row rejected."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -724,6 +731,7 @@ def __test_journal_modify_entry_reject_marks_rejected__(tmp_path: Path) -> None:
 
 def __test_journal_modify_entry_timeout_marks_disposition_unknown__(
         tmp_path: Path) -> None:
+    """Modify entry: amend timeout re-raises and marks the row disposition-unknown."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -760,6 +768,7 @@ def __test_journal_modify_entry_timeout_marks_disposition_unknown__(
 # === Modify exit path tests ===============================================
 
 def __test_journal_modify_exit_happy_path_invokes_mirror__(tmp_path: Path) -> None:
+    """Modify exit: amend confirms, invokes the mirror hook, and closes the command row."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -812,6 +821,7 @@ def __test_journal_modify_exit_happy_path_invokes_mirror__(tmp_path: Path) -> No
 
 
 def __test_journal_modify_exit_reject_skips_mirror__(tmp_path: Path) -> None:
+    """Modify exit: amend reject re-raises, marks rejected, and skips the mirror hook."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -846,6 +856,7 @@ def __test_journal_modify_exit_reject_skips_mirror__(tmp_path: Path) -> None:
 
 
 def __test_journal_modify_exit_timeout_skips_mirror__(tmp_path: Path) -> None:
+    """Modify exit: amend timeout marks disposition-unknown and skips the mirror hook."""
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -884,6 +895,7 @@ def __test_journal_modify_exit_timeout_skips_mirror__(tmp_path: Path) -> None:
 # === State helper coverage tests (close / cancel / modify) ================
 
 def __test_create_close_target_row_rejects_bogus_kind__(tmp_path: Path) -> None:
+    """``create_close_target_row`` raises ``ValueError`` for a non-close ``kind``."""
     from pynecore.core.broker.store_helpers import create_close_target_row
     path = tmp_path / "broker.sqlite"
     with BrokerStore(path, plugin_name=PLUGIN) as store:
@@ -904,6 +916,7 @@ def __test_create_close_target_row_rejects_bogus_kind__(tmp_path: Path) -> None:
 
 def __test_record_close_server_ref_rejects_full_close_kind__(
         tmp_path: Path) -> None:
+    """``record_close_server_ref`` raises ``ValueError`` for a full-close ``kind``."""
     from pynecore.core.broker.store_helpers import (
         create_close_target_row, record_close_server_ref,
     )
@@ -929,6 +942,7 @@ def __test_record_close_server_ref_rejects_full_close_kind__(
 
 
 def __test_mark_closing_rejects_partial_kind__(tmp_path: Path) -> None:
+    """``mark_closing`` raises ``ValueError`` for a partial-close ``kind``."""
     from pynecore.core.broker.store_helpers import (
         create_close_target_row, mark_closing,
     )
@@ -954,6 +968,7 @@ def __test_mark_closing_rejects_partial_kind__(tmp_path: Path) -> None:
 
 
 def __test_mark_close_completed_rejects_bogus_kind__(tmp_path: Path) -> None:
+    """``mark_close_completed`` raises ``ValueError`` for an unknown ``kind``."""
     from pynecore.core.broker.store_helpers import (
         create_close_target_row, mark_close_completed,
     )

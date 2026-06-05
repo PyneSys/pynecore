@@ -916,8 +916,7 @@ def __test_journal_submit_reject_persists_rejected__(tmp_path: Path) -> None:
 # === Refs passed to recovery hooks ========================================
 
 def __test_recover_pending_passes_refs_from_order_refs__(tmp_path: Path) -> None:
-    """resume_pending_dispatch sees ``deal_reference`` even when only
-    ``order_refs`` was written.
+    """resume_pending_dispatch sees ``deal_reference`` materialised from ``order_refs``.
 
     Between the ``add_ref('deal_reference', ...)`` commit inside
     :func:`record_server_ref` and the subsequent
@@ -964,8 +963,10 @@ def __test_recover_pending_passes_refs_from_order_refs__(tmp_path: Path) -> None
 def __test_recover_pending_adopts_orphan_from_previous_instance__(
         tmp_path: Path,
 ) -> None:
-    """A pending dispatch from a *previous* run instance is visible to
-    :meth:`DispatchJournal.recover_pending` after restart.
+    """A pending dispatch from a *previous* run instance is recovered after restart.
+
+    :meth:`DispatchJournal.recover_pending` makes the orphaned row
+    visible again after the restart.
 
     Without adoption, :func:`find_pending_dispatch` filters by the
     current ``run_instance_id`` and misses the crashed instance's

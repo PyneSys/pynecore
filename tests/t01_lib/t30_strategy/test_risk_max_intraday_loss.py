@@ -44,6 +44,8 @@ def _make_syminfo(period: str = '60'):
 # noinspection PyShadowingNames
 def __test_max_intraday_loss_halts_within_day__(script_path, module_key):
     """
+    Intraday loss exceeding the limit within the same trading day fires the halt on that bar.
+
     Long entry filled at $100, price drops to $88 within the same trading day:
     unrealized intraday loss = $120 > limit $100 → halt must fire on that bar.
     """

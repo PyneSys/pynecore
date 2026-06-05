@@ -21,6 +21,7 @@ def main():
 
 
 def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module_key, syminfo):
+    """Percent commission charges both entry and exit notional, not just the entry leg."""
     import math
     import sys
     from pathlib import Path

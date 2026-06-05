@@ -256,7 +256,9 @@ def _stress_reader(sec_id, sync_block_name, lock, stop_event, result_queue, erro
            "cannot import them. Fork start method required.",
 )
 def __test_concurrent_lock_protects_cross_context__(log):
-    """Two processes hammer the same slot concurrently under a shared
+    """Per-slot ``multiprocessing.Lock`` keeps concurrent reads structurally valid, never torn.
+
+    Two processes hammer the same slot concurrently under a shared
     ``multiprocessing.Lock``: a writer cycles through small/large/na publications
     and a reader spins on `ResultReader.read`. Mirrors the security-child
     cross-context read path. With the per-slot lock in place, every read must

@@ -591,7 +591,9 @@ def main():
 
 
 def __test_strategy_state_via_local_alias_passes__(log):
-    """Transitive (local-alias) bind is intentionally NOT detected at AST level —
+    """Strategy state passed via a local alias compiles cleanly (not rejected at AST level).
+
+    Transitive (local-alias) bind is intentionally NOT detected at AST level —
     runtime guard in the strategy module handles it via 0.0/0 inert defaults."""
     source = """
 def main():

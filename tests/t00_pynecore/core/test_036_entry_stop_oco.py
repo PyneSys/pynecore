@@ -167,6 +167,7 @@ def _arm(eng: OrderSyncEngine, intent: EntryIntent):
 
 
 def __test_arm_registers_watch_with_stop_level__():
+    """Arming a both-set entry registers an ARMED watch at the stop level and side."""
     broker = _FakeBroker(_caps())
     eng = _engine(broker)
     _arm(eng, _both_set_entry())
@@ -178,6 +179,7 @@ def __test_arm_registers_watch_with_stop_level__():
 
 
 def __test_stop_cross_confirmed_cancel_fires_market__():
+    """A stop cross with a confirmed LIMIT cancel fires a MARKET with a distinct id."""
     broker = _FakeBroker(_caps(),
                          cancel_outcome=CancelDispositionOutcome.CANCEL_CONFIRMED)
     eng = _engine(broker)
@@ -202,6 +204,7 @@ def __test_stop_cross_confirmed_cancel_fires_market__():
 
 
 def __test_no_cross_keeps_watch_armed_and_no_market__():
+    """A price below the stop level leaves the watch ARMED and fires no market."""
     broker = _FakeBroker(_caps())
     eng = _engine(broker)
     _arm(eng, _both_set_entry())
@@ -216,6 +219,7 @@ def __test_no_cross_keeps_watch_armed_and_no_market__():
 
 
 def __test_already_filled_cancel_means_limit_won_no_market__():
+    """An ALREADY_FILLED cancel means the limit won the OCO, so no market fires."""
     # Hard gate: the LIMIT filled while we tried to cancel it -> limit won the
     # OCO, the market must NEVER fire.
     broker = _FakeBroker(_caps(),
@@ -232,6 +236,7 @@ def __test_already_filled_cancel_means_limit_won_no_market__():
 
 
 def __test_unknown_cancel_withholds_market_and_retries__():
+    """An UNKNOWN cancel withholds the market and stays cancel_pending until confirmed."""
     # Hard gate: UNKNOWN disposition -> stay cancel_pending, NO market. The
     # next tick re-drives the (idempotent) cancel gate.
     broker = _FakeBroker(_caps(),
@@ -254,6 +259,7 @@ def __test_unknown_cancel_withholds_market_and_retries__():
 
 
 def __test_native_limit_fill_retires_watch__():
+    """A native LIMIT fill retires the watch so a later stop cross fires no market."""
     # The native LIMIT leg fills first: the watch retires (limit wins) and no
     # market may ever fire.
     broker = _FakeBroker(_caps())
@@ -283,6 +289,7 @@ def __test_native_limit_fill_retires_watch__():
 # === modify keeps the software watch in lockstep with the both-set state =====
 
 def __test_arm_skips_stop_only_entry__():
+    """Arming a stop-only entry registers no software watch."""
     # Direct guard: a stop-only entry (native STOP, no limit) must NOT arm a
     # software watch — only a both-set entry (limit AND stop) does.
     broker = _FakeBroker(_caps())
@@ -295,6 +302,7 @@ def __test_arm_skips_stop_only_entry__():
 
 
 def __test_modify_limit_only_to_stop_only_does_not_arm_watch__():
+    """Modifying a limit-only entry to stop-only arms no software watch."""
     # Regression: modifying a limit-only entry to stop-only (native STOP) must
     # NOT arm a software watch alongside the native STOP. Keying the modify arm
     # on ``new.stop is not None`` alone (the pre-fix bug) would double-arm here.
@@ -316,6 +324,7 @@ def __test_modify_limit_only_to_stop_only_does_not_arm_watch__():
 
 
 def __test_modify_both_set_to_stop_only_retires_watch__():
+    """Demoting a both-set entry to stop-only retires the watch so no market fires."""
     # Regression: demoting a both-set entry to stop-only removes the software
     # STOP leg; the watch must retire so no market ever fires (the native STOP
     # now owns the trigger).
@@ -338,6 +347,7 @@ def __test_modify_both_set_to_stop_only_retires_watch__():
 
 
 def __test_modify_both_set_amends_watch_stop_level__():
+    """A both-set modify with a new stop level amends the armed watch in place."""
     # A both-set -> both-set modify with a new stop level amends the existing
     # watch in place (no re-arm, no retire); the armed level tracks the change.
     broker = _FakeBroker(_caps())

@@ -20,7 +20,9 @@ def _clear_ensured_cache():
 
 
 def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
-    """First-run smoke: no ``brokers.toml`` exists → file auto-created,
+    """Missing ``brokers.toml`` auto-creates the file and returns safe defaults.
+
+    First-run smoke: no ``brokers.toml`` exists → file auto-created,
     safe defaults returned (graceful stop, hedging-mode probe armed).
     This is the most common production path — users get a working broker
     without writing any TOML by hand."""
@@ -31,7 +33,9 @@ def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
 
 
 def __test_require_one_way_mode_override__(tmp_path: Path) -> None:
-    """Disabling the hedging-mode probe must round-trip through the
+    """``require_one_way_mode = false`` round-trips through the self-healing loader.
+
+    Disabling the hedging-mode probe must round-trip through the
     self-healing TOML loader. There is no validation list here — the
     field is a plain bool, so any truthy/falsy TOML literal is accepted."""
     (tmp_path / 'brokers.toml').write_text(
@@ -43,7 +47,9 @@ def __test_require_one_way_mode_override__(tmp_path: Path) -> None:
 
 
 def __test_user_override_is_loaded__(tmp_path: Path) -> None:
-    """A user-edited ``on_unexpected_cancel = "ignore"`` line must round-
+    """A user-edited ``on_unexpected_cancel = "ignore"`` line is loaded unchanged.
+
+    A user-edited ``on_unexpected_cancel = "ignore"`` line must round-
     trip through the self-healing TOML loader unchanged."""
     (tmp_path / 'brokers.toml').write_text(
         'on_unexpected_cancel = "ignore"\n',
@@ -54,7 +60,9 @@ def __test_user_override_is_loaded__(tmp_path: Path) -> None:
 
 
 def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
-    """Typos in the policy value must fail closed at startup rather than
+    """An invalid policy value fails closed at load time with a ``ValueError``.
+
+    Typos in the policy value must fail closed at startup rather than
     surface at the first reconcile cycle — the misconfiguration would
     otherwise silently fall through to the ``stop`` branch via the
     ``policy not in {…}`` checks in :mod:`reconcile`, which is harder
@@ -71,7 +79,9 @@ def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
 
 
 def __test_valid_policy_set_contents__() -> None:
-    """Guard against accidental drift between the validator's allow-set
+    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the four expected policies.
+
+    Guard against accidental drift between the validator's allow-set
     and the four branches implemented in
     :meth:`CapitalCom._maybe_raise_unexpected_cancel`."""
     assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
