@@ -106,6 +106,9 @@
     "gaps_on": {
       "type": "variable"
     },
+    "lookahead_last_closed": {
+      "type": "variable"
+    },
     "lookahead_off": {
       "type": "variable"
     },
