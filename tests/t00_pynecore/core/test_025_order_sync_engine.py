@@ -1390,6 +1390,134 @@ def __test_reconcile_adopts_exchange_position_size__():
     assert engine.exchange_position is b.position
 
 
+def __test_startup_adoption_seeds_open_trades_so_close_nets_flat__():
+    """A non-zero startup adoption seeds ``open_trades`` so a later exit fill nets to flat.
+
+    Regression: adoption used to restore only ``size``/``avg_price`` and leave
+    ``open_trades`` empty. When the reconstructed bracket's reduce-only CLOSE
+    leg then filled, ``record_fill`` walked an empty FIFO and minted a phantom
+    opposite-side position instead of going flat.
+    """
+    b = MockBroker()
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1000.0, entry_price=1.15200,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+
+    engine.reconcile()  # startup adoption
+
+    assert pos.size == 1000.0
+    assert pos.sign == 1.0
+    assert len(pos.open_trades) == 1
+    assert pos.open_trades[0].size == 1000.0
+    assert pos.open_trades[0].entry_id == "__adopted_startup__"
+
+    # The bracket's TP/SL fires: a reduce-only CLOSE sell of the full size.
+    pos.record_fill(
+        _fill_event("sell", 1000.0, 1.15263, pine_id="Bracket", leg=LegType.CLOSE)
+    )
+
+    assert pos.size == 0.0  # flat — NOT a phantom -1000 short
+    assert pos.sign == 0.0
+    assert pos.open_trades == []
+
+
+def __test_startup_adoption_decodes_short_side_to_negative_size__():
+    """``ExchangePosition.size`` is an unsigned magnitude — a short must adopt as a negative size.
+
+    Regression: the plain adoption branch used ``exch_pos.size`` raw, so a
+    short (``side="short"``, ``size=1000``) was adopted as a +1000 long.
+    """
+    b = MockBroker()
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1000.0, entry_price=1.15200,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+
+    engine.reconcile()
+
+    assert pos.size == -1000.0  # short, not +1000
+    assert pos.sign == -1.0
+    assert len(pos.open_trades) == 1
+    assert pos.open_trades[0].size == -1000.0
+
+    # Closing a short is a BUY; nets cleanly to flat.
+    pos.record_fill(
+        _fill_event("buy", 1000.0, 1.15100, pine_id="Bracket", leg=LegType.CLOSE)
+    )
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+
+
+def __test_record_fill_exit_leg_clamps_to_flat_instead_of_flipping__():
+    """A reduce-only/exit leg with insufficient FIFO clamps to flat, never opening an opposite side."""
+    pos = BrokerPosition()
+    pos.size = 1000.0
+    pos.sign = 1.0
+    pos.avg_price = 1.15200
+    # open_trades intentionally empty — simulates a FIFO desync.
+
+    flipped = pos.record_fill(
+        _fill_event("sell", 1000.0, 1.15263, pine_id="Bracket", leg=LegType.CLOSE)
+    )
+
+    assert pos.size == 0.0  # clamped flat — NOT -1000
+    assert pos.sign == 0.0
+    assert pos.open_trades == []
+    assert flipped is True  # side did change (long -> flat)
+
+
+def __test_record_fill_partial_exit_leg_keeps_residual_size__():
+    """A PARTIAL reduce-only fill against an under-counted FIFO keeps the residual size.
+
+    Regression: the exit-leg guard used to clamp to flat on ANY leftover qty,
+    so an adopted long 1000 with no FIFO rows receiving a sell TP of 400 went
+    to size 0 instead of 600 — losing live broker exposure and letting the
+    script re-fire the entry. The authoritative net (``self.size += signed_delta``)
+    is correct; the clamp must only fire when the exit actually over-closes.
+    """
+    pos = BrokerPosition()
+    pos.size = 1000.0
+    pos.sign = 1.0
+    pos.avg_price = 1.15200
+    # open_trades intentionally empty — simulates a FIFO desync.
+
+    flipped = pos.record_fill(
+        _fill_event("sell", 400.0, 1.15263, pine_id="Bracket", leg=LegType.TAKE_PROFIT)
+    )
+
+    assert pos.size == 600.0  # residual kept — NOT clamped to 0
+    assert pos.sign == 1.0  # still long
+    assert pos.avg_price == 1.15200  # untouched on a partial reduce
+    assert flipped is False  # side did NOT change (long -> long)
+
+
+def __test_record_fill_entry_leg_still_flips_for_reversal__():
+    """An ENTRY leg may still flip the side (stop-and-reverse) — the clamp only blocks exit legs."""
+    from pynecore.lib.strategy import Trade
+    pos = BrokerPosition()
+    pos.size = 1000.0
+    pos.sign = 1.0
+    pos.avg_price = 1.15200
+    pos.open_trades.append(Trade(
+        size=1000.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=1.15200, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    pos.record_fill(
+        _fill_event("sell", 1500.0, 1.15300, pine_id="Short", leg=LegType.ENTRY)
+    )
+
+    assert pos.size == -500.0  # closed +1000, reversed into -500
+    assert pos.sign == -1.0
+
+
 def __test_reconcile_clears_position_when_exchange_flat__():
     """User manually closes via web UI: ``get_position`` returns ``None``.
 
@@ -4518,7 +4646,7 @@ def _persist_bracket_ownership(ctx, *, leg_id="1", intent_key="X\0L",
         ctx, coid=f"bo-test:{leg_id}", symbol=SYMBOL, side="sell", qty=2.0,
         intent_key=intent_key, pine_entry_id=pine_id, from_entry=from_entry,
         leg_id=leg_id, attach_coid="t-attach",
-        tp_price=120.0, sl_price=90.0, trail_offset=None,
+        tp_price=120.0, sl_price=90.0, trail_price=None, trail_offset=None,
     )
 
 
@@ -4570,6 +4698,94 @@ def __test_active_one_way_bracket_not_orphan_swept__(tmp_path):
         assert b.amend_calls == []  # neither cleared nor re-dispatched
         assert any(r.intent_key == "X\0L"
                    for r in iter_active_bracket_ownerships(ctx))  # still protected
+
+
+def __test_restart_reconstructs_one_way_bracket_and_adopts__(tmp_path):
+    """A restart rebuilds a persisted one-way bracket the script no longer re-emits, and adopts it.
+
+    Pine ``strategy.exit`` orders persist across bars without re-emission, so a
+    common script attaches the bracket only on the entry bar. After a restart
+    with the position adopted, the entry bar never re-fires — but the bracket
+    must NOT be torn down. The first sync reconstructs the Pine-side exit from
+    the persisted ownership ledger, the diff adopts it, and the live broker
+    protection is preserved (re-asserted, never cleared).
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine.sync(BAR_TS)  # Pine emits nothing; reconstruction + adoption run
+        assert ("1", None, None) not in b.amend_calls  # never cleared to None
+        assert ("1", 120.0, 90.0) in b.amend_calls  # re-asserted by restart_replay
+        assert ("X", "L") in pos.exit_orders  # Pine-side exit rebuilt
+        assert engine._order_mapping.get("X\0L") == ["bracket:1"]
+        assert "X\0L" in engine.active_intents  # adopted, not re-dispatched
+        assert any(r.intent_key == "X\0L"
+                   for r in iter_active_bracket_ownerships(ctx))  # still protected
+
+
+def __test_restart_one_way_multi_leg_grouped_into_one_order__(tmp_path):
+    """A bracket replicated onto several hedged legs rebuilds as ONE exit, mapping every leg."""
+    # The emulator writes one ownership row per position-side leg, all sharing
+    # the exit's intent_key with identical levels. Reconstruction must collapse
+    # them into a single Pine exit Order and seed _order_mapping with every leg.
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx, leg_id="1")
+        _persist_bracket_ownership(ctx, leg_id="2")
+        _persist_bracket_ownership(ctx, leg_id="3")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0), _pleg("2", "buy", 2.0),
+                      _pleg("3", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine.sync(BAR_TS)
+        assert len([k for k in pos.exit_orders if k == ("X", "L")]) == 1  # one Order
+        assert sorted(engine._order_mapping["X\0L"]) == [
+            "bracket:1", "bracket:2", "bracket:3"]
+        assert all(("1", None, None) != c and ("2", None, None) != c
+                   and ("3", None, None) != c for c in b.amend_calls)  # no clears
+
+
+def __test_restart_reconstructed_bracket_modify_not_duplicate__(tmp_path):
+    """After a restart adopts a bracket, a changed TP on the next bar amends — not re-attaches."""
+    # Reconstruction + adoption pins the intent in _active_intents, so the normal
+    # diff handles a subsequent level change as a modify of the live bracket
+    # rather than a fresh duplicate attach.
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine.sync(BAR_TS)  # adopt
+        b.amend_calls.clear()
+        # The script now emits the same exit with a raised TP on the next bar.
+        pos.exit_orders[("X", "L")] = _exit_order("L", -2.0, "X", limit=130.0, stop=90.0)
+        engine.sync(BAR_TS + 60_000)
+        # The live leg's bracket is amended to the new TP; never cleared to None.
+        assert ("1", 130.0, 90.0) in b.amend_calls
+        assert ("1", None, None) not in b.amend_calls
 
 
 def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):

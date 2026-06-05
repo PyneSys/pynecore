@@ -105,6 +105,13 @@ from pynecore.core.broker.storage import (
 )
 from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
+    EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_TP,
+    EXTRAS_KEY_BRACKET_OWN_SL,
+    EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE,
+    EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
+    BRACKET_OWN_STATE_ACTIVE,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
     LEG_KIND_TRAIL_PARTIAL,
@@ -373,6 +380,13 @@ class OrderSyncEngine:
         # via the port, so unlike the sync sibling replays it cannot run inline
         # in ``__init__``.
         self._one_way_replay_done: bool = False
+        # Set on the first ``sync`` after the replays above: rebuilds the
+        # persistent Pine-side ``strategy.exit`` bracket orders the previous run
+        # armed (one-way ownership ledger + engine-trigger partial legs) into
+        # ``_position.exit_orders`` so the diff adopts the live broker bracket
+        # instead of tearing it down as an orphan. See
+        # :meth:`_reconstruct_pine_bracket_state`.
+        self._pine_bracket_reconstruct_done: bool = False
 
         self._active_intents: dict[str, Intent] = {}
         self._order_mapping: dict[str, list[str]] = {}
@@ -1134,6 +1148,19 @@ class OrderSyncEngine:
                 e,
             )
             return
+
+        # Rebuild the persistent Pine-side ``strategy.exit`` bracket orders the
+        # previous run armed, ONCE, after the replays above re-asserted them on
+        # the broker and before ``build_intents`` reads ``exit_orders``. Pine
+        # exits persist across bars without re-emission, but a fresh process
+        # starts with empty order dicts — so without this the diff sees no
+        # bracket, treats the live broker protection as an orphan, and tears it
+        # down. Pure-local (store + already-replayed ledgers -> in-memory Pine
+        # state); reached only after ``_one_way_replay_done`` so it never runs
+        # against an un-replayed ledger.
+        if not self._pine_bracket_reconstruct_done:
+            self._reconstruct_pine_bracket_state()
+            self._pine_bracket_reconstruct_done = True
 
         raw = build_intents(
             self._position.entry_orders,
@@ -2113,26 +2140,81 @@ class OrderSyncEngine:
             self._adopt_size_with_replayed_close(
                 new_size, exch_pos, replayed_markers_to_consider,
             )
-        elif is_startup and new_size != self._position.size:
-            _blog_warning(
-                "position size mismatch (exchange=%s, internal=%s) — "
-                "adopting exchange",
-                new_size, self._position.size,
-            )
-            self._position.size = new_size
-            self._position.sign = (
-                1.0 if new_size > 0.0
-                else (-1.0 if new_size < 0.0 else 0.0)
-            )
-            if new_size == 0.0:
-                self._position.avg_price = na_float
-                self._position.open_trades.clear()
-                self._position.openprofit = 0.0
-                self._position.open_commission = 0.0
-            else:
-                self._position.avg_price = (
-                    exch_pos.entry_price if exch_pos is not None else na_float
+        elif is_startup:
+            # ``ExchangePosition.size`` is the unsigned magnitude with the
+            # direction carried by ``side`` (same convention decoded in
+            # :meth:`_adopt_size_with_replayed_close`). Comparing/adopting
+            # ``new_size`` raw would adopt every short as a long.
+            broker_signed = 0.0
+            broker_entry_price = 0.0
+            adopt_known = True
+            if exch_pos is not None:
+                broker_abs = float(exch_pos.size)
+                broker_side = (exch_pos.side or "").lower()
+                broker_entry_price = float(exch_pos.entry_price)
+                if broker_abs == 0.0 or broker_side == "flat":
+                    broker_signed = 0.0
+                elif broker_side == "long":
+                    broker_signed = broker_abs
+                elif broker_side == "short":
+                    broker_signed = -broker_abs
+                else:
+                    # Non-zero size with an unrecognised side label — refuse
+                    # to guess the direction rather than adopt the wrong sign.
+                    adopt_known = False
+                    _blog_warning(
+                        "skipping startup size adoption (exchange=%s, "
+                        "internal=%s) — broker snapshot carries an "
+                        "unrecognised side label %r",
+                        new_size, self._position.size, exch_pos.side,
+                    )
+            if adopt_known and broker_signed != self._position.size:
+                _blog_warning(
+                    "position size mismatch (exchange=%s, internal=%s) — "
+                    "adopting exchange",
+                    broker_signed, self._position.size,
                 )
+                self._position.size = broker_signed
+                self._position.sign = (
+                    1.0 if broker_signed > 0.0
+                    else (-1.0 if broker_signed < 0.0 else 0.0)
+                )
+                if broker_signed == 0.0:
+                    self._position.avg_price = na_float
+                    self._position.open_trades.clear()
+                    self._position.openprofit = 0.0
+                    self._position.open_commission = 0.0
+                else:
+                    self._position.avg_price = broker_entry_price
+                    # Adoption restores the net size, but BrokerPosition has no
+                    # simulator to populate the FIFO ``open_trades``. Seed one
+                    # synthetic parent trade so a later exit fill nets against
+                    # it instead of walking an empty FIFO and minting a phantom
+                    # opposite-side position in ``record_fill``.
+                    if not (broker_entry_price > 0.0):
+                        _blog_warning(
+                            "adopted position has no usable entry price (%s) "
+                            "— seeding parent trade for size correctness; "
+                            "realized P&L on this trade will be approximate",
+                            broker_entry_price,
+                        )
+                    # Prefer the real Pine parent entry id recovered from the
+                    # durable bracket-ownership ledger so a post-restart
+                    # ``strategy.exit(..., from_entry='L')`` still resolves the
+                    # seeded trade and can re-target the reconstructed bracket
+                    # (the Pine ``exit`` helper matches ``open_trades`` by
+                    # ``entry_id``). Falls back to the synthetic id when no
+                    # single parent can be recovered (no bracket, or pyramided
+                    # multi-parent position).
+                    adopted_entry_id = (
+                        self._recover_adopted_parent_entry_id()
+                        or "__adopted_startup__"
+                    )
+                    self._position.reconstruct_parent_trade(
+                        entry_id=adopted_entry_id,
+                        size=broker_signed,
+                        entry_price=broker_entry_price,
+                    )
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
             # Skip while bot-initiated work is in flight — a close we
             # dispatched ourselves will flatten /positions seconds before
@@ -6207,6 +6289,152 @@ class OrderSyncEngine:
             elif isinstance(intent, EntryIntent):
                 mods['stop'] = result.modified_stop
         return dataclasses.replace(intent, **mods) if mods else intent
+
+    # === Restart-time Pine-side bracket reconstruction ===
+
+    def _recover_adopted_parent_entry_id(self) -> str | None:
+        """Recover the single real Pine parent entry id for a startup adoption.
+
+        When startup adoption seeds the FIFO parent trade for a position opened
+        in a prior process, the synthetic ``__adopted_startup__`` id breaks any
+        later ``strategy.exit(..., from_entry='L')`` that targets the real entry:
+        the Pine helper (:func:`~pynecore.lib.strategy.exit`) resolves
+        ``from_entry`` by scanning ``entry_orders`` then ``open_trades`` for a
+        matching ``entry_id`` and silently returns when neither holds it, so a
+        dynamic TP/SL change after restart would be dropped and the reconstructed
+        bracket frozen on its pre-restart levels.
+
+        Recover the parent id from the durable bracket-ownership ledger (the same
+        rows :meth:`_reconstruct_one_way_bracket_exits` rebuilds the exit from),
+        which persists the real ``from_entry``. Return it only when every active
+        row agrees on a single parent: a pyramided position carries several
+        distinct ``from_entry`` parents that cannot be collapsed into one seeded
+        trade, so fall back to the synthetic id there (a degraded but safe state —
+        the bracket is still preserved, only dynamic re-targeting by a specific
+        parent id is lost). Returns ``None`` when no parent can be recovered.
+
+        Pure-local: read-only over the persisted ledger.
+        """
+        if self._store_ctx is None:
+            return None
+        parents: set[str] = set()
+        for row in iter_active_bracket_ownerships(
+                self._store_ctx, symbol=self._symbol,
+        ):
+            if (row.extras or {}).get(
+                    EXTRAS_KEY_BRACKET_OWN_STATE) != BRACKET_OWN_STATE_ACTIVE:
+                continue
+            if row.from_entry is not None:
+                parents.add(row.from_entry)
+        if len(parents) == 1:
+            return next(iter(parents))
+        return None
+
+    def _reconstruct_pine_bracket_state(self) -> None:
+        """Rebuild the persistent Pine-side exit brackets the previous run armed.
+
+        A Pine ``strategy.exit`` order is persistent: once placed it lives in
+        ``position.exit_orders`` across bars (the script need not re-emit it)
+        until it fills or is cancelled, and ``build_intents`` re-derives the same
+        :class:`ExitIntent` from it every sync. A fresh process starts with empty
+        order dicts, so after a restart that bracket is invisible to the diff —
+        :meth:`_diff_and_dispatch` then sees the live broker bracket (already
+        re-asserted by the emulator's ``restart_replay``) as an orphan and tears
+        it down. Rebuild it here, ONCE, from the durable broker-side ledger so
+        the diff adopts the live protection exactly as if the script had kept it
+        emitted.
+
+        Pure-local: reads the persisted ownership ledger and mutates only
+        in-memory Pine-side state (``_position.exit_orders`` + ``_order_mapping``).
+        """
+        self._reconstruct_one_way_bracket_exits()
+
+    def _reconstruct_one_way_bracket_exits(self) -> None:
+        """Re-install one-way (hedging-emulated) native brackets after a restart.
+
+        One Pine exit replicates onto every position-side leg, so N active
+        ownership rows share one ``intent_key`` with identical levels. Rebuild a
+        single Pine exit ``Order`` per ``intent_key`` and seed ``_order_mapping``
+        with the per-leg synthetic ids (the same shape the live dispatch sets),
+        so the existing cross-restart adoption branch in :meth:`_diff_and_dispatch`
+        adopts the intent instead of re-dispatching it.
+
+        Only ``active`` rows are rebuilt — a ``clearing`` row is marked for
+        removal and owned by ``restart_replay`` / the per-sync drain. On the rare
+        chance the legs of one intent carry divergent levels (a partial modify
+        the previous run never finished), the bracket is still rebuilt from a
+        representative row with a warning — never cleared. The live broker
+        protection is preserved in every branch.
+        """
+        one_way_port = getattr(self._broker, 'position_port', None)
+        if one_way_port is None or self._store_ctx is None:
+            return
+        groups: dict[str, list] = {}
+        for row in iter_active_bracket_ownerships(
+                self._store_ctx, symbol=self._symbol,
+        ):
+            extras = row.extras or {}
+            if extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) != BRACKET_OWN_STATE_ACTIVE:
+                continue
+            if (row.intent_key is None or row.pine_entry_id is None
+                    or row.from_entry is None):
+                continue
+            groups.setdefault(row.intent_key, []).append(row)
+        for ikey, rows in groups.items():
+            rep = rows[0]
+            # Skip only when the bracket exit is genuinely already tracked: an
+            # in-session dispatch left it in ``_active_intents``, or it is already
+            # present in ``_position.exit_orders`` (a prior reconstruction, or a
+            # live emission). A bare ``_order_mapping`` slot is NOT sufficient —
+            # :meth:`_consume_plugin_resolutions` seeds an empty mapping for an
+            # ``'attached'`` bracket resolution (``_order_mapping.setdefault(key, [])``)
+            # before this pass runs in the same first sync. Guarding on that would
+            # skip rebuilding ``exit_orders``, leaving ``build_intents`` to emit no
+            # exit and the one-way orphan sweep in :meth:`_diff_and_dispatch` to
+            # tear down the live broker protection it iterates ownership rows for.
+            if (ikey in self._active_intents
+                    or (rep.pine_entry_id, rep.from_entry)
+                    in self._position.exit_orders):
+                continue
+            rextras = rep.extras or {}
+            tp_price = rextras.get(EXTRAS_KEY_BRACKET_OWN_TP)
+            sl_price = rextras.get(EXTRAS_KEY_BRACKET_OWN_SL)
+            trail_price = rextras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE)
+            trail_offset = rextras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
+            if any(
+                (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_TP) != tp_price
+                or (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_SL) != sl_price
+                or (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
+                != trail_offset
+                for r in rows
+            ):
+                _blog_warning(
+                    "reconstructed one-way bracket %r has divergent leg levels "
+                    "across rows after restart; preserving from representative "
+                    "leg (tp=%s sl=%s trail_offset=%s) — no teardown",
+                    ikey, tp_price, sl_price, trail_offset,
+                )
+            leg_ids = [
+                (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+                for r in rows
+            ]
+            leg_ids = [lid for lid in leg_ids if lid is not None]
+            self._position.reconstruct_exit_order(
+                pine_id=rep.pine_entry_id,
+                from_entry=rep.from_entry,
+                side=rep.side,
+                qty=rep.qty,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                trail_price=trail_price,
+                trail_offset=trail_offset,
+            )
+            self._order_mapping[ikey] = [f"bracket:{lid}" for lid in leg_ids]
+            _blog_info(
+                "reconstructed one-way bracket exit %r after restart "
+                "(%d leg(s)) — adopting live broker protection",
+                ikey, len(leg_ids),
+            )
 
     # === Diff + dispatch ===
 

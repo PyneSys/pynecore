@@ -11,6 +11,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from pynecore import lib
+from pynecore.core.broker.models import LegType
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
@@ -224,6 +225,107 @@ class BrokerPosition(PositionBase):
         self.entry_orders.clear()
         self.exit_orders.clear()
 
+    # === Restart-time Pine-side reconstruction ===
+
+    def reconstruct_exit_order(
+            self,
+            *,
+            pine_id: str,
+            from_entry: str,
+            side: str,
+            qty: float,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_price: float | None,
+            trail_offset: float | None,
+            oca_name: str | None = None,
+    ) -> None:
+        """Re-install a persistent ``strategy.exit`` bracket order after a restart.
+
+        Pine ``strategy.exit`` orders are persistent: once placed they live in
+        :attr:`exit_orders` across bars (the script need not re-emit them) until
+        they fill or are cancelled. A fresh process starts with empty order
+        dicts, so the bracket the previous run armed is invisible to
+        :func:`~pynecore.core.broker.intent_builder.build_intents` until it is
+        rebuilt here from the durable broker-side ledger (the one-way
+        bracket-ownership rows or the engine-trigger partial-leg ledger). The
+        :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine` calls this
+        once at startup so the diff sees the same exit it saw before the crash
+        and adopts (rather than tears down) the live broker protection.
+
+        ``side`` is the CLOSE side (``"buy"``/``"sell"``); the stored
+        :class:`~pynecore.lib.strategy.Order` carries the opposite-of-position
+        signed size so ``build_intents`` re-derives the same side. Tick fields
+        are left ``None`` — the ledger persists resolved absolute prices, never
+        the original tick distances.
+
+        :param pine_id: The ``strategy.exit(id=...)`` value (the exit id).
+        :param from_entry: The parent entry id the exit protects.
+        :param side: The exit (close) side, ``"buy"`` or ``"sell"``.
+        :param qty: Exit quantity magnitude.
+        :param tp_price: Absolute take-profit price, or ``None``.
+        :param sl_price: Absolute stop-loss price, or ``None``.
+        :param trail_price: Absolute trailing-stop activation price, or ``None``.
+        :param trail_offset: Trailing-stop offset (price units), or ``None``.
+        :param oca_name: OCA group name, or ``None``.
+        """
+        # noinspection PyProtectedMember
+        from pynecore.lib.strategy import Order, _order_type_close
+        signed_size = qty if side == "buy" else -qty
+        order = Order(
+            from_entry,
+            signed_size,
+            order_type=_order_type_close,
+            exit_id=pine_id,
+            limit=tp_price,
+            stop=sl_price,
+            trail_price=trail_price,
+            trail_offset=trail_offset,
+            oca_name=oca_name,
+        )
+        self.exit_orders[(pine_id, from_entry)] = order
+
+    def reconstruct_parent_trade(
+            self,
+            *,
+            entry_id: str,
+            size: float,
+            entry_price: float,
+    ) -> None:
+        """Seed one open :class:`~pynecore.lib.strategy.Trade` for an adopted parent.
+
+        Startup adoption restores :attr:`size`/:attr:`avg_price` but leaves
+        :attr:`open_trades` empty. A partial-quantity bracket needs the parent's
+        open qty to classify
+        :attr:`~pynecore.core.broker.models.ExitIntent.is_partial_qty_bracket`
+        consistently across bars (``build_intents`` derives the parent total
+        from :attr:`open_trades`); without it the exit would be misclassified as
+        a whole-row bracket and adopted on the wrong dispatch path. The trade is
+        inert until a real broker fill routes through :meth:`record_fill` (the
+        sole :attr:`open_trades` mutator), so seeding it cannot emit an intent or
+        re-open anything.
+
+        :param entry_id: The parent entry id (``from_entry``).
+        :param size: Signed parent open size (positive long, negative short).
+        :param entry_price: Parent average entry price.
+        """
+        if any(t.entry_id == entry_id for t in self.open_trades):
+            return
+        # ``entry_equity`` stays 0.0: the parent opened in a prior process so
+        # its true entry equity is unknowable, and startup adoption runs in
+        # ``start_broker`` before the script is attached (``self.equity`` reads
+        # ``lib._script``, not yet set). The broker close path never divides by
+        # a trade's entry equity, so the placeholder is inert.
+        self.open_trades.append(Trade(
+            size=size,
+            entry_id=entry_id,
+            entry_bar_index=int(getattr(lib, 'bar_index', 0)),
+            entry_time=0,
+            entry_price=entry_price,
+            commission=0.0,
+            entry_equity=0.0,
+        ))
+
     # === Exchange-side state updates ===
 
     def record_fill(self, event: 'OrderEvent') -> bool:
@@ -332,23 +434,61 @@ class BrokerPosition(PositionBase):
         else:
             self.sign = 1.0 if self.size > 0.0 else -1.0
 
-        # If there is leftover qty after closing all open_trades → side flip
+        # If there is leftover qty after closing all open_trades → side flip.
+        # On a one-way account only an ENTRY leg may legitimately open the
+        # opposite side (stop-and-reverse). A reduce-only/exit leg (close, TP,
+        # SL, trailing) must NEVER flip: leftover qty means the local FIFO
+        # under-counted exposure (e.g. a restart adopted the net size without
+        # seeding open_trades). The authoritative net is already in ``self.size``
+        # (``self.size += signed_delta`` above), so two cases split apart:
+        #   * the net kept its original sign → the exit only PARTIALLY reduced;
+        #     the leftover is a stale FIFO row shortfall, NOT an over-close.
+        #     Keep the (already-correct) residual size — clamping to flat would
+        #     drop live broker exposure and let the script re-fire the entry.
+        #   * the net reached or crossed zero → the exit closed at least the
+        #     whole position; reconcile toward flat instead of fabricating an
+        #     opposite position the diff engine could then "close" with a real
+        #     reversing order.
         if remaining > 0.0:
-            new_size = self.sign * remaining if self.sign != 0.0 else signed_delta
-            self.size = new_size
-            self.sign = 1.0 if new_size > 0.0 else (-1.0 if new_size < 0.0 else 0.0)
-            self.avg_price = fill_price
-            flipped = Trade(
-                size=new_size,
-                entry_id=event.pine_id,
-                entry_bar_index=int(getattr(lib, 'bar_index', 0)),
-                entry_time=int(event.timestamp * 1000.0),
-                entry_price=fill_price,
-                commission=0.0,
-                entry_comment=None,
-                entry_equity=self.equity,
-            )
-            self.open_trades.append(flipped)
+            if event.leg_type in (
+                LegType.CLOSE, LegType.TAKE_PROFIT,
+                LegType.STOP_LOSS, LegType.TRAILING_STOP,
+            ):
+                if old_sign * self.size > 0.0:
+                    # Partial reduce-only fill against an under-counted FIFO:
+                    # the residual already in ``self.size`` is authoritative.
+                    _blog_warning(
+                        "exit fill (leg=%s qty=%s) under-counted FIFO exposure "
+                        "by %s — keeping residual size %s (partial reduce, "
+                        "not an over-close)",
+                        event.leg_type, fill_qty, remaining, self.size,
+                    )
+                else:
+                    _blog_warning(
+                        "exit fill (leg=%s qty=%s) exceeded known FIFO exposure "
+                        "by %s — clamping to flat instead of opening an opposite "
+                        "position",
+                        event.leg_type, fill_qty, remaining,
+                    )
+                    self.size = 0.0
+                    self.sign = 0.0
+                    self.avg_price = na_float
+            else:
+                new_size = self.sign * remaining if self.sign != 0.0 else signed_delta
+                self.size = new_size
+                self.sign = 1.0 if new_size > 0.0 else (-1.0 if new_size < 0.0 else 0.0)
+                self.avg_price = fill_price
+                flipped = Trade(
+                    size=new_size,
+                    entry_id=event.pine_id,
+                    entry_bar_index=int(getattr(lib, 'bar_index', 0)),
+                    entry_time=int(event.timestamp * 1000.0),
+                    entry_price=fill_price,
+                    commission=0.0,
+                    entry_comment=None,
+                    entry_equity=self.equity,
+                )
+                self.open_trades.append(flipped)
 
         # Update running stats
         self.netprofit += closed_profit

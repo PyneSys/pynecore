@@ -442,6 +442,7 @@ class OneWayEmulator:
                     attach_coid=attach_coid,
                     tp_price=intent.tp_price,
                     sl_price=intent.sl_price,
+                    trail_price=intent.trail_price,
                     trail_offset=intent.trail_offset,
                 )
             try:

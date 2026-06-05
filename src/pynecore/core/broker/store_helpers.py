@@ -131,6 +131,7 @@ __all__ = [
     'EXTRAS_KEY_BRACKET_OWN_CLEAR_COID',
     'EXTRAS_KEY_BRACKET_OWN_TP',
     'EXTRAS_KEY_BRACKET_OWN_SL',
+    'EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE',
     'EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET',
     'create_bracket_ownership_row',
     'update_bracket_ownership_state',
@@ -588,6 +589,12 @@ EXTRAS_KEY_BRACKET_OWN_CLEAR_COID = 'bracket_own_clear_coid'
 # Pine-unit protective levels last replicated onto the leg (audit + modify diff).
 EXTRAS_KEY_BRACKET_OWN_TP = 'bracket_own_tp'
 EXTRAS_KEY_BRACKET_OWN_SL = 'bracket_own_sl'
+# Absolute trailing-stop activation price (``ExitIntent.trail_price``). Persisted
+# so a restart can faithfully rebuild a pending-trailing exit's Pine ``Order``;
+# ``trail_offset`` alone cannot distinguish a pre-activation trail from an active
+# one. Absent on rows written before this key existed — reconstruct trail_price
+# as ``None`` in that case (never tear the bracket down over the gap).
+EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE = 'bracket_own_trail_price'
 EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET = 'bracket_own_trail_offset'
 
 
@@ -1821,6 +1828,7 @@ def create_bracket_ownership_row(
         attach_coid: str,
         tp_price: float | None,
         sl_price: float | None,
+        trail_price: float | None,
         trail_offset: float | None,
         extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
@@ -1852,6 +1860,7 @@ def create_bracket_ownership_row(
     :param attach_coid: The exit's ``KIND_EXIT_SL`` bracket-attach coid.
     :param tp_price: Pine-unit take-profit level last replicated (or ``None``).
     :param sl_price: Pine-unit stop-loss level last replicated (or ``None``).
+    :param trail_price: Pine-unit trailing-stop activation price (or ``None``).
     :param trail_offset: Pine-unit trailing offset last replicated (or ``None``).
     :param extra_payload: Additional plugin-specific extras to merge.
     """
@@ -1861,6 +1870,7 @@ def create_bracket_ownership_row(
         EXTRAS_KEY_BRACKET_OWN_ATTACH_COID: attach_coid,
         EXTRAS_KEY_BRACKET_OWN_TP: tp_price,
         EXTRAS_KEY_BRACKET_OWN_SL: sl_price,
+        EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE: trail_price,
         EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET: trail_offset,
     }
     if extra_payload:
