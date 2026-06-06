@@ -114,6 +114,8 @@ class Order:
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
+        "reserved_size",  # Exit-leg slice of the entry's original size (frozen at creation)
+        "consumed",  # True once an exit leg fired its slice while its entry is still open
     )
 
     def __init__(
@@ -181,6 +183,8 @@ class Order:
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
         self.from_entry_na = False
+        self.reserved_size = abs(size)
+        self.consumed = False
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -195,7 +199,7 @@ class Trade:
     """
 
     __slots__ = (
-        "size", "sign", "entry_id", "entry_bar_index", "entry_time", "entry_price", "entry_comment", "entry_equity",
+        "size", "init_size", "sign", "entry_id", "entry_bar_index", "entry_time", "entry_price", "entry_comment", "entry_equity",
         "exit_id", "exit_bar_index", "exit_time", "exit_price", "exit_comment", "exit_equity",
         "commission", "max_drawdown", "max_drawdown_percent", "max_runup", "max_runup_percent",
         "profit", "profit_percent", "cum_profit", "cum_profit_percent",
@@ -208,6 +212,9 @@ class Trade:
                  commission: PyneFloat, entry_comment: PyneStr | None = None,
                  entry_equity: PyneFloat = 0.0):
         self.size: PyneFloat = size
+        # Original entry quantity, frozen — partial exits shrink ``size`` but
+        # qty_percent / no-qty "rest" exit legs reserve off this value.
+        self.init_size: PyneFloat = size
         self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
         self.entry_id: str | None = entry_id
@@ -577,9 +584,10 @@ class Position:
             if order.oca_name == oca_name and order != executed_order:
                 self._remove_order(order)
 
-        # Cancel exit orders in the same OCA group
+        # Cancel exit orders in the same OCA group (consumed tombstones are
+        # retired — they keep their reservation until the entry fully closes)
         for order in list(self.exit_orders.values()):
-            if order.oca_name == oca_name and order != executed_order:
+            if order.oca_name == oca_name and order != executed_order and not order.consumed:
                 self._remove_order(order)
 
     def _reduce_oca_group(self, oca_name: str, filled_size: PyneFloat):
@@ -597,9 +605,10 @@ class Position:
                     # Keep original sign
                     order.size = new_size * order.sign
 
-        # Reduce exit orders
+        # Reduce exit orders (skip consumed tombstones: a leg that fired its
+        # slice is retired and keeps its reservation until the entry closes)
         for order in list(self.exit_orders.values()):
-            if order.oca_name == oca_name and not order.cancelled:
+            if order.oca_name == oca_name and not order.cancelled and not order.consumed:
                 new_size = abs(order.size) - reduction
                 if new_size <= 0:
                     self._remove_order(order)
@@ -790,7 +799,19 @@ class Position:
             self.open_trades = new_open_trades
 
             if delete:
-                self._remove_order(order)
+                # A partial-exit leg that fired its whole slice while its entry's
+                # position is still open becomes a tombstone: kept in exit_orders
+                # (so its reservation still counts against sibling "rest" legs and
+                # a per-bar strategy.exit() re-call cannot resurrect it) and only
+                # pulled from the order book. It is purged when the entry fully
+                # closes (the trade.size == 0.0 block above).
+                if (order.order_type == _order_type_close and order.order_id is not None
+                        and _size_round(order.size) == 0.0
+                        and any(t.entry_id == order.order_id for t in self.open_trades)):
+                    order.consumed = True
+                    self.orderbook.remove_order(order)
+                else:
+                    self._remove_order(order)
 
                 if commission_type == _commission.cash_per_order:
                     # Realize commission
@@ -2392,19 +2413,40 @@ def exit(id: str, from_entry: str = "",
 
     direction = 0
     size = 0.0
+    init_size = 0.0
 
     # noinspection PyProtectedMember,PyShadowingNames
     def _exit():
         nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
-        if isinstance(qty, NA):
-            size = -size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) else -size
-        else:
-            size = -direction * qty
-
-        size = _size_round(size)
-        if size == 0.0:
+        # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
+        # Re-issuing it every bar updates its prices, but a leg that already fired
+        # its slice must not be resurrected, and the slice is reserved off the
+        # entry's ORIGINAL size, not the shrinking remainder.
+        exit_key = (id, from_entry)
+        existing = position.exit_orders.get(exit_key)
+        if existing is not None and existing.consumed:
             return
+
+        if existing is not None:
+            # Live leg being re-issued: keep its reserved slice, only update prices.
+            reserved = existing.reserved_size
+        elif not isinstance(qty, NA):
+            reserved = abs(qty)
+        elif not isinstance(qty_percent, NA):
+            reserved = abs(init_size) * (qty_percent * 0.01)
+        else:
+            # No-qty "rest" leg: the entry size minus the slices reserved by
+            # sibling legs (consumed siblings keep their reservation until the
+            # entry fully closes), so it never over-closes the position.
+            sibling = sum(o.reserved_size for o in position.exit_orders.values()
+                          if o.order_id == from_entry and o is not existing)
+            reserved = abs(init_size) - sibling
+
+        reserved = _size_round(reserved)
+        if reserved <= 0.0:
+            return
+        size = -direction * reserved
 
         # Store tick values for later calculation when entry price is known
         profit_ticks: float | None = _na_to_none(profit)
@@ -2465,7 +2507,7 @@ def exit(id: str, from_entry: str = "",
             for trade in position.open_trades:
                 if trade.entry_id == from_entry:
                     direction = trade.sign
-                    size = trade.size
+                    init_size = trade.init_size
                     _exit()
 
             # The position should be opened, or an entry order should exist
@@ -2473,7 +2515,7 @@ def exit(id: str, from_entry: str = "",
                 return
         else:
             direction = entry_order.sign
-            size = entry_order.size
+            init_size = entry_order.size
             _exit()
 
     else:
@@ -2481,7 +2523,7 @@ def exit(id: str, from_entry: str = "",
         if not direction:
             for order in list(position.entry_orders.values()):
                 direction = order.sign
-                size = order.size
+                init_size = order.size
                 from_entry = order.order_id or ""
                 # Only mark as from_entry_na on first creation (not replacement)
                 exit_key = (id, from_entry)
@@ -2495,7 +2537,7 @@ def exit(id: str, from_entry: str = "",
             if not direction:
                 for trade in position.open_trades:
                     direction = trade.sign
-                    size = trade.size
+                    init_size = trade.init_size
                     from_entry = trade.entry_id or ""
                     _exit()
 
