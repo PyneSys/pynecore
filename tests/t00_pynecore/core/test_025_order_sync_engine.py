@@ -4640,13 +4640,15 @@ def __test_one_way_replay_connection_error_retries_next_sync__():
 
 
 def _persist_bracket_ownership(ctx, *, leg_id="1", intent_key="X\0L",
-                               pine_id="X", from_entry="L"):
+                               pine_id="X", from_entry="L",
+                               oca_name=None, oca_type=None):
     from pynecore.core.broker.store_helpers import create_bracket_ownership_row
     create_bracket_ownership_row(
         ctx, coid=f"bo-test:{leg_id}", symbol=SYMBOL, side="sell", qty=2.0,
         intent_key=intent_key, pine_entry_id=pine_id, from_entry=from_entry,
         leg_id=leg_id, attach_coid="t-attach",
         tp_price=120.0, sl_price=90.0, trail_price=None, trail_offset=None,
+        oca_name=oca_name, oca_type=oca_type,
     )
 
 
@@ -4733,6 +4735,136 @@ def __test_restart_reconstructs_one_way_bracket_and_adopts__(tmp_path):
                    for r in iter_active_bracket_ownerships(ctx))  # still protected
 
 
+def __test_first_bar_cancel_survives_restart_settle__(tmp_path):
+    """settle_restart_state rebuilds the bracket BEFORE the first-bar script, so a
+    first-bar strategy.cancel takes effect instead of being overwritten.
+
+    The bar-close branch runs the script before sync. After a restart the Pine
+    order dicts start empty, so a first-bar cancel would no-op against an empty
+    ``exit_orders`` and the post-script sync would then reconstruct the bracket,
+    silently resurrecting the exit the user just cancelled. Running
+    reconstruction in :meth:`settle_restart_state` (before the script) lets the
+    cancel see — and remove — the rebuilt exit; the post-script sync no longer
+    reconstructs (the one-time flag latched in settle), so the cancel survives
+    and the diff clears the live broker bracket.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Fresh process: the Pine order book is empty until reconstruction.
+        assert ("X", "L") not in pos.exit_orders
+        # settle runs BEFORE the first-bar script -> rebuilds the exit so the
+        # script's cancel can act on a populated book.
+        engine.settle_restart_state(BAR_TS)
+        assert ("X", "L") in pos.exit_orders  # reconstructed pre-script
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        # The first-bar script issues strategy.cancel -> the exit is removed.
+        del pos.exit_orders[("X", "L")]
+        # Post-script sync: reconstruction is one-time (already done in settle),
+        # so it does NOT resurrect the cancelled exit; the diff clears the leg.
+        engine.sync(BAR_TS)
+        assert ("X", "L") not in pos.exit_orders  # cancel NOT overwritten
+        assert ("1", None, None) in b.amend_calls  # live bracket cleared
+        assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+
+
+def __test_settle_restart_state_skips_when_already_reconstructed__(tmp_path):
+    """Once reconstruction has latched, settle_restart_state is an immediate no-op.
+
+    Guards the steady-state contract: the script runner calls
+    :meth:`settle_restart_state` every bar before the script, and once the
+    one-time restart reconstruction is done it must do zero work — no replay, no
+    reconstruction, no ``get_open_orders`` — so steady-state bars pay nothing and
+    the per-bar ``verify`` runs only in :meth:`sync`.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)  # a reconstructable bracket exists in the ledger
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._pine_bracket_reconstruct_done = True  # type: ignore[attr-defined]
+        engine.settle_restart_state(BAR_TS)
+        # Early-returned: the ledger bracket was NOT reconstructed and the live
+        # leg was NOT re-asserted.
+        assert ("X", "L") not in pos.exit_orders
+        assert b.amend_calls == []
+
+
+def __test_restart_reconstruction_restores_oca_cancel_group__(tmp_path):
+    """A reconstructed one-way bracket carries the OCA group it was emitted under.
+
+    The persist-first ownership ledger records the exit's ``oca_name`` /
+    ``oca_type``; without it the rebuilt Pine ``Order`` would have no OCA group,
+    so an explicit ``oca_type='cancel'`` cross-bracket cascade (the engine's job
+    when ``oca_cancel`` is SOFTWARE) would silently stop firing after a restart.
+    Reconstruction restores both so ``build_intents`` re-derives the same group.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx, oca_name="G", oca_type="cancel")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        b.capabilities = ExchangeCapabilities(oca_cancel=CapabilityLevel.SOFTWARE)
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine.sync(BAR_TS)
+        order = pos.exit_orders[("X", "L")]
+        assert order.oca_name == "G"  # group name restored on the Pine Order
+        assert str(order.oca_type) == "cancel"  # cancel type restored
+        # build_intents re-derives the same group on the adopted intent.
+        intent = engine.active_intents["X\0L"]
+        assert intent.oca_name == "G"
+        assert intent.oca_type == "cancel"
+
+
+def __test_restart_reconstruction_without_oca_metadata_is_groupless__(tmp_path):
+    """A row persisted before the OCA keys existed reconstructs as a groupless exit.
+
+    Graceful-degradation guard: an old ownership row carries no ``oca_name`` /
+    ``oca_type``, so reconstruction leaves the rebuilt exit without an OCA group
+    (a single-member synthetic reduce group is a cascade no-op, so the only thing
+    ever lost is an explicit group) — and never raises over the missing keys.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)  # no oca_name / oca_type
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine.sync(BAR_TS)
+        order = pos.exit_orders[("X", "L")]
+        assert order.oca_name is None  # no group on a pre-OCA-keys row
+        assert engine.active_intents["X\0L"].oca_name is None
+
+
 def __test_restart_one_way_multi_leg_grouped_into_one_order__(tmp_path):
     """A bracket replicated onto several hedged legs rebuilds as ONE exit, mapping every leg."""
     # The emulator writes one ownership row per position-side leg, all sharing
@@ -4786,6 +4918,264 @@ def __test_restart_reconstructed_bracket_modify_not_duplicate__(tmp_path):
         # The live leg's bracket is amended to the new TP; never cleared to None.
         assert ("1", 130.0, 90.0) in b.amend_calls
         assert ("1", None, None) not in b.amend_calls
+
+
+def _persist_partial_leg(ctx, *, leg_kind, leg_state="armed",
+                         intent_key="X\0L", pine_id="X", from_entry="L",
+                         qty=0.4, intent_partial_qty=0.4, trigger_level=None,
+                         trigger_offset=None, trail_activation_level=None,
+                         oca_group=None, oca_type=None,
+                         parent_entry_dispatch_ref="parent-ref"):
+    from pynecore.core.broker.store_helpers import (
+        create_engine_trigger_partial_leg_row,
+    )
+    create_engine_trigger_partial_leg_row(
+        ctx, coid=f"pl-test:{pine_id}:{from_entry}:{leg_kind}", symbol=SYMBOL,
+        side="sell", qty=qty, intent_key=intent_key, pine_entry_id=pine_id,
+        from_entry=from_entry, leg_kind=leg_kind, leg_state=leg_state,
+        parent_pine_entry_id=from_entry,
+        parent_entry_dispatch_ref=parent_entry_dispatch_ref,
+        intent_partial_qty=intent_partial_qty, trigger_level=trigger_level,
+        trigger_offset=trigger_offset,
+        trail_activation_level=trail_activation_level,
+        oca_group=oca_group, oca_type=oca_type,
+    )
+
+
+def _software_partial_broker():
+    b = MockBroker()
+    b.position_port = b
+    b.capabilities = ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+    )
+    return b
+
+
+def __test_recover_adopted_parent_entry_id_from_partial_legs__(tmp_path):
+    """Startup parent-id recovery folds in the partial-leg ledger, not only one-way rows.
+
+    A partial-only restart has no one-way ownership rows, so without reading the
+    partial-leg ledger the seeded parent trade keeps the synthetic id and the
+    exit's ``from_entry`` finds no match — ``build_intents`` then reads a zero
+    parent total and misclassifies the bracket as whole-row.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0)
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0)
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        assert engine._recover_adopted_parent_entry_id() == "L"  # type: ignore[attr-defined]
+
+
+def __test_restart_reconstructs_partial_bracket_exit__(tmp_path):
+    """The replayed partial legs rebuild a single Pine exit Order in exit_orders.
+
+    Mirrors the one-way reconstruction: the in-memory leg ledger that
+    ``restart_replay`` rebuilds is invisible to ``build_intents`` until the
+    Pine-side exit is re-installed. The TP/SL trigger levels, the partial qty,
+    and the OCA group are restored onto one combined exit.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._reconstruct_partial_bracket_exits()  # type: ignore[attr-defined]
+        order = pos.exit_orders[("X", "L")]
+        assert abs(order.size) == 0.4  # partial qty, not the parent total
+        assert order.limit == 120.0  # tp from the TP leg's trigger_level
+        assert order.stop == 90.0  # sl from the SL leg's trigger_level
+        assert order.oca_name == "__partial_exit_X_L__"
+        assert str(order.oca_type) == "cancel"
+
+
+def __test_restart_reconstructs_partial_active_trail_leg__(tmp_path):
+    """An active trail leg re-derives as a TRAIL leg (trail_price falls back to the moving stop).
+
+    A pre-activation trail carries ``trail_activation_level``; an already-active
+    trail has cleared it and tracks the live moving stop in ``trigger_level``.
+    Either way the rebuilt Order must keep a non-None ``trail_price`` so
+    ``_enumerate_engine_trigger_legs`` emits a trail leg and the adoption
+    branch's leg-kind completeness check matches (the value is inert once the
+    live leg is adopted).
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import LEG_KIND_TRAIL_PARTIAL
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TRAIL_PARTIAL,
+                             trigger_level=95.0, trigger_offset=5.0,
+                             trail_activation_level=None)
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._reconstruct_partial_bracket_exits()  # type: ignore[attr-defined]
+        order = pos.exit_orders[("X", "L")]
+        assert order.trail_price == 95.0  # active trail -> live moving stop
+        assert order.trail_offset == 5.0
+
+
+def __test_restart_partial_reconstruction_skips_pending_entry_group__(tmp_path):
+    """A group still pending its parent entry is not reconstructed (no open position yet)."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL,
+                             leg_state="pending_entry", trigger_offset=20.0)
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL,
+                             leg_state="pending_entry", trigger_offset=10.0)
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._reconstruct_partial_bracket_exits()  # type: ignore[attr-defined]
+        assert ("X", "L") not in pos.exit_orders
+
+
+def __test_restart_partial_reconstruction_noop_when_not_software__(tmp_path):
+    """Reconstruction only runs in the SOFTWARE partial mode; default UNSUPPORTED is a no-op."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0)
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0)
+        b = MockBroker()  # default ExchangeCapabilities -> partial_qty_bracket_exit UNSUPPORTED
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._reconstruct_partial_bracket_exits()  # type: ignore[attr-defined]
+        assert ("X", "L") not in pos.exit_orders
+
+
+def __test_restart_partial_bracket_adopted_not_swept__(tmp_path):
+    """End-to-end: the first post-restart sync reconstructs, classifies partial, and ADOPTS the legs.
+
+    Without reconstruction the orphan-leg sweep in :meth:`_diff_and_dispatch`
+    would cancel the replayed legs (their intent_key is in neither
+    ``_active_intents`` nor new_map). Reconstruction makes ``build_intents``
+    re-derive the partial bracket; the parent ref matches the replayed legs and
+    the leg set is complete, so the adoption branch pins the intent and the live
+    legs survive instead of being torn down.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        parent_ref = build_client_order_id(
+            run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=0,
+        )
+        # Persist the parent-entry envelope anchor so the engine's replay rebuilds
+        # the SAME coid the legs were stamped with -> _resolve_parent_opening_ref
+        # matches and the adoption branch does not treat the legs as stale.
+        ctx.record_envelope("L", BAR_TS, 0)
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
+                             parent_entry_dispatch_ref=parent_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0,
+                             parent_entry_dispatch_ref=parent_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Adopted parent: open total 1.0 > partial 0.4 -> is_partial_qty_bracket.
+        pos.size = 1.0
+        pos.reconstruct_parent_trade(entry_id="L", size=1.0, entry_price=100.0)
+        engine.sync(BAR_TS)
+        assert ("X", "L") in pos.exit_orders  # Pine-side exit rebuilt
+        assert "X\0L" in engine.active_intents  # adopted, not re-dispatched
+        # The replayed legs survive the orphan sweep.
+        assert engine._partial_bracket_engine.has_active_legs_for_intent("X\0L")  # type: ignore[attr-defined]
+
+
+def __test_restart_multi_parent_partial_brackets_adopted_not_converted__(tmp_path):
+    """A pyramided (multi-parent) restart adopts every partial bracket, never converting one.
+
+    Startup adoption of a position opened under several distinct ``from_entry``
+    parents seeds a single synthetic ``__adopted_startup__`` trade (the parent id
+    cannot be collapsed into one), so each real ``from_entry`` carries no
+    ``open_trades`` row and ``build_intents`` reads ``parent_total_qty == 0`` —
+    misclassifying every partial bracket as a whole-row exit. Left uncorrected the
+    dispatch else-branch fires the ``partial_to_whole_row_conversion`` cleanup and
+    cancels the replayed legs, rewriting the live software protection. The leg
+    ledger is authoritative: ``_restore_adopted_partial_bracket_classification``
+    re-flags the exits as partial so the adoption branch pins each one and the
+    live legs of BOTH parents survive.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        for parent in ("L1", "L2"):
+            ref = build_client_order_id(
+                run_tag=RUN_TAG, pine_id=parent, bar_ts_ms=BAR_TS,
+                kind=KIND_ENTRY, retry_seq=0,
+            )
+            ctx.record_envelope(parent, BAR_TS, 0)
+            for leg_kind, level in (
+                (LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0),
+            ):
+                _persist_partial_leg(
+                    ctx, leg_kind=leg_kind, trigger_level=level,
+                    intent_key=f"TP\0{parent}", pine_id="TP", from_entry=parent,
+                    parent_entry_dispatch_ref=ref,
+                    oca_group=f"__partial_exit_TP_{parent}__", oca_type="cancel",
+                )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Multi-parent adoption result: the net size lives under one synthetic
+        # trade, so neither real from_entry has an open_trades row and
+        # build_intents classifies both partial brackets as whole-row.
+        pos.size = 2.0
+        pos.reconstruct_parent_trade(
+            entry_id="__adopted_startup__", size=2.0, entry_price=100.0,
+        )
+        engine.sync(BAR_TS)
+        for parent in ("L1", "L2"):
+            key = f"TP\0{parent}"
+            assert ("TP", parent) in pos.exit_orders  # Pine-side exit rebuilt
+            assert key in engine.active_intents  # adopted, not converted
+            # The replayed legs survive — no partial_to_whole_row_conversion.
+            assert engine._partial_bracket_engine.has_active_legs_for_intent(key)  # type: ignore[attr-defined]
 
 
 def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):

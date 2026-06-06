@@ -133,6 +133,8 @@ __all__ = [
     'EXTRAS_KEY_BRACKET_OWN_SL',
     'EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE',
     'EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET',
+    'EXTRAS_KEY_BRACKET_OWN_OCA_NAME',
+    'EXTRAS_KEY_BRACKET_OWN_OCA_TYPE',
     'create_bracket_ownership_row',
     'update_bracket_ownership_state',
     'iter_active_bracket_ownerships',
@@ -596,6 +598,15 @@ EXTRAS_KEY_BRACKET_OWN_SL = 'bracket_own_sl'
 # as ``None`` in that case (never tear the bracket down over the gap).
 EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE = 'bracket_own_trail_price'
 EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET = 'bracket_own_trail_offset'
+# The owning exit's OCA group identity (``ExitIntent.oca_name`` /
+# ``oca_type``). Persisted so a restart rebuilds the Pine ``Order`` with the same
+# group it was emitted under — otherwise the reconstructed exit carries no OCA
+# group and an explicit ``oca_type='cancel'`` cross-bracket cascade silently
+# stops firing across the restart. Absent on rows written before these keys
+# existed — reconstruct as ``None`` in that case (a single-member synthetic
+# reduce group is a cascade no-op, so the gap only ever loses an explicit group).
+EXTRAS_KEY_BRACKET_OWN_OCA_NAME = 'bracket_own_oca_name'
+EXTRAS_KEY_BRACKET_OWN_OCA_TYPE = 'bracket_own_oca_type'
 
 
 # === Entry order row lifecycle =============================================
@@ -1830,6 +1841,8 @@ def create_bracket_ownership_row(
         sl_price: float | None,
         trail_price: float | None,
         trail_offset: float | None,
+        oca_name: str | None = None,
+        oca_type: str | None = None,
         extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist one per-leg bracket-ownership row (PERSIST-FIRST).
@@ -1862,6 +1875,9 @@ def create_bracket_ownership_row(
     :param sl_price: Pine-unit stop-loss level last replicated (or ``None``).
     :param trail_price: Pine-unit trailing-stop activation price (or ``None``).
     :param trail_offset: Pine-unit trailing offset last replicated (or ``None``).
+    :param oca_name: The owning exit's OCA group name (or ``None``).
+    :param oca_type: The owning exit's OCA type string (``"reduce"`` /
+        ``"cancel"`` / ``"none"``, or ``None``).
     :param extra_payload: Additional plugin-specific extras to merge.
     """
     extras: dict[str, Any] = {
@@ -1872,6 +1888,8 @@ def create_bracket_ownership_row(
         EXTRAS_KEY_BRACKET_OWN_SL: sl_price,
         EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE: trail_price,
         EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET: trail_offset,
+        EXTRAS_KEY_BRACKET_OWN_OCA_NAME: oca_name,
+        EXTRAS_KEY_BRACKET_OWN_OCA_TYPE: oca_type,
     }
     if extra_payload:
         extras.update(extra_payload)

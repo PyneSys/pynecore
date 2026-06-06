@@ -1450,6 +1450,20 @@ class ScriptRunner:
                                 # noinspection PyProtectedMember
                                 bpos._handle_bar_open_risk()
                             lib._plot_data.clear()
+                            # Restart settle: this branch runs the script BEFORE
+                            # sync (so a bar-close order dispatches same-bar), but
+                            # on the first bar after a restart the Pine order book
+                            # is still empty — a first-bar strategy.cancel/exit
+                            # would no-op against empty exit_orders and then be
+                            # overwritten by the reconstruction inside the
+                            # post-script sync. Reconstruct here, before the
+                            # script, so its mutation takes effect. Idempotent:
+                            # returns immediately once the one-time reconstruct
+                            # has latched, so steady-state bars pay nothing.
+                            if is_strat and position \
+                                    and self._order_sync_engine is not None:
+                                cast('OrderSyncEngine', self._order_sync_engine) \
+                                    .settle_restart_state(int(lib.last_bar_time))
                             _run_libs_and_main()
                             if is_strat and position:
                                 # noinspection PyProtectedMember

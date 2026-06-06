@@ -239,6 +239,7 @@ class BrokerPosition(PositionBase):
             trail_price: float | None,
             trail_offset: float | None,
             oca_name: str | None = None,
+            oca_type: str | None = None,
     ) -> None:
         """Re-install a persistent ``strategy.exit`` bracket order after a restart.
 
@@ -268,9 +269,14 @@ class BrokerPosition(PositionBase):
         :param trail_price: Absolute trailing-stop activation price, or ``None``.
         :param trail_offset: Trailing-stop offset (price units), or ``None``.
         :param oca_name: OCA group name, or ``None``.
+        :param oca_type: OCA type string (``"reduce"`` / ``"cancel"`` /
+            ``"none"``), or ``None`` for rows persisted before the OCA fields
+            existed. Restored so ``build_intents`` re-derives the same group the
+            exit was emitted under and the cross-bracket OCA-cancel cascade keeps
+            firing across the restart.
         """
         # noinspection PyProtectedMember
-        from pynecore.lib.strategy import Order, _order_type_close
+        from pynecore.lib.strategy import Order, _order_type_close, oca as _oca
         signed_size = qty if side == "buy" else -qty
         order = Order(
             from_entry,
@@ -282,6 +288,7 @@ class BrokerPosition(PositionBase):
             trail_price=trail_price,
             trail_offset=trail_offset,
             oca_name=oca_name,
+            oca_type=_oca.Oca(oca_type) if oca_type is not None else None,
         )
         self.exit_orders[(pine_id, from_entry)] = order
 

@@ -83,6 +83,7 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
     PendingDefensiveClose,
+    format_intent_key,
 )
 from pynecore.core.broker.native_failsafe_manager import (
     NativeBracketSnapshot,
@@ -111,6 +112,8 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_SL,
     EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE,
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
+    EXTRAS_KEY_BRACKET_OWN_OCA_NAME,
+    EXTRAS_KEY_BRACKET_OWN_OCA_TYPE,
     BRACKET_OWN_STATE_ACTIVE,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
@@ -986,6 +989,91 @@ class OrderSyncEngine:
         self.raise_if_halted()
         self._drain_events()
 
+    def settle_restart_state(self, bar_ts_ms: int) -> None:
+        """Run the one-time restart settle BEFORE the first post-restart script.
+
+        On a fresh process the Pine order dicts start empty, so a
+        ``strategy.cancel`` / ``strategy.cancel_all`` / ``strategy.exit`` issued
+        on the first bar after a restart would operate on an empty
+        ``exit_orders`` (a silent no-op) and then be overwritten when
+        :meth:`sync` reconstructs the bracket *after* the script runs. The
+        bar-close branch in the script runner deliberately runs the script
+        before ``sync`` (so a market order queued at bar close dispatches on the
+        same bar instead of one bar late), which is correct in steady state but
+        loses a first-bar order-book mutation across a restart. Reconstructing
+        here, before the script, lets the first-bar script see the rebuilt book
+        so its mutation takes effect.
+
+        This mirrors the one-time prefix of :meth:`sync` (entry-anchor scan ->
+        one-way replay -> pending-dispatch verify -> Pine-bracket reconstruct)
+        and shares the same flags, so whichever runs first latches them and the
+        other skips. :meth:`sync` stays the unconditional per-bar backstop: once
+        :attr:`_pine_bracket_reconstruct_done` latches this returns immediately,
+        so steady-state bars do no extra work here and the every-bar
+        ``_drain_events`` / ``_verify_pending_dispatches`` keep running only in
+        :meth:`sync`. On a restart bar ``_verify_pending_dispatches`` runs here
+        (to settle ``_active_intents`` before reconstruction, so the skip guard
+        in :meth:`_reconstruct_pine_bracket_state` does not rebuild an exit for a
+        key a modify-rejected resolution is about to restore) and again in the
+        following :meth:`sync`; that single extra ``get_open_orders`` is bounded
+        to the restart window.
+
+        Connection errors leave the relevant step flag unset and return, exactly
+        like :meth:`sync`, so a broker that is briefly unreachable at startup
+        retries on the next bar instead of halting. ``_drain_events`` is not
+        repeated here: ``apply_async_events`` drains immediately before this call
+        on the bar-close path, and reconstruction/replay read the persisted
+        ledger and live broker rather than the event queue.
+
+        :param bar_ts_ms: Current bar timestamp in milliseconds — identical to
+            the value :meth:`sync` receives on the same bar (sourced from
+            ``lib.last_bar_time`` at the call site). Anchors the stale-window
+            timer for the native-failsafe rehydrate, exactly as in :meth:`sync`.
+        """
+        if self._pine_bracket_reconstruct_done:
+            return
+        self._current_bar_ts_ms = bar_ts_ms
+        if self._pending_native_failsafe_rehydrate:
+            self._pending_native_failsafe_rehydrate = False
+            self._rehydrate_native_failsafe_from_replayed_legs()
+        if self._pending_cancel_tentative_rehydrate:
+            self._pending_cancel_tentative_rehydrate = False
+            self._rehydrate_cancel_tentative_from_replayed_legs()
+        if not self._restart_entry_scan_done and self._store_ctx is not None:
+            try:
+                self._scan_live_entry_anchors_for_restart()
+            except ExchangeConnectionError as e:
+                _blog_warning(
+                    "restart settle skipped before entry-anchor scan could "
+                    "complete (connection error: %s) — retrying next bar", e,
+                )
+                return
+            self._restart_entry_scan_done = True
+        one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        if not self._one_way_replay_done and one_way_port is not None:
+            try:
+                self._run_async(
+                    self._one_way_emulator.restart_replay(one_way_port),
+                )
+            except ExchangeConnectionError as e:
+                _blog_warning(
+                    "restart settle skipped before one-way emulation replay "
+                    "could complete (connection error: %s) — retrying next bar", e,
+                )
+                return
+            self._one_way_replay_done = True
+        try:
+            self._verify_pending_dispatches()
+        except ExchangeConnectionError as e:
+            _blog_warning(
+                "restart settle skipped after pending dispatch verification "
+                "connection error: %s — retrying next bar", e,
+            )
+            return
+        if not self._pine_bracket_reconstruct_done:
+            self._reconstruct_pine_bracket_state()
+            self._pine_bracket_reconstruct_done = True
+
     def sync(self, bar_ts_ms: int, *, last_price: float | None = None) -> None:
         """Run one diff/dispatch cycle.
 
@@ -1278,7 +1366,7 @@ class OrderSyncEngine:
                 self._recovered_close_anchor_keys.add(key)
             _log.info(
                 "recovered pending dispatch %s -> exchange order %s "
-                "for intent %s", coid, order.id, key,
+                "for intent %s", coid, order.id, format_intent_key(key),
             )
         for coid in list(self._persisted_pending_anchors):
             order = by_coid.get(coid)
@@ -1662,7 +1750,7 @@ class OrderSyncEngine:
                         "plugin-resolved pending dispatch %s as %s "
                         "for intent %s (kind=%s); rejected wins for key "
                         "— %s",
-                        record.coid, record.resolution, key,
+                        record.coid, record.resolution, format_intent_key(key),
                         record.dispatch_kind,
                         ("scheduling re-dispatch"
                          if not kind_is_modify
@@ -1831,7 +1919,7 @@ class OrderSyncEngine:
                 self._persisted_pending_anchors.pop(coid, None)
                 _log.info(
                     "plugin-resolved pending dispatch %s as attached "
-                    "for intent %s; keeping active intent", coid, key,
+                    "for intent %s; keeping active intent", coid, format_intent_key(key),
                 )
             # After a restart ``_active_intents`` is empty (intents are
             # rebuilt from the Pine order book on the first post-restart
@@ -1959,7 +2047,7 @@ class OrderSyncEngine:
                 self._drop_envelope(key)
                 _log.info(
                     "cleared stale attached-adoption marker for intent %s "
-                    "(no Pine intent claimed it this sync)", key,
+                    "(no Pine intent claimed it this sync)", format_intent_key(key),
                 )
         self._attached_adoption_keys.clear()
 
@@ -3128,7 +3216,7 @@ class OrderSyncEngine:
                 # ``reconcile()`` retry that may also see the outcome.
                 _blog_info(
                     "cancel-tentative %r resolved by broker cancelled event",
-                    key,
+                    format_intent_key(key),
                 )
                 self._clear_intent_cancel_disposition_pending(
                     key,
@@ -3140,7 +3228,7 @@ class OrderSyncEngine:
             if key is not None:
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
-                    key, event,
+                    format_intent_key(key), event,
                 )
                 # §2.6.7: retire the parent's native fail-safe state BEFORE the
                 # teardown below evicts the legs / envelope used to resolve its
@@ -3195,7 +3283,7 @@ class OrderSyncEngine:
             if key is not None:
                 _blog_warning(
                     "order rejected for intent %s (%s)",
-                    key, event,
+                    format_intent_key(key), event,
                 )
                 # §2.6.7: mirror the 'cancelled' branch — retire the parent's
                 # native fail-safe state before the teardown evicts its COID
@@ -3529,7 +3617,7 @@ class OrderSyncEngine:
         for key, intent in siblings:
             _log.info(
                 "OCA cascade cancel: fill on %s cancels sibling %s in group %r",
-                filled_key, key, oca_name,
+                format_intent_key(filled_key), format_intent_key(key), oca_name,
             )
             self._active_intents.pop(key, None)
             self._remove_pine_order_for_intent(intent)
@@ -4492,6 +4580,35 @@ class OrderSyncEngine:
             parent_qty=float(parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size),
             resolver=resolver,
         )
+        # Restart-orphan guard. When the process restarted while this parent's
+        # entry was still pending, every leg was ``pending_entry`` so the
+        # one-time :meth:`_reconstruct_partial_bracket_exits` deliberately
+        # skipped seeding ``position.exit_orders`` (it would misclassify against
+        # a zero parent total) and that pass never runs again. The fill above
+        # just promoted those legs to ``armed``, but with the Pine-side exit
+        # slot still empty ``build_intents`` emits no ``ExitIntent`` — so the
+        # orphan sweep in :meth:`_diff_and_dispatch` (which now sees a promoted,
+        # non-``pending_entry`` leg in neither ``_active_intents`` nor
+        # ``new_map``) would cancel the just-armed protection on the next sync.
+        # Re-seed the exit slot here for any group that has no live slot and is
+        # not already tracked; the normal in-session dispatch keeps its slot in
+        # ``exit_orders`` (the script's ``strategy.exit``), so this fires only
+        # for the cross-restart case.
+        if self._partial_qty_bracket_exit_mode is CapabilityLevel.SOFTWARE:
+            promoted_groups: dict[str, list[PartialBracketLeg]] = {}
+            for leg in self._partial_bracket_engine.iter_legs():
+                if leg.from_entry != pine_id:
+                    continue
+                if not leg.pine_id or not leg.from_entry:
+                    continue
+                promoted_groups.setdefault(leg.intent_key, []).append(leg)
+            for ikey, legs in promoted_groups.items():
+                rep = legs[0]
+                if (ikey in self._active_intents
+                        or (rep.pine_id, rep.from_entry)
+                        in self._position.exit_orders):
+                    continue
+                self._seed_partial_bracket_exit_from_legs(ikey, legs)
 
     def _sync_pine_exit_qty(self, bracket: ExitIntent, new_qty: float) -> None:
         """Mutate the Pine-side exit :class:`Order` to match the amended qty.
@@ -5274,7 +5391,7 @@ class OrderSyncEngine:
             except Exception as e:  # noqa: BLE001
                 _blog_warning(
                     "cancel-tentative retry for %r raised %s; treating as UNKNOWN",
-                    intent_key, e,
+                    format_intent_key(intent_key), e,
                 )
                 meta.last_retry_outcome = CancelDispositionOutcome.UNKNOWN
                 continue
@@ -5377,7 +5494,7 @@ class OrderSyncEngine:
                 "qty live — operator intervention may be required if the "
                 "residual fills against the partial position's leg "
                 "protection: %s",
-                intent_key, e.client_order_id, e,
+                format_intent_key(intent_key), e.client_order_id, e,
             )
             return
         except BrokerManualInterventionError as e:
@@ -5387,7 +5504,7 @@ class OrderSyncEngine:
             _blog_warning(
                 "residual cancel for %r after partial-event resolution "
                 "raised %s; leaving mapping in place",
-                intent_key, e,
+                format_intent_key(intent_key), e,
             )
             return
         # Successful cancel — drop the order mapping so the next
@@ -6193,7 +6310,7 @@ class OrderSyncEngine:
         _blog_error(
             "sync engine halted by BrokerManualInterventionError: %s "
             "(intent_key=%s, context=%r)",
-            error.reason, error.intent_key, error.context,
+            error.reason, format_intent_key(error.intent_key), error.context,
         )
         self._emit_broker_event(ManualInterventionRequiredEvent(
             reason=error.reason,
@@ -6263,7 +6380,7 @@ class OrderSyncEngine:
                     rejected = True
                     _log.info(
                         "intent %s rejected by interceptor: %s",
-                        current.intent_key, result.reject_reason,
+                        format_intent_key(current.intent_key), result.reject_reason,
                     )
                     break
                 current = self._apply_modifications(current, result)
@@ -6304,16 +6421,18 @@ class OrderSyncEngine:
         dynamic TP/SL change after restart would be dropped and the reconstructed
         bracket frozen on its pre-restart levels.
 
-        Recover the parent id from the durable bracket-ownership ledger (the same
-        rows :meth:`_reconstruct_one_way_bracket_exits` rebuilds the exit from),
-        which persists the real ``from_entry``. Return it only when every active
-        row agrees on a single parent: a pyramided position carries several
+        Recover the parent id from the durable broker-side ledgers that persist
+        the real ``from_entry``: the one-way bracket-ownership rows (the same rows
+        :meth:`_reconstruct_one_way_bracket_exits` rebuilds the exit from) AND the
+        engine-trigger partial-leg ledger (already rehydrated by
+        ``restart_replay`` in ``__init__``). Return the id only when every active
+        record agrees on a single parent: a pyramided position carries several
         distinct ``from_entry`` parents that cannot be collapsed into one seeded
         trade, so fall back to the synthetic id there (a degraded but safe state —
         the bracket is still preserved, only dynamic re-targeting by a specific
         parent id is lost). Returns ``None`` when no parent can be recovered.
 
-        Pure-local: read-only over the persisted ledger.
+        Pure-local: read-only over the persisted ledger and the in-memory legs.
         """
         if self._store_ctx is None:
             return None
@@ -6326,6 +6445,23 @@ class OrderSyncEngine:
                 continue
             if row.from_entry is not None:
                 parents.add(row.from_entry)
+        # Engine-trigger partial brackets persist their parent in the partial-leg
+        # ledger, not the one-way ownership rows above. Without folding them in, a
+        # partial-only restart leaves the seeded trade with the synthetic id, the
+        # exit's ``from_entry`` finds no match in ``open_trades``, and
+        # ``build_intents`` reads ``parent_total_qty == 0`` — misclassifying the
+        # partial bracket as a whole-row exit on the wrong dispatch path. Only the
+        # parents of *filled* entries count: a ``pending_entry`` (or its
+        # ``cancel_tentative`` sub-state) leg protects an entry that has not landed,
+        # so it is not part of the adopted open position. Folding it in would seed
+        # the open position under a not-yet-real id, or — when it disagrees with the
+        # genuine open parent — force the multi-parent fallback to the synthetic id
+        # and lose post-restart dynamic re-targeting of the real bracket.
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.leg_state in (LEG_STATE_PENDING_ENTRY, LEG_STATE_CANCEL_TENTATIVE):
+                continue
+            if leg.from_entry:
+                parents.add(leg.from_entry)
         if len(parents) == 1:
             return next(iter(parents))
         return None
@@ -6346,8 +6482,22 @@ class OrderSyncEngine:
 
         Pure-local: reads the persisted ownership ledger and mutates only
         in-memory Pine-side state (``_position.exit_orders`` + ``_order_mapping``).
+
+        Skipped entirely once a risk halt is active: on the first post-restart
+        bar :meth:`BrokerPosition._handle_bar_open_risk` can fire a halt that
+        clears ``exit_orders`` and queues a flatten-close *before* this runs (the
+        runner's bar-close branch invokes the risk hook ahead of the restart
+        settle). Rebuilding the bracket here would resurrect the protection the
+        halt just tore down and let the next ``sync`` re-adopt it as live. Both
+        callers latch ``_pine_bracket_reconstruct_done`` afterwards, so the skip is
+        permanent for the run — the orphan-leg / orphan-bracket sweeps in
+        :meth:`_diff_and_dispatch` then cancel the live legs, matching the halt's
+        intent to flatten.
         """
+        if self._position.risk_halt_trading:
+            return
         self._reconstruct_one_way_bracket_exits()
+        self._reconstruct_partial_bracket_exits()
 
     def _reconstruct_one_way_bracket_exits(self) -> None:
         """Re-install one-way (hedging-emulated) native brackets after a restart.
@@ -6401,6 +6551,8 @@ class OrderSyncEngine:
             sl_price = rextras.get(EXTRAS_KEY_BRACKET_OWN_SL)
             trail_price = rextras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE)
             trail_offset = rextras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
+            oca_name = rextras.get(EXTRAS_KEY_BRACKET_OWN_OCA_NAME)
+            oca_type = rextras.get(EXTRAS_KEY_BRACKET_OWN_OCA_TYPE)
             if any(
                 (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_TP) != tp_price
                 or (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_SL) != sl_price
@@ -6412,7 +6564,7 @@ class OrderSyncEngine:
                     "reconstructed one-way bracket %r has divergent leg levels "
                     "across rows after restart; preserving from representative "
                     "leg (tp=%s sl=%s trail_offset=%s) — no teardown",
-                    ikey, tp_price, sl_price, trail_offset,
+                    format_intent_key(ikey), tp_price, sl_price, trail_offset,
                 )
             leg_ids = [
                 (r.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
@@ -6428,17 +6580,224 @@ class OrderSyncEngine:
                 sl_price=sl_price,
                 trail_price=trail_price,
                 trail_offset=trail_offset,
+                oca_name=oca_name,
+                oca_type=oca_type,
             )
             self._order_mapping[ikey] = [f"bracket:{lid}" for lid in leg_ids]
             _blog_info(
                 "reconstructed one-way bracket exit %r after restart "
                 "(%d leg(s)) — adopting live broker protection",
-                ikey, len(leg_ids),
+                format_intent_key(ikey), len(leg_ids),
             )
+
+    def _reconstruct_partial_bracket_exits(self) -> None:
+        """Rebuild the Pine-side exit ``Order`` for each replayed partial bracket.
+
+        The engine-trigger partial analogue of
+        :meth:`_reconstruct_one_way_bracket_exits`. After a restart
+        :meth:`SoftwarePartialBracketEngine.restart_replay` rebuilds the in-memory
+        leg ledger, but ``position.exit_orders`` starts empty — so
+        ``build_intents`` emits no partial :class:`ExitIntent`, the cross-restart
+        partial-adoption branch in :meth:`_diff_and_dispatch` never fires, and the
+        orphan-leg sweep there cancels the very legs the replay just restored,
+        stripping the live software protection off an open position. Rebuild one
+        Pine exit ``Order`` per ``intent_key`` from the replayed legs so
+        ``build_intents`` re-derives the partial bracket; the adoption branch then
+        adopts the live legs (it verifies the parent ref and the persisted leg set
+        itself, re-dispatching a fresh bracket only on a genuine mismatch).
+
+        Only runs in the SOFTWARE partial mode, and skips a group still waiting on
+        its parent entry (no open position to protect yet — the parent-fill
+        handler arms those). The rebuilt ``Order``'s levels are markers for
+        ``build_intents``'s leg-kind enumeration and the partial-vs-whole-row
+        classification (its ``qty`` must stay below the seeded parent total); the
+        adopted legs keep their own live ``trigger_level`` as the authoritative
+        trigger state, so the marker values are inert once adopted.
+
+        Pure-local: reads the in-memory leg ledger and mutates only
+        ``position.exit_orders``. ``_order_mapping`` is restored by the adoption
+        branch from the leg ``coid``s, not here.
+        """
+        if self._partial_qty_bracket_exit_mode is not CapabilityLevel.SOFTWARE:
+            return
+        groups: dict[str, list[PartialBracketLeg]] = {}
+        for leg in self._partial_bracket_engine.iter_legs():
+            groups.setdefault(leg.intent_key, []).append(leg)
+        for ikey, legs in groups.items():
+            rep = legs[0]
+            if not rep.pine_id or not rep.from_entry:
+                continue
+            # A group whose legs are all still pending the parent entry —
+            # ``pending_entry`` proper, or its ``cancel_tentative`` sub-state
+            # (the parent ``EntryIntent`` cancel disposition is still being
+            # resolved by :meth:`_drive_cancel_tentative`) — has no open
+            # position to protect, and seeding an exit against a zero parent
+            # total would misclassify it as a whole-row bracket. The parent-fill
+            # handler arms these once the entry lands. Reconstructing a
+            # ``cancel_tentative`` group is worse than inert: a later
+            # CANCEL_CONFIRMED resolution closes the leg rows
+            # (:meth:`_clear_intent_cancel_disposition_pending`) but only drops
+            # ``_active_intents``/mapping/envelope — it never clears
+            # ``position.exit_orders`` — so the reconstructed slot would survive
+            # and re-emit a stale whole-row exit against the cancelled parent.
+            if all(
+                leg.leg_state in (LEG_STATE_PENDING_ENTRY, LEG_STATE_CANCEL_TENTATIVE)
+                for leg in legs
+            ):
+                continue
+            # Already tracked in this session (a live dispatch) or already
+            # rebuilt by a prior pass.
+            if (ikey in self._active_intents
+                    or (rep.pine_id, rep.from_entry)
+                    in self._position.exit_orders):
+                continue
+            self._seed_partial_bracket_exit_from_legs(ikey, legs)
+
+    def _seed_partial_bracket_exit_from_legs(
+            self, ikey: str, legs: 'list[PartialBracketLeg]',
+    ) -> None:
+        """Rebuild one Pine-side exit ``Order`` from a replayed partial-leg group.
+
+        Shared body of :meth:`_reconstruct_partial_bracket_exits` (the one-time
+        startup pass) and the parent-fill promotion path
+        (:meth:`_promote_pending_partial_bracket_legs`). Extracts the TP/SL/TRAIL
+        levels from the live leg ledger and seeds
+        ``position.exit_orders[(pine_id, from_entry)]`` so ``build_intents``
+        re-derives the partial bracket and the cross-restart adoption branch
+        adopts the live legs instead of letting the orphan sweep tear them down.
+
+        The caller owns the skip guards (mode, pending-entry group, already
+        tracked); this only reads the leg group and mutates ``exit_orders``.
+
+        :param ikey: The shared ``intent_key`` of the leg group (for logging).
+        :param legs: The replayed legs of one partial bracket (non-empty).
+        """
+        rep = legs[0]
+        tp_price: float | None = None
+        sl_price: float | None = None
+        trail_price: float | None = None
+        trail_offset: float | None = None
+        for leg in legs:
+            if leg.leg_kind == LEG_KIND_TP_PARTIAL:
+                tp_price = leg.trigger_level
+            elif leg.leg_kind == LEG_KIND_SL_PARTIAL:
+                sl_price = leg.trigger_level
+            elif leg.leg_kind == LEG_KIND_TRAIL_PARTIAL:
+                # Re-derive a TRAIL leg so the adoption branch's leg-kind
+                # completeness check matches: use the activation level while
+                # pre-activation, else the live moving stop. Non-None is all
+                # that matters — the value is inert once the leg is adopted.
+                trail_price = (
+                    leg.trail_activation_level
+                    if leg.trail_activation_level is not None
+                    else leg.trigger_level
+                )
+                # ``leg.trigger_offset`` is persisted in PRICE units
+                # (``_enumerate_engine_trigger_legs`` multiplied the Pine
+                # ``trail_offset`` ticks by ``mintick``), but
+                # ``Order.trail_offset`` is in TICKS — ``build_intents`` →
+                # ``_enumerate_engine_trigger_legs`` re-multiplies it by
+                # ``mintick``. Convert back to ticks so the rebuilt spec's
+                # ``trigger_offset`` matches the replayed leg on the next
+                # sync; otherwise (``mintick != 1``) the adoption parity
+                # check sees a double-scaled offset, treats the trail as a
+                # mismatch and re-dispatches it with the wrong distance.
+                trail_offset = (
+                    leg.trigger_offset / self._mintick
+                    if leg.trigger_offset is not None
+                    else None
+                )
+        self._position.reconstruct_exit_order(
+            pine_id=rep.pine_id,
+            from_entry=rep.from_entry,
+            side=rep.side,
+            qty=rep.intent_partial_qty,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            trail_price=trail_price,
+            trail_offset=trail_offset,
+            oca_name=rep.oca_group,
+            oca_type=rep.oca_type,
+        )
+        _blog_info(
+            "reconstructed engine-trigger partial bracket exit %r after "
+            "restart (%d leg(s)) — build_intents will re-derive it for "
+            "adoption", format_intent_key(ikey), len(legs),
+        )
 
     # === Diff + dispatch ===
 
+    def _restore_adopted_partial_bracket_classification(
+            self, intents: list[Intent],
+    ) -> list[Intent]:
+        """Re-flag adopted engine-trigger partial brackets the builder mis-typed.
+
+        :func:`build_intents` derives :attr:`ExitIntent.is_partial_qty_bracket`
+        from the per-``from_entry`` open qty in ``position.open_trades``.
+        Startup adoption of a *pyramided* position seeds a single synthetic
+        parent trade — :meth:`_recover_adopted_parent_entry_id` returns ``None``
+        when several distinct ``from_entry`` parents cannot collapse into one —
+        so each real ``from_entry`` carries no ``open_trades`` row,
+        ``parent_total_qty`` reads ``0`` and the bracket is misclassified as a
+        whole-row exit. The cross-restart partial-adoption branch in
+        :meth:`_diff_and_dispatch` is gated on the flag, so the misclassified
+        exit falls through to the whole-row path where the
+        ``partial_to_whole_row_conversion`` cleanup cancels the very legs
+        ``restart_replay`` restored — rewriting the live software protection.
+
+        The engine-trigger leg ledger is the authoritative signal: a leg is
+        *only ever* created by a partial-qty bracket dispatch (a whole-row exit
+        takes the native bracket path), so an exit carrying armed legs under its
+        ``intent_key`` IS a partial bracket. Restore the flag, but only while
+        the exit's qty still matches the legs' ``intent_partial_qty``: a genuine
+        partial->whole-row conversion (the script grew the exit to cover the
+        full parent) changes the qty, so it stays whole-row and the conversion
+        path runs as before. In-session ``open_trades`` carries the per-parent
+        rows so the flag is already correct — this only fires on the
+        post-restart adoption path where the per-parent seed is missing.
+
+        ``pending_entry`` / ``cancel_tentative`` legs are ignored: their parent
+        has not filled, so there is no open position to protect and the exit
+        slot for an all-pending group is not even reconstructed.
+
+        Pure-local: reads the in-memory leg ledger and returns a new list with
+        the corrected (frozen) :class:`ExitIntent`s replaced in place.
+        """
+        if self._partial_qty_bracket_exit_mode is not CapabilityLevel.SOFTWARE:
+            return intents
+        armed_by_key: dict[str, list[PartialBracketLeg]] = {}
+        for leg in self._partial_bracket_engine.iter_legs():
+            if (leg.leg_state in LEG_STATE_ACTIVE
+                    and leg.leg_state not in (
+                        LEG_STATE_PENDING_ENTRY, LEG_STATE_CANCEL_TENTATIVE)):
+                armed_by_key.setdefault(leg.intent_key, []).append(leg)
+        if not armed_by_key:
+            return intents
+        corrected: list[Intent] = []
+        for intent in intents:
+            if (isinstance(intent, ExitIntent)
+                    and not intent.is_partial_qty_bracket):
+                armed_legs = armed_by_key.get(intent.intent_key)
+                if armed_legs and all(
+                        abs(leg.intent_partial_qty - intent.qty) <= 1e-9
+                        for leg in armed_legs
+                ):
+                    intent = dataclasses.replace(
+                        intent, is_partial_qty_bracket=True,
+                    )
+                    _blog_info(
+                        "restored partial-qty classification for adopted "
+                        "engine-trigger bracket %r (qty=%s): open_trades lacks "
+                        "the per-parent seed after a pyramided restart — "
+                        "adopting the live legs instead of converting to a "
+                        "whole-row exit",
+                        format_intent_key(intent.intent_key), intent.qty,
+                    )
+            corrected.append(intent)
+        return corrected
+
     def _diff_and_dispatch(self, intents: list[Intent]) -> None:
+        intents = self._restore_adopted_partial_bracket_classification(intents)
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 
         # Pine semantic: when an entry intent fails to dispatch in this same
@@ -6477,6 +6836,24 @@ class OrderSyncEngine:
         # appears in neither set BEFORE the diff loops run.
         if (self._partial_qty_bracket_exit_mode
                 is CapabilityLevel.SOFTWARE):
+            # A group still entirely ``pending_entry`` is NOT an orphan: its
+            # parent ENTRY has not filled yet, so there is no open position to
+            # protect and ``_reconstruct_partial_bracket_exits`` deliberately
+            # skips it (it would misclassify against a zero parent total). On
+            # the first post-restart bar Pine may not have re-emitted the exit
+            # yet, leaving the key in neither ``_active_intents`` nor
+            # ``new_map`` — but ``cancel_legs_for_intent`` treats
+            # ``pending_entry`` as active and would wipe the persisted legs,
+            # so the parent would later fill without the TP/SL protection that
+            # was already armed. These legs are retired only when the parent
+            # entry itself dies (cancel/reject) via
+            # :meth:`_abort_pending_partial_legs_for_dead_entry`. Only sweep a
+            # key that has at least one promoted (non-``pending_entry``) leg.
+            keys_with_promoted_leg: set[str] = {
+                leg.intent_key
+                for leg in self._partial_bracket_engine.iter_legs()
+                if leg.leg_state != LEG_STATE_PENDING_ENTRY
+            }
             orphan_intent_keys: set[str] = set()
             for leg in self._partial_bracket_engine.iter_legs():
                 ikey = leg.intent_key
@@ -6484,11 +6861,13 @@ class OrderSyncEngine:
                     continue
                 if ikey in new_map:
                     continue
+                if ikey not in keys_with_promoted_leg:
+                    continue
                 orphan_intent_keys.add(ikey)
             for ikey in orphan_intent_keys:
                 _blog_info(
                     "cancelling orphan engine-trigger partial legs for "
-                    "intent %r (not emitted by Pine after restart)", ikey,
+                    "intent %r (not emitted by Pine after restart)", format_intent_key(ikey),
                 )
                 self._partial_bracket_engine.cancel_legs_for_intent(
                     ikey, reason='orphan_after_restart',
@@ -6541,7 +6920,7 @@ class OrderSyncEngine:
                     "dispatches — the script must cancel one side "
                     "before the other can attach",
                     partial_keys,
-                    native_intent.intent_key,
+                    format_intent_key(native_intent.intent_key),
                     from_entry,
                 )
                 for p in partial_intents:
@@ -6575,6 +6954,15 @@ class OrderSyncEngine:
         # was not just refused by the §12 #4 coexistence preflight, which pops
         # the key from ``new_map`` even though Pine emitted it) BEFORE the diff
         # loops run.
+        #
+        # NOT dead despite ``_reconstruct_pine_bracket_state`` rebuilding every
+        # ACTIVE row first: (1) reconstruction now runs pre-script (via
+        # :meth:`settle_restart_state`), so a first-bar ``strategy.cancel`` of the
+        # rebuilt bracket drops it from ``exit_orders`` before the first diff ever
+        # adopts it — leaving the key in NEITHER set, so THIS sweep (not the
+        # cancellation diff, which iterates ``_active_intents``) is what clears the
+        # live leg; (2) a ``clearing`` row is never reconstructed (the rebuild only
+        # restores ACTIVE rows), so its re-clear retry lives here too.
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if one_way_port is not None and self._store_ctx is not None:
             orphan_cancels: dict[str, CancelIntent] = {}
@@ -6596,7 +6984,7 @@ class OrderSyncEngine:
             for ikey, cancel in orphan_cancels.items():
                 _blog_info(
                     "cancelling orphan one-way bracket for intent %r "
-                    "(not emitted by Pine after restart)", ikey,
+                    "(not emitted by Pine after restart)", format_intent_key(ikey),
                 )
                 try:
                     self._run_async(
@@ -6614,7 +7002,7 @@ class OrderSyncEngine:
                     # mapping/envelope in place — do not declare it cleared.
                     _blog_warning(
                         "orphan one-way bracket clear for %r did not confirm "
-                        "(%s) — retrying next sync", ikey, e,
+                        "(%s) — retrying next sync", format_intent_key(ikey), e,
                     )
                     continue
                 self._order_mapping.pop(ikey, None)
@@ -6759,7 +7147,7 @@ class OrderSyncEngine:
                         "child partial-bracket exit %r cancel deferred — "
                         "parent %r is cancel-tentative; next reconcile "
                         "will resolve the parent and retire the child",
-                        key, old.from_entry,
+                        format_intent_key(key), old.from_entry,
                     )
                     continue
                 # Cross-key native-to-engine partial conversion: the script
@@ -6854,7 +7242,7 @@ class OrderSyncEngine:
                         "intent %r deferred — prior cancel disposition on "
                         "parent %r is unresolved (since_ts_ms=%s); next "
                         "reconcile will attempt to resolve",
-                        key, tentative_parent_key, meta.since_ts_ms,
+                        format_intent_key(key), tentative_parent_key, meta.since_ts_ms,
                     )
                     self._emit_broker_event(
                         EntryDeferredCancelDispositionPendingEvent(
@@ -6975,7 +7363,7 @@ class OrderSyncEngine:
                                 "for new parent %r is blocking; keeping "
                                 "stale legs as residual protection until "
                                 "the state recovers",
-                                intent.intent_key,
+                                format_intent_key(intent.intent_key),
                                 expected_parent_ref,
                             )
                             continue
@@ -6984,7 +7372,7 @@ class OrderSyncEngine:
                             "for intent %r: parent dispatch ref mismatch "
                             "(expected %r) — script re-used from_entry %r "
                             "for a new parent",
-                            intent.intent_key,
+                            format_intent_key(intent.intent_key),
                             expected_parent_ref,
                             intent.from_entry,
                         )
@@ -7041,7 +7429,7 @@ class OrderSyncEngine:
                                 "fail-safe for parent %r is blocking; "
                                 "keeping replayed legs as residual "
                                 "protection until the state recovers",
-                                intent.intent_key,
+                                format_intent_key(intent.intent_key),
                                 sorted(persisted_leg_kinds),
                                 sorted(expected_leg_kinds),
                                 expected_parent_ref,
@@ -7052,7 +7440,7 @@ class OrderSyncEngine:
                             "legs for intent %r: persisted kinds %r do not "
                             "match expected %r — likely a crash between "
                             "leg-row writes; re-dispatching fresh bracket",
-                            intent.intent_key,
+                            format_intent_key(intent.intent_key),
                             sorted(persisted_leg_kinds),
                             sorted(expected_leg_kinds),
                         )
@@ -7150,7 +7538,7 @@ class OrderSyncEngine:
                                 "fail-safe for parent %r is blocking; "
                                 "keeping stale legs as residual protection "
                                 "until the state recovers",
-                                intent.intent_key,
+                                format_intent_key(intent.intent_key),
                                 expected_parent_ref,
                             )
                             continue
@@ -7161,7 +7549,7 @@ class OrderSyncEngine:
                             "trail_activation_offset) — script retuned the "
                             "bracket across the restart boundary; "
                             "re-dispatching fresh bracket",
-                            intent.intent_key,
+                            format_intent_key(intent.intent_key),
                         )
                         self._partial_bracket_engine.cancel_legs_for_intent(
                             intent.intent_key,
@@ -7380,7 +7768,7 @@ class OrderSyncEngine:
                         "intent %r modify deferred — parent %r is mid "
                         "cancel-tentative (since_ts_ms=%s); next reconcile "
                         "will attempt to resolve",
-                        key, intent.from_entry, meta.since_ts_ms,
+                        format_intent_key(key), intent.from_entry, meta.since_ts_ms,
                     )
                     self._emit_broker_event(
                         EntryDeferredCancelDispositionPendingEvent(
@@ -7767,7 +8155,7 @@ class OrderSyncEngine:
         _log.warning(
             "dispatch for %s ended with unknown disposition "
             "(client_order_id=%s, kind=%s); will verify on next sync: %s",
-            envelope.intent.intent_key, coid, kind, error,
+            format_intent_key(envelope.intent.intent_key), coid, kind, error,
         )
 
     def _dispatch_new(self, intent: Intent) -> None:
@@ -7937,7 +8325,7 @@ class OrderSyncEngine:
                                 "to native whole-row exit for intent %r: "
                                 "cancelling persisted partial legs before "
                                 "dispatching the replacement full-row exit",
-                                intent.intent_key,
+                                format_intent_key(intent.intent_key),
                             )
                             self._partial_bracket_engine.cancel_legs_for_intent(
                                 intent.intent_key,
@@ -8031,7 +8419,7 @@ class OrderSyncEngine:
                                 "retiring stale failsafe state for parent %r "
                                 "(no remaining active legs) before attaching "
                                 "replacement whole-row exit %r",
-                                parent_dispatch_ref, intent.intent_key,
+                                parent_dispatch_ref, format_intent_key(intent.intent_key),
                             )
                             self._native_failsafe_manager.unregister_parent(
                                 parent_dispatch_ref,
@@ -8093,7 +8481,7 @@ class OrderSyncEngine:
                             "one-way close for %s short by %s units (broker "
                             "holds less than Pine believes); closed what was "
                             "open, re-deriving from the net next reconcile",
-                            intent.intent_key, fan.shortfall,
+                            format_intent_key(intent.intent_key), fan.shortfall,
                         )
                     self._order_mapping[intent.intent_key] = [
                         f"close-leg:{leg_id}" for leg_id, _vol in fan.legs
@@ -8893,7 +9281,7 @@ class OrderSyncEngine:
                 "plugin get_residual_orders_after_bracket_attach_reject "
                 "transient failure for %s (%s: %s) — will retry on next "
                 "reconcile/restart",
-                context.intent_key, type(exc).__name__, exc,
+                format_intent_key(context.intent_key), type(exc).__name__, exc,
             )
             if raise_on_transient:
                 raise
@@ -10834,7 +11222,7 @@ class OrderSyncEngine:
                         "modify %s -> %s deferred — cancel of %s left "
                         "disposition pending; the replacement will be "
                         "dispatched after the cancel-retry loop resolves",
-                        old, new, old.intent_key,
+                        old, new, format_intent_key(old.intent_key),
                     )
                     raise _PartialBracketModifyDeferred(
                         "cancel+re-execute modify deferred — cancel "
@@ -10876,7 +11264,7 @@ class OrderSyncEngine:
             _blog_warning(
                 "cancel dispatch for %s timed out (coid=%s); "
                 "next reconcile will verify: %s",
-                old.intent_key, e.client_order_id, e,
+                format_intent_key(old.intent_key), e.client_order_id, e,
             )
             # Parent entry cancel with engine-trigger partial brackets:
             # enter cancel-tentative instead of the original eager retire.

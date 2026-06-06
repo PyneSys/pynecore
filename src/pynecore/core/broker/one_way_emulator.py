@@ -444,6 +444,8 @@ class OneWayEmulator:
                     sl_price=intent.sl_price,
                     trail_price=intent.trail_price,
                     trail_offset=intent.trail_offset,
+                    oca_name=intent.oca_name,
+                    oca_type=intent.oca_type,
                 )
             try:
                 await port.amend_bracket(

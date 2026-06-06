@@ -11,6 +11,7 @@ from pynecore.core.broker.models import (
     CloseIntent,
     CancelIntent,
     ScriptRequirements,
+    format_intent_key,
 )
 
 
@@ -71,6 +72,20 @@ def __test_cancel_intent_key_with_and_without_from_entry__():
     scoped = CancelIntent(pine_id="TP", symbol="BTCUSDT", from_entry="Long")
     assert bare.intent_key == "TP"
     assert scoped.intent_key == "TP\0Long"
+
+
+def __test_format_intent_key_makes_separator_readable__():
+    """``format_intent_key`` swaps the NUL separator for a readable glyph in logs.
+
+    A compound exit/cancel key renders the NUL as ``\\x00`` in operator logs;
+    the formatter replaces it. Keys without the separator (entry/close intents,
+    plain ids) pass through unchanged, so it is safe to apply to any logged key.
+    """
+    assert format_intent_key("TP\0Long") == "TP|Long"  # compound exit key
+    assert "\0" not in format_intent_key("TP\0Long")
+    assert format_intent_key("Long") == "Long"  # plain pine id — unchanged
+    assert format_intent_key("") == ""  # degenerate input — no crash
+    assert format_intent_key(None) is None  # optional error/context key — no crash
 
 
 def __test_script_requirements_defaults_all_false__():

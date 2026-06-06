@@ -60,7 +60,38 @@ __all__ = [
     'PartialBracketCancelTentativeResolvedEvent',
     'PartialBracketCancelTentativeDegradedEvent',
     'EntryDeferredCancelDispositionPendingEvent',
+    'INTENT_KEY_SEP',
+    'format_intent_key',
 ]
+
+
+# Field separator inside a compound intent_key (``pine_id<SEP>from_entry`` for
+# ExitIntent / CancelIntent). NUL can never appear in a Pine identifier, so the
+# split back to (pine_id, from_entry) is unambiguous — but it renders as an ugly
+# ``\x00`` in logs, so user-facing messages route the key through
+# :func:`format_intent_key`.
+INTENT_KEY_SEP = "\0"
+# Readable separator substituted for :data:`INTENT_KEY_SEP` in log output.
+_INTENT_KEY_DISPLAY_SEP = "|"
+
+
+def format_intent_key(key: str | None) -> str | None:
+    """Render an ``intent_key`` for a human-readable log line.
+
+    A compound exit / cancel key is ``pine_id<NUL>from_entry``; the raw NUL
+    prints as ``\\x00`` and clutters operator logs. Swap it for a readable
+    separator. Keys without the separator (entry / close intents, plain pine
+    ids) pass through unchanged, and ``None`` passes through too, so this is
+    safe to apply to any logged key — including the optional keys carried by
+    error/context objects.
+
+    :param key: The ``intent_key`` (or any id) about to be logged, or ``None``.
+    :return: The key with :data:`INTENT_KEY_SEP` replaced by a readable glyph,
+        or ``None`` unchanged.
+    """
+    if key is None:
+        return None
+    return key.replace(INTENT_KEY_SEP, _INTENT_KEY_DISPLAY_SEP)
 
 
 class OrderStatus(StrEnum):
@@ -544,7 +575,7 @@ class ExitIntent:
         exit orders for different from_entry values (e.g. "Long" and "Short").
         The (pine_id, from_entry) tuple is the unique key.
         """
-        return f"{self.pine_id}\0{self.from_entry}"
+        return f"{self.pine_id}{INTENT_KEY_SEP}{self.from_entry}"
 
     @property
     def has_unresolved_ticks(self) -> bool:
@@ -622,7 +653,7 @@ class CancelIntent:
     @property
     def intent_key(self) -> str:
         if self.from_entry is not None:
-            return f"{self.pine_id}\0{self.from_entry}"
+            return f"{self.pine_id}{INTENT_KEY_SEP}{self.from_entry}"
         return self.pine_id
 
     def __str__(self) -> str:
