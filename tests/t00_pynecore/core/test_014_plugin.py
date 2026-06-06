@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from pynecore.core.plugin import (
     Plugin,
     ProviderPlugin,
+    ProviderError,
+    TransientProviderError,
+    is_retryable_provider_error,
     LiveProviderConfig,
     LiveProviderPlugin,
     PluginSymbol,
@@ -152,3 +155,44 @@ def __test_live_provider_config_default_symbol_map__():
     # Each instance gets its own dict (default_factory), not a shared one.
     a.symbol_map["k"] = "v"
     assert b.symbol_map == {}
+
+
+def __test_provider_error_not_retryable_by_default__():
+    """A plain ProviderError is permanent: retry must not be attempted."""
+    assert ProviderError("bad symbol").retryable is False
+    assert is_retryable_provider_error(ProviderError("bad symbol")) is False
+
+
+def __test_transient_provider_error_is_retryable__():
+    """TransientProviderError marks a retry-worthy connectivity fault."""
+    assert TransientProviderError("link dropped").retryable is True
+    assert is_retryable_provider_error(TransientProviderError("link dropped")) is True
+
+
+def __test_is_retryable_walks_cause_chain__():
+    """A transient error wrapped in a plain ProviderError is still retryable."""
+    transient = TransientProviderError("maintenance")
+    try:
+        try:
+            raise transient
+        except TransientProviderError as inner:
+            raise ProviderError("download failed") from inner
+    except ProviderError as outer:
+        assert is_retryable_provider_error(outer) is True
+
+
+def __test_is_retryable_walks_context_chain__():
+    """A transient error in the implicit (__context__) chain is still retryable."""
+    try:
+        try:
+            raise TransientProviderError("maintenance")
+        except TransientProviderError:
+            # No ``from`` — links via __context__, not __cause__.
+            raise ProviderError("download failed")
+    except ProviderError as outer:
+        assert is_retryable_provider_error(outer) is True
+
+
+def __test_is_retryable_non_provider_error_is_false__():
+    """A non-ProviderError exception is never classified retryable."""
+    assert is_retryable_provider_error(ValueError("boom")) is False

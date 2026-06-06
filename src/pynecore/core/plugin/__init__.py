@@ -83,7 +83,52 @@ class ProviderError(Exception):
     :class:`NotImplementedError`) on its listing/download paths and prints a
     one-line ``Error: ...`` instead of a traceback. A plugin's own error
     hierarchy should subclass it so those failures surface cleanly.
+
+    :cvar retryable: Whether the same operation could plausibly succeed if
+        retried later — a *transient* connectivity / broker-unavailable fault,
+        as opposed to a permanent misconfiguration (unknown symbol, bad
+        credentials, wrong account mode). Defaults to ``False`` so an unknown
+        failure fails fast rather than looping forever; genuine transient
+        faults set it via :class:`TransientProviderError` or a ``retryable``
+        property keyed on an error code.
     """
+
+    retryable: bool = False
+
+
+class TransientProviderError(ProviderError):
+    """A *transient* provider failure — the operation may succeed on retry.
+
+    Connectivity drops, request-routing failures (broker maintenance), socket
+    timeouts. A long-running ``--broker`` / ``--live`` run should wait and
+    retry rather than halt; a one-shot backtest still fails fast. See
+    :func:`is_retryable_provider_error`.
+    """
+
+    retryable: bool = True
+
+
+def is_retryable_provider_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a transient, retry-worthy provider failure.
+
+    Walks the ``__cause__`` / ``__context__`` chain so a transient error stays
+    classifiable even after being re-wrapped in another exception (the
+    original wire fault is often nested under a higher-level
+    :class:`ProviderError`). Returns ``True`` as soon as any link is a
+    :class:`ProviderError` whose ``retryable`` flag is set.
+
+    :param exc: The caught exception.
+    :return: ``True`` if waiting and retrying the operation could plausibly
+        succeed, ``False`` for permanent / unknown failures.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ProviderError) and current.retryable:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def discover_plugins() -> dict[str, EntryPoint]:

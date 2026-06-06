@@ -417,6 +417,75 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     )
 
 
+#: Startup provider-download retry backoff (seconds): the first wait and the
+#: ceiling the exponential growth saturates at. Internal tunables — deliberately
+#: not user config: a live bot should keep trying until the broker returns, and
+#: ~1 minute is a sane poll cadence through a multi-hour maintenance window.
+_PROVIDER_RETRY_BASE_DELAY = 2.0
+_PROVIDER_RETRY_MAX_DELAY = 60.0
+
+
+def _wait_before_retry(delay: float) -> None:
+    """Block for ``delay`` seconds interruptibly, without a bare sleep.
+
+    Waits on a never-set :class:`threading.Event`, an event-driven,
+    deadline-bounded primitive: a ``Ctrl-C`` (``KeyboardInterrupt`` in the main
+    thread) breaks out of the backoff at once instead of stalling for the full
+    delay, and there is no busy-poll.
+
+    :param delay: Maximum seconds to wait.
+    """
+    threading.Event().wait(timeout=delay)
+
+
+def _download_provider_data_resilient(
+        provider_str: str, time_from_str: str | None, *, retry_transient: bool,
+) -> _ProviderData:
+    """Download provider data, riding out transient broker outages.
+
+    For a long-running run (``--broker`` / ``--live``) a *transient* provider
+    failure — broker maintenance, a lost route, a dropped connection — must not
+    strand the bot: we wait with capped exponential backoff and keep retrying
+    until the feed returns or the operator interrupts (``Ctrl-C``). A
+    *permanent* failure (unknown symbol, bad credentials, wrong account mode),
+    and every failure of a one-shot backtest, still exits immediately with a
+    clean one-line message instead of a traceback — mirroring ``pyne data
+    download``.
+
+    Retrying is intentionally unbounded for the transient class: a bot is meant
+    to run until told to stop, so giving up after N attempts would re-introduce
+    the very crash we are fixing for any outage longer than the backoff budget.
+    The safeguard against looping on a misclassified error is that the transient
+    set is narrow and source-specific (see ``is_retryable_provider_error`` and
+    the cTrader ``_CONNECTION_CLASS_CODES``), and every wait is logged.
+
+    :param provider_str: The provider string (e.g. ``ctrader:pepperstoneuk:BTCUSD@1``).
+    :param time_from_str: The ``--from`` value (date, days, or ``-bars``).
+    :param retry_transient: Whether to wait-and-retry on transient errors —
+        ``True`` only for long-running ``--broker`` / ``--live`` runs.
+    :return: The downloaded provider data.
+    """
+    from pynecore.core.plugin import ProviderError, is_retryable_provider_error
+
+    delay = _PROVIDER_RETRY_BASE_DELAY
+    attempt = 0
+    while True:
+        try:
+            return _download_provider_data(provider_str, time_from_str)
+        except ProviderError as e:
+            if not (retry_transient and is_retryable_provider_error(e)):
+                secho(f"Error: {e}", err=True, fg=colors.RED)
+                raise Exit(1)
+            attempt += 1
+            secho(
+                f"Provider temporarily unavailable ({e}); waiting {int(delay)}s "
+                f"before retry #{attempt} (press Ctrl-C to abort)...",
+                err=True, fg=colors.YELLOW,
+            )
+            _wait_before_retry(delay)
+            delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
+
+
 @app.command(cls=PluggableCommand)
 def run(
         script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
@@ -583,8 +652,14 @@ def run(
         raise Exit(1)
 
     if provider_mode:
-        # Provider mode: download historical data, get syminfo
-        provider_data = _download_provider_data(data, time_from)
+        # Provider mode: download historical warmup data + syminfo. A
+        # long-running --broker/--live run rides out transient broker outages
+        # (maintenance, lost route) instead of dying mid-startup; a one-shot
+        # backtest and any permanent failure (unknown symbol, bad credentials)
+        # still fail fast with a clean one-line error, not a traceback.
+        provider_data = _download_provider_data_resilient(
+            data, time_from, retry_transient=(live or broker),
+        )
         data_path, syminfo = provider_data.ohlcv_path, provider_data.syminfo
     else:
         # File mode: resolve path, convert if needed
