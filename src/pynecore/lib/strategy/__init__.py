@@ -2506,7 +2506,7 @@ class SimPosition(PositionBase):
 # noinspection PyProtectedMember
 def _size_round(qty: PyneFloat) -> PyneFloat:
     """
-    Round size to the nearest possible value
+    Round a size down to the nearest tradable lot (``1 / _size_round_factor``).
 
     :param qty: The quantity to round
     :return: The rounded quantity
@@ -2514,9 +2514,15 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     if isinstance(qty, NA):
         return na_float
     rfactor = syminfo._size_round_factor  # noqa
-    qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
+    # Floor to the lot step (1 / rfactor). The float64 product can land an exact
+    # lot multiple a hair below the integer (e.g. 173.432 * 1e4 ->
+    # 1734319.9999999998); snap values within a few ULPs of an integer up before
+    # the floor so an exact multiple is not truncated a whole lot down.
+    scaled = abs(qty) * rfactor
+    nearest = round(scaled)
+    lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
     sign = 1 if qty > 0 else -1
-    return sign * int(qrf) / rfactor
+    return sign * lots / rfactor
 
 
 def _margin_call_round(qty: float) -> float:
