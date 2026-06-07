@@ -108,7 +108,7 @@ class Order:
         "comment_profit", "comment_loss", "comment_trailing",
         "alert_profit", "alert_loss", "alert_trailing",
         "trail_price", "trail_offset",
-        "trail_triggered",
+        "trail_triggered", "trail_stop",
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
@@ -168,6 +168,7 @@ class Order:
         self.trail_price = trail_price
         self.trail_offset = trail_offset or 0  # in ticks
         self.trail_triggered = False
+        self.trail_stop: float | None = None  # active trailing-stop level once triggered
 
         self.profit_ticks = profit_ticks
         self.loss_ticks = loss_ticks
@@ -327,28 +328,6 @@ class PriceOrderBook:
                     del self.price_levels[idx]
                 del self.orders_at_price[price]
         del self.order_prices[order]
-
-    def update_order_stop(self, order: Order, new_stop: float | None):
-        """Update the stop price of an order in the order book"""
-        # Remove the order from the old stop price level if it exists
-        if order.stop is not None and order.stop in self.order_prices[order]:
-            old_stop = order.stop
-            self.orders_at_price[old_stop].remove(order)
-            self.order_prices[order].remove(old_stop)
-            if not self.orders_at_price[old_stop]:
-                idx = bisect_left(self.price_levels, old_stop)
-                if idx < len(self.price_levels) and self.price_levels[idx] == old_stop:
-                    del self.price_levels[idx]
-                del self.orders_at_price[old_stop]
-
-        # Update the order's stop price
-        order.stop = new_stop
-
-        # Add the order to the new stop price level
-        if new_stop not in self.orders_at_price:
-            insort(self.price_levels, new_stop)
-        self.orders_at_price[new_stop].append(order)
-        self.order_prices[order].add(new_stop)
 
     def iter_orders(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
         """
@@ -1393,22 +1372,166 @@ class SimPosition(PositionBase):
                 return True
         return False
 
-    def _check_high_trailing(self, order: Order) -> bool:
-        # Update trailing stop
-        if order.trail_price is not None and order.sign < 0:
-            # Check if trailing price has been triggered
-            if not order.trail_triggered and self.h > order.trail_price:
+    def _process_trailing_stop(self, order: Order, ohlc: bool) -> bool:
+        """Process a trailing-stop exit for the current bar (TradingView model).
+
+        The activation level is ``order.trail_price`` (``entry ± trail_points``).
+        Once the bar's extreme reaches it, the stop anchors at the activation
+        level offset by ``trail_offset`` and fills on the SAME bar if the bar
+        retraces to it. The current bar's extreme only advances the trail for the
+        NEXT bar — TradingView evaluates a trailing stop from the prior
+        high/low-water mark, so with ``trail_offset == 0`` the fill lands exactly
+        at the activation level on the activation bar instead of riding to the
+        bar's extreme.
+
+        A trail that activates on THIS bar arms at the favorable extreme (the high
+        for a long, the low for a short). When that extreme is the bar's SECOND
+        intra-bar leg, a hard ``stop=`` reached on the FIRST leg fills earlier in
+        intra-bar time and must win, so the trail defers to the price walk in that
+        case instead of pre-empting it. A trail carried from a prior bar is live
+        from the open and keeps priority. ``ohlc`` selects the leg order:
+        ``True`` => open->high->low, ``False`` => open->low->high.
+
+        :param order: The exit order carrying ``trail_price``.
+        :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`).
+        :return: True if the order filled this bar.
+        """
+        if order.trail_price is None:
+            return False
+        round_to_mintick = lib.math.round_to_mintick
+        offset_price = syminfo.mintick * order.trail_offset
+        slippage = lib._script.slippage
+
+        if order.sign < 0:
+            # Long position: trailing sell-stop riding under the high-water mark.
+            just_activated = False
+            if not order.trail_triggered:
+                if self.h < order.trail_price:
+                    return False
                 order.trail_triggered = True
-            # Update stop if trailing price has been triggered
-            if order.trail_triggered:
-                offset_price = syminfo.mintick * order.trail_offset
-                assert order.stop is not None
-                new_stop: float = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)
-                if new_stop != order.stop:
-                    # Update the order in the orderbook with the new stop price
-                    self.orderbook.update_order_stop(order, new_stop)
+                order.trail_stop = round_to_mintick(order.trail_price - offset_price)
+                just_activated = True
+            stop = order.trail_stop
+            if stop is None:
+                return False
+            # Activated on the high (second leg, open->low->high): a hard stop hit
+            # on the first (low) leg fills before the trail arms, so defer to it.
+            stop_first = (just_activated and not ohlc
+                          and order.stop is not None and order.stop >= self.l)
+            if self.l <= stop and not stop_first:
+                # A stop carried from a prior bar fills at the open when the bar
+                # gaps below it; on the activation bar the stop was just placed
+                # intra-bar at the activation level, so the fill is at the stop.
+                p = self.o if (not just_activated and self.o <= stop) else stop
+                if slippage > 0:
+                    p -= syminfo.mintick * slippage
+                order.filled_by_type = 'trailing'
+                self.fill_order(order, p, self.h, p)
                 return True
+            # No fill: ratchet the trail up with this bar's high for the next bar.
+            new_stop = round_to_mintick(self.h - offset_price)
+            if new_stop > stop:
+                order.trail_stop = new_stop
+            return False
+
+        if order.sign > 0:
+            # Short position: trailing buy-stop riding above the low-water mark.
+            just_activated = False
+            if not order.trail_triggered:
+                if self.l > order.trail_price:
+                    return False
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(order.trail_price + offset_price)
+                just_activated = True
+            stop = order.trail_stop
+            if stop is None:
+                return False
+            # Activated on the low (second leg, open->high->low): a hard stop hit
+            # on the first (high) leg fills before the trail arms, so defer to it.
+            stop_first = (just_activated and ohlc
+                          and order.stop is not None and order.stop <= self.h)
+            if self.h >= stop and not stop_first:
+                p = self.o if (not just_activated and self.o >= stop) else stop
+                if slippage > 0:
+                    p += syminfo.mintick * slippage
+                order.filled_by_type = 'trailing'
+                self.fill_order(order, p, p, self.l)
+                return True
+            # No fill: ratchet the trail down with this bar's low for the next bar.
+            new_stop = round_to_mintick(self.l + offset_price)
+            if new_stop < stop:
+                order.trail_stop = new_stop
+            return False
+
         return False
+
+    def _seed_trail_at_issue(self, order: Order) -> None:
+        """Fold the issue bar's extreme into a trailing exit's high/low-water mark.
+
+        ``process_orders`` runs before the script body, so an exit issued in the
+        script on bar N -- e.g. one gated on ``strategy.position_size``, which is
+        only known once the entry has filled -- is first evaluated on bar N+1.
+        The entry-fill bar's own extreme would then never seed the trail, leaving
+        PyneCore's water mark one bar behind TradingView's, which keeps the
+        trailing stop alive from the bar the position is already open. Advance the
+        water mark here at issue time (activation + ratchet only -- the fill still
+        happens in the next ``process_orders``).
+
+        Exits placed on the entry SIGNAL bar (entry still pending, so no bound
+        trade is open yet) are skipped: ``process_orders`` seeds those on their
+        fill bar exactly as before, so the single-issue path is unchanged.
+
+        :param order: The freshly (re-)issued trailing exit order.
+        """
+        if order.trail_points_ticks is None and order.trail_price is None:
+            return
+        entry_price: float | None = None
+        for trade in self.open_trades:
+            if trade.entry_id == order.order_id:
+                entry_price = trade.entry_price
+                break
+        if entry_price is None:
+            return  # entry still pending -- seeded later on the fill bar
+
+        direction = 1.0 if order.size < 0 else -1.0
+        trail_price = order.trail_price
+        if trail_price is None and order.trail_points_ticks is not None:
+            trail_price = _price_round(
+                entry_price + direction * syminfo.mintick * order.trail_points_ticks, direction)
+        if trail_price is None:
+            return
+
+        round_to_mintick = lib.math.round_to_mintick
+        offset_price = syminfo.mintick * order.trail_offset
+        # Arming on the issue (entry-fill) bar is gated on the bar CLOSE, not its
+        # intrabar extreme: TradingView only carries a trailing stop out of the
+        # entry-fill bar when that bar closes past the activation level. A bar
+        # whose extreme pierces the activation level but closes back inside it does
+        # NOT arm here -- it arms later, intrabar, in the normal price walk (which
+        # also performs the same-bar fill that is suppressed on the entry-fill
+        # bar). On every later bar a close past the level implies the high already
+        # pierced it, so process_orders has already armed the carried order and
+        # this gate never fires there.
+        if order.sign < 0:
+            # Long position: trailing sell-stop riding under the high-water mark.
+            if not order.trail_triggered:
+                if self.c <= trail_price:
+                    return
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(trail_price - offset_price)
+            new_stop = round_to_mintick(self.h - offset_price)
+            if order.trail_stop is None or new_stop > order.trail_stop:
+                order.trail_stop = new_stop
+        elif order.sign > 0:
+            # Short position: trailing buy-stop riding above the low-water mark.
+            if not order.trail_triggered:
+                if self.c >= trail_price:
+                    return
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(trail_price + offset_price)
+            new_stop = round_to_mintick(self.l + offset_price)
+            if order.trail_stop is None or new_stop < order.trail_stop:
+                order.trail_stop = new_stop
 
     def _check_margin_call(self, check_price: float, *, for_short: bool,
                            at_open: bool = False,
@@ -1556,42 +1679,6 @@ class SimPosition(PositionBase):
                 order.filled_by_type = 'profit'
                 self.fill_order(order, p, self.h, p)
                 return True
-        return False
-
-    def _check_low_trailing(self, order: Order) -> bool:
-        # Update trailing stop
-        if order.trail_price is not None and order.sign > 0:
-            # Check if trailing price has been triggered
-            if not order.trail_triggered and self.l < order.trail_price:
-                order.trail_triggered = True
-            # Update stop if trailing price has been triggered
-            if order.trail_triggered:
-                offset_price = syminfo.mintick * order.trail_offset
-                new_stop: float = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
-                if new_stop != order.stop:
-                    # Update the order in the orderbook with the new stop price
-                    self.orderbook.update_order_stop(order, new_stop)
-                return True
-        return False
-
-    def _check_close(self, order: Order, ohlc: bool) -> bool:
-        """ Check close price if trailing stop is triggered """
-        if order.stop is None:
-            return False
-        p = order.stop
-        slippage = lib._script.slippage
-        if slippage > 0:
-            p += syminfo.mintick * slippage * order.sign
-        # open → high → low → close
-        if ohlc and order.stop <= self.c:
-            order.filled_by_type = 'trailing'
-            self.fill_order(order, p, p, self.l)
-            return True
-        # open → low → high → close
-        elif order.stop >= self.c:
-            order.filled_by_type = 'trailing'
-            self.fill_order(order, p, self.h, p)
-            return True
         return False
 
     def process_orders(self):
@@ -1921,6 +2008,18 @@ class SimPosition(PositionBase):
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
+        # Trailing stops are evaluated from the prior high/low-water mark, so they
+        # are processed once per bar here rather than inside the price walk — the
+        # walk would ride the stop to the current bar's extreme and fill there.
+        # Iterate a snapshot since fills mutate the order book; an order indexed at
+        # several price levels is yielded once per level, so dedupe by identity.
+        seen: set[Order] = set()
+        for order in list(self.orderbook.iter_orders()):
+            if order in seen or order.cancelled or order.trail_price is None:
+                continue
+            seen.add(order)
+            self._process_trailing_stop(order, ohlc)
+
         # Process orders: open → high → low → close
         if ohlc:
             # open -> high
@@ -1929,10 +2028,6 @@ class SimPosition(PositionBase):
                     continue
                 if self._check_high(order):
                     continue
-                if self._check_high_trailing(order):
-                    continue
-                if order.trail_triggered and order.stop is not None:
-                    self._check_close(order, ohlc)
 
             if not self._check_margin_call(self.h, for_short=True):
                 # open -> low
@@ -1941,10 +2036,6 @@ class SimPosition(PositionBase):
                         continue
                     if self._check_low(order):
                         continue
-                    if self._check_low_trailing(order):
-                        continue
-                    if order.trail_triggered and order.stop is not None:
-                        self._check_close(order, ohlc)
 
                 self._check_margin_call(self.l, for_short=False, can_defer=False)
 
@@ -1956,10 +2047,6 @@ class SimPosition(PositionBase):
                     continue
                 if self._check_low(order):
                     continue
-                if self._check_low_trailing(order):
-                    continue
-                if order.trail_triggered and order.stop is not None:
-                    self._check_close(order, ohlc)
 
             if not self._check_margin_call(self.l, for_short=False):
                 # open -> high
@@ -1968,10 +2055,6 @@ class SimPosition(PositionBase):
                         continue
                     if self._check_high(order):
                         continue
-                    if self._check_high_trailing(order):
-                        continue
-                    if order.trail_triggered and order.stop is not None:
-                        self._check_close(order, ohlc)
 
                 self._check_margin_call(self.h, for_short=True, can_defer=False)
 
@@ -2820,7 +2903,20 @@ def exit(id: str, from_entry: str = "",
             alert_loss=_na_to_none(alert_loss),
             alert_trailing=_na_to_none(alert_trailing)
         )
+
+        # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
+        # activated high/low-water mark. TradingView carries ONE logical trailing
+        # stop across re-issues -- only the activation level tracks the
+        # (entry-anchored) trail_points -- so a fresh Order must inherit the
+        # ratcheted ``trail_stop`` instead of re-arming at the bare activation
+        # level every bar, which would leave the stop permanently one or more bars
+        # behind the carried water mark.
+        if existing is not None and not entry_pending and existing.trail_triggered:
+            order.trail_triggered = True
+            order.trail_stop = existing.trail_stop
+
         position._add_order(order)
+        position._seed_trail_at_issue(order)
 
     # Find direction and size
     if from_entry:

@@ -3,7 +3,6 @@ import sys
 from zoneinfo import ZoneInfo
 from datetime import datetime, UTC
 from functools import cache, lru_cache
-from ..lib import syminfo
 
 # Standard formats for non-ISO dates
 # %b = abbreviated month (Jan, Feb), %B = full month (January, February)
@@ -103,36 +102,28 @@ def _missing_timezone_message(timezone: str) -> str:
 
 
 @lru_cache(maxsize=128)
-def parse_timezone(timezone: str | None) -> ZoneInfo:
+def _parse_timezone_cached(timezone: str) -> ZoneInfo:
     """
-    Parse timezone string into ZoneInfo object. Supports:
-    - IANA timezone names (e.g. "America/New_York")
-    - UTC±HHMM format (e.g. "UTC-5", "UTC+0530")
-    - GMT±HHMM format (e.g. "GMT-5", "GMT+0530")
-    - Raw offset (e.g. "+0530", "-05:00")
+    Parse a concrete, non-empty timezone string into a ZoneInfo object.
 
-    :param timezone: Timezone string
+    Kept separate from :func:`parse_timezone` so the cache is only ever keyed on
+    an explicit timezone string. The ``None`` -> exchange-timezone fallback must
+    NOT be cached: it resolves against the mutable ``syminfo.timezone`` global,
+    so a cached ``None`` entry would leak one script's timezone into the next run
+    in the same process.
+
+    :param timezone: Concrete timezone string (IANA name or UTC/GMT±HHMM offset)
     :return: ZoneInfo object
-    :raises ValueError: If timezone format is invalid
+    :raises TimezoneNotFoundError: If the timezone cannot be resolved
     """
-    if not timezone and syminfo.timezone:
-        timezone = syminfo.timezone
-
     # Try as IANA timezone first
     try:
-        try:
-            return ZoneInfo(timezone)  # type: ignore
-        except TypeError:  # timezone is None and syminfo has none -> default to UTC
-            return ZoneInfo('UTC')
+        return ZoneInfo(timezone)
     except KeyError:
         # ZoneInfoNotFoundError is a KeyError subclass: the name is not in the IANA
         # database. UTC/GMT±HHMM offset forms are parsed below; any other name is an
         # IANA name whose lookup genuinely failed.
         pass
-
-    # ZoneInfo raised KeyError, which only happens for a string key (None/NA raise
-    # TypeError, handled above), so timezone is a str from here on.
-    assert isinstance(timezone, str)
 
     # Parse UTC/GMT±HHMM offset format with optional colon
     match = _OFFSET_RE.match(timezone)
@@ -157,6 +148,40 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
     zone = f"Etc/GMT{'-' if sign == '+' else '+'}{int(abs(offset))}"
     return ZoneInfo(zone)
+
+
+# Lazily bound to the ``lib.syminfo`` module on first use. Importing it at module
+# top would create a datetime <-> lib import cycle (lib pulls in timeframe, which
+# imports parse_timezone), so the reference is fetched once on the first fallback
+# call and reused -- keeping the hot path a plain attribute read with no per-call
+# import cost.
+_syminfo = None
+
+
+def parse_timezone(timezone: str | None) -> ZoneInfo:
+    """
+    Parse timezone string into ZoneInfo object. Supports:
+    - IANA timezone names (e.g. "America/New_York")
+    - UTC±HHMM format (e.g. "UTC-5", "UTC+0530")
+    - GMT±HHMM format (e.g. "GMT-5", "GMT+0530")
+    - Raw offset (e.g. "+0530", "-05:00")
+
+    When ``timezone`` is falsy the exchange timezone (``syminfo.timezone``) is
+    used, defaulting to UTC when that is unset too. This fallback value is read on
+    every call -- never cached -- so changing the active symbol's timezone takes
+    effect immediately instead of returning a previous run's cached zone.
+
+    :param timezone: Timezone string, or None to use the exchange timezone
+    :return: ZoneInfo object
+    :raises TimezoneNotFoundError: If the timezone cannot be resolved
+    """
+    if not timezone:
+        global _syminfo
+        if _syminfo is None:
+            from ..lib import syminfo
+            _syminfo = syminfo
+        timezone = _syminfo.timezone or 'UTC'
+    return _parse_timezone_cached(timezone)
 
 
 def parse_datestring(datestring: str) -> datetime:
