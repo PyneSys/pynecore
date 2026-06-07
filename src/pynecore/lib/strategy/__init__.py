@@ -346,14 +346,20 @@ class PriceOrderBook:
         :return: Generator yielding Order objects
         """
         if min_price is not None and max_price is not None:
-            # Range query - ascending from min to max
+            # Range query - ascending from min to max (or descending when desc=True,
+            # e.g. the open->low price walk, where the level nearest the open is
+            # reached first in time). Price levels reverse; within a level the
+            # insertion order is preserved so same-price ties keep their sequence.
             min_idx = bisect_left(self.price_levels, min_price)
             max_idx = bisect_left(self.price_levels, max_price)
             # Include max_price if it matches exactly
             if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
                 max_idx += 1
             # Create a copy of price levels to avoid iteration issues when levels are removed
-            for p in list(self.price_levels[min_idx:max_idx]):
+            levels = list(self.price_levels[min_idx:max_idx])
+            if desc:
+                levels.reverse()
+            for p in levels:
                 # Create a copy to avoid iteration issues when orders are removed during iteration
                 yield from list(self.orders_at_price[p])
 
@@ -562,6 +568,17 @@ class PositionBase(ABC):
             return allowed == short
         return True
 
+    def _seed_trail_at_issue(self, order: 'Order') -> None:
+        """Sim-only hook: fold the issue bar's extreme into a freshly issued
+        trailing exit's water mark.
+
+        This is a backtest price-walk concern. The live broker path tracks the
+        trailing stop through the exchange / order-sync engine, so the base
+        implementation is a no-op; :class:`SimPosition` overrides it with the
+        backtest behaviour.
+        """
+        return None
+
     @abstractmethod
     def _add_order(self, order: 'Order') -> None:
         """Register an order with this position."""
@@ -626,7 +643,7 @@ class SimPosition(PositionBase):
         self.grossloss: PyneFloat = 0.0
 
         # Order books
-        self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
+        self.market_orders: dict[tuple[_OrderType, str | None, str | None], Order] = {}  # Market orders from strategy.market()
         self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
         # Exit orders from strategy.exit(), strategy.close(), etc.
         # Key is (exit_id, from_entry) — both partial-TP fan-out (same from_entry,
@@ -690,9 +707,12 @@ class SimPosition(PositionBase):
         # Set the bar_index when the order is placed
         order.bar_index = int(lib.bar_index)
 
-        # Add market order to market orders dict
+        # Add market order to market orders dict. Key on exit_id too: two
+        # brackets sharing the same from_entry (order_id) would otherwise
+        # collide on the same key, so a second gap-through exit would evict
+        # the first and only one of them would fill on the gap bar.
         if order.is_market_order:
-            self.market_orders[(order.order_type, order.order_id)] = order
+            self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
@@ -721,7 +741,7 @@ class SimPosition(PositionBase):
             self.entry_orders.pop(order.order_id, None)
         # Remove market order from market orders dict
         if order.is_market_order:
-            self.market_orders.pop((order.order_type, order.order_id), None)
+            self.market_orders.pop((order.order_type, order.order_id, order.exit_id), None)
         # Remove order from order book
         self.orderbook.remove_order(order)
 
@@ -1846,7 +1866,7 @@ class SimPosition(PositionBase):
                 # Convert to market order
                 order.is_market_order = True
                 # Add to market orders dict
-                self.market_orders[(order.order_type, order.order_id)] = order
+                self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -2062,8 +2082,8 @@ class SimPosition(PositionBase):
                     continue
 
             if not self._check_margin_call(self.h, for_short=True):
-                # open -> low
-                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
+                # open -> low (descending: the level nearest the open fills first)
+                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
                     if self._check_low_stop(order):
                         continue
                     if self._check_low(order):
@@ -2073,8 +2093,8 @@ class SimPosition(PositionBase):
 
         # Process orders: open → low → high → close
         else:
-            # open -> low
-            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
+            # open -> low (descending: the level nearest the open fills first)
+            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
                 if self._check_low_stop(order):
                     continue
                 if self._check_low(order):
