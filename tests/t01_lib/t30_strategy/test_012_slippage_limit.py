@@ -14,6 +14,7 @@ from pynecore.types import Persistent, Table
 SLIPPAGE_TICKS: int = 20
 
 
+# noinspection PyTypeChecker
 @script.strategy("Slippage Test - Limit Orders (No Slippage)", overlay=True, initial_capital=10000, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1)
 def main(
     limitOffset=input.float(0.5, "Limit Offset %", minval=0.1, step=0.1),

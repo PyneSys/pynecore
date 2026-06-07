@@ -29,6 +29,7 @@ def main():
 def _make_syminfo(period: str = '1'):
     from pynecore.core.syminfo import SymInfo
     from pynecore.providers.ccxt import CCXTProvider
+    # noinspection PyProtectedMember
     opening_hours, session_starts, session_ends = CCXTProvider._create_24_7_sessions()
     return SymInfo(
         prefix="TEST", description="Test", ticker="TEST", currency="USD",

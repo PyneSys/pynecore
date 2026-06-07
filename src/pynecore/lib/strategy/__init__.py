@@ -404,6 +404,7 @@ class PriceOrderBook:
         self.order_prices.clear()
 
 
+# noinspection PyProtectedMember,PyShadowingNames
 class PositionBase(ABC):
     """
     Abstract base class for position tracking.
@@ -427,6 +428,11 @@ class PositionBase(ABC):
     grossprofit: PyneFloat
     grossloss: PyneFloat
     open_commission: float
+    # Current-bar OHLC the order-fill checks read off the position
+    # (sim tracks them as slots; broker serves them from the live feed).
+    c: float
+    h: float
+    l: float
     eventrades: int
     wintrades: int
     losstrades: int
@@ -436,7 +442,7 @@ class PositionBase(ABC):
     closed_trades: 'deque[Trade]'
     new_closed_trades: list['Trade']
     entry_orders: dict[str | None, 'Order']
-    exit_orders: dict[str | None, 'Order']
+    exit_orders: dict[tuple[str | None, str | None], 'Order']
     risk_halt_trading: bool
 
     # Risk management state shared by Sim and Broker positions. Setters
@@ -455,6 +461,7 @@ class PositionBase(ABC):
     risk_max_intraday_filled_orders_alert: str | None
     risk_max_position_size: float | None
     risk_intraday_start_equity: float
+    risk_intraday_filled_orders: int
     risk_cons_loss_days: int
 
     @property
@@ -1146,7 +1153,7 @@ class SimPosition(PositionBase):
             if self._is_intraday_filled_cap_reached():
                 self._remove_order(order)
                 return False
-            adjusted = self._adjust_for_max_position_size(order.size, order.sign)
+            adjusted = self._adjust_for_max_position_size(float(order.size), order.sign)
             if adjusted is None:
                 self._remove_order(order)
                 return False
@@ -2639,7 +2646,9 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
-    if immediately:
+    # Same-tick fill is a backtest concept; in broker mode the order is already
+    # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
+    if immediately and isinstance(position, SimPosition):
         position.fill_order(order, position.c, position.h, position.l)
 
 
@@ -2666,7 +2675,9 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
-    if immediately:
+    # Same-tick fill is a backtest concept; in broker mode the order is already
+    # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
+    if immediately and isinstance(position, SimPosition):
         position.fill_order(order, position.c, position.h, position.l)
 
 
@@ -2918,6 +2929,15 @@ def exit(id: str, from_entry: str = "",
         profit_ticks: float | None = _na_to_none(profit)
         loss_ticks: float | None = _na_to_none(loss)
         trail_points_ticks: float | None = _na_to_none(trail_points)
+
+        # An exit must arm at least one trigger. TradingView treats a call whose
+        # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
+        # from a flat position_avg_price (na) on a bar before the entry fills --
+        # not a level-less market close that fires at the next open.
+        if (isinstance(limit, NA) and isinstance(stop, NA) and isinstance(profit, NA)
+                and isinstance(loss, NA) and isinstance(trail_price, NA)
+                and isinstance(trail_points, NA)):
+            return
 
         # We need to have limit, stop or both
         if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):

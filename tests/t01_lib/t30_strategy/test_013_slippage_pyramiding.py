@@ -15,6 +15,7 @@ SLIPPAGE_TICKS: int = 5
 PYRAMIDING_LIMIT: int = 3
 
 
+# noinspection PyTypeChecker
 @script.strategy("Slippage Test - Pyramiding", overlay=True, initial_capital=10000, pyramiding=PYRAMIDING_LIMIT, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 def main(
     entrySpacing=input.int(5, "Bars Between Entries", minval=1),
