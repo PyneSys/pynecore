@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Literal, overload
 
 import math
+from abc import ABC, abstractmethod
 from datetime import datetime, UTC
 from collections import deque, defaultdict
 from copy import copy
@@ -25,7 +26,7 @@ __all__ = [
     "fixed", "cash", "percent_of_equity",
     "long", "short", 'direction',
 
-    'Trade', 'Order', 'Position',
+    'Trade', 'Order', 'PositionBase', 'SimPosition',
     "cancel", "cancel_all", "close", "close_all", "entry", "exit", "order",
 
     "closedtrades", "opentrades",
@@ -107,7 +108,7 @@ class Order:
         "comment_profit", "comment_loss", "comment_trailing",
         "alert_profit", "alert_loss", "alert_trailing",
         "trail_price", "trail_offset",
-        "trail_triggered",
+        "trail_triggered", "trail_stop",
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
@@ -167,6 +168,7 @@ class Order:
         self.trail_price = trail_price
         self.trail_offset = trail_offset or 0  # in ticks
         self.trail_triggered = False
+        self.trail_stop: float | None = None  # active trailing-stop level once triggered
 
         self.profit_ticks = profit_ticks
         self.loss_ticks = loss_ticks
@@ -327,28 +329,6 @@ class PriceOrderBook:
                 del self.orders_at_price[price]
         del self.order_prices[order]
 
-    def update_order_stop(self, order: Order, new_stop: float | None):
-        """Update the stop price of an order in the order book"""
-        # Remove the order from the old stop price level if it exists
-        if order.stop is not None and order.stop in self.order_prices[order]:
-            old_stop = order.stop
-            self.orders_at_price[old_stop].remove(order)
-            self.order_prices[order].remove(old_stop)
-            if not self.orders_at_price[old_stop]:
-                idx = bisect_left(self.price_levels, old_stop)
-                if idx < len(self.price_levels) and self.price_levels[idx] == old_stop:
-                    del self.price_levels[idx]
-                del self.orders_at_price[old_stop]
-
-        # Update the order's stop price
-        order.stop = new_stop
-
-        # Add the order to the new stop price level
-        if new_stop not in self.orders_at_price:
-            insort(self.price_levels, new_stop)
-        self.orders_at_price[new_stop].append(order)
-        self.order_prices[order].add(new_stop)
-
     def iter_orders(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
         """
         Iterate over orders within price range.
@@ -366,14 +346,20 @@ class PriceOrderBook:
         :return: Generator yielding Order objects
         """
         if min_price is not None and max_price is not None:
-            # Range query - ascending from min to max
+            # Range query - ascending from min to max (or descending when desc=True,
+            # e.g. the open->low price walk, where the level nearest the open is
+            # reached first in time). Price levels reverse; within a level the
+            # insertion order is preserved so same-price ties keep their sequence.
             min_idx = bisect_left(self.price_levels, min_price)
             max_idx = bisect_left(self.price_levels, max_price)
             # Include max_price if it matches exactly
             if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
                 max_idx += 1
             # Create a copy of price levels to avoid iteration issues when levels are removed
-            for p in list(self.price_levels[min_idx:max_idx]):
+            levels = list(self.price_levels[min_idx:max_idx])
+            if desc:
+                levels.reverse()
+            for p in levels:
                 # Create a copy to avoid iteration issues when orders are removed during iteration
                 yield from list(self.orders_at_price[p])
 
@@ -418,12 +404,216 @@ class PriceOrderBook:
         self.order_prices.clear()
 
 
-# noinspection PyProtectedMember,PyShadowingNames,DuplicatedCode
-class Position:
+# noinspection PyProtectedMember,PyShadowingNames
+class PositionBase(ABC):
     """
-    This holds data about positions and trades
+    Abstract base class for position tracking.
 
-    This is the main class for strategies
+    Both backtest simulation (:class:`SimPosition`) and live broker trading
+    (:class:`pynecore.core.broker.position.BrokerPosition`) subclass this.
+    The Pine Script API surface — ``strategy.position_size``,
+    ``strategy.opentrades``, ``strategy.netprofit``, ``strategy.equity``,
+    etc. — reads the attributes declared here, so concrete subclasses MUST
+    initialize all of them in ``__init__``.
+    """
+    __slots__ = ()
+
+    # Attribute surface (declared for documentation and type-checking only —
+    # concrete subclasses declare these in ``__slots__`` and initialize them).
+    size: float
+    sign: float
+    avg_price: PyneFloat
+    netprofit: PyneFloat
+    openprofit: PyneFloat
+    grossprofit: PyneFloat
+    grossloss: PyneFloat
+    open_commission: float
+    # Current-bar OHLC the order-fill checks read off the position
+    # (sim tracks them as slots; broker serves them from the live feed).
+    c: float
+    h: float
+    l: float
+    eventrades: int
+    wintrades: int
+    losstrades: int
+    max_drawdown: float
+    max_runup: float
+    open_trades: list['Trade']
+    closed_trades: 'deque[Trade]'
+    new_closed_trades: list['Trade']
+    entry_orders: dict[str | None, 'Order']
+    exit_orders: dict[tuple[str | None, str | None], 'Order']
+    risk_halt_trading: bool
+
+    # Risk management state shared by Sim and Broker positions. Setters
+    # in :mod:`pynecore.lib.strategy.risk` populate the ``risk_max_*`` fields;
+    # the ``risk_*`` runtime counters are updated by the concrete subclass.
+    risk_allowed_direction: 'direction.Direction | None'
+    risk_max_drawdown_value: float | None
+    risk_max_drawdown_type: 'QtyType | None'
+    risk_max_drawdown_alert: str | None
+    risk_max_intraday_loss_value: float | None
+    risk_max_intraday_loss_type: 'QtyType | None'
+    risk_max_intraday_loss_alert: str | None
+    risk_max_cons_loss_days: int | None
+    risk_max_cons_loss_days_alert: str | None
+    risk_max_intraday_filled_orders: int | None
+    risk_max_intraday_filled_orders_alert: str | None
+    risk_max_position_size: float | None
+    risk_intraday_start_equity: float
+    risk_intraday_filled_orders: int
+    risk_cons_loss_days: int
+
+    @property
+    def equity(self) -> PyneFloat:
+        """The current equity (initial capital + realized + unrealized P&L)."""
+        return lib._script.initial_capital + self.netprofit + self.openprofit
+
+    # === Risk-rule predicates (shared by Sim and Broker positions) ===
+
+    def _peak_equity(self) -> float:
+        """Reference equity for ``max_drawdown(..., percent_of_equity)``.
+
+        TradingView measures drawdown from the running peak equity, so the
+        percent threshold scales with the high-water mark — a strategy that
+        grows from $10k to $20k and is configured with ``max_drawdown(30%)``
+        tolerates a $6k drawdown from $20k, not $3k from initial capital.
+
+        Subclasses that track a peak (``SimPosition.max_equity``) override
+        this; the base falls back to initial capital, which matches the
+        first-bar value before any equity history exists.
+        """
+        return float(lib._script.initial_capital)
+
+    def _is_max_drawdown_breached(self) -> bool:
+        if self.risk_max_drawdown_value is None:
+            return False
+        if self.risk_max_drawdown_type == percent_of_equity:
+            threshold = self._peak_equity() * self.risk_max_drawdown_value * 0.01
+        else:
+            threshold = float(self.risk_max_drawdown_value)
+        return self.max_drawdown >= threshold > 0.0
+
+    def _is_max_intraday_loss_breached(self) -> bool:
+        if self.risk_max_intraday_loss_value is None:
+            return False
+        # Per TV docs: percent_of_equity for max_intraday_loss is measured
+        # against the start-of-day equity (the same anchor used for the loss
+        # delta), so the threshold scales with the day's opening capital
+        # rather than the initial-bar capital.
+        if self.risk_max_intraday_loss_type == percent_of_equity:
+            threshold = self.risk_intraday_start_equity * self.risk_max_intraday_loss_value * 0.01
+        else:
+            threshold = float(self.risk_max_intraday_loss_value)
+        intraday_loss = self.risk_intraday_start_equity - float(self.equity)
+        return intraday_loss >= threshold > 0.0
+
+    def _is_max_cons_loss_days_breached(self) -> bool:
+        if self.risk_max_cons_loss_days is None:
+            return False
+        return self.risk_cons_loss_days >= self.risk_max_cons_loss_days > 0
+
+    # === Pre-fill / pre-submit gates (shared by sim fill loop and broker submit) ===
+    # These mirror the inline checks in :meth:`SimPosition.fill_order` so that
+    # :class:`~pynecore.core.broker.position.BrokerPosition` can enforce the
+    # same policy at its pre-submit boundary (``_add_order``) without
+    # duplicating the logic. Sim and broker hit the same predicate at
+    # different points in the order lifecycle — sim at fill time, broker at
+    # submit time — but the rule body is identical.
+
+    def _is_intraday_filled_cap_reached(self) -> bool:
+        """``risk_max_intraday_filled_orders`` already at/above the cap.
+
+        Caller rejects the new entry/normal order when this returns True.
+        Mirrors the sim ``is not None`` check; a stored cap of ``0`` is
+        treated as "all orders blocked" by both sites — the
+        :mod:`~pynecore.lib.strategy.risk` setter is responsible for
+        normalizing the no-limit sentinel.
+        """
+        cap = self.risk_max_intraday_filled_orders
+        if cap is None:
+            return False
+        return self.risk_intraday_filled_orders >= cap
+
+    def _adjust_for_max_position_size(
+            self, intent_size: float, intent_sign: float,
+    ) -> float | None:
+        """Honor ``risk_max_position_size``; trim the order or reject it.
+
+        :param intent_size: Signed order size requested by the caller.
+        :param intent_sign: ``+1.0`` for buy intents, ``-1.0`` for sell.
+        :return: Possibly trimmed signed size (caller proceeds with this),
+                 the original ``intent_size`` if no cap is set or no trim
+                 needed, or ``None`` if the cap is already met and the order
+                 must be rejected.
+        """
+        cap = self.risk_max_position_size
+        if cap is None:
+            return intent_size
+        new_position_size = abs(self.size + intent_size)
+        if new_position_size <= cap:
+            return intent_size
+        max_allowed_size = cap - abs(self.size)
+        if max_allowed_size <= 0:
+            return None
+        return max_allowed_size * intent_sign
+
+    def _is_direction_allowed(self, intent_sign: float) -> bool:
+        """``risk_allowed_direction`` permits an entry/flip in this direction.
+
+        The caller decides *when* to consult this (sim only checks on
+        ``size == 0``; broker checks at every submit). The helper itself is
+        stateless w.r.t. current position size — it only inspects the
+        configured allowed direction.
+        """
+        allowed = self.risk_allowed_direction
+        if allowed is None:
+            return True
+        if intent_sign > 0:
+            return allowed == long
+        if intent_sign < 0:
+            return allowed == short
+        return True
+
+    def _seed_trail_at_issue(self, order: 'Order') -> None:
+        """Sim-only hook: fold the issue bar's extreme into a freshly issued
+        trailing exit's water mark.
+
+        This is a backtest price-walk concern. The live broker path tracks the
+        trailing stop through the exchange / order-sync engine, so the base
+        implementation is a no-op; :class:`SimPosition` overrides it with the
+        backtest behaviour.
+        """
+        return None
+
+    @abstractmethod
+    def _add_order(self, order: 'Order') -> None:
+        """Register an order with this position."""
+
+    @abstractmethod
+    def _remove_order(self, order: 'Order') -> None:
+        """Cancel/remove an order from this position."""
+
+    @abstractmethod
+    def _remove_order_by_id(self, order_id: str) -> None:
+        """Remove an order by its id (searches both exit and entry books)."""
+
+    @abstractmethod
+    def _cancel_all_orders(self) -> None:
+        """Cancel every pending entry/exit order tracked by this position."""
+
+
+# noinspection PyProtectedMember,PyShadowingNames,DuplicatedCode
+class SimPosition(PositionBase):
+    """
+    Backtest simulation of position and trade state.
+
+    Reproduces TradingView's strategy simulator faithfully: OHLC-based fill
+    detection, synthetic slippage, margin-call emulation, gap-through logic,
+    OCA reduce/cancel handling, trailing-stop tracking, etc.
+
+    Live broker trading uses :class:`BrokerPosition` instead — exchange fills
+    override all of the simulator logic below.
     """
 
     __slots__ = (
@@ -441,7 +631,7 @@ class Position:
         'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
         'risk_max_intraday_loss_value', 'risk_max_intraday_loss_type', 'risk_max_intraday_loss_alert',
         'risk_max_position_size',
-        'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
+        'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
         '_deferred_margin_call', '_fill_counter'
     )
@@ -460,7 +650,7 @@ class Position:
         self.grossloss: PyneFloat = 0.0
 
         # Order books
-        self.market_orders: dict[tuple[_OrderType, str | None], Order] = {}  # Market orders from strategy.market()
+        self.market_orders: dict[tuple[_OrderType, str | None, str | None], Order] = {}  # Market orders from strategy.market()
         self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
         # Exit orders from strategy.exit(), strategy.close(), etc.
         # Key is (exit_id, from_entry) — both partial-TP fan-out (same from_entry,
@@ -509,7 +699,7 @@ class Position:
 
         # Risk management state tracking
         self.risk_cons_loss_days: int = 0
-        self.risk_last_day_index: int = -1
+        self.risk_last_trading_day: int = -1
         self.risk_last_day_equity: float = 0.0
         self.risk_intraday_filled_orders: int = 0
         self.risk_intraday_start_equity: float = 0.0
@@ -519,19 +709,17 @@ class Position:
         self._deferred_margin_call: tuple[float, bool] | None = None
         self._fill_counter: int = 0
 
-    @property
-    def equity(self) -> PyneFloat:
-        """ The current equity """
-        return lib._script.initial_capital + self.netprofit + self.openprofit
-
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
         # Set the bar_index when the order is placed
         order.bar_index = int(lib.bar_index)
 
-        # Add market order to market orders dict
+        # Add market order to market orders dict. Key on exit_id too: two
+        # brackets sharing the same from_entry (order_id) would otherwise
+        # collide on the same key, so a second gap-through exit would evict
+        # the first and only one of them would fill on the gap bar.
         if order.is_market_order:
-            self.market_orders[(order.order_type, order.order_id)] = order
+            self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
@@ -560,7 +748,7 @@ class Position:
             self.entry_orders.pop(order.order_id, None)
         # Remove market order from market orders dict
         if order.is_market_order:
-            self.market_orders.pop((order.order_type, order.order_id), None)
+            self.market_orders.pop((order.order_type, order.order_id, order.exit_id), None)
         # Remove order from order book
         self.orderbook.remove_order(order)
 
@@ -576,6 +764,11 @@ class Position:
         order = self.entry_orders.get(order_id)
         if order:
             self._remove_order(order)
+
+    def _cancel_all_orders(self) -> None:
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
 
     def _cancel_oca_group(self, oca_name: str, executed_order: Order):
         """Cancel all orders in the same OCA group except the executed one"""
@@ -615,7 +808,8 @@ class Position:
                 else:
                     order.size = new_size * order.sign
 
-    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat):
+    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat,
+                    counts_as_filled_order: bool = True):
         """
         Fill an order (actually)
 
@@ -623,6 +817,12 @@ class Position:
         :param price: The price to fill at
         :param h: The high price
         :param l: The low price
+        :param counts_as_filled_order: Whether this fill increments the
+                                       ``max_intraday_filled_orders`` counter.
+                                       ``False`` for the open half of a
+                                       position-reversing order, whose close
+                                       half already counted it once — TV treats
+                                       a reversal as a single filled order.
         """
         # Close orders cannot fill when no position exists
         if order.order_type == _order_type_close and self.size == 0.0:
@@ -918,10 +1118,13 @@ class Position:
                     continue
                 self._remove_order(exit_order)
 
-        # Increment intraday filled orders counter for ALL filled orders
-        # TradingView counts ALL filled orders (entry, exit, normal) toward the limit
-        # This is done after successful fill to match TradingView behavior
-        self.risk_intraday_filled_orders += 1
+        # Count this fill toward strategy.risk.max_intraday_filled_orders.
+        # TradingView counts every filled order (entry, exit, normal) toward the
+        # limit, but a position-reversing order is a SINGLE filled order even
+        # though the sim executes it as a close followed by an open — the open
+        # half passes counts_as_filled_order=False so the reversal counts once.
+        if counts_as_filled_order:
+            self.risk_intraday_filled_orders += 1
 
         # Handle OCA groups after order execution
         # This is done here to avoid code duplication in fill_order()
@@ -945,33 +1148,19 @@ class Position:
         close_only = False
         # Apply risk management only to entry orders, not normal orders from strategy.order()
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
-            # Risk management: Check max intraday filled orders
-            if self.risk_max_intraday_filled_orders is not None:
-                if self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders:
-                    # Max intraday filled orders reached - don't fill the entry order
-                    self._remove_order(order)
-                    return False
-
-            # Risk management: Check max position size
-            if self.risk_max_position_size is not None:
-                new_position_size = abs(self.size + order.size)
-                if new_position_size > self.risk_max_position_size:
-                    # Adjust order size to not exceed max position size
-                    max_allowed_size = self.risk_max_position_size - abs(self.size)
-                    if max_allowed_size <= 0:
-                        # Can't add to position - remove order
-                        self._remove_order(order)
-                        return False
-                    # Adjust the order size
-                    order.size = max_allowed_size * order.sign
-
-            # Check risk allowed direction for new positions (when no current position)
-            if self.size == 0.0 and self.risk_allowed_direction is not None:
-                if (order.sign > 0 and self.risk_allowed_direction != long) or \
-                        (order.sign < 0 and self.risk_allowed_direction != short):
-                    # Direction not allowed - don't fill the entry order
-                    self._remove_order(order)
-                    return False
+            # Pre-fill risk gates — shared with BrokerPosition pre-submit so
+            # the same policy applies regardless of execution mode.
+            if self._is_intraday_filled_cap_reached():
+                self._remove_order(order)
+                return False
+            adjusted = self._adjust_for_max_position_size(float(order.size), order.sign)
+            if adjusted is None:
+                self._remove_order(order)
+                return False
+            order.size = adjusted
+            if self.size == 0.0 and not self._is_direction_allowed(order.sign):
+                self._remove_order(order)
+                return False
 
             if order.order_type == _order_type_entry:
                 # If we have an existing position
@@ -1017,51 +1206,138 @@ class Position:
             # Check if new direction is allowed by risk management
             # According to Pine Script docs: "long exit trades will be made instead of reverse trades"
             new_direction_sign = 1.0 if new_size > 0.0 else -1.0
-            if self.risk_allowed_direction is not None:
-                if (new_direction_sign > 0 and self.risk_allowed_direction != long) or \
-                        (new_direction_sign < 0 and self.risk_allowed_direction != short):
-                    # Direction not allowed - convert entry to exit only
-                    # Don't open new position in restricted direction
-                    self._remove_order(order)
-                    return False
+            if not self._is_direction_allowed(new_direction_sign):
+                # Direction not allowed - convert entry to exit only
+                # Don't open new position in restricted direction
+                self._remove_order(order)
+                return False
 
             # Modify the original order to open a position in the new direction
             order.size = new_size
             # close_all overshoot: change type to allow opening new trade
             if order.order_type == _order_type_close:
                 order.order_type = _order_type_normal
-            # Fill the entry order
-            self._fill_order(order, price, h, l)
+            # Fill the entry order. The close half above already counted this
+            # reversal toward the intraday filled-orders cap, so the open half
+            # must not count it a second time.
+            self._fill_order(order, price, h, l, counts_as_filled_order=False)
+            # A reversal that hits the cap is flattened too — same as the
+            # non-flip path. Without this the cap-close never fires for a
+            # position-reversing strategy, the common TradingView idiom.
+            if self._is_intraday_filled_cap_reached() and self.size != 0.0:
+                self._close_position_at_intraday_cap(order, price)
             return True
 
         # If position direction is not about to change, we can fill the order directly
         else:
             self._fill_order(order, price, h, l)
 
-            # After filling, check if we need to close positions due to risk management
-            if (self.risk_max_intraday_filled_orders is not None and
-                    self.risk_intraday_filled_orders >= self.risk_max_intraday_filled_orders and self.size != 0.0):
-                # Max intraday filled orders reached - close all positions immediately
-                # Cancel all pending orders first
-                self.entry_orders.clear()
-                self.exit_orders.clear()
-                self.orderbook.clear()
-
-                # Create an immediate close order with special comment
-                close_comment = "Close Position (Max number of filled orders in one day)"
-                close_order = Order(
-                    None, -self.size,
-                    exit_id='Risk management close',
-                    order_type=_order_type_close,
-                    comment=close_comment
-                )
-                # Fill the close order immediately at current price
-                self._fill_order(close_order, price, h, l)
-
-                # Halt trading for the rest of the day
-                self.risk_halt_trading = True
+            # After filling, close the position if this fill hit the intraday cap
+            # (TradingView flattens for the rest of the day; the counter blocks
+            # new entries until it resets next day).
+            if self._is_intraday_filled_cap_reached() and self.size != 0.0:
+                self._close_position_at_intraday_cap(order, price)
 
             return False
+
+    def _peak_equity(self) -> float:
+        """Running high-water mark equity for percent-based drawdown threshold.
+
+        Falls back to initial capital before any fill — ``max_equity`` is
+        ``-inf`` until the first ``_fill_order`` updates it.
+        """
+        initial = float(lib._script.initial_capital)
+        if self.max_equity == -float("inf"):
+            return initial
+        return max(initial, float(self.max_equity))
+
+    def _trigger_risk_halt(self, reason: str, price: float, h: float, l: float) -> None:
+        """Cancel pending orders, close any open position at ``price``, halt trading.
+
+        ``reason`` is embedded in the synthetic close order's comment so the
+        backtest log identifies which ``strategy.risk.*`` rule fired. Once
+        :attr:`risk_halt_trading` is set, ``strategy.entry`` / ``strategy.order``
+        early-return, ``process_orders`` short-circuits, and the strategy stays
+        flat until the script completes.
+        """
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
+        if self.size != 0.0:
+            close_order = Order(
+                None, -self.size,
+                exit_id='Risk management close',
+                order_type=_order_type_close,
+                comment=f"Close Position ({reason})",
+            )
+            self._fill_order(close_order, price, h, l)
+        self.risk_halt_trading = True
+
+    def _close_position_at_intraday_cap(self, order: Order, price: float) -> None:
+        """Flatten the position when ``max_intraday_filled_orders`` is reached.
+
+        TradingView closes the open position the moment the daily filled-orders
+        cap is hit, tagging the exit ``Close Position (Max number of filled
+        orders in one day)``. Unlike :meth:`_trigger_risk_halt` this does NOT
+        set :attr:`risk_halt_trading`: the cap is a per-day limit, and the
+        intraday counter (already at the cap) blocks any further entry fills
+        until it resets at the next day rollover, so trading resumes by itself
+        the following day. The forced close is not itself a strategy order, so
+        it does not count toward the cap.
+
+        The exit price mirrors TradingView's broker emulation. When the
+        cap-triggering fill is a market/stop *entry* that fired intra-bar — past
+        the bar open on the favorable side (a long stop above the open, a short
+        stop below it) — TV traces the bar path to that extreme and closes there
+        (bar high for a long, bar low for a short), not at the entry trigger
+        price. Fills that landed at the open (gaps, plain market entries) and
+        non-entry fills close at the triggering fill price.
+        """
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
+        if self.size != 0.0:
+            # ``self.h`` / ``self.l`` are the full current-bar extremes; the ``h`` / ``l``
+            # arguments threaded through :meth:`fill_order` are truncated to the stop
+            # trigger as the intra-bar path is walked, so they cannot stand in for the
+            # bar's reached extreme here.
+            cap_close_price = price
+            if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
+                if self.size > 0.0 and price > self.o:
+                    cap_close_price = self.h
+                elif self.size < 0.0 and price < self.o:
+                    cap_close_price = self.l
+            close_order = Order(
+                None, -self.size,
+                exit_id='Risk management close',
+                order_type=_order_type_close,
+                comment="Close Position (Max number of filled orders in one day)",
+            )
+            self._fill_order(close_order, cap_close_price, self.h, self.l, counts_as_filled_order=False)
+
+    def _enforce_post_bar_risk(self) -> None:
+        """Run the post-bar ``strategy.risk.*`` checks that depend on bar-end P&L.
+
+        ``max_intraday_filled_orders`` is enforced inline in :meth:`fill_order`
+        because it is fill-count driven; the rules below need the finalised
+        bar P&L (``max_drawdown``) or daily realised equity
+        (``max_intraday_loss``, ``max_cons_loss_days``) and therefore run after
+        :meth:`_finalize_bar_pnl`. The first triggered rule wins — subsequent
+        checks are skipped, since a halt closes all positions and clears
+        pending orders.
+        """
+        if self.risk_halt_trading:
+            return
+        # Use the bar-close price for the synthetic close — the bar is over.
+        price, h, l = self.c, self.h, self.l
+        if self._is_max_drawdown_breached():
+            self._trigger_risk_halt("Max drawdown reached", price, h, l)
+            return
+        if self._is_max_intraday_loss_breached():
+            self._trigger_risk_halt("Max intraday loss reached", price, h, l)
+            return
+        if self._is_max_cons_loss_days_breached():
+            self._trigger_risk_halt("Max consecutive loss days reached", price, h, l)
 
     def _check_already_filled(self, order: Order) -> bool:
         """
@@ -1123,22 +1399,198 @@ class Position:
                 return True
         return False
 
-    def _check_high_trailing(self, order: Order) -> bool:
-        # Update trailing stop
-        if order.trail_price is not None and order.sign < 0:
-            # Check if trailing price has been triggered
-            if not order.trail_triggered and self.h > order.trail_price:
+    def _process_trailing_stop(self, order: Order, ohlc: bool) -> bool:
+        """Process a trailing-stop exit for the current bar (TradingView model).
+
+        The activation level is ``order.trail_price`` (``entry ± trail_points``).
+        Once the bar's extreme reaches it, the stop anchors at the activation
+        level offset by ``trail_offset`` and fills on the SAME bar if the bar
+        retraces to it. The current bar's extreme only advances the trail for the
+        NEXT bar — TradingView evaluates a trailing stop from the prior
+        high/low-water mark, so with ``trail_offset == 0`` the fill lands exactly
+        at the activation level on the activation bar instead of riding to the
+        bar's extreme.
+
+        A trail that activates on THIS bar arms at the favorable extreme (the high
+        for a long, the low for a short). When that extreme is the bar's SECOND
+        intra-bar leg, a hard ``stop=`` reached on the FIRST leg fills earlier in
+        intra-bar time and must win, so the trail defers to the price walk in that
+        case instead of pre-empting it. A trail carried from a prior bar is live
+        from the open and keeps priority. When such a bar opens at its own low
+        (long) or high (short) -- no wick on the trailing side -- and that open
+        gaps past the prior water mark, the open is itself the new water mark and
+        the bar never trades back to it, so the fill lands at the open.
+        ``ohlc`` selects the leg order:
+        ``True`` => open->high->low, ``False`` => open->low->high.
+
+        :param order: The exit order carrying ``trail_price``.
+        :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`).
+        :return: True if the order filled this bar.
+        """
+        if order.trail_price is None:
+            return False
+        round_to_mintick = lib.math.round_to_mintick
+        offset_price = syminfo.mintick * order.trail_offset
+        slippage = lib._script.slippage
+
+        if order.sign < 0:
+            # Long position: trailing sell-stop riding under the high-water mark.
+            just_activated = False
+            if not order.trail_triggered:
+                if self.h < order.trail_price:
+                    return False
                 order.trail_triggered = True
-            # Update stop if trailing price has been triggered
-            if order.trail_triggered:
-                offset_price = syminfo.mintick * order.trail_offset
-                assert order.stop is not None
-                new_stop: float = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)
-                if new_stop != order.stop:
-                    # Update the order in the orderbook with the new stop price
-                    self.orderbook.update_order_stop(order, new_stop)
+                order.trail_stop = round_to_mintick(order.trail_price - offset_price)
+                just_activated = True
+            stop = order.trail_stop
+            if stop is None:
+                return False
+            # A carried trail on a bar that opens at its low (no lower wick) and
+            # gaps above the prior water mark fills at the open: TradingView folds
+            # the new bar's open into the high-water mark, so the offset-0 stop
+            # sits at the open and the bar -- which never trades lower -- touches
+            # it there.
+            if not just_activated and self.l == self.o:
+                open_stop = round_to_mintick(self.o - offset_price)
+                if open_stop > stop:
+                    p = open_stop
+                    if slippage > 0:
+                        p -= syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, self.h, p)
+                    return True
+            # Activated on the high (second leg, open->low->high): a hard stop hit
+            # on the first (low) leg fills before the trail arms, so defer to it.
+            stop_first = (just_activated and not ohlc
+                          and order.stop is not None and order.stop >= self.l)
+            if self.l <= stop and not stop_first:
+                # A stop carried from a prior bar fills at the open when the bar
+                # gaps below it; on the activation bar the stop was just placed
+                # intra-bar at the activation level, so the fill is at the stop.
+                p = self.o if (not just_activated and self.o <= stop) else stop
+                if slippage > 0:
+                    p -= syminfo.mintick * slippage
+                order.filled_by_type = 'trailing'
+                self.fill_order(order, p, self.h, p)
                 return True
+            # No fill: ratchet the trail up with this bar's high for the next bar.
+            new_stop = round_to_mintick(self.h - offset_price)
+            if new_stop > stop:
+                order.trail_stop = new_stop
+            return False
+
+        if order.sign > 0:
+            # Short position: trailing buy-stop riding above the low-water mark.
+            just_activated = False
+            if not order.trail_triggered:
+                if self.l > order.trail_price:
+                    return False
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(order.trail_price + offset_price)
+                just_activated = True
+            stop = order.trail_stop
+            if stop is None:
+                return False
+            # A carried trail on a bar that opens at its high (no upper wick) and
+            # gaps below the prior water mark fills at the open: TradingView folds
+            # the new bar's open into the low-water mark, so the offset-0 stop sits
+            # at the open and the bar -- which never trades higher -- touches it
+            # there.
+            if not just_activated and self.h == self.o:
+                open_stop = round_to_mintick(self.o + offset_price)
+                if open_stop < stop:
+                    p = open_stop
+                    if slippage > 0:
+                        p += syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, p, self.l)
+                    return True
+            # Activated on the low (second leg, open->high->low): a hard stop hit
+            # on the first (high) leg fills before the trail arms, so defer to it.
+            stop_first = (just_activated and ohlc
+                          and order.stop is not None and order.stop <= self.h)
+            if self.h >= stop and not stop_first:
+                p = self.o if (not just_activated and self.o >= stop) else stop
+                if slippage > 0:
+                    p += syminfo.mintick * slippage
+                order.filled_by_type = 'trailing'
+                self.fill_order(order, p, p, self.l)
+                return True
+            # No fill: ratchet the trail down with this bar's low for the next bar.
+            new_stop = round_to_mintick(self.l + offset_price)
+            if new_stop < stop:
+                order.trail_stop = new_stop
+            return False
+
         return False
+
+    def _seed_trail_at_issue(self, order: Order) -> None:
+        """Fold the issue bar's extreme into a trailing exit's high/low-water mark.
+
+        ``process_orders`` runs before the script body, so an exit issued in the
+        script on bar N -- e.g. one gated on ``strategy.position_size``, which is
+        only known once the entry has filled -- is first evaluated on bar N+1.
+        The entry-fill bar's own extreme would then never seed the trail, leaving
+        PyneCore's water mark one bar behind TradingView's, which keeps the
+        trailing stop alive from the bar the position is already open. Advance the
+        water mark here at issue time (activation + ratchet only -- the fill still
+        happens in the next ``process_orders``).
+
+        Exits placed on the entry SIGNAL bar (entry still pending, so no bound
+        trade is open yet) are skipped: ``process_orders`` seeds those on their
+        fill bar exactly as before, so the single-issue path is unchanged.
+
+        :param order: The freshly (re-)issued trailing exit order.
+        """
+        if order.trail_points_ticks is None and order.trail_price is None:
+            return
+        entry_price: float | None = None
+        for trade in self.open_trades:
+            if trade.entry_id == order.order_id:
+                entry_price = trade.entry_price
+                break
+        if entry_price is None:
+            return  # entry still pending -- seeded later on the fill bar
+
+        direction = 1.0 if order.size < 0 else -1.0
+        trail_price = order.trail_price
+        if trail_price is None and order.trail_points_ticks is not None:
+            trail_price = _price_round(
+                entry_price + direction * syminfo.mintick * order.trail_points_ticks, direction)
+        if trail_price is None:
+            return
+
+        round_to_mintick = lib.math.round_to_mintick
+        offset_price = syminfo.mintick * order.trail_offset
+        # Arming on the issue (entry-fill) bar is gated on the bar CLOSE, not its
+        # intrabar extreme: TradingView only carries a trailing stop out of the
+        # entry-fill bar when that bar closes past the activation level. A bar
+        # whose extreme pierces the activation level but closes back inside it does
+        # NOT arm here -- it arms later, intrabar, in the normal price walk (which
+        # also performs the same-bar fill that is suppressed on the entry-fill
+        # bar). On every later bar a close past the level implies the high already
+        # pierced it, so process_orders has already armed the carried order and
+        # this gate never fires there.
+        if order.sign < 0:
+            # Long position: trailing sell-stop riding under the high-water mark.
+            if not order.trail_triggered:
+                if self.c <= trail_price:
+                    return
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(trail_price - offset_price)
+            new_stop = round_to_mintick(self.h - offset_price)
+            if order.trail_stop is None or new_stop > order.trail_stop:
+                order.trail_stop = new_stop
+        elif order.sign > 0:
+            # Short position: trailing buy-stop riding above the low-water mark.
+            if not order.trail_triggered:
+                if self.c >= trail_price:
+                    return
+                order.trail_triggered = True
+                order.trail_stop = round_to_mintick(trail_price + offset_price)
+            new_stop = round_to_mintick(self.l + offset_price)
+            if order.trail_stop is None or new_stop < order.trail_stop:
+                order.trail_stop = new_stop
 
     def _check_margin_call(self, check_price: float, *, for_short: bool,
                            at_open: bool = False,
@@ -1288,42 +1740,6 @@ class Position:
                 return True
         return False
 
-    def _check_low_trailing(self, order: Order) -> bool:
-        # Update trailing stop
-        if order.trail_price is not None and order.sign > 0:
-            # Check if trailing price has been triggered
-            if not order.trail_triggered and self.l < order.trail_price:
-                order.trail_triggered = True
-            # Update stop if trailing price has been triggered
-            if order.trail_triggered:
-                offset_price = syminfo.mintick * order.trail_offset
-                new_stop: float = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
-                if new_stop != order.stop:
-                    # Update the order in the orderbook with the new stop price
-                    self.orderbook.update_order_stop(order, new_stop)
-                return True
-        return False
-
-    def _check_close(self, order: Order, ohlc: bool) -> bool:
-        """ Check close price if trailing stop is triggered """
-        if order.stop is None:
-            return False
-        p = order.stop
-        slippage = lib._script.slippage
-        if slippage > 0:
-            p += syminfo.mintick * slippage * order.sign
-        # open → high → low → close
-        if ohlc and order.stop <= self.c:
-            order.filled_by_type = 'trailing'
-            self.fill_order(order, p, p, self.l)
-            return True
-        # open → low → high → close
-        elif order.stop >= self.c:
-            order.filled_by_type = 'trailing'
-            self.fill_order(order, p, self.h, p)
-            return True
-        return False
-
     def process_orders(self):
         """ Process orders """
         # We need to round to the nearest tick to get the same results as in TradingView
@@ -1342,16 +1758,42 @@ class Position:
         self._process_at_bar_open(ohlc)
         self._process_limit_stop_orders(ohlc)
         self._finalize_bar_pnl()
+        self._enforce_post_bar_risk()
+        self._finalize_new_closed_trades()
 
     def _process_at_bar_open(self, ohlc: bool):
         """Phase 1: Process orders at bar open — gap detection, market fills, margin."""
-        # Check if we're in a new trading day for intraday risk management
-        # TradingView tracks intraday based on trading session, not calendar day
-        current_day = lib.dayofmonth()
-        if current_day != self.risk_last_day_index:
-            # New trading day - reset intraday counters
-            self.risk_last_day_index = current_day
+        # Check if we're in a new trading day for intraday risk management.
+        # ``time_tradingday`` is session-aware: for overnight sessions (forex,
+        # futures) the day rolls at the session open (e.g. 17:00 ET), not at
+        # calendar midnight — matching TradingView's intraday risk reset. For
+        # 24/7 crypto and intraday stock sessions it collapses to the calendar
+        # day in the exchange timezone, so those symbols are unaffected.
+        current_trading_day = int(lib.time_tradingday())
+        if current_trading_day != self.risk_last_trading_day:
+            current_equity = float(self.equity)
+            # Roll over consecutive-loss-day count for ``strategy.risk.max_cons_loss_days``.
+            # On the very first bar we have no prior day to compare against — initialise
+            # the trailing-equity anchor without touching the loss-day counter.
+            if self.risk_last_trading_day != -1:
+                if current_equity < self.risk_last_day_equity:
+                    self.risk_cons_loss_days += 1
+                else:
+                    self.risk_cons_loss_days = 0
+            self.risk_last_day_equity = current_equity
+            # Anchor for ``strategy.risk.max_intraday_loss`` — captured at the
+            # start of every trading day, not just the first one.
+            self.risk_intraday_start_equity = current_equity
+            self.risk_last_trading_day = current_trading_day
             self.risk_intraday_filled_orders = 0
+            # ``max_cons_loss_days`` becomes known the moment the day rolls
+            # over — halt now rather than at bar end so the new day's queued
+            # entries cannot fill at this bar's open.
+            if self._is_max_cons_loss_days_breached() and not self.risk_halt_trading:
+                self._trigger_risk_halt(
+                    "Max consecutive loss days reached", self.o, self.h, self.l,
+                )
+                return
 
         # Get script reference for slippage
         script = lib._script
@@ -1431,7 +1873,7 @@ class Position:
                 # Convert to market order
                 order.is_market_order = True
                 # Add to market orders dict
-                self.market_orders[(order.order_type, order.order_id)] = order
+                self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -1625,6 +2067,18 @@ class Position:
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
+        # Trailing stops are evaluated from the prior high/low-water mark, so they
+        # are processed once per bar here rather than inside the price walk — the
+        # walk would ride the stop to the current bar's extreme and fill there.
+        # Iterate a snapshot since fills mutate the order book; an order indexed at
+        # several price levels is yielded once per level, so dedupe by identity.
+        seen: set[Order] = set()
+        for order in list(self.orderbook.iter_orders()):
+            if order in seen or order.cancelled or order.trail_price is None:
+                continue
+            seen.add(order)
+            self._process_trailing_stop(order, ohlc)
+
         # Process orders: open → high → low → close
         if ohlc:
             # open -> high
@@ -1633,37 +2087,25 @@ class Position:
                     continue
                 if self._check_high(order):
                     continue
-                if self._check_high_trailing(order):
-                    continue
-                if order.trail_triggered and order.stop is not None:
-                    self._check_close(order, ohlc)
 
             if not self._check_margin_call(self.h, for_short=True):
-                # open -> low
-                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
+                # open -> low (descending: the level nearest the open fills first)
+                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
                     if self._check_low_stop(order):
                         continue
                     if self._check_low(order):
                         continue
-                    if self._check_low_trailing(order):
-                        continue
-                    if order.trail_triggered and order.stop is not None:
-                        self._check_close(order, ohlc)
 
                 self._check_margin_call(self.l, for_short=False, can_defer=False)
 
         # Process orders: open → low → high → close
         else:
-            # open -> low
-            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l):
+            # open -> low (descending: the level nearest the open fills first)
+            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
                 if self._check_low_stop(order):
                     continue
                 if self._check_low(order):
                     continue
-                if self._check_low_trailing(order):
-                    continue
-                if order.trail_triggered and order.stop is not None:
-                    self._check_close(order, ohlc)
 
             if not self._check_margin_call(self.l, for_short=False):
                 # open -> high
@@ -1672,10 +2114,6 @@ class Position:
                         continue
                     if self._check_high(order):
                         continue
-                    if self._check_high_trailing(order):
-                        continue
-                    if order.trail_triggered and order.stop is not None:
-                        self._check_close(order, ohlc)
 
                 self._check_margin_call(self.h, for_short=True, can_defer=False)
 
@@ -1728,24 +2166,34 @@ class Position:
             self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
             self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
 
-        # Cumulative stats
-        if self.new_closed_trades:
-            initial_capital = lib._script.initial_capital
-            for closed_trade in self.new_closed_trades:
-                # Incrementally add each trade's profit to cumulative total
-                self.cum_profit += closed_trade.profit
-                closed_trade.cum_profit = self.cum_profit
-                closed_trade.cum_max_drawdown = self.max_drawdown
-                closed_trade.cum_max_runup = self.max_runup
+    def _finalize_new_closed_trades(self) -> None:
+        """Apply cumulative stats to every trade closed on this bar.
 
-                # Cumulative profit percent
-                try:
-                    closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
-                except ZeroDivisionError:
-                    closed_trade.cum_profit_percent = 0.0
+        Split out from :meth:`_finalize_bar_pnl` so it runs **after**
+        :meth:`_enforce_post_bar_risk` — otherwise a synthetic close
+        emitted by a risk-rule halt would be appended to
+        ``new_closed_trades`` after this loop has finished, ship out with
+        default ``cum_profit`` / ``cum_max_drawdown`` / ``cum_max_runup``
+        / ``cum_profit_percent`` values, and never be revisited.
+        """
+        if not self.new_closed_trades:
+            return
+        initial_capital = lib._script.initial_capital
+        for closed_trade in self.new_closed_trades:
+            # Incrementally add each trade's profit to cumulative total
+            self.cum_profit += closed_trade.profit
+            closed_trade.cum_profit = self.cum_profit
+            closed_trade.cum_max_drawdown = self.max_drawdown
+            closed_trade.cum_max_runup = self.max_runup
 
-                # Modify entry equity, for max drawdown and runup
-                self.entry_equity += closed_trade.profit
+            # Cumulative profit percent
+            try:
+                closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
+            except ZeroDivisionError:
+                closed_trade.cum_profit_percent = 0.0
+
+            # Modify entry equity, for max drawdown and runup
+            self.entry_equity += closed_trade.profit
 
     def process_orders_at_close(self):
         """
@@ -2054,6 +2502,8 @@ class Position:
         self.l = round_to_mintick(aggregated.low)
         self.c = round_to_mintick(aggregated.close)
         self._finalize_bar_pnl()
+        self._enforce_post_bar_risk()
+        self._finalize_new_closed_trades()
 
 
 #
@@ -2063,7 +2513,7 @@ class Position:
 # noinspection PyProtectedMember
 def _size_round(qty: PyneFloat) -> PyneFloat:
     """
-    Round size to the nearest possible value
+    Round a size down to the nearest tradable lot (``1 / _size_round_factor``).
 
     :param qty: The quantity to round
     :return: The rounded quantity
@@ -2071,9 +2521,15 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     if isinstance(qty, NA):
         return na_float
     rfactor = syminfo._size_round_factor  # noqa
-    qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
+    # Floor to the lot step (1 / rfactor). The float64 product can land an exact
+    # lot multiple a hair below the integer (e.g. 173.432 * 1e4 ->
+    # 1734319.9999999998); snap values within a few ULPs of an integer up before
+    # the floor so an exact multiple is not truncated a whole lot down.
+    scaled = abs(qty) * rfactor
+    nearest = round(scaled)
+    lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
     sign = 1 if qty > 0 else -1
-    return sign * int(qrf) / rfactor
+    return sign * lots / rfactor
 
 
 def _margin_call_round(qty: float) -> float:
@@ -2129,7 +2585,7 @@ def cancel(id: str):
 
     :param id: The identifier of the order to cancel
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -2141,12 +2597,9 @@ def cancel_all():
     """
     Cancels all pending or unfilled orders
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
-    position = lib._script.position
-    position.entry_orders.clear()
-    position.exit_orders.clear()
-    position.orderbook.clear()
+    lib._script.position._cancel_all_orders()
 
 
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
@@ -2164,7 +2617,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     :param alert_message: Custom text for the alert that fires when an order fills.
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -2193,7 +2646,9 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
-    if immediately:
+    # Same-tick fill is a backtest concept; in broker mode the order is already
+    # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
+    if immediately and isinstance(position, SimPosition):
         position.fill_order(order, position.c, position.h, position.l)
 
 
@@ -2207,7 +2662,7 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     :param alert_message: Custom text for the alert that fires when an order fills
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     position = lib._script.position
@@ -2220,7 +2675,9 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
-    if immediately:
+    # Same-tick fill is a backtest concept; in broker mode the order is already
+    # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
+    if immediately and isinstance(position, SimPosition):
         position.fill_order(order, position.c, position.h, position.l)
 
 
@@ -2243,7 +2700,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param comment: Additional notes on the filled order
     :param alert_message: Custom text for the alert that fires when an order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script
@@ -2251,6 +2708,15 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     # Risk management: Check if trading is halted
     if position.risk_halt_trading:
+        return
+
+    # Intraday-cap freeze gate: once ``strategy.risk.max_intraday_filled_orders``
+    # is reached for the current day, TradingView blocks all subsequent entry
+    # placements until the next trading day. Dropping only the fill is not
+    # enough — an entry placed on a latched bar would survive the day rollover
+    # and fire a phantom entry at the new day's open, where the counter has
+    # already reset. Block the placement itself, matching TV's broker emulator.
+    if position._is_intraday_filled_cap_reached():
         return
 
     # Get default qty by script parameters if no qty is specified
@@ -2324,9 +2790,11 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
 
-    # Creation-time margin check for market entry orders (TradingView behavior)
-    # TV checks _size_round(qty) × (close + slippage) > equity at strategy.entry() call time
-    if limit is None and stop is None:
+    # Creation-time margin check for market entry orders (TradingView backtest behavior).
+    # Skip in broker mode: the exchange enforces margin authoritatively, and the script's
+    # equity view can drift from the exchange (funding, fees, transfers) — making the
+    # local check a source of silent false positives rather than a safety net.
+    if limit is None and stop is None and isinstance(position, SimPosition):
         margin_percent = (script.margin_short if direction_sign < 0
                           else script.margin_long)
         if margin_percent > 0:
@@ -2402,7 +2870,7 @@ def exit(id: str, from_entry: str = "",
     :param alert_trailing: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the alert will not fire when the order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script
@@ -2416,20 +2884,29 @@ def exit(id: str, from_entry: str = "",
     init_size = 0.0
 
     # noinspection PyProtectedMember,PyShadowingNames
-    def _exit():
+    def _exit(entry_pending: bool = False):
         nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
         # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
         # Re-issuing it every bar updates its prices, but a leg that already fired
         # its slice must not be resurrected, and the slice is reserved off the
         # entry's ORIGINAL size, not the shrinking remainder.
+        #
+        # The freeze only applies once the bound entry has FILLED. While the entry
+        # is still a PENDING order, re-issuing ``strategy.entry`` can change its
+        # qty bar-to-bar (e.g. cash-based sizing re-evaluated each bar), and the
+        # exit must track the entry's CURRENT pending size — otherwise it locks the
+        # first bar's size and under-closes the eventual fill, stranding a sliver
+        # that some other rule (a per-bar ``close_all``) then mops up as a phantom
+        # second trade.
         exit_key = (id, from_entry)
         existing = position.exit_orders.get(exit_key)
         if existing is not None and existing.consumed:
             return
 
-        if existing is not None:
-            # Live leg being re-issued: keep its reserved slice, only update prices.
+        if existing is not None and not entry_pending:
+            # Live leg on an already-filled position: keep its reserved slice,
+            # only update prices.
             reserved = existing.reserved_size
         elif not isinstance(qty, NA):
             reserved = abs(qty)
@@ -2452,6 +2929,15 @@ def exit(id: str, from_entry: str = "",
         profit_ticks: float | None = _na_to_none(profit)
         loss_ticks: float | None = _na_to_none(loss)
         trail_points_ticks: float | None = _na_to_none(trail_points)
+
+        # An exit must arm at least one trigger. TradingView treats a call whose
+        # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
+        # from a flat position_avg_price (na) on a bar before the entry fills --
+        # not a level-less market close that fires at the next open.
+        if (isinstance(limit, NA) and isinstance(stop, NA) and isinstance(profit, NA)
+                and isinstance(loss, NA) and isinstance(trail_price, NA)
+                and isinstance(trail_points, NA)):
+            return
 
         # We need to have limit, stop or both
         if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
@@ -2495,7 +2981,20 @@ def exit(id: str, from_entry: str = "",
             alert_loss=_na_to_none(alert_loss),
             alert_trailing=_na_to_none(alert_trailing)
         )
+
+        # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
+        # activated high/low-water mark. TradingView carries ONE logical trailing
+        # stop across re-issues -- only the activation level tracks the
+        # (entry-anchored) trail_points -- so a fresh Order must inherit the
+        # ratcheted ``trail_stop`` instead of re-arming at the bare activation
+        # level every bar, which would leave the stop permanently one or more bars
+        # behind the carried water mark.
+        if existing is not None and not entry_pending and existing.trail_triggered:
+            order.trail_triggered = True
+            order.trail_stop = existing.trail_stop
+
         position._add_order(order)
+        position._seed_trail_at_issue(order)
 
     # Find direction and size
     if from_entry:
@@ -2516,7 +3015,7 @@ def exit(id: str, from_entry: str = "",
         else:
             direction = entry_order.sign
             init_size = entry_order.size
-            _exit()
+            _exit(entry_pending=True)
 
     else:
         # If still no entry order found, we should exit all open trades and open orders
@@ -2528,7 +3027,7 @@ def exit(id: str, from_entry: str = "",
                 # Only mark as from_entry_na on first creation (not replacement)
                 exit_key = (id, from_entry)
                 had_existing_exit = exit_key in position.exit_orders
-                _exit()
+                _exit(entry_pending=True)
                 if not had_existing_exit:
                     exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
@@ -2563,15 +3062,15 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param id: The identifier of the order
     :param direction: The direction of the trade (strategy.long or strategy.short)
     :param qty: The number of contracts/shares/lots/units to trade when the order fills
-    :param limit: The limit price of the order (creates limit or stop-limit order)
-    :param stop: The stop price of the order (creates stop or stop-limit order)
+    :param limit: The limit price of the order. With ``stop`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
+    :param stop: The stop price of the order. With ``limit`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
     :param oca_name: The name of the One-Cancels-All (OCA) group
     :param oca_type: Specifies how an unfilled order behaves when another order in the same OCA group executes
     :param comment: Additional notes on the filled order
     :param alert_message: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore:
+    if lib._lib_semaphore or lib._strategy_suppressed:
         return
 
     script = lib._script

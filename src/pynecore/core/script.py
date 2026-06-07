@@ -104,7 +104,7 @@ class Script:
     use_bar_magnifier: bool = True
     fill_orders_on_standard_ohlc: bool = False
 
-    position: _strategy.Position = None  # type: ignore[assignment]
+    position: _strategy.PositionBase = None  # type: ignore[assignment]
 
     _modified: set[str] = field(default_factory=set)
 
@@ -472,7 +472,7 @@ class Script:
         script.dynamic_requests = dynamic_requests
         script.behind_chart = behind_chart
 
-        script.position = _strategy.Position()
+        script.position = _strategy.SimPosition()
 
         return script._decorate()
 

@@ -231,15 +231,26 @@ class CCXTProvider(Provider):
         """
         Process opening hours information
         """
+        return cls._create_24_7_sessions()
+
+    @staticmethod
+    def _create_24_7_sessions() -> tuple[
+        list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]
+    ]:
+        """
+        Create 24/7 opening hours and sessions for crypto markets.
+
+        :return: Tuple of (opening_hours, session_starts, session_ends).
+        """
         opening_hours = []
         session_starts = []
         session_ends = []
         for i in range(7):
             opening_hours.append(
-                SymInfoInterval(day=i, start=time(hour=0, minute=0), end=time(hour=23, minute=59, second=59)))
+                SymInfoInterval(day=i, start=time(hour=0, minute=0),
+                                end=time(hour=23, minute=59, second=59)))
             session_starts.append(SymInfoSession(day=i, time=time(hour=0, minute=0)))
             session_ends.append(SymInfoSession(day=i, time=time(hour=23, minute=59, second=59)))
-
         return opening_hours, session_starts, session_ends
 
     @override
