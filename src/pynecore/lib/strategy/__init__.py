@@ -2732,20 +2732,29 @@ def exit(id: str, from_entry: str = "",
     init_size = 0.0
 
     # noinspection PyProtectedMember,PyShadowingNames
-    def _exit():
+    def _exit(entry_pending: bool = False):
         nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
         # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
         # Re-issuing it every bar updates its prices, but a leg that already fired
         # its slice must not be resurrected, and the slice is reserved off the
         # entry's ORIGINAL size, not the shrinking remainder.
+        #
+        # The freeze only applies once the bound entry has FILLED. While the entry
+        # is still a PENDING order, re-issuing ``strategy.entry`` can change its
+        # qty bar-to-bar (e.g. cash-based sizing re-evaluated each bar), and the
+        # exit must track the entry's CURRENT pending size — otherwise it locks the
+        # first bar's size and under-closes the eventual fill, stranding a sliver
+        # that some other rule (a per-bar ``close_all``) then mops up as a phantom
+        # second trade.
         exit_key = (id, from_entry)
         existing = position.exit_orders.get(exit_key)
         if existing is not None and existing.consumed:
             return
 
-        if existing is not None:
-            # Live leg being re-issued: keep its reserved slice, only update prices.
+        if existing is not None and not entry_pending:
+            # Live leg on an already-filled position: keep its reserved slice,
+            # only update prices.
             reserved = existing.reserved_size
         elif not isinstance(qty, NA):
             reserved = abs(qty)
@@ -2832,7 +2841,7 @@ def exit(id: str, from_entry: str = "",
         else:
             direction = entry_order.sign
             init_size = entry_order.size
-            _exit()
+            _exit(entry_pending=True)
 
     else:
         # If still no entry order found, we should exit all open trades and open orders
@@ -2844,7 +2853,7 @@ def exit(id: str, from_entry: str = "",
                 # Only mark as from_entry_na on first creation (not replacement)
                 exit_key = (id, from_entry)
                 had_existing_exit = exit_key in position.exit_orders
-                _exit()
+                _exit(entry_pending=True)
                 if not had_existing_exit:
                     exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
