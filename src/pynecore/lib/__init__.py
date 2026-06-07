@@ -624,29 +624,38 @@ def time_tradingday() -> PyneInt:
     the exchange timezone — on which the bar's trading session ends.
 
     For symbols whose session crosses midnight (e.g. forex and futures overnight
-    sessions) a bar at or after the session start belongs to the next calendar day's
-    trading day, matching TradingView. For symbols whose session stays within a
-    single calendar day (stocks, 24/7 crypto) it is simply 00:00 UTC of the bar's
-    exchange-timezone date.
+    sessions) a bar that reaches into the session start belongs to the next calendar
+    day's trading day, matching TradingView — including the boundary bar whose window
+    merely contains the open (a 17:00-18:00 bar for a 17:05 open). For symbols whose
+    session stays within a single calendar day (stocks, 24/7 crypto) it is simply
+    00:00 UTC of the bar's exchange-timezone date.
 
     :return: UNIX time in milliseconds of 00:00 UTC on the trading day's date
     """
     local_dt = _datetime  # already expressed in the exchange timezone
     trade_date = local_dt.date()
 
-    # Roll into the next trading day when the bar sits in the evening portion of an
+    # Roll into the next trading day when the bar overlaps the evening portion of an
     # overnight session — one that ends at or before its own start (crosses midnight)
-    # and does not begin exactly at midnight (which is a plain calendar day).
+    # and does not begin exactly at midnight (which is a plain calendar day). A bar
+    # whose window merely *contains* the session open — e.g. a 17:00-18:00 bar when the
+    # session opens at 17:05 — already belongs to the new trading day, matching
+    # TradingView and ``session.isfirstbar_regular``. Comparing the bar's *end* against
+    # the open captures that boundary bar; comparing only the bar's start would leave it
+    # in the previous day whenever the open does not land exactly on a bar boundary.
     weekday = local_dt.weekday()
-    bar_time = local_dt.time()
+    bar_end = local_dt + timedelta(seconds=timeframe_module.in_seconds(syminfo.period))
     for day, start, end in syminfo._opening_hours:
         if day != weekday:
             continue
         starts_at_midnight = start.hour == 0 and start.minute == 0 and start.second == 0
         is_overnight = end <= start and not starts_at_midnight
-        if is_overnight and bar_time >= start:
-            trade_date += timedelta(days=1)
-            break
+        if is_overnight:
+            session_open = local_dt.replace(
+                hour=start.hour, minute=start.minute, second=start.second, microsecond=0)
+            if bar_end > session_open:
+                trade_date += timedelta(days=1)
+                break
 
     return int(datetime(trade_date.year, trade_date.month, trade_date.day, tzinfo=UTC).timestamp() * 1000)
 

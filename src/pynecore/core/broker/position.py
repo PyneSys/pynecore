@@ -61,7 +61,7 @@ class BrokerPosition(PositionBase):
         'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
         'risk_max_position_size',
         # Runtime counters / day-rollover tracking:
-        'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
+        'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         'risk_halt_trading',
         '_current_price',
@@ -117,7 +117,7 @@ class BrokerPosition(PositionBase):
         self.risk_max_position_size: float | None = None
         # Runtime counters / day-rollover tracking:
         self.risk_cons_loss_days: int = 0
-        self.risk_last_day_index: int = -1
+        self.risk_last_trading_day: int = -1
         self.risk_last_day_equity: float = 0.0
         self.risk_intraday_filled_orders: int = 0
         self.risk_intraday_start_equity: float = 0.0
@@ -568,22 +568,22 @@ class BrokerPosition(PositionBase):
         if self.risk_halt_trading:
             return
         try:
-            current_day = int(lib.dayofmonth())
+            current_trading_day = int(lib.time_tradingday())
         except (AttributeError, TypeError, ValueError):
             return
-        if current_day == self.risk_last_day_index:
+        if current_trading_day == self.risk_last_trading_day:
             return
         current_equity = float(self.equity)
         # On the very first bar there is no prior day to compare against —
         # initialise the trailing-equity anchor without touching the counter.
-        if self.risk_last_day_index != -1:
+        if self.risk_last_trading_day != -1:
             if current_equity < self.risk_last_day_equity:
                 self.risk_cons_loss_days += 1
             else:
                 self.risk_cons_loss_days = 0
         self.risk_last_day_equity = current_equity
         self.risk_intraday_start_equity = current_equity
-        self.risk_last_day_index = current_day
+        self.risk_last_trading_day = current_trading_day
         self.risk_intraday_filled_orders = 0
         if self._is_max_cons_loss_days_breached():
             self._trigger_risk_halt("Max consecutive loss days reached")

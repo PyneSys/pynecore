@@ -38,19 +38,33 @@ from pynecore.lib.strategy import (
 def _stub_script():
     prev_script = lib._script
     prev_dt = lib._datetime
+    prev_period = lib.syminfo.period
+    prev_opening_hours = lib.syminfo._opening_hours
     lib._script = SimpleNamespace(initial_capital=10_000.0)
-    # Anchor for ``lib.dayofmonth()``; individual tests override per bar.
+    # ``_handle_bar_open_risk`` keys the trading day off ``lib.time_tradingday()``,
+    # which needs a valid timeframe and consults the opening hours. With no overnight
+    # session the trading day is the plain UTC calendar day, so each ``_set_day`` bar
+    # produces a distinct key. Individual tests move the day via ``_set_day``.
+    lib.syminfo.period = "1D"
+    lib.syminfo._opening_hours = []
     lib._datetime = datetime(2024, 1, 1, tzinfo=tz.utc)
     try:
         yield
     finally:
         lib._script = prev_script
         lib._datetime = prev_dt
+        lib.syminfo.period = prev_period
+        lib.syminfo._opening_hours = prev_opening_hours
 
 
 def _set_day(day: int) -> None:
     """Move ``lib._datetime`` to a fixed UTC midnight on the given day."""
     lib._datetime = datetime(2024, 1, day, tzinfo=tz.utc)
+
+
+def _day_key(day: int) -> int:
+    """Expected ``time_tradingday`` value (00:00 UTC ms) for a ``2024-01-<day>`` bar."""
+    return int(datetime(2024, 1, day, tzinfo=tz.utc).timestamp() * 1000)
 
 
 def _fill(side: str, qty: float, price: float, *,
@@ -153,7 +167,7 @@ def __test_day_rollover_initialises_anchors_on_first_bar__():
     p = BrokerPosition()
     _set_day(1)
     p._handle_bar_open_risk()
-    assert p.risk_last_day_index == 1
+    assert p.risk_last_trading_day == _day_key(1)
     assert p.risk_cons_loss_days == 0
     assert p.risk_intraday_start_equity == pytest.approx(10_000.0)
     assert p.risk_halt_trading is False
@@ -177,7 +191,7 @@ def __test_day_rollover_resets_cons_loss_days_on_winning_day__():
     p = BrokerPosition()
     p.risk_cons_loss_days = 2
     p.risk_last_day_equity = 9_000.0
-    p.risk_last_day_index = 1
+    p.risk_last_trading_day = _day_key(1)
     p.netprofit = 500.0  # equity = 10_500
     _set_day(2)
     p._handle_bar_open_risk()
@@ -190,7 +204,7 @@ def __test_max_cons_loss_days_halts_on_day_rollover__():
     p.risk_max_cons_loss_days = 3
     p.risk_cons_loss_days = 2  # one more loss day will breach
     p.risk_last_day_equity = 9_000.0
-    p.risk_last_day_index = 1
+    p.risk_last_trading_day = _day_key(1)
     p.netprofit = -500.0  # equity = 9_500 < 9_000? NO, 9_500 > 9_000, so use stronger drop
     p.netprofit = -1_500.0  # equity = 8_500 < 9_000 → loss day
     _set_day(2)
@@ -236,7 +250,7 @@ def __test_max_intraday_loss_halts_within_day__():
     p.risk_max_intraday_loss_type = cash
     # Anchor start-of-day equity, then take an unrealized loss.
     p.risk_intraday_start_equity = 10_000.0
-    p.risk_last_day_index = 1
+    p.risk_last_trading_day = _day_key(1)
     p.record_fill(_fill("buy", 10.0, 100.0))
     p.update_unrealized_pnl(88.0)  # -120 loss > 100 limit
     p._enforce_post_bar_risk()

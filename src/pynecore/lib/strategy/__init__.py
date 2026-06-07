@@ -628,7 +628,7 @@ class SimPosition(PositionBase):
         'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
         'risk_max_intraday_loss_value', 'risk_max_intraday_loss_type', 'risk_max_intraday_loss_alert',
         'risk_max_position_size',
-        'risk_cons_loss_days', 'risk_last_day_index', 'risk_last_day_equity',
+        'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
         '_deferred_margin_call', '_fill_counter'
     )
@@ -696,7 +696,7 @@ class SimPosition(PositionBase):
 
         # Risk management state tracking
         self.risk_cons_loss_days: int = 0
-        self.risk_last_day_index: int = -1
+        self.risk_last_trading_day: int = -1
         self.risk_last_day_equity: float = 0.0
         self.risk_intraday_filled_orders: int = 0
         self.risk_intraday_start_equity: float = 0.0
@@ -802,7 +802,8 @@ class SimPosition(PositionBase):
                 else:
                     order.size = new_size * order.sign
 
-    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat):
+    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat,
+                    counts_as_filled_order: bool = True):
         """
         Fill an order (actually)
 
@@ -810,6 +811,12 @@ class SimPosition(PositionBase):
         :param price: The price to fill at
         :param h: The high price
         :param l: The low price
+        :param counts_as_filled_order: Whether this fill increments the
+                                       ``max_intraday_filled_orders`` counter.
+                                       ``False`` for the open half of a
+                                       position-reversing order, whose close
+                                       half already counted it once — TV treats
+                                       a reversal as a single filled order.
         """
         # Close orders cannot fill when no position exists
         if order.order_type == _order_type_close and self.size == 0.0:
@@ -1105,10 +1112,13 @@ class SimPosition(PositionBase):
                     continue
                 self._remove_order(exit_order)
 
-        # Increment intraday filled orders counter for ALL filled orders
-        # TradingView counts ALL filled orders (entry, exit, normal) toward the limit
-        # This is done after successful fill to match TradingView behavior
-        self.risk_intraday_filled_orders += 1
+        # Count this fill toward strategy.risk.max_intraday_filled_orders.
+        # TradingView counts every filled order (entry, exit, normal) toward the
+        # limit, but a position-reversing order is a SINGLE filled order even
+        # though the sim executes it as a close followed by an open — the open
+        # half passes counts_as_filled_order=False so the reversal counts once.
+        if counts_as_filled_order:
+            self.risk_intraday_filled_orders += 1
 
         # Handle OCA groups after order execution
         # This is done here to avoid code duplication in fill_order()
@@ -1201,19 +1211,26 @@ class SimPosition(PositionBase):
             # close_all overshoot: change type to allow opening new trade
             if order.order_type == _order_type_close:
                 order.order_type = _order_type_normal
-            # Fill the entry order
-            self._fill_order(order, price, h, l)
+            # Fill the entry order. The close half above already counted this
+            # reversal toward the intraday filled-orders cap, so the open half
+            # must not count it a second time.
+            self._fill_order(order, price, h, l, counts_as_filled_order=False)
+            # A reversal that hits the cap is flattened too — same as the
+            # non-flip path. Without this the cap-close never fires for a
+            # position-reversing strategy, the common TradingView idiom.
+            if self._is_intraday_filled_cap_reached() and self.size != 0.0:
+                self._close_position_at_intraday_cap(order, price)
             return True
 
         # If position direction is not about to change, we can fill the order directly
         else:
             self._fill_order(order, price, h, l)
 
-            # After filling, check if we need to close positions due to risk management
+            # After filling, close the position if this fill hit the intraday cap
+            # (TradingView flattens for the rest of the day; the counter blocks
+            # new entries until it resets next day).
             if self._is_intraday_filled_cap_reached() and self.size != 0.0:
-                self._trigger_risk_halt(
-                    "Max number of filled orders in one day", price, h, l,
-                )
+                self._close_position_at_intraday_cap(order, price)
 
             return False
 
@@ -1249,6 +1266,48 @@ class SimPosition(PositionBase):
             )
             self._fill_order(close_order, price, h, l)
         self.risk_halt_trading = True
+
+    def _close_position_at_intraday_cap(self, order: Order, price: float) -> None:
+        """Flatten the position when ``max_intraday_filled_orders`` is reached.
+
+        TradingView closes the open position the moment the daily filled-orders
+        cap is hit, tagging the exit ``Close Position (Max number of filled
+        orders in one day)``. Unlike :meth:`_trigger_risk_halt` this does NOT
+        set :attr:`risk_halt_trading`: the cap is a per-day limit, and the
+        intraday counter (already at the cap) blocks any further entry fills
+        until it resets at the next day rollover, so trading resumes by itself
+        the following day. The forced close is not itself a strategy order, so
+        it does not count toward the cap.
+
+        The exit price mirrors TradingView's broker emulation. When the
+        cap-triggering fill is a market/stop *entry* that fired intra-bar — past
+        the bar open on the favorable side (a long stop above the open, a short
+        stop below it) — TV traces the bar path to that extreme and closes there
+        (bar high for a long, bar low for a short), not at the entry trigger
+        price. Fills that landed at the open (gaps, plain market entries) and
+        non-entry fills close at the triggering fill price.
+        """
+        self.entry_orders.clear()
+        self.exit_orders.clear()
+        self.orderbook.clear()
+        if self.size != 0.0:
+            # ``self.h`` / ``self.l`` are the full current-bar extremes; the ``h`` / ``l``
+            # arguments threaded through :meth:`fill_order` are truncated to the stop
+            # trigger as the intra-bar path is walked, so they cannot stand in for the
+            # bar's reached extreme here.
+            cap_close_price = price
+            if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
+                if self.size > 0.0 and price > self.o:
+                    cap_close_price = self.h
+                elif self.size < 0.0 and price < self.o:
+                    cap_close_price = self.l
+            close_order = Order(
+                None, -self.size,
+                exit_id='Risk management close',
+                order_type=_order_type_close,
+                comment="Close Position (Max number of filled orders in one day)",
+            )
+            self._fill_order(close_order, cap_close_price, self.h, self.l, counts_as_filled_order=False)
 
     def _enforce_post_bar_risk(self) -> None:
         """Run the post-bar ``strategy.risk.*`` checks that depend on bar-end P&L.
@@ -1558,15 +1617,19 @@ class SimPosition(PositionBase):
 
     def _process_at_bar_open(self, ohlc: bool):
         """Phase 1: Process orders at bar open — gap detection, market fills, margin."""
-        # Check if we're in a new trading day for intraday risk management
-        # TradingView tracks intraday based on trading session, not calendar day
-        current_day = lib.dayofmonth()
-        if current_day != self.risk_last_day_index:
+        # Check if we're in a new trading day for intraday risk management.
+        # ``time_tradingday`` is session-aware: for overnight sessions (forex,
+        # futures) the day rolls at the session open (e.g. 17:00 ET), not at
+        # calendar midnight — matching TradingView's intraday risk reset. For
+        # 24/7 crypto and intraday stock sessions it collapses to the calendar
+        # day in the exchange timezone, so those symbols are unaffected.
+        current_trading_day = int(lib.time_tradingday())
+        if current_trading_day != self.risk_last_trading_day:
             current_equity = float(self.equity)
             # Roll over consecutive-loss-day count for ``strategy.risk.max_cons_loss_days``.
             # On the very first bar we have no prior day to compare against — initialise
             # the trailing-equity anchor without touching the loss-day counter.
-            if self.risk_last_day_index != -1:
+            if self.risk_last_trading_day != -1:
                 if current_equity < self.risk_last_day_equity:
                     self.risk_cons_loss_days += 1
                 else:
@@ -1575,7 +1638,7 @@ class SimPosition(PositionBase):
             # Anchor for ``strategy.risk.max_intraday_loss`` — captured at the
             # start of every trading day, not just the first one.
             self.risk_intraday_start_equity = current_equity
-            self.risk_last_day_index = current_day
+            self.risk_last_trading_day = current_trading_day
             self.risk_intraday_filled_orders = 0
             # ``max_cons_loss_days`` becomes known the moment the day rolls
             # over — halt now rather than at bar end so the new day's queued
@@ -2493,6 +2556,15 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     # Risk management: Check if trading is halted
     if position.risk_halt_trading:
+        return
+
+    # Intraday-cap freeze gate: once ``strategy.risk.max_intraday_filled_orders``
+    # is reached for the current day, TradingView blocks all subsequent entry
+    # placements until the next trading day. Dropping only the fill is not
+    # enough — an entry placed on a latched bar would survive the day rollover
+    # and fire a phantom entry at the new day's open, where the counter has
+    # already reset. Block the placement itself, matching TV's broker emulator.
+    if position._is_intraday_filled_cap_reached():
         return
 
     # Get default qty by script parameters if no qty is specified
