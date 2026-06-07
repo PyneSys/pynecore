@@ -1389,7 +1389,11 @@ class SimPosition(PositionBase):
         intra-bar leg, a hard ``stop=`` reached on the FIRST leg fills earlier in
         intra-bar time and must win, so the trail defers to the price walk in that
         case instead of pre-empting it. A trail carried from a prior bar is live
-        from the open and keeps priority. ``ohlc`` selects the leg order:
+        from the open and keeps priority. When such a bar opens at its own low
+        (long) or high (short) -- no wick on the trailing side -- and that open
+        gaps past the prior water mark, the open is itself the new water mark and
+        the bar never trades back to it, so the fill lands at the open.
+        ``ohlc`` selects the leg order:
         ``True`` => open->high->low, ``False`` => open->low->high.
 
         :param order: The exit order carrying ``trail_price``.
@@ -1414,6 +1418,20 @@ class SimPosition(PositionBase):
             stop = order.trail_stop
             if stop is None:
                 return False
+            # A carried trail on a bar that opens at its low (no lower wick) and
+            # gaps above the prior water mark fills at the open: TradingView folds
+            # the new bar's open into the high-water mark, so the offset-0 stop
+            # sits at the open and the bar -- which never trades lower -- touches
+            # it there.
+            if not just_activated and self.l == self.o:
+                open_stop = round_to_mintick(self.o - offset_price)
+                if open_stop > stop:
+                    p = open_stop
+                    if slippage > 0:
+                        p -= syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, self.h, p)
+                    return True
             # Activated on the high (second leg, open->low->high): a hard stop hit
             # on the first (low) leg fills before the trail arms, so defer to it.
             stop_first = (just_activated and not ohlc
@@ -1446,6 +1464,20 @@ class SimPosition(PositionBase):
             stop = order.trail_stop
             if stop is None:
                 return False
+            # A carried trail on a bar that opens at its high (no upper wick) and
+            # gaps below the prior water mark fills at the open: TradingView folds
+            # the new bar's open into the low-water mark, so the offset-0 stop sits
+            # at the open and the bar -- which never trades higher -- touches it
+            # there.
+            if not just_activated and self.h == self.o:
+                open_stop = round_to_mintick(self.o + offset_price)
+                if open_stop < stop:
+                    p = open_stop
+                    if slippage > 0:
+                        p += syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, p, self.l)
+                    return True
             # Activated on the low (second leg, open->high->low): a hard stop hit
             # on the first (high) leg fills before the trail arms, so defer to it.
             stop_first = (just_activated and ohlc
