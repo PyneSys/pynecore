@@ -38,6 +38,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     ExchangeCapabilityError,
+    ExchangeConnectionError,
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.script_runner import ScriptRunner
@@ -329,6 +330,40 @@ def __test_market_entry_dispatches_execute_entry__(tmp_path):
     assert call.side == "buy"
     assert call.qty == 1.0
     assert call.order_type is OrderType.MARKET
+
+
+def __test_broker_connection_error_parks_dispatch_no_crash__(tmp_path):
+    """A recoverable ``ExchangeConnectionError`` from dispatch parks the sync
+    cycle instead of crashing the live run.
+
+    When the broker plugin exhausts its in-band recovery (e.g. a mid-session
+    account-auth loss it cannot re-win) it surfaces ``ExchangeConnectionError``.
+    The runner must swallow it, log a warning and continue to the next bar — the
+    COID-idempotent diff re-dispatches once the connection recovers — rather
+    than letting it tear the run loop down.
+    """
+    class _DisconnectingPlugin(MockBrokerPlugin):
+        async def execute_entry(self, envelope):
+            self.entry_calls.append(envelope.intent)
+            raise ExchangeConnectionError("account authorization lost")
+
+    plugin = _DisconnectingPlugin(capabilities=ExchangeCapabilities())
+    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(3),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+    )
+
+    # Must NOT raise — the connection error is parked, the whole run completes.
+    list(runner.run_iter())
+
+    # The entry reached the (failing) exchange call and was parked, not crashed.
+    assert len(plugin.entry_calls) >= 1
+    assert isinstance(runner.script.position, BrokerPosition)
+    assert runner.script.position.size == 0.0
 
 
 def __test_close_dispatches_execute_close__(tmp_path):

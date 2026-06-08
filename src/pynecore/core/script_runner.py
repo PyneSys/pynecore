@@ -6,7 +6,8 @@ from pathlib import Path
 from datetime import datetime, UTC
 
 from pynecore import lib
-from pynecore.lib.log import broker_info, ohlcv_info, sim_info
+from pynecore.lib.log import broker_info, broker_warning, ohlcv_info, sim_info
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
@@ -554,6 +555,43 @@ class ScriptRunner:
 
     # === Order-processing dispatch =========================================
 
+    def _broker_sync(self) -> None:
+        """Run one engine sync, parking a recoverable broker connection loss.
+
+        The broker plugin re-authorizes a mid-session account-auth / connection
+        loss in-band; only a fully failed recovery surfaces
+        :class:`ExchangeConnectionError` from dispatch. Park the cycle and retry
+        on the next bar — the COID-idempotent diff re-dispatches safely — rather
+        than crashing the live run. A deliberate halt
+        (:class:`BrokerManualInterventionError`) is NOT caught here and still
+        stops the bot. A dispatch-bridge ``TimeoutError`` (a broker call wedged
+        past ``execute_timeout``) is deliberately NOT parked: the engine's
+        ``run_coroutine_threadsafe(...).result(timeout)`` does not cancel the
+        still-running coroutine, so the in-flight order may yet land — silently
+        re-dispatching it next bar could double-fill a close/amend (which carry
+        no ``client_order_id`` and so are not exchange-deduped). It stays fatal
+        (the pre-existing behaviour), which is the safe choice for a wedged
+        broker. A slow but recoverable re-auth instead surfaces as the
+        ``ExchangeConnectionError`` above, bounded by ``_REAUTH_TIMEOUT``.
+        """
+        try:
+            cast('OrderSyncEngine', self._order_sync_engine).sync(
+                int(lib.last_bar_time),
+                last_price=_close_price_or_none(),
+            )
+        except ExchangeConnectionError as e:
+            broker_warning(
+                "broker sync skipped after connection error: %s — "
+                "retrying next bar", e,
+            )
+            return
+        # Heartbeat the storage run on every sync — the RunContext rate-limits
+        # internally to ``HEARTBEAT_INTERVAL_MS``, so the actual UPDATE fires at
+        # most once per minute regardless of sync frequency. SIGKILL / OOM then
+        # gets cleaned on the next open_run() via the stale-run threshold.
+        if self._broker_store_ctx is not None:
+            self._broker_store_ctx.heartbeat()
+
     def _process_orders(self, position) -> None:
         """Run one order-processing step.
 
@@ -564,17 +602,7 @@ class ScriptRunner:
         arrived asynchronously through :meth:`BrokerPosition.record_fill`.
         """
         if self._order_sync_engine is not None:
-            cast('OrderSyncEngine', self._order_sync_engine).sync(
-                int(lib.last_bar_time),
-                last_price=_close_price_or_none(),
-            )
-            # Heartbeat the storage run on every sync — the RunContext
-            # rate-limits internally to ``HEARTBEAT_INTERVAL_MS``, so the
-            # actual UPDATE fires at most once per minute regardless of
-            # sync frequency. SIGKILL / OOM then gets cleaned on the next
-            # open_run() via the stale-run threshold.
-            if self._broker_store_ctx is not None:
-                self._broker_store_ctx.heartbeat()
+            self._broker_sync()
         else:
             position.process_orders()
 
@@ -583,12 +611,7 @@ class ScriptRunner:
         is the source of truth — magnification is irrelevant and the engine
         runs a plain sync."""
         if self._order_sync_engine is not None:
-            cast('OrderSyncEngine', self._order_sync_engine).sync(
-                int(lib.last_bar_time),
-                last_price=_close_price_or_none(),
-            )
-            if self._broker_store_ctx is not None:
-                self._broker_store_ctx.heartbeat()
+            self._broker_sync()
         else:
             position.process_orders_magnified(sub_bars, candle)
 
@@ -1434,7 +1457,20 @@ class ScriptRunner:
                             # script sees the updated ``position.size``
                             # immediately rather than one bar later.
                             if self._order_sync_engine is not None:
-                                cast('OrderSyncEngine', self._order_sync_engine).apply_async_events()
+                                try:
+                                    cast('OrderSyncEngine', self._order_sync_engine) \
+                                        .apply_async_events()
+                                except ExchangeConnectionError as e:
+                                    # A recoverable broker loss surfaced while
+                                    # draining async fills (e.g. a deferred entry
+                                    # re-dispatch after a failed re-auth). Skip the
+                                    # drain this bar; the next bar retries. A halt
+                                    # is not caught here and still stops the bot.
+                                    broker_warning(
+                                        "async event apply skipped after "
+                                        "connection error: %s — retrying next bar",
+                                        e,
+                                    )
                             # Risk management hooks (broker-side parity with
                             # the sim's ``process_orders`` rollover/halt block):
                             # mark-to-market the open P&L so the equity-based
