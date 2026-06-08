@@ -95,26 +95,40 @@ def import_script(script_path: Path) -> ModuleType:
     return module
 
 
-def _round_price(price: float):
+def _round_price(price: float, tick_decimals: int | None):
     """
-    Round price to 6 significant digits to clean float32 storage artifacts
-    without destroying sub-mintick precision.
+    Clean float32 ``.ohlcv`` storage artifacts from an OHLC price, keeping the
+    finer of the mintick grid and a 6-significant-digit clean-up.
 
-    TradingView does NOT round OHLC data to syminfo.mintick — scripts see
-    the raw data (e.g. close=4.125 even when mintick=0.01). The float32
-    OHLCV format introduces small errors (e.g. 4.12 → 4.1199998856) that
-    this function cleans by rounding to 6 significant digits (float32 has ~7).
+    The float32 OHLCV format stores prices with sub-tick error (mintick=0.01
+    turns 93761.9 into 93761.8984; 109547.84 into 109547.836). Two clean-up
+    grids matter, and the right one depends on price magnitude:
+
+    - **6 significant digits** (``5 - floor(log10|price|)`` decimals) is the
+      historical heuristic. It is correct for small prices, where TradingView
+      itself carries sub-mintick precision (e.g. close=4.38075 on a coarser
+      tick), so it must NOT be snapped to the tick.
+    - **mintick decimals** is needed for large prices: at BTC ~94000, 6 sig
+      digits only reaches 1 decimal (93898.05 -> 93898.1) and discards the real
+      mintick-aligned precision, which flips threshold/hysteresis indicators.
+
+    Taking ``max`` of the two decimal counts keeps the finer grid in both
+    regimes — never coarser than the old 6-sig behaviour, only finer when the
+    mintick demands it. ``tick_decimals`` is ``None`` when the symbol has no
+    real mintick, falling back to the 6-sig clean-up alone.
     """
     if price == 0.0:
         return 0.0
     from math import log10, floor
-    magnitude = floor(log10(abs(price)))
-    precision = 5 - magnitude  # 6 significant digits
+    precision = 5 - floor(log10(abs(price)))  # 6 significant digits
+    if tick_decimals is not None and tick_decimals > precision:
+        precision = tick_decimals
     return round(price, precision)
 
 
 # noinspection PyShadowingNames,PyUnusedLocal
-def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType):
+def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
+                        round_decimals: int | None):
     """
     Set lib properties from OHLCV
     """
@@ -123,10 +137,10 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
 
     lib.bar_index = lib.last_bar_index = bar_index
 
-    lib.open = _round_price(ohlcv.open)
-    lib.high = _round_price(ohlcv.high)
-    lib.low = _round_price(ohlcv.low)
-    lib.close = _round_price(ohlcv.close)
+    lib.open = _round_price(ohlcv.open, round_decimals)
+    lib.high = _round_price(ohlcv.high, round_decimals)
+    lib.low = _round_price(ohlcv.low, round_decimals)
+    lib.close = _round_price(ohlcv.close, round_decimals)
 
     lib.volume = ohlcv.volume
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
@@ -226,6 +240,7 @@ class ScriptRunner:
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
+                 '_round_decimals',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -476,6 +491,10 @@ class ScriptRunner:
         # path uses a synthetic ``0.01`` tick for the same case).
         _mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
         self._price_decimals = mintick_decimals(_mintick) if _mintick > 0 else 2
+        # Decimals used to snap OHLC to the mintick grid (see ``_round_price``).
+        # ``None`` when the symbol carries no real mintick, so rounding falls
+        # back to the magnitude-relative significant-digit heuristic.
+        self._round_decimals = mintick_decimals(_mintick) if _mintick > 0 else None
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
@@ -1225,7 +1244,7 @@ class ScriptRunner:
                     barstate.islast = (next_item is LIVE_TRANSITION)
 
                 # Update lib properties
-                _set_lib_properties(candle, self.bar_index, self.tz, lib)
+                _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals)
 
                 # Store first price for buy & hold calculation
                 if self.first_price is None:
@@ -1357,7 +1376,7 @@ class ScriptRunner:
                     barstate.isconfirmed = bar_update.is_closed
                     barstate.isnew = is_new_bar
 
-                    _set_lib_properties(candle, self.bar_index, self.tz, lib)
+                    _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals)
 
                     if self.first_price is None:
                         self.first_price = lib.close  # type: ignore
@@ -1722,7 +1741,7 @@ class ScriptRunner:
             barstate.islast = window.is_last_window
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
-            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib)
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals)
 
             # Store first price for buy & hold calculation
             if self.first_price is None:
