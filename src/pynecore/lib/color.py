@@ -1,4 +1,5 @@
 from ..types.color import Color
+from ..types.na import NA
 
 #
 # Constants
@@ -71,10 +72,15 @@ def new(color: Color | str, transp: float = 0) -> Color:
     :param color: A color object or a string in "#RRGGBB" or "#RRGGBBAA" format
     :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
     """
+    # Pine propagates na: a na color or na transparency yields a na color
+    if isinstance(color, NA) or isinstance(transp, NA):
+        return NA(Color)
     if isinstance(color, str):
-        color: Color = Color(color)
-    color.t = transp
-    return color
+        color = Color(color)
+    # Build a fresh color so the caller's color (e.g. a color.* constant) is not mutated
+    result = Color(f'#{color.value:08X}')
+    result.t = transp
+    return result
 
 
 # noinspection PyShadowingNames
