@@ -101,6 +101,31 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
         d = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         return f"${d:,.2f}"
 
+    # Pine number patterns follow Java DecimalFormat: an optional negative
+    # subpattern after ';', and literal prefix/suffix (e.g. '+', '-', '$', 'R')
+    # around the digit pattern. Pick the subpattern by sign, format the
+    # magnitude with the bare digit pattern, and re-attach the affixes.
+    prefix = ''
+    suffix = ''
+    subpatterns = precision.split(';')
+    if value < 0:
+        value = -value
+        if len(subpatterns) > 1:
+            chosen = subpatterns[1]
+        else:
+            chosen = subpatterns[0]
+            prefix = '-'
+    else:
+        chosen = subpatterns[0]
+
+    pattern_chars = '#0.,'
+    digit_idx = [i for i, c in enumerate(chosen) if c in pattern_chars]
+    if digit_idx:
+        lo, hi = digit_idx[0], digit_idx[-1]
+        prefix += chosen[:lo]
+        suffix = chosen[hi + 1:]
+        precision = chosen[lo:hi + 1]
+
     # Parse format string
     if '.' in precision:
         before, after = precision.split('.')
@@ -144,20 +169,17 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
         else:
             result = formatted
 
-    # Handle leading zeros if needed
+    # Handle leading zeros if needed (the sign, if any, is carried by ``prefix``)
     if required_before > 0:
-        int_part = result.split('.')[0].lstrip('-')  # Handle negative numbers
-        is_negative = value < 0
+        int_part = result.split('.')[0]
         while len(int_part) < required_before:
             int_part = '0' + int_part
-        if is_negative:
-            int_part = '-' + int_part
         if '.' in result:
             result = f"{int_part}.{result.split('.')[1]}"
         else:
             result = int_part
 
-    return result
+    return prefix + result + suffix
 
 
 def _format_value(value: Any, _no_format_numbers=False) -> str:
