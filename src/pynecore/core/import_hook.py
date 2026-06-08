@@ -1,10 +1,32 @@
 from typing import cast
 import os
 import sys
+import hashlib
 import importlib.util
 import importlib.machinery
 import re
 from pathlib import Path
+
+
+# Module-level constant the transform pipeline bakes into every transformed module
+# (see ``PyneLoader.source_to_code``). Its presence — together with a matching
+# pipeline hash in ``co_consts`` — certifies a loaded code object as current
+# pipeline output, so foreign or stale bytecode can be told apart and dropped.
+_PYNE_SENTINEL = '__pyne_transformed__'
+
+# A module is Pyne code only when its docstring STARTS with ``@pyne``. Matching the
+# raw source head mirrors the strict docstring check in ``source_to_code`` without
+# paying for a full parse on every import.
+_PYNE_HEAD_RE = re.compile(rb'^\s*[rRbBuUfF]*("""|\'\'\'|"|\')\s*@pyne(\s|$)')
+
+
+def _source_starts_with_pyne(head: bytes) -> bool:
+    """Return whether a source head is a Pyne module (docstring begins with ``@pyne``).
+
+    :param head: First bytes of the source file.
+    :return: Whether the module should carry the transform sentinel.
+    """
+    return _PYNE_HEAD_RE.match(head) is not None
 
 
 def _cache_from_source(source_path: Path) -> Path:
@@ -24,94 +46,104 @@ def _cache_from_source(source_path: Path) -> Path:
     return Path(importlib.util.cache_from_source(str(source_path)))
 
 
-_transform_pipeline_mtime: float | None = None
+_transform_pipeline_hash: str | None = None
 
 
-def _get_transform_pipeline_mtime() -> float:
-    """Return the newest mtime among the files that define the AST transform output.
+def _get_transform_pipeline_hash() -> str:
+    """Return a content digest identifying the current AST transform pipeline.
 
-    The bytecode cached for an ``@pyne`` module is only valid for the transform
-    pipeline that produced it, but CPython validates a ``.pyc`` solely against its
-    source ``.py`` mtime/size. A PyneCore upgrade therefore leaves a user script's
-    cached bytecode stale (old transform shape) while the source stays untouched.
-    Comparing the cached ``.pyc`` against this timestamp catches that: ``pip``
-    rewrites package files with a fresh mtime on upgrade, and edits bump it in an
-    editable checkout. ``module_properties.json`` is included because it shapes the
-    transform output yet has no bytecode of its own.
+    Transformed bytecode is only valid for the exact pipeline that produced it, yet
+    CPython validates a ``.pyc`` solely against its source ``.py`` mtime/size — it
+    cannot tell a transformed module from one compiled without the import hook
+    (``pip``'s post-install ``compileall``, an IDE, a packaging step) or one left
+    over by an older PyneCore. This digest is baked into every transformed module as
+    ``__pyne_transformed__`` and re-checked on load; a missing or mismatched value
+    forces a retransform.
 
-    :return: Newest mtime of the import hook and every file under ``transformers/``.
+    Hashing the pipeline *contents* — this module plus every file under
+    ``transformers/`` (``module_properties.json`` shapes the output yet has no
+    bytecode of its own) — keeps the check deterministic and immune to file mtimes,
+    cache markers and read-only install locations.
+
+    :return: Hex digest pinning the transform pipeline.
     """
-    global _transform_pipeline_mtime
-    if _transform_pipeline_mtime is None:
+    global _transform_pipeline_hash
+    if _transform_pipeline_hash is None:
         files = [Path(__file__)]  # this module pins the transformer pipeline order
         transformers_dir = Path(__file__).parent.parent / "transformers"
         try:
-            files.extend(p for p in transformers_dir.iterdir() if p.is_file())
+            files.extend(transformers_dir.iterdir())
         except OSError:
             pass
-        mtimes: list[float] = []
-        for f in files:
+        digest = hashlib.sha256()
+        for f in sorted(files, key=lambda p: p.name):
             try:
-                mtimes.append(f.stat().st_mtime)
+                if f.is_file():
+                    digest.update(f.name.encode('utf-8'))
+                    digest.update(f.read_bytes())
             except OSError:
                 pass
-        _transform_pipeline_mtime = max(mtimes) if mtimes else 0.0
-    return _transform_pipeline_mtime
+        _transform_pipeline_hash = digest.hexdigest()[:16]
+    return _transform_pipeline_hash
 
 
 class PyneLoader(importlib.machinery.SourceFileLoader):
     """Loader that handles AST transformation"""
 
     def get_code(self, fullname: str):
-        """Drop transformed bytecode left over from an older transform pipeline.
+        """Retransform cached bytecode not produced by the current transform pipeline.
 
-        CPython validates a cached ``.pyc`` only against the source ``.py`` mtime
-        and size, so a PyneCore upgrade that changes the transform output (e.g. a
-        builtin moving from a module property to a plain variable) keeps executing
-        the obsolete bytecode while the unchanged source masks the staleness. For
-        ``@pyne`` modules we additionally invalidate any ``.pyc`` older than the
-        transform pipeline itself, forcing ``source_to_code`` to run again.
+        CPython validates a cached ``.pyc`` only against its source ``.py`` mtime and
+        size, so it cannot distinguish a transformed ``@pyne`` module from one compiled
+        without the import hook (``pip``'s post-install ``compileall``, an IDE, a
+        packaging step) or one left over by an older pipeline — all of them load as
+        "valid" and silently run the wrong bytecode. Every transformed module carries a
+        ``__pyne_transformed__ = <pipeline hash>`` sentinel baked into its code object;
+        if the loaded bytecode lacks it or the hash is stale, the ``.pyc`` is dropped and
+        the source is retransformed. The check is content-based, so it holds regardless
+        of file mtimes, cache markers or a read-only install location.
 
         :param fullname: Fully-qualified module name being loaded.
-        :return: The compiled code object (re-transformed if the cache was stale).
+        :return: The compiled code object (retransformed if the cache was foreign or stale).
         """
         source_path = self.get_filename(fullname)
+        code = super().get_code(fullname)
+
         try:
             with open(source_path, 'rb') as f:
                 head = f.read(256)
         except OSError:
             head = b''
 
-        # Only transformed modules carry a pipeline-dependent cache; restrict the
-        # invalidation to them so unrelated packages keep their bytecode untouched.
-        if re.search(rb'@pyne(\s|$)', head):
-            pyc_path = _cache_from_source(Path(source_path))
-            try:
-                if pyc_path.stat().st_mtime < _get_transform_pipeline_mtime():
-                    pyc_path.unlink()
-            except OSError:
-                pass  # no cached bytecode, or a read-only cache dir: nothing to drop
+        # Only transformed modules carry the sentinel; leave everything else untouched.
+        # ``get_code`` is typed Optional, but a real source file always yields a code
+        # object — the ``None`` guard just narrows the type for the checks below.
+        if code is None or not _source_starts_with_pyne(head):
+            return code
 
-        return super().get_code(fullname)
+        pipeline_hash = _get_transform_pipeline_hash()
+        if _PYNE_SENTINEL in code.co_names and pipeline_hash in code.co_consts:
+            return code
+
+        # Foreign or stale bytecode slipped past CPython's mtime/size check — drop it
+        # and let the loader recompile, refreshing the cache when the dir is writable.
+        try:
+            _cache_from_source(Path(source_path)).unlink()
+        except OSError:
+            pass  # no cached bytecode, or a read-only cache dir: nothing to drop
+        code = super().get_code(fullname)
+        if code is None or (_PYNE_SENTINEL in code.co_names and pipeline_hash in code.co_consts):
+            return code
+
+        # The stale ``.pyc`` could not be removed (read-only / locked cache) and still
+        # masks the source. Compile straight from source so the correct bytecode runs
+        # regardless; caching is skipped this load — correctness wins over the cache.
+        return self.source_to_code(self.get_data(source_path), source_path)
 
     # noinspection PyMethodOverriding
     def source_to_code(self, data: bytes | str, path: str, *, _optimize: int = -1):
         """Transform source to code if needed"""
         path: Path = Path(path)
-
-        # Create marker file for pynecore site-packages to indicate we processed this file
-        if (os.path.sep + 'site-packages' + os.path.sep in str(path).lower()
-                and os.path.sep + 'pynecore' + os.path.sep in str(path).lower()):
-            pyc_path = _cache_from_source(path)
-            cache_dir = pyc_path.parent
-            marker_path = pyc_path.parent / f'{pyc_path.name}.pyne'
-            try:
-                cache_dir.mkdir(exist_ok=True)
-                # Write the .py file's mtime to the marker
-                py_mtime = str(path.stat().st_mtime)
-                marker_path.write_text(py_mtime)
-            except (OSError, PermissionError):
-                pass  # Ignore if we can't create marker
 
         # Fast prefilter: require @pyne as a standalone token, not just any substring.
         # Compiled Pyne code always has it as the first non-whitespace content of
@@ -201,6 +233,26 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                 with open(f"/tmp/pyne/{path.stem}.py", "w") as f:
                     f.write(ast.unparse(transformed))
 
+            # Bake a pipeline-identity sentinel into the module body so a loaded code
+            # object can be distinguished from foreign or stale bytecode (see get_code).
+            # It must survive into the .pyc, so it is a plain assignment the compiler
+            # marshals like any other constant — no .pyc-format surgery needed. Added
+            # after the debug/save dumps above so those keep showing the semantic
+            # transform, free of this loader-level bookkeeping.
+            sentinel = ast.Assign(
+                targets=[ast.Name(id=_PYNE_SENTINEL, ctx=ast.Store())],
+                value=ast.Constant(value=_get_transform_pipeline_hash()),
+            )
+            # is_pyne_module guarantees body[0] is the module docstring; keep it first,
+            # and stay after any ``from __future__`` imports (which must lead the module).
+            insert_at = 1
+            while (insert_at < len(transformed.body)
+                   and isinstance(transformed.body[insert_at], ast.ImportFrom)
+                   and cast(ast.ImportFrom, transformed.body[insert_at]).module == '__future__'):
+                insert_at += 1
+            transformed.body.insert(insert_at, sentinel)
+            ast.fix_missing_locations(transformed)
+
             tree = transformed
 
         # Let Python handle bytecode caching
@@ -233,39 +285,9 @@ class PyneImportHook:
 
             for py_path in candidates:
                 if py_path.exists():
-                    # Check if pynecore site-packages bytecode needs recompilation
-                    if (os.path.sep + 'site-packages' + os.path.sep in str(py_path).lower() and
-                            os.path.sep + 'pynecore' + os.path.sep in str(py_path).lower()):
-                        pyc_path = _cache_from_source(py_path)
-                        marker_path = pyc_path.parent / f'{pyc_path.name}.pyne'
-
-                        need_recompile = False
-
-                        if pyc_path.exists():
-                            if not marker_path.exists():
-                                # No marker - definitely need recompile
-                                need_recompile = True
-                            else:
-                                # Check if marker has the correct py mtime
-                                try:
-                                    stored_mtime = marker_path.read_text().strip()
-                                    current_mtime = str(py_path.stat().st_mtime)
-                                    if stored_mtime != current_mtime:
-                                        # .py file changed - need recompile
-                                        need_recompile = True
-                                except (OSError, ValueError):
-                                    # Can't read marker or invalid content - need recompile
-                                    need_recompile = True
-
-                        if need_recompile:
-                            # Force recompile by removing the old bytecode
-                            try:
-                                pyc_path.unlink()
-                                if marker_path.exists():
-                                    marker_path.unlink()  # Also remove old marker
-                            except (OSError, PermissionError):
-                                pass  # Ignore if we can't delete
-
+                    # Stale/foreign bytecode is handled content-based in
+                    # ``PyneLoader.get_code`` (via the transform sentinel), so there is
+                    # no per-path cache bookkeeping to do here.
                     return importlib.util.spec_from_file_location(
                         fullname,
                         py_path,
