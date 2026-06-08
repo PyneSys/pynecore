@@ -30,13 +30,13 @@ def _missing_tz_db(monkeypatch):
 
     monkeypatch.setattr(pcd, "ZoneInfo", _no_db)
     pcd._timezone_db_available.cache_clear()
-    parse_timezone.cache_clear()
+    pcd._parse_timezone_cached.cache_clear()
     try:
         yield
     finally:
         monkeypatch.undo()
         pcd._timezone_db_available.cache_clear()
-        parse_timezone.cache_clear()
+        pcd._parse_timezone_cached.cache_clear()
 
 
 def __test_valid_iana_and_offsets_resolve__():
