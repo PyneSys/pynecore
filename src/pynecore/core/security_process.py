@@ -94,6 +94,13 @@ def security_process_main(
     from pynecore.lib import _parse_timezone
     tz = _parse_timezone(syminfo.timezone)
 
+    # Mintick decimals for OHLC grid-snapping in ``_set_lib_properties``
+    # (``None`` when the symbol has no real mintick -> falls back to the
+    # significant-digit clean-up). Mirrors ``ScriptRunner._round_decimals``.
+    from .syminfo import mintick_decimals
+    _sec_mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
+    round_decimals = mintick_decimals(_sec_mintick) if _sec_mintick > 0 else None
+
     # Import the script
     script_module = import_script(Path(script_path))
 
@@ -144,7 +151,7 @@ def security_process_main(
                     break
 
                 # Set lib properties for this bar
-                _set_lib_properties(ohlcv, current_bar, tz, lib)
+                _set_lib_properties(ohlcv, current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = total_bars - 1
 
                 # Set barstate
