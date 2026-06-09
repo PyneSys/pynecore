@@ -757,6 +757,21 @@ def live_ohlcv_generator(
                             # iteration's top-of-loop dispatch drives the
                             # reconnect path.
                             continue
+                        # Dead WS during an open session: reconnect instead
+                        # of synthesising a frozen idle bar. Idle-bar synth is
+                        # for a live-but-quiet feed; manufacturing bars on a
+                        # dead socket would run the strategy on stale prices
+                        # while the real market keeps moving, and the steady
+                        # synth cadence keeps the boundary deadline perpetually
+                        # "just passed" so the dead-WS check below never fires.
+                        # Defer via the flag — a ``raise`` here would escape the
+                        # sibling ``except Exception`` reconnect block (same
+                        # reason as the session-gated branch above).
+                        if not provider.is_connected:
+                            pending_connection_error = ConnectionError(
+                                "Provider reports disconnected state"
+                            )
+                            continue
                         last_close = last_closed_bar.close
                         synth = OHLCV(
                             timestamp=synth_ts,
@@ -784,7 +799,13 @@ def live_ohlcv_generator(
                         bar_queue.put(synth)
                         continue
                     if not provider.is_connected:
-                        raise ConnectionError(
+                        # Defer to the top-of-loop dispatch rather than
+                        # raising here: a ``raise`` from inside this
+                        # ``except asyncio.TimeoutError`` handler escapes past
+                        # the sibling ``except Exception`` reconnect block and
+                        # would kill the live iterator (same reason as the
+                        # session-gated branch above).
+                        pending_connection_error = ConnectionError(
                             "Provider reports disconnected state"
                         )
                     continue
