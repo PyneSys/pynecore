@@ -570,7 +570,8 @@ def _intraday_session_args(timeframe: str) -> tuple:
 
 
 @module_property
-def time(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> PyneInt:
+def time(timeframe: str | None = None, session: str | int | None = None,
+         timezone: str | None = None, bars_back: int = 0) -> PyneInt:
     """
     The time function returns the UNIX time of the current bar for the specified timeframe
     and session or NA if the time point is out of session.
@@ -580,17 +581,33 @@ def time(timeframe: str | None = None, session: str | None = None, timezone: str
     - time("60") - Current 1-hour bar start time
     - time("1D", "0930-1600") - Daily bar time if within session
     - time("60", "0930-1600:23456", "America/New_York") - With timezone
+    - time("60", -1) - Expected start time of the next 1-hour bar
 
     :param timeframe: The timeframe to get the time for (e.g., "D", "60", "240").
+                     An empty string selects the chart's timeframe.
                      If None, returns current bar time.
     :param session: Session specification string (e.g., "0930-1600", "0000-0000:23456").
-                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat)
+                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat).
+                   An int value here is treated as ``bars_back`` (Pine's
+                   ``time(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
                     If None, uses exchange timezone.
+    :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
+                     bars, negative values to the expected times of future bars. The offset
+                     is computed on a continuous time grid (exact for 24/7 markets).
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
+    # Pine overload: time(timeframe, bars_back) -- an int second argument is a bar offset
+    if isinstance(session, int) and not isinstance(session, bool):
+        bars_back = session
+        session = None
+
     if timeframe is None:
         return _time
+
+    # An empty string selects the chart's timeframe
+    if timeframe == '':
+        timeframe = str(syminfo.period)
 
     # Get resampler for the requested timeframe
     try:
@@ -601,6 +618,11 @@ def time(timeframe: str | None = None, session: str | None = None, timezone: str
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
+    if bars_back:
+        try:
+            current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+        except (ValueError, AssertionError):
+            return NA(int)
     bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     if session is None:
@@ -686,7 +708,8 @@ def time_tradingday() -> PyneInt:
 
 
 @module_property
-def time_close(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> PyneInt:
+def time_close(timeframe: str | None = None, session: str | int | None = None,
+               timezone: str | None = None, bars_back: int = 0) -> PyneInt:
     """
     The time_close function returns the UNIX time of the current bar's close for the specified timeframe
     and session or NA if the time point is outside the session.
@@ -696,17 +719,37 @@ def time_close(timeframe: str | None = None, session: str | None = None, timezon
     - time_close("60") - Current 1-hour bar close time
     - time_close("1D", "0930-1600") - Daily bar close time if within session
     - time_close("60", "0930-1600:23456", "America/New_York") - With timezone
+    - time_close("60", -1) - Expected close time of the next 1-hour bar
 
     :param timeframe: The timeframe to get the close time for (e.g., "D", "60", "240").
+                     An empty string selects the chart's timeframe.
                      If None, returns current bar close time.
     :param session: Session specification string (e.g., "0930-1600", "0000-0000:23456").
-                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat)
+                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat).
+                   An int value here is treated as ``bars_back`` (Pine's
+                   ``time_close(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
                     If None, uses exchange timezone.
+    :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
+                     bars, negative values to the expected times of future bars. The offset
+                     is computed on a continuous time grid (exact for 24/7 markets).
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
+    # Pine overload: time_close(timeframe, bars_back) -- an int second argument is a bar offset
+    if isinstance(session, int) and not isinstance(session, bool):
+        bars_back = session
+        session = None
+
     if timeframe is None:
-        return _time
+        # Close time of the current chart bar
+        try:
+            return _time + timeframe_module.in_seconds(str(syminfo.period)) * 1000
+        except (ValueError, AssertionError):
+            return NA(int)
+
+    # An empty string selects the chart's timeframe
+    if timeframe == '':
+        timeframe = str(syminfo.period)
 
     # Get resampler for the requested timeframe
     try:
@@ -717,6 +760,11 @@ def time_close(timeframe: str | None = None, session: str | None = None, timezon
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
+    if bars_back:
+        try:
+            current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+        except (ValueError, AssertionError):
+            return NA(int)
     bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     # Calculate bar close time by adding timeframe duration

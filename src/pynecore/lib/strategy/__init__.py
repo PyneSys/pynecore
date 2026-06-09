@@ -3172,6 +3172,39 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
 # noinspection PyProtectedMember
 @module_property
+def avg_losing_trade() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.losstrades == 0:
+        return NA(float)
+    return position.grossloss / position.losstrades
+
+
+# noinspection PyProtectedMember
+@module_property
+def avg_trade() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.closed_trades_count == 0:
+        return NA(float)
+    return position.netprofit / position.closed_trades_count
+
+
+# noinspection PyProtectedMember
+@module_property
+def avg_winning_trade() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.wintrades == 0:
+        return NA(float)
+    return position.grossprofit / position.wintrades
+
+
+# noinspection PyProtectedMember
+@module_property
 def equity() -> PyneFloat:
     if lib._script is None:
         return 0.0

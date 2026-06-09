@@ -178,6 +178,9 @@
     "left_visible_bar_time": {
       "type": "property"
     },
+    "point": {
+      "type": "variable"
+    },
     "right_visible_bar_time": {
       "type": "property"
     }
@@ -665,6 +668,15 @@
     }
   },
   "lib.strategy": {
+    "avg_losing_trade": {
+      "type": "property"
+    },
+    "avg_trade": {
+      "type": "property"
+    },
+    "avg_winning_trade": {
+      "type": "property"
+    },
     "cash": {
       "type": "variable"
     },
@@ -911,6 +923,7 @@
       "type": "variable"
     }
   },
+  "lib.ticker": {},
   "lib.timeframe": {
     "isdaily": {
       "type": "property"

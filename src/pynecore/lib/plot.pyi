@@ -15,7 +15,11 @@ class PlotModule(CallableModule):
     style_line: PlotEnum
     style_linebr: PlotEnum
     style_stepline: PlotEnum
+    style_steplinebr: PlotEnum
     style_stepline_diamond: PlotEnum
+    linestyle_solid: PlotEnum
+    linestyle_dashed: PlotEnum
+    linestyle_dotted: PlotEnum
 
     def __call__(self, series: Any, title: str | None = None, *args, **kwargs) -> Plot: ...
 
