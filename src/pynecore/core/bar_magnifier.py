@@ -37,19 +37,25 @@ class BarMagnifier:
             ohlcv_iter: Iterable[OHLCV],
             chart_tf: str,
             tz: ZoneInfo | dt_timezone | None = None,
+            session_starts: 'list | None' = None,
     ):
         """
         :param ohlcv_iter: Iterator of sub-timeframe OHLCV candles
         :param chart_tf: Chart timeframe string (e.g., '60', '1D')
         :param tz: Timezone for day/week/month boundary alignment
+        :param session_starts: Per-trading-day primary opens for intraday session
+            anchoring. ``None`` keeps the pure clock-floor (see
+            :meth:`Resampler.get_bar_time`).
         """
         self._ohlcv_iter = ohlcv_iter
         self._resampler = Resampler.get_resampler(chart_tf)
         self._tz = tz
+        self._session_starts = session_starts
 
     def _get_bar_time(self, candle: OHLCV) -> int:
         """Get the chart-bar opening timestamp (seconds) for a sub-bar candle."""
-        bar_time_ms = self._resampler.get_bar_time(candle.timestamp * 1000, tz=self._tz)
+        bar_time_ms = self._resampler.get_bar_time(
+            candle.timestamp * 1000, tz=self._tz, session_starts=self._session_starts)
         return bar_time_ms // 1000
 
     def __iter__(self) -> Iterator[MagnifiedWindow]:

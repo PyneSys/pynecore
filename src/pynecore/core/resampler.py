@@ -1,9 +1,56 @@
 from datetime import datetime, timedelta, timezone as dt_timezone
-from typing import ClassVar
+from typing import ClassVar, TYPE_CHECKING
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 from ..lib import timeframe as tf_module
+
+if TYPE_CHECKING:
+    from .syminfo import SymInfoSession
+
+
+def _session_anchor_sec(
+        t_sec: int,
+        tz: ZoneInfo | dt_timezone | None,
+        session_starts: 'list[SymInfoSession]',
+) -> int:
+    """
+    Epoch seconds of the session open anchoring ``t_sec``'s trading session.
+
+    Returns the opening instant of the trading session that *contains* ``t_sec`` —
+    for overnight sessions this is the previous evening's open. Used to align
+    intraday HTF bars to the session open the way TradingView does, instead of
+    flooring to the UTC clock.
+
+    Sessions are assumed shorter than 24h, so the containing open lies on the bar's
+    local date or the one before it. Falls back to ``0`` — which makes the caller
+    reproduce the plain UTC clock-floor — when no declared session covers ``t_sec``.
+
+    :param t_sec: Bar timestamp in epoch seconds.
+    :param tz: Exchange timezone for locating session opens. ``None`` uses local time.
+    :param session_starts: Per-trading-day primary opens (``SymInfoSession``).
+    :return: Anchor (session-open) time in epoch seconds, or 0 if none applies.
+    """
+    if tz is not None:
+        local_date = datetime.fromtimestamp(t_sec, tz=tz).date()
+    else:
+        local_date = datetime.fromtimestamp(t_sec).date()
+
+    best: int | None = None
+    for delta in (0, 1):
+        d = local_date - timedelta(days=delta)
+        weekday = d.weekday()
+        for s in session_starts:
+            if s.day != weekday:
+                continue
+            open_sec = int(datetime(
+                d.year, d.month, d.day,
+                s.time.hour, s.time.minute, s.time.second,
+                tzinfo=tz,
+            ).timestamp())
+            if open_sec <= t_sec and (best is None or open_sec > best):
+                best = open_sec
+    return best if best is not None else 0
 
 
 class Resampler:
@@ -47,17 +94,29 @@ class Resampler:
         return cls._resamplers[timeframe]
 
     def get_bar_time(self, current_time_ms: int,
-                     tz: ZoneInfo | dt_timezone | None = None) -> int:
+                     tz: ZoneInfo | dt_timezone | None = None,
+                     session_starts: 'list[SymInfoSession] | None' = None) -> int:
         """
         Calculate the bar opening time for the current timeframe.
 
-        For seconds and minutes, timezone is irrelevant (pure epoch arithmetic).
         For daily, weekly, and monthly timeframes, the timezone determines where
         midnight falls — i.e., which calendar day a timestamp belongs to.
 
+        For intraday timeframes the bar grid is, by default, a pure UTC-epoch
+        clock-floor (session-unaware fast path). When ``session_starts`` is given
+        the grid is instead anchored to the session open — matching TradingView,
+        which aligns intraday HTF bars to the session open rather than the UTC
+        clock (e.g. a 09:30 open at 1H yields 09:30, 10:30, 11:30…). For sessions
+        that open on a ``tf`` boundary the two are identical; callers therefore
+        pass ``session_starts`` only when the open is actually off-grid, so the
+        common case keeps the zero-overhead fast path.
+
         :param current_time_ms: Current time in milliseconds (UNIX timestamp)
-        :param tz: Timezone for day/week/month boundary calculation.
+        :param tz: Timezone for day/week/month boundary calculation, and for
+                   locating session opens when ``session_starts`` is given.
                    If None, uses the system's local timezone.
+        :param session_starts: Per-trading-day primary opens for intraday session
+                   anchoring. ``None`` (default) selects the pure clock-floor.
         :return: Bar opening time in milliseconds
         """
         # Convert to seconds for calculations
@@ -70,12 +129,16 @@ class Resampler:
         # noinspection PyProtectedMember
         modifier, multiplier = tf_module._process_tf(self.timeframe)
 
-        if modifier == 'S':  # Seconds
-            bar_start_sec = (current_time_sec // tf_seconds) * tf_seconds
-
-        elif modifier == '':  # Minutes
-            # Round down to the nearest timeframe boundary
-            bar_start_sec = (current_time_sec // tf_seconds) * tf_seconds
+        if modifier in ('S', ''):  # Seconds / minutes (intraday)
+            if session_starts is None:
+                # Pure UTC-epoch clock-floor — session-unaware fast path
+                bar_start_sec = (current_time_sec // tf_seconds) * tf_seconds
+            else:
+                # Session-anchored grid. Anchor and step in absolute epoch
+                # seconds so the boundaries stay correct across DST transitions.
+                anchor_sec = _session_anchor_sec(current_time_sec, tz, session_starts)
+                bar_start_sec = anchor_sec + (
+                    (current_time_sec - anchor_sec) // tf_seconds) * tf_seconds
 
         elif modifier in ('D', 'W', 'M'):
             # Daily/Weekly/Monthly — timezone matters for calendar alignment

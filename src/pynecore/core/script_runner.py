@@ -432,7 +432,7 @@ class ScriptRunner:
                 no_process_ids = frozenset(same_context_ids | ignored_sec_ids)
 
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
-                    sec_contexts, chart_tf, self.tz,
+                    sec_contexts, chart_tf, self.tz, chart_syminfo=self.syminfo,
                 )
 
                 all_sec_ids = list(sec_contexts.keys())
@@ -481,6 +481,15 @@ class ScriptRunner:
                     elif sec_state.resampler is None:
                         from .resampler import Resampler
                         sec_state.resampler = Resampler.get_resampler(resolved_tf)
+                    # Redo the intraday session-anchor decision now that the real
+                    # timeframe is known (the placeholder may have been chart TF).
+                    if same_tf:
+                        sec_state.session_starts = None
+                        sec_state.session_tz = None
+                    else:
+                        from .security import resolve_session_anchor
+                        sec_state.session_starts, sec_state.session_tz = (
+                            resolve_session_anchor(self.syminfo, resolved_tf, self.tz))
                     # Resolve OHLCV path and spawn process
                     resolve_ctx = {'symbol': symbol, 'timeframe': resolved_tf}
                     resolved = self._resolve_security_data({sid: resolve_ctx})
@@ -538,7 +547,8 @@ class ScriptRunner:
                     # On-the-fly aggregation: aggregate sub-TF to chart TF
                     from .bar_magnifier import BarMagnifier
                     chart_tf = str(lib.syminfo.period)
-                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
+                                             session_starts=self.syminfo.session_starts)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
             # Initialize calc_on_order_fills snapshot (only for strategies with COOF).
@@ -830,7 +840,8 @@ class ScriptRunner:
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
-        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
+                                 session_starts=self.syminfo.session_starts)
 
         trade_num = 0
 

@@ -477,11 +477,14 @@ def aggregate(
         )
 
         try:
-            # Use data timezone from TOML for correct day/week/month boundaries
+            # Use data timezone from TOML for correct day/week/month boundaries,
+            # and the session opens so intraday bars anchor to the session the
+            # way TradingView does (no-op for on-hour / 24-7 markets).
             from zoneinfo import ZoneInfo
             data_tz = ZoneInfo(syminfo.timezone) if syminfo.timezone else None
             source_count, target_count = aggregate_ohlcv(
-                source, out_path, timeframe, tz=data_tz)
+                source, out_path, timeframe, tz=data_tz,
+                session_starts=syminfo.session_starts)
         except Exception as e:
             secho(f"Error during aggregation: {e}", err=True, fg=colors.RED)
             raise Exit(1)

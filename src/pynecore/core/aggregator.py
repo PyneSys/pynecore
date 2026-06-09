@@ -61,6 +61,7 @@ def aggregate_ohlcv(
         target_path: Path,
         target_tf: str,
         tz: ZoneInfo | dt_timezone | None = None,
+        session_starts: list | None = None,
 ) -> tuple[int, int]:
     """
     Aggregate OHLCV data from a lower timeframe file to a higher timeframe file.
@@ -70,6 +71,10 @@ def aggregate_ohlcv(
     :param target_tf: Target timeframe string (e.g., '60', '1W')
     :param tz: Timezone for day/week/month boundary alignment.
                Should match the data's timezone (from TOML metadata).
+    :param session_starts: Per-trading-day primary opens for intraday session
+               anchoring. When given, intraday bars align to the session open
+               (TradingView behaviour) instead of the UTC clock; ``None`` keeps
+               the pure clock-floor. See :meth:`Resampler.get_bar_time`.
     :return: Tuple of (source_candles_read, target_candles_written)
     """
     resampler = Resampler.get_resampler(target_tf)
@@ -90,7 +95,8 @@ def aggregate_ohlcv(
                 source_count += 1
 
                 # Resampler works in ms, OHLCV timestamps are in seconds
-                bar_time_ms = resampler.get_bar_time(candle.timestamp * 1000, tz=tz)
+                bar_time_ms = resampler.get_bar_time(
+                    candle.timestamp * 1000, tz=tz, session_starts=session_starts)
                 bar_time = bar_time_ms // 1000
 
                 if current_bar_time is not None and bar_time != current_bar_time:

@@ -197,3 +197,36 @@ def __test_aggregate_preserves_high_low__(tmp_path):
     # Second bar: high from candle 4 (130), low from candle 5 (88)
     assert result[1].high == pytest.approx(130.0, rel=1e-5)
     assert result[1].low == pytest.approx(88.0, rel=1e-5)
+
+
+def __test_aggregate_session_anchored__():
+    """Off-grid session (09:30) anchors 60m target bars to the session open."""
+    from datetime import datetime, time
+    from zoneinfo import ZoneInfo
+    from pynecore.core.syminfo import SymInfoSession
+
+    ny = ZoneInfo("America/New_York")
+
+    def ts(h: int, mi: int) -> int:
+        return int(datetime(2024, 1, 17, h, mi, tzinfo=ny).timestamp())
+
+    # 30m source candles across a 09:30-opening session.
+    candles = [
+        OHLCV(timestamp=ts(9, 30),  open=10.0, high=11.0, low=9.0,  close=10.5, volume=1.0),
+        OHLCV(timestamp=ts(10, 0),  open=10.5, high=12.0, low=10.0, close=11.5, volume=2.0),
+        OHLCV(timestamp=ts(10, 30), open=11.5, high=13.0, low=11.0, close=12.0, volume=3.0),
+        OHLCV(timestamp=ts(11, 0),  open=12.0, high=12.5, low=11.5, close=12.2, volume=4.0),
+    ]
+    session_starts = [SymInfoSession(day=d, time=time(9, 30, 0)) for d in range(5)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "src.ohlcv"
+        target = Path(tmp) / "tgt.ohlcv"
+        _create_ohlcv_file(source, candles)
+        aggregate_ohlcv(source, target, "60", tz=ny, session_starts=session_starts)
+        result = _read_all(target)
+
+    # Two 60m bars anchored to the session: 09:30 (09:30+10:00) and 10:30 (10:30+11:00).
+    assert [c.timestamp for c in result] == [ts(9, 30), ts(10, 30)]
+    assert result[0].volume == pytest.approx(3.0)   # 1 + 2
+    assert result[1].volume == pytest.approx(7.0)   # 3 + 4

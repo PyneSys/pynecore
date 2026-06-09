@@ -13,9 +13,12 @@ Architecture:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from multiprocessing import Event, Lock
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
+from .datetime import parse_timezone
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     write_result,
@@ -25,8 +28,8 @@ if TYPE_CHECKING:
     from multiprocessing import Process
     from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
-    from zoneinfo import ZoneInfo
     from .resampler import Resampler
+    from .syminfo import SymInfo, SymInfoSession
 
 
 # Liveness poll interval for security-process waits. Short enough to detect a
@@ -87,6 +90,15 @@ class SecurityState:
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
 
+    # Intraday session anchoring (chart-side). Populated by
+    # ``setup_security_states`` only when this security's session opens off the
+    # requested HTF grid (e.g. equities 09:30 at 1H). ``None`` selects the pure
+    # UTC clock-floor fast path in ``Resampler.get_bar_time`` — zero overhead for
+    # 24/7, on-hour, and session-aligned instruments. ``session_tz`` is the
+    # security's own exchange timezone.
+    session_starts: 'list[SymInfoSession] | None' = None
+    session_tz: ZoneInfo | None = None
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     prev_chart_time: int | None = None
@@ -115,8 +127,16 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
 
     resampler = state.resampler
     assert resampler is not None
-    current_period = resampler.get_bar_time(chart_time, state.tz)
-    prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
+    if state.session_starts is not None:
+        # Off-grid intraday session → anchor HTF bars to the session open,
+        # using the security's own exchange timezone.
+        current_period = resampler.get_bar_time(
+            chart_time, state.session_tz, state.session_starts)
+        prev_period = resampler.get_bar_time(
+            prev_chart_time, state.session_tz, state.session_starts)
+    else:
+        current_period = resampler.get_bar_time(chart_time, state.tz)
+        prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
 
     if current_period != prev_period:
         # New period started → previous period is now confirmed
@@ -322,10 +342,82 @@ def create_security_protocol(
     return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup, flush
 
 
+# Representative dates for the off-grid session probe — one on each side of the
+# DST boundary so a session that lands on the tf grid only half the year is still
+# detected. Both are Mondays, so the weekday offset arithmetic below is exact.
+_WINTER_PROBE = date(2024, 1, 15)
+_SUMMER_PROBE = date(2024, 7, 15)
+
+
+def _needs_session_anchor(
+    session_starts: 'list[SymInfoSession]',
+    tzinfo: ZoneInfo | None,
+    timeframe: str,
+) -> bool:
+    """
+    Whether intraday ``timeframe`` bars need session anchoring for this market.
+
+    Session anchoring changes nothing when every declared session open already
+    lands on the ``timeframe`` UTC-epoch grid (24/7, on-hour, session-aligned
+    markets), so those keep the zero-overhead clock-floor fast path. The open is
+    probed on both a winter and a summer date to cover both DST offsets. The test
+    is deliberately conservative: it anchors whenever any open is off-grid.
+    """
+    if not session_starts:
+        return False
+    # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle.
+    from ..lib import timeframe as tf_module
+    # noinspection PyProtectedMember
+    modifier, _ = tf_module._process_tf(timeframe)
+    if modifier not in ('S', ''):
+        return False  # D/W/M alignment is timezone-driven, not session-anchored
+    tf_seconds = tf_module.in_seconds(timeframe)
+    for probe in (_WINTER_PROBE, _SUMMER_PROBE):
+        for s in session_starts:
+            d = probe + timedelta(days=(s.day - probe.weekday()) % 7)
+            open_sec = int(datetime(
+                d.year, d.month, d.day,
+                s.time.hour, s.time.minute, s.time.second,
+                tzinfo=tzinfo,
+            ).timestamp())
+            if open_sec % tf_seconds != 0:
+                return True
+    return False
+
+
+def resolve_session_anchor(
+    si: 'SymInfo | None',
+    timeframe: str,
+    fallback_tz: ZoneInfo,
+) -> 'tuple[list[SymInfoSession] | None, ZoneInfo | None]':
+    """
+    Decide intraday HTF session anchoring for one security context.
+
+    Returns ``(session_starts, session_tz)`` to store on the ``SecurityState`` so
+    ``_get_confirmed_time`` anchors HTF bars to the session open, or ``(None,
+    None)`` when the market opens on the ``timeframe`` grid (the clock-floor fast
+    path).
+
+    :param si: The security's own ``SymInfo`` (``None`` → no anchoring).
+    :param timeframe: The resolved HTF string (e.g. ``"60"``).
+    :param fallback_tz: Timezone used if the syminfo timezone is missing/invalid.
+    """
+    if si is None or not getattr(si, 'session_starts', None):
+        return None, None
+    try:
+        si_tz = parse_timezone(si.timezone) if si.timezone else fallback_tz
+    except (ValueError, KeyError):
+        si_tz = fallback_tz
+    if _needs_session_anchor(si.session_starts, si_tz, timeframe):
+        return si.session_starts, si_tz
+    return None, None
+
+
 def setup_security_states(
     contexts: dict[str, dict],
     chart_timeframe: str,
     tz: 'ZoneInfo',
+    chart_syminfo: 'SymInfo | None' = None,
 ) -> tuple[dict[str, SecurityState], SyncBlock, dict[str, ResultBlock]]:
     """
     Initialize security states, shared memory, and events from ``__security_contexts__``.
@@ -334,6 +426,9 @@ def setup_security_states(
                      Keys are sec_ids, values are dicts with 'symbol', 'timeframe', 'gaps'.
     :param chart_timeframe: The chart's timeframe string (e.g., "5", "1D").
     :param tz: The chart's timezone.
+    :param chart_syminfo: The chart symbol's ``SymInfo``, used as the session
+                     source for intraday HTF session anchoring. ``None`` disables
+                     anchoring (pure clock-floor).
     :return: (states, sync_block, result_blocks)
     """
     from pynecore.lib import barmerge
@@ -348,6 +443,8 @@ def setup_security_states(
         timeframe = str(ctx.get('timeframe', chart_timeframe))
         is_ltf = bool(ctx.get('is_ltf', False))
 
+        anchor_starts: 'list[SymInfoSession] | None' = None
+        anchor_tz: ZoneInfo | None = None
         if is_ltf:
             is_gaps_on = False
             same_tf = False
@@ -358,6 +455,12 @@ def setup_security_states(
             same_tf = (timeframe == chart_timeframe)
             resampler = None if same_tf else Resampler.get_resampler(timeframe)
 
+            # Intraday session anchoring: align HTF bars to the session open
+            # (TradingView behaviour) when the open is off the requested tf grid.
+            if not same_tf:
+                anchor_starts, anchor_tz = resolve_session_anchor(
+                    chart_syminfo, timeframe, tz)
+
         state = SecurityState(
             sec_id=sec_id,
             timeframe=timeframe,
@@ -366,6 +469,8 @@ def setup_security_states(
             resampler=resampler,
             tz=tz,
             is_ltf=is_ltf,
+            session_starts=anchor_starts,
+            session_tz=anchor_tz,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()
