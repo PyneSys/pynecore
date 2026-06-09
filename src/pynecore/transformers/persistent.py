@@ -597,7 +597,12 @@ class PersistentTransformer(ast.NodeTransformer):
                     value=transformed_value
                 )
 
-        # If not a persistent assignment, still visit the value part
+        # If not a persistent assignment, still visit both the targets and the value.
+        # The target may itself contain persistent references that must be rewritten,
+        # e.g. an attribute or subscript target like ``persistent_udt.field = ...`` or
+        # ``persistent_var[i] = ...``; visiting only the value would leave the base
+        # name un-transformed and raise NameError at runtime.
+        node.targets = [cast(ast.expr, self.visit(cast(ast.AST, t))) for t in node.targets]
         node.value = self.visit(cast(ast.AST, node.value))
         return node
 

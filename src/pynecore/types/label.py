@@ -3,6 +3,7 @@ from typing import Optional
 
 from ..lib import color as _color, xloc as _xloc, yloc as _yloc, size as _size, text as _text, font as _font
 from .base import StrLiteral
+from .na import NA
 
 
 class LabelStyleEnum(StrLiteral):
@@ -11,9 +12,10 @@ class LabelStyleEnum(StrLiteral):
 
 @dataclass(slots=True)
 class Label:
-    # Required parameters
-    x: int  # Bar index or UNIX time
-    y: int | float  # Price of the label position
+    # Required parameters (``na`` when set from a chart.point that lacks the corresponding
+    # coordinate for the active xloc)
+    x: int | NA  # Bar index or UNIX time
+    y: int | float | NA  # Price of the label position
     text: str = ""  # Label text
     
     # Optional parameters with defaults
