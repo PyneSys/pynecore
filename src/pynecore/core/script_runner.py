@@ -885,6 +885,7 @@ class ScriptRunner:
 
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
                     sec_contexts, chart_tf, self.tz, chart_symbol=chart_ticker,
+                    chart_syminfo=self.syminfo, sec_syminfos=self._sec_syminfos,
                 )
 
                 # Currency rate provider — built after the SyncBlock exists so
@@ -956,39 +957,13 @@ class ScriptRunner:
                     elif sec_state.resampler is None:
                         from .resampler import Resampler
                         sec_state.resampler = Resampler.get_resampler(resolved_tf)
-                    # Now that the real symbol/timeframe are known, decide
-                    # whether the live HTF transport applies. ``setup_security_states``
-                    # built the aggregator under the assumption ``sym is None``
-                    # ⇒ same-symbol; reverse that decision if the resolved symbol
-                    # is cross-symbol, or attach one if the timeframe just
-                    # promoted from chart-TF to HTF.
-                    is_same_symbol = (chart_ticker is None
-                                      or str(symbol) == chart_ticker)
-                    needs_aggregator = (not same_tf) and is_same_symbol
-                    if needs_aggregator and sec_state.htf_aggregator is None:
-                        from .htf_aggregator import HTFAggregator
-                        sec_state.htf_aggregator = HTFAggregator(resolved_tf, self.tz)
-                    elif not needs_aggregator and sec_state.htf_aggregator is not None:
-                        sec_state.htf_aggregator = None
-                    elif (needs_aggregator
-                          and sec_state.htf_aggregator is not None
-                          and sec_state.htf_aggregator.timeframe != resolved_tf):
-                        # Timeframe resolved to something different from the
-                        # placeholder used at setup — rebuild for the right TF.
-                        from .htf_aggregator import HTFAggregator
-                        sec_state.htf_aggregator = HTFAggregator(resolved_tf, self.tz)
-                    # Cross-symbol HTF + lookahead_on: developing bar cannot be
-                    # aggregated from chart OHLCV (wrong instrument). Chart-side
-                    # read returns ``na`` for every chart bar inside an open HTF
-                    # period; the subprocess still advances on closed cross-symbol
-                    # HTF bars, so close[1] at the period boundary delivers the
-                    # just-closed close.
-                    sec_state.na_on_developing = (
-                            (not same_tf)
-                            and (not is_same_symbol)
-                            and sec_state.lookahead is Lookahead.ON
-                    )
-                    # Resolve OHLCV path and spawn process
+                    # Resolve the OHLCV source and prefetch the security's own
+                    # syminfo BEFORE the session-anchor decision below, so the
+                    # anchor reads ``self._sec_syminfos[sid]`` (the security
+                    # symbol's session) instead of falling back to the chart
+                    # syminfo. For a cross-symbol HTF in a different exchange
+                    # session this is what keeps the HTF grid aligned to the
+                    # security's session open.
                     resolve_ctx = {
                         'symbol': symbol,
                         'timeframe': resolved_tf,
@@ -1002,6 +977,57 @@ class ScriptRunner:
                     )
                     resolved_path = resolved[sid]
                     sec_ohlcv_paths[sid] = resolved_path
+                    # Now that the real symbol/timeframe are known, redo the
+                    # intraday session-anchor decision (the placeholder TF at
+                    # setup may have been the chart TF, and the syminfo may only
+                    # now be resolved).
+                    if same_tf:
+                        sec_state.session_starts = None
+                        sec_state.session_tz = None
+                    else:
+                        from .security import resolve_session_anchor
+                        si = self._sec_syminfos.get(sid) or self.syminfo
+                        sec_state.session_starts, sec_state.session_tz = (
+                            resolve_session_anchor(si, resolved_tf, self.tz))
+                    # Now that the real symbol/timeframe are known, decide
+                    # whether the live HTF transport applies. ``setup_security_states``
+                    # built the aggregator under the assumption ``sym is None``
+                    # ⇒ same-symbol; reverse that decision if the resolved symbol
+                    # is cross-symbol, or attach one if the timeframe just
+                    # promoted from chart-TF to HTF.
+                    is_same_symbol = (chart_ticker is None
+                                      or str(symbol) == chart_ticker)
+                    needs_aggregator = (not same_tf) and is_same_symbol
+                    if needs_aggregator and sec_state.htf_aggregator is None:
+                        from .htf_aggregator import HTFAggregator
+                        sec_state.htf_aggregator = HTFAggregator(
+                            resolved_tf, self.tz,
+                            session_starts=sec_state.session_starts)
+                    elif not needs_aggregator and sec_state.htf_aggregator is not None:
+                        sec_state.htf_aggregator = None
+                    elif (needs_aggregator
+                          and sec_state.htf_aggregator is not None
+                          and sec_state.htf_aggregator.timeframe != resolved_tf):
+                        # Timeframe resolved to something different from the
+                        # placeholder used at setup — rebuild for the right TF.
+                        from .htf_aggregator import HTFAggregator
+                        sec_state.htf_aggregator = HTFAggregator(
+                            resolved_tf, self.tz,
+                            session_starts=sec_state.session_starts)
+                    # Cross-symbol HTF + lookahead_on: developing bar cannot be
+                    # aggregated from chart OHLCV (wrong instrument). Chart-side
+                    # read returns ``na`` for every chart bar inside an open HTF
+                    # period; the subprocess still advances on closed cross-symbol
+                    # HTF bars, so close[1] at the period boundary delivers the
+                    # just-closed close.
+                    sec_state.na_on_developing = (
+                            (not same_tf)
+                            and (not is_same_symbol)
+                            and sec_state.lookahead is Lookahead.ON
+                    )
+                    # OHLCV source and syminfo were resolved above; spawn the
+                    # security subprocess (or mark as no-process when the
+                    # symbol was downgraded to ``None``).
                     if resolved_path is not None:
                         _spawn_security_process(sid, resolved_path)
                     else:
@@ -1093,7 +1119,8 @@ class ScriptRunner:
                     # On-the-fly aggregation: aggregate sub-TF to chart TF
                     from .bar_magnifier import BarMagnifier
                     chart_tf = str(lib.syminfo.period)
-                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+                    magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
+                                             session_starts=self.syminfo.session_starts)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
             # Initialize calc_on_order_fills snapshot (for COOF or live mode).
@@ -1720,7 +1747,8 @@ class ScriptRunner:
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
-        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz)
+        magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
+                                 session_starts=self.syminfo.session_starts)
 
         trade_num = 0
 
@@ -1980,6 +2008,15 @@ class ScriptRunner:
         out: dict[str, str | PluginSymbol | None] = {}
         for sec_id, entry in sec_data.items():
             if not isinstance(entry, PluginSymbol):
+                # File-mode (backtest) source: cache the security's OWN syminfo
+                # from the sibling ``.toml`` so the session-anchor decision in
+                # ``setup_security_states`` aligns the HTF grid to the security
+                # symbol's exchange session rather than falling back to the
+                # chart's session.
+                if isinstance(entry, (str, Path)) and sec_id not in self._sec_syminfos:
+                    sec_toml = Path(entry).with_suffix('.toml')
+                    if sec_toml.exists():
+                        self._sec_syminfos[sec_id] = SymInfo.load_toml(sec_toml)
                 out[sec_id] = entry
                 continue
             if entry.syminfo is not None:

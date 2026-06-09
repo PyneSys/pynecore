@@ -297,15 +297,30 @@ Each line is prefixed with the security context identifier:
 
 > See [Debugging](../debugging.md#debugging-security-contexts) for more details.
 
+## Session anchoring of intraday higher timeframes
+
+For intraday higher timeframes (minutes and hours), PyneCore anchors the HTF bar grid to the
+**session open**, matching TradingView. On a market that opens at 09:30, a `1H` security therefore
+produces bars at 09:30, 10:30, 11:30… rather than 09:00, 10:00, 11:00. The grid steps in real time
+from the open, so it stays correct across daylight-saving transitions, and the alignment is derived
+from the symbol's own session — a cross-symbol security in a different exchange session anchors to
+*its* open, not the chart's. Markets that open on a whole-`tf` boundary (24/7 crypto, on-hour forex
+and futures) are unaffected: the session-anchored grid is identical to a plain clock-floor there.
+
+> The session open is read from the symbol's `session_starts` metadata. If a security's session
+> information is missing, intraday bars fall back to the UTC clock-floor for that symbol.
+
 ## Known Differences from TradingView
 
 On markets with **shortened trading sessions** (e.g., half-day sessions before holidays), minor
 differences may occur when the chart symbol and the security symbol follow different session
 calendars — one closes early while the other trades a full day. This can cause period boundary
 alignment to differ slightly from TradingView. In practice, this is rare and only affects a handful
-of bars on specific calendar dates. PyneCore's handling of these cases appears to produce more
-consistent results, though TradingView's behavior on irregular sessions may follow internal calendar
-rules that are not publicly documented.
+of bars on specific calendar dates.
+
+Markets with an **intraday recess** (e.g. a lunch break) keep a single grid anchored to the day's
+primary session open; the bar whose window spans the recess simply holds the data of the first
+trade after it, as on TradingView for the common case.
 
 > For technical implementation details (AST transformation, shared memory layout, process lifecycle),
 > see the [request.security() Internals](../advanced/request-security-internals.md) page.

@@ -13,10 +13,13 @@ Architecture:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
 from multiprocessing import Event, Lock
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
+from .datetime import parse_timezone
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
@@ -27,9 +30,9 @@ if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
     from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
-    from zoneinfo import ZoneInfo
     from .resampler import Resampler
     from .htf_aggregator import HTFAggregator
+    from .syminfo import SymInfo, SymInfoSession
 
 
 class Lookahead(Enum):
@@ -167,6 +170,15 @@ class SecurityState:
     # transport — historical bars never emit developing OHLCV.
     is_live: bool = False
 
+    # Intraday session anchoring (chart-side). Populated by
+    # ``setup_security_states`` only when this security's session opens off the
+    # requested HTF grid (e.g. equities 09:30 at 1H). ``None`` selects the pure
+    # UTC clock-floor fast path in ``Resampler.get_bar_time`` — zero overhead for
+    # 24/7, on-hour, and session-aligned instruments. ``session_tz`` is the
+    # security's own exchange timezone (correct even for cross-symbol HTF).
+    session_starts: 'list[SymInfoSession] | None' = None
+    session_tz: ZoneInfo | None = None
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     prev_chart_time: int | None = None
@@ -202,8 +214,16 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
 
     resampler = state.resampler
     assert resampler is not None
-    current_period = resampler.get_bar_time(chart_time, state.tz)
-    prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
+    if state.session_starts is not None:
+        # Off-grid intraday session → anchor HTF bars to the session open,
+        # using the security's own exchange timezone.
+        current_period = resampler.get_bar_time(
+            chart_time, state.session_tz, state.session_starts)
+        prev_period = resampler.get_bar_time(
+            prev_chart_time, state.session_tz, state.session_starts)
+    else:
+        current_period = resampler.get_bar_time(chart_time, state.tz)
+        prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
 
     if (state.lookahead is Lookahead.ON and state.is_live
             and state.htf_aggregator is not None):
@@ -573,11 +593,98 @@ def create_security_protocol(
     return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup, flush
 
 
+# Representative dates for the off-grid session probe — one on each side of the
+# DST boundary so a session that lands on the tf grid only half the year is still
+# detected. Both are Mondays, so the weekday offset arithmetic below is exact.
+_WINTER_PROBE = date(2024, 1, 15)
+_SUMMER_PROBE = date(2024, 7, 15)
+
+
+def _needs_session_anchor(
+    session_starts: 'list[SymInfoSession]',
+    tzinfo: ZoneInfo | None,
+    timeframe: str,
+) -> bool:
+    """
+    Whether intraday ``timeframe`` bars need session anchoring for this market.
+
+    Session anchoring changes nothing when every declared session open already
+    lands on the ``timeframe`` UTC-epoch grid (24/7, on-hour, session-aligned
+    markets), so those keep the zero-overhead clock-floor fast path. The open is
+    probed on both a winter and a summer date to cover both DST offsets. The test
+    is deliberately conservative: it anchors whenever any open is off-grid.
+
+    :param session_starts: Per-trading-day primary opens.
+    :param tzinfo: The market's exchange timezone.
+    :param timeframe: The requested HTF string (e.g. ``"60"``).
+    :return: True if the security loop must pass ``session_starts`` to anchor.
+    """
+    if not session_starts:
+        return False
+    # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle
+    # (mirrors the existing ``from pynecore.lib import ...`` uses in this file).
+    from ..lib import timeframe as tf_module
+    # noinspection PyProtectedMember
+    modifier, _ = tf_module._process_tf(timeframe)
+    if modifier not in ('S', ''):
+        return False  # D/W/M alignment is timezone-driven, not session-anchored
+    tf_seconds = tf_module.in_seconds(timeframe)
+    for probe in (_WINTER_PROBE, _SUMMER_PROBE):
+        for s in session_starts:
+            d = probe + timedelta(days=(s.day - probe.weekday()) % 7)
+            open_sec = int(datetime(
+                d.year, d.month, d.day,
+                s.time.hour, s.time.minute, s.time.second,
+                tzinfo=tzinfo,
+            ).timestamp())
+            if open_sec % tf_seconds != 0:
+                return True
+    return False
+
+
+def resolve_session_anchor(
+    si: 'SymInfo | None',
+    timeframe: str,
+    fallback_tz: ZoneInfo,
+) -> 'tuple[list[SymInfoSession] | None, ZoneInfo | None]':
+    """
+    Decide intraday HTF session anchoring for one security context.
+
+    Returns ``(session_starts, session_tz)`` to store on the ``SecurityState`` so
+    ``_get_confirmed_time`` anchors HTF bars to the session open, or ``(None,
+    None)`` when the market opens on the ``timeframe`` grid (the clock-floor fast
+    path). ``session_tz`` is the security's own exchange timezone — correct even
+    for a cross-symbol HTF in a different session.
+
+    :param si: The security's own ``SymInfo`` (``None`` → no anchoring).
+    :param timeframe: The resolved HTF string (e.g. ``"60"``).
+    :param fallback_tz: Timezone used if the syminfo timezone is missing/invalid.
+    """
+    if si is None or not getattr(si, 'session_starts', None):
+        return None, None
+    if si.timezone:
+        try:
+            # parse_timezone resolves both IANA names and UTC/GMT±HHMM offset
+            # forms (e.g. "UTC-5"), which bare ZoneInfo() rejects.
+            si_tz = parse_timezone(si.timezone)
+        except (ValueError, KeyError):
+            # Unknown / malformed timezone (ZoneInfoNotFoundError is a KeyError;
+            # TimezoneNotFoundError is a ValueError).
+            si_tz = fallback_tz
+    else:
+        si_tz = fallback_tz
+    if _needs_session_anchor(si.session_starts, si_tz, timeframe):
+        return si.session_starts, si_tz
+    return None, None
+
+
 def setup_security_states(
     contexts: dict[str, dict],
     chart_timeframe: str,
     tz: 'ZoneInfo',
     chart_symbol: str | None = None,
+    chart_syminfo: 'SymInfo | None' = None,
+    sec_syminfos: 'dict[str, SymInfo] | None' = None,
 ) -> tuple[dict[str, SecurityState], SyncBlock, dict[str, ResultBlock]]:
     """
     Initialize security states, shared memory, and events from ``__security_contexts__``.
@@ -592,6 +699,12 @@ def setup_security_states(
                         OHLCV would be the wrong instrument. ``None`` (unit-test
                         / legacy callers without symbol context) is treated as
                         "every HTF is same-symbol".
+    :param chart_syminfo: The chart symbol's ``SymInfo``, used as the session
+                        source for same-symbol HTF anchoring. ``None`` disables
+                        anchoring unless a per-security syminfo is supplied.
+    :param sec_syminfos: ``sec_id → SymInfo`` for cross-symbol contexts, used so
+                        each security anchors to its own session/timezone. ``None``
+                        falls back to ``chart_syminfo``.
     :return: (states, sync_block, result_blocks)
     """
     from pynecore.lib import barmerge
@@ -609,6 +722,8 @@ def setup_security_states(
 
         htf_aggregator: HTFAggregator | None = None
         na_on_developing = False
+        anchor_starts: 'list[SymInfoSession] | None' = None
+        anchor_tz: ZoneInfo | None = None
         if is_ltf:
             is_gaps_on = False
             same_tf = False
@@ -644,8 +759,18 @@ def setup_security_states(
                     or sym is None
                     or str(sym) == chart_symbol
                 )
+
+                # Intraday session anchoring: align HTF bars to the session open
+                # (TradingView behaviour) when the open is off the requested tf
+                # grid. Use the security's OWN syminfo — correct even for a
+                # cross-symbol HTF in a different exchange session.
+                si = (sec_syminfos.get(sec_id)
+                      if sec_syminfos is not None else None) or chart_syminfo
+                anchor_starts, anchor_tz = resolve_session_anchor(si, timeframe, tz)
+
                 if is_same_symbol:
-                    htf_aggregator = HTFAggregator(timeframe, tz)
+                    htf_aggregator = HTFAggregator(
+                        timeframe, tz, session_starts=anchor_starts)
                 elif lookahead_mode is Lookahead.ON:
                     # Cross-symbol HTF + lookahead_on: developing bar cannot
                     # be aggregated from chart OHLCV (wrong instrument). The
@@ -668,6 +793,8 @@ def setup_security_states(
             lookahead=lookahead_mode,
             htf_aggregator=htf_aggregator,
             na_on_developing=na_on_developing,
+            session_starts=anchor_starts,
+            session_tz=anchor_tz,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()

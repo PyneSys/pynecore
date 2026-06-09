@@ -544,6 +544,31 @@ def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe:
     return in_session
 
 
+def _intraday_session_args(timeframe: str) -> tuple:
+    """
+    Build the ``(tz, session_starts)`` arguments for :meth:`Resampler.get_bar_time`
+    that anchor an intraday ``timeframe`` to the exchange session open, the way
+    TradingView aligns intraday HTF bars. Returns an empty tuple for daily/weekly/
+    monthly timeframes and when no session is known, keeping the pure UTC
+    clock-floor. Anchoring is a no-op for on-hour / 24-7 markets, so it is always
+    safe to pass for intraday.
+
+    :param timeframe: The requested timeframe string (already validated).
+    :return: ``(tz, session_starts)`` for intraday with a session, else ``()``.
+    """
+    # noinspection PyProtectedMember
+    session_starts = getattr(syminfo, '_session_starts', None)
+    if not session_starts:
+        return ()
+    # noinspection PyProtectedMember
+    modifier, _ = timeframe_module._process_tf(timeframe)
+    if modifier not in ('S', ''):
+        return ()
+    tz_name = getattr(syminfo, 'timezone', None)
+    tz = _parse_timezone(tz_name) if tz_name else None
+    return tz, session_starts
+
+
 @module_property
 def time(timeframe: str | None = None, session: str | None = None, timezone: str | None = None) -> PyneInt:
     """
@@ -576,7 +601,7 @@ def time(timeframe: str | None = None, session: str | None = None, timezone: str
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    bar_time = resampler.get_bar_time(current_time_ms)
+    bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     if session is None:
         # No session specified, return the bar time
@@ -692,7 +717,7 @@ def time_close(timeframe: str | None = None, session: str | None = None, timezon
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    bar_start_time = resampler.get_bar_time(current_time_ms)
+    bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     # Calculate bar close time by adding timeframe duration
     try:

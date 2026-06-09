@@ -76,13 +76,17 @@ class DevelopingBar:
 class HTFAggregator:
     """Per-sec_id aggregator of chart OHLCV into a developing HTF bar."""
 
-    __slots__ = ('_timeframe', '_tz', '_resampler', '_state')
+    __slots__ = ('_timeframe', '_tz', '_resampler', '_state', '_session_starts')
 
-    def __init__(self, timeframe: str, tz: 'ZoneInfo'):
+    def __init__(self, timeframe: str, tz: 'ZoneInfo',
+                 session_starts: 'list | None' = None):
         self._timeframe = timeframe
         self._tz = tz
         self._resampler = Resampler.get_resampler(timeframe)
         self._state: DevelopingBar | None = None
+        # Intraday session anchoring (TradingView aligns HTF bars to the session
+        # open). ``None`` keeps the pure clock-floor — see ``Resampler.get_bar_time``.
+        self._session_starts = session_starts
 
     @property
     def timeframe(self) -> str:
@@ -117,28 +121,31 @@ class HTFAggregator:
             - ``closed_or_none`` — the previous period's final accumulated bar
               when ``is_new_period`` is True, else None.
         """
-        period_start = self._resampler.get_bar_time(chart_time_ms, self._tz)
+        period_start = self._resampler.get_bar_time(
+            chart_time_ms, self._tz, self._session_starts)
 
         if self._state is None:
-            self._state = DevelopingBar(
+            fresh = DevelopingBar(
                 period_start=period_start,
                 open=chart_open, high=chart_high, low=chart_low,
                 close=chart_close, volume=chart_volume,
                 last_chart_time_ms=chart_time_ms,
                 last_chart_volume=chart_volume,
             )
-            return True, self._state, None
+            self._state = fresh
+            return True, fresh, None
 
         if period_start != self._state.period_start:
             closed = self._state
-            self._state = DevelopingBar(
+            fresh = DevelopingBar(
                 period_start=period_start,
                 open=chart_open, high=chart_high, low=chart_low,
                 close=chart_close, volume=chart_volume,
                 last_chart_time_ms=chart_time_ms,
                 last_chart_volume=chart_volume,
             )
-            return True, self._state, closed
+            self._state = fresh
+            return True, fresh, closed
 
         self._state.update(chart_time_ms, chart_high, chart_low,
                            chart_close, chart_volume)
