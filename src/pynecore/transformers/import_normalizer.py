@@ -294,6 +294,17 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
 
         self.current_function = node.name
 
+        # Parameter default values are evaluated in the ENCLOSING scope at def-execution
+        # time, not inside the function body. Visit them before the parameter names enter
+        # `function_parameters`, otherwise a default that references a lib module shadowed
+        # by a same-named parameter (e.g. a param `position` defaulting to
+        # `position.top_center`) is left unrewritten and the lib import is dropped.
+        node.args.defaults = [cast(ast.expr, self.visit(d)) for d in node.args.defaults]
+        node.args.kw_defaults = [
+            cast(ast.expr, self.visit(d)) if d is not None else None
+            for d in node.args.kw_defaults
+        ]
+
         # Collect function parameters
         for arg in node.args.args:
             self.function_parameters.add(arg.arg)
