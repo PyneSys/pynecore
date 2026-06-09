@@ -1,8 +1,9 @@
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
+from functools import wraps
 from inspect import signature
 from collections import defaultdict
-from types import FunctionType
+from types import FunctionType, UnionType
 
 from .function_isolation import isolate_function
 from ..types.base import StrLiteral
@@ -16,17 +17,20 @@ __scope_id__ = ""
 
 
 class Implementation:
-    __slots__ = ('func', 'sig', 'type_hints', 'param_types')
+    __slots__ = ('func', 'sig', 'type_hints', 'param_types', 'call_id')
     func: Callable
     sig: Any  # Signature object
     type_hints: dict
     param_types: tuple  # Cached parameter types for quick checking
+    call_id: str  # Per-implementation isolation call id
 
-    def __init__(self, func: Callable, sig: Any, type_hints: dict, param_types: tuple):
+    def __init__(self, func: Callable, sig: Any, type_hints: dict, param_types: tuple,
+                 call_id: str):
         self.func = func
         self.sig = sig
         self.type_hints = type_hints
         self.param_types = param_types
+        self.call_id = call_id
 
 
 _registry: dict[str, list[Implementation]] = defaultdict(list)
@@ -36,6 +40,23 @@ _dispatchers: dict[str, Callable] = {}  # Store dispatchers separately
 
 def _check_type(value: Any, expected_type: Type) -> bool:
     """Cached type checking for better performance with Pine Script compatibility"""
+    # Parameterized containers (list[T], dict[K, V], ...): isinstance() rejects
+    # parameterized generics. Match on the container type, then discriminate on a
+    # sample element -- overloads can differ only in their element types
+    # (map<string, string> vs map<string, float>)
+    _origin = get_origin(expected_type)
+    if isinstance(_origin, type) and _origin is not UnionType:
+        if isinstance(value, _origin):
+            _args = get_args(expected_type)
+            if _args and isinstance(value, dict):
+                if value:
+                    _key, _val = next(iter(value.items()))
+                    return _check_type(_key, _args[0]) and _check_type(_val, _args[1])
+            elif _args and isinstance(value, (list, tuple)) and value:
+                return _check_type(value[0], _args[0])
+            return True
+        expected_type = cast(Type, _origin)
+
     # Direct type match
     if isinstance(value, expected_type):
         return True
@@ -64,10 +85,11 @@ def _check_type(value: Any, expected_type: Type) -> bool:
 
         # For non-basic types, check if NA's type matches
         na_type = value.type
+        # A typeless `na` is assignable to anything, like in Pine
+        if na_type is None:
+            return True
         # Handle the case when na_type is an actual instance and not a type
         if not isinstance(na_type, type):
-            if na_type is None:
-                return isinstance(None, expected_type)
             na_type = type(na_type)
         return na_type is expected_type
 
@@ -111,7 +133,10 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
     # Register with typing.overload for IDE support
     typing_overload(func)
 
-    # Pre-calculate and cache implementation info
+    # Pre-calculate and cache implementation info; the call id carries the
+    # implementation's identity so different overloads never share one
+    # isolation cache slot (a shared slot would rebuild one implementation's
+    # code with another one's globals)
     impl = Implementation(
         func=func,
         sig=signature(func),
@@ -120,11 +145,16 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
             (name, get_type_hints(func).get(name, Any))
             for name in signature(func).parameters
         ),
+        call_id=f"__overloaded__·{qualname_with_line}",
     )
     _implementations[qualname_with_line] = impl
 
     if qualname not in _dispatchers:
+        # The dispatcher must carry the implementation's metadata (__name__ in particular):
+        # for exported library functions the @export decorator sits above @overload and looks
+        # up the module-level Exported proxy by the wrapped callable's __name__.
         # noinspection PyShadowingNames
+        @wraps(func)
         def dispatcher(*args: Any, **kwargs: Any) -> Any:
             # Quick path: try direct positional args match first
             if not kwargs:
@@ -132,7 +162,7 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
                     if len(args) == len(impl.param_types):
                         if all(_check_type(arg, type_)
                                for arg, (_, type_) in zip(args, impl.param_types)):
-                            return isolate_function(impl.func, '__overloaded__', __scope_id__)(*args)
+                            return isolate_function(impl.func, impl.call_id, __scope_id__)(*args)
 
             # Slower path: handle mixed args/kwargs
             for impl in _registry[qualname]:
@@ -143,7 +173,7 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
                     if all(_check_type(value, impl.type_hints[name])
                            for name, value in bound.arguments.items()
                            if name in impl.type_hints):
-                        return isolate_function(impl.func, '__overloaded__', __scope_id__)(*args, **kwargs)
+                        return isolate_function(impl.func, impl.call_id, __scope_id__)(*args, **kwargs)
                 except TypeError:
                     continue
 

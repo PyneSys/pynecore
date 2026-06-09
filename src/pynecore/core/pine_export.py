@@ -16,10 +16,16 @@ class Exported(Generic[F]):
     - No annotation: Exported (falls back to Any)
     """
     __fn__: Optional[F] = None
+    __name__: str
 
     def set(self, client: F):
         """Set the client function"""
         self.__fn__ = client
+        # Expose the client's name so callers that inspect the callable
+        # (e.g. method_call's builtin-method name check) see the real one
+        name = getattr(client, '__name__', None)
+        if name is not None:
+            self.__name__ = name
 
     def __call__(self, *args, **kwargs) -> Any:
         if self.__fn__ is None:

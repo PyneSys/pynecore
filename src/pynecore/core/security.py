@@ -150,8 +150,8 @@ def create_chart_protocol(
     sync_block: SyncBlock,
     deferred_resolve_fn: 'Callable[[str, str, str | None], None] | None' = None,
     lazy_spawn_fn: 'Callable[[str], None] | None' = None,
-    same_context_ids: frozenset[str] = frozenset(),
-    no_process_ids: frozenset[str] = frozenset(),
+    same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
+    no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, Process] | None' = None,
@@ -440,7 +440,13 @@ def setup_security_states(
     result_blocks: dict[str, ResultBlock] = {}
 
     for sec_id, ctx in contexts.items():
-        timeframe = str(ctx.get('timeframe', chart_timeframe))
+        tf_val = ctx.get('timeframe', chart_timeframe)
+        if tf_val is None or tf_val == '':
+            # Runtime-dependent (deferred) timeframe gets the chart TF as a
+            # placeholder until the runtime ``__sec_signal__`` resolves it;
+            # an empty string IS the chart's timeframe (Pine semantics)
+            tf_val = chart_timeframe
+        timeframe = str(tf_val)
         is_ltf = bool(ctx.get('is_ltf', False))
 
         anchor_starts: 'list[SymInfoSession] | None' = None
@@ -484,7 +490,8 @@ def setup_security_states(
 
 
 def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn,
-                    active_security=None, same_context: frozenset[str] = frozenset()):
+                    active_security=None,
+                    same_context: 'set[str] | frozenset[str]' = frozenset()):
     """
     Inject protocol functions and __active_security__ into a script module's globals.
 

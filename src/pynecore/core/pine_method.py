@@ -1,5 +1,8 @@
+import sys
+from types import ModuleType
 from typing import Any, Callable
 from ..lib import array, matrix, box, line, label, table, linefill, polyline
+from ..lib import map as map_lib
 from ..types import matrix as matrix_types
 from ..types import line as line_types
 from ..types import box as box_types
@@ -9,6 +12,7 @@ from ..types import linefill as linefill_types
 from ..types import polyline as polyline_types
 
 from .function_isolation import isolate_function
+from .pine_export import Exported
 
 __scope_id__ = ''
 
@@ -34,6 +38,8 @@ def _get_builtin_method(method_name: str, var: Any) -> Callable | None:
         match var_type:
             case _ if var_type is list:
                 return getattr(array, method_name)
+            case _ if var_type is dict:
+                return getattr(map_lib, method_name)
             case _ if var_type is matrix_types.Matrix:
                 return getattr(matrix, method_name)
             case _ if var_type is line_types.Line:
@@ -89,6 +95,28 @@ def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: in
         except AttributeError:
             pass
 
+        # Methods exported by a compiled library are module-level Exported proxies.
+        # Try the module that defines the receiver's UDT class first, then the
+        # caller's own module, then every library module the caller imports -- a
+        # library can export methods on another library's UDT, so the defining
+        # module is not always the UDT's own
+        mod = sys.modules.get(type(var).__module__)
+        _method = getattr(mod, method, None) if mod is not None else None
+        if isinstance(_method, Exported):
+            return (isolate_function(_method, _method_call_id(_method), __scope_id__, _closure_vars_count)
+                    (var, *args, **kwargs))
+        caller_globals = sys._getframe(1).f_globals
+        _method = caller_globals.get(method)
+        if isinstance(_method, Exported):
+            return (isolate_function(_method, _method_call_id(_method), __scope_id__, _closure_vars_count)
+                    (var, *args, **kwargs))
+        for _gval in caller_globals.values():
+            if isinstance(_gval, ModuleType) and _gval.__name__.startswith('lib.'):
+                _method = getattr(_gval, method, None)
+                if isinstance(_method, Exported):
+                    return (isolate_function(_method, _method_call_id(_method), __scope_id__,
+                                             _closure_vars_count)(var, *args, **kwargs))
+
         assert False, f'No such method: {var}->{method}'
 
     # It is a local method, it should be a local function
@@ -106,7 +134,20 @@ def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: in
             pre_args = ()
 
         # If not in kwargs, check if the method has closure arguments information on the function itself
-        return (isolate_function(method, '__method_call__', __scope_id__, _closure_vars_count)
+        return (isolate_function(method, _method_call_id(method), __scope_id__, _closure_vars_count)
                 (*pre_args, var, *args, **kwargs))
 
     return None
+
+
+def _method_call_id(func: Callable) -> str:
+    """
+    Build a per-function isolation call id. A constant id would make every method
+    share one isolation cache slot, rebuilding one method's code with another
+    method's (even another module's) globals.
+
+    :param func: The method callable (possibly an Exported proxy)
+    :return: The call id string
+    """
+    target = func.__fn__ if isinstance(func, Exported) else func
+    return f"__method_call__·{getattr(target, '__module__', '?')}.{getattr(target, '__qualname__', '?')}"

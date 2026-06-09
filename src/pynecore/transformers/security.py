@@ -1,5 +1,6 @@
 import ast
 import copy
+import hashlib
 
 
 # Strategy state accessors are meaningful only in the chart context — the
@@ -52,7 +53,11 @@ class SecurityTransformer(ast.NodeTransformer):
         self._module_file: str = '<script>'
 
     def _gen_id(self) -> str:
-        sec_id = f"sec\xb7{self._counter}"
+        # The module hash keeps sec ids unique across modules: the main script and
+        # any imported library may each have their own security calls, and their
+        # contexts are merged into one registry by the runner
+        module_hash = hashlib.sha1(self._module_file.encode()).hexdigest()[:8]
+        sec_id = f"sec\xb7{module_hash}\xb7{self._counter}"
         self._counter += 1
         return sec_id
 

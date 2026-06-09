@@ -368,9 +368,20 @@ class ScriptRunner:
             )
 
         # --- Security contexts setup ---
-        sec_contexts: dict[str, dict] | None = getattr(
-            self.script_module, '__security_contexts__', None
-        )
+        # Imported library modules can call request.security() too: merge their
+        # contexts (sec ids carry a module hash, so they cannot collide) and
+        # remember every module that needs the security protocol injected
+        sec_modules: list = [self.script_module]
+        for _lib_title, _lib_main in script._registered_libraries:
+            _lib_mod = sys.modules.get(getattr(_lib_main, '__module__', ''))
+            if _lib_mod is not None and _lib_mod is not self.script_module:
+                sec_modules.append(_lib_mod)
+        _merged_contexts: dict[str, dict] = {}
+        for _sec_mod in sec_modules:
+            _mod_contexts: dict[str, dict] | None = getattr(_sec_mod, '__security_contexts__', None)
+            if _mod_contexts:
+                _merged_contexts.update(_mod_contexts)
+        sec_contexts: dict[str, dict] | None = _merged_contexts or None
         sec_processes: 'dict[str, Process]' = {}
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
@@ -401,18 +412,26 @@ class ScriptRunner:
                 same_context_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
                     sym = ctx.get('symbol')
-                    tf = str(ctx.get('timeframe', chart_tf))
+                    tf_val = ctx.get('timeframe', chart_tf)
+                    if tf_val == '':
+                        # An empty string selects the chart's timeframe (Pine semantics)
+                        tf_val = chart_tf
+                    tf = str(tf_val)
                     if sym is not None and str(sym) == chart_ticker and tf == chart_tf:
                         same_context_ids.add(sec_id)
 
-                # Separate static (symbol known) and deferred (symbol=None) contexts
+                # Separate static and deferred contexts. The security transformer
+                # stores None for symbol/timeframe expressions that are not
+                # evaluable at module level (inputs, function parameters), so a
+                # context with either of them None must wait for the runtime
+                # ``__sec_signal__`` values instead of being resolved eagerly.
                 # Same-context ids are excluded from both (no process needed)
                 static_contexts = {}
                 deferred_sec_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
                     if sec_id in same_context_ids:
                         continue
-                    if ctx.get('symbol') is not None:
+                    if ctx.get('symbol') is not None and ctx.get('timeframe', '') is not None:
                         static_contexts[sec_id] = ctx
                     else:
                         deferred_sec_ids.add(sec_id)
@@ -429,7 +448,7 @@ class ScriptRunner:
                         ignored_sec_ids.add(sec_id)
 
                 # No-process IDs: both same-context and ignored
-                no_process_ids = frozenset(same_context_ids | ignored_sec_ids)
+                no_process_ids: set[str] = set(same_context_ids | ignored_sec_ids)
 
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
                     sec_contexts, chart_tf, self.tz, chart_syminfo=self.syminfo,
@@ -471,6 +490,19 @@ class ScriptRunner:
                     # Resolve actual timeframe
                     current_chart_tf = str(lib.syminfo.period)
                     resolved_tf = timeframe if timeframe else current_chart_tf
+                    # The context may turn out to be the chart's own symbol and
+                    # timeframe: no subprocess and no data file is needed, the
+                    # inline same-context write/read path serves it
+                    if (chart_ticker is not None and str(symbol) == chart_ticker
+                            and resolved_tf == current_chart_tf):
+                        _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                        _state.timeframe = resolved_tf
+                        _state.same_timeframe = True
+                        _state.resampler = None
+                        _state.htf_aggregator = None
+                        same_context_ids.add(sid)
+                        no_process_ids.add(sid)
+                        return
                     # Update SecurityState with correct timeframe info
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     sec_state.timeframe = resolved_tf
@@ -520,19 +552,24 @@ class ScriptRunner:
                                         sec_si.currency, target_cur_str
                                     )
 
-                frozen_same_ctx = frozenset(same_context_ids)
+                # Passed BY REFERENCE (like ``no_process_ids``): the deferred-resolve
+                # callback can discover late that a context is the chart's own
+                # symbol+timeframe and append it, and every consumer — the protocol
+                # closures and the modules' ``__same_context__`` — must see that
+                same_ctx_ref = same_context_ids
                 signal_fn, write_fn, read_fn, wait_fn, sec_cleanup_fn = create_chart_protocol(
                     sec_states, sec_sync_block,
                     deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
                     lazy_spawn_fn=_lazy_spawn if static_contexts else None,
-                    same_context_ids=frozen_same_ctx,
+                    same_context_ids=same_ctx_ref,
                     no_process_ids=no_process_ids,
                     result_blocks=sec_result_blocks if same_context_ids else None,
                     currency_conversions=currency_conversions or None,
                     sec_processes=sec_processes,
                 )
-                inject_protocol(self.script_module, signal_fn, write_fn, read_fn, wait_fn,
-                                same_context=frozen_same_ctx)
+                for _sec_mod in sec_modules:
+                    inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
+                                    same_context=same_ctx_ref)
 
             # --timeframe mode: magnifier_iter provides sub-TF data
             if self._magnifier_iter is not None:
