@@ -941,11 +941,20 @@ class SimPosition(PositionBase):
                     # Modify sizes
                     self.size += size
                     # Handle too small sizes because of floating point inaccuracy and rounding
-                    if _size_round(self.size) == 0.0:
+                    position_flat = _size_round(self.size) == 0.0
+                    if position_flat:
                         size -= self.size
                         self.size = 0.0
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
                     trade.size += size
+                    if position_flat:
+                        # `size` already absorbed the position residual above, so the
+                        # trade that flattened the position is fully closed. Snap off
+                        # float epsilon so it is removed from open_trades instead of
+                        # lingering as a ~0-size ghost trade — a stale leg would force
+                        # avg_price to NA and poison equity (and every subsequent
+                        # percent-of-equity sizing) on later bars.
+                        trade.size = 0.0
                     order.size -= size
 
                     # Cancel exit orders for closed trades (TradingView behavior)
