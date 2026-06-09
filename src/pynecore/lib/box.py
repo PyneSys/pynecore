@@ -4,7 +4,7 @@ from typing import overload
 from ..core.module_property import module_property
 
 from ..types.box import Box
-from ..types.na import NA
+from ..types.na import NA, na_int, na_float
 from ..types.chart import ChartPoint
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
@@ -13,7 +13,7 @@ _registry: list[Box] = []
 
 
 @overload
-def new(left: ChartPoint, top: ChartPoint, border_color: _color.Color = _color.blue,
+def new(top_left: ChartPoint, bottom_right: ChartPoint, border_color: _color.Color = _color.blue,
         border_width: int = 1, border_style: _line.LineEnum = _line.style_solid,
         extend: _extend.Extend = _extend.none, xloc: _xloc.XLoc = _xloc.bar_index,
         bgcolor: _color.Color = _color.blue, text: str = "", text_size: _size.Size = _size.auto,
@@ -34,27 +34,31 @@ def new(left: int | float, top: float, right: int | float, bottom: float,
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
 
 
-def new(left, top=None, right=None, bottom=None,
+def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | None = None,
+        right: int | float | None = None, bottom: float | None = None,
         border_color: _color.Color = _color.blue, border_width: int = 1,
         border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
         xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
         text_size: _size.Size = _size.auto, text_color: _color.Color = _color.black,
         text_halign: _text.AlignEnum = _text.align_center, text_valign: _text.AlignEnum = _text.align_center,
         text_wrap: _text.WrapEnum = _text.wrap_none, text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box:
+        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none,
+        top_left: ChartPoint | None = None, bottom_right: ChartPoint | None = None) -> Box:
     """
     Creates a new box object.
 
     Two call shapes are accepted (Pine-compatible):
-    - ``box.new(left, top, ...)`` where ``left`` is the top-left corner ``chart.point``
-      and ``top`` is the bottom-right corner ``chart.point``.
+    - ``box.new(top_left, bottom_right, ...)`` where both arguments are ``chart.point`` objects
+      (the top-left and bottom-right corners).
     - ``box.new(left, top, right, bottom, ...)`` where ``left`` / ``right`` are bar index
       (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
       and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated
       to int to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
 
-    :param left: Top-left ``chart.point`` (point form), or bar index / bar time of the left border (coordinate form)
-    :param top: Bottom-right ``chart.point`` (point form), or price of the top border (coordinate form)
+    :param left: Bar index / bar time of the left border (coordinate form), or the top-left corner
+                 ``chart.point`` (point form, when passed as the first positional argument)
+    :param top: Price of the top border (coordinate form), or the bottom-right corner
+                ``chart.point`` when the first positional argument is a ``chart.point``
     :param right: Bar index / bar time of the right border (coordinate form only)
     :param bottom: Price of the bottom border (coordinate form only)
     :param border_color: Color of the four borders
@@ -72,22 +76,27 @@ def new(left, top=None, right=None, bottom=None,
     :param text_font_family: The font family of the text
     :param force_overlay: If true, the drawing will display on the main chart pane
     :param text_formatting: The formatting of the displayed text
+    :param top_left: Top-left corner ``chart.point`` (point form, keyword equivalent of the first positional)
+    :param bottom_right: Bottom-right corner ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A box object
     """
+    if top_left is not None:
+        left = top_left
+    if bottom_right is not None:
+        top = bottom_right
     if isinstance(left, ChartPoint):
-        top_left = left
-        bottom_right = top
+        bottom_right_point = top if isinstance(top, ChartPoint) else left
         if xloc == _xloc.bar_time:
-            left_val, top_val = top_left.time, top_left.price
-            right_val, bottom_val = bottom_right.time, bottom_right.price
+            left_val, top_val = left.time, left.price
+            right_val, bottom_val = bottom_right_point.time, bottom_right_point.price
         else:
-            left_val, top_val = top_left.index, top_left.price
-            right_val, bottom_val = bottom_right.index, bottom_right.price
+            left_val, top_val = left.index, left.price
+            right_val, bottom_val = bottom_right_point.index, bottom_right_point.price
     else:
-        left_val = int(left) if isinstance(left, float) else left
-        top_val = top
-        right_val = int(right) if isinstance(right, float) else right
-        bottom_val = bottom
+        left_val = int(left) if isinstance(left, (int, float)) else na_int
+        top_val = top if isinstance(top, (int, float)) else na_float
+        right_val = int(right) if isinstance(right, (int, float)) else na_int
+        bottom_val = bottom if isinstance(bottom, (int, float)) else na_float
 
     box = Box(
         left=left_val,

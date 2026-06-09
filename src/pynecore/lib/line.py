@@ -4,7 +4,7 @@ from typing import overload
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.line import LineEnum, Line
-from ..types.na import NA
+from ..types.na import NA, na_int, na_float
 from ..lib import xloc as _xloc, extend as _extend, color as _color
 
 _registry: list[Line] = []
@@ -18,7 +18,7 @@ style_solid = LineEnum('sol')
 
 
 @overload
-def new(x1: ChartPoint, y1: ChartPoint, xloc: _xloc.XLoc = _xloc.bar_index,
+def new(first_point: ChartPoint, second_point: ChartPoint, xloc: _xloc.XLoc = _xloc.bar_index,
         extend: _extend.Extend = _extend.none, color: _color.Color = _color.blue,
         style: LineEnum = style_solid, width: int = 1, force_overlay: bool = False) -> Line: ...
 
@@ -30,23 +30,26 @@ def new(x1: int | float, y1: float, x2: int | float, y2: float,
         width: int = 1, force_overlay: bool = False) -> Line: ...
 
 
-def new(x1, y1=None, x2=None, y2=None,
+def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | None = None,
+        x2: int | float | None = None, y2: float | None = None,
         xloc: _xloc.XLoc = _xloc.bar_index, extend: _extend.Extend = _extend.none,
         color: _color.Color = _color.blue, style: LineEnum = style_solid,
-        width: int = 1, force_overlay: bool = False) -> Line:
+        width: int = 1, force_overlay: bool = False,
+        first_point: ChartPoint | None = None, second_point: ChartPoint | None = None) -> Line:
     """
     Creates a new line object.
 
     Two call shapes are accepted (Pine-compatible):
-    - ``line.new(x1, y1, ...)`` where ``x1`` is the first ``chart.point`` and
-      ``y1`` is the second ``chart.point``.
+    - ``line.new(first_point, second_point, ...)`` where both arguments are ``chart.point`` objects.
     - ``line.new(x1, y1, x2, y2, ...)`` where ``x1`` / ``x2`` are bar index
       (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
       and ``y1`` / ``y2`` are prices. Float ``x1`` / ``x2`` are truncated to int
       to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
 
-    :param x1: First ``chart.point`` (point form), or bar index / bar time of the first point (coordinate form)
-    :param y1: Second ``chart.point`` (point form), or price of the first point (coordinate form)
+    :param x1: Bar index / bar time of the first point (coordinate form), or the first
+               ``chart.point`` (point form, when passed as the first positional argument)
+    :param y1: Price of the first point (coordinate form), or the second ``chart.point`` when
+               the first positional argument is a ``chart.point``
     :param x2: Bar index / bar time of the second point (coordinate form only)
     :param y2: Price of the second point (coordinate form only)
     :param xloc: Possible values: ``xloc.bar_index`` and ``xloc.bar_time``
@@ -57,22 +60,27 @@ def new(x1, y1=None, x2=None, y2=None,
                   ``line.style_arrow_both``
     :param width: Line width in pixels
     :param force_overlay: If true, the drawing will display on the main chart pane
+    :param first_point: First ``chart.point`` (point form, keyword equivalent of the first positional)
+    :param second_point: Second ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A line object
     """
+    if first_point is not None:
+        x1 = first_point
+    if second_point is not None:
+        y1 = second_point
     if isinstance(x1, ChartPoint):
-        first_point = x1
-        second_point = y1
+        second = y1 if isinstance(y1, ChartPoint) else x1
         if xloc == _xloc.bar_time:
-            x1_val, y1_val = first_point.time, first_point.price
-            x2_val, y2_val = second_point.time, second_point.price
+            x1_val, y1_val = x1.time, x1.price
+            x2_val, y2_val = second.time, second.price
         else:
-            x1_val, y1_val = first_point.index, first_point.price
-            x2_val, y2_val = second_point.index, second_point.price
+            x1_val, y1_val = x1.index, x1.price
+            x2_val, y2_val = second.index, second.price
     else:
-        x1_val = int(x1) if isinstance(x1, float) else x1
-        y1_val = y1
-        x2_val = int(x2) if isinstance(x2, float) else x2
-        y2_val = y2
+        x1_val = int(x1) if isinstance(x1, (int, float)) else na_int
+        y1_val = y1 if isinstance(y1, (int, float)) else na_float
+        x2_val = int(x2) if isinstance(x2, (int, float)) else na_int
+        y2_val = y2 if isinstance(y2, (int, float)) else na_float
 
     line_obj = Line(
         x1=x1_val,

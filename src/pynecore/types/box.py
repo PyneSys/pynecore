@@ -3,15 +3,17 @@ from dataclasses import dataclass
 
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
+from .na import NA
 
 
 @dataclass(slots=True)
 class Box:
-    # Required parameters - coordinates
-    left: int  # Bar index or UNIX time
-    top: float  # Price of the top border
-    right: int  # Bar index or UNIX time
-    bottom: float  # Price of the bottom border
+    # Required parameters - coordinates (``na`` when set from a chart.point that lacks the
+    # corresponding coordinate for the active xloc)
+    left: int | NA  # Bar index or UNIX time
+    top: float | NA  # Price of the top border
+    right: int | NA  # Bar index or UNIX time
+    bottom: float | NA  # Price of the bottom border
 
     # Optional parameters with defaults
     border_color: Optional[_color.Color] = None
