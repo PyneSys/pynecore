@@ -27,6 +27,7 @@ from pynecore.core.broker.exceptions import (
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     BrokerEvent,
     CapabilityLevel,
@@ -826,6 +827,169 @@ def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):
         assert engine._restart_entry_scan_done is True  # type: ignore[attr-defined]
         assert len(b.entry_calls) == 1
         assert b.entry_calls[0].retry_seq == 1
+
+
+# === Read-path backstop: untranslated transient faults park, never crash ===
+#
+# A plugin is contractually expected to translate a transient connectivity fault
+# on a state-query READ into ``ExchangeConnectionError``. When a less-carefully-
+# written plugin lets a raw provider/socket error escape instead, the engine's
+# read-only bridge ``_run_async_read`` is the central safety net: it maps the
+# untranslated transient to ``ExchangeConnectionError`` so the existing park-and-
+# retry sites handle it rather than the raw error tearing down the live run.
+# Reads are idempotent, so retry-next-bar is always safe. Mirrors the real
+# cTrader net-drop crash on a per-bar reconcile ``get_position``.
+
+
+def __test_reconcile_read_raw_retryable_provider_error_maps_to_exchange_connection__():
+    """A raw retryable ``ProviderError`` on the reconcile ``get_position`` read
+    is mapped to ``ExchangeConnectionError`` (the engine then parks + retries)."""
+    b = MockBroker()
+    b.raise_on_next_get_position = TransientProviderError("net dropped mid-read")
+    engine, _ = _mk_engine(b)
+    with pytest.raises(ExchangeConnectionError):
+        engine.reconcile()
+
+
+def __test_reconcile_read_stdlib_connection_and_timeout_map_to_exchange_connection__():
+    """Raw stdlib ``ConnectionError`` / ``TimeoutError`` on a read map to
+    ``ExchangeConnectionError`` too — covers a plugin that lets a socket/timeout
+    fault propagate (or a wedged dispatch-bridge ``result(timeout=...)``)."""
+    for raw in (ConnectionError("socket gone"), TimeoutError("read timed out")):
+        b = MockBroker()
+        b.raise_on_next_get_position = raw
+        engine, _ = _mk_engine(b)
+        with pytest.raises(ExchangeConnectionError):
+            engine.reconcile()
+
+
+def __test_reconcile_read_non_retryable_provider_error_fails_loud__():
+    """A non-retryable ``ProviderError`` (permanent misconfig) is NOT mapped — it
+    propagates so the run fails loud instead of looping forever."""
+    b = MockBroker()
+    b.raise_on_next_get_position = ProviderError("unknown symbol")  # retryable=False
+    engine, _ = _mk_engine(b)
+    with pytest.raises(ProviderError) as excinfo:
+        engine.reconcile()
+    # Stays the original provider error, NOT silently reclassified to a reconnect.
+    assert not isinstance(excinfo.value, ExchangeConnectionError)
+
+
+def __test_restart_scan_raw_retryable_provider_error_parks_and_retries__(tmp_path):
+    """End-to-end: a raw retryable ``ProviderError`` from the restart-scan
+    ``get_open_orders`` parks the sync and retries, identical to an explicit
+    ``ExchangeConnectionError`` — proving the backstop prevents the crash.
+
+    Sibling of ``__test_restart_scan_connection_error_skips_sync_and_retries__``
+    with an *untranslated* transient instead of a broker-taxonomy one.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    bumped_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=1,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.raise_on_next_get_open_orders = TransientProviderError("broker link dropped")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)  # scan hits the raw transient -> mapped + parked, no crash
+
+        assert len(b.entry_calls) == 0
+        assert engine._restart_entry_scan_done is False  # type: ignore[attr-defined]
+
+        b.open_orders = [_live_working_order(bumped_coid)]
+        engine.sync(BAR_TS)  # broker recovered -> scan + adoption
+
+        assert engine._restart_entry_scan_done is True  # type: ignore[attr-defined]
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].retry_seq == 1
+
+
+# === Write-path backstop: untranslated dispatch transients halt, never dup ===
+#
+# The complement of the read backstop. A WRITE drop is disposition-ambiguous: a
+# retry could duplicate a landed order, a blind park could strand a never-sent
+# one. Only the plugin can tell pre-send from post-send, so an *untranslated*
+# transient escaping a direct order write (``execute_*`` / ``modify_*``) is
+# routed by ``_run_async_write`` to a controlled ``BrokerManualInterventionError``
+# halt — strictly better than a raw crash, and only reachable for a contract-
+# violating plugin. A plugin that DOES translate (ExchangeConnectionError /
+# OrderDispositionUnknownError) is unaffected.
+
+
+def __test_write_untranslated_retryable_transient_halts_for_manual_intervention__():
+    """A raw retryable ``ProviderError`` escaping ``execute_entry`` latches a
+    manual-intervention halt and does NOT re-dispatch (no duplicate order)."""
+    b = MockBroker()
+    b.raise_on_next_entry = TransientProviderError("link dropped after entry send")
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    # Surfaces now or latches for the next ``raise_if_halted`` — never a silent
+    # re-dispatch.
+    try:
+        engine.sync(BAR_TS)
+    except BrokerManualInterventionError:
+        pass
+    assert engine.halted is True
+    with pytest.raises(BrokerManualInterventionError):
+        engine.raise_if_halted()
+    # Attempted exactly once — the ambiguous write is not retried.
+    assert len(b.entry_calls) == 1
+
+
+def __test_write_stdlib_connection_error_halts_for_manual_intervention__():
+    """A raw stdlib ``ConnectionError`` on a write halts too (same ambiguity)."""
+    b = MockBroker()
+    b.raise_on_next_entry = ConnectionError("socket reset mid-dispatch")
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    try:
+        engine.sync(BAR_TS)
+    except BrokerManualInterventionError:
+        pass
+    assert engine.halted is True
+
+
+def __test_write_disposition_unknown_parks_without_halt__():
+    """A plugin that DOES translate a post-send drop
+    (``OrderDispositionUnknownError``) is parked for verification, NOT halted —
+    the contract path is unaffected by the backstop."""
+    b = MockBroker()
+    b.raise_on_next_entry = OrderDispositionUnknownError(
+        "entry ack timed out", client_order_id="coid-x",
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    engine.sync(BAR_TS)
+
+    assert engine.halted is False
+
+
+def __test_write_non_retryable_provider_error_fails_loud_without_halt__():
+    """A non-retryable ``ProviderError`` on a write is NOT swallowed into a halt —
+    it propagates so a permanent misconfiguration fails loud."""
+    b = MockBroker()
+    b.raise_on_next_entry = ProviderError("unsupported order type")  # retryable=False
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    with pytest.raises(ProviderError) as excinfo:
+        engine.sync(BAR_TS)
+    assert not isinstance(excinfo.value, BrokerManualInterventionError)
+    assert engine.halted is False
 
 
 def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):

@@ -40,6 +40,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
+from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.core.broker.idempotency import (
     KIND_CLOSE,
     KIND_ENTRY,
@@ -1343,7 +1344,7 @@ class OrderSyncEngine:
             self._consume_plugin_resolutions()
         if not self._pending_verification and not self._persisted_pending_anchors:
             return
-        orders = self._run_async(self._broker.get_open_orders(self._symbol))
+        orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
         by_coid = {o.client_order_id: o for o in orders if o.client_order_id}
         for coid in list(self._pending_verification):
             order = by_coid.get(coid)
@@ -2176,7 +2177,7 @@ class OrderSyncEngine:
         if deferred:
             return
 
-        exch_pos = self._run_async(self._broker.get_position(self._symbol))
+        exch_pos = self._run_async_read(self._broker.get_position(self._symbol))
         self._exchange_position = exch_pos
         if exch_pos is not None:
             self._position.openprofit = float(exch_pos.unrealized_pnl)
@@ -5486,7 +5487,7 @@ class OrderSyncEngine:
         cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
         envelope = self._build_cancel_envelope(cancel)
         try:
-            self._run_async(self._broker.execute_cancel(envelope))
+            self._run_async_write(self._broker.execute_cancel(envelope))
         except OrderDispositionUnknownError as e:
             _blog_warning(
                 "residual cancel for %r after partial-event resolution "
@@ -5993,7 +5994,7 @@ class OrderSyncEngine:
         # forward the failure as "no snapshot this tick" rather than
         # turning a transient blip into a live-runner halt.
         try:
-            parent_snapshot = self._run_async(
+            parent_snapshot = self._run_async_read(
                 self._broker.get_position(self._symbol),
             )
         except Exception as e:
@@ -7990,7 +7991,7 @@ class OrderSyncEngine:
         :meth:`sync`, which skips the cycle and retries next sync so the scan
         completes before any fresh entry dispatch can mint a colliding COID.
         """
-        orders = self._run_async(self._broker.get_open_orders(self._symbol))
+        orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
         by_pid: dict[str, set[tuple[int, int]]] = {}
         for order in orders:
             coid = order.client_order_id
@@ -8265,7 +8266,7 @@ class OrderSyncEngine:
                     )
                     orders = list(reversal.opened_orders)
                 else:
-                    orders = self._run_async(self._broker.execute_entry(envelope))
+                    orders = self._run_async_write(self._broker.execute_entry(envelope))
                 self._order_mapping[intent.intent_key] = [o.id for o in orders]
                 # Both-set Pine entry: the dispatch above placed the native
                 # LIMIT leg. Arm the software price-watch for the STOP leg so
@@ -8453,7 +8454,7 @@ class OrderSyncEngine:
                             f"bracket:{leg_id}" for leg_id in bracket.legs
                         ]
                     else:
-                        orders = self._run_async(self._broker.execute_exit(envelope))
+                        orders = self._run_async_write(self._broker.execute_exit(envelope))
                         self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, CloseIntent):
                 if port is not None:
@@ -8487,7 +8488,7 @@ class OrderSyncEngine:
                         f"close-leg:{leg_id}" for leg_id, _vol in fan.legs
                     ]
                 else:
-                    order = self._run_async(self._broker.execute_close(envelope))
+                    order = self._run_async_write(self._broker.execute_close(envelope))
                     self._order_mapping[intent.intent_key] = [order.id]
             # The dispatch reached the broker. If this envelope carries a
             # reject bump (retry_seq > 0) it was NOT journaled at build time —
@@ -9318,7 +9319,7 @@ class OrderSyncEngine:
         all_clean = True
         for ref in residuals:
             try:
-                self._run_async(self._broker.cancel_broker_order_ref(ref))
+                self._run_async_write(self._broker.cancel_broker_order_ref(ref))
             except (ExchangeConnectionError, OrderDispositionUnknownError) as exc:
                 _blog_warning(
                     "residual cancel %s transient failure (%s): %s — will "
@@ -10386,7 +10387,7 @@ class OrderSyncEngine:
         # (FILLs have not yet been routed, so it still includes the
         # to-be-closed qty).
         try:
-            exch_pos = self._run_async(
+            exch_pos = self._run_async_read(
                 self._broker.get_position(self._symbol),
             )
         except Exception as exc:  # noqa: BLE001 — diagnostic fallback only
@@ -11141,7 +11142,7 @@ class OrderSyncEngine:
         _blog_info("modifying %s -> %s", old, new)
         try:
             if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
-                orders = self._run_async(self._broker.modify_entry(old_env, new_env))
+                orders = self._run_async_write(self._broker.modify_entry(old_env, new_env))
                 self._order_mapping[new.intent_key] = [o.id for o in orders]
                 # Keep the both-set entry's software STOP leg in step with the
                 # amended native LIMIT. modify_entry preserves the LIMIT's
@@ -11202,7 +11203,7 @@ class OrderSyncEngine:
                         f"bracket:{leg_id}" for leg_id in bracket.legs
                     ]
                 else:
-                    orders = self._run_async(self._broker.modify_exit(old_env, new_env))
+                    orders = self._run_async_write(self._broker.modify_exit(old_env, new_env))
                     self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
                 # CloseIntent or mismatched kinds — cancel + re-execute.
@@ -11379,7 +11380,7 @@ class OrderSyncEngine:
                     ),
                 )
             else:
-                self._run_async(self._broker.execute_cancel(cancel_envelope))
+                self._run_async_write(self._broker.execute_cancel(cancel_envelope))
         except BrokerManualInterventionError as e:
             self._record_halt(e)
             raise
@@ -11446,3 +11447,116 @@ class OrderSyncEngine:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(
             timeout=self._timeout,
         )
+
+    def _run_async_read(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """Run a read-only broker query, parking an untranslated transient fault.
+
+        Central safety net for the per-bar state-query reads (``get_position``,
+        ``get_open_orders``): if a plugin lets a transient connectivity fault
+        escape *without* translating it into the broker taxonomy, this maps it to
+        :class:`ExchangeConnectionError` so the engine's existing
+        ``except ExchangeConnectionError`` sites park the cycle and retry on the
+        next bar instead of crashing the live run. Reads are idempotent, so a
+        blind retry next bar is always safe.
+
+        Three transient shapes are caught:
+
+        - a retryable :class:`~pynecore.core.plugin.ProviderError` (the sanctioned
+          convention — a plugin whose wire faults subclass it, e.g. cTrader);
+        - stdlib :class:`ConnectionError` and :class:`TimeoutError` (a plugin that
+          lets a raw socket / timeout fault propagate, or a wedged dispatch-bridge
+          ``result(timeout=...)`` — safe to park on a read since nothing mutated).
+
+        A non-retryable ``ProviderError`` (a permanent misconfiguration — unknown
+        symbol, bad account mode) is re-raised unchanged: it must fail loud, not
+        loop forever. The write/dispatch path deliberately does NOT use this — a
+        post-send drop is disposition-ambiguous (the order may have landed), so it
+        must be classified by the plugin
+        (:class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`),
+        never blindly mapped to a clean reconnect.
+
+        :param coro: A read-only broker coroutine (no order-mutating side effect).
+        :return: The coroutine's result.
+        :raises ExchangeConnectionError: On a translated transient connectivity
+            fault.
+        """
+        try:
+            return self._run_async(coro)
+        except ProviderError as exc:
+            if is_retryable_provider_error(exc):
+                raise ExchangeConnectionError(str(exc) or "connection lost") from exc
+            raise
+        except (ConnectionError, TimeoutError) as exc:
+            raise ExchangeConnectionError(str(exc) or "connection lost") from exc
+
+    def _run_async_write(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """Run a disposition-ambiguous order dispatch, halting on an untranslated fault.
+
+        Wraps the direct order-write calls (``execute_entry`` / ``execute_exit`` /
+        ``execute_close`` / ``execute_cancel`` / ``modify_*`` /
+        ``cancel_broker_order_ref``). A plugin is contractually required to
+        classify a transient connectivity fault on a write as either
+        :class:`ExchangeConnectionError` (the request never left the client — safe
+        to re-dispatch next bar) or
+        :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`
+        (the request may have landed — parked for ``get_open_orders``
+        verification). When a plugin instead lets a raw retryable
+        :class:`~pynecore.core.plugin.ProviderError` or a stdlib
+        :class:`ConnectionError` escape, the engine cannot tell pre-send from
+        post-send, so it must NOT guess: re-dispatching could duplicate a fill,
+        and blindly parking could strand a never-sent intent. The safe resolution
+        is a controlled halt (:class:`BrokerManualInterventionError`) for operator
+        review — strictly better than an unhandled crash, and only reachable for a
+        contract-violating plugin (a conforming one never lets these escape).
+
+        Unlike :meth:`_run_async_read`, a stdlib :class:`TimeoutError` is
+        deliberately NOT caught: the dispatch-bridge ``result(timeout=...)`` does
+        not cancel the still-running coroutine, so the order may yet land —
+        silently halting (or retrying) a wedged write could mis-handle a fill that
+        completes late. That case stays fatal, the pre-existing safe choice. A
+        non-retryable ``ProviderError`` (a permanent misconfiguration) propagates
+        unchanged. The idempotent recovery composites (one-way replay, drain,
+        bracket-clear) deliberately do NOT use this — they are wrapped in
+        ``except ExchangeConnectionError`` park-and-retry and must not halt.
+        The outcome-driven cancel/entry-stop retry loops
+        (:meth:`_drive_cancel_tentative`,
+        :meth:`_resolve_entry_stop_cancel_then_fire`,
+        :meth:`_fire_entry_stop_market`) likewise stay on raw :meth:`_run_async`:
+        they own a stricter state machine that treats a transient as
+        ``UNKNOWN`` / ``cancel_pending`` / ``stop_market_pending`` and retries
+        idempotently, so a central halt would defeat their "never a halt for a
+        live bot" contract.
+
+        :param coro: A direct order-dispatch broker coroutine.
+        :return: The coroutine's result.
+        :raises BrokerManualInterventionError: On an untranslated transient fault.
+        """
+        try:
+            return self._run_async(coro)
+        except ProviderError as exc:
+            if not is_retryable_provider_error(exc):
+                raise
+            raise self._untranslated_dispatch_halt(exc) from exc
+        except ConnectionError as exc:
+            raise self._untranslated_dispatch_halt(exc) from exc
+
+    def _untranslated_dispatch_halt(
+            self, exc: Exception,
+    ) -> BrokerManualInterventionError:
+        """Build and latch a manual-intervention halt for an untranslated dispatch fault.
+
+        Records the halt through the standard :meth:`_record_halt` path (logs the
+        ``[BROKER] ERROR`` line and emits a ``ManualInterventionRequiredEvent``)
+        and returns the exception for the caller to ``raise ... from`` the
+        original fault. See :meth:`_run_async_write` for why an untranslated
+        dispatch transient is unrecoverable centrally.
+        """
+        halt = BrokerManualInterventionError(
+            "broker plugin let an untranslated transient connectivity fault escape "
+            "an order dispatch; the disposition is unknown and cannot be safely "
+            "retried — the plugin must raise ExchangeConnectionError (request not "
+            "sent) or OrderDispositionUnknownError (request may have landed): "
+            f"{exc}",
+        )
+        self._record_halt(halt)
+        return halt

@@ -173,6 +173,38 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     according to the configured :attr:`on_unexpected_cancel` policy. See
     the Capital.com plugin's ``_reconcile_snapshot`` +
     ``_emit_unexpected_cancellations`` for the reference implementation.
+
+    **Transient-fault contract.** A plugin classifies connectivity faults into
+    the broker taxonomy: :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError`
+    for a drop the engine recovers from by reconnecting, and
+    :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError` for a
+    write whose acknowledgement was lost in flight (the engine parks it and
+    matches against :meth:`get_open_orders`). The Order Sync Engine adds a central
+    safety net for a plugin that lets a *raw* transient escape — a retryable
+    :class:`~pynecore.core.plugin.ProviderError` (transient wire faults should
+    subclass it) or a stdlib :class:`ConnectionError` / :class:`TimeoutError`. The
+    net behaves differently on a read than on a write:
+
+    - On a per-bar state read (:meth:`get_position` / :meth:`get_open_orders`)
+      the untranslated transient — retryable ``ProviderError``,
+      ``ConnectionError`` or ``TimeoutError`` — is treated as
+      ``ExchangeConnectionError`` and parked: reads are idempotent, so the
+      retry-next-bar is always safe. The one-shot startup :meth:`get_balance`
+      auth probe is outside this net (it runs before the per-bar engine loop, so
+      there is no cycle to park onto); a raw transient there aborts startup.
+    - On a direct order write (``execute_*`` / ``modify_*`` /
+      :meth:`cancel_broker_order_ref`) it is unrecoverable centrally — the engine
+      cannot tell a never-sent request from a landed one — so an untranslated
+      retryable ``ProviderError`` or ``ConnectionError`` raises
+      :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError` (a
+      controlled halt) rather than risk a duplicate fill. A raw write-side
+      ``TimeoutError`` is the exception: the dispatch bridge cannot cancel the
+      still-running coroutine, so the order may yet land and the timeout stays
+      fatal rather than being latched as a halt.
+
+    The net only catches contract violations; a plugin SHOULD still classify
+    explicitly, which keeps the recoverable read path parking and the ambiguous
+    write path parked-for-verification instead of halting.
     """
 
     require_one_way_mode: bool = True
