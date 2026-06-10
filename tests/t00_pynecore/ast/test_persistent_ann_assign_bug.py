@@ -1,7 +1,23 @@
 """Test case for persistent variable transformation in annotated assignments"""
 
 import ast
+
 from pynecore.transformers.persistent import PersistentTransformer
+from pynecore.transformers.slot_layout import ModuleLayout
+
+
+def _find_main(tree: ast.Module) -> ast.FunctionDef:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            return node
+    raise AssertionError("main function not found")
+
+
+def _is_state_ref(node: ast.expr | None, slot: int) -> bool:
+    """Check that a node is a ``__state__[slot]`` reference."""
+    return (isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name) and node.value.id == "__state__"
+            and isinstance(node.slice, ast.Constant) and node.slice.value == slot)
 
 
 def __test_persistent_variable_in_annotated_assignment__():
@@ -16,23 +32,7 @@ def main():
     gamma: int = length_2 + 5  # Complex expression should also work
     return alpha + beta + gamma
 '''
-
-    # Parse and transform
-    tree = ast.parse(test_code)
-    transformer = PersistentTransformer()
-    transformed_tree = transformer.visit(tree)
-
-    # Find the main function
-    main_func = None
-    for node in transformed_tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "main":
-            main_func = node
-            break
-
-    assert main_func is not None, "main function not found"
-
-    # Check that persistent variables are properly transformed
-    persistent_name = "__persistent_main·length_2__"
+    main_func = _find_main(PersistentTransformer(ModuleLayout()).visit(ast.parse(test_code)))
 
     # Find alpha assignment
     alpha_assign = None
@@ -42,9 +42,7 @@ def main():
             break
 
     assert alpha_assign is not None, "alpha assignment not found"
-    assert isinstance(alpha_assign.value, ast.Name), "alpha value should be a Name node"
-    assert alpha_assign.value.id == persistent_name, \
-        f"alpha value should be {persistent_name}, got {alpha_assign.value.id}"
+    assert _is_state_ref(alpha_assign.value, 0), "alpha value should be a __state__[0] reference"
 
     # Find beta assignment
     beta_assign = None
@@ -55,9 +53,7 @@ def main():
             break
 
     assert beta_assign is not None, "beta assignment not found"
-    assert isinstance(beta_assign.value, ast.Name), "beta value should be a Name node"
-    assert beta_assign.value.id == persistent_name, \
-        f"beta value should be {persistent_name}, got {beta_assign.value.id}"
+    assert _is_state_ref(beta_assign.value, 0), "beta value should be a __state__[0] reference"
 
     # Find gamma assignment (complex expression)
     gamma_assign = None
@@ -68,11 +64,8 @@ def main():
 
     assert gamma_assign is not None, "gamma assignment not found"
     assert isinstance(gamma_assign.value, ast.BinOp), "gamma value should be a BinOp node"
-    assert isinstance(gamma_assign.value.left, ast.Name), "gamma left operand should be a Name node"
-    assert gamma_assign.value.left.id == persistent_name, \
-        f"gamma left operand should be {persistent_name}, got {gamma_assign.value.left.id}"
-
-    print("✅ All tests passed!")
+    assert _is_state_ref(gamma_assign.value.left, 0), \
+        "gamma left operand should be a __state__[0] reference"
 
 
 def __test_non_persistent_annotated_assignment__():
@@ -83,20 +76,7 @@ def main():
     alpha: float = normal_var  # This should NOT be transformed
     return alpha
 '''
-
-    # Parse and transform
-    tree = ast.parse(test_code)
-    transformer = PersistentTransformer()
-    transformed_tree = transformer.visit(tree)
-
-    # Find the main function
-    main_func = None
-    for node in transformed_tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "main":
-            main_func = node
-            break
-
-    assert main_func is not None, "main function not found"
+    main_func = _find_main(PersistentTransformer(ModuleLayout()).visit(ast.parse(test_code)))
 
     # Find alpha assignment
     alpha_assign = None
@@ -108,8 +88,6 @@ def main():
     assert alpha_assign is not None, "alpha assignment not found"
     assert isinstance(alpha_assign.value, ast.Name), "alpha value should be a Name node"
     assert alpha_assign.value.id == "normal_var", f"alpha value should be 'normal_var', got {alpha_assign.value.id}"
-
-    print("✅ Non-persistent variable test passed!")
 
 
 if __name__ == "__main__":
