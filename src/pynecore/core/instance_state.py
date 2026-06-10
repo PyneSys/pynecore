@@ -9,8 +9,8 @@ hanging off a small set of root vectors (script main, library mains, security
 processes). There is no global keyed instance cache: dropping a parent
 releases its whole subtree through normal GC.
 
-This module is the successor of ``function_isolation.py``; the two coexist
-while the transformers migrate.
+This module is the successor of the deleted ``function_isolation.py``
+runtime (module-globals copying with a global keyed instance cache).
 
 Layout metadata
 ---------------
@@ -71,7 +71,7 @@ state. State does not survive an a -> b -> a swap; the legacy scheme did not
 support that either (a cache hit there reused the first callee's instance
 regardless of the current value).
 """
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from copy import copy, deepcopy
 from dataclasses import replace as dataclass_replace
 from functools import partial
@@ -304,8 +304,8 @@ def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
 
 
 def _copy_value(value: Any) -> Any:
-    """Copy a value for snapshot/restore — same pattern as the legacy
-    ``var_snapshot._copy_value``.
+    """Copy a value for snapshot/restore: immutables as-is, dicts/lists by
+    deepcopy, dataclasses by ``replace``, everything else by shallow copy.
 
     :param value: Value to copy.
     :return: Copied (or immutable, as-is) value.
@@ -324,14 +324,20 @@ class RootVarSnapshot:
     """Snapshot/restore of the ``var`` slots of the root vectors, for the
     calc_on_order_fills rollback. Parity with the legacy ``VarSnapshot``:
     varip slots are excluded and isolated child instances are not touched.
+
+    Passing ``keys`` scopes the snapshot to specific roots — the runner uses
+    its own root keys, so interleaved runner instances never roll back each
+    other's state (the legacy snapshot was scoped to explicit modules).
     """
 
     __slots__ = ('_targets', '_snapshots')
 
-    def __init__(self):
+    def __init__(self, keys: Iterable[str] | None = None):
         self._targets: list[tuple[list, tuple[int, ...]]] = []
         self._snapshots: list[list] = []
-        for state, layout in _root_vectors.values():
+        entries = (_root_vectors.values() if keys is None
+                   else (_root_vectors[key] for key in keys if key in _root_vectors))
+        for state, layout in entries:
             slots = _var_slots(layout)
             if slots:
                 self._targets.append((state, slots))

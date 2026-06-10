@@ -208,6 +208,26 @@ def __test_root_var_snapshot__():
         discard_root('test·snap')
 
 
+def __test_root_var_snapshot_keys__():
+    """ RootVarSnapshot(keys): only the named roots are covered """
+    mine = create_root('test·snap·mine', LAYOUT_PARENT)
+    other = create_root('test·snap·other', LAYOUT_PARENT)
+    try:
+        mine[0] = 1
+        other[0] = 1
+        snapshot = RootVarSnapshot(['test·snap·mine', 'test·snap·gone'])
+        assert snapshot.has_vars
+        snapshot.save()
+        mine[0] = 99
+        other[0] = 99
+        snapshot.restore()
+        assert mine[0] == 1
+        assert other[0] == 99  # foreign root is not rolled back
+    finally:
+        discard_root('test·snap·mine')
+        discard_root('test·snap·other')
+
+
 def __test_explain_state__():
     """ explain_state: named slots map to values, fallback labels are descriptive """
     acc = _make_stateful(LAYOUT_PARENT)

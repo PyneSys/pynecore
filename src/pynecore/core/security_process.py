@@ -10,6 +10,7 @@ Communication with the chart process uses shared memory + Events (see security.p
 from __future__ import annotations
 
 import os
+from functools import partial
 from pathlib import Path
 from datetime import datetime, UTC
 from typing import TYPE_CHECKING
@@ -85,7 +86,7 @@ def security_process_main(
     from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
     from pynecore import lib
     from pynecore.lib import barstate
-    from pynecore.core import function_isolation
+    from pynecore.core import instance_state
 
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo, lib)
@@ -108,8 +109,16 @@ def security_process_main(
     inject_protocol(script_module, signal_fn, write_fn, read_fn, wait_fn,
                     active_security=sec_id)
 
-    # Reset function isolation for fresh state
-    function_isolation.reset()
+    # Fresh per-process state: drop anything inherited (fork start method) and
+    # create the root state vector of the script's main
+    instance_state.reset()
+    main_func = script_module.main
+    main_layout = getattr(main_func, '__pyne_layout__', None)
+    if main_layout is not None:
+        root_key = f'{main_func.__module__}.{main_func.__qualname__}'
+        run_main = partial(main_func, instance_state.create_root(root_key, main_layout))
+    else:
+        run_main = main_func
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
@@ -160,7 +169,7 @@ def security_process_main(
                 barstate.isconfirmed = True
 
                 # Run the script
-                script_module.main()
+                run_main()
 
                 current_bar += 1
                 bars_run = True
