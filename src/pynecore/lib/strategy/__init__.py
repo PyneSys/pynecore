@@ -2076,10 +2076,17 @@ class SimPosition(PositionBase):
                     # Margin/equity live in account currency; convert price * qty into
                     # account-currency units via the futures pointvalue.
                     pv = syminfo.pointvalue
-                    # A margin overshoot does not reject the order outright: TV
-                    # fills it and the bar-open margin call immediately trims
-                    # whole contracts at the fill price. Reject only when that
-                    # immediate margin call would wipe the entire position.
+                    # On fractional-lot symbols a margin overshoot does not reject
+                    # the order outright: TV fills it and the bar-open margin call
+                    # immediately trims whole contracts at the fill price; only an
+                    # overshoot whose immediate margin call would wipe the entire
+                    # position is rejected (verified on a BINANCE:BTCUSDT export).
+                    # On whole-lot symbols TV rejects the overshooting entry and
+                    # the signal has to re-fire later (verified on a BATS:SRFM
+                    # stock export: the gapped-up fill was rejected, the entry
+                    # landed two bars later -- the ganzalgo_v2_pro pynecomp test).
+                    whole_lot = syminfo._size_round_factor <= 1  # noqa
+
                     def _mc_wipes_position(equity_: float, margin_needed_: float,
                                            qty_after_fill: float) -> bool:
                         loss = (equity_ - margin_needed_) / margin_ratio
@@ -2090,7 +2097,8 @@ class SimPosition(PositionBase):
                         equity = script.initial_capital + self.netprofit
                         margin_needed = abs(order.size) * fill_price * pv * margin_ratio
                         if (margin_needed > equity
-                                and _mc_wipes_position(equity, margin_needed, abs(order.size))):
+                                and (whole_lot
+                                     or _mc_wipes_position(equity, margin_needed, abs(order.size)))):
                             self._remove_order(order)
                             continue
                     elif self.sign == order.sign:
@@ -2103,7 +2111,8 @@ class SimPosition(PositionBase):
                         equity = script.initial_capital + self.netprofit + open_profit
                         margin_needed = mvs * margin_ratio
                         if (margin_needed > equity
-                                and _mc_wipes_position(equity, margin_needed, new_qty)):
+                                and (whole_lot
+                                     or _mc_wipes_position(equity, margin_needed, new_qty))):
                             self._remove_order(order)
                             continue
 
@@ -3093,14 +3102,12 @@ def exit(id: str, from_entry: str = "",
         trail_points_ticks: float | None = _na_to_none(trail_points)
         _trail_price = _na_to_none(trail_price)
 
-        # TradingView only creates the trailing leg when ``trail_offset`` comes
-        # with the activation level ("a strategy.exit() call must specify a
-        # trail_offset argument and either a trail_price or trail_points
-        # argument"); without the offset the trailing arguments are ignored
-        # instead of degrading into an offset-0 stop.
-        if isinstance(trail_offset, NA):
-            _trail_price = None
-            trail_points_ticks = None
+        # A missing ``trail_offset`` does NOT disable the trailing leg. TradingView's
+        # compile rule only requires the offset when the trailing pair is the
+        # exit's SOLE trigger; alongside ``stop``/``limit`` the call compiles, and the
+        # TV reference exports (pynecomp bracket trail probes 88-91) prove the trailing
+        # stop arms with an offset of 0 ticks. The offset-0 default is applied at
+        # ``Order`` construction.
 
         # An exit must arm at least one trigger. TradingView treats a call whose
         # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
