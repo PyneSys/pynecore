@@ -1412,26 +1412,34 @@ class SimPosition(PositionBase):
     def _process_trailing_stop(self, order: Order, ohlc: bool) -> bool:
         """Process a trailing-stop exit for the current bar (TradingView model).
 
-        The activation level is ``order.trail_price`` (``entry ± trail_points``).
-        Once the bar's extreme reaches it, the stop anchors at the activation
-        level offset by ``trail_offset`` and fills on the SAME bar if the bar
-        retraces to it. The current bar's extreme only advances the trail for the
-        NEXT bar — TradingView evaluates a trailing stop from the prior
-        high/low-water mark, so with ``trail_offset == 0`` the fill lands exactly
-        at the activation level on the activation bar instead of riding to the
-        bar's extreme.
+        TradingView's broker emulator moves the market price along the assumed
+        intrabar path (``open -> high -> low -> close`` or
+        ``open -> low -> high -> close``, see :meth:`process_orders`) and the
+        trailing stop follows it tick by tick: the high/low-water mark advances
+        on every favorable segment of the path — including the current bar's own
+        extreme — and the stop sits ``trail_offset`` ticks behind it. The trail
+        arms when the path touches ``order.trail_price`` (``entry ±
+        trail_points``) and can fill on the SAME bar once the path retraces
+        ``trail_offset`` ticks from the watermark reached after arming: a bar
+        that pierces the activation level, runs on to its extreme and pulls back
+        fills at ``extreme -/+ offset``, not at the activation level. With
+        ``trail_offset == 0`` the stop sits on the watermark itself, so the fill
+        lands at the activation tick (or at the open of a bar opening beyond the
+        carried watermark).
 
-        A trail that activates on THIS bar arms at the favorable extreme (the high
-        for a long, the low for a short). When that extreme is the bar's SECOND
-        intra-bar leg, a hard ``stop=`` reached on the FIRST leg fills earlier in
-        intra-bar time and must win, so the trail defers to the price walk in that
-        case instead of pre-empting it. A trail carried from a prior bar is live
-        from the open and keeps priority. When such a bar opens at its own low
-        (long) or high (short) -- no wick on the trailing side -- and that open
-        gaps past the prior water mark, the open is itself the new water mark and
-        the bar never trades back to it, so the fill lands at the open.
-        ``ohlc`` selects the leg order:
-        ``True`` => open->high->low, ``False`` => open->low->high.
+        A bar that opens beyond a CARRIED stop (inter-bar gap) fills at the
+        open; within the bar the path is assumed gapless, so fills land exactly
+        at the trailed stop level. When the same order also carries a hard
+        ``stop=`` leg that the path reaches earlier in intrabar time — before
+        the trail arms, or at a less favorable level on the same falling
+        segment — the trail defers to the price walk so the hard stop wins.
+        Likewise a take-profit ``limit=`` leg reached on a favorable segment
+        fires before any trailing fill on a later retrace, so the trail defers
+        to the price walk there too (verified against TradingView references
+        on BINANCE:ETHUSDT.P — TV fills the limit at its level, not the
+        trailing stop at ``watermark -/+ offset``); only an offset-0 arming
+        fill at a not-stricter activation level precedes the limit on the same
+        segment.
 
         :param order: The exit order carrying ``trail_price``.
         :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`).
@@ -1445,91 +1453,218 @@ class SimPosition(PositionBase):
 
         if order.sign < 0:
             # Long position: trailing sell-stop riding under the high-water mark.
-            just_activated = False
-            if not order.trail_triggered:
-                if self.h < order.trail_price:
-                    return False
-                order.trail_triggered = True
-                order.trail_stop = round_to_mintick(order.trail_price - offset_price)
-                just_activated = True
-            stop = order.trail_stop
-            if stop is None:
-                return False
-            # A carried trail on a bar that opens at its low (no lower wick) and
-            # gaps above the prior water mark fills at the open: TradingView folds
-            # the new bar's open into the high-water mark, so the offset-0 stop
-            # sits at the open and the bar -- which never trades lower -- touches
-            # it there.
-            if not just_activated and self.l == self.o:
-                open_stop = round_to_mintick(self.o - offset_price)
-                if open_stop > stop:
-                    p = open_stop
+            armed = order.trail_triggered
+            stop = order.trail_stop if armed else None
+
+            if armed and stop is not None:
+                # A carried stop gapped through between bars fills at the open.
+                if self.o <= stop:
+                    p = self.o
                     if slippage > 0:
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, self.h, p)
                     return True
-            # Activated on the high (second leg, open->low->high): a hard stop hit
-            # on the first (low) leg fills before the trail arms, so defer to it.
-            stop_first = (just_activated and not ohlc
-                          and order.stop is not None and order.stop >= self.l)
-            if self.l <= stop and not stop_first:
-                # A stop carried from a prior bar fills at the open when the bar
-                # gaps below it; on the activation bar the stop was just placed
-                # intra-bar at the activation level, so the fill is at the stop.
-                p = self.o if (not just_activated and self.o <= stop) else stop
-                if slippage > 0:
-                    p -= syminfo.mintick * slippage
-                order.filled_by_type = 'trailing'
-                self.fill_order(order, p, self.h, p)
-                return True
-            # No fill: ratchet the trail up with this bar's high for the next bar.
-            new_stop = round_to_mintick(self.h - offset_price)
-            if new_stop > stop:
-                order.trail_stop = new_stop
+                # The open tick advances the water mark; with trail_offset == 0
+                # the stop lands on the open itself and fills there.
+                new_stop = round_to_mintick(self.o - offset_price)
+                if new_stop > stop:
+                    stop = new_stop
+                    if self.o <= stop:
+                        p = stop
+                        if slippage > 0:
+                            p -= syminfo.mintick * slippage
+                        order.filled_by_type = 'trailing'
+                        self.fill_order(order, p, self.h, p)
+                        return True
+            elif not armed and self.o >= order.trail_price:
+                # The bar opens beyond the activation level: the trail arms on
+                # the first tick with the open as its water mark.
+                armed = True
+                stop = round_to_mintick(self.o - offset_price)
+                if self.o <= stop:
+                    p = stop
+                    if slippage > 0:
+                        p -= syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, self.h, p)
+                    return True
+
+            # Walk the assumed intrabar path: rising segments arm the trail and
+            # ratchet the water mark, a falling segment fills at the trailed
+            # stop when it reaches it.
+            prev = self.o
+            for nxt in ((self.h, self.l, self.c) if ohlc else (self.l, self.h, self.c)):
+                if nxt > prev:
+                    if order.limit is not None and nxt >= order.limit and not (
+                            not armed and offset_price <= 0
+                            and order.trail_price <= order.limit
+                            and nxt >= order.trail_price):
+                        # The take-profit limit leg is reached on this rising
+                        # segment, earlier in intrabar time than any trailing
+                        # fill on a later retrace: defer to the price walk so
+                        # the limit wins, carrying the trail state ratcheted
+                        # so far. Only an offset-0 arming fill at a not-higher
+                        # activation level precedes it.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if not armed and nxt >= order.trail_price:
+                        armed = True
+                        stop = round_to_mintick(order.trail_price - offset_price)
+                        if order.trail_price <= stop:
+                            # trail_offset == 0: the stop sits on the activation
+                            # level and the arming tick itself fills it.
+                            p = stop
+                            if slippage > 0:
+                                p -= syminfo.mintick * slippage
+                            order.filled_by_type = 'trailing'
+                            self.fill_order(order, p, self.h, p)
+                            return True
+                    if armed:
+                        new_stop = round_to_mintick(nxt - offset_price)
+                        if stop is None or new_stop > stop:
+                            stop = new_stop
+                else:
+                    if order.limit is not None and prev >= order.limit:
+                        # The take-profit limit became marketable earlier on
+                        # the path (at the open tick or on a prior rising
+                        # segment): defer to the price walk so the limit wins.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if order.stop is not None and nxt <= order.stop and (
+                            not armed or stop is None or order.stop >= stop):
+                        # The hard stop leg is reached earlier in intrabar time:
+                        # defer to the price walk, carrying the trail state
+                        # ratcheted so far.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if armed and stop is not None and nxt <= stop:
+                        p = stop
+                        if slippage > 0:
+                            p -= syminfo.mintick * slippage
+                        order.filled_by_type = 'trailing'
+                        self.fill_order(order, p, self.h, p)
+                        return True
+                prev = nxt
+
+            # No fill: carry the ratcheted stop into the next bar.
+            if armed:
+                order.trail_triggered = True
+                order.trail_stop = stop
             return False
 
         if order.sign > 0:
             # Short position: trailing buy-stop riding above the low-water mark.
-            just_activated = False
-            if not order.trail_triggered:
-                if self.l > order.trail_price:
-                    return False
-                order.trail_triggered = True
-                order.trail_stop = round_to_mintick(order.trail_price + offset_price)
-                just_activated = True
-            stop = order.trail_stop
-            if stop is None:
-                return False
-            # A carried trail on a bar that opens at its high (no upper wick) and
-            # gaps below the prior water mark fills at the open: TradingView folds
-            # the new bar's open into the low-water mark, so the offset-0 stop sits
-            # at the open and the bar -- which never trades higher -- touches it
-            # there.
-            if not just_activated and self.h == self.o:
-                open_stop = round_to_mintick(self.o + offset_price)
-                if open_stop < stop:
-                    p = open_stop
+            armed = order.trail_triggered
+            stop = order.trail_stop if armed else None
+
+            if armed and stop is not None:
+                # A carried stop gapped through between bars fills at the open.
+                if self.o >= stop:
+                    p = self.o
                     if slippage > 0:
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, p, self.l)
                     return True
-            # Activated on the low (second leg, open->high->low): a hard stop hit
-            # on the first (high) leg fills before the trail arms, so defer to it.
-            stop_first = (just_activated and ohlc
-                          and order.stop is not None and order.stop <= self.h)
-            if self.h >= stop and not stop_first:
-                p = self.o if (not just_activated and self.o >= stop) else stop
-                if slippage > 0:
-                    p += syminfo.mintick * slippage
-                order.filled_by_type = 'trailing'
-                self.fill_order(order, p, p, self.l)
-                return True
-            # No fill: ratchet the trail down with this bar's low for the next bar.
-            new_stop = round_to_mintick(self.l + offset_price)
-            if new_stop < stop:
-                order.trail_stop = new_stop
+                # The open tick advances the water mark; with trail_offset == 0
+                # the stop lands on the open itself and fills there.
+                new_stop = round_to_mintick(self.o + offset_price)
+                if new_stop < stop:
+                    stop = new_stop
+                    if self.o >= stop:
+                        p = stop
+                        if slippage > 0:
+                            p += syminfo.mintick * slippage
+                        order.filled_by_type = 'trailing'
+                        self.fill_order(order, p, p, self.l)
+                        return True
+            elif not armed and self.o <= order.trail_price:
+                # The bar opens beyond the activation level: the trail arms on
+                # the first tick with the open as its water mark.
+                armed = True
+                stop = round_to_mintick(self.o + offset_price)
+                if self.o >= stop:
+                    p = stop
+                    if slippage > 0:
+                        p += syminfo.mintick * slippage
+                    order.filled_by_type = 'trailing'
+                    self.fill_order(order, p, p, self.l)
+                    return True
+
+            # Walk the assumed intrabar path: falling segments arm the trail and
+            # ratchet the water mark, a rising segment fills at the trailed stop
+            # when it reaches it.
+            prev = self.o
+            for nxt in ((self.h, self.l, self.c) if ohlc else (self.l, self.h, self.c)):
+                if nxt < prev:
+                    if order.limit is not None and nxt <= order.limit and not (
+                            not armed and offset_price <= 0
+                            and order.trail_price >= order.limit
+                            and nxt <= order.trail_price):
+                        # The take-profit limit leg is reached on this falling
+                        # segment, earlier in intrabar time than any trailing
+                        # fill on a later rebound: defer to the price walk so
+                        # the limit wins, carrying the trail state ratcheted
+                        # so far. Only an offset-0 arming fill at a not-lower
+                        # activation level precedes it.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if not armed and nxt <= order.trail_price:
+                        armed = True
+                        stop = round_to_mintick(order.trail_price + offset_price)
+                        if order.trail_price >= stop:
+                            # trail_offset == 0: the stop sits on the activation
+                            # level and the arming tick itself fills it.
+                            p = stop
+                            if slippage > 0:
+                                p += syminfo.mintick * slippage
+                            order.filled_by_type = 'trailing'
+                            self.fill_order(order, p, p, self.l)
+                            return True
+                    if armed:
+                        new_stop = round_to_mintick(nxt + offset_price)
+                        if stop is None or new_stop < stop:
+                            stop = new_stop
+                else:
+                    if order.limit is not None and prev <= order.limit:
+                        # The take-profit limit became marketable earlier on
+                        # the path (at the open tick or on a prior falling
+                        # segment): defer to the price walk so the limit wins.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if order.stop is not None and nxt >= order.stop and (
+                            not armed or stop is None or order.stop <= stop):
+                        # The hard stop leg is reached earlier in intrabar time:
+                        # defer to the price walk, carrying the trail state
+                        # ratcheted so far.
+                        order.trail_triggered = armed
+                        if armed:
+                            order.trail_stop = stop
+                        return False
+                    if armed and stop is not None and nxt >= stop:
+                        p = stop
+                        if slippage > 0:
+                            p += syminfo.mintick * slippage
+                        order.filled_by_type = 'trailing'
+                        self.fill_order(order, p, p, self.l)
+                        return True
+                prev = nxt
+
+            # No fill: carry the ratcheted stop into the next bar.
+            if armed:
+                order.trail_triggered = True
+                order.trail_stop = stop
             return False
 
         return False
@@ -1670,8 +1805,18 @@ class SimPosition(PositionBase):
         # force-closing a minimum of one whole contract.
         rfactor = 1 if whole_contracts else syminfo._size_round_factor  # noqa
         cover_lots = int(abs(loss) / (check_price * pv) * rfactor)
-        mc_lots = max(1, cover_lots * 4)
-        margin_call_size = mc_lots / rfactor
+        if cover_lots == 0 and rfactor > 1:
+            # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
+            # the ENTIRE position instead of trimming a minimum slice. Verified
+            # against TV references on BINANCE:BTCUSDT — a shortfall under one
+            # lot's notional at the bar extreme wiped a 0.93 BTC short in one
+            # margin-call fill, while shortfalls of one lot or more liquidate
+            # 4x the cover amount in lot units.
+            mc_lots = 0
+            margin_call_size = quantity
+        else:
+            mc_lots = max(1, cover_lots * 4)
+            margin_call_size = mc_lots / rfactor
 
         if margin_call_size > quantity:
             margin_call_size = quantity
@@ -1931,10 +2076,17 @@ class SimPosition(PositionBase):
                     # Margin/equity live in account currency; convert price * qty into
                     # account-currency units via the futures pointvalue.
                     pv = syminfo.pointvalue
-                    # A margin overshoot does not reject the order outright: TV
-                    # fills it and the bar-open margin call immediately trims
-                    # whole contracts at the fill price. Reject only when that
-                    # immediate margin call would wipe the entire position.
+                    # On fractional-lot symbols a margin overshoot does not reject
+                    # the order outright: TV fills it and the bar-open margin call
+                    # immediately trims whole contracts at the fill price; only an
+                    # overshoot whose immediate margin call would wipe the entire
+                    # position is rejected (verified on a BINANCE:BTCUSDT export).
+                    # On whole-lot symbols TV rejects the overshooting entry and
+                    # the signal has to re-fire later (verified on a BATS:SRFM
+                    # stock export: the gapped-up fill was rejected, the entry
+                    # landed two bars later -- the ganzalgo_v2_pro pynecomp test).
+                    whole_lot = syminfo._size_round_factor <= 1  # noqa
+
                     def _mc_wipes_position(equity_: float, margin_needed_: float,
                                            qty_after_fill: float) -> bool:
                         loss = (equity_ - margin_needed_) / margin_ratio
@@ -1945,7 +2097,8 @@ class SimPosition(PositionBase):
                         equity = script.initial_capital + self.netprofit
                         margin_needed = abs(order.size) * fill_price * pv * margin_ratio
                         if (margin_needed > equity
-                                and _mc_wipes_position(equity, margin_needed, abs(order.size))):
+                                and (whole_lot
+                                     or _mc_wipes_position(equity, margin_needed, abs(order.size)))):
                             self._remove_order(order)
                             continue
                     elif self.sign == order.sign:
@@ -1958,7 +2111,8 @@ class SimPosition(PositionBase):
                         equity = script.initial_capital + self.netprofit + open_profit
                         margin_needed = mvs * margin_ratio
                         if (margin_needed > equity
-                                and _mc_wipes_position(equity, margin_needed, new_qty)):
+                                and (whole_lot
+                                     or _mc_wipes_position(equity, margin_needed, new_qty))):
                             self._remove_order(order)
                             continue
 
@@ -2103,9 +2257,9 @@ class SimPosition(PositionBase):
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
-        # Trailing stops are evaluated from the prior high/low-water mark, so they
-        # are processed once per bar here rather than inside the price walk — the
-        # walk would ride the stop to the current bar's extreme and fill there.
+        # Trailing stops walk the assumed intrabar path themselves (arming,
+        # water-mark ratchet and fill in chronological order), so they are
+        # processed once per bar here rather than inside the level-indexed walk.
         # Iterate a snapshot since fills mutate the order book; an order indexed at
         # several price levels is yielded once per level, so dedupe by identity.
         seen: set[Order] = set()
@@ -2907,31 +3061,25 @@ def exit(id: str, from_entry: str = "",
     init_size = 0.0
 
     # noinspection PyProtectedMember,PyShadowingNames
-    def _exit(entry_pending: bool = False):
+    def _exit():
         nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
 
         # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
         # Re-issuing it every bar updates its prices, but a leg that already fired
-        # its slice must not be resurrected, and the slice is reserved off the
-        # entry's ORIGINAL size, not the shrinking remainder.
-        #
-        # The freeze only applies once the bound entry has FILLED. While the entry
-        # is still a PENDING order, re-issuing ``strategy.entry`` can change its
-        # qty bar-to-bar (e.g. cash-based sizing re-evaluated each bar), and the
-        # exit must track the entry's CURRENT pending size — otherwise it locks the
-        # first bar's size and under-closes the eventual fill, stranding a sliver
-        # that some other rule (a per-bar ``close_all``) then mops up as a phantom
-        # second trade.
+        # its slice must not be resurrected (the ``consumed`` tombstone). The
+        # reservation is recomputed from ``init_size`` on every issue: that is the
+        # ORIGINAL size of everything bound to ``from_entry`` — open pyramid adds
+        # at their entry size plus a still-pending entry order at its CURRENT
+        # size — so a pyramid add grows the slice, margin-call shrinkage does not
+        # erode it, and a pending entry re-sized bar-to-bar keeps being tracked
+        # (locking the first bar's size would under-close the eventual fill and
+        # strand a sliver).
         exit_key = (id, from_entry)
         existing = position.exit_orders.get(exit_key)
         if existing is not None and existing.consumed:
             return
 
-        if existing is not None and not entry_pending:
-            # Live leg on an already-filled position: keep its reserved slice,
-            # only update prices.
-            reserved = existing.reserved_size
-        elif not isinstance(qty, NA):
+        if not isinstance(qty, NA):
             reserved = abs(qty)
         elif not isinstance(qty_percent, NA):
             reserved = abs(init_size) * (qty_percent * 0.01)
@@ -2952,18 +3100,22 @@ def exit(id: str, from_entry: str = "",
         profit_ticks: float | None = _na_to_none(profit)
         loss_ticks: float | None = _na_to_none(loss)
         trail_points_ticks: float | None = _na_to_none(trail_points)
+        _trail_price = _na_to_none(trail_price)
+
+        # A missing ``trail_offset`` does NOT disable the trailing leg. TradingView's
+        # compile rule only requires the offset when the trailing pair is the
+        # exit's SOLE trigger; alongside ``stop``/``limit`` the call compiles, and the
+        # TV reference exports (pynecomp bracket trail probes 88-91) prove the trailing
+        # stop arms with an offset of 0 ticks. The offset-0 default is applied at
+        # ``Order`` construction.
 
         # An exit must arm at least one trigger. TradingView treats a call whose
         # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
         # from a flat position_avg_price (na) on a bar before the entry fills --
         # not a level-less market close that fires at the next open.
         if (isinstance(limit, NA) and isinstance(stop, NA) and isinstance(profit, NA)
-                and isinstance(loss, NA) and isinstance(trail_price, NA)
-                and isinstance(trail_points, NA)):
-            return
-
-        # We need to have limit, stop or both
-        if isinstance(limit, NA) and isinstance(stop, NA) and not isinstance(trail_price, NA):
+                and isinstance(loss, NA) and _trail_price is None
+                and trail_points_ticks is None):
             return
 
         _limit = _na_to_none(limit)
@@ -2972,7 +3124,6 @@ def exit(id: str, from_entry: str = "",
         _stop = _na_to_none(stop)
         if _stop is not None:
             _stop = _price_round(_stop, -direction)
-        _trail_price = _na_to_none(trail_price)
         if _trail_price is not None:
             _trail_price = _price_round(_trail_price, -direction)
 
@@ -3011,56 +3162,88 @@ def exit(id: str, from_entry: str = "",
         # (entry-anchored) trail_points -- so a fresh Order must inherit the
         # ratcheted ``trail_stop`` instead of re-arming at the bare activation
         # level every bar, which would leave the stop permanently one or more bars
-        # behind the carried water mark.
-        if existing is not None and not entry_pending and existing.trail_triggered:
-            order.trail_triggered = True
-            order.trail_stop = existing.trail_stop
+        # behind the carried water mark. EXCEPTION: when the script re-issues the
+        # leg with a STRICTER activation level (above the high-water mark for a
+        # long, below the low-water mark for a short — e.g. a take-profit rebased
+        # on a pyramid add), TradingView treats the moved activation as not yet
+        # reached and the trail re-arms at the new level.
+        if existing is not None and existing.trail_triggered:
+            inherit = True
+            # The stricter-activation check needs the re-issued activation level
+            # in price terms: the explicit ``trail_price``, or the entry-anchored
+            # ``trail_points`` form resolved against the bound entry's fill price
+            # (the existing leg is armed, so its entry has filled).
+            new_trail_price = _trail_price
+            if new_trail_price is None and trail_points_ticks is not None:
+                for open_trade in position.open_trades:
+                    if open_trade.entry_id == from_entry:
+                        new_trail_price = _price_round(
+                            open_trade.entry_price
+                            + direction * syminfo.mintick * trail_points_ticks,
+                            direction)
+                        break
+            if new_trail_price is not None and existing.trail_stop is not None:
+                old_offset_price = syminfo.mintick * existing.trail_offset
+                if direction > 0:
+                    inherit = new_trail_price <= existing.trail_stop + old_offset_price
+                else:
+                    inherit = new_trail_price >= existing.trail_stop - old_offset_price
+            if inherit:
+                order.trail_triggered = True
+                order.trail_stop = existing.trail_stop
 
         position._add_order(order)
         position._seed_trail_at_issue(order)
 
+    def _bound_size(entry_id: str) -> tuple[float, float]:
+        """Combined sign and ORIGINAL size of everything bound to an entry id:
+        open pyramid adds at their entry size plus a still-pending entry order at
+        its current size. TradingView's exit covers each of them, so the leg is
+        reserved off the combined size and the FIFO fill allocation then closes
+        the bound trades the way TV's per-entry exit brackets do."""
+        sign = 0.0
+        total = 0.0
+        pending = position.entry_orders.get(entry_id)
+        if pending is not None:
+            sign = pending.sign
+            total += abs(pending.size)
+        for open_trade in position.open_trades:
+            if open_trade.entry_id == entry_id:
+                sign = open_trade.sign
+                total += abs(open_trade.init_size)
+        return sign, total
+
     # Find direction and size
     if from_entry:
-        # Get from entry_orders dict
-        entry_order: Order | None = position.entry_orders.get(from_entry, None)
-
-        # Find open trade if no entry order found
-        if not entry_order:
-            for trade in position.open_trades:
-                if trade.entry_id == from_entry:
-                    direction = trade.sign
-                    init_size = trade.init_size
-                    _exit()
-
-            # The position should be opened, or an entry order should exist
-            if not entry_order:
-                return
-        else:
-            direction = entry_order.sign
-            init_size = entry_order.size
-            _exit(entry_pending=True)
+        direction, init_size = _bound_size(from_entry)
+        # The position should be open, or an entry order should exist
+        if not direction:
+            return
+        _exit()
 
     else:
         # If still no entry order found, we should exit all open trades and open orders
         if not direction:
             for order in list(position.entry_orders.values()):
-                direction = order.sign
-                init_size = order.size
                 from_entry = order.order_id or ""
+                direction, init_size = _bound_size(from_entry)
                 # Only mark as from_entry_na on first creation (not replacement)
                 exit_key = (id, from_entry)
                 had_existing_exit = exit_key in position.exit_orders
-                _exit(entry_pending=True)
+                _exit()
                 if not had_existing_exit:
                     exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
                         exit_order.from_entry_na = True
 
             if not direction:
+                seen_ids: set[str] = set()
                 for trade in position.open_trades:
-                    direction = trade.sign
-                    init_size = trade.init_size
                     from_entry = trade.entry_id or ""
+                    if from_entry in seen_ids:
+                        continue
+                    seen_ids.add(from_entry)
+                    direction, init_size = _bound_size(from_entry)
                     _exit()
 
 
