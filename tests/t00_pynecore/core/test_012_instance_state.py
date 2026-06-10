@@ -6,7 +6,7 @@ import pytest
 from pynecore.core.instance_state import (
     __resolve_slot__, __grow__, __bind_any__, __bind_any_loop__,
     __attach_layout__,
-    create_root, get_root, discard_root, reset,
+    create_root, get_root, discard_root, reset, register_shared_cache,
     RootVarSnapshot, explain_state, _make_state,
 )
 from pynecore.core.pine_export import Exported
@@ -175,6 +175,14 @@ def __test_reset__():
     finally:
         discard_root('test·reset')
     assert get_root('test·reset') is None
+
+
+def __test_register_shared_cache__():
+    """ reset(): registered module-lifetime bound caches are cleared """
+    cache = register_shared_cache({'bound': object()})
+    assert cache
+    reset()
+    assert cache == {}
 
 
 def __test_root_var_snapshot__():

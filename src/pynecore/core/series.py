@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, Iterator, cast, overload
+from typing import TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
@@ -47,8 +47,10 @@ class SeriesImpl(Generic[T]):
         # Internal capacity is max_bars_back + 1 (for current candle + historical bars)
         self._capacity = self._max_bars_back + 1
 
-        # Pre-allocated buffer with None values for better performance
-        self._buffer: list[T | NA | None] = [None] * self._capacity
+        # Pre-allocated buffer for better performance. The None placeholders
+        # only ever fill the unused tail (positions >= _size are never read),
+        # so the element type can omit None and reads stay cast-free.
+        self._buffer: list[T | NA[T]] = cast('list[T | NA[T]]', [None] * self._capacity)
 
         # The next logical write position in a circular manner.
         self._write_pos = 0
@@ -95,8 +97,9 @@ class SeriesImpl(Generic[T]):
             self._max_bars_back = new_max_bars_back
             self._max_bars_back_set = new_max_bars_back
             self._capacity = new_capacity
-            # Extend pre-allocated buffer with None values
-            self._buffer.extend([None] * (new_capacity - len(self._buffer)))
+            # Extend pre-allocated buffer with None placeholders (unused tail)
+            self._buffer.extend(cast('list[T | NA[T]]',
+                                     [None] * (new_capacity - len(self._buffer))))
             return
 
         old_buffer = self._buffer
@@ -105,8 +108,8 @@ class SeriesImpl(Generic[T]):
         # Number of items to keep: either all old items or new_capacity, whichever is smaller.
         items_to_keep = min(old_size, new_capacity)
 
-        # Build a new pre-allocated buffer.
-        new_buffer: list[T | NA[T] | None] = [None] * new_capacity
+        # Build a new pre-allocated buffer (None placeholders in the unused tail).
+        new_buffer: list[T | NA[T]] = cast('list[T | NA[T]]', [None] * new_capacity)
 
         if items_to_keep > 0 and old_buffer:
             # The newest item is at (old_write_pos - 1) in a circular manner.
@@ -168,7 +171,7 @@ class SeriesImpl(Generic[T]):
         :return: The value that was set, or na if buffer is empty.
         """
         if self._size == 0:
-            return NA(T)
+            return cast(NA[T], NA(T))
 
         pos = self._write_pos - 1
         if pos < 0:
@@ -199,7 +202,7 @@ class SeriesImpl(Generic[T]):
         # Pine: series[na] -> na. Must come before any int(key) coercion
         # because int(NA) raises.
         if isinstance(key, NA):
-            return NA(T)
+            return cast(NA[T], NA(T))
 
         if isinstance(key, float):
             key = int(key)
@@ -208,12 +211,11 @@ class SeriesImpl(Generic[T]):
             # Pine: out-of-range subscript -> na (covers both negative and
             # positive past-end indices).
             if key < 0 or key >= self._size:
-                return NA(T)
+                return cast(NA[T], NA(T))
             pos = self._write_pos - 1 - key
             if pos < 0:
                 pos += self._capacity
-            result = self._buffer[pos]
-            return result
+            return self._buffer[pos]
 
         elif isinstance(key, slice):
             # Handle slice notation
@@ -310,8 +312,28 @@ class ReadOnlySeriesView(Generic[T]):
         return f"ReadOnlySeriesView({list(self)})"
 
 
-__series_function_vars__ = {'inline_series': ['__series_create_series_series__']}
-__series_create_series_series__: SeriesImpl = SeriesImpl()
+def _inline_series_instance() -> Callable[..., SeriesImpl]:
+    """One ``inline_series`` instance: a closure over its own series buffer.
+
+    The slot transform routes ``inline_series`` call sites on the uniform
+    path, so ``__bind_any__`` anchors one of these per call site (and one per
+    iteration at loop sites) through the ``__pyne_bind__`` factory — that is
+    what keeps two ``expr[n]`` rewrites in one scope independent (issue #61).
+
+    :return: The bound instance with the public ``inline_series`` signature.
+    """
+    series: SeriesImpl = SeriesImpl()
+
+    def bound(value: T, idx: int) -> SeriesImpl[T]:
+        if isinstance(idx, float):
+            idx = int(idx)
+        series.add(value)
+        return cast(SeriesImpl[T], series[idx])
+
+    return bound
+
+
+_inline_series_shared: SeriesImpl = SeriesImpl()
 
 
 def inline_series(value: T, idx: int) -> SeriesImpl[T]:
@@ -319,13 +341,19 @@ def inline_series(value: T, idx: int) -> SeriesImpl[T]:
     Inline series creation
     It is mainly for compiled codes
 
+    Calling it directly (no anchor — non-transformed code) uses one shared
+    module-lifetime buffer, the same semantics the legacy module-global
+    series gave such calls; anchored call sites get independent buffers from
+    ``__pyne_bind__``.
+
     :param value: The value to store
     :param idx: The index, 0 is the last, 1 is the second last and so on
     :return:
     """
     if isinstance(idx, float):
         idx = int(idx)
-    global __series_create_series_series__
-    __series_create_series_series__.add(value)
-    result = __series_create_series_series__[idx]
-    return cast(SeriesImpl[T], result)
+    _inline_series_shared.add(value)
+    return cast(SeriesImpl[T], _inline_series_shared[idx])
+
+
+setattr(inline_series, '__pyne_bind__', _inline_series_instance)

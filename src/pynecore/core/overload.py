@@ -36,7 +36,7 @@ from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
-from .instance_state import _bind_target
+from .instance_state import _bind_target, register_shared_cache
 from ..types.base import StrLiteral
 from ..types.na import NA
 
@@ -189,16 +189,22 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
     return None
 
 
-def _anchored(impls: list[Implementation], qualname: str) -> Callable:
+def _anchored(impls: list[Implementation], qualname: str,
+              cache: dict[Implementation, tuple[Callable, Callable]] | None = None) -> Callable:
     """Create an anchored dispatch entry with its own per-implementation
     bound cache. ``__pyne_bind__`` hands these out, one per anchor; the
-    dispatcher itself is one too (the shared, anchorless fallback).
+    dispatcher itself is one too (the shared, anchorless fallback, whose
+    cache is registered for clearing on ``instance_state.reset()`` — anchor
+    caches die with their anchor, the dispatcher's would outlive the run).
 
     :param impls: The registry list of the overload group (shared, live).
     :param qualname: Qualified name for error messages.
+    :param cache: Externally held cache dict (the dispatcher's registered
+        one); per-anchor entries create their own.
     :return: The dispatch callable.
     """
-    cache: dict[Implementation, tuple[Callable, Callable]] = {}
+    if cache is None:
+        cache = {}
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
         impl = _select(impls, args, kwargs)
@@ -247,7 +253,8 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
         # particular): for exported library functions the @export decorator sits
         # above @overload and looks up the module-level Exported proxy by the
         # wrapped callable's __name__.
-        _dispatcher = wraps(func)(_anchored(_registry[qualname], qualname))
+        _dispatcher = wraps(func)(_anchored(_registry[qualname], qualname,
+                                            register_shared_cache({})))
         # @wraps copies the implementation's __dict__ too — including the
         # __pyne_layout__ the slot transform attached. The dispatcher must
         # not look state-carrying to the call-site classifier or to

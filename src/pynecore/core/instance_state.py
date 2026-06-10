@@ -82,13 +82,34 @@ from .series import SeriesImpl
 __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
     '__attach_layout__',
-    'create_root', 'get_root', 'discard_root', 'reset',
+    'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'explain_state',
 ]
 
 # Root state vectors by key; only roots are registered globally, every other
 # instance lives in the tree hanging off them.
 _root_vectors: dict[str, tuple[list, dict[str, Any]]] = {}
+
+# Module-lifetime bound caches of the anchorless fallbacks (an overload
+# dispatcher's own cache, method_call's per-method cache). They live outside
+# the root-vector tree, so reset() clears them explicitly.
+_shared_caches: list[dict] = []
+
+
+def register_shared_cache(cache: dict) -> dict:
+    """Register a module-lifetime bound cache for clearing on :func:`reset`.
+
+    Anchorless call paths (direct dispatcher calls, ``method_call`` dispatch)
+    keep their bound instances in module-lifetime dicts instead of anchor
+    slots. The legacy runtime kept such state in its global instance cache,
+    which ``reset()`` dropped between runs — registering the dict keeps that
+    contract.
+
+    :param cache: The cache dict (held by reference, never replaced).
+    :return: The same dict, for inline registration at the definition site.
+    """
+    _shared_caches.append(cache)
+    return cache
 
 
 def _make_state(layout: dict[str, Any]) -> list:
@@ -257,13 +278,16 @@ def discard_root(key: str) -> None:
 
 def reset() -> None:
     """Drop every function instance: clear the child slots of all root
-    vectors. Var and series slots of the roots are left untouched — exact
-    parity with the legacy ``function_isolation.reset()``, which cleared the
-    instance cache but never touched main's own state.
+    vectors and the registered module-lifetime bound caches. Var and series
+    slots of the roots are left untouched — exact parity with the legacy
+    ``function_isolation.reset()``, which cleared the instance cache but
+    never touched main's own state.
     """
     for state, layout in _root_vectors.values():
         for slot, _call_id, in_loop in layout['children']:
             state[slot] = [] if in_loop else None
+    for cache in _shared_caches:
+        cache.clear()
 
 
 def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
