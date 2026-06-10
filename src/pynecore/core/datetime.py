@@ -15,6 +15,10 @@ STANDARD_FORMATS = [
 
 # Pine Script specific formats (without timezone)
 # %b = abbreviated month (Jan, Feb), %B = full month (January, February)
+# Numeric dates are MONTH-FIRST (MM-DD-YYYY) with '-', '/' or '.' separators:
+# TradingView parses "03-04-2023" as March 4 and rejects a day-first
+# "13-04-2023" outright ("timestamp(s): unrecognized datetime format"),
+# so there is intentionally no day-first fallback here.
 PINE_FORMATS = [
     "%b %d %Y %H:%M:%S",  # "Feb 01 2020 22:10:05"
     "%d %b %Y %H:%M:%S",  # "04 Dec 1995 00:12:00"
@@ -26,7 +30,16 @@ PINE_FORMATS = [
     "%d %B %Y %H:%M",  # "01 January 2018 00:00"
     "%B %d %Y",  # "February 01 2020"
     "%d %B %Y",  # "04 December 1995"
-    "%Y-%m-%d"  # "2020-02-20"
+    "%Y-%m-%d",  # "2020-02-20"
+    "%m-%d-%Y %H:%M:%S",  # "03-04-2023 10:20:30"
+    "%m-%d-%Y %H:%M",  # "03-04-2023 10:20"
+    "%m-%d-%Y",  # "03-04-2023", "3-4-2023"
+    "%m/%d/%Y %H:%M:%S",  # "03/04/2023 10:20:30"
+    "%m/%d/%Y %H:%M",  # "03/04/2023 10:20"
+    "%m/%d/%Y",  # "03/04/2023"
+    "%m.%d.%Y %H:%M:%S",  # "03.04.2023 10:20:30"
+    "%m.%d.%Y %H:%M",  # "03.04.2023 10:20"
+    "%m.%d.%Y",  # "03.04.2023"
 ]
 
 
@@ -264,5 +277,6 @@ def parse_datestring(datestring: str) -> datetime:
         "- ISO Style: '2020-02-20T15:30:00+02:00', '2025-01-01 01:23:45-05:00'\n"
         "- With fraction: '2024-08-01T04:38:47.731215+00:00'\n"
         "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200', '1 January 2018 00:00 +0000'\n"
-        "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'"
+        "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'\n"
+        "- Numeric, month first: '01-01-2023', '03/04/2023', '03.04.2023 10:20:30'"
     )
