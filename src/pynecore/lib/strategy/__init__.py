@@ -436,6 +436,7 @@ class PositionBase(ABC):
     eventrades: int
     wintrades: int
     losstrades: int
+    closed_trades_count: int
     max_drawdown: float
     max_runup: float
     open_trades: list['Trade']
@@ -1603,7 +1604,8 @@ class SimPosition(PositionBase):
 
     def _check_margin_call(self, check_price: float, *, for_short: bool,
                            at_open: bool = False,
-                           can_defer: bool = True) -> bool:
+                           can_defer: bool = True,
+                           whole_contracts: bool = False) -> bool:
         """
         Check and execute margin call using TradingView's 10-step algorithm.
 
@@ -1621,6 +1623,10 @@ class SimPosition(PositionBase):
         :param for_short: If True, check short positions. If False, check long positions.
         :param at_open: If True, this is an open check — always fire immediately, never defer.
         :param can_defer: If False, MC fires immediately even when mc_size==1 and AF@C<0.
+        :param whole_contracts: If True, size the liquidation in whole contracts even on
+            fractional-lot symbols. TV's bar-open margin call (the one that fires right
+            after entry fills at the open price) liquidates whole contracts, while its
+            intrabar (H/L) and deferred margin calls work in lot units.
         :return: True if MC was deferred (caller should stop OHLC processing)
         """
         if not self.open_trades:
@@ -1657,16 +1663,22 @@ class SimPosition(PositionBase):
             return False
 
         loss = available_funds / margin_ratio
-        # One contract is worth `check_price * pv` in account currency.
-        cover_amount = int(loss / (check_price * pv))
-        margin_call_size = max(1, abs(cover_amount) * 4)
+        # One contract is worth `check_price * pv` in account currency. Work in
+        # lot units (1 / _size_round_factor): whole-lot symbols (stocks) keep
+        # TV's integer-contract truncation, while fractional-lot symbols
+        # (crypto) liquidate fractional amounts the way TV does instead of
+        # force-closing a minimum of one whole contract.
+        rfactor = 1 if whole_contracts else syminfo._size_round_factor  # noqa
+        cover_lots = int(abs(loss) / (check_price * pv) * rfactor)
+        mc_lots = max(1, cover_lots * 4)
+        margin_call_size = mc_lots / rfactor
 
         if margin_call_size > quantity:
             margin_call_size = quantity
 
-        # Deferral check: mc_size==1 at first OHLC extremum, check if AF@C<0
+        # Deferral check: mc_size==1 lot at first OHLC extremum, check if AF@C<0
         # Skip deferral when check_price == close: no recovery possible at same price
-        if not at_open and can_defer and margin_call_size == 1 and check_price != self.c:
+        if not at_open and can_defer and mc_lots == 1 and check_price != self.c:
             c_mvs = quantity * self.c * pv
             c_open_profit = c_mvs - money_spent
             if self.sign < 0:
@@ -1919,10 +1931,21 @@ class SimPosition(PositionBase):
                     # Margin/equity live in account currency; convert price * qty into
                     # account-currency units via the futures pointvalue.
                     pv = syminfo.pointvalue
+                    # A margin overshoot does not reject the order outright: TV
+                    # fills it and the bar-open margin call immediately trims
+                    # whole contracts at the fill price. Reject only when that
+                    # immediate margin call would wipe the entire position.
+                    def _mc_wipes_position(equity_: float, margin_needed_: float,
+                                           qty_after_fill: float) -> bool:
+                        loss = (equity_ - margin_needed_) / margin_ratio
+                        cover = int(abs(loss) / (fill_price * pv))
+                        return max(1, cover * 4) >= qty_after_fill
+
                     if self.size == 0.0:
                         equity = script.initial_capital + self.netprofit
                         margin_needed = abs(order.size) * fill_price * pv * margin_ratio
-                        if margin_needed > equity:
+                        if (margin_needed > equity
+                                and _mc_wipes_position(equity, margin_needed, abs(order.size))):
                             self._remove_order(order)
                             continue
                     elif self.sign == order.sign:
@@ -1934,7 +1957,8 @@ class SimPosition(PositionBase):
                                        else (money_spent - mvs))
                         equity = script.initial_capital + self.netprofit + open_profit
                         margin_needed = mvs * margin_ratio
-                        if margin_needed > equity:
+                        if (margin_needed > equity
+                                and _mc_wipes_position(equity, margin_needed, new_qty)):
                             self._remove_order(order)
                             continue
 
@@ -2070,9 +2094,12 @@ class SimPosition(PositionBase):
                         self.fill_order(order, fill_price, self.l, fill_price)
                     continue
 
-        # Margin call check at OPEN
-        self._check_margin_call(self.o, for_short=True, at_open=True)
-        self._check_margin_call(self.o, for_short=False, at_open=True)
+        # Margin call check at OPEN — TV liquidates whole contracts here even on
+        # fractional-lot symbols (verified against a TV strategy export where an
+        # entry overshooting margin filled and was immediately trimmed by exactly
+        # 1.0 contract at the fill price).
+        self._check_margin_call(self.o, for_short=True, at_open=True, whole_contracts=True)
+        self._check_margin_call(self.o, for_short=False, at_open=True, whole_contracts=True)
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
@@ -2539,19 +2566,6 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
     sign = 1 if qty > 0 else -1
     return sign * lots / rfactor
-
-
-def _margin_call_round(qty: float) -> float:
-    """
-    Ceil rounding for margin call liquidation (minimum 1 unit)
-
-    :param qty: Quantity to round (can be negative for short)
-    :return: Rounded quantity (minimum 1 in absolute value)
-    """
-    rfactor = syminfo._size_round_factor  # noqa
-    qrf = math.ceil(abs(qty) * rfactor * 10.0) * 0.1
-    sign = 1 if qty > 0 else -1
-    return sign * max(1, int(qrf)) / rfactor
 
 
 # noinspection PyShadowingNames
