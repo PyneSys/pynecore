@@ -16,7 +16,7 @@ from typing import Literal
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 from pynecore.utils.file_utils import copy_mtime, is_updated
 from ..lib.timeframe import from_seconds
-from .syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from .syminfo import SymInfo, SymInfoInterval, SymInfoSession, default_mincontract
 
 
 class DataFormatError(Exception):
@@ -211,6 +211,11 @@ class DataConverter:
                 # Users can manually adjust in the generated TOML file if needed
                 pointvalue = 1.0
 
+                # Quantity step: volume-data analysis, then the heuristic
+                # (no provider here that could supply an exchange value)
+                mincontract = (ohlcv_writer.analyzed_qty_step
+                               or default_mincontract(symbol_type, base_currency))
+
                 # Get opening hours from OHLCVWriter
                 analyzed_opening_hours = ohlcv_writer.analyzed_opening_hours
 
@@ -240,6 +245,7 @@ class DataConverter:
                     pricescale=int(pricescale),
                     minmove=int(minmove),
                     pointvalue=pointvalue,
+                    mincontract=mincontract,
                     opening_hours=opening_hours,
                     session_starts=session_starts,
                     session_ends=session_ends,

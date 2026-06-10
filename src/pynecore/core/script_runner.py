@@ -175,16 +175,17 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
     lib.syminfo.root = syminfo.ticker
     lib.syminfo.tickerid = syminfo.prefix + ':' + syminfo.ticker
     lib.syminfo.ticker = lib.syminfo.tickerid
+    lib.syminfo.main_tickerid = lib.syminfo.tickerid
 
     lib.syminfo._opening_hours = syminfo.opening_hours
     lib.syminfo._session_starts = syminfo.session_starts
     lib.syminfo._session_ends = syminfo.session_ends
 
-    if syminfo.type == 'crypto':
-        decimals = 6 if syminfo.basecurrency == 'BTC' else 4
-        lib.syminfo._size_round_factor = 10 ** decimals
-    else:
-        lib.syminfo._size_round_factor = 1
+    # Order sizes are truncated to the symbol's quantity grid, exactly like TV
+    # floors sizes to syminfo.mincontract. SymInfo guarantees a positive value
+    # (exchange value, volume-data analysis or heuristic fallback).
+    factor = round(1.0 / syminfo.mincontract) if syminfo.mincontract > 0 else 1
+    lib.syminfo._size_round_factor = max(1, factor)
 
 
 # noinspection PyProtectedMember

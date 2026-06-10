@@ -300,6 +300,7 @@ def syminfo() -> SymInfo:
         pricescale=100000,
         minmove=1,
         pointvalue=1,
+        mincontract=0.0001,
         timezone="UTC",
         volumetype="base",
         taker_fee=0.1,

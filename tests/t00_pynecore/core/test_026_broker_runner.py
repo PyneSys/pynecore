@@ -62,6 +62,7 @@ def _make_syminfo() -> SymInfo:
         mintick=0.01,
         pricescale=100.0,
         pointvalue=1.0,
+        mincontract=0.00001,
         timezone="UTC",
         volumetype="base",
         opening_hours=[],

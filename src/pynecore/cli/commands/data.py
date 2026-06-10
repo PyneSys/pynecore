@@ -487,6 +487,15 @@ def download(
                     provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress,
                                                      limit=chunk_size, with_extra=extra_data)
 
+            # Refine the heuristic mincontract from the downloaded volume data
+            # (only when the provider had no exchange value for it)
+            if provider_instance.mincontract_estimated:
+                qty_step = ohlcv_writer.analyzed_qty_step
+                if qty_step is not None and qty_step != sym_info.mincontract:
+                    sym_info.mincontract = qty_step
+                    assert provider_instance.ohlcv_path is not None
+                    sym_info.save_toml(provider_instance.ohlcv_path.with_suffix('.toml'))
+
     except ProviderError as e:
         secho(f"Error: {e}", err=True, fg=colors.RED)
         raise Exit(1)

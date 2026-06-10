@@ -371,6 +371,41 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         )
         return _DEFAULT_MINTICK
 
+    def _derive_qty_step(self, market_details: dict) -> float:
+        """Derive the minimum order quantity step (``mincontract``) for a market.
+
+        Mirrors :meth:`_derive_mintick` on the amount axis: with ``TICK_SIZE``
+        precision ``precision.amount`` already *is* the step, with
+        ``DECIMAL_PLACES`` it is a decimal-place count, and
+        ``SIGNIFICANT_DIGITS`` cannot map to a fixed step. The raw fallback is
+        ``limits.amount.min`` — TV defines ``mincontract`` as the smallest
+        tradable amount, which on most exchanges equals the amount step (e.g.
+        Binance ``LOT_SIZE`` ``stepSize`` / ``minQty``).
+
+        :param market_details: A CCXT market dict.
+        :return: The quantity step, or ``0.0`` when the exchange does not
+            expose one (the symbol info chain then falls back to volume
+            analysis / heuristics).
+        """
+        import ccxt
+
+        precision_amount = market_details.get('precision', {}).get('amount')
+        mode = self._client.precisionMode
+
+        if precision_amount is not None:
+            if mode == ccxt.TICK_SIZE:
+                return float(precision_amount)
+            if mode == ccxt.DECIMAL_PLACES:
+                return 10.0 ** -int(precision_amount)
+            # SIGNIFICANT_DIGITS: not a fixed step -- fall through to raw values.
+
+        raw = market_details.get('limits', {}).get('amount', {}).get('min')
+        try:
+            step = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return step if step > 0.0 else 0.0
+
     @override
     def update_symbol_info(self) -> SymInfo:
         """Update symbol info from the exchange."""
@@ -424,6 +459,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             pricescale=pricescale,
             minmove=minmove,
             pointvalue=market_details.get('contractSize') or 1.0,
+            mincontract=self._derive_qty_step(market_details),
             timezone=self.timezone,
             opening_hours=opening_hours,
             session_starts=session_starts,

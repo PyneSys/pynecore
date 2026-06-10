@@ -197,6 +197,7 @@ def __test_chart_as_rate_source__(log):
         prefix="CAPITALCOM", description="EUR/USD", ticker="EURUSD",
         currency="USD", basecurrency="EUR", period="1D", type="forex",
         mintick=0.00001, pricescale=100000, pointvalue=1.0,
+        mincontract=1.0,
         opening_hours=[], session_starts=[], session_ends=[],
     )
 

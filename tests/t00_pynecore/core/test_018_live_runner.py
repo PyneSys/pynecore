@@ -551,6 +551,7 @@ def _make_syminfo(opening_hours, timezone: str = "UTC"):
         pricescale=10000,
         minmove=1,
         pointvalue=1.0,
+        mincontract=1.0,
         opening_hours=opening_hours,
         session_starts=[],
         session_ends=[],

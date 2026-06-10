@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 from pynecore.types.ohlcv import OHLCV
-from pynecore.core.syminfo import SymInfo
+from pynecore.core.syminfo import SymInfo, default_mincontract
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 
 from . import Plugin, ConfigT
@@ -53,6 +53,11 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     of the provider string after the provider name selects the broker
     (e.g. ``ccxt:BYBIT:BTC/USDT:USDT`` → broker ``BYBIT``). Single-broker
     providers leave this ``False`` and treat the whole string as the symbol."""
+
+    mincontract_estimated: bool = False
+    """True when the last :meth:`get_symbol_info` fetch had to estimate
+    ``mincontract`` because the provider returned no exchange value. The
+    download flow then refines the estimate from the downloaded volume data."""
 
     @classmethod
     @abstractmethod
@@ -239,6 +244,12 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
             return SymInfo.load_toml(toml_path)
 
         sym_info = self.update_symbol_info()
+        if sym_info.mincontract <= 0.0:
+            # No exchange value (providers signal that with 0.0): estimate it.
+            # The download flow refines the estimate from the downloaded
+            # volume data, see ``mincontract_estimated``.
+            sym_info.mincontract = default_mincontract(sym_info.type, sym_info.basecurrency)
+            self.mincontract_estimated = True
         sym_info.save_toml(toml_path)
         return sym_info
 
