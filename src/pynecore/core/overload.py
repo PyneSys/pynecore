@@ -40,6 +40,13 @@ _dispatchers: dict[str, Callable] = {}  # Store dispatchers separately
 
 def _check_type(value: Any, expected_type: Type) -> bool:
     """Cached type checking for better performance with Pine Script compatibility"""
+    # ``Any`` matches every value. Parameters without a type hint default to ``Any``
+    # (see ``param_types`` below), and the compiler threads a closure variable in as a
+    # leading, unannotated parameter -- both surface here as ``Any`` and must accept any
+    # argument, like an unconstrained Pine parameter. isinstance() rejects ``Any``.
+    if expected_type is Any:
+        return True
+
     # Parameterized containers (list[T], dict[K, V], ...): isinstance() rejects
     # parameterized generics. Match on the container type, then discriminate on a
     # sample element -- overloads can differ only in their element types
