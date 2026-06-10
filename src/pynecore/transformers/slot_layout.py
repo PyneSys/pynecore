@@ -88,7 +88,7 @@ class _Slot:
     max_bars_back: ast.expr | None = None  # series slots only
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
-    varip: bool = False  # var slots only
+    varip: bool = False  # var slots and their kahan companions only
 
 
 @dataclass
@@ -122,13 +122,17 @@ class ScopeLayout:
         """
         return self._add(_Slot(len(self.slots), 'flag', f'{name}·flag', ast.Constant(value=False)))
 
-    def add_kahan(self, name: str) -> int:
+    def add_kahan(self, name: str, *, varip: bool = False) -> int:
         """Allocate a Kahan compensation slot (init ``0.0``).
 
         :param name: Name of the variable the compensation belongs to.
+        :param varip: Whether the compensated variable is ``varip`` — the
+            compensation must follow it out of the var rollback, otherwise a
+            rollback would desynchronize the pair.
         :return: The allocated slot index.
         """
-        return self._add(_Slot(len(self.slots), 'kahan', f'{name}·kahan', ast.Constant(value=0.0)))
+        return self._add(_Slot(len(self.slots), 'kahan', f'{name}·kahan', ast.Constant(value=0.0),
+                               varip=varip))
 
     def add_series(self, name: str, max_bars_back: ast.expr) -> int:
         """Allocate a series slot (``_make_state`` puts a fresh ``SeriesImpl`` here).

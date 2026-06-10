@@ -5,7 +5,7 @@ title: "Core Concepts"
 description: "Fundamental concepts and mechanisms of PyneCore"
 icon: "psychology_alt"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-06-10"
 draft: false
 toc: true
 categories: ["Overview", "Fundamentals"]
@@ -24,9 +24,9 @@ PyneCore's magic lies in its use of Python's **Abstract Syntax Tree (AST) transf
 Here's how it works:
 1. Your Python script (marked with `@pyne`) is parsed into an AST.
 2. A chain of AST transformers modify the tree, including:
-   - `PersistentTransformer`: Converts `Persistent[type]` annotated variables to specially named globals, this is the fastest possible way to maintain state between bars.
+   - `PersistentTransformer`: Converts `Persistent[type]` annotated variables to slots of a per-instance state vector (a plain list addressed with literal indexes) — the fastest possible way to maintain state between bars.
    - `SeriesTransformer`: Converts `Series[type]` annotated variables to special Series operations, on assignment it stores the value in a circular buffer, on subscription it retrieves the value from the circular buffer. Every other operation uses the pure value. Makes it really fast.
-   - `FunctionIsolationTransformer`: Ensures functions have their own isolated contexts
+   - `FunctionIsolationTransformer`: Ensures each function call site has its own isolated state
    - Lot of other optimizations, like library normalization, etc.
 3. The transformed AST is then compiled and executed by the standard Python interpreter.
 4. The compiled code is cached into the Python bytecode cache for future runs, so you can enjoy the performance of PyneCore without the overhead (very fast anyway) of the first run. The AST transformations are run only after modifications of the source code.
@@ -63,8 +63,8 @@ print(f"Current bar index (persistent): {bar_count}")
 The implementation of Persistent variables in PyneCore is especially clever:
 
 1. The `PersistentTransformer` identifies variables with `Persistent[type]` annotations at compile time.
-2. It transforms these into specially named global variables (e.g., `__persistent_main_bar_count__`).
-3. Every function that uses persistent variables gets global statements for those variables.
+2. It assigns each one a slot in the function's **state vector** — a plain list the function receives as a hidden parameter.
+3. Every read and write of the variable becomes a list access with a literal index (e.g., `__state__[0] += 1`).
 
 This approach allows PyneCore to maintain state between bar executions without relying on complex object-oriented designs. Makes it really fast.
 
@@ -148,13 +148,12 @@ def main():
     # sum1 and sum2 will have different persistent states
 ```
 
-The function isolation system uses a sophisticated runtime mechanism:
+The function isolation system uses per-instance state vectors:
 
-1. The `isolate_function` utility creates separate instances of functions for each call context.
-2. Each function instance gets its own copy of persistent variables and fresh Series instances.
-3. A function cache (`_function_cache`) keeps track of these isolated function instances.
-4. Call IDs and parent scopes are used to uniquely identify each call context.
-5. This ensures that when a function is called from different contexts, it maintains separate state for each caller.
+1. Each function instance's state (persistent variables, series buffers) lives in its own state vector — a plain list built from the function's compile-time layout.
+2. The state of a callee instance occupies a dedicated slot of the *caller's* state vector, assigned at transform time, so all live state forms a tree.
+3. The first call through a call site creates the callee's state vector; subsequent calls reach it with a single list index read.
+4. This ensures that when a function is called from different call sites, it maintains separate state for each one.
 
 This approach allows for true isolation while preserving the functional programming style that Pine Script developers are accustomed to.
 

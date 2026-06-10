@@ -1,9 +1,8 @@
 """
 @pyne
 """
-__persistent_main·p__ = 1
-__persistent_function_vars__ = {'main': ('__persistent_main·p__',)}
+__pyne_slot_layout__ = {'main': {'init': (1,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
 
-def main():
-    global __persistent_main·p__
-    __persistent_main·p__ += 1
+def main(__state__):
+    __state__[0] += 1
+main.__pyne_layout__ = __pyne_slot_layout__['main']

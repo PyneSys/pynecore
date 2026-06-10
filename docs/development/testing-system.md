@@ -5,7 +5,7 @@ title: "Testing System"
 description: "Overview of the PyneCore testing system"
 icon: "science"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-06-10"
 draft: false
 toc: true
 categories: ["Development", "Testing"]
@@ -86,7 +86,7 @@ def __test_simple_persistent__(ast_transformed_code, file_reader, log):
 ```
 
 This type of test ensures that:
-- Persistent variables are correctly converted to global variables
+- Persistent variables are correctly converted to state-vector slots
 - Series objects are properly managed
 - Function isolation is applied correctly
 - Import statements are normalized

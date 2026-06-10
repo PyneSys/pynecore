@@ -59,7 +59,7 @@ import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import stdlib_checker
-from .slot_layout import ModuleLayout, scope_for_function
+from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
 __all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS']
 
@@ -318,6 +318,12 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         :param scope_stack: Function-name path of the call site's scope.
         :return: One of the route constants or ``('same', scope_id)``.
         """
+        if self._is_series_slot_method(func, scope_stack):
+            # Synthetic SeriesImpl method call emitted by the Series
+            # transformer (__state__[N].add / .set) — stateless by
+            # construction, and an anchor could never hit anyway (a bound
+            # method is a fresh object on every attribute access)
+            return _SKIP
         path = _get_func_path(func)
         if path is None:
             return _UNIFORM
@@ -362,6 +368,33 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             return _SKIP  # unresolvable private name — legacy parity
         return _UNIFORM
 
+    def _is_series_slot_method(self, func: ast.expr, scope_stack: list[str]) -> bool:
+        """Whether a callee is a method of a series slot
+        (``__state__[N].add`` / ``__state·scope__[N].set``).
+
+        :param func: The callee expression.
+        :param scope_stack: Function-name path of the call site's scope.
+        :return: True if the slot under the attribute is a series slot.
+        """
+        if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Subscript)):
+            return False
+        sub = func.value
+        if not (isinstance(sub.value, ast.Name) and isinstance(sub.slice, ast.Constant)
+                and isinstance(sub.slice.value, int)):
+            return False
+        param = sub.value.id
+        if param == DEFAULT_STATE_PARAM:
+            scope_id = '·'.join(scope_stack)
+        elif param.startswith('__state·') and param.endswith('__'):
+            scope_id = param[len('__state·'):-2]
+        else:
+            return False
+        scope = self.layout.scopes.get(scope_id)
+        if scope is None:
+            return False
+        index = sub.slice.value
+        return 0 <= index < len(scope.slots) and scope.slots[index].kind == 'series'
+
     def _resolve_imported(self, path: str, parts: list[str]) -> Any | None:
         """Resolve a dotted callee path through the module-level import map
         at transform time (imports are cached in sys.modules)."""
@@ -374,7 +407,16 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         try:
             obj = importlib.import_module(module_name)
             for name in ([attr] if attr else []) + parts[1:]:
-                obj = getattr(obj, name)
+                try:
+                    obj = getattr(obj, name)
+                except AttributeError:
+                    # Submodule not yet loaded: the script's own import only
+                    # runs after compilation, so import it here — otherwise
+                    # the route would depend on what happens to be in
+                    # sys.modules and the emission would not be deterministic
+                    if not isinstance(obj, types.ModuleType):
+                        raise
+                    obj = importlib.import_module(f'{obj.__name__}.{name}')
         except Exception:  # noqa: BLE001 - any resolution failure means "unprovable"
             obj = None
         self._resolve_cache[path] = obj

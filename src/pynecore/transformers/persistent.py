@@ -252,7 +252,9 @@ class PersistentTransformer(ast.NodeTransformer):
         scope_kahans = self.kahan_slots.setdefault(scope, {})
         comp = scope_kahans.get(var_name)
         if comp is None:
-            comp = scope_kahans[var_name] = self.layout.scope(scope).add_kahan(var_name)
+            scope_layout = self.layout.scope(scope)
+            comp = scope_kahans[var_name] = scope_layout.add_kahan(
+                var_name, varip=scope_layout.slots[slot].varip)
 
         def var_ref(ctx: ast.expr_context) -> ast.Subscript:
             return self._state_ref(scope, slot, ctx)

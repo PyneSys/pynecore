@@ -5,7 +5,7 @@ title: "AST Transformation"
 description: "How PyneCore uses AST transformation to implement Pine Script behavior"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2026-03-18"
+lastmod: "2026-06-10"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
@@ -38,27 +38,45 @@ A cheap regex prefilter (`@pyne(\s|$)`) skips full AST parsing for files that ob
 
 ## Transformation Chain
 
-PyneCore applies several key transformations to Python code to make it behave like Pine Script:
+PyneCore applies several key transformations to Python code to make it behave like Pine Script, in this order:
 
 1. **Import Lifter** - Moves function-level imports to module level
-2. **Import Normalizer** - Standardizes import statements
-3. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
-   (see [request.security()](./request-security.md))
-4. **PersistentSeries Transformer** - Manages the hybrid PersistentSeries type
-5. **Library Series Transformer** - Prepares library Series variables
-6. **Module Property Transformer** - Handles module properties
-7. **Closure Arguments Transformer** - Converts closure variables to function arguments
-8. **Function Isolation Transformer** - Ensures separate state for each function call
+2. **TYPE_CHECKING Stripper** - Removes `if TYPE_CHECKING:` blocks (IDE-only hints)
+3. **Import Normalizer** - Standardizes import statements
+4. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
+   (see [request.security() Internals](./request-security-internals.md))
+5. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
+6. **Library Series Transformer** - Prepares library Series variables
+7. **Module Property Transformer** - Handles module properties
+8. **Closure Arguments Transformer** - Converts closure variables to function arguments
 9. **Unused Series Detector** - Removes unnecessary Series annotations for performance
 10. **Series Transformer** - Handles Series variables
 11. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
-12. **Input Transformer** - Processes input parameters
-13. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
-14. **Safe Division Transformer** - Protects against division by zero
+12. **Function Isolation Transformer** - Ensures separate state for each function call
+13. **Input Transformer** - Processes input parameters
+14. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
+15. **Safe Division Transformer** - Protects against division by zero
 
-This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations.
+This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
 
 Each transformation step modifies the Python AST to implement Pine Script behavior while maintaining Python syntax and readability.
+
+## The Slot Layout
+
+The state-related transformers (Series, Persistent, Function Isolation) share one **module layout**: a table that assigns a **slot index** to every piece of per-instance state — persistent variables, series buffers, Kahan compensation values, and the state of isolated call sites. At the end of the chain this table is emitted into the module as a plain dict constant, and every state-carrying function gets:
+
+- a hidden first parameter (`__state__`) that receives its **state vector** — a plain Python list whose slots are addressed with literal int indexes, and
+- a `__pyne_layout__` attribute describing how to build such a vector (initial values, series slots, `varip` slots, child call sites).
+
+```python
+__pyne_slot_layout__ = {'main': {'init': (0,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
+
+def main(__state__):
+    __state__[0] += 1
+main.__pyne_layout__ = __pyne_slot_layout__['main']
+```
+
+The runtime side of this scheme (who creates the state vectors and when) is described on the [Function Isolation](./function-isolation.md) page.
 
 ## Detailed Transformation Process
 
@@ -85,6 +103,10 @@ Key aspects:
 - Lifts all pynecore.lib related imports to module level
 - Ensures imports are accessible throughout the module
 - Prevents duplicate imports
+
+### TYPE_CHECKING Stripper
+
+Removes `if TYPE_CHECKING:` blocks and the `TYPE_CHECKING` import itself. These blocks carry IDE-only type hints (casts, re-annotations) that have no runtime role, so stripping them keeps the transformed module free of dead code.
 
 ### Import Normalizer
 
@@ -155,35 +177,43 @@ This makes easier to declare variables are both persistent and series.
 
 ### Library Series Transformer
 
-The Library Series transformer prepares library Series variables (like close, open, high, etc.) for proper handling by the Series transformer.
+The Library Series transformer prepares library Series variables (like close, open, high, etc.) for proper handling by the Series transformer: every scope that indexes a library value gets a local Series anchor for it.
 
 **Original code:**
 ```python
 def main():
-    def f():
+    a = lib.close[1]
+
+    def nested():
         return lib.high[1]
-    h1 = lib.high[1]
+    result = nested()
+    print(a, result)
 ```
 
-**Transformed code:**
+**Transformed code (after the Series transformer has assigned the slots):**
 ```python
-def main():
-    __lib·high: Series = lib.high
+__pyne_slot_layout__ = {'main': {'init': (None, None), 'series': ((0, None), (1, None)), 'varip': (), 'children': (), 'names': ('__lib·close', '__lib·high')}}
 
-    def f():
-        __lib·high: Series = lib.high
-        return __lib·high[1]
-    h1 = __lib·high[1]
+def main(__state·main__):
+    __lib·close = __state·main__[0].add(lib.close)
+    __lib·high = __state·main__[1].add(lib.high)
+    a = __state·main__[0][1]
+
+    def nested():
+        return __state·main__[1][1]
+    result = nested()
+    print(a, result)
+main.__pyne_layout__ = __pyne_slot_layout__['main']
 ```
 
 Key aspects:
-- Creates local Series variables for library Series in each scope
+- Creates local Series variables for library Series in each scope that needs them
 - Uses Unicode middle dot (·) as separator to prevent name collisions
-- Maintains proper function context across nested functions
+- The buffers anchor in the outermost function that uses them; nested functions reach them through the parent's state vector
 - Prepares variables for Series transformer processing
 
 **Collision Prevention**: The transformer uses `__lib·` prefix with Unicode middle dot separators to prevent naming conflicts. For example:
-- `mylib.bar.foo` becomes `__lib·mylib·bar·foo`  
+- `mylib.bar.foo` becomes `__lib·mylib·bar·foo`
 - `mylib.bar_foo` becomes `__lib·mylib·bar_foo`
 
 This ensures that hierarchical module names cannot collide with underscore-separated names.
@@ -210,7 +240,7 @@ Key aspects:
 - Uses configuration to determine which attributes are properties
 - Automatically adds parentheses for property calls
 - Preserves normal attributes as is
-- Handles dynamic cases with runtime checks
+- Handles dynamic cases with a runtime `hasattr(..., '__module_property__')` check
 
 ### Closure Arguments Transformer
 
@@ -222,10 +252,10 @@ The Closure Arguments transformer converts closure variables in inner functions 
 def main():
     length = 14
     multiplier = 2.0
-    
+
     def calculate(offset=0):
         return lib.ta.sma(lib.close, length) * multiplier + offset
-    
+
     return calculate() + calculate(10)
 ```
 
@@ -235,10 +265,10 @@ def main():
 def main():
     length = 14
     multiplier = 2.0
-    
+
     def calculate(length: int, multiplier: float, offset=0):
         return lib.ta.sma(lib.close, length) * multiplier + offset
-    
+
     return calculate(length, multiplier) + calculate(length, multiplier, 10)
 ```
 
@@ -250,37 +280,6 @@ Key aspects:
 - Maintains proper scope isolation for nested functions
 - Prepares functions for the Function Isolation transformer
 
-### Function Isolation Transformer
-
-The Function Isolation transformer ensures each function call gets its own isolated scope by wrapping functions with the isolate_function decorator.
-
-**Original code:**
-```python
-def compute_avg(source):
-    return (source + source[1]) / 2
-
-result = compute_avg(close)
-```
-
-**Transformed code:**
-```python
-from pynecore.core.function_isolation import isolate_function
-__scope_id__ = "8af7c21e_example.py"
-
-def compute_avg(source):
-    global __scope_id__
-    return (source + source[1]) / 2
-
-result = isolate_function(compute_avg, "main|compute_avg|0", __scope_id__)(close)
-```
-
-Key aspects:
-- Wraps each function call with isolate_function
-- Generates a unique call ID for each invocation
-- Maintains scope hierarchy information
-- Adds scope ID handling to each function
-- Excludes standard library and non-transformable functions
-
 ### Unused Series Detector
 
 The Unused Series Detector optimizes performance by removing Series annotations from variables that are never indexed with the subscript operator.
@@ -290,11 +289,11 @@ The Unused Series Detector optimizes performance by removing Series annotations 
 def main():
     # This variable is never indexed - can be optimized
     s: Series[float] = close
-    
+
     def f(source: Series[float], m = 1.0):
         # This parameter IS indexed - must keep Series annotation
         return source * m + s[1]
-    
+
     r = f(s, 2.0)
     plot(s)
 ```
@@ -304,12 +303,12 @@ def main():
 def main():
     # Series annotation removed since s is never indexed in main scope
     s: float = close
-    
+
     def f(source: float, m = 1.0):
         # Series annotation removed since source is never indexed in f scope
         # Note: s[1] refers to the closure variable, not the parameter
         return source * m + s[1]
-    
+
     r = f(s, 2.0)
     plot(s)
 ```
@@ -326,38 +325,43 @@ Key aspects:
 
 ### Series Transformer
 
-The Series transformer converts Series annotated variables in Python code into a global SeriesImpl instance with add() and set() operations.
+The Series transformer converts Series annotated variables into operations on a `SeriesImpl` instance (a circular buffer) living in a slot of the function's state vector.
 
 **Original code:**
 ```python
-s: Series[float] = close
-s += 1
-previous = s[1]
+from pynecore import Series
+from pynecore.lib import close
+
+def main():
+    s: Series[float] = close
+    s += 1
+    previous = s[1]
+    print(previous)
 ```
 
 **Transformed code:**
 ```python
-from pynecore.core.series import SeriesImpl
+from pynecore import lib
+__pyne_slot_layout__ = {'main': {'init': (None,), 'series': ((0, None),), 'varip': (), 'children': (), 'names': ('s',)}}
 
-__series_main·s__ = SeriesImpl()
-__series_function_vars__ = {'main': ['__series_main·s__']}
-
-def main():
-    s = __series_main·s__.add(close)
-    s = __series_main·s__.set(s + 1)
-    previous = __series_main·s__[1]
+def main(__state__):
+    s = __state__[0].add(lib.close)
+    s = __state__[0].set(s + 1)
+    previous = __state__[0][1]
+    print(previous)
+main.__pyne_layout__ = __pyne_slot_layout__['main']
 ```
 
 Key aspects:
-- Creates a global SeriesImpl instance for each Series variable
-- Converts assignments to add() and set() operations
-- Redirects indexing operations to the global instance
-- Maintains a registry of all Series variables per function scope
-- Uses Unicode middle dot (·) as scope separator to prevent conflicts with underscores in function names
+- Allocates a series slot in the function's state vector for each Series variable; the runtime puts a fresh `SeriesImpl` into these slots when an instance is created
+- Converts the declaration to an `add()` (push the bar's value) and assignments to `set()` operations
+- Redirects indexing operations to the slot (`s[1]` becomes `__state__[0][1]`)
+- Statement-position `lib.max_bars_back(s, n)` calls become assignments to the slot's `max_bars_back` attribute
+- Each function instance gets its own buffers, because each instance has its own state vector
 
 ### Persistent Transformer
 
-The Persistent transformer converts variables with Persistent type annotation to global variables that maintain their values across function calls.
+The Persistent transformer converts variables with Persistent type annotation to slots of the function's state vector, so they maintain their values across function calls.
 
 **Original code:**
 ```python
@@ -367,30 +371,63 @@ p += 1
 
 **Transformed code:**
 ```python
-__persistent_main·p__ = 0
-__persistent_function_vars__ = {'main': ['__persistent_main·p__']}
+__pyne_slot_layout__ = {'main': {'init': (0,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
 
-def main():
-    global __persistent_main·p__
-    __persistent_main·p__ += 1
+def main(__state__):
+    __state__[0] += 1
+main.__pyne_layout__ = __pyne_slot_layout__['main']
 ```
 
 Key aspects:
-- Creates a global variable for each Persistent variable
-- Adds global declarations in functions
-- Handles initialization for non-literal values
-- Maintains a registry of all Persistent variables by scope
-- Uses `·` (middle dot, U+00B7) as scope separator in variable names to avoid conflicts with underscores in function names
+- Allocates a slot with the initial value in the layout's `init` tuple; literal initializers are baked in, non-literal initializers get a lazy init-flag companion slot that triggers the assignment on the instance's first call
+- Rewrites every read and write of the variable to the slot (`__state__[0]`)
+- `IBPersistent` (varip) variables get their slot listed in the layout's `varip` tuple, which excludes them from the `var` rollback on intra-bar re-execution
+- Slot reads/writes are plain list indexing with literal indexes — the fastest state access Python offers
 
-This is the fastest possible way to implement persistent variables.
+**Kahan Summation**: The `+=` operator on Persistent float variables is automatically transformed into Kahan summation. This eliminates accumulated floating-point errors in running sums. The compensation value lives in a companion slot (`p·kahan`), which also follows the variable's `varip` flag so a rollback can never desynchronize the pair. To bypass Kahan summation, use `x = x + val` instead of `x += val`.
 
-**Kahan Summation**: The `+=` operator on Persistent float variables is automatically transformed into Kahan summation by the AST transformer. This eliminates accumulated floating-point errors in running sums. To bypass Kahan summation, use `x = x + val` instead of `x += val`.
+```python
+__pyne_slot_layout__ = {'main': {'init': (0.0, 0.0), 'series': (), 'varip': (), 'children': (), 'names': ('cumulative', 'cumulative·kahan')}}
 
-**Important Note**: The Persistent and Series transformers use the Unicode character `·` (middle dot, U+00B7) as the internal scope separator. This prevents conflicts when function names contain underscores. For example:
-- Function `f_f` in scope `main` creates variables like `__persistent_main·f_f·a__`
-- This ensures proper isolation between functions with similar names
+def main(__state__):
+    __kahan_corrected__ = some_value - __state__[1]
+    __kahan_new_sum__ = __state__[0] + __kahan_corrected__
+    __state__[1] = __kahan_new_sum__ - __state__[0] - __kahan_corrected__
+    __state__[0] = __kahan_new_sum__
+```
 
-Avoid using the `·` character in function or variable names to prevent conflicts with the internal scoping system.
+**Important Note**: The state-related transformers use the Unicode character `·` (middle dot, U+00B7) as the internal scope separator in slot names and call-site identifiers (e.g. `main·t·0`). This prevents conflicts when function names contain underscores. Avoid using the `·` character in function or variable names to prevent conflicts with the internal scoping system.
+
+### Function Isolation Transformer
+
+The Function Isolation transformer ensures each function call site gets its own isolated state. The state of a callee instance lives in a dedicated **child slot of the caller's state vector**, assigned at transform time.
+
+**Original code:**
+```python
+from pynecore.lib import ta, close
+
+def main():
+    print(ta.sma(close, 12))
+```
+
+**Transformed code:**
+```python
+from pynecore import lib
+import pynecore.lib.ta
+from pynecore.core.instance_state import __resolve_slot__
+__pyne_slot_layout__ = {'main': {'init': (None,), 'series': (), 'varip': (), 'children': ((0, 'main·lib.ta.sma·0', False),), 'names': ('main·lib.ta.sma·0',)}}
+
+def main(__state__):
+    print(lib.ta.sma(__st__ if (__st__ := __state__[0]) is not None else __resolve_slot__(__state__, 0, lib.ta.sma), lib.close, 12))
+main.__pyne_layout__ = __pyne_slot_layout__['main']
+```
+
+Key aspects:
+- The callee receives its own state vector as hidden first argument; after the first call it is a single list-index read
+- Callees the transformer can prove stateful get this fast path; callees it cannot resolve at transform time go through a uniform binding path; stateless callees are called directly; builtins, types and module properties are left untouched
+- Call sites in loops get one child state per iteration
+
+The full routing logic, the loop emission and the runtime side are described on the [Function Isolation](./function-isolation.md) page.
 
 ### Input Transformer
 
@@ -479,24 +516,25 @@ Let's see a full example of how a simple Pyne code is transformed:
 @pyne
 """
 from pynecore import Series, Persistent
-from pynecore.lib.ta import sma
-from pynecore.lib import close, open_, high, low, plot
+from pynecore.lib import script, ta, close, open_, high, low, plot, color
 
+
+@script.indicator("Example")
 def main():
     # Persistent counter
     count: Persistent[int] = 0
     count += 1
 
     # Moving average calculation
-    ma: Series[float] = sma(close, 14)
-    
+    ma: Series[float] = ta.sma(close, 14)
+
     # Safe division that could cause division by zero
     range_ratio = (close - open_) / (high - low)
 
     # Plot results
-    plot(ma, "MA", color=lib.color.blue)
-    plot(count, "Count", color=lib.color.red)
-    plot(range_ratio, "Range Ratio", color=lib.color.green)
+    plot(ma, "MA", color=color.blue)
+    plot(count, "Count", color=color.red)
+    plot(range_ratio, "Range Ratio", color=color.green)
 ```
 
 **Transformed Code:**
@@ -505,44 +543,40 @@ def main():
 @pyne
 """
 from pynecore import lib
+import pynecore.lib.color
 import pynecore.lib.ta
-from pynecore.core.series import SeriesImpl
-from pynecore.core.function_isolation import isolate_function
+from pynecore.core.instance_state import __bind_any__, __resolve_slot__
 from pynecore.core import safe_convert
+from pynecore.core.instance_state import __attach_layout__
+__pyne_slot_layout__ = {'main': {'init': (0, None, None), 'series': (), 'varip': (), 'children': ((1, 'main·lib.ta.sma·0', False), (2, 'main·lib.open_·1', False)), 'names': ('count', 'main·lib.ta.sma·0', 'main·lib.open_·1')}}
 
-# Global variables and scope ID
-__scope_id__ = "8af7c21e_example.py"
-__persistent_main·count__ = 0
-__series_main·ma__ = SeriesImpl()
-__series_main·range_ratio__ = SeriesImpl()
-
-# Function and variable registries
-__persistent_function_vars__ = {'main': ['__persistent_main·count__']}
-__series_function_vars__ = {'main': ['__series_main·ma__', '__series_main·range_ratio__']}
-
-def main():
-    global __scope_id__
-    global __persistent_main·count__
-    
-    # Library Series declarations
-    __lib·close: Series = lib.close
-    __lib·open_: Series = lib.open_
-    __lib·high: Series = lib.high
-    __lib·low: Series = lib.low
-
-    # Persistent counter
-    __persistent_main·count__ += 1
-
-    # Moving average calculation
-    ma = __series_main·ma__.add(isolate_function(lib.ta.sma, "main|lib.ta.sma|0", __scope_id__)(__lib·close, 14))
-    
-    # Safe division that could cause division by zero
-    range_ratio = __series_main·range_ratio__.add(safe_convert.safe_div(__lib·close - __lib·open_, __lib·high - __lib·low))
-
-    # Plot results
-    lib.plot(ma, "MA", color=lib.color.blue)
-    lib.plot(__persistent_main·count__, "Count", color=lib.color.red)
-    lib.plot(range_ratio, "Range Ratio", color=lib.color.green)
+@lib.script.indicator('Example')
+@__attach_layout__(__pyne_slot_layout__['main'])
+def main(__state__):
+    __state__[0] += 1
+    ma: float = lib.ta.sma(__st__ if (__st__ := __state__[1]) is not None else __resolve_slot__(__state__, 1, lib.ta.sma), lib.close, 14)
+    range_ratio = safe_convert.safe_div(lib.close - ((__b__[1] if (__b__ := __state__[2]) is not None and __b__[0] is lib.open_ else __bind_any__(__state__, 2, lib.open_))() if hasattr(lib.open_, '__module_property__') else lib.open_), lib.high - lib.low)
+    lib.plot(ma, 'MA', color=lib.color.blue)
+    lib.plot(__state__[0], 'Count', color=lib.color.red)
+    lib.plot(range_ratio, 'Range Ratio', color=lib.color.green)
 ```
 
+Worth noting in the output:
+
+- `count` became slot 0 of main's state vector (`init` starts with its initial value `0`).
+- `ma` lost its Series annotation (never indexed — Unused Series Detector), so no series slot was allocated for it.
+- The `ta.sma` call got child slot 1: the first call creates the callee's state vector there, subsequent calls reuse it.
+- Since `main` is decorated, the layout attach uses the `@__attach_layout__` decorator form (innermost position, so it tags the raw function before other decorators wrap it).
+- `lib.open_` could not be proven a plain value at transform time, so the Module Property transformer emitted the dynamic `hasattr(..., '__module_property__')` check for it.
+
 This example demonstrates how the different transformers work together to convert a simple Pyne code into equivalent Python code that provides Pine Script-like behavior through PyneCore's runtime system.
+
+## Debugging the Transformation
+
+To see the transformed code of a script, use:
+
+```bash
+pyne debug ast my_script.py
+```
+
+or the `PYNE_AST_DEBUG` family of environment variables — see [Debugging](../debugging.md#inspecting-the-transformed-code) for details.

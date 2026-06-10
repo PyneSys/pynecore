@@ -234,8 +234,12 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                 except ImportError:
                     print(display_dump(transformed, slot_layout))
                 print("-" * 100)
-            elif os.environ.get('PYNE_AST_DEBUG_RAW'):
-                print(ast.unparse(transformed))
+            elif raw_filter := os.environ.get('PYNE_AST_DEBUG_RAW'):
+                # '1' dumps every transformed module; any other value is a source
+                # path filter so a capture is not polluted by modules imported
+                # during the transform (callee resolution imports lib submodules)
+                if raw_filter == '1' or Path(raw_filter).resolve() == path.resolve():
+                    print(ast.unparse(transformed))
 
             if os.environ.get('PYNE_AST_SAVE'):
                 from pynecore.transformers.display_rewrite import display_dump

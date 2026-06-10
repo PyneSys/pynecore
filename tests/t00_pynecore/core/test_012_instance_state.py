@@ -1,6 +1,9 @@
 """
 Unit tests for the slot-based instance state runtime (core/instance_state.py).
 """
+import sys
+from pathlib import Path
+
 import pytest
 
 from pynecore.core.instance_state import (
@@ -226,6 +229,42 @@ def __test_root_var_snapshot_keys__():
     finally:
         discard_root('test·snap·mine')
         discard_root('test·snap·other')
+
+
+def __test_varip_kahan_rollback_exclusion__():
+    """ varip Kahan companion follows its variable out of the var rollback """
+    from pynecore.core.script_runner import import_script
+
+    # A real transformed script, so the transformer-side flag inheritance is
+    # covered too, not just the runtime exclusion
+    module = import_script(Path(__file__).parent / 'data' / 'varip_kahan.py')
+    try:
+        layout = module.main.__pyne_layout__
+        names = layout['names']
+        varip_slots = set(layout['varip'])
+        # The varip variable AND its Kahan companion must carry the flag
+        assert names.index('varip_total') in varip_slots
+        assert names.index('varip_total·kahan') in varip_slots
+        # The plain float's pair stays subject to the rollback
+        assert names.index('plain') not in varip_slots
+        assert names.index('plain·kahan') not in varip_slots
+
+        # Runtime: a rollback restores the plain pair, skips the varip pair
+        root = create_root('test·varip·kahan', layout)
+        try:
+            snapshot = RootVarSnapshot(['test·varip·kahan'])
+            snapshot.save()
+            for slot in range(len(names)):
+                root[slot] = 99.0
+            snapshot.restore()
+            assert root[names.index('plain')] == 0.0
+            assert root[names.index('plain·kahan')] == 0.0
+            assert root[names.index('varip_total')] == 99.0
+            assert root[names.index('varip_total·kahan')] == 99.0
+        finally:
+            discard_root('test·varip·kahan')
+    finally:
+        sys.modules.pop('varip_kahan', None)
 
 
 def __test_explain_state__():
