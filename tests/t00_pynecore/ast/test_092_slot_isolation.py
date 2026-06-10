@@ -189,6 +189,64 @@ def main():
     assert '__resolve_slot__(__state·main__, 0, t)' in dump
 
 
+def __test_decorated_def_uniform__():
+    """ A decorated def routes uniform (the name's runtime value is the
+    decorator's result) and gets its layout through the attach decorator """
+    ns, dump = _transform('''
+from pynecore import Persistent
+
+def deco(func):
+    return func
+
+@deco
+def t():
+    p: Persistent[int] = 0
+    p += 1
+    return p
+
+def main():
+    return t()
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert set(layouts) == {'t', 'main'}
+    state = _make_state(layouts['main'])
+    assert ns['main'](state) == 1
+    assert ns['main'](state) == 2  # anchored instance persists
+    assert '__bind_any__(__state__, 0, t)' in dump  # uniform, not fast
+    # the attach decorator sits innermost, tagging the raw function
+    assert "@__attach_layout__(__pyne_slot_layout__['t'])" in dump
+    assert 't.__pyne_layout__' not in dump  # no post-def attach for decorated defs
+
+
+def __test_duplicate_def_names_get_own_scopes__():
+    """ Repeated definitions of one name keep separate layouts; call sites
+    resolve to the last definition, like the runtime name binding """
+    ns, dump = _transform('''
+from pynecore import Persistent
+
+def f():
+    p: Persistent[int] = 0
+    p += 1
+    return p
+
+def f():
+    q: Persistent[int] = 100
+    q += 1
+    return q
+
+def main():
+    return f()
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert set(layouts) == {'f', 'f·2', 'main'}
+    assert layouts['f']['names'] == ('p',)
+    assert layouts['f·2']['names'] == ('q',)
+    state = _make_state(layouts['main'])
+    assert ns['main'](state) == 101  # the second definition wins
+    assert ns['main'](state) == 102
+    assert '__resolve_slot__(__state__, 0, f)' in dump
+
+
 def __test_builtins_skipped__():
     """ Builtin calls are not isolation territory """
     ns, dump = _transform('''

@@ -81,6 +81,7 @@ from .series import SeriesImpl
 
 __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
+    '__attach_layout__',
     'create_root', 'get_root', 'discard_root', 'reset',
     'RootVarSnapshot', 'explain_state',
 ]
@@ -136,10 +137,32 @@ def __grow__(children: list, func: Any) -> list:
     return state
 
 
+def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
+    """Decorator form of the layout attach, emitted for DECORATED
+    state-carrying definitions. It sits in the innermost decorator position,
+    so it tags the raw function before any other decorator (``overload`` in
+    particular) wraps or replaces it — the post-definition
+    ``func.__pyne_layout__ = ...`` assignment would tag the decorator's
+    return value instead.
+
+    :param layout: The function's layout entry.
+    :return: Identity decorator that attaches the layout.
+    """
+    def attach(func: Any) -> Callable:
+        func.__pyne_layout__ = layout
+        return func
+    return attach
+
+
 def _bind_target(func: Any) -> Callable:
     """Binding logic of the uniform path: the legacy per-call entry guards
     (type, classmethod, Exported unwrap) run here, once per binding, not per
     call; state-carrying callees get a fresh state baked into a partial.
+
+    Callees that publish a ``__pyne_bind__`` factory (overload dispatchers)
+    get a fresh per-anchor binding from it — that is how the dispatcher
+    receives the caller's anchor and keeps one instance per implementation
+    in it.
 
     :param func: The callee as it appears at the call site.
     :return: The bound callable to invoke.
@@ -149,6 +172,9 @@ def _bind_target(func: Any) -> Callable:
         target = target.__fn__
         if target is None:
             raise ValueError("Exported proxy has not been initialized with a function yet")
+    bind = getattr(target, '__pyne_bind__', None)
+    if bind is not None:
+        return bind()
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target

@@ -10,13 +10,18 @@ materializes the result into the module AST:
   state-carrying scope),
 - a ``func.__pyne_layout__ = __pyne_slot_layout__['<scope>']`` attach
   statement after every state-carrying function definition (inside the parent
-  body for nested definitions),
+  body for nested definitions); decorated definitions get an innermost
+  ``@__attach_layout__(...)`` decorator instead, so the layout lands on the
+  raw function and not on the decorator's return value,
 - the hidden state parameter injected as the FIRST parameter of every
   state-carrying function.
 
 Scope identifiers join the function-name path with the middle-dot separator
 (``main``, ``main·helper``) — the same convention the legacy global-name
-mangling used.
+mangling used. Repeated definitions of one name within a scope (``overload``
+implementations) are disambiguated with an ordinal suffix (``highest·2``);
+the mapping comes from :func:`collect_scope_segments` and every pipeline
+stage reads it through :meth:`ModuleLayout.scope_segment`.
 
 The hidden parameter is named ``__state__`` by default. Functions that
 contain nested function definitions get a scope-qualified name
@@ -30,9 +35,47 @@ The runtime side of the contract (layout dict format, ``_make_state``,
 import ast
 from dataclasses import dataclass, field
 
-__all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function']
+__all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function',
+           'collect_scope_segments']
 
 DEFAULT_STATE_PARAM = '__state__'
+
+
+def _scope_defs(scope_node: ast.AST):
+    """Yield the function definitions belonging to one scope in source order
+    (descends through statements and class bodies, but not into nested
+    function definitions — those belong to the inner scope)."""
+    for child in ast.iter_child_nodes(scope_node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield child
+        elif not isinstance(child, ast.Lambda):
+            yield from _scope_defs(child)
+
+
+def collect_scope_segments(tree: ast.Module) -> dict[int, str]:
+    """Compute the scope segment of every function definition in a module.
+
+    Repeated definitions of the same name within one scope (typically
+    ``overload`` implementations) get an ordinal suffix (``highest``,
+    ``highest·2``) so each keeps its own slot layout. The result is a pure
+    function of the tree structure, so every pipeline stage that recomputes
+    it gets identical segments.
+
+    :param tree: The module AST.
+    :return: ``id(def node) -> segment`` mapping.
+    """
+    segments: dict[int, str] = {}
+
+    def assign(scope_node: ast.AST) -> None:
+        counts: dict[str, int] = {}
+        for func in _scope_defs(scope_node):
+            n = counts.get(func.name, 0) + 1
+            counts[func.name] = n
+            segments[id(func)] = func.name if n == 1 else f'{func.name}·{n}'
+            assign(func)
+
+    assign(tree)
+    return segments
 
 
 @dataclass
@@ -129,6 +172,26 @@ class ModuleLayout:
 
     def __init__(self):
         self.scopes: dict[str, ScopeLayout] = {}
+        self._segments: dict[int, str] = {}
+
+    def assign_scope_ids(self, tree: ast.Module) -> None:
+        """(Re)build the definition -> scope-segment mapping for a module.
+
+        Every transformer entry point (and :func:`apply_layout`) calls this;
+        the rebuild is deterministic, so repeated calls on the same tree
+        agree even after body mutations.
+
+        :param tree: The module AST.
+        """
+        self._segments = collect_scope_segments(tree)
+
+    def scope_segment(self, node: ast.FunctionDef) -> str:
+        """Disambiguated scope segment of a function definition.
+
+        :param node: The function definition.
+        :return: ``name`` or ``name·N`` for repeated names in one scope.
+        """
+        return self._segments.get(id(node), node.name)
 
     def scope(self, scope_id: str) -> ScopeLayout:
         """Return (creating on demand) the layout of a scope.
@@ -233,18 +296,39 @@ def _attach_ast(func_name: str, scope_id: str) -> ast.Assign:
     )
 
 
-def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout) -> list[ast.stmt]:
+def _attach_decorator_ast(scope_id: str) -> ast.Call:
+    """Build the ``__attach_layout__(__pyne_slot_layout__['scope'])`` decorator.
+
+    Used for decorated definitions: appended as the INNERMOST decorator it
+    tags the raw function, while a post-definition attribute assignment
+    would tag whatever the other decorators returned (e.g. an ``overload``
+    dispatcher).
+    """
+    return ast.Call(
+        func=ast.Name(id='__attach_layout__', ctx=ast.Load()),
+        args=[ast.Subscript(value=ast.Name(id='__pyne_slot_layout__', ctx=ast.Load()),
+                            slice=ast.Constant(value=scope_id), ctx=ast.Load())],
+        keywords=[])
+
+
+def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
+                  used_imports: set[str]) -> list[ast.stmt]:
     """Inject hidden state parameters and layout attaches into a statement list."""
     new_body: list[ast.stmt] = []
     for stmt in body:
         new_body.append(stmt)
         if not isinstance(stmt, ast.FunctionDef):
             continue
-        scope_id = f'{scope_prefix}·{stmt.name}' if scope_prefix else stmt.name
-        stmt.body = _process_defs(stmt.body, scope_id, layout)
+        segment = layout.scope_segment(stmt)
+        scope_id = f'{scope_prefix}·{segment}' if scope_prefix else segment
+        stmt.body = _process_defs(stmt.body, scope_id, layout, used_imports)
         if layout.state_carrying(scope_id):
             stmt.args.args.insert(0, ast.arg(arg=layout.state_param(scope_id)))
-            new_body.append(_attach_ast(stmt.name, scope_id))
+            if stmt.decorator_list:
+                stmt.decorator_list.append(_attach_decorator_ast(scope_id))
+                used_imports.add('__attach_layout__')
+            else:
+                new_body.append(_attach_ast(stmt.name, scope_id))
     return new_body
 
 
@@ -275,6 +359,14 @@ def apply_layout(tree: ast.Module, layout: ModuleLayout) -> ast.Module:
     # The dict is emitted even when empty: its presence marks the module as
     # transformed, which the cross-module call-site classification relies on
     # ("transformed module + no layout attribute -> provably stateless").
-    tree.body = _process_defs(tree.body, '', layout)
-    tree.body.insert(_insert_index(tree.body), _layout_assign_ast(layout))
+    layout.assign_scope_ids(tree)
+    used_imports: set[str] = set()
+    tree.body = _process_defs(tree.body, '', layout, used_imports)
+    index = _insert_index(tree.body)
+    tree.body.insert(index, _layout_assign_ast(layout))
+    if used_imports:
+        tree.body.insert(index, ast.ImportFrom(
+            module='pynecore.core.instance_state',
+            names=[ast.alias(name=name, asname=None) for name in sorted(used_imports)],
+            level=0))
     return tree

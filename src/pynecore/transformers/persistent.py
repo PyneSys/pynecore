@@ -14,7 +14,9 @@ literal-index subscript:
 - ``+=`` with a non-literal value keeps Kahan summation, emitted as a
   four-statement sequence (a slot cannot be the target of a walrus, so the
   legacy single-expression form does not carry over — statement position is
-  guaranteed because ``+=`` is always a statement),
+  guaranteed because ``+=`` is always a statement); variables declared with
+  a ``str``/``bool`` element type skip Kahan (numeric error compensation
+  would crash string concatenation),
 - a walrus write to a persistent (expression position) is emitted through
   ``__state__.__setitem__`` inside a tuple expression, preserving the value.
 
@@ -45,6 +47,8 @@ class PersistentTransformer(ast.NodeTransformer):
         # scope -> var name -> (value slot, flag slot or None, kahan slot or None)
         self.var_slots: dict[str, dict[str, int]] = {}
         self.kahan_slots: dict[str, dict[str, int]] = {}
+        # scope -> var name -> declared element type name (None when unknown)
+        self.var_types: dict[str, dict[str, str | None]] = {}
         self.persistent_declarations: dict[str, set[str]] = {}
         self.local_vars: dict[str, set[str]] = {}
 
@@ -107,6 +111,13 @@ class PersistentTransformer(ast.NodeTransformer):
             return True
         return isinstance(node, ast.Name) and node.id == 'na'
 
+    @staticmethod
+    def _inner_type_name(annotation: ast.expr) -> str | None:
+        """Declared element type name of a ``Persistent[...]`` annotation."""
+        if isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Name):
+            return annotation.slice.id
+        return None
+
     # --- visitors --------------------------------------------------------
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom | None:
@@ -118,9 +129,13 @@ class PersistentTransformer(ast.NodeTransformer):
             node.names = new_names
         return node
 
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self.layout.assign_scope_ids(node)
+        return cast(ast.Module, self.generic_visit(node))
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Track scopes, qualify the state parameter when nested defs exist."""
-        self.scope_stack.append(node.name)
+        self.scope_stack.append(self.layout.scope_segment(node))
         self.current_scope = '·'.join(self.scope_stack)
 
         scope_for_function(self.layout, self.current_scope, node)
@@ -168,6 +183,8 @@ class PersistentTransformer(ast.NodeTransformer):
         var_name = node.target.id
         self.persistent_declarations[self.current_scope].add(var_name)
         self.local_vars[self.current_scope].add(var_name)
+        self.var_types.setdefault(self.current_scope, {})[var_name] = \
+            self._inner_type_name(node.annotation)
         varip = self._is_varip_type(node.annotation)
         scope_layout = self.layout.scope(self.current_scope)
 
@@ -217,7 +234,11 @@ class PersistentTransformer(ast.NodeTransformer):
             found = self._lookup(node.target.id)
             if found:
                 scope, slot = found
-                if isinstance(node.op, ast.Add) and not self._is_literal_or_na(node.value):
+                if (isinstance(node.op, ast.Add) and not self._is_literal_or_na(node.value)
+                        # Kahan is numeric error compensation — a declared
+                        # str/bool element type concatenates/accumulates plain
+                        and self.var_types.get(scope, {}).get(node.target.id)
+                        not in ('str', 'bool')):
                     return self._emit_kahan(scope, slot, node.target.id,
                                             cast(ast.expr, self.visit(node.value)))
                 node.target = self._state_ref(scope, slot, ast.Store())

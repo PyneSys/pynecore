@@ -21,7 +21,7 @@ tests compare against that).
 from typing import cast
 import ast
 
-from .slot_layout import ModuleLayout, DEFAULT_STATE_PARAM
+from .slot_layout import ModuleLayout, DEFAULT_STATE_PARAM, collect_scope_segments
 
 __all__ = ['display_dump']
 
@@ -31,8 +31,12 @@ _INDEXED_HELPERS = ('__resolve_slot__', '__bind_any__')
 class _IndexNamer(ast.NodeTransformer):
     """Replace literal state-vector indexes with named constants."""
 
-    def __init__(self, layout: ModuleLayout):
+    def __init__(self, layout: ModuleLayout, segments: dict[int, str]):
         self.layout = layout
+        # The display copy is re-parsed, so the layout's node-identity map
+        # does not apply — segments are recomputed on the copy (the mapping
+        # is a pure function of the tree structure, so they agree).
+        self.segments = segments
         self.stack: list[str] = []
         self.used: dict[str, int] = {}  # constant name -> slot index
 
@@ -75,7 +79,7 @@ class _IndexNamer(ast.NodeTransformer):
     # --- visitors --------------------------------------------------------
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        self.stack.append(node.name)
+        self.stack.append(self.segments.get(id(node), node.name))
         self.generic_visit(node)
         self.stack.pop()
         return node
@@ -119,7 +123,7 @@ def display_dump(tree: ast.Module, layout: ModuleLayout) -> str:
     :return: Source text with named index constants.
     """
     clean = ast.parse(ast.unparse(tree))
-    namer = _IndexNamer(layout)
+    namer = _IndexNamer(layout, collect_scope_segments(clean))
     clean = cast(ast.Module, namer.visit(clean))
     if namer.used:
         defs: list[ast.stmt] = [

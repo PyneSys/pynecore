@@ -5,6 +5,7 @@ import pytest
 
 from pynecore.core.instance_state import (
     __resolve_slot__, __grow__, __bind_any__, __bind_any_loop__,
+    __attach_layout__,
     create_root, get_root, discard_root, reset,
     RootVarSnapshot, explain_state, _make_state,
 )
@@ -107,6 +108,35 @@ def __test_bind_any_exported__():
     assert bound(3.0) == 5.0
     with pytest.raises(ValueError):
         __bind_any__(parent, 2, Exported())
+
+
+def __test_attach_layout__():
+    """ __attach_layout__: tags the raw function and returns it unchanged """
+    @__attach_layout__(LAYOUT_LEAF)
+    def acc(__state__, x):
+        __state__[0] += x
+        return __state__[0]
+
+    assert acc.__pyne_layout__ is LAYOUT_LEAF
+    state = _make_state(LAYOUT_LEAF)
+    assert acc(state, 2.0) == 2.0
+
+
+def __test_bind_any_dispatcher_hook__():
+    """ __bind_any__: a callee with __pyne_bind__ gets a fresh per-anchor
+    binding from the factory """
+    def fake_dispatcher():
+        raise AssertionError("the anchor must call the factory's binding")
+
+    def bound_instance(x):
+        return x * 10
+    fake_dispatcher.__pyne_bind__ = lambda: bound_instance
+
+    parent = _make_state(LAYOUT_PARENT)
+    bound = __bind_any__(parent, 2, fake_dispatcher)
+    assert bound is bound_instance
+    assert parent[2] == (fake_dispatcher, bound_instance)
+    assert bound(2) == 20
 
 
 def __test_bind_any_loop__():

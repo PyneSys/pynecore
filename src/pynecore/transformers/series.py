@@ -106,6 +106,10 @@ class SeriesTransformer(ast.NodeTransformer):
 
     # --- visitors --------------------------------------------------------
 
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self.layout.assign_scope_ids(node)
+        return cast(ast.Module, self.generic_visit(node))
+
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom | None:
         """Strip the Series name from pynecore imports."""
         if node.module and node.module.startswith('pynecore'):
@@ -117,7 +121,7 @@ class SeriesTransformer(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Track scopes and convert Series-annotated parameters."""
-        self.scope_stack.append(node.name)
+        self.scope_stack.append(self.layout.scope_segment(node))
         self.current_scope = '·'.join(self.scope_stack)
         scope_for_function(self.layout, self.current_scope, node)
         self.local_vars.setdefault(self.current_scope, set())

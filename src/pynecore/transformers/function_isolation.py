@@ -30,12 +30,15 @@ Classification sources:
 - same-module functions: the shared :class:`ModuleLayout` (this transformer
   must run AFTER the Persistent and Series transformers) plus a carrier
   fixpoint over the module's call graph — a function carries state if it has
-  own slots or any non-direct call site;
+  own slots or any non-direct call site; a name whose LAST definition is
+  decorated routes uniform (the runtime value is the decorator's return
+  value — an ``overload`` dispatcher, an ``lru_cache`` wrapper, ...);
 - cross-module callees (``lib.*``, user Pyne libraries): the callee module
   is imported at transform time and the object inspected —
+  ``__pyne_bind__`` marks an overload dispatcher (uniform),
   ``__pyne_layout__`` proves state-carrying, a ``__pyne_slot_layout__``
   marker in the function's globals with no layout attribute proves
-  stateless, ``overload`` dispatchers and everything else fall to uniform.
+  stateless, everything else falls to uniform.
 
 Unprovable always degrades to uniform (correct, only slower) — an error can
 only come from a false proof, never from missing knowledge.
@@ -197,8 +200,11 @@ class _ScopeIndex(ast.NodeVisitor):
     """Pass 1a: per-scope name bindings (defs, classes, everything else
     assigned) and the module-level import map."""
 
-    def __init__(self):
-        self.defs: dict[str, set[str]] = {'': set()}
+    def __init__(self, layout: ModuleLayout):
+        self.layout = layout
+        # scope -> name -> (target scope id of the LAST def, has decorators);
+        # the last definition wins, like the runtime name binding does
+        self.defs: dict[str, dict[str, tuple[str, bool]]] = {'': {}}
         self.classes: dict[str, set[str]] = {'': set()}
         self.assigned: dict[str, set[str]] = {'': set()}
         # name -> (module path, attribute or None)
@@ -206,10 +212,13 @@ class _ScopeIndex(ast.NodeVisitor):
         self._stack: list[str] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self.defs['·'.join(self._stack)].add(node.name)
-        self._stack.append(node.name)
+        outer = '·'.join(self._stack)
+        segment = self.layout.scope_segment(node)
+        target = f'{outer}·{segment}' if outer else segment
+        self.defs[outer][node.name] = (target, bool(node.decorator_list))
+        self._stack.append(segment)
         scope = '·'.join(self._stack)
-        self.defs.setdefault(scope, set())
+        self.defs.setdefault(scope, {})
         self.classes.setdefault(scope, set())
         assigned = self.assigned.setdefault(scope, set())
         args = node.args
@@ -268,7 +277,7 @@ class _RouteCollector(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if _is_test_function(node.name):
             return
-        self._stack.append(node.name)
+        self._stack.append(self.transformer.layout.scope_segment(node))
         self.scope_routes.setdefault('·'.join(self._stack), [])
         for stmt in node.body:
             self.visit(stmt)
@@ -289,7 +298,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
 
     def __init__(self, layout: ModuleLayout):
         self.layout = layout
-        self.index = _ScopeIndex()
+        self.index = _ScopeIndex(layout)
         self.carrier: dict[str, bool] = {}
         self._scope_stack: list[str] = []
         self._loop_depth = 0
@@ -321,10 +330,15 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         for i in range(len(scope_stack), -1, -1):
             scope = '·'.join(scope_stack[:i])
             is_assigned = base in self.index.assigned.get(scope, ())
-            if base in self.index.defs.get(scope, ()):
-                if is_assigned or len(parts) > 1:
-                    return _UNIFORM  # rebound name / attribute on a def
-                return 'same', (f'{scope}·{base}' if scope else base)
+            entry = self.index.defs.get(scope, {}).get(base)
+            if entry is not None:
+                target, decorated = entry
+                if is_assigned or len(parts) > 1 or decorated:
+                    # Rebound name, attribute on a def, or a decorated def
+                    # (the runtime value is the decorator's return value —
+                    # an overload dispatcher, an lru_cache wrapper, ...)
+                    return _UNIFORM
+                return 'same', target
             if base in self.index.classes.get(scope, ()):
                 # Constructor or class attribute — the legacy runtime guard
                 # returned types untouched, skipping is the same net effect
@@ -378,13 +392,16 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             return _SKIP  # classmethod
         if isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
             return _SKIP
+        if getattr(obj, '__pyne_bind__', None) is not None:
+            # Overload dispatcher — the implementation is chosen at runtime.
+            # Must be checked BEFORE the layout: functools.wraps copies the
+            # first implementation's __dict__ (its __pyne_layout__ included)
+            # onto the dispatcher.
+            return _UNIFORM
         if getattr(obj, '__pyne_layout__', None) is not None:
             return _FAST
         if getattr(obj, '__module_property__', False):
             return _SKIP  # Pine-style module property getter — stateless by design
-        code = getattr(obj, '__code__', None)
-        if code is not None and code.co_qualname == 'overload.<locals>.dispatcher':
-            return _UNIFORM  # implementation chosen at runtime
         if isinstance(obj, types.FunctionType) and '__pyne_slot_layout__' in obj.__globals__:
             return _DIRECT  # transformed module, no layout -> provably stateless
         return _UNIFORM
@@ -541,7 +558,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
     # --- visitors ------------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        self.index = _ScopeIndex()
+        self.layout.assign_scope_ids(node)
+        self.index = _ScopeIndex(self.layout)
         self.index.visit(node)
         collector = _RouteCollector(self)
         collector.visit(node)
@@ -574,7 +592,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         if _is_test_function(node.name):
             return node
-        self._scope_stack.append(node.name)
+        self._scope_stack.append(self.layout.scope_segment(node))
         scope = '·'.join(self._scope_stack)
         scope_for_function(self.layout, scope, node)
         old_loop, self._loop_depth = self._loop_depth, 0

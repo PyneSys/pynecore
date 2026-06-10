@@ -1,3 +1,34 @@
+"""
+Function overloading with per-implementation instance state (slot scheme).
+
+The ``@overload`` decorator registers every implementation under the
+function's qualified name and binds the name to a single dispatcher. The
+dispatcher selects the implementation by argument types (Pine Script
+compatible matching) and calls it through a per-anchor bound cache:
+
+- Call sites reach the dispatcher on the UNIFORM route — the caller anchors
+  it in its own state vector with ``__bind_any__``, whose ``_bind_target``
+  finds the dispatcher's ``__pyne_bind__`` factory and stores a fresh
+  anchored dispatcher in the anchor slot.
+- One anchor holds one bound callable PER IMPLEMENTATION: a call site where
+  different argument types win on different bars keeps a separate persistent
+  instance for every implementation, while one implementation's state
+  persists across the bars it wins on.
+- State-carrying implementations are bound through
+  ``instance_state._bind_target`` (their ``__pyne_layout__`` comes from the
+  ``@__attach_layout__`` decorator the slot transform inserts below
+  ``@overload``); stateless implementations are called raw.
+- Calling the dispatcher directly (no anchor — module level, non-transformed
+  code, function values passed to builtins) falls back to the dispatcher's
+  own module-lifetime bound cache: one shared instance per implementation,
+  the same semantics the legacy module-global scope gave such calls.
+
+Implementation matching skips the hidden state parameter the slot transform
+injects (``__state__`` or the scope-qualified ``__state·{scope}__`` form):
+signatures and parameter types are computed from the VISIBLE parameters
+only, and the state argument is prepended by the bound partial, never by
+the caller.
+"""
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
 from functools import wraps
@@ -5,7 +36,7 @@ from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
-from .function_isolation import isolate_function
+from .instance_state import _bind_target
 from ..types.base import StrLiteral
 from ..types.na import NA
 
@@ -13,24 +44,47 @@ __all__ = ['overload']
 
 T = TypeVar('T')
 
-__scope_id__ = ""
+
+def _is_state_param(name: str) -> bool:
+    """Whether a parameter is the hidden state parameter injected by the
+    slot-layout transform.
+
+    :param name: Parameter name.
+    :return: True for ``__state__`` and the scope-qualified form.
+    """
+    return name == '__state__' or (name.startswith('__state·') and name.endswith('__'))
 
 
 class Implementation:
-    __slots__ = ('func', 'sig', 'type_hints', 'param_types', 'call_id')
+    __slots__ = ('func', 'sig', 'type_hints', 'param_types')
     func: Callable
-    sig: Any  # Signature object
+    sig: Any  # Signature object of the VISIBLE parameters
     type_hints: dict
-    param_types: tuple  # Cached parameter types for quick checking
-    call_id: str  # Per-implementation isolation call id
+    param_types: tuple  # Cached visible parameter types for quick checking
 
-    def __init__(self, func: Callable, sig: Any, type_hints: dict, param_types: tuple,
-                 call_id: str):
+    def __init__(self, func: Callable):
+        self.update(func)
+
+    def update(self, func: Callable) -> None:
+        """(Re)bind to the implementation function and cache its matching
+        metadata. Re-running a module re-decorates the same source lines —
+        the dispatcher and the Implementation objects survive, only the
+        function objects are swapped.
+
+        :param func: The (possibly re-created) implementation function.
+        """
+        sig = signature(func)
+        params = list(sig.parameters.values())
+        if params and _is_state_param(params[0].name):
+            # Hide the injected state parameter from matching: arity and
+            # types are checked against what the call site passes, the
+            # state argument comes from the bound partial
+            params = params[1:]
+        hints = get_type_hints(func)
         self.func = func
-        self.sig = sig
-        self.type_hints = type_hints
-        self.param_types = param_types
-        self.call_id = call_id
+        self.sig = sig.replace(parameters=params)
+        self.type_hints = hints
+        self.param_types = tuple((p.name, hints.get(p.name, Any)) for p in params)
 
 
 _registry: dict[str, list[Implementation]] = defaultdict(list)
@@ -104,93 +158,103 @@ def _check_type(value: Any, expected_type: Type) -> bool:
     return False
 
 
+def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implementation | None:
+    """Select the implementation matching a call's arguments.
+
+    :param impls: Registered implementations (registration order).
+    :param args: Positional arguments of the call.
+    :param kwargs: Keyword arguments of the call.
+    :return: The first matching implementation, or None.
+    """
+    # Quick path: try direct positional args match first
+    if not kwargs:
+        for impl in impls:
+            if len(args) == len(impl.param_types):
+                if all(_check_type(arg, type_)
+                       for arg, (_, type_) in zip(args, impl.param_types)):
+                    return impl
+
+    # Slower path: handle mixed args/kwargs and defaults
+    for impl in impls:
+        try:
+            bound = impl.sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+
+            if all(_check_type(value, impl.type_hints[name])
+                   for name, value in bound.arguments.items()
+                   if name in impl.type_hints):
+                return impl
+        except TypeError:
+            continue
+    return None
+
+
+def _anchored(impls: list[Implementation], qualname: str) -> Callable:
+    """Create an anchored dispatch entry with its own per-implementation
+    bound cache. ``__pyne_bind__`` hands these out, one per anchor; the
+    dispatcher itself is one too (the shared, anchorless fallback).
+
+    :param impls: The registry list of the overload group (shared, live).
+    :param qualname: Qualified name for error messages.
+    :return: The dispatch callable.
+    """
+    cache: dict[Implementation, tuple[Callable, Callable]] = {}
+
+    def dispatch(*args: Any, **kwargs: Any) -> Any:
+        impl = _select(impls, args, kwargs)
+        if impl is None:
+            raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
+        entry = cache.get(impl)
+        if entry is None or entry[0] is not impl.func:
+            # First win at this anchor, or the module was re-executed and
+            # the implementation function was swapped under us
+            entry = cache[impl] = (impl.func, _bind_target(impl.func))
+        return entry[1](*args, **kwargs)
+
+    return dispatch
+
+
 def overload(func: Callable[..., T]) -> Callable[..., T]:
     """
-    Optimized function overloading decorator with:
+    Function overloading decorator with:
     - Type checking cache
-    - Pre-calculated signatures and type hints
+    - Pre-calculated signatures and type hints (hidden state parameter excluded)
     - Quick parameter matching
+    - Per-anchor instance state through ``__pyne_bind__``
     - IDE type checking support via typing.overload
     """
-    global __scope_id__
-
     _func = cast(FunctionType, func)
     qualname = _func.__module__ + '.' + _func.__qualname__
     qualname_with_line = f"{qualname}:{_func.__code__.co_firstlineno}"
 
-    # This caching prevents re-creating the dispatcher if it already exists
+    # Re-executed module: same dispatcher, rebind the implementation
     _dispatcher = _dispatchers.get(qualname)
-    if _dispatcher:
-        try:
-            impl = _implementations[qualname_with_line]
-            if impl:
-                # Change the function implementation to the new one
-                impl.func = func
-                return _dispatcher
-        except KeyError:
-            pass
+    if _dispatcher is not None:
+        impl = _implementations.get(qualname_with_line)
+        if impl is not None:
+            impl.update(func)
+            return _dispatcher
 
     # Register with typing.overload for IDE support
     typing_overload(func)
 
-    # Pre-calculate and cache implementation info; the call id carries the
-    # implementation's identity so different overloads never share one
-    # isolation cache slot (a shared slot would rebuild one implementation's
-    # code with another one's globals)
-    impl = Implementation(
-        func=func,
-        sig=signature(func),
-        type_hints=get_type_hints(func),
-        param_types=tuple(
-            (name, get_type_hints(func).get(name, Any))
-            for name in signature(func).parameters
-        ),
-        call_id=f"__overloaded__·{qualname_with_line}",
-    )
+    impl = Implementation(func)
     _implementations[qualname_with_line] = impl
-
-    if qualname not in _dispatchers:
-        # The dispatcher must carry the implementation's metadata (__name__ in particular):
-        # for exported library functions the @export decorator sits above @overload and looks
-        # up the module-level Exported proxy by the wrapped callable's __name__.
-        # noinspection PyShadowingNames
-        @wraps(func)
-        def dispatcher(*args: Any, **kwargs: Any) -> Any:
-            # Quick path: try direct positional args match first
-            if not kwargs:
-                for impl in _registry[qualname]:
-                    if len(args) == len(impl.param_types):
-                        if all(_check_type(arg, type_)
-                               for arg, (_, type_) in zip(args, impl.param_types)):
-                            return isolate_function(impl.func, impl.call_id, __scope_id__)(*args)
-
-            # Slower path: handle mixed args/kwargs
-            for impl in _registry[qualname]:
-                try:
-                    bound = impl.sig.bind(*args, **kwargs)
-                    bound.apply_defaults()
-
-                    if all(_check_type(value, impl.type_hints[name])
-                           for name, value in bound.arguments.items()
-                           if name in impl.type_hints):
-                        return isolate_function(impl.func, impl.call_id, __scope_id__)(*args, **kwargs)
-                except TypeError:
-                    continue
-
-            raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
-
-        # Store implementation and dispatcher
-        _registry[qualname].append(impl)
-
-        _dispatcher = dispatcher
-
-        _dispatchers[qualname] = _dispatcher
-        return _dispatcher
-
-    # Add additional implementation
     _registry[qualname].append(impl)
 
-    dispatcher = _dispatchers[qualname]
+    if _dispatcher is None:
+        # The dispatcher must carry the implementation's metadata (__name__ in
+        # particular): for exported library functions the @export decorator sits
+        # above @overload and looks up the module-level Exported proxy by the
+        # wrapped callable's __name__.
+        _dispatcher = wraps(func)(_anchored(_registry[qualname], qualname))
+        # @wraps copies the implementation's __dict__ too — including the
+        # __pyne_layout__ the slot transform attached. The dispatcher must
+        # not look state-carrying to the call-site classifier or to
+        # _bind_target.
+        _dispatcher.__dict__.pop('__pyne_layout__', None)
+        setattr(_dispatcher, '__pyne_bind__',
+                lambda: _anchored(_registry[qualname], qualname))
+        _dispatchers[qualname] = _dispatcher
 
-    # Return existing dispatcher
-    return dispatcher
+    return _dispatcher
