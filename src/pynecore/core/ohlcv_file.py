@@ -33,6 +33,9 @@ from ..core.syminfo import SymInfoInterval
 RECORD_SIZE = 24  # 6 * 4
 STRUCT_FORMAT = 'Ifffff'  # I: uint32, f: float32
 
+_QTY_STEP_MIN_SAMPLES = 100  # positive-volume bars needed before analyzed_qty_step answers
+_QTY_STEP_MAX_DECIMALS = 8  # more decimals than any real exchange lot step -> float dust
+
 __all__ = ['OHLCVWriter', 'OHLCVReader', 'RECORD_SIZE', 'STRUCT_FORMAT']
 
 
@@ -201,6 +204,7 @@ class OHLCVWriter:
     __slots__ = ('path', '_file', '_size', '_start_timestamp', '_interval', '_current_pos', '_last_timestamp',
                  '_price_changes', '_price_decimals', '_last_close', '_analyzed_tick_size',
                  '_analyzed_price_scale', '_analyzed_min_move', '_confidence',
+                 '_volume_max_decimals', '_volume_count', '_volume_dust_count',
                  '_trading_hours', '_analyzed_opening_hours', '_timestamp_offsets', '_analyzed_timezone',
                  '_truncate')
 
@@ -221,6 +225,10 @@ class OHLCVWriter:
         self._analyzed_price_scale: int | None = None
         self._analyzed_min_move: int | None = None
         self._confidence: float = 0.0
+        # Quantity step (mincontract) analysis
+        self._volume_max_decimals: int = 0
+        self._volume_count: int = 0
+        self._volume_dust_count: int = 0
         # Trading hours analysis
         self._trading_hours: dict[tuple[int, int], int] = {}  # (weekday, hour) -> count
         self._analyzed_opening_hours: list | None = None
@@ -332,6 +340,23 @@ class OHLCVWriter:
         if self._analyzed_opening_hours is None and self._has_enough_data_for_opening_hours():
             self._analyze_opening_hours()
         return self._analyzed_opening_hours
+
+    @property
+    def analyzed_qty_step(self) -> float | None:
+        """
+        Automatically detected quantity step (``mincontract`` candidate) from volume data.
+
+        Every bar volume is a sum of trade quantities on the exchange's lot
+        grid, so the maximum decimal precision seen across the written volumes
+        bounds the lot step from below. Returns ``None`` without enough
+        positive-volume bars or when the volumes carry float dust (which means
+        they were computed, not exchange-native).
+        """
+        if self._volume_count < _QTY_STEP_MIN_SAMPLES:
+            return None
+        if self._volume_dust_count * 20 > self._volume_count:  # >5% dusty samples
+            return None
+        return 10.0 ** -self._volume_max_decimals
 
     def open(self) -> 'OHLCVWriter':
         """
@@ -454,6 +479,9 @@ class OHLCVWriter:
         # Collect data for tick size analysis
         self._collect_price_data(candle)
 
+        # Collect volume data for quantity step analysis
+        self._collect_volume_data(candle)
+
         # Collect trading hours data
         self._collect_trading_hours(candle)
 
@@ -534,6 +562,28 @@ class OHLCVWriter:
                     self._price_decimals.add(decimals)
 
         self._last_close = candle.close
+
+    def _collect_volume_data(self, candle: OHLCV) -> None:
+        """
+        Collect volume decimal statistics for quantity step analysis during writing.
+
+        Must run on the original float64 volumes: the file stores float32,
+        whose ~7 significant digits destroy a small lot step on large volumes,
+        so the analysis cannot be redone from the file afterwards.
+        """
+        volume = candle.volume
+        if volume <= 0.0:  # empty bars and -1.0 gap fills carry no quantity information
+            return
+        vol_str = str(volume)  # shortest round-trip repr, no float dust
+        if 'e' in vol_str or 'E' in vol_str:
+            vol_str = f"{volume:.20f}".rstrip('0')
+        decimals = len(vol_str.split('.')[1].rstrip('0')) if '.' in vol_str else 0
+        if decimals > _QTY_STEP_MAX_DECIMALS:
+            self._volume_dust_count += 1
+            return
+        self._volume_count += 1
+        if decimals > self._volume_max_decimals:
+            self._volume_max_decimals = decimals
 
     def _analyze_tick_size(self) -> None:
         """

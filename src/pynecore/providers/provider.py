@@ -5,7 +5,7 @@ from datetime import datetime
 import tomllib
 
 from ..types.ohlcv import OHLCV
-from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession, default_mincontract
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 
 
@@ -28,6 +28,11 @@ class Provider(metaclass=ABCMeta):
 
     ohlcv_path: Path | None = None
     """ Directory to save OHLV data """
+
+    mincontract_estimated: bool = False
+    """True when the last :meth:`get_symbol_info` fetch had to estimate
+    ``mincontract`` because the provider returned no exchange value. The
+    download flow then refines the estimate from the downloaded volume data."""
 
     config_keys = {
         '# Settings for the provider': '',
@@ -130,6 +135,12 @@ class Provider(metaclass=ABCMeta):
             return SymInfo.load_toml(toml_path)
 
         sym_info = self.update_symbol_info()
+        if sym_info.mincontract <= 0.0:
+            # No exchange value (providers signal that with 0.0): estimate it.
+            # The download flow refines the estimate from the downloaded
+            # volume data, see ``mincontract_estimated``.
+            sym_info.mincontract = default_mincontract(sym_info.type, sym_info.basecurrency)
+            self.mincontract_estimated = True
         sym_info.save_toml(toml_path)
         return sym_info
 

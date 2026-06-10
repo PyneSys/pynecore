@@ -7,6 +7,26 @@ SymInfoInterval = NamedTuple("SymInfoInterval", [('day', int), ('start', time), 
 SymInfoSession = NamedTuple("SymInfoSession", [('day', int), ('time', time)])
 
 
+def default_mincontract(sym_type: str, basecurrency: str | None = None) -> float:
+    """
+    Heuristic minimum order quantity step for symbols whose data source does
+    not expose one.
+
+    Crypto exchanges quote fractional lot steps (BTC pairs commonly 1e-5,
+    other coins 1e-4); everything else trades in whole contracts. This is the
+    last resort of the ``mincontract`` resolution chain (exchange value ->
+    volume-data analysis -> heuristic), and it also fills the gap when
+    loading symbol info saved before ``mincontract`` existed.
+
+    :param sym_type: The symbol type (``SymInfo.type``).
+    :param basecurrency: The symbol's base currency, if known.
+    :return: The estimated minimum quantity step.
+    """
+    if sym_type == 'crypto':
+        return 1e-05 if basecurrency == 'BTC' else 1e-04
+    return 1.0
+
+
 @dataclass(kw_only=True, slots=True)
 class SymInfo:
     """
@@ -33,6 +53,11 @@ class SymInfo:
     pricescale: int
     minmove: int = 1
     pointvalue: float
+    mincontract: float
+    """Minimum order quantity step (Pine ``syminfo.mincontract``); order sizes
+    are truncated to this grid. Always positive: filled from the exchange when
+    available, otherwise estimated from volume data or the
+    :func:`default_mincontract` heuristic."""
     opening_hours: list[SymInfoInterval]
     session_starts: list[SymInfoSession]
     session_ends: list[SymInfoSession]
@@ -42,10 +67,36 @@ class SymInfo:
     taker_fee: float | None = None
     maker_fee: float | None = None
 
+    # Reference data (None when the data source does not expose it)
+    country: str | None = None
+    sector: str | None = None
+    industry: str | None = None
+    isin: str | None = None
+
+    # Futures contract information
+    expiration_date: int | None = None  # UNIX timestamp
+    current_contract: str | None = None
+
+    # Fundamentals (stocks only, None elsewhere)
+    employees: int | None = None
+    shareholders: int | None = None
+    shares_outstanding_total: float | None = None
+    shares_outstanding_float: float | None = None
+
+    # Analyst recommendation counts
+    recommendations_buy: int | None = None
+    recommendations_buy_strong: int | None = None
+    recommendations_date: int | None = None  # UNIX timestamp
+    recommendations_hold: int | None = None
+    recommendations_sell: int | None = None
+    recommendations_sell_strong: int | None = None
+    recommendations_total: int | None = None
+
     # Analyst price target information (added 2025-07-08)
     target_price_average: float | None = None
     target_price_high: float | None = None
     target_price_low: float | None = None
+    target_price_median: float | None = None
     target_price_date: int | None = None  # UNIX timestamp
     target_price_estimates: int | None = None
 
@@ -112,6 +163,9 @@ class SymInfo:
             pricescale=symbol['pricescale'],
             minmove=symbol.get('minmove', 1),
             pointvalue=symbol['pointvalue'],
+            # Files saved before mincontract existed fall back to the heuristic
+            mincontract=(float(symbol.get('mincontract', 0.0))
+                         or default_mincontract(symbol['type'], symbol.get('basecurrency'))),
             opening_hours=opening_hours,
             session_starts=session_starts,
             session_ends=session_ends,
@@ -120,9 +174,27 @@ class SymInfo:
             avg_spread=symbol.get('avg_spread'),
             taker_fee=symbol.get('taker_fee'),
             maker_fee=symbol.get('maker_fee'),
+            country=symbol.get('country'),
+            sector=symbol.get('sector'),
+            industry=symbol.get('industry'),
+            isin=symbol.get('isin'),
+            expiration_date=symbol.get('expiration_date'),
+            current_contract=symbol.get('current_contract'),
+            employees=symbol.get('employees'),
+            shareholders=symbol.get('shareholders'),
+            shares_outstanding_total=symbol.get('shares_outstanding_total'),
+            shares_outstanding_float=symbol.get('shares_outstanding_float'),
+            recommendations_buy=symbol.get('recommendations_buy'),
+            recommendations_buy_strong=symbol.get('recommendations_buy_strong'),
+            recommendations_date=symbol.get('recommendations_date'),
+            recommendations_hold=symbol.get('recommendations_hold'),
+            recommendations_sell=symbol.get('recommendations_sell'),
+            recommendations_sell_strong=symbol.get('recommendations_sell_strong'),
+            recommendations_total=symbol.get('recommendations_total'),
             target_price_average=symbol.get('target_price_average'),
             target_price_high=symbol.get('target_price_high'),
             target_price_low=symbol.get('target_price_low'),
+            target_price_median=symbol.get('target_price_median'),
             target_price_date=symbol.get('target_price_date'),
             target_price_estimates=symbol.get('target_price_estimates')
         )
@@ -158,9 +230,16 @@ class SymInfo:
         # Basic fields
         for key in ['prefix', 'description', 'ticker', 'currency', 'basecurrency',
                     'period', 'type', 'mintick', 'pricescale', 'minmove', 'pointvalue',
-                    'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee',
-                    'target_price_average', 'target_price_high', 'target_price_low', 'target_price_date',
-                    'target_price_estimates']:
+                    'mincontract', 'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee',
+                    'country', 'sector', 'industry', 'isin',
+                    'expiration_date', 'current_contract',
+                    'employees', 'shareholders',
+                    'shares_outstanding_total', 'shares_outstanding_float',
+                    'recommendations_buy', 'recommendations_buy_strong', 'recommendations_date',
+                    'recommendations_hold', 'recommendations_sell', 'recommendations_sell_strong',
+                    'recommendations_total',
+                    'target_price_average', 'target_price_high', 'target_price_low',
+                    'target_price_median', 'target_price_date', 'target_price_estimates']:
             lines.append(format_field(key, getattr(self, key)))
 
         # Arrays of tables

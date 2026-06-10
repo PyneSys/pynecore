@@ -40,6 +40,7 @@ def _make_syminfo(period: str = '1'):
         prefix="TEST", description="Test", ticker="TEST", currency="USD",
         period=period, type="crypto", mintick=0.01, pricescale=100,
         minmove=1, pointvalue=1, timezone="UTC", volumetype="base",
+        mincontract=0.0001,
         opening_hours=opening_hours, session_starts=session_starts,
         session_ends=session_ends,
     )
