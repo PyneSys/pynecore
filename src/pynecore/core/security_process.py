@@ -103,6 +103,13 @@ def security_process_main(
     _sec_mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
     round_decimals = mintick_decimals(_sec_mintick) if _sec_mintick > 0 else None
 
+    # A security child is a read-only replica of the user's script, not a place
+    # to persist config. ``script.indicator``/``strategy`` re-saves the script's
+    # ``.toml`` on import when ``pytest`` is absent (always true in a spawned
+    # child), so several contexts would race to rewrite — and can corrupt — the
+    # same user file. Disable the save for this process before importing.
+    os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
+
     # Import the script
     script_module = import_script(Path(script_path))
 
