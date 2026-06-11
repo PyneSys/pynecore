@@ -1,39 +1,32 @@
 """
 Horizontal line
 
-This is a callable module, so the modul itself is both a function and a namespace
+The module is both a function (``hline(...)``) and a namespace (``hline.style_solid``);
+call sites are routed to :func:`hline` by the module property AST transformer.
 """
-from __future__ import annotations
-from ..core.callable_module import CallableModule
-
 from ..types.hline import HLineEnum, HLine
 
 from . import color as _color, display as _display
 
 
 #
-# Module object
+# Constants
 #
 
-class HLineModule(CallableModule):
-    #
-    # Constants
-    #
-
-    style_solid = HLineEnum('style_solid')
-    style_dotted = HLineEnum('style_dotted')
-    style_dashed = HLineEnum('style_dashed')
+style_solid = HLineEnum('style_solid')
+style_dotted = HLineEnum('style_dotted')
+style_dashed = HLineEnum('style_dashed')
 
 
 #
-# Callable module function
+# Module function
 #
 
 def hline(
         price: float,
         title: str = "",
         color: _color.Color = _color.blue,
-        linestyle: HLineEnum = HLineModule.style_solid,
+        linestyle: HLineEnum = style_solid,
         linewidth: int = 1,
         editable: bool = True,
         display: _display.Display = _display.all
@@ -59,10 +52,3 @@ def hline(
         editable=editable,
         display=display
     )
-
-
-#
-# Module initialization
-#
-
-HLineModule(__name__)

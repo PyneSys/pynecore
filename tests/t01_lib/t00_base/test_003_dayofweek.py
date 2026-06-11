@@ -37,15 +37,15 @@ def __test_dayofweek_function_matches_named_constant_for_every_weekday__():
     ]
     for iso_date, expected_const, label in cases:
         ts_ms = int(datetime.fromisoformat(iso_date).replace(tzinfo=timezone.utc).timestamp() * 1000)
-        assert dayofweek(ts_ms) == expected_const, f"{label} ({iso_date}) failed"
+        assert dayofweek.dayofweek(ts_ms) == expected_const, f"{label} ({iso_date}) failed"
 
 
 def __test_issue_56_friday_and_saturday_not_swapped__():
     """Reporter's bars: Friday matches dayofweek.friday, Saturday matches dayofweek.saturday."""
     ts_fri = int(datetime(2024, 6, 14, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
-    assert dayofweek(ts_fri) == dayofweek.friday
-    assert dayofweek(ts_fri) != dayofweek.saturday
+    assert dayofweek.dayofweek(ts_fri) == dayofweek.friday
+    assert dayofweek.dayofweek(ts_fri) != dayofweek.saturday
 
     ts_sat = int(datetime(2024, 9, 14, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
-    assert dayofweek(ts_sat) == dayofweek.saturday
-    assert dayofweek(ts_sat) != dayofweek.friday
+    assert dayofweek.dayofweek(ts_sat) == dayofweek.saturday
+    assert dayofweek.dayofweek(ts_sat) != dayofweek.friday

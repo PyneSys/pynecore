@@ -16,8 +16,10 @@ _PYNE_SENTINEL = '__pyne_transformed__'
 
 # A module is Pyne code only when its docstring STARTS with ``@pyne``. Matching the
 # raw source head mirrors the strict docstring check in ``source_to_code`` without
-# paying for a full parse on every import.
-_PYNE_HEAD_RE = re.compile(rb'^\s*[rRbBuUfF]*("""|\'\'\'|"|\')\s*@pyne(\s|$)')
+# paying for a full parse on every import. Leading comment lines are skipped so a
+# PEP 723 ``# /// script`` metadata block before the docstring does not hide it.
+_PYNE_HEAD_RE = re.compile(
+    rb'^(?:\s*#[^\r\n]*(?:\r?\n|$))*\s*[rRbBuUfF]*("""|\'\'\'|"|\')\s*@pyne(?:\s|\1|$)')
 
 
 def _source_starts_with_pyne(head: bytes) -> bool:
@@ -111,7 +113,8 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
 
         try:
             with open(source_path, 'rb') as f:
-                head = f.read(256)
+                # Large enough to cover a PEP 723 metadata block before the docstring
+                head = f.read(4096)
         except OSError:
             head = b''
 

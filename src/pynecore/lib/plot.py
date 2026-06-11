@@ -1,38 +1,32 @@
 from typing import Any
 import sys
 
-from ..core.callable_module import CallableModule
 from ..types.plot import PlotEnum, Plot
 
 
 #
-# Module object
+# Constants
 #
 
-class PlotModule(CallableModule):
-    #
-    # Constants
-    #
+style_area = PlotEnum()
+style_areabr = PlotEnum()
+style_circles = PlotEnum()
+style_columns = PlotEnum()
+style_cross = PlotEnum()
+style_histogram = PlotEnum()
+style_line = PlotEnum()
+style_linebr = PlotEnum()
+style_stepline = PlotEnum()
+style_steplinebr = PlotEnum()
+style_stepline_diamond = PlotEnum()
 
-    style_area = PlotEnum()
-    style_areabr = PlotEnum()
-    style_circles = PlotEnum()
-    style_columns = PlotEnum()
-    style_cross = PlotEnum()
-    style_histogram = PlotEnum()
-    style_line = PlotEnum()
-    style_linebr = PlotEnum()
-    style_stepline = PlotEnum()
-    style_steplinebr = PlotEnum()
-    style_stepline_diamond = PlotEnum()
-
-    linestyle_solid = PlotEnum()
-    linestyle_dashed = PlotEnum()
-    linestyle_dotted = PlotEnum()
+linestyle_solid = PlotEnum()
+linestyle_dashed = PlotEnum()
+linestyle_dotted = PlotEnum()
 
 
 #
-# Callable module function
+# Module function
 #
 
 # noinspection PyProtectedMember
@@ -51,7 +45,7 @@ def plot(series: Any, title: str | None = None, *_, **__):
 
     if lib.bar_index == 0:  # Only check if it is the first bar for performance reasons
         # Check if it is called from the main function
-        if sys._getframe(2).f_code.co_name not in ('main', 'plotchar'):  # noqa
+        if sys._getframe(1).f_code.co_name not in ('main', 'plotchar'):  # noqa
             raise RuntimeError("The plot function can only be called from the main function!")
 
     # Ensure unique title
@@ -68,10 +62,3 @@ def plot(series: Any, title: str | None = None, *_, **__):
     lib._plot_data[title] = series
 
     return Plot()
-
-
-#
-# Module initialization
-#
-
-PlotModule(__name__)

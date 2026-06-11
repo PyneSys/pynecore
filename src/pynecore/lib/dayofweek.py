@@ -1,30 +1,22 @@
-from __future__ import annotations
-
 from ..types.datetime import DayOfWeek
 from ..core.module_property import module_property
-from ..core.callable_module import CallableModule
 
 
 #
-# Module object
+# Constants
 #
 
-class DayOfWeekModule(CallableModule):
-    #
-    # Constants
-    #
-
-    sunday = DayOfWeek()
-    monday = DayOfWeek()
-    tuesday = DayOfWeek()
-    wednesday = DayOfWeek()
-    thursday = DayOfWeek()
-    friday = DayOfWeek()
-    saturday = DayOfWeek()
+sunday = DayOfWeek()
+monday = DayOfWeek()
+tuesday = DayOfWeek()
+wednesday = DayOfWeek()
+thursday = DayOfWeek()
+friday = DayOfWeek()
+saturday = DayOfWeek()
 
 
 #
-# Callable module function
+# Module function
 #
 
 # noinspection PyShadowingNames
@@ -42,10 +34,3 @@ def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
     if res == 8:
         res = 1
     return res
-
-
-#
-# Module initialization
-#
-
-DayOfWeekModule(__name__)
