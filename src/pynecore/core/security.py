@@ -189,12 +189,17 @@ def create_chart_protocol(
         from pynecore import lib
         state = states[sec_id]
 
-        # Resolve deferred symbol/timeframe on first call
+        # Resolve deferred symbol/timeframe on first call. The two callbacks are
+        # NOT alternatives: in a script with both deferred and static contexts the
+        # deferred resolver no-ops for a static sec_id (and the runtime symbol
+        # argument is always present), so an elif here would leave every static
+        # context's subprocess unspawned and its first real read deadlocked.
+        # ``lazy_spawn_fn`` itself skips sids that already have a process.
         if sec_id not in resolved:
             resolved.add(sec_id)
             if deferred_resolve_fn is not None and symbol is not None:
                 deferred_resolve_fn(sec_id, symbol, timeframe)
-            elif lazy_spawn_fn is not None:
+            if lazy_spawn_fn is not None:
                 lazy_spawn_fn(sec_id)
 
         # No-process contexts (same-context, ignored): skip advance/wait

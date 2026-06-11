@@ -85,7 +85,7 @@ def security_process_main(
     from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
     from pynecore import lib
     from pynecore.lib import barstate
-    from pynecore.core import function_isolation
+    from pynecore.core import function_isolation, script as script_mod
 
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo, lib)
@@ -113,6 +113,18 @@ def security_process_main(
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
+
+    # noinspection PyProtectedMember
+    def _run_script_main():
+        """Mirror the chart's ``_run_libs_and_main``: registered library mains
+        initialize their exported-function proxies, so they must run before the
+        script's ``main()`` on every bar — otherwise a script that calls an
+        imported library function dies here with "Exported proxy has not been
+        initialized". ``lib._lib_semaphore`` stays True for both (every side
+        effect is suppressed in a security child)."""
+        for _title, _lib_main in script_mod._registered_libraries:
+            _lib_main()
+        script_module.main()
 
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")
@@ -160,7 +172,7 @@ def security_process_main(
                 barstate.isconfirmed = True
 
                 # Run the script
-                script_module.main()
+                _run_script_main()
 
                 current_bar += 1
                 bars_run = True
