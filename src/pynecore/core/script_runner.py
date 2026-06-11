@@ -2,6 +2,7 @@ from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import sys
+from dataclasses import dataclass
 from functools import partial
 from math import log10, floor
 from pathlib import Path
@@ -35,6 +36,8 @@ __all__ = [
     'import_script',
     'ScriptRunner',
     'LIVE_TRANSITION',
+    'SecurityRequirement',
+    'DataRequirements',
 ]
 
 LIVE_TRANSITION = OHLCV(timestamp=-1, open=-1, high=-1, low=-1, close=-1, volume=-1)
@@ -228,6 +231,48 @@ def _reset_lib_vars():
 
     from ..lib import request
     request._reset_request_state()
+
+
+@dataclass(frozen=True)
+class SecurityRequirement:
+    """A single ``request.security()`` / ``request.security_lower_tf()`` data
+    dependency extracted statically from a script's ``__security_contexts__``.
+
+    :ivar sec_id: The transformer-assigned security context id.
+    :ivar symbol: Resolved symbol string, or ``None`` when it is only known at
+        runtime (computed from a variable/series/function parameter).
+    :ivar timeframe: Resolved timeframe string (``''`` already normalized to the
+        chart timeframe), or ``None`` when only known at runtime.
+    :ivar is_ltf: ``True`` for ``request.security_lower_tf()`` (lower timeframe).
+    :ivar ignore_invalid_symbol: ``True`` when the call passes
+        ``ignore_invalid_symbol=true`` (missing data is tolerated, not an error).
+    :ivar from_library: ``True`` when the context comes from an imported library
+        module rather than the main script.
+    :ivar has_security_mapping: ``True`` when a matching ``--security`` key was
+        provided for this symbol/timeframe.
+    """
+    sec_id: str
+    symbol: str | None
+    timeframe: str | None
+    is_ltf: bool
+    ignore_invalid_symbol: bool
+    from_library: bool
+    has_security_mapping: bool
+
+
+@dataclass(frozen=True)
+class DataRequirements:
+    """Classified data dependencies of a script, relative to a chart symbol/TF.
+
+    Each bucket holds the :class:`SecurityRequirement` entries that fall into it.
+    See :meth:`ScriptRunner.list_data_requirements` for the classification rules.
+    """
+    chart_symbol: str
+    chart_tf: str
+    chart_main: list[SecurityRequirement]
+    same_symbol_other_tf: list[SecurityRequirement]
+    cross_symbol: list[SecurityRequirement]
+    dynamic: list[SecurityRequirement]
 
 
 class ScriptRunner:
@@ -1975,6 +2020,108 @@ class ScriptRunner:
 
         if on_progress:
             on_progress(datetime.max)
+
+    # noinspection PyProtectedMember
+    def list_data_requirements(
+            self, *, chart_symbol: str, chart_tf: str,
+            security_keys: set[str] | None = None,
+    ) -> DataRequirements:
+        """Statically classify the script's external data dependencies.
+
+        Merges ``__security_contexts__`` from the main script module and every
+        registered library module, then buckets each context the same way
+        :meth:`run_iter` does (same-context vs. static vs. deferred) without
+        spawning processes, opening data files, or calling
+        :meth:`_resolve_security_data` (which would raise on unmapped backtest
+        contexts). It only inspects whether a matching ``--security`` key is
+        present, so it never raises.
+
+        :param chart_symbol: The chart's ``PREFIX:TICKER`` (matches what
+            ``_set_lib_syminfo_properties`` stores in ``lib.syminfo.ticker``).
+        :param chart_tf: The chart's timeframe (``lib.syminfo.period``).
+        :param security_keys: The keys of the user-provided ``--security``
+            mappings, used to flag which contexts already have a data file.
+        :return: A :class:`DataRequirements` with the four classified buckets.
+        """
+        from . import script
+
+        keys = security_keys or set()
+
+        # Merge contexts from the script module and every registered library
+        # module — sec ids carry a module hash so they cannot collide. Track
+        # which ids came from a library so the report can flag them.
+        merged: dict[str, tuple[dict, bool]] = {}
+
+        def _absorb(mod: ModuleType, from_lib: bool) -> None:
+            ctxs: dict[str, dict] | None = getattr(mod, '__security_contexts__', None)
+            if ctxs:
+                for _sid, _ctx in ctxs.items():
+                    merged[_sid] = (_ctx, from_lib)
+
+        _absorb(self.script_module, False)
+        for _lib_title, _lib_main in script._registered_libraries:
+            _mod_name = getattr(_lib_main, '__module__', '')
+            if _mod_name not in sys.modules:
+                continue
+            _lib_mod = sys.modules[_mod_name]
+            if _lib_mod is not self.script_module:
+                _absorb(_lib_mod, True)
+
+        chart_main: list[SecurityRequirement] = []
+        same_symbol_other_tf: list[SecurityRequirement] = []
+        cross_symbol: list[SecurityRequirement] = []
+        dynamic: list[SecurityRequirement] = []
+
+        for sec_id, (ctx, from_library) in merged.items():
+            sym = ctx.get('symbol')
+            tf_val = ctx.get('timeframe', chart_tf)
+            # An empty-string timeframe selects the chart's timeframe (Pine
+            # semantics); a None timeframe stays runtime-deferred.
+            if tf_val == '':
+                tf_val = chart_tf
+            is_ltf = bool(ctx.get('is_ltf'))
+            ignore_invalid = bool(ctx.get('ignore_invalid_symbol'))
+
+            if sym is None or tf_val is None:
+                dynamic.append(SecurityRequirement(
+                    sec_id=sec_id, symbol=None if sym is None else str(sym),
+                    timeframe=None if tf_val is None else str(tf_val),
+                    is_ltf=is_ltf, ignore_invalid_symbol=ignore_invalid,
+                    from_library=from_library, has_security_mapping=False,
+                ))
+                continue
+
+            sym_str = str(sym)
+            tf_str = str(tf_val)
+            # Mirror _resolve_security_data's key precedence: "SYMBOL:TF",
+            # then "SYMBOL", then "TF".
+            has_mapping = (
+                f"{sym_str}:{tf_str}" in keys
+                or sym_str in keys
+                or tf_str in keys
+            )
+            req = SecurityRequirement(
+                sec_id=sec_id, symbol=sym_str, timeframe=tf_str, is_ltf=is_ltf,
+                ignore_invalid_symbol=ignore_invalid, from_library=from_library,
+                has_security_mapping=has_mapping,
+            )
+            if sym_str == chart_symbol and tf_str == chart_tf:
+                chart_main.append(req)
+            elif sym_str == chart_symbol:
+                same_symbol_other_tf.append(req)
+            else:
+                cross_symbol.append(req)
+
+        def _sort_key(r: SecurityRequirement) -> tuple[str, str]:
+            return r.symbol or '', r.timeframe or ''
+
+        return DataRequirements(
+            chart_symbol=chart_symbol, chart_tf=chart_tf,
+            chart_main=sorted(chart_main, key=_sort_key),
+            same_symbol_other_tf=sorted(same_symbol_other_tf, key=_sort_key),
+            cross_symbol=sorted(cross_symbol, key=_sort_key),
+            dynamic=sorted(dynamic, key=_sort_key),
+        )
 
     def _resolve_security_data(self, contexts: dict) -> 'dict[str, str | PluginSymbol | None]':
         """

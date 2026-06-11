@@ -29,7 +29,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo, mintick_decimals
-from pynecore.core.script_runner import ScriptRunner
+from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
 from pynecore.core.live_runner import live_ohlcv_generator
@@ -486,6 +486,72 @@ def _download_provider_data_resilient(
             delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
 
 
+def _print_data_requirements(requirements: DataRequirements, script_name: str) -> None:
+    """Print a plain, human-readable summary of a script's data dependencies.
+
+    Used by ``--list-data``: only non-empty sections are shown, with ASCII
+    markers (``->``, ``!``) so the output stays terminal-safe.
+
+    :param requirements: The classified buckets from
+        :meth:`ScriptRunner.list_data_requirements`.
+    :param script_name: Display name of the script (for the header line).
+    """
+    def _tags(sr: SecurityRequirement) -> str:
+        out = ""
+        if sr.is_ltf:
+            out += " (lower timeframe)"
+        if sr.ignore_invalid_symbol:
+            out += " [ignore_invalid_symbol]"
+        if sr.from_library:
+            out += " (from library)"
+        return out
+
+    lines: list[str] = [
+        f"Data requirements for {script_name} "
+        f"(chart: {requirements.chart_symbol} @ {requirements.chart_tf})"
+    ]
+
+    total = (len(requirements.chart_main) + len(requirements.same_symbol_other_tf)
+             + len(requirements.cross_symbol) + len(requirements.dynamic))
+    if total == 0:
+        lines.append("")
+        lines.append("No external data required — this script uses only the "
+                     "chart data you pass as DATA.")
+        console.print("\n".join(lines), markup=False, highlight=False)
+        return
+
+    if requirements.chart_main:
+        lines.append("")
+        lines.append("Chart / main data (served from the DATA you pass):")
+        for r in requirements.chart_main:
+            lines.append(f"  -> {r.symbol} @ {r.timeframe}{_tags(r)}")
+
+    if requirements.same_symbol_other_tf:
+        lines.append("")
+        lines.append("Same symbol, other timeframe (resampled from the chart base data):")
+        for r in requirements.same_symbol_other_tf:
+            suffix = (" [mapping present]" if r.has_security_mapping
+                      else f" [needs --security '{r.timeframe}=<base file>' in backtest]")
+            lines.append(f"  -> {r.symbol} @ {r.timeframe}{_tags(r)}{suffix}")
+
+    if requirements.cross_symbol:
+        lines.append("")
+        lines.append("Cross-symbol data (separate download / --security mapping required):")
+        for r in requirements.cross_symbol:
+            suffix = (" [mapping present]" if r.has_security_mapping
+                      else " ! no --security mapping")
+            lines.append(f"  -> {r.symbol} @ {r.timeframe}{_tags(r)}{suffix}")
+
+    if requirements.dynamic:
+        lines.append("")
+        lines.append("Dynamic data (symbol or timeframe only known at runtime):")
+        lines.append(f"  ! {len(requirements.dynamic)} request.security() "
+                     f"call(s) with a runtime symbol/timeframe")
+        lines.append("    -> cannot be listed statically; inspect the script source")
+
+    console.print("\n".join(lines), markup=False, highlight=False)
+
+
 @app.command(cls=PluggableCommand)
 def run(
         script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
@@ -537,6 +603,10 @@ def run(
                                             help='Security data: "TIMEFRAME=data_name" or '
                                                  '"SYMBOL:TIMEFRAME=data_name"',
                                             rich_help_panel="Security Options"),
+        list_data: bool = Option(False, "--list-data",
+                                 help="List the OHLCV data this script needs (from "
+                                      "request.security calls) and exit without running.",
+                                 rich_help_panel="Security Options"),
         timeframe: str | None = Option(None, "--timeframe", "-tf",
                                        help="Chart timeframe (TradingView format, e.g. '60', '1D'). "
                                             "When larger than data timeframe: aggregates on-the-fly, "
@@ -1020,6 +1090,17 @@ def run(
 
                 # Mark as completed
                 loading_progress.update(loading_task, completed=1)
+
+            # --list-data: report the data this script needs (from
+            # request.security calls) and exit before consuming any bar.
+            if list_data:
+                requirements = runner.list_data_requirements(
+                    chart_symbol=f"{syminfo.prefix}:{syminfo.ticker}",
+                    chart_tf=str(syminfo.period),
+                    security_keys=set(security_data or {}),
+                )
+                _print_data_requirements(requirements, script.name)
+                raise Exit(0)
 
             # Now that the script is loaded, start the live OHLCV stream.
             # ``live_ohlcv_generator`` eager-starts the WS connect (and
