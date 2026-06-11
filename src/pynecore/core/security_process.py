@@ -10,8 +10,8 @@ Communication with the chart process uses shared memory + Events (see security.p
 from __future__ import annotations
 
 import os
+from functools import partial
 from pathlib import Path
-from datetime import datetime, UTC
 from typing import TYPE_CHECKING
 
 from .security_shm import (
@@ -22,6 +22,8 @@ from .security import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
     from multiprocessing.synchronize import Lock as LockType
 
 
@@ -85,7 +87,7 @@ def security_process_main(
     from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
     from pynecore import lib
     from pynecore.lib import barstate
-    from pynecore.core import function_isolation, script as script_mod
+    from pynecore.core import instance_state, script as script_mod
 
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo, lib)
@@ -108,13 +110,35 @@ def security_process_main(
     inject_protocol(script_module, signal_fn, write_fn, read_fn, wait_fn,
                     active_security=sec_id)
 
-    # Reset function isolation for fresh state
-    function_isolation.reset()
+    # Fresh per-process state: drop anything inherited (fork start method) and
+    # build the root state vectors of the script's main and every registered
+    # library main, mirroring ``ScriptRunner``'s bound-entries scheme so the
+    # security child uses identical per-instance state keys as the chart.
+    instance_state.reset()
+    main_func = script_module.main
+    bound_entries: dict[int, Callable[[], Any]] = {}
+    seen_keys: set[str] = set()
+    root_keys: list[str] = []
+    for entry_func in [main_func] + [f for _title, f in script_mod._registered_libraries]:
+        if id(entry_func) in bound_entries:
+            continue
+        entry_layout = getattr(entry_func, '__pyne_layout__', None)
+        if entry_layout is None:
+            bound_entries[id(entry_func)] = entry_func
+            continue
+        root_key = f'{entry_func.__module__}.{entry_func.__qualname__}'
+        if root_key in seen_keys:
+            root_key = f'{root_key}#{len(root_keys)}'
+        seen_keys.add(root_key)
+        root_keys.append(root_key)
+        bound_entries[id(entry_func)] = partial(
+            entry_func, instance_state.create_root(root_key, entry_layout))
+    run_main = bound_entries[id(main_func)]
+    lib_mains = [bound_entries[id(f)] for _title, f in script_mod._registered_libraries]
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
 
-    # noinspection PyProtectedMember
     def _run_script_main():
         """Mirror the chart's ``_run_libs_and_main``: registered library mains
         initialize their exported-function proxies, so they must run before the
@@ -122,9 +146,9 @@ def security_process_main(
         imported library function dies here with "Exported proxy has not been
         initialized". ``lib._lib_semaphore`` stays True for both (every side
         effect is suppressed in a security child)."""
-        for _title, _lib_main in script_mod._registered_libraries:
-            _lib_main()
-        script_module.main()
+        for run_lib_main in lib_mains:
+            run_lib_main()
+        run_main()
 
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")
@@ -153,11 +177,10 @@ def security_process_main(
             bars_run = False
             while current_bar < total_bars:
                 ohlcv = reader.read(current_bar)
-                # Convert timestamp to milliseconds for comparison
-                bar_time_ms = int(
-                    datetime.fromtimestamp(ohlcv.timestamp, UTC)
-                    .astimezone(tz).timestamp() * 1000
-                )
+                # Convert timestamp to milliseconds for comparison (a UTC->tz
+                # datetime roundtrip preserves the instant, so the raw
+                # timestamp is already the answer)
+                bar_time_ms = int(ohlcv.timestamp * 1000)
 
                 if bar_time_ms > target_time:
                     break

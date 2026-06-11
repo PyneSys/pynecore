@@ -1,10 +1,9 @@
 """
 @pyne
 """
-from pynecore.core.series import SeriesImpl
-__series_main·s__ = SeriesImpl()
-__series_function_vars__ = {'main': ('__series_main·s__',)}
+__pyne_slot_layout__ = {'main': {'init': (None,), 'series': ((0, None),), 'varip': (), 'children': (), 'names': ('s',)}}
 
-def main():
-    s = __series_main·s__.add(1)
-    print(__series_main·s__[5])
+def main(__state__):
+    s = __state__[0].add(1)
+    print(__state__[0][5])
+main.__pyne_layout__ = __pyne_slot_layout__['main']

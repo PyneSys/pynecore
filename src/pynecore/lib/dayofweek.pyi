@@ -1,8 +1,9 @@
-from ..core.callable_module import CallableModule
 from ..types.datetime import DayOfWeek
 
 
-class DayOfWeekModule(CallableModule):
+# IDE-facing view of the function-and-namespace module: user code reads the
+# constants and calls the bare name; the AST transformer resolves both at runtime.
+class DayOfWeekModule:
     sunday: DayOfWeek
     monday: DayOfWeek
     tuesday: DayOfWeek
@@ -14,4 +15,4 @@ class DayOfWeekModule(CallableModule):
     def __call__(self, time: int | None = None, timezone: str | None = None) -> int: ...
 
 
-dayofweek: DayOfWeekModule = DayOfWeekModule(__name__)
+dayofweek: DayOfWeekModule

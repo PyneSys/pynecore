@@ -12,7 +12,7 @@ import sys
 import math as _math
 
 from functools import lru_cache
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, time as dt_time, UTC
 
 from pynecore.types.source import Source
 
@@ -23,8 +23,10 @@ from ..types.na import NA
 from ..types import Series, PyneInt
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
+from .plot import plot as _plot
 from . import timeframe as timeframe_module
 from . import session as session_module
+from ._fixnan import fixnan
 
 from pynecore.core.overload import overload
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
@@ -115,13 +117,14 @@ _is_live = False
 _strategy_suppressed = False
 
 #
-# Callable modules
+# Function-and-namespace modules — the IDE-facing rebinding; at runtime the AST
+# transformer routes ``hline(...)``-style calls to the module's self-named function
 #
 
 if TYPE_CHECKING:
-    from hline import hline
-    from plot import plot
-    from alert import alert
+    from .hline import hline
+    from .plot import plot
+    from .alert import alert
 
 
 #
@@ -261,7 +264,7 @@ def plotcandle(*_, **__):
 
 
 def plotchar(series: Any, title: str | None = None, *_, **__):
-    plot(series, title)
+    _plot(series, title)
 
 
 def plotshape(*_, **__):
@@ -284,22 +287,6 @@ def alertcondition(*_, **__):
 
 
 ### Other ###
-
-__persistent_last_not_nan__: Any = NA(None)
-__persistent_function_vars__ = {'fixnan': ['__persistent_last_not_nan__']}
-
-
-def fixnan(source: Any) -> Any:
-    """
-    Fix NA values by replacing them with the last non-NA value
-
-    :param source: The source value
-    :return: The source value if it is not NA, otherwise the last non-NA value
-    """
-    global __persistent_last_not_nan__
-    __persistent_last_not_nan__ = source if not isinstance(source, NA) else __persistent_last_not_nan__
-    return __persistent_last_not_nan__
-
 
 def is_na(source: Any = None) -> bool | NA:
     """
@@ -662,6 +649,26 @@ def timenow():
     return int(datetime.now(UTC).timestamp() * 1000)
 
 
+# ``time_tradingday`` cache. The strategy engine calls the property on every bar
+# (intraday risk day-rollover), so the result is memoized per bar, keyed by the
+# identity of ``_datetime`` — the function's actual input. Every bar installs a
+# fresh (immutable) datetime object, so an identity hit guarantees an identical
+# result; anything that swaps ``_datetime`` (including tests driving it
+# directly) misses the memo and recomputes. NOT keyed by calendar date, which
+# would be wrong for overnight sessions where bars before/after the session
+# open on the same date belong to different trading days. The session-structure
+# table is rebuilt whenever ``syminfo._opening_hours`` is replaced
+# (``_set_lib_syminfo_properties`` always assigns a fresh list) or
+# ``syminfo.period`` changes.
+_ttd_memo_dt: datetime | None = None
+_ttd_memo_result: int = 0
+_ttd_session_hours: list | None = None
+_ttd_session_period: str | None = None
+_ttd_overnight_by_wd: dict[int, list[dt_time]] = {}
+_ttd_period_delta: timedelta = timedelta()
+_EPOCH_ORDINAL = 719163  # date(1970, 1, 1).toordinal()
+
+
 # noinspection PyProtectedMember
 @module_property
 def time_tradingday() -> PyneInt:
@@ -679,32 +686,55 @@ def time_tradingday() -> PyneInt:
 
     :return: UNIX time in milliseconds of 00:00 UTC on the trading day's date
     """
+    global _ttd_memo_dt, _ttd_memo_result, _ttd_session_hours, _ttd_session_period, \
+        _ttd_overnight_by_wd, _ttd_period_delta
+
+    opening_hours = syminfo._opening_hours
+    period = syminfo.period
+    if opening_hours is not _ttd_session_hours or period != _ttd_session_period:
+        # Session structure changed — rebuild the per-weekday table of overnight
+        # session opens (the only entries that can roll the trading day: ones that
+        # end at or before their own start and do not begin exactly at midnight).
+        overnight: dict[int, list[dt_time]] = {}
+        for day, start, end in opening_hours:
+            starts_at_midnight = start.hour == 0 and start.minute == 0 and start.second == 0
+            if end <= start and not starts_at_midnight:
+                overnight.setdefault(day, []).append(start)
+        _ttd_overnight_by_wd = overnight
+        _ttd_period_delta = timedelta(seconds=timeframe_module.in_seconds(period))
+        _ttd_session_hours = opening_hours
+        _ttd_session_period = period
+        _ttd_memo_dt = None
+
+    if _datetime is _ttd_memo_dt:
+        return _ttd_memo_result
+
     local_dt = _datetime  # already expressed in the exchange timezone
     trade_date = local_dt.date()
 
     # Roll into the next trading day when the bar overlaps the evening portion of an
-    # overnight session — one that ends at or before its own start (crosses midnight)
-    # and does not begin exactly at midnight (which is a plain calendar day). A bar
-    # whose window merely *contains* the session open — e.g. a 17:00-18:00 bar when the
-    # session opens at 17:05 — already belongs to the new trading day, matching
-    # TradingView and ``session.isfirstbar_regular``. Comparing the bar's *end* against
-    # the open captures that boundary bar; comparing only the bar's start would leave it
-    # in the previous day whenever the open does not land exactly on a bar boundary.
-    weekday = local_dt.weekday()
-    bar_end = local_dt + timedelta(seconds=timeframe_module.in_seconds(syminfo.period))
-    for day, start, end in syminfo._opening_hours:
-        if day != weekday:
-            continue
-        starts_at_midnight = start.hour == 0 and start.minute == 0 and start.second == 0
-        is_overnight = end <= start and not starts_at_midnight
-        if is_overnight:
+    # overnight session. A bar whose window merely *contains* the session open — e.g.
+    # a 17:00-18:00 bar when the session opens at 17:05 — already belongs to the new
+    # trading day, matching TradingView and ``session.isfirstbar_regular``. Comparing
+    # the bar's *end* against the open captures that boundary bar; comparing only the
+    # bar's start would leave it in the previous day whenever the open does not land
+    # exactly on a bar boundary.
+    overnight_starts = _ttd_overnight_by_wd.get(local_dt.weekday())
+    if overnight_starts:
+        bar_end = local_dt + _ttd_period_delta
+        for start in overnight_starts:
             session_open = local_dt.replace(
                 hour=start.hour, minute=start.minute, second=start.second, microsecond=0)
             if bar_end > session_open:
                 trade_date += timedelta(days=1)
                 break
 
-    return int(datetime(trade_date.year, trade_date.month, trade_date.day, tzinfo=UTC).timestamp() * 1000)
+    # 00:00 UTC of the trading day's date — pure ordinal arithmetic (UTC has no
+    # DST, so this is exactly ``datetime(y, m, d, tzinfo=UTC).timestamp() * 1000``).
+    result = (trade_date.toordinal() - _EPOCH_ORDINAL) * 86_400_000
+    _ttd_memo_dt = local_dt
+    _ttd_memo_result = result
+    return result
 
 
 @module_property

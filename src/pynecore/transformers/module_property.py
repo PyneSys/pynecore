@@ -6,20 +6,23 @@ from pathlib import Path
 
 class ModulePropertyTransformer(ast.NodeTransformer):
     """
-    Transform lib.xxx references based on JSON configuration.
-    If module+name exists in config:
-        - Transform properties to function calls
-        - Leave variables as is
-    If not in config:
-        - Use callable() check
-    Skip transformation inside isolate_function arguments.
+    Transform lib.xxx references based on the generated module_properties.json registry.
+
+    - ``property`` entries (Pine names that are values): bare reads become calls
+      (``ta.tr`` -> ``ta.tr()``); explicit calls are left untouched.
+    - ``variable`` entries: left as plain attribute reads.
+    - Function-and-namespace modules (``plot``, ``dayofweek``, ...): calls and promoted
+      bare reads are routed to the module's self-named function
+      (``plot(x)`` -> ``plot.plot(x)``, bare ``dayofweek`` -> ``dayofweek.dayofweek()``).
+    - Unknown names on known pynecore.lib modules raise at transform time — the
+      registry is exhaustive, so this catches typos and a stale registry early.
+    - Unknown module paths (user ``lib.*`` workdir libraries) and ``_``-prefixed
+      names are plain attribute reads.
     """
 
     def __init__(self):
         # Structure: module -> name -> {"type": "property"|"variable"}
         self.module_info: dict[str, dict[str, dict[str, Any]]] = {}
-        # Track if we're inside isolate_function args
-        self.in_isolate_function = False
 
         # Load config
         try:
@@ -30,15 +33,9 @@ class ModulePropertyTransformer(ast.NodeTransformer):
 
     def visit(self, node: ast.AST) -> ast.AST:
         """
-        Override the generic visit method to:
-        1. Set .parent on each child node for chain detection
-        2. Track isolate_function context
+        Override the generic visit method to set .parent on each child node
+        for chain detection.
         """
-        # Check if entering isolate_function call
-        is_isolate_call = (isinstance(node, ast.Call) and
-                           isinstance(node.func, ast.Name) and
-                           node.func.id == 'isolate_function')
-
         # Set parent on children
         for field, value in ast.iter_fields(node):
             if isinstance(value, ast.AST):
@@ -48,23 +45,11 @@ class ModulePropertyTransformer(ast.NodeTransformer):
                     if isinstance(item, ast.AST):
                         setattr(item, "parent", node)
 
-        # Handle isolate_function context
-        if is_isolate_call:
-            old_context = self.in_isolate_function
-            self.in_isolate_function = True
-            result = super().visit(node)
-            self.in_isolate_function = old_context
-            return result
-
         return super().visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        """Process attribute access, but skip if inside isolate_function args or type annotations."""
+        """Process attribute access, but skip if inside type annotations."""
         node = cast(ast.Attribute, self.generic_visit(node))
-
-        # Skip if inside isolate_function
-        if self.in_isolate_function:
-            return node
 
         # Skip if inside type annotations
         if self._is_in_type_annotation(node):
@@ -77,10 +62,6 @@ class ModulePropertyTransformer(ast.NodeTransformer):
         if isinstance(parent, ast.Attribute):
             return node
 
-        # Function call - if the parent is a Call, and this is being called
-        if isinstance(parent, ast.Call) and parent.func == node:
-            return node
-
         # If this node has already been processed, or the chain does not start with lib..., skip
         if hasattr(node, '_processed') or not self._is_lib_reference(node):
             return node
@@ -91,43 +72,54 @@ class ModulePropertyTransformer(ast.NodeTransformer):
         if not module_path or not name:
             return node
 
-        # Check the config for this attribute
-        module_attrs = self.module_info.get(module_path, {})
-        attr_info = module_attrs.get(name)
+        full_path = f"{module_path}.{name}"
 
-        # If the attribute is in the config: property -> () call, or variable -> leave as is
-        if attr_info:
+        # Call site — explicit calls stay as they are, except when the callee is a
+        # function-and-namespace module (its registry entry contains a self-named
+        # function): ``lib.plot(...)`` routes to ``lib.plot.plot(...)``
+        if isinstance(parent, ast.Call) and parent.func == node:
+            inner_attrs = self.module_info.get(full_path)
+            if inner_attrs is not None and name in inner_attrs:
+                result: ast.expr = ast.Attribute(value=node, attr=name, ctx=ast.Load())
+                setattr(result, "_processed", True)
+                return result
+            return node
+
+        module_attrs = self.module_info.get(module_path)
+        if module_attrs is None:
+            # Unknown module path: a user workdir library or a class-attribute chain —
+            # plain Python attribute access
+            return node
+
+        attr_info = module_attrs.get(name)
+        if attr_info is not None:
             if attr_info["type"] == "property":
-                result = ast.Call(
-                    func=self._copy_node(node),
-                    args=[],
-                    keywords=[]
-                )
+                inner_attrs = self.module_info.get(full_path)
+                if inner_attrs is not None and name in inner_attrs:
+                    # Promoted self-named property of a function-and-namespace module:
+                    # bare ``dayofweek`` -> ``lib.dayofweek.dayofweek()``
+                    func: ast.expr = ast.Attribute(value=self._copy_node(node), attr=name,
+                                                   ctx=ast.Load())
+                else:
+                    func = self._copy_node(node)
+                result = ast.Call(func=func, args=[], keywords=[])
             else:
                 result = node
 
-        # Fall back to __module_property__ check
-        elif f"{module_path}.{name}" not in self.module_info:  # Skip if it is a module
-            # Check for __module_property__ attribute
-            result = ast.IfExp(
-                test=ast.Call(
-                    func=ast.Name(id='hasattr', ctx=ast.Load()),
-                    args=[
-                        self._copy_node(node),
-                        ast.Constant(value='__module_property__')
-                    ],
-                    keywords=[]
-                ),
-                body=ast.Call(
-                    func=self._copy_node(node),
-                    args=[],
-                    keywords=[]
-                ),
-                orelse=self._copy_node(node)
-            )
-        # Leave module attributes as is
-        else:
+        # Submodule reference — leave as is
+        elif full_path in self.module_info:
             result = node
+
+        # Internal names are never module properties — plain attribute access
+        elif name.startswith('_'):
+            result = node
+
+        else:
+            raise SyntaxError(
+                f"unknown attribute '{name}' on module '{module_path}' (line {node.lineno}); "
+                f"if this is a new pynecore.lib name, regenerate module_properties.json "
+                f"with scripts/module_property_collector.py"
+            )
 
         setattr(result, "_processed", True)
         return result

@@ -1,11 +1,12 @@
 from typing import Any
 
-from ..core.callable_module import CallableModule
 from ..types.plot import Plot
 from ..types.plot import PlotEnum
 
 
-class PlotModule(CallableModule):
+# IDE-facing view of the function-and-namespace module: user code reads the
+# constants and calls the bare name; the AST transformer resolves both at runtime.
+class PlotModule:
     style_area: PlotEnum
     style_areabr: PlotEnum
     style_circles: PlotEnum
@@ -23,7 +24,5 @@ class PlotModule(CallableModule):
 
     def __call__(self, series: Any, title: str | None = None, *args, **kwargs) -> Plot: ...
 
-    def new(self): ...
 
-
-plot: PlotModule = PlotModule(__name__)
+plot: PlotModule

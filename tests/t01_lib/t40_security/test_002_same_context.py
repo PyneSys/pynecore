@@ -21,6 +21,7 @@ def main():
 def __test_same_context__(csv_reader, runner, log):
     """Same symbol + same TF uses chart data directly without spawning a process"""
     from pynecore import lib
+    from pynecore.types.na import NA
 
     sma_values = []
     with csv_reader('advance_decline_ratio.csv', subdir="data") as cr:
@@ -33,12 +34,12 @@ def __test_same_context__(csv_reader, runner, log):
             sma_values.append(lib.close)
 
             # sec_close must be exactly close
-            if not isinstance(plot_values.get('SecClose'), type(lib.na)):
+            if not isinstance(plot_values.get('SecClose'), NA):
                 assert plot_values['SecClose'] == lib.close, \
                     f"bar {i}: SecClose={plot_values['SecClose']} != close={lib.close}"
 
             # sec_high must be exactly high
-            if not isinstance(plot_values.get('SecHigh'), type(lib.na)):
+            if not isinstance(plot_values.get('SecHigh'), NA):
                 assert plot_values['SecHigh'] == lib.high, \
                     f"bar {i}: SecHigh={plot_values['SecHigh']} != high={lib.high}"
 
@@ -46,7 +47,7 @@ def __test_same_context__(csv_reader, runner, log):
             if i >= 4:
                 expected_sma = sum(sma_values[-5:]) / 5
                 sec_sma_val = plot_values.get('SecSMA')
-                if sec_sma_val is not None and not isinstance(sec_sma_val, type(lib.na)):
+                if sec_sma_val is not None and not isinstance(sec_sma_val, NA):
                     assert math.isclose(sec_sma_val, expected_sma, rel_tol=1e-10), \
                         f"bar {i}: SecSMA={sec_sma_val} != expected={expected_sma}"
 

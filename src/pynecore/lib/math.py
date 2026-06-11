@@ -4,13 +4,9 @@ import math
 
 from ..types.na import NA
 from ..types import PyneFloat, PyneInt
-from ..types.series import Series
 
 from . import syminfo
-
-from ..core.series import SeriesImpl as _SeriesImpl
-from ..core.random import PineRandom as _PineRandom
-from ..core import safe_convert
+from ._math_stateful import random, sum
 
 TFI = TypeVar('TFI', float, int)
 
@@ -26,10 +22,6 @@ e = math.e
 pi = math.pi
 phi = (1 + math.sqrt(5)) / 2
 rphi = 1 / phi
-
-__persistent_function_vars__ = {}
-__series_function_vars__ = {}
-
 
 # noinspection PyShadowingBuiltins
 def abs(number: TFI | NA[TFI]) -> PyneFloat:
@@ -214,28 +206,6 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     return base ** exponent
 
 
-__persistent_random_prng__: _PineRandom | None = None
-__persistent_function_vars__['random'] = ['__persistent_random_prng__']
-
-
-# noinspection PyShadowingBuiltins,PyShadowingNames
-def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(int)) -> PyneFloat:
-    """
-    Returns a random number between two numbers.
-
-    :param min: The minimum number.
-    :param max: The maximum number.
-    :param seed: The seed for the random number generator.
-    :return: A random number between the minimum and maximum numbers.
-    """
-    global __persistent_random_prng__
-    prng = __persistent_random_prng__
-    if prng is None:
-        prng = __persistent_random_prng__ = _PineRandom(seed)
-    res = prng.random(min, max)
-    return res
-
-
 # noinspection PyShadowingBuiltins
 def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     """
@@ -247,9 +217,8 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     """
     if isinstance(number, NA):
         return NA(float)
-    if isinstance(precision, NA):
+    if not isinstance(precision, int):
         return builtins.round(number)
-    precision: int
     return builtins.round(number, precision)
 
 
@@ -311,69 +280,6 @@ def sqrt(number: float | int | NA) -> PyneFloat:
         return math.sqrt(number)
     except ValueError:
         return NA(float)
-
-
-__series_summ_source__: _SeriesImpl[float] = _SeriesImpl()
-__persistent_summ_summ__: float = 0.0
-__persistent_summ_count__: int = 0
-__persistent_summ_compensation__: float = 0.0
-__persistent_function_vars__['sum'] = [
-    '__persistent_summ_summ__', '__persistent_summ_count__', '__persistent_summ_compensation__'
-]
-__series_function_vars__['sum'] = ['__series_summ_source__']
-
-
-# noinspection PyShadowingBuiltins
-def sum(source: Series[TFI | NA[TFI]], length: int) -> PyneFloat | Series[TFI | NA[TFI]]:
-    """
-    Returns the sum of a series over a specified length using Kahan summation.
-
-    :param source: Source series
-    :param length: Length of the sum
-    :return: The sliding sum of the series
-    """
-    global __series_summ_source__, __persistent_summ_summ__, __persistent_summ_count__, __persistent_summ_compensation__
-
-    if length == 1:  # Shortcut
-        return source
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    length = int(length)
-
-    isna = isinstance(source, NA)
-    if not isna:
-        source: float
-        __series_summ_source__.add(source)
-
-    if __persistent_summ_count__ < length - 1:
-        if not isna:
-            __persistent_summ_count__ += 1
-            # Kahan summation for adding new value
-            corrected_value = float(source) - __persistent_summ_compensation__
-            new_sum = __persistent_summ_summ__ + corrected_value
-            __persistent_summ_compensation__ = (new_sum - __persistent_summ_summ__) - corrected_value
-            __persistent_summ_summ__ = new_sum
-        return NA(float)
-    elif __persistent_summ_count__ == length - 1:
-        if isna:
-            return NA(float)
-        __persistent_summ_count__ += 1
-    else:
-        if isna:
-            return __persistent_summ_summ__
-        # Kahan summation for removing old value
-        old_value = safe_convert.safe_float(__series_summ_source__[length])
-        corrected_old = -old_value - __persistent_summ_compensation__
-        new_sum = __persistent_summ_summ__ + corrected_old
-        __persistent_summ_compensation__ = (new_sum - __persistent_summ_summ__) - corrected_old
-        __persistent_summ_summ__ = new_sum
-
-    # Kahan summation for adding new value
-    corrected_value = float(source) - __persistent_summ_compensation__
-    new_sum = __persistent_summ_summ__ + corrected_value
-    __persistent_summ_compensation__ = (new_sum - __persistent_summ_summ__) - corrected_value
-    __persistent_summ_summ__ = new_sum
-
-    return __persistent_summ_summ__
 
 
 def tan(angle: TFI | NA[TFI]) -> PyneFloat:

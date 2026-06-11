@@ -1,35 +1,28 @@
 """
 Alert
 
-This is a callable module, so the module itself is both a function and a namespace
+The module is both a function (``alert(...)``) and a namespace (``alert.freq_once_per_bar``);
+call sites are routed to :func:`alert` by the module property AST transformer.
 """
-from __future__ import annotations
-from ..core.callable_module import CallableModule
-
 from ..types.alert import AlertEnum
 
 
 #
-# Module object
+# Constants
 #
 
-class AlertModule(CallableModule):
-    #
-    # Constants
-    #
-
-    freq_all = AlertEnum('all')
-    freq_once_per_bar = AlertEnum('once_per_bar')
-    freq_once_per_bar_close = AlertEnum('once_per_bar_close')
+freq_all = AlertEnum('all')
+freq_once_per_bar = AlertEnum('once_per_bar')
+freq_once_per_bar_close = AlertEnum('once_per_bar_close')
 
 
 #
-# Callable module function
+# Module function
 #
 
 def alert(
         message: str,
-        freq: AlertEnum = AlertModule.freq_once_per_bar  # noqa
+        freq: AlertEnum = freq_once_per_bar
 ) -> None:
     """
     Display alert message. Uses rich formatting if available, falls back to print.
@@ -44,10 +37,3 @@ def alert(
     except ImportError:
         # Fallback to simple print
         print(f"🚨 ALERT: {message}")
-
-
-#
-# Module initialization
-#
-
-AlertModule(__name__)

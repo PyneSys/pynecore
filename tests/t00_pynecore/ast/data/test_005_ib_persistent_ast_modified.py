@@ -2,15 +2,13 @@
 @pyne
 """
 from pynecore.types import IBPersistent
-__persistent_main·var_count__ = 0
-__persistent_main·varip_count__ = 0
-__persistent_main·varip_total__ = 0.0
-__persistent_main·varip_total___kahan_c__ = 0.0
-__persistent_function_vars__ = {'main': ('__persistent_main·var_count__', '__persistent_main·varip_count__', '__persistent_main·varip_total__', '__persistent_main·varip_total___kahan_c__')}
-__varip_function_vars__ = {'main': ('__persistent_main·varip_count__', '__persistent_main·varip_total__', '__persistent_main·varip_total___kahan_c__')}
+__pyne_slot_layout__ = {'main': {'init': (0, 0, 0.0, 0.0), 'series': (), 'varip': (1, 2, 3), 'children': (), 'names': ('var_count', 'varip_count', 'varip_total', 'varip_total·kahan')}}
 
-def main():
-    global __persistent_main·var_count__, __persistent_main·varip_count__, __persistent_main·varip_total__, __persistent_main·varip_total___kahan_c__
-    __persistent_main·var_count__ += 1
-    __persistent_main·varip_count__ += 1
-    ((__kahan_corrected__ := (some_value - __persistent_main·varip_total___kahan_c__)), (__kahan_new_sum__ := (__persistent_main·varip_total__ + __kahan_corrected__)), (__persistent_main·varip_total___kahan_c__ := (__kahan_new_sum__ - __persistent_main·varip_total__ - __kahan_corrected__)), (__persistent_main·varip_total__ := __kahan_new_sum__))[-1]
+def main(__state__):
+    __state__[0] += 1
+    __state__[1] += 1
+    __kahan_corrected__ = some_value - __state__[3]
+    __kahan_new_sum__ = __state__[2] + __kahan_corrected__
+    __state__[3] = __kahan_new_sum__ - __state__[2] - __kahan_corrected__
+    __state__[2] = __kahan_new_sum__
+main.__pyne_layout__ = __pyne_slot_layout__['main']

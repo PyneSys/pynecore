@@ -1,15 +1,13 @@
 """
 @pyne
 """
-__persistent_main·p__ = 1
-__persistent_main·test·p__ = 1
-__persistent_function_vars__ = {'main': ('__persistent_main·p__',), 'main.test': ('__persistent_main·test·p__',)}
+__pyne_slot_layout__ = {'main': {'init': (1,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}, 'main·test': {'init': (1,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
 
-def main():
-    global __persistent_main·p__
-    __persistent_main·p__ += 1
+def main(__state·main__):
+    __state·main__[0] += 1
 
-    def test():
-        global __persistent_main·test·p__
-        __persistent_main·test·p__ += 1
-        return __persistent_main·test·p__
+    def test(__state__):
+        __state__[0] += 1
+        return __state__[0]
+    test.__pyne_layout__ = __pyne_slot_layout__['main·test']
+main.__pyne_layout__ = __pyne_slot_layout__['main']

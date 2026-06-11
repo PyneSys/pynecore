@@ -1,6 +1,8 @@
 from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any
 from types import ModuleType
 import sys
+from functools import partial
+from math import log10, floor
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -88,7 +90,6 @@ def _round_price(price: float, tick_decimals: int | None):
     """
     if price == 0.0:
         return 0.0
-    from math import log10, floor
     precision = 5 - floor(log10(abs(price)))  # 6 significant digits
     if tick_decimals is not None and tick_decimals > precision:
         precision = tick_decimals
@@ -106,10 +107,10 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
 
     lib.bar_index = lib.last_bar_index = bar_index
 
-    lib.open = _round_price(ohlcv.open, round_decimals)
-    lib.high = _round_price(ohlcv.high, round_decimals)
-    lib.low = _round_price(ohlcv.low, round_decimals)
-    lib.close = _round_price(ohlcv.close, round_decimals)
+    lib.open = o = _round_price(ohlcv.open, round_decimals)
+    lib.high = h = _round_price(ohlcv.high, round_decimals)
+    lib.low = lo = _round_price(ohlcv.low, round_decimals)
+    lib.close = c = _round_price(ohlcv.close, round_decimals)
 
     lib.volume = ohlcv.volume
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
@@ -119,13 +120,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # they are always ``na`` — matching TV behaviour on bar timeframes.
     lib.bid = lib.ask = na_float
 
-    lib.hl2 = (lib.high + lib.low) / 2.0
-    lib.hlc3 = (lib.high + lib.low + lib.close) / 3.0
-    lib.ohlc4 = (lib.open + lib.high + lib.low + lib.close) / 4.0
-    lib.hlcc4 = (lib.high + lib.low + 2 * lib.close) / 4.0
+    lib.hl2 = (h + lo) / 2.0
+    lib.hlc3 = (h + lo + c) / 3.0
+    lib.ohlc4 = (o + h + lo + c) / 4.0
+    lib.hlcc4 = (h + lo + 2 * c) / 4.0
 
-    dt = lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, UTC).astimezone(tz)
-    lib._time = lib.last_bar_time = int(dt.timestamp() * 1000)  # PineScript representation of time
+    # ``fromtimestamp(ts, tz)`` converts straight to the exchange timezone (same
+    # instant as a UTC roundtrip), and the epoch milliseconds come directly from
+    # the raw timestamp — no astimezone/timestamp C calls per bar.
+    lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, tz)
+    lib._time = lib.last_bar_time = int(ohlcv.timestamp * 1000)  # PineScript representation of time
 
 
 # noinspection PyUnusedLocal
@@ -319,15 +323,15 @@ class ScriptRunner:
         """
         from .. import lib
         from ..lib import _parse_timezone, barstate, string
-        from pynecore.core import function_isolation
+        from pynecore.core import instance_state
         from . import script
 
         is_strat = self.script.script_type == script_type.strategy
 
         # Reset bar_index
         self.bar_index = 0
-        # Reset function isolation
-        function_isolation.reset()
+        # Drop function instances left over from a previous run
+        instance_state.reset()
 
         # Set script data
         lib._script = self.script  # Store script object in lib
@@ -353,8 +357,14 @@ class ScriptRunner:
         # Trade counter
         trade_num = 0
 
-        # Position shortcut
+        # Position shortcut. The runner drives the simulator directly — the
+        # strategy decorator always installs a ``SimPosition`` (indicators leave
+        # it ``None``); narrow once so the per-bar calls below type-check.
+        # Imported here like ``lib`` above: ``pynecore.lib`` must not be a
+        # module-level import of the runner (circular import).
+        from ..lib.strategy import SimPosition
         position = self.script.position
+        assert position is None or isinstance(position, SimPosition)
 
         # --- Currency rate provider setup ---
         from .currency import CurrencyRateProvider
@@ -389,7 +399,40 @@ class ScriptRunner:
         sec_sync_block = None
         sec_result_blocks = None
 
+        # Root keys of this run, discarded in the finally block (declared before
+        # the try so the cleanup is safe on any early failure)
+        root_keys: list[str] = []
+
         try:
+            # Root state vectors of the entry points driven directly by the
+            # runner: a state-carrying main takes the hidden __state__ argument,
+            # a stateless one is called as-is. Keys are qualified per function so
+            # two entry points never collide on one root. Duplicate registrations
+            # of the same function object (a library script run directly registers
+            # its own main as a library too) share one bound entry; a stale
+            # same-name duplicate (module re-imported under the same name) gets a
+            # suffixed key and keeps its own state, like its own module globals
+            # did before the slot-state scheme.
+            main_func = self.script_module.main
+            bound_entries: dict[int, Callable[[], Any]] = {}
+            seen_keys: set[str] = set()
+            for entry_func in [main_func] + [f for _title, f in script._registered_libraries]:
+                if id(entry_func) in bound_entries:
+                    continue
+                entry_layout = getattr(entry_func, '__pyne_layout__', None)
+                if entry_layout is None:
+                    bound_entries[id(entry_func)] = entry_func
+                    continue
+                root_key = f'{entry_func.__module__}.{entry_func.__qualname__}'
+                if root_key in seen_keys:
+                    root_key = f'{root_key}#{len(root_keys)}'
+                seen_keys.add(root_key)
+                root_keys.append(root_key)
+                bound_entries[id(entry_func)] = partial(
+                    entry_func, instance_state.create_root(root_key, entry_layout))
+            run_main = bound_entries[id(main_func)]
+            lib_mains = [bound_entries[id(f)] for _title, f in script._registered_libraries]
+
             if sec_contexts:
                 import os
                 max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
@@ -500,7 +543,6 @@ class ScriptRunner:
                         _state.timeframe = resolved_tf
                         _state.same_timeframe = True
                         _state.resampler = None
-                        _state.htf_aggregator = None
                         same_context_ids.add(sid)
                         no_process_ids.add(sid)
                         return
@@ -581,12 +623,21 @@ class ScriptRunner:
                     inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
                                     same_context=same_ctx_ref)
 
+            # Initialize calc_on_order_fills snapshot (only for strategies with COOF).
+            # Pine TV semantics: `calc_on_order_fills` is silently disabled when
+            # `process_orders_on_close=True` (TV reverts to a single script calculation
+            # per bar in that combo), so the snapshot stays unused in that case.
+            var_snapshot = None
+            if (is_strat and self.script.calc_on_order_fills
+                    and not self.script.process_orders_on_close):
+                var_snapshot = instance_state.RootVarSnapshot(root_keys)
+
             # --timeframe mode: magnifier_iter provides sub-TF data
             if self._magnifier_iter is not None:
                 if is_strat and self.script.use_bar_magnifier:
                     # Bar magnifier: accurate order fills at sub-bar resolution
                     yield from self._run_iter_magnified(
-                        lib, barstate, position, script_mod=script,
+                        lib, barstate, position, run_main, lib_mains, var_snapshot,
                         is_strat=is_strat, on_progress=on_progress, string=string,
                     )
                     return
@@ -597,16 +648,6 @@ class ScriptRunner:
                     magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
                                              session_starts=self.syminfo.session_starts)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
-
-            # Initialize calc_on_order_fills snapshot (only for strategies with COOF).
-            # Pine TV semantics: `calc_on_order_fills` is silently disabled when
-            # `process_orders_on_close=True` (TV reverts to a single script calculation
-            # per bar in that combo), so the snapshot stays unused in that case.
-            var_snapshot = None
-            if (is_strat and self.script.calc_on_order_fills
-                    and not self.script.process_orders_on_close):
-                from .var_snapshot import VarSnapshot
-                var_snapshot = VarSnapshot(self.script_module, script._registered_libraries)
 
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
             ohlcv_iterator = iter(self.ohlcv_iter)
@@ -646,12 +687,12 @@ class ScriptRunner:
                     while new_fills > old_fills:
                         if var_snapshot.has_vars:
                             var_snapshot.restore()
-                        function_isolation.reset()
+                        instance_state.reset()
                         lib._lib_semaphore = True
-                        for library_title, main_func in script._registered_libraries:
-                            main_func()
+                        for run_lib_main in lib_mains:
+                            run_lib_main()
                         lib._lib_semaphore = False
-                        self.script_module.main()
+                        run_main()
                         old_fills = new_fills
                         position.process_orders()
                         new_fills = position._fill_counter
@@ -665,12 +706,12 @@ class ScriptRunner:
 
                 # Execute registered library main functions before main script
                 lib._lib_semaphore = True
-                for library_title, main_func in script._registered_libraries:
-                    main_func()
+                for run_lib_main in lib_mains:
+                    run_lib_main()
                 lib._lib_semaphore = False
 
                 # Run the script
-                res = self.script_module.main()
+                res = run_main()
 
                 # Pine `process_orders_on_close=true` — extra fill attempt at the bar
                 # close for current-bar orders, before the next bar's open arrives.
@@ -872,18 +913,21 @@ class ScriptRunner:
 
             # Reset library variables
             _reset_lib_vars(lib)
-            # Reset function isolation
-            function_isolation.reset()
+            # Drop function instances and this run's root vectors
+            instance_state.reset()
+            for root_key in root_keys:
+                instance_state.discard_root(root_key)
 
     # noinspection PyProtectedMember
-    def _run_iter_magnified(self, lib, barstate, position, script_mod, is_strat, on_progress, string):
+    def _run_iter_magnified(self, lib, barstate, position, run_main, lib_mains, var_snapshot,
+                            is_strat, on_progress, string):
         """
         Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
         resolution, execute script once per chart bar.
         """
         from .bar_magnifier import BarMagnifier
         # Needed for COOF re-execution path (already loaded by run_iter, safe to re-import)
-        from pynecore.core import function_isolation
+        from pynecore.core import instance_state
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
@@ -891,16 +935,6 @@ class ScriptRunner:
                                  session_starts=self.syminfo.session_starts)
 
         trade_num = 0
-
-        # Initialize calc_on_order_fills snapshot for magnified path.
-        # Pine TV semantics: `calc_on_order_fills` is silently disabled when
-        # `process_orders_on_close=True` (TV reverts to a single script calculation
-        # per bar in that combo), so the snapshot stays unused in that case.
-        var_snapshot = None
-        if (is_strat and self.script.calc_on_order_fills
-                and not self.script.process_orders_on_close):
-            from .var_snapshot import VarSnapshot
-            var_snapshot = VarSnapshot(self.script_module, script_mod._registered_libraries)
 
         for window in magnifier:
             barstate.islast = window.is_last_window
@@ -927,12 +961,12 @@ class ScriptRunner:
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
-                    function_isolation.reset()
+                    instance_state.reset()
                     lib._lib_semaphore = True
-                    for library_title, main_func in script_mod._registered_libraries:
-                        main_func()
+                    for run_lib_main in lib_mains:
+                        run_lib_main()
                     lib._lib_semaphore = False
-                    self.script_module.main()
+                    run_main()
                     old_fills = new_fills
                     position.process_orders_magnified(window.sub_bars, window.aggregated)
                     new_fills = position._fill_counter
@@ -944,12 +978,12 @@ class ScriptRunner:
 
             # Execute registered library main functions before main script
             lib._lib_semaphore = True
-            for library_title, main_func in script_mod._registered_libraries:
-                main_func()
+            for run_lib_main in lib_mains:
+                run_lib_main()
             lib._lib_semaphore = False
 
             # Run the script
-            res = self.script_module.main()
+            res = run_main()
 
             # Pine `process_orders_on_close=true` — extra fill attempt at the bar
             # close for current-bar orders. No COOF re-run: Pine disables

@@ -208,8 +208,10 @@ def ast_transformed_code(script_path, test_name, module_key) -> str:
     from contextlib import redirect_stdout
     from io import StringIO
 
-    # Enable AST debug output
-    os.environ['PYNE_AST_DEBUG_RAW'] = '1'
+    # Enable AST debug output, filtered to the script under test — callee
+    # resolution may import @pyne lib modules mid-transform, and their dumps
+    # must not pollute the captured output
+    os.environ['PYNE_AST_DEBUG_RAW'] = str(script_path)
 
     # Remove module from sys.modules
     del sys.modules[module_key]

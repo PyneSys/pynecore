@@ -111,19 +111,6 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                 new_args.extend(node.args.args)
                 node.args.args = new_args
 
-                # Mark this function as having closure arguments transformed
-                # This will be used by function_isolation transformer
-                setattr(node, '_has_closure_arguments', True)
-                setattr(node, '_closure_vars_count', len(closure_vars))
-
-                # Also store the closure vars list for reference
-                setattr(node, '_closure_vars', closure_vars)
-            else:
-                # No closure variables, but still mark it
-                setattr(node, '_has_closure_arguments', True)
-                setattr(node, '_closure_vars_count', 0)
-                setattr(node, '_closure_vars', [])
-
             # Store the function definition
             self.inner_functions[node.name] = node
 
@@ -160,15 +147,6 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                     new_args.extend(node.args)
                     node.args = new_args
 
-                    # Mark this call as having closure arguments
-                    # This will be used by function_isolation transformer
-                    setattr(node, '_has_closure_arguments', True)
-                    setattr(node, '_closure_vars_count', len(closure_vars))
-                else:
-                    # No closure variables for this function
-                    setattr(node, '_has_closure_arguments', True)
-                    setattr(node, '_closure_vars_count', 0)
-
             # Handle method_call() calls - these need special handling
             elif func_name == 'method_call' and len(node.args) >= 2:
                 method_name = None
@@ -191,6 +169,8 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                         if func_key in self.closure_vars and self.closure_vars[func_key]:
                             # Add closure variables as arguments
                             # For method_call: method_call(method_ref, closure_vars..., this_obj, original_args...)
+                            # — the converted method signature has the closure
+                            # parameters prepended, so this order lines up as-is
                             closure_vars = sorted(self.closure_vars[func_key])
                             new_args: List[ast.expr] = [node.args[0]]
 
@@ -205,14 +185,6 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                             new_args.extend(node.args[2:])
 
                             node.args = new_args
-
-                            # Mark this call as having closure arguments
-                            setattr(node, '_has_closure_arguments', True)
-                            setattr(node, '_closure_vars_count', len(closure_vars))
-                        else:
-                            # No closure variables for this method
-                            setattr(node, '_has_closure_arguments', True)
-                            setattr(node, '_closure_vars_count', 0)
 
         return node
 

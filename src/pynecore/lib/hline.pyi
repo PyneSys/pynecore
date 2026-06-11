@@ -1,24 +1,24 @@
-from ..core.callable_module import CallableModule
 from ..types.hline import HLineEnum, HLine
 from . import color as _color, display as _display
 
 
-class HLineModule(CallableModule):
-    style_solid = HLineEnum()
-    style_dotted = HLineEnum()
-    style_dashed = HLineEnum()
+# IDE-facing view of the function-and-namespace module: user code reads the
+# constants and calls the bare name; the AST transformer resolves both at runtime.
+class HLineModule:
+    style_solid: HLineEnum
+    style_dotted: HLineEnum
+    style_dashed: HLineEnum
 
-    def hline(
+    def __call__(
             self,
             price: float,
-            title: str = "",
-            color: _color.Color = _color.blue,
-            linestyle: HLineEnum = HLineModule.style_solid,
-            linewidth: int = 1,
-            editable: bool = True,
-            display: _display.Display = _display.all
-    ) -> HLine:
-        ...
+            title: str = ...,
+            color: _color.Color = ...,
+            linestyle: HLineEnum = ...,
+            linewidth: int = ...,
+            editable: bool = ...,
+            display: _display.Display = ...
+    ) -> HLine: ...
 
 
-hline: HLineModule = HLineModule(__name__)
+hline: HLineModule
