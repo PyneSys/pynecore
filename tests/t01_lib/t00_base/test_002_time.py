@@ -243,7 +243,8 @@ def __test_time__(csv_reader, runner, dict_comparator, log):
     
     # Test basic functionality
     lib._time = 1672672200000  # Set test timestamp
-    
+    lib.syminfo.period = "60"  # Chart timeframe (always set by the script runner in real runs)
+
     # Validate basic functionality
     basic_time = time()
     basic_time_close = time_close()

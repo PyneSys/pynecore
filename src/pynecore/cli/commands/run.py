@@ -803,6 +803,7 @@ def run(
 
     # Validate and process --timeframe option
     magnifier_mode = False
+    magnifier_source_tf: str | None = None
     if timeframe:
         chart_tf: str = timeframe.upper()
         try:
@@ -822,6 +823,7 @@ def run(
             # Override syminfo period to the chart timeframe
             syminfo.period = chart_tf
             magnifier_mode = True
+            magnifier_source_tf = data_tf
 
     # --- Open data and run ---
     with OHLCVReader(data_path) as reader:
@@ -1076,6 +1078,7 @@ def run(
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                           security_data=security_data,
                                           magnifier_iter=magnifier_iter,
+                                          magnifier_source_tf=magnifier_source_tf,
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
                                           broker_store_ctx=broker_store_ctx,

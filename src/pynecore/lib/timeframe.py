@@ -4,14 +4,12 @@ if TYPE_CHECKING:
     from pynecore.types.type_checker import *
 
 from functools import lru_cache
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta
 
 from ..core.module_property import module_property
 
 from .. import lib
 from . import syminfo as _syminfo
-
-from pynecore.core.datetime import parse_timezone as _parse_timezone
 
 from ._timeframe_change import change
 
@@ -64,75 +62,6 @@ def _process_tf(timeframe: str) -> tuple[str, int]:
     assert _modifier in ('', 'T', 'S', 'D', 'W', 'M'), "Invalid timeframe: wrong modifier!"
     assert _multiplier > 0, "Invalid timeframe: wrong multiplier!"
     return _modifier, _multiplier
-
-
-def _is_time_in_candle(candle_time: datetime, check_time: datetime, tf_sec: int) -> bool:
-    """
-    Check if a given time is within the candle's timeframe.
-
-    :param candle_time: Start datetime of the candle
-    :param check_time: Time to check
-    :param tf_sec: Timeframe in seconds
-    :return: True if the time is within the candle
-    """
-    candle_end = candle_time + timedelta(seconds=tf_sec)
-    return candle_time <= check_time < candle_end
-
-
-# noinspection PyProtectedMember
-def _get_first_session_start_in_day(dt: datetime) -> datetime | None:
-    """
-    Get first session start time in the given day using session_starts configuration.
-
-    :param dt: The datetime to check (in UTC)
-    :return: First session start time in UTC
-    """
-    if not isinstance(_syminfo.timezone, str):
-        return None
-    local_dt = dt.astimezone(_parse_timezone(_syminfo.timezone))
-    weekday = local_dt.weekday()
-
-    # Get all session starts for current weekday
-    day_starts = [
-        time for day, time in _syminfo._session_starts
-        if day == weekday
-    ]
-
-    if not day_starts:
-        return None
-
-    # Get the earliest session start for the day
-    first_start = min(day_starts)
-
-    # Create datetime with the session start time
-    ssdt = local_dt.replace(
-        hour=first_start.hour,
-        minute=first_start.minute,
-        second=first_start.second,
-        microsecond=0
-    )
-
-    return ssdt.astimezone(UTC)
-
-
-# noinspection PyProtectedMember
-def _get_new_year_session(dt: datetime) -> datetime | None:
-    """
-    Get the new year session of the given datetime.
-
-    :param dt: The datetime to start searching in UTC
-    :return: The next new year session in exchange timezone
-    """
-    dt_utc = dt.astimezone(UTC)
-    nydt_utc = dt_utc.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    # Get next new year
-    while True:
-        ss = _get_first_session_start_in_day(nydt_utc)
-        if ss is None:
-            nydt_utc += timedelta(days=1)
-            continue
-        # Found the next new year session, which will be the next anchor
-        return ss.astimezone(_parse_timezone(str(_syminfo.timezone)))
 
 
 # noinspection PyProtectedMember
@@ -189,86 +118,6 @@ def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_se
             return True
 
     return False
-
-
-# noinspection PyProtectedMember
-def _anchor_init(dt: datetime, modifier: str, multiplier: int, tf_sec: int, xchg_tf_sec: int,
-                 last_signal: datetime | None) \
-        -> tuple[datetime | None, int, datetime | None, datetime | None, datetime | None]:
-    """
-    First-bar anchor setup for ``change``: find the anchor point and replay
-    sessions up to the 1st bar. Stays in this (untransformed) module because
-    the daily replay loop can span a year of virtual candles — it must run
-    at full speed, without per-iteration call-site bookkeeping.
-
-    :param dt: Current candle datetime (in exchange timezone)
-    :param modifier: Timeframe modifier from ``_process_tf`` ('D', 'W' or 'M')
-    :param multiplier: Timeframe multiplier from ``_process_tf``
-    :param tf_sec: The checked timeframe in seconds
-    :param xchg_tf_sec: The chart timeframe in seconds
-    :param last_signal: The current last-signal state
-    :return: Tuple of (next_new_year_session, cycle, last_signal, next_anchor, next_signal)
-    """
-    dt_utc = dt.astimezone(UTC)
-    nydt_utc = dt_utc.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    nydt = _get_new_year_session(nydt_utc)
-
-    assert nydt is not None
-
-    next_new_year_session = _get_new_year_session(dt_utc.replace(year=dt_utc.year + 1))
-    cycle = 0
-    next_anchor: datetime | None = None
-    next_signal: datetime | None = None
-
-    # Daily timeframe's anchor is the first session of the year
-    if modifier == 'D':
-        _dt = nydt
-
-        while _dt < dt:
-            if _is_new_session(_dt, _dt - timedelta(seconds=xchg_tf_sec), xchg_tf_sec):
-                cycle -= 1
-                if cycle <= 0:
-                    last_signal = _dt
-                    cycle = multiplier
-
-            _dt += timedelta(seconds=xchg_tf_sec)
-
-    # Weekly timeframe's anchor is the first Monday of the year
-    elif modifier == 'W':
-        _dt_utc = nydt_utc
-
-        # The anchor point must be Monday
-        while _dt_utc < dt_utc:
-            if _dt_utc.weekday() != 0:
-                _dt_utc += timedelta(days=1)
-                continue
-            break
-
-        # Find the next signal
-        while _dt_utc < dt_utc:
-            _dt_utc += timedelta(seconds=tf_sec)
-
-        next_anchor = _dt_utc
-        while next_signal is None:
-            next_signal = _get_first_session_start_in_day(_dt_utc)
-            _dt_utc += timedelta(days=1)
-        next_signal = next_signal.astimezone(_parse_timezone(_syminfo.timezone))
-
-    # Monthly timeframe's anchor is the first day of the month
-    elif modifier == 'M':
-        if dt_utc.month == 12:
-            next_month_dt = dt_utc.replace(year=dt_utc.year + 1, month=1, day=1, hour=0, minute=0, second=0)
-        else:
-            next_month_dt = dt_utc.replace(month=dt_utc.month + 1, day=1, hour=0, minute=0, second=0)
-
-        while next_signal is None:
-            next_signal = _get_first_session_start_in_day(next_month_dt)
-            next_month_dt += timedelta(days=1)
-        next_signal = next_signal.astimezone(_parse_timezone(_syminfo.timezone))
-
-        cycle = dt_utc.month
-
-    return next_new_year_session, cycle, last_signal, next_anchor, next_signal
 
 
 @lru_cache(maxsize=128)

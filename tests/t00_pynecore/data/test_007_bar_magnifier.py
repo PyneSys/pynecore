@@ -177,3 +177,44 @@ def __test_1min_to_60min__():
     assert len(windows) == 2
     assert len(windows[0].sub_bars) == 60
     assert len(windows[1].sub_bars) == 60
+
+
+def __test_magnifier_observed_multiperiod__():
+    """'Observed' 2D chart groups by trading days present, stamped by first sub-bar."""
+    from datetime import datetime, time, timedelta, date
+    from zoneinfo import ZoneInfo
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+
+    ny = ZoneInfo("America/New_York")
+    t17 = time(17, 0)
+    hours = [SymInfoInterval(day=d, start=t17, end=t17) for d in (6, 0, 1, 2, 3)]
+    starts = [SymInfoSession(day=d, time=t17) for d in (6, 0, 1, 2, 3)]
+
+    def open_ts(trading_day: date) -> int:
+        prev = trading_day - timedelta(days=1)
+        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp())
+
+    # Two weeks of daily sub-bars; Mon Jan 13 2025 is a holiday (no bar)
+    days = [date(2025, 1, d) for d in (6, 7, 8, 9, 10, 14, 15, 16, 17)]
+    sub_bars = [
+        OHLCV(timestamp=open_ts(d), open=10.0, high=11.0, low=9.0, close=10.5,
+              volume=float(i + 1))
+        for i, d in enumerate(days)
+    ]
+
+    windows = list(BarMagnifier(sub_bars, '2D', tz=ny, session_starts=starts,
+                                opening_hours=hours, sym_type='futures',
+                                source_tf='1D'))
+
+    # Same grouping as the aggregator: the holiday consumes no slot
+    expected_groups = [
+        [date(2025, 1, 6)],
+        [date(2025, 1, 7), date(2025, 1, 8)],
+        [date(2025, 1, 9), date(2025, 1, 10)],
+        [date(2025, 1, 14), date(2025, 1, 15)],
+        [date(2025, 1, 16), date(2025, 1, 17)],
+    ]
+    assert [w.aggregated.timestamp for w in windows] == \
+        [open_ts(g[0]) for g in expected_groups]
+    assert [len(w.sub_bars) for w in windows] == [len(g) for g in expected_groups]
+    assert windows[-1].is_last_window and not windows[0].is_last_window
