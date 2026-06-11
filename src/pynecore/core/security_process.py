@@ -199,10 +199,9 @@ def _run_rate_source_loop(
             bars_run = False
             while current_bar < len(bar_buffer):
                 bar = bar_buffer[current_bar]
-                bar_time_ms = int(
-                    datetime.fromtimestamp(bar.timestamp, UTC)
-                    .astimezone(tz).timestamp() * 1000
-                )
+                # A UTC->tz datetime roundtrip preserves the instant, so the
+                # raw timestamp is already the answer
+                bar_time_ms = int(bar.timestamp * 1000)
                 if bar_time_ms > target_time:
                     break
                 last_close = float(bar.close)
@@ -684,10 +683,9 @@ def security_process_main(
                                         bar_buffer.append(_bar)
                                 continue
                     break
-                bar_time_ms = int(
-                    datetime.fromtimestamp(ohlcv_file_bar.timestamp, UTC)
-                    .astimezone(tz).timestamp() * 1000
-                )
+                # A UTC->tz datetime roundtrip preserves the instant, so the
+                # raw timestamp is already the answer
+                bar_time_ms = int(ohlcv_file_bar.timestamp * 1000)
                 if bar_time_ms > target_time:
                     break
 

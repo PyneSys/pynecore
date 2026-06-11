@@ -3,6 +3,7 @@ from types import ModuleType
 import asyncio
 import sys
 from functools import partial
+from math import log10, floor
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -119,7 +120,6 @@ def _round_price(price: float, tick_decimals: int | None):
     """
     if price == 0.0:
         return 0.0
-    from math import log10, floor
     precision = 5 - floor(log10(abs(price)))  # 6 significant digits
     if tick_decimals is not None and tick_decimals > precision:
         precision = tick_decimals
@@ -137,10 +137,10 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
 
     lib.bar_index = lib.last_bar_index = bar_index
 
-    lib.open = _round_price(ohlcv.open, round_decimals)
-    lib.high = _round_price(ohlcv.high, round_decimals)
-    lib.low = _round_price(ohlcv.low, round_decimals)
-    lib.close = _round_price(ohlcv.close, round_decimals)
+    lib.open = o = _round_price(ohlcv.open, round_decimals)
+    lib.high = h = _round_price(ohlcv.high, round_decimals)
+    lib.low = lo = _round_price(ohlcv.low, round_decimals)
+    lib.close = c = _round_price(ohlcv.close, round_decimals)
 
     lib.volume = ohlcv.volume
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
@@ -150,13 +150,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # they are always ``na`` — matching TV behaviour on bar timeframes.
     lib.bid = lib.ask = na_float
 
-    lib.hl2 = (lib.high + lib.low) / 2.0
-    lib.hlc3 = (lib.high + lib.low + lib.close) / 3.0
-    lib.ohlc4 = (lib.open + lib.high + lib.low + lib.close) / 4.0
-    lib.hlcc4 = (lib.high + lib.low + 2 * lib.close) / 4.0
+    lib.hl2 = (h + lo) / 2.0
+    lib.hlc3 = (h + lo + c) / 3.0
+    lib.ohlc4 = (o + h + lo + c) / 4.0
+    lib.hlcc4 = (h + lo + 2 * c) / 4.0
 
-    dt = lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, UTC).astimezone(tz)
-    lib._time = lib.last_bar_time = int(dt.timestamp() * 1000)  # PineScript representation of time
+    # ``fromtimestamp(ts, tz)`` converts straight to the exchange timezone (same
+    # instant as a UTC roundtrip), and the epoch milliseconds come directly from
+    # the raw timestamp — no astimezone/timestamp C calls per bar.
+    lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, tz)
+    lib._time = lib.last_bar_time = int(ohlcv.timestamp * 1000)  # PineScript representation of time
 
 
 # noinspection PyUnusedLocal
@@ -775,7 +778,8 @@ class ScriptRunner:
         # Trade counter
         trade_num = 0
 
-        # Position shortcut
+        # Position shortcut — ``SimPosition`` in backtest, ``BrokerPosition``
+        # in broker mode, ``None`` for indicators
         position = self.script.position
 
         # --- Security contexts setup ---
@@ -1009,7 +1013,6 @@ class ScriptRunner:
                         _state.timeframe = resolved_tf
                         _state.same_timeframe = True
                         _state.resampler = None
-                        _state.htf_aggregator = None
                         same_context_ids.add(sid)
                         no_process_ids.add(sid)
                         return
