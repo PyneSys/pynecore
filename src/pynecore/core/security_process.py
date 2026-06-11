@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 from functools import partial
 from pathlib import Path
-from datetime import datetime, UTC
 from typing import TYPE_CHECKING
 
 from .security_shm import (
@@ -150,11 +149,10 @@ def security_process_main(
             bars_run = False
             while current_bar < total_bars:
                 ohlcv = reader.read(current_bar)
-                # Convert timestamp to milliseconds for comparison
-                bar_time_ms = int(
-                    datetime.fromtimestamp(ohlcv.timestamp, UTC)
-                    .astimezone(tz).timestamp() * 1000
-                )
+                # Convert timestamp to milliseconds for comparison (a UTC->tz
+                # datetime roundtrip preserves the instant, so the raw
+                # timestamp is already the answer)
+                bar_time_ms = int(ohlcv.timestamp * 1000)
 
                 if bar_time_ms > target_time:
                     break

@@ -1908,58 +1908,92 @@ class SimPosition(PositionBase):
 
     def process_orders(self):
         """ Process orders """
-        # We need to round to the nearest tick to get the same results as in TradingView
-        round_to_mintick = lib.math.round_to_mintick
-        self.o = round_to_mintick(lib.open)
-        self.h = round_to_mintick(lib.high)
-        self.l = round_to_mintick(lib.low)
-        self.c = round_to_mintick(lib.close)
-
-        # If the order is open → high → low → close or open → low → high → close
-        ohlc = self.h - self.o < self.o - self.l
+        # We need to round to the nearest tick to get the same results as in TradingView.
+        # ``lib.math.round_to_mintick`` is inlined here (this preamble runs every bar):
+        # OHLC are always plain floats at this point, so its NA branch is dead code.
+        # The expression shape must stay ``int(x / mintick + 0.5) * minmove / pricescale``
+        # (left to right) — see the bit-parity note in ``lib/math.py``.
+        mintick = syminfo.mintick
+        minmove = syminfo.minmove
+        pricescale = syminfo.pricescale
+        self.o = int(lib.open / mintick + 0.5) * minmove / pricescale
+        self.h = int(lib.high / mintick + 0.5) * minmove / pricescale
+        self.l = int(lib.low / mintick + 0.5) * minmove / pricescale
+        self.c = int(lib.close / mintick + 0.5) * minmove / pricescale
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
 
+        # Idle fast path: with no open position and no pending orders every phase
+        # below is a provable no-op (each loop iterates an empty container, every
+        # ``_check_margin_call`` early-returns on ``not open_trades``) except the
+        # trading-day rollover and the post-bar risk rules — run just those two.
+        if (not self.open_trades and not self.entry_orders and not self.exit_orders
+                and not self.market_orders and not self.orderbook.price_levels):
+            if self._roll_trading_day():
+                return
+            if (self.risk_max_drawdown_value is not None
+                    or self.risk_max_intraday_loss_value is not None
+                    or self.risk_max_cons_loss_days is not None):
+                self._enforce_post_bar_risk()
+            return
+
+        # If the order is open → high → low → close or open → low → high → close
+        ohlc = self.h - self.o < self.o - self.l
+
         self._process_at_bar_open(ohlc)
         self._process_limit_stop_orders(ohlc)
         self._finalize_bar_pnl()
-        self._enforce_post_bar_risk()
+        if (self.risk_max_drawdown_value is not None
+                or self.risk_max_intraday_loss_value is not None
+                or self.risk_max_cons_loss_days is not None):
+            self._enforce_post_bar_risk()
         self._finalize_new_closed_trades()
+
+    def _roll_trading_day(self) -> bool:
+        """Roll the intraday risk anchors when the bar enters a new trading day.
+
+        ``time_tradingday`` is session-aware: for overnight sessions (forex,
+        futures) the day rolls at the session open (e.g. 17:00 ET), not at
+        calendar midnight — matching TradingView's intraday risk reset. For
+        24/7 crypto and intraday stock sessions it collapses to the calendar
+        day in the exchange timezone, so those symbols are unaffected.
+
+        :return: True when the ``max_cons_loss_days`` halt fired — the caller
+            must stop processing the bar's orders.
+        """
+        current_trading_day = int(lib.time_tradingday())
+        if current_trading_day == self.risk_last_trading_day:
+            return False
+        current_equity = float(self.equity)
+        # Roll over consecutive-loss-day count for ``strategy.risk.max_cons_loss_days``.
+        # On the very first bar we have no prior day to compare against — initialise
+        # the trailing-equity anchor without touching the loss-day counter.
+        if self.risk_last_trading_day != -1:
+            if current_equity < self.risk_last_day_equity:
+                self.risk_cons_loss_days += 1
+            else:
+                self.risk_cons_loss_days = 0
+        self.risk_last_day_equity = current_equity
+        # Anchor for ``strategy.risk.max_intraday_loss`` — captured at the
+        # start of every trading day, not just the first one.
+        self.risk_intraday_start_equity = current_equity
+        self.risk_last_trading_day = current_trading_day
+        self.risk_intraday_filled_orders = 0
+        # ``max_cons_loss_days`` becomes known the moment the day rolls
+        # over — halt now rather than at bar end so the new day's queued
+        # entries cannot fill at this bar's open.
+        if self._is_max_cons_loss_days_breached() and not self.risk_halt_trading:
+            self._trigger_risk_halt(
+                "Max consecutive loss days reached", self.o, self.h, self.l,
+            )
+            return True
+        return False
 
     def _process_at_bar_open(self, ohlc: bool):
         """Phase 1: Process orders at bar open — gap detection, market fills, margin."""
-        # Check if we're in a new trading day for intraday risk management.
-        # ``time_tradingday`` is session-aware: for overnight sessions (forex,
-        # futures) the day rolls at the session open (e.g. 17:00 ET), not at
-        # calendar midnight — matching TradingView's intraday risk reset. For
-        # 24/7 crypto and intraday stock sessions it collapses to the calendar
-        # day in the exchange timezone, so those symbols are unaffected.
-        current_trading_day = int(lib.time_tradingday())
-        if current_trading_day != self.risk_last_trading_day:
-            current_equity = float(self.equity)
-            # Roll over consecutive-loss-day count for ``strategy.risk.max_cons_loss_days``.
-            # On the very first bar we have no prior day to compare against — initialise
-            # the trailing-equity anchor without touching the loss-day counter.
-            if self.risk_last_trading_day != -1:
-                if current_equity < self.risk_last_day_equity:
-                    self.risk_cons_loss_days += 1
-                else:
-                    self.risk_cons_loss_days = 0
-            self.risk_last_day_equity = current_equity
-            # Anchor for ``strategy.risk.max_intraday_loss`` — captured at the
-            # start of every trading day, not just the first one.
-            self.risk_intraday_start_equity = current_equity
-            self.risk_last_trading_day = current_trading_day
-            self.risk_intraday_filled_orders = 0
-            # ``max_cons_loss_days`` becomes known the moment the day rolls
-            # over — halt now rather than at bar end so the new day's queued
-            # entries cannot fill at this bar's open.
-            if self._is_max_cons_loss_days_breached() and not self.risk_halt_trading:
-                self._trigger_risk_halt(
-                    "Max consecutive loss days reached", self.o, self.h, self.l,
-                )
-                return
+        if self._roll_trading_day():
+            return
 
         # Get script reference for slippage
         script = lib._script
@@ -2251,61 +2285,78 @@ class SimPosition(PositionBase):
         # Margin call check at OPEN — TV liquidates whole contracts here even on
         # fractional-lot symbols (verified against a TV strategy export where an
         # entry overshooting margin filled and was immediately trimmed by exactly
-        # 1.0 contract at the fill price).
-        self._check_margin_call(self.o, for_short=True, at_open=True, whole_contracts=True)
-        self._check_margin_call(self.o, for_short=False, at_open=True, whole_contracts=True)
+        # 1.0 contract at the fill price). The sign gates mirror the callee's own
+        # direction guards (a liquidation never reverses the position, so the
+        # second direction stays a no-op after the first fires).
+        if self.sign < 0:
+            self._check_margin_call(self.o, for_short=True, at_open=True, whole_contracts=True)
+        elif self.sign > 0:
+            self._check_margin_call(self.o, for_short=False, at_open=True, whole_contracts=True)
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
-        # Trailing stops walk the assumed intrabar path themselves (arming,
-        # water-mark ratchet and fill in chronological order), so they are
-        # processed once per bar here rather than inside the level-indexed walk.
-        # Iterate a snapshot since fills mutate the order book; an order indexed at
-        # several price levels is yielded once per level, so dedupe by identity.
-        seen: set[Order] = set()
-        for order in list(self.orderbook.iter_orders()):
-            if order in seen or order.cancelled or order.trail_price is None:
-                continue
-            seen.add(order)
-            self._process_trailing_stop(order, ohlc)
+        # The order-book walks are gated on ``price_levels`` at each walk site
+        # (re-checked, not hoisted — margin fills and trailing stops mutate the
+        # book between walks); an empty book makes every walk yield nothing, so
+        # skipping the generator is exactly behaviour-preserving. The margin
+        # checks are gated on the position sign, mirroring the callee's own
+        # direction guards — a mismatched direction is a guaranteed ``False``.
+        if self.orderbook.price_levels:
+            # Trailing stops walk the assumed intrabar path themselves (arming,
+            # water-mark ratchet and fill in chronological order), so they are
+            # processed once per bar here rather than inside the level-indexed walk.
+            # Iterate a snapshot since fills mutate the order book; an order indexed at
+            # several price levels is yielded once per level, so dedupe by identity.
+            seen: set[Order] = set()
+            for order in list(self.orderbook.iter_orders()):
+                if order in seen or order.cancelled or order.trail_price is None:
+                    continue
+                seen.add(order)
+                self._process_trailing_stop(order, ohlc)
 
         # Process orders: open → high → low → close
         if ohlc:
             # open -> high
-            for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
-                if self._check_high_stop(order):
-                    continue
-                if self._check_high(order):
-                    continue
-
-            if not self._check_margin_call(self.h, for_short=True):
-                # open -> low (descending: the level nearest the open fills first)
-                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
-                    if self._check_low_stop(order):
-                        continue
-                    if self._check_low(order):
-                        continue
-
-                self._check_margin_call(self.l, for_short=False, can_defer=False)
-
-        # Process orders: open → low → high → close
-        else:
-            # open -> low (descending: the level nearest the open fills first)
-            for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
-                if self._check_low_stop(order):
-                    continue
-                if self._check_low(order):
-                    continue
-
-            if not self._check_margin_call(self.l, for_short=False):
-                # open -> high
+            if self.orderbook.price_levels:
                 for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
                     if self._check_high_stop(order):
                         continue
                     if self._check_high(order):
                         continue
 
-                self._check_margin_call(self.h, for_short=True, can_defer=False)
+            if not (self.sign < 0 and self._check_margin_call(self.h, for_short=True)):
+                # open -> low (descending: the level nearest the open fills first)
+                if self.orderbook.price_levels:
+                    for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
+                        if self._check_low_stop(order):
+                            continue
+                        if self._check_low(order):
+                            continue
+
+                if self.sign > 0:
+                    self._check_margin_call(self.l, for_short=False, can_defer=False)
+
+        # Process orders: open → low → high → close
+        else:
+            # open -> low (descending: the level nearest the open fills first)
+            if self.orderbook.price_levels:
+                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
+                    if self._check_low_stop(order):
+                        continue
+                    if self._check_low(order):
+                        continue
+
+            if not (self.sign > 0 and self._check_margin_call(self.l, for_short=False)):
+                # open -> high
+                if self.orderbook.price_levels:
+                    for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
+                        if self._check_high_stop(order):
+                            continue
+                        if self._check_high(order):
+                            continue
+
+                if self.sign < 0:
+                    self._check_margin_call(self.h, for_short=True, can_defer=False)
 
     def _finalize_bar_pnl(self):
         """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
@@ -2663,14 +2714,19 @@ class SimPosition(PositionBase):
         Phase 2 (limit/stop) runs on each sub-bar sequentially.
         Phase 3 (P&L) runs once using aggregated bar values.
         """
-        round_to_mintick = lib.math.round_to_mintick
+        # ``lib.math.round_to_mintick`` inlined — sub-bar OHLC are plain floats, and
+        # this runs per sub-bar. Expression shape must stay left-to-right (see the
+        # bit-parity note in ``lib/math.py``).
+        mintick = syminfo.mintick
+        minmove = syminfo.minmove
+        pricescale = syminfo.pricescale
         # Setup from first sub-bar (= chart bar open)
         first = sub_bars[0]
-        self.o = round_to_mintick(first.open)
-        self.h = round_to_mintick(first.high)
-        self.l = round_to_mintick(first.low)
+        self.o = int(first.open / mintick + 0.5) * minmove / pricescale
+        self.h = int(first.high / mintick + 0.5) * minmove / pricescale
+        self.l = int(first.low / mintick + 0.5) * minmove / pricescale
         # Use aggregated close for margin deferral checks
-        self.c = round_to_mintick(aggregated.close)
+        self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
 
@@ -2680,19 +2736,22 @@ class SimPosition(PositionBase):
 
         # Phase 2: process limit/stop orders on each sub-bar
         for sub_bar in sub_bars:
-            self.o = round_to_mintick(sub_bar.open)
-            self.h = round_to_mintick(sub_bar.high)
-            self.l = round_to_mintick(sub_bar.low)
-            self.c = round_to_mintick(sub_bar.close)
+            self.o = int(sub_bar.open / mintick + 0.5) * minmove / pricescale
+            self.h = int(sub_bar.high / mintick + 0.5) * minmove / pricescale
+            self.l = int(sub_bar.low / mintick + 0.5) * minmove / pricescale
+            self.c = int(sub_bar.close / mintick + 0.5) * minmove / pricescale
             ohlc = self.h - self.o < self.o - self.l
             self._process_limit_stop_orders(ohlc)
 
         # Phase 3: P&L update using aggregated bar values
-        self.h = round_to_mintick(aggregated.high)
-        self.l = round_to_mintick(aggregated.low)
-        self.c = round_to_mintick(aggregated.close)
+        self.h = int(aggregated.high / mintick + 0.5) * minmove / pricescale
+        self.l = int(aggregated.low / mintick + 0.5) * minmove / pricescale
+        self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
         self._finalize_bar_pnl()
-        self._enforce_post_bar_risk()
+        if (self.risk_max_drawdown_value is not None
+                or self.risk_max_intraday_loss_value is not None
+                or self.risk_max_cons_loss_days is not None):
+            self._enforce_post_bar_risk()
         self._finalize_new_closed_trades()
 
 
