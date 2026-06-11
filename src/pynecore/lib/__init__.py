@@ -648,13 +648,17 @@ def timenow():
 
 
 # ``time_tradingday`` cache. The strategy engine calls the property on every bar
-# (intraday risk day-rollover), so the result is memoized per bar (keyed by
-# ``_time``, the bar's identity — NOT by calendar date, which would be wrong for
-# overnight sessions where bars before/after the session open on the same date
-# belong to different trading days). The session-structure table is rebuilt
-# whenever ``syminfo._opening_hours`` is replaced (``_set_lib_syminfo_properties``
-# always assigns a fresh list) or ``syminfo.period`` changes.
-_ttd_memo_time: int = -1
+# (intraday risk day-rollover), so the result is memoized per bar, keyed by the
+# identity of ``_datetime`` — the function's actual input. Every bar installs a
+# fresh (immutable) datetime object, so an identity hit guarantees an identical
+# result; anything that swaps ``_datetime`` (including tests driving it
+# directly) misses the memo and recomputes. NOT keyed by calendar date, which
+# would be wrong for overnight sessions where bars before/after the session
+# open on the same date belong to different trading days. The session-structure
+# table is rebuilt whenever ``syminfo._opening_hours`` is replaced
+# (``_set_lib_syminfo_properties`` always assigns a fresh list) or
+# ``syminfo.period`` changes.
+_ttd_memo_dt: datetime | None = None
 _ttd_memo_result: int = 0
 _ttd_session_hours: list | None = None
 _ttd_session_period: str | None = None
@@ -680,7 +684,7 @@ def time_tradingday() -> PyneInt:
 
     :return: UNIX time in milliseconds of 00:00 UTC on the trading day's date
     """
-    global _ttd_memo_time, _ttd_memo_result, _ttd_session_hours, _ttd_session_period, \
+    global _ttd_memo_dt, _ttd_memo_result, _ttd_session_hours, _ttd_session_period, \
         _ttd_overnight_by_wd, _ttd_period_delta
 
     opening_hours = syminfo._opening_hours
@@ -698,9 +702,9 @@ def time_tradingday() -> PyneInt:
         _ttd_period_delta = timedelta(seconds=timeframe_module.in_seconds(period))
         _ttd_session_hours = opening_hours
         _ttd_session_period = period
-        _ttd_memo_time = -1
+        _ttd_memo_dt = None
 
-    if _time == _ttd_memo_time:
+    if _datetime is _ttd_memo_dt:
         return _ttd_memo_result
 
     local_dt = _datetime  # already expressed in the exchange timezone
@@ -726,7 +730,7 @@ def time_tradingday() -> PyneInt:
     # 00:00 UTC of the trading day's date — pure ordinal arithmetic (UTC has no
     # DST, so this is exactly ``datetime(y, m, d, tzinfo=UTC).timestamp() * 1000``).
     result = (trade_date.toordinal() - _EPOCH_ORDINAL) * 86_400_000
-    _ttd_memo_time = _time
+    _ttd_memo_dt = local_dt
     _ttd_memo_result = result
     return result
 
