@@ -22,6 +22,15 @@ _opening_hours: list[SymInfoInterval] = []
 _session_starts: list[SymInfoSession] = []
 _session_ends: list[SymInfoSession] = []
 
+# Provider-supplied symbol details — annotation-only: the runner injects the values
+# per run (the fee/spread fields only when the data provider supplies them)
+opening_hours: list[SymInfoInterval]
+session_starts: list[SymInfoSession]
+session_ends: list[SymInfoSession]
+avg_spread: float
+taker_fee: float
+maker_fee: float
+
 prefix: str = ""
 description: str = ""
 ticker: str = ""

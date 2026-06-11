@@ -33,14 +33,15 @@ __all__ = [
 ]
 
 #
-# Callable modules
+# Function-and-namespace modules — the IDE-facing rebinding; at runtime the AST
+# transformer routes bare reads and calls to the module's self-named function
 #
 
 from ...types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
-    from closedtrades import closedtrades
-    from opentrades import opentrades
+    from .closedtrades import closedtrades
+    from .opentrades import opentrades
 
 
 #

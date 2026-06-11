@@ -1,12 +1,13 @@
-from ...core.callable_module import CallableModule
 from ...types import PyneFloat, PyneInt, PyneStr
 
 
-class ClosedTradesModule(CallableModule, int):
+# IDE-facing view of the function-and-namespace module: bare ``strategy.closedtrades``
+# is an int value, ``strategy.closedtrades.commission(...)`` a namespaced function;
+# the AST transformer resolves both at runtime. The ``int`` base keeps arithmetic
+# on the bare name type-checking.
+class ClosedTradesModule(int):
 
     def __call__(self) -> int: ...
-
-    def new(self): ...
 
     #
     # Functions
@@ -49,4 +50,4 @@ class ClosedTradesModule(CallableModule, int):
     def size(self, trade_num: int) -> PyneFloat: ...
 
 
-closedtrades: ClosedTradesModule = ClosedTradesModule(__name__)
+closedtrades: ClosedTradesModule

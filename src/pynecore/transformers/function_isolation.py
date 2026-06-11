@@ -69,16 +69,17 @@ __all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS']
 # - are purely for output/display purposes
 # This makes code run little bit faster
 NON_TRANSFORMABLE_FUNCTIONS = {
-    # Plot and display related
-    'lib.plot', 'lib.plotchar', 'lib.plotshape', 'lib.plotarrow',
-    'lib.label', 'lib.table', 'lib.box', 'lib.line', 'lib.hline',
+    # Plot and display related (function-and-namespace modules appear as their
+    # self-named function after the module property rewrite, e.g. lib.plot.plot)
+    'lib.plot.plot', 'lib.plotchar', 'lib.plotshape', 'lib.plotarrow',
+    'lib.label', 'lib.table', 'lib.box', 'lib.line', 'lib.hline.hline',
     'lib.fill', 'lib.bgcolor', 'lib.barcolor', 'lib.plotcandle',
-    'lib.alert', 'lib.alertcondition', 'lib.na',
+    'lib.alert.alert', 'lib.alertcondition', 'lib.na',
 
     # Other builtin functions
-    'lib.timestamp', 'lib.dayofmonth', 'lib.dayofweek', 'lib.hour', 'lib.minute', 'lib.month', 'lib.second',
-    'lib.weekofyear', 'lib.year', 'lib.time', 'lib.time_close', 'lib.time_tradingday', 'lib.timenow',
-    'lib.is_na', 'lib.nz', 'lib.timestamp',
+    'lib.timestamp', 'lib.dayofmonth', 'lib.dayofweek.dayofweek', 'lib.hour', 'lib.minute', 'lib.month',
+    'lib.second', 'lib.weekofyear', 'lib.year', 'lib.time', 'lib.time_close', 'lib.time_tradingday',
+    'lib.timenow', 'lib.is_na', 'lib.nz', 'lib.timestamp',
 
     # Strategy
     'lib.strategy.entry', 'lib.strategy.order', 'lib.strategy.exit', 'lib.strategy.close',
@@ -104,6 +105,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.strategy.opentrades.max_runup', 'lib.strategy.opentrades.max_runup_percent',
     'lib.strategy.opentrades.profit', 'lib.strategy.opentrades.profit_percent',
     'lib.strategy.opentrades.size',
+    'lib.strategy.opentrades.opentrades', 'lib.strategy.closedtrades.closedtrades',
 
     # Input functions
     'lib.input', 'lib.input.int', 'lib.input.float', 'lib.input.bool', 'lib.input.string',

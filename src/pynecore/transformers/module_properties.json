@@ -1,9 +1,60 @@
 {
   "lib": {
+    "Any": {
+      "type": "variable"
+    },
+    "Callable": {
+      "type": "variable"
+    },
+    "DateStr": {
+      "type": "variable"
+    },
+    "GenericAlias": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "Resampler": {
+      "type": "variable"
+    },
+    "Series": {
+      "type": "variable"
+    },
+    "Source": {
+      "type": "variable"
+    },
+    "TYPE_CHECKING": {
+      "type": "variable"
+    },
+    "TimezoneNotFoundError": {
+      "type": "variable"
+    },
+    "TimezoneStr": {
+      "type": "variable"
+    },
+    "TypeAlias": {
+      "type": "variable"
+    },
+    "UTC": {
+      "type": "variable"
+    },
+    "alertcondition": {
+      "type": "variable"
+    },
     "ask": {
       "type": "variable"
     },
     "bar_index": {
+      "type": "variable"
+    },
+    "barcolor": {
+      "type": "variable"
+    },
+    "bgcolor": {
       "type": "variable"
     },
     "bid": {
@@ -12,13 +63,25 @@
     "close": {
       "type": "variable"
     },
+    "datetime": {
+      "type": "variable"
+    },
     "dayofmonth": {
       "type": "property"
     },
     "dayofweek": {
       "type": "property"
     },
+    "dt_time": {
+      "type": "variable"
+    },
     "extra_fields": {
+      "type": "variable"
+    },
+    "fill": {
+      "type": "variable"
+    },
+    "fixnan": {
       "type": "variable"
     },
     "high": {
@@ -36,6 +99,12 @@
     "hour": {
       "type": "property"
     },
+    "input": {
+      "type": "variable"
+    },
+    "is_na": {
+      "type": "variable"
+    },
     "last_bar_index": {
       "type": "variable"
     },
@@ -45,8 +114,17 @@
     "low": {
       "type": "variable"
     },
+    "lru_cache": {
+      "type": "variable"
+    },
+    "max_bars_back": {
+      "type": "variable"
+    },
     "minute": {
       "type": "property"
+    },
+    "module_property": {
+      "type": "variable"
     },
     "month": {
       "type": "property"
@@ -54,14 +132,44 @@
     "na": {
       "type": "property"
     },
+    "nz": {
+      "type": "variable"
+    },
     "ohlc4": {
       "type": "variable"
     },
     "open": {
       "type": "variable"
     },
+    "overload": {
+      "type": "variable"
+    },
+    "plotarrow": {
+      "type": "variable"
+    },
+    "plotbar": {
+      "type": "variable"
+    },
+    "plotcandle": {
+      "type": "variable"
+    },
+    "plotchar": {
+      "type": "variable"
+    },
+    "plotshape": {
+      "type": "variable"
+    },
+    "script": {
+      "type": "variable"
+    },
     "second": {
       "type": "property"
+    },
+    "session_module": {
+      "type": "variable"
+    },
+    "sys": {
+      "type": "variable"
     },
     "time": {
       "type": "property"
@@ -72,8 +180,17 @@
     "time_tradingday": {
       "type": "property"
     },
+    "timedelta": {
+      "type": "variable"
+    },
+    "timeframe_module": {
+      "type": "variable"
+    },
     "timenow": {
       "type": "property"
+    },
+    "timestamp": {
+      "type": "variable"
     },
     "volume": {
       "type": "variable"
@@ -96,13 +213,248 @@
       "type": "variable"
     }
   },
-  "lib.alert": {},
+  "lib.alert": {
+    "AlertEnum": {
+      "type": "variable"
+    },
+    "alert": {
+      "type": "variable"
+    },
+    "freq_all": {
+      "type": "variable"
+    },
+    "freq_once_per_bar": {
+      "type": "variable"
+    },
+    "freq_once_per_bar_close": {
+      "type": "variable"
+    }
+  },
   "lib.array": {
+    "Any": {
+      "type": "variable"
+    },
+    "Box": {
+      "type": "variable"
+    },
+    "Color": {
+      "type": "variable"
+    },
+    "Label": {
+      "type": "variable"
+    },
+    "Line": {
+      "type": "variable"
+    },
+    "LineFill": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "Number": {
+      "type": "variable"
+    },
+    "PyneBool": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
+    "SequenceView": {
+      "type": "variable"
+    },
+    "T": {
+      "type": "variable"
+    },
+    "TypeVar": {
+      "type": "variable"
+    },
+    "abs": {
+      "type": "variable"
+    },
+    "avg": {
+      "type": "variable"
+    },
+    "binary_search": {
+      "type": "variable"
+    },
+    "binary_search_leftmost": {
+      "type": "variable"
+    },
+    "binary_search_rightmost": {
+      "type": "variable"
+    },
+    "builtins": {
+      "type": "variable"
+    },
+    "cast": {
+      "type": "variable"
+    },
+    "clear": {
+      "type": "variable"
+    },
+    "concat": {
+      "type": "variable"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "covariance": {
+      "type": "variable"
+    },
+    "every": {
+      "type": "variable"
+    },
+    "fill": {
+      "type": "variable"
+    },
+    "first": {
+      "type": "variable"
+    },
+    "from_items": {
+      "type": "variable"
+    },
+    "get": {
+      "type": "variable"
+    },
+    "includes": {
+      "type": "variable"
+    },
+    "indexof": {
+      "type": "variable"
+    },
+    "insert": {
+      "type": "variable"
+    },
+    "join": {
+      "type": "variable"
+    },
+    "last": {
+      "type": "variable"
+    },
+    "lastindexof": {
+      "type": "variable"
+    },
+    "math": {
+      "type": "variable"
+    },
+    "max": {
+      "type": "variable"
+    },
+    "median": {
+      "type": "variable"
+    },
+    "min": {
+      "type": "variable"
+    },
+    "mode": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "new_bool": {
+      "type": "variable"
+    },
+    "new_box": {
+      "type": "variable"
+    },
+    "new_color": {
+      "type": "variable"
+    },
+    "new_float": {
+      "type": "variable"
+    },
+    "new_int": {
+      "type": "variable"
+    },
+    "new_label": {
+      "type": "variable"
+    },
+    "new_line": {
+      "type": "variable"
+    },
+    "new_linefill": {
+      "type": "variable"
+    },
+    "new_string": {
+      "type": "variable"
+    },
+    "percentile_linear_interpolation": {
+      "type": "variable"
+    },
+    "percentile_nearest_rank": {
+      "type": "variable"
+    },
+    "percentrank": {
+      "type": "variable"
+    },
+    "pop": {
+      "type": "variable"
+    },
+    "push": {
+      "type": "variable"
+    },
+    "range": {
+      "type": "variable"
+    },
+    "remove": {
+      "type": "variable"
+    },
+    "reverse": {
+      "type": "variable"
+    },
+    "set": {
+      "type": "variable"
+    },
+    "shift": {
+      "type": "variable"
+    },
+    "size": {
+      "type": "variable"
+    },
+    "slice": {
+      "type": "variable"
+    },
+    "some": {
+      "type": "variable"
+    },
+    "sort": {
+      "type": "variable"
+    },
+    "sort_indices": {
+      "type": "variable"
+    },
+    "standardize": {
+      "type": "variable"
+    },
+    "statistics": {
+      "type": "variable"
+    },
+    "stdev": {
+      "type": "variable"
+    },
+    "sum": {
+      "type": "variable"
+    },
+    "unshift": {
+      "type": "variable"
+    },
+    "variance": {
       "type": "variable"
     }
   },
   "lib.barmerge": {
+    "BarMerge": {
+      "type": "variable"
+    },
     "gaps_off": {
       "type": "variable"
     },
@@ -140,15 +492,135 @@
     }
   },
   "lib.box": {
+    "Box": {
+      "type": "variable"
+    },
+    "ChartPoint": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "get_bottom": {
+      "type": "variable"
+    },
+    "get_left": {
+      "type": "variable"
+    },
+    "get_right": {
+      "type": "variable"
+    },
+    "get_top": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "overload": {
+      "type": "variable"
+    },
+    "set_bgcolor": {
+      "type": "variable"
+    },
+    "set_border_color": {
+      "type": "variable"
+    },
+    "set_border_style": {
+      "type": "variable"
+    },
+    "set_border_width": {
+      "type": "variable"
+    },
+    "set_bottom": {
+      "type": "variable"
+    },
+    "set_bottom_right_point": {
+      "type": "variable"
+    },
+    "set_extend": {
+      "type": "variable"
+    },
+    "set_left": {
+      "type": "variable"
+    },
+    "set_lefttop": {
+      "type": "variable"
+    },
+    "set_right": {
+      "type": "variable"
+    },
+    "set_rightbottom": {
+      "type": "variable"
+    },
+    "set_text": {
+      "type": "variable"
+    },
+    "set_text_color": {
+      "type": "variable"
+    },
+    "set_text_font_family": {
+      "type": "variable"
+    },
+    "set_text_formatting": {
+      "type": "variable"
+    },
+    "set_text_halign": {
+      "type": "variable"
+    },
+    "set_text_size": {
+      "type": "variable"
+    },
+    "set_text_valign": {
+      "type": "variable"
+    },
+    "set_text_wrap": {
+      "type": "variable"
+    },
+    "set_top": {
+      "type": "variable"
+    },
+    "set_top_left_point": {
+      "type": "variable"
+    },
+    "set_xloc": {
+      "type": "variable"
     }
   },
   "lib.chart": {
+    "ChartPoint": {
+      "type": "variable"
+    },
+    "Color": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "bg_color": {
       "type": "variable"
     },
     "fg_color": {
+      "type": "variable"
+    },
+    "in_seconds": {
       "type": "variable"
     },
     "is_heikinashi": {
@@ -175,15 +647,33 @@
     "left_visible_bar_time": {
       "type": "property"
     },
+    "lib": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
     "point": {
       "type": "variable"
     },
     "right_visible_bar_time": {
       "type": "property"
+    },
+    "timedelta": {
+      "type": "variable"
     }
   },
   "lib.color": {
+    "Color": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "aqua": {
+      "type": "variable"
+    },
+    "b": {
       "type": "variable"
     },
     "black": {
@@ -192,7 +682,13 @@
     "blue": {
       "type": "variable"
     },
+    "from_gradient": {
+      "type": "variable"
+    },
     "fuchsia": {
+      "type": "variable"
+    },
+    "g": {
       "type": "variable"
     },
     "gray": {
@@ -210,6 +706,9 @@
     "navy": {
       "type": "variable"
     },
+    "new": {
+      "type": "variable"
+    },
     "olive": {
       "type": "variable"
     },
@@ -219,10 +718,19 @@
     "purple": {
       "type": "variable"
     },
+    "r": {
+      "type": "variable"
+    },
     "red": {
       "type": "variable"
     },
+    "rgb": {
+      "type": "variable"
+    },
     "silver": {
+      "type": "variable"
+    },
+    "t": {
       "type": "variable"
     },
     "teal": {
@@ -235,13 +743,215 @@
       "type": "variable"
     }
   },
-  "lib.currency": {},
+  "lib.currency": {
+    "AED": {
+      "type": "variable"
+    },
+    "ARS": {
+      "type": "variable"
+    },
+    "AUD": {
+      "type": "variable"
+    },
+    "BDT": {
+      "type": "variable"
+    },
+    "BHD": {
+      "type": "variable"
+    },
+    "BRL": {
+      "type": "variable"
+    },
+    "BTC": {
+      "type": "variable"
+    },
+    "CAD": {
+      "type": "variable"
+    },
+    "CHF": {
+      "type": "variable"
+    },
+    "CLP": {
+      "type": "variable"
+    },
+    "CNY": {
+      "type": "variable"
+    },
+    "COP": {
+      "type": "variable"
+    },
+    "CZK": {
+      "type": "variable"
+    },
+    "Currency": {
+      "type": "variable"
+    },
+    "DKK": {
+      "type": "variable"
+    },
+    "EGP": {
+      "type": "variable"
+    },
+    "ETH": {
+      "type": "variable"
+    },
+    "EUR": {
+      "type": "variable"
+    },
+    "GBP": {
+      "type": "variable"
+    },
+    "HKD": {
+      "type": "variable"
+    },
+    "HUF": {
+      "type": "variable"
+    },
+    "IDR": {
+      "type": "variable"
+    },
+    "ILS": {
+      "type": "variable"
+    },
+    "INR": {
+      "type": "variable"
+    },
+    "ISK": {
+      "type": "variable"
+    },
+    "JPY": {
+      "type": "variable"
+    },
+    "KES": {
+      "type": "variable"
+    },
+    "KRW": {
+      "type": "variable"
+    },
+    "KWD": {
+      "type": "variable"
+    },
+    "LKR": {
+      "type": "variable"
+    },
+    "MAD": {
+      "type": "variable"
+    },
+    "MXN": {
+      "type": "variable"
+    },
+    "MYR": {
+      "type": "variable"
+    },
+    "NGN": {
+      "type": "variable"
+    },
+    "NOK": {
+      "type": "variable"
+    },
+    "NONE": {
+      "type": "variable"
+    },
+    "NZD": {
+      "type": "variable"
+    },
+    "PEN": {
+      "type": "variable"
+    },
+    "PHP": {
+      "type": "variable"
+    },
+    "PKR": {
+      "type": "variable"
+    },
+    "PLN": {
+      "type": "variable"
+    },
+    "QAR": {
+      "type": "variable"
+    },
+    "RON": {
+      "type": "variable"
+    },
+    "RSD": {
+      "type": "variable"
+    },
+    "RUB": {
+      "type": "variable"
+    },
+    "SAR": {
+      "type": "variable"
+    },
+    "SEK": {
+      "type": "variable"
+    },
+    "SGD": {
+      "type": "variable"
+    },
+    "THB": {
+      "type": "variable"
+    },
+    "TND": {
+      "type": "variable"
+    },
+    "TRY": {
+      "type": "variable"
+    },
+    "TWD": {
+      "type": "variable"
+    },
+    "USD": {
+      "type": "variable"
+    },
+    "USDT": {
+      "type": "variable"
+    },
+    "VES": {
+      "type": "variable"
+    },
+    "VND": {
+      "type": "variable"
+    },
+    "ZAR": {
+      "type": "variable"
+    }
+  },
   "lib.dayofweek": {
+    "DayOfWeek": {
+      "type": "variable"
+    },
     "dayofweek": {
       "type": "property"
+    },
+    "friday": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "monday": {
+      "type": "variable"
+    },
+    "saturday": {
+      "type": "variable"
+    },
+    "sunday": {
+      "type": "variable"
+    },
+    "thursday": {
+      "type": "variable"
+    },
+    "tuesday": {
+      "type": "variable"
+    },
+    "wednesday": {
+      "type": "variable"
     }
   },
   "lib.display": {
+    "Display": {
+      "type": "variable"
+    },
     "all": {
       "type": "variable"
     },
@@ -262,6 +972,12 @@
     }
   },
   "lib.dividends": {
+    "Dividends": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "future_amount": {
       "type": "variable"
     },
@@ -279,6 +995,12 @@
     }
   },
   "lib.earnings": {
+    "Earnings": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "actual": {
       "type": "variable"
     },
@@ -302,6 +1024,9 @@
     }
   },
   "lib.extend": {
+    "Extend": {
+      "type": "variable"
+    },
     "both": {
       "type": "variable"
     },
@@ -316,6 +1041,9 @@
     }
   },
   "lib.font": {
+    "FontFamilyEnum": {
+      "type": "variable"
+    },
     "family_default": {
       "type": "variable"
     },
@@ -323,8 +1051,36 @@
       "type": "variable"
     }
   },
-  "lib.footprint": {},
+  "lib.footprint": {
+    "Footprint": {
+      "type": "variable"
+    },
+    "VolumeRow": {
+      "type": "variable"
+    },
+    "buy_volume": {
+      "type": "variable"
+    },
+    "delta": {
+      "type": "variable"
+    },
+    "poc": {
+      "type": "variable"
+    },
+    "sell_volume": {
+      "type": "variable"
+    },
+    "vah": {
+      "type": "variable"
+    },
+    "val": {
+      "type": "variable"
+    }
+  },
   "lib.format": {
+    "Format": {
+      "type": "variable"
+    },
     "inherit": {
       "type": "variable"
     },
@@ -341,10 +1097,104 @@
       "type": "variable"
     }
   },
-  "lib.hline": {},
+  "lib.hline": {
+    "HLine": {
+      "type": "variable"
+    },
+    "HLineEnum": {
+      "type": "variable"
+    },
+    "hline": {
+      "type": "variable"
+    },
+    "style_dashed": {
+      "type": "variable"
+    },
+    "style_dotted": {
+      "type": "variable"
+    },
+    "style_solid": {
+      "type": "variable"
+    }
+  },
   "lib.label": {
+    "ChartPoint": {
+      "type": "variable"
+    },
+    "Label": {
+      "type": "variable"
+    },
+    "LabelStyleEnum": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "get_text": {
+      "type": "variable"
+    },
+    "get_x": {
+      "type": "variable"
+    },
+    "get_y": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "overload": {
+      "type": "variable"
+    },
+    "set_color": {
+      "type": "variable"
+    },
+    "set_size": {
+      "type": "variable"
+    },
+    "set_style": {
+      "type": "variable"
+    },
+    "set_text": {
+      "type": "variable"
+    },
+    "set_textalign": {
+      "type": "variable"
+    },
+    "set_textcolor": {
+      "type": "variable"
+    },
+    "set_tooltip": {
+      "type": "variable"
+    },
+    "set_x": {
+      "type": "variable"
+    },
+    "set_xy": {
+      "type": "variable"
+    },
+    "set_y": {
+      "type": "variable"
+    },
+    "set_yloc": {
+      "type": "variable"
     },
     "style_arrowdown": {
       "type": "variable"
@@ -411,8 +1261,95 @@
     }
   },
   "lib.line": {
+    "ChartPoint": {
+      "type": "variable"
+    },
+    "Line": {
+      "type": "variable"
+    },
+    "LineEnum": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "get_price": {
+      "type": "variable"
+    },
+    "get_x1": {
+      "type": "variable"
+    },
+    "get_x2": {
+      "type": "variable"
+    },
+    "get_y1": {
+      "type": "variable"
+    },
+    "get_y2": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "overload": {
+      "type": "variable"
+    },
+    "set_color": {
+      "type": "variable"
+    },
+    "set_extend": {
+      "type": "variable"
+    },
+    "set_first_point": {
+      "type": "variable"
+    },
+    "set_second_point": {
+      "type": "variable"
+    },
+    "set_style": {
+      "type": "variable"
+    },
+    "set_width": {
+      "type": "variable"
+    },
+    "set_x1": {
+      "type": "variable"
+    },
+    "set_x2": {
+      "type": "variable"
+    },
+    "set_xloc": {
+      "type": "variable"
+    },
+    "set_xy1": {
+      "type": "variable"
+    },
+    "set_xy2": {
+      "type": "variable"
+    },
+    "set_y1": {
+      "type": "variable"
+    },
+    "set_y2": {
+      "type": "variable"
     },
     "style_arrow_both": {
       "type": "variable"
@@ -433,8 +1370,36 @@
       "type": "variable"
     }
   },
-  "lib.linefill": {},
+  "lib.linefill": {
+    "Line": {
+      "type": "variable"
+    },
+    "LineFill": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "get_line1": {
+      "type": "variable"
+    },
+    "get_line2": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "set_color": {
+      "type": "variable"
+    }
+  },
   "lib.location": {
+    "Location": {
+      "type": "variable"
+    },
     "abovebar": {
       "type": "variable"
     },
@@ -452,20 +1417,173 @@
     }
   },
   "lib.log": {
+    "Any": {
+      "type": "variable"
+    },
+    "Path": {
+      "type": "variable"
+    },
+    "PineLogFormatter": {
+      "type": "variable"
+    },
+    "PineRichHandler": {
+      "type": "variable"
+    },
+    "SecurityFileFormatter": {
+      "type": "variable"
+    },
+    "datetime": {
+      "type": "variable"
+    },
+    "error": {
+      "type": "variable"
+    },
+    "handler": {
+      "type": "variable"
+    },
+    "info": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
     "logger": {
+      "type": "variable"
+    },
+    "logging": {
+      "type": "variable"
+    },
+    "os": {
+      "type": "variable"
+    },
+    "rich": {
+      "type": "variable"
+    },
+    "setup_security_file_log": {
+      "type": "variable"
+    },
+    "warning": {
       "type": "variable"
     }
   },
   "lib.map": {
+    "Any": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
     "TKey": {
       "type": "variable"
     },
     "TValue": {
       "type": "variable"
+    },
+    "TypeVar": {
+      "type": "variable"
+    },
+    "clear": {
+      "type": "variable"
+    },
+    "contains": {
+      "type": "variable"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "get": {
+      "type": "variable"
+    },
+    "keys": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "put": {
+      "type": "variable"
+    },
+    "put_all": {
+      "type": "variable"
+    },
+    "remove": {
+      "type": "variable"
+    },
+    "size": {
+      "type": "variable"
+    },
+    "values": {
+      "type": "variable"
     }
   },
   "lib.math": {
+    "NA": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "TFI": {
+      "type": "variable"
+    },
+    "TypeVar": {
+      "type": "variable"
+    },
+    "abs": {
+      "type": "variable"
+    },
+    "acos": {
+      "type": "variable"
+    },
+    "asin": {
+      "type": "variable"
+    },
+    "atan": {
+      "type": "variable"
+    },
+    "avg": {
+      "type": "variable"
+    },
+    "builtins": {
+      "type": "variable"
+    },
+    "cast": {
+      "type": "variable"
+    },
+    "ceil": {
+      "type": "variable"
+    },
+    "cos": {
+      "type": "variable"
+    },
     "e": {
+      "type": "variable"
+    },
+    "exp": {
+      "type": "variable"
+    },
+    "floor": {
+      "type": "variable"
+    },
+    "log": {
+      "type": "variable"
+    },
+    "log10": {
+      "type": "variable"
+    },
+    "math": {
+      "type": "variable"
+    },
+    "max": {
+      "type": "variable"
+    },
+    "min": {
+      "type": "variable"
+    },
+    "overload": {
       "type": "variable"
     },
     "phi": {
@@ -474,16 +1592,220 @@
     "pi": {
       "type": "variable"
     },
+    "pow": {
+      "type": "variable"
+    },
+    "random": {
+      "type": "variable"
+    },
+    "round": {
+      "type": "variable"
+    },
+    "round_to_mintick": {
+      "type": "variable"
+    },
     "rphi": {
+      "type": "variable"
+    },
+    "sign": {
+      "type": "variable"
+    },
+    "sin": {
+      "type": "variable"
+    },
+    "sqrt": {
+      "type": "variable"
+    },
+    "sum": {
+      "type": "variable"
+    },
+    "syminfo": {
+      "type": "variable"
+    },
+    "tan": {
+      "type": "variable"
+    },
+    "todegrees": {
+      "type": "variable"
+    },
+    "toradians": {
       "type": "variable"
     }
   },
   "lib.matrix": {
+    "Any": {
+      "type": "variable"
+    },
+    "Matrix": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "add_col": {
+      "type": "variable"
+    },
+    "add_row": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "annotations": {
+      "type": "variable"
+    },
+    "avg": {
+      "type": "variable"
+    },
+    "col": {
+      "type": "variable"
+    },
+    "columns": {
+      "type": "variable"
+    },
+    "concat": {
+      "type": "variable"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "det": {
+      "type": "variable"
+    },
+    "diff": {
+      "type": "variable"
+    },
+    "eigenvalues": {
+      "type": "variable"
+    },
+    "eigenvectors": {
+      "type": "variable"
+    },
+    "elements_count": {
+      "type": "variable"
+    },
+    "fill": {
+      "type": "variable"
+    },
+    "get": {
+      "type": "variable"
+    },
+    "inv": {
+      "type": "variable"
+    },
+    "is_antidiagonal": {
+      "type": "variable"
+    },
+    "is_antisymmetric": {
+      "type": "variable"
+    },
+    "is_binary": {
+      "type": "variable"
+    },
+    "is_diagonal": {
+      "type": "variable"
+    },
+    "is_identity": {
+      "type": "variable"
+    },
+    "is_square": {
+      "type": "variable"
+    },
+    "is_stochastic": {
+      "type": "variable"
+    },
+    "is_symmetric": {
+      "type": "variable"
+    },
+    "is_triangular": {
+      "type": "variable"
+    },
+    "is_zero": {
+      "type": "variable"
+    },
+    "kron": {
+      "type": "variable"
+    },
+    "max": {
+      "type": "variable"
+    },
+    "median": {
+      "type": "variable"
+    },
+    "min": {
+      "type": "variable"
+    },
+    "mode": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "mult": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "pinv": {
+      "type": "variable"
+    },
+    "pow": {
+      "type": "variable"
+    },
+    "rank": {
+      "type": "variable"
+    },
+    "remove_col": {
+      "type": "variable"
+    },
+    "remove_row": {
+      "type": "variable"
+    },
+    "reshape": {
+      "type": "variable"
+    },
+    "reverse": {
+      "type": "variable"
+    },
+    "row": {
+      "type": "variable"
+    },
+    "rows": {
+      "type": "variable"
+    },
+    "set": {
+      "type": "variable"
+    },
+    "sort": {
+      "type": "variable"
+    },
+    "submatrix": {
+      "type": "variable"
+    },
+    "sum": {
+      "type": "variable"
+    },
+    "swap_columns": {
+      "type": "variable"
+    },
+    "swap_rows": {
+      "type": "variable"
+    },
+    "trace": {
+      "type": "variable"
+    },
+    "transpose": {
+      "type": "variable"
     }
   },
   "lib.order": {
+    "Order": {
+      "type": "variable"
+    },
     "ascending": {
       "type": "variable"
     },
@@ -492,6 +1814,9 @@
     }
   },
   "lib.pivotpointtype": {
+    "PivotPointType": {
+      "type": "variable"
+    },
     "camarilla": {
       "type": "variable"
     },
@@ -511,10 +1836,89 @@
       "type": "variable"
     }
   },
-  "lib.plot": {},
+  "lib.plot": {
+    "Any": {
+      "type": "variable"
+    },
+    "Plot": {
+      "type": "variable"
+    },
+    "PlotEnum": {
+      "type": "variable"
+    },
+    "linestyle_dashed": {
+      "type": "variable"
+    },
+    "linestyle_dotted": {
+      "type": "variable"
+    },
+    "linestyle_solid": {
+      "type": "variable"
+    },
+    "plot": {
+      "type": "variable"
+    },
+    "style_area": {
+      "type": "variable"
+    },
+    "style_areabr": {
+      "type": "variable"
+    },
+    "style_circles": {
+      "type": "variable"
+    },
+    "style_columns": {
+      "type": "variable"
+    },
+    "style_cross": {
+      "type": "variable"
+    },
+    "style_histogram": {
+      "type": "variable"
+    },
+    "style_line": {
+      "type": "variable"
+    },
+    "style_linebr": {
+      "type": "variable"
+    },
+    "style_stepline": {
+      "type": "variable"
+    },
+    "style_stepline_diamond": {
+      "type": "variable"
+    },
+    "style_steplinebr": {
+      "type": "variable"
+    },
+    "sys": {
+      "type": "variable"
+    }
+  },
   "lib.polyline": {
+    "ChartPoint": {
+      "type": "variable"
+    },
+    "LineEnum": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "Polyline": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
     },
     "style_arrow_both": {
       "type": "variable"
@@ -536,6 +1940,9 @@
     }
   },
   "lib.position": {
+    "Position": {
+      "type": "variable"
+    },
     "bottom_center": {
       "type": "variable"
     },
@@ -564,9 +1971,62 @@
       "type": "variable"
     }
   },
-  "lib.request": {},
-  "lib.runtime": {},
+  "lib.request": {
+    "Footprint": {
+      "type": "variable"
+    },
+    "TYPE_CHECKING": {
+      "type": "variable"
+    },
+    "annotations": {
+      "type": "variable"
+    },
+    "currency_rate": {
+      "type": "variable"
+    },
+    "dividends": {
+      "type": "variable"
+    },
+    "earnings": {
+      "type": "variable"
+    },
+    "economic": {
+      "type": "variable"
+    },
+    "financial": {
+      "type": "variable"
+    },
+    "footprint": {
+      "type": "variable"
+    },
+    "nan": {
+      "type": "variable"
+    },
+    "quandl": {
+      "type": "variable"
+    },
+    "security": {
+      "type": "variable"
+    },
+    "security_lower_tf": {
+      "type": "variable"
+    },
+    "seed": {
+      "type": "variable"
+    },
+    "splits": {
+      "type": "variable"
+    }
+  },
+  "lib.runtime": {
+    "error": {
+      "type": "variable"
+    }
+  },
   "lib.scale": {
+    "Scale": {
+      "type": "variable"
+    },
     "left": {
       "type": "variable"
     },
@@ -578,6 +2038,12 @@
     }
   },
   "lib.session": {
+    "Session": {
+      "type": "variable"
+    },
+    "datetime": {
+      "type": "variable"
+    },
     "extended": {
       "type": "variable"
     },
@@ -602,11 +2068,29 @@
     "ispremarket": {
       "type": "property"
     },
+    "lib": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
     "regular": {
+      "type": "variable"
+    },
+    "syminfo": {
+      "type": "variable"
+    },
+    "timedelta": {
+      "type": "variable"
+    },
+    "timeframe": {
       "type": "variable"
     }
   },
   "lib.shape": {
+    "Shape": {
+      "type": "variable"
+    },
     "arrowdown": {
       "type": "variable"
     },
@@ -645,6 +2129,9 @@
     }
   },
   "lib.size": {
+    "Size": {
+      "type": "variable"
+    },
     "auto": {
       "type": "variable"
     },
@@ -665,6 +2152,57 @@
     }
   },
   "lib.strategy": {
+    "ABC": {
+      "type": "variable"
+    },
+    "IntEnum": {
+      "type": "variable"
+    },
+    "Literal": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "OHLCV": {
+      "type": "variable"
+    },
+    "Order": {
+      "type": "variable"
+    },
+    "PositionBase": {
+      "type": "variable"
+    },
+    "PriceOrderBook": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
+    "QtyType": {
+      "type": "variable"
+    },
+    "SimPosition": {
+      "type": "variable"
+    },
+    "TYPE_CHECKING": {
+      "type": "variable"
+    },
+    "Trade": {
+      "type": "variable"
+    },
+    "UTC": {
+      "type": "variable"
+    },
+    "abstractmethod": {
+      "type": "variable"
+    },
     "avg_losing_trade": {
       "type": "property"
     },
@@ -674,17 +2212,50 @@
     "avg_winning_trade": {
       "type": "property"
     },
+    "bisect_left": {
+      "type": "variable"
+    },
+    "cancel": {
+      "type": "variable"
+    },
+    "cancel_all": {
+      "type": "variable"
+    },
     "cash": {
+      "type": "variable"
+    },
+    "close": {
+      "type": "variable"
+    },
+    "close_all": {
       "type": "variable"
     },
     "closedtrades": {
       "type": "property"
+    },
+    "copy": {
+      "type": "variable"
+    },
+    "datetime": {
+      "type": "variable"
+    },
+    "defaultdict": {
+      "type": "variable"
+    },
+    "deque": {
+      "type": "variable"
+    },
+    "entry": {
+      "type": "variable"
     },
     "equity": {
       "type": "property"
     },
     "eventrades": {
       "type": "property"
+    },
+    "exit": {
+      "type": "variable"
     },
     "fixed": {
       "type": "variable"
@@ -698,17 +2269,35 @@
     "initial_capital": {
       "type": "property"
     },
+    "insort": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
     "long": {
       "type": "variable"
     },
     "losstrades": {
       "type": "property"
     },
+    "math": {
+      "type": "variable"
+    },
     "max_drawdown": {
       "type": "property"
     },
     "max_runup": {
       "type": "property"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "na_float": {
+      "type": "variable"
+    },
+    "na_str": {
+      "type": "variable"
     },
     "netprofit": {
       "type": "property"
@@ -718,6 +2307,12 @@
     },
     "opentrades": {
       "type": "property"
+    },
+    "order": {
+      "type": "variable"
+    },
+    "overload": {
+      "type": "variable"
     },
     "percent_of_equity": {
       "type": "variable"
@@ -731,16 +2326,94 @@
     "short": {
       "type": "variable"
     },
+    "syminfo": {
+      "type": "variable"
+    },
     "wintrades": {
       "type": "property"
     }
   },
   "lib.strategy.closedtrades": {
+    "NA": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
     "closedtrades": {
       "type": "property"
+    },
+    "commission": {
+      "type": "variable"
+    },
+    "entry_bar_index": {
+      "type": "variable"
+    },
+    "entry_comment": {
+      "type": "variable"
+    },
+    "entry_id": {
+      "type": "variable"
+    },
+    "entry_price": {
+      "type": "variable"
+    },
+    "entry_time": {
+      "type": "variable"
+    },
+    "exit_bar_index": {
+      "type": "variable"
+    },
+    "exit_comment": {
+      "type": "variable"
+    },
+    "exit_id": {
+      "type": "variable"
+    },
+    "exit_price": {
+      "type": "variable"
+    },
+    "exit_time": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
+    "max_drawdown": {
+      "type": "variable"
+    },
+    "max_drawdown_percent": {
+      "type": "variable"
+    },
+    "max_runup": {
+      "type": "variable"
+    },
+    "max_runup_percent": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "profit": {
+      "type": "variable"
+    },
+    "profit_percent": {
+      "type": "variable"
+    },
+    "size": {
+      "type": "variable"
     }
   },
   "lib.strategy.commission": {
+    "Commission": {
+      "type": "variable"
+    },
     "cash_per_contract": {
       "type": "variable"
     },
@@ -752,6 +2425,9 @@
     }
   },
   "lib.strategy.direction": {
+    "Direction": {
+      "type": "variable"
+    },
     "all": {
       "type": "variable"
     },
@@ -763,6 +2439,9 @@
     }
   },
   "lib.strategy.oca": {
+    "Oca": {
+      "type": "variable"
+    },
     "cancel": {
       "type": "variable"
     },
@@ -774,13 +2453,207 @@
     }
   },
   "lib.strategy.opentrades": {
+    "NA": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
+    "commission": {
+      "type": "variable"
+    },
+    "entry_bar_index": {
+      "type": "variable"
+    },
+    "entry_comment": {
+      "type": "variable"
+    },
+    "entry_id": {
+      "type": "variable"
+    },
+    "entry_price": {
+      "type": "variable"
+    },
+    "entry_time": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
+    "max_drawdown": {
+      "type": "variable"
+    },
+    "max_drawdown_percent": {
+      "type": "variable"
+    },
+    "max_runup": {
+      "type": "variable"
+    },
+    "max_runup_percent": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
     "opentrades": {
       "type": "property"
+    },
+    "profit": {
+      "type": "variable"
+    },
+    "profit_percent": {
+      "type": "variable"
+    },
+    "size": {
+      "type": "variable"
     }
   },
-  "lib.strategy.risk": {},
-  "lib.string": {},
+  "lib.strategy.risk": {
+    "NA": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
+    "allow_entry_in": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
+    "max_cons_loss_days": {
+      "type": "variable"
+    },
+    "max_drawdown": {
+      "type": "variable"
+    },
+    "max_intraday_filled_orders": {
+      "type": "variable"
+    },
+    "max_intraday_loss": {
+      "type": "variable"
+    },
+    "max_position_size": {
+      "type": "variable"
+    },
+    "strategy": {
+      "type": "variable"
+    }
+  },
+  "lib.string": {
+    "Any": {
+      "type": "variable"
+    },
+    "Decimal": {
+      "type": "variable"
+    },
+    "Format": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "ROUND_HALF_UP": {
+      "type": "variable"
+    },
+    "UTC": {
+      "type": "variable"
+    },
+    "contains": {
+      "type": "variable"
+    },
+    "datetime": {
+      "type": "variable"
+    },
+    "endswith": {
+      "type": "variable"
+    },
+    "format": {
+      "type": "variable"
+    },
+    "format_time": {
+      "type": "variable"
+    },
+    "length": {
+      "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
+    },
+    "lower": {
+      "type": "variable"
+    },
+    "lru_cache": {
+      "type": "variable"
+    },
+    "match": {
+      "type": "variable"
+    },
+    "pos": {
+      "type": "variable"
+    },
+    "re": {
+      "type": "variable"
+    },
+    "repeat": {
+      "type": "variable"
+    },
+    "replace": {
+      "type": "variable"
+    },
+    "replace_all": {
+      "type": "variable"
+    },
+    "safe_convert": {
+      "type": "variable"
+    },
+    "split": {
+      "type": "variable"
+    },
+    "startswith": {
+      "type": "variable"
+    },
+    "substring": {
+      "type": "variable"
+    },
+    "tonumber": {
+      "type": "variable"
+    },
+    "tostring": {
+      "type": "variable"
+    },
+    "trim": {
+      "type": "variable"
+    },
+    "upper": {
+      "type": "variable"
+    }
+  },
   "lib.syminfo": {
+    "Literal": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "Session": {
+      "type": "variable"
+    },
+    "SymInfoInterval": {
+      "type": "variable"
+    },
+    "SymInfoSession": {
+      "type": "variable"
+    },
+    "avg_spread": {
+      "type": "variable"
+    },
     "basecurrency": {
       "type": "variable"
     },
@@ -790,16 +2663,40 @@
     "currency": {
       "type": "variable"
     },
+    "current_contract": {
+      "type": "variable"
+    },
     "description": {
       "type": "variable"
     },
+    "employees": {
+      "type": "variable"
+    },
+    "expiration_date": {
+      "type": "variable"
+    },
     "industry": {
+      "type": "variable"
+    },
+    "isin": {
+      "type": "variable"
+    },
+    "main_tickerid": {
+      "type": "variable"
+    },
+    "maker_fee": {
+      "type": "variable"
+    },
+    "mincontract": {
       "type": "variable"
     },
     "minmove": {
       "type": "variable"
     },
     "mintick": {
+      "type": "variable"
+    },
+    "opening_hours": {
       "type": "variable"
     },
     "period": {
@@ -814,6 +2711,30 @@
     "pricescale": {
       "type": "variable"
     },
+    "recommendations_buy": {
+      "type": "variable"
+    },
+    "recommendations_buy_strong": {
+      "type": "variable"
+    },
+    "recommendations_date": {
+      "type": "variable"
+    },
+    "recommendations_hold": {
+      "type": "variable"
+    },
+    "recommendations_sell": {
+      "type": "variable"
+    },
+    "recommendations_sell_strong": {
+      "type": "variable"
+    },
+    "recommendations_total": {
+      "type": "variable"
+    },
+    "regular": {
+      "type": "variable"
+    },
     "root": {
       "type": "variable"
     },
@@ -821,6 +2742,24 @@
       "type": "variable"
     },
     "session": {
+      "type": "variable"
+    },
+    "session_ends": {
+      "type": "variable"
+    },
+    "session_starts": {
+      "type": "variable"
+    },
+    "shareholders": {
+      "type": "variable"
+    },
+    "shares_outstanding_float": {
+      "type": "variable"
+    },
+    "shares_outstanding_total": {
+      "type": "variable"
+    },
+    "taker_fee": {
       "type": "variable"
     },
     "target_price_average": {
@@ -836,6 +2775,9 @@
       "type": "variable"
     },
     "target_price_low": {
+      "type": "variable"
+    },
+    "target_price_median": {
       "type": "variable"
     },
     "ticker": {
@@ -855,11 +2797,182 @@
     }
   },
   "lib.ta": {
+    "EPSILON": {
+      "type": "variable"
+    },
+    "NA": {
+      "type": "variable"
+    },
+    "Persistent": {
+      "type": "variable"
+    },
+    "PyneBool": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "Series": {
+      "type": "variable"
+    },
+    "TFI": {
+      "type": "variable"
+    },
+    "TFIB": {
+      "type": "variable"
+    },
+    "TYPE_CHECKING": {
+      "type": "variable"
+    },
+    "TypeVar": {
+      "type": "variable"
+    },
     "accdist": {
       "type": "property"
     },
+    "alma": {
+      "type": "variable"
+    },
+    "array": {
+      "type": "variable"
+    },
+    "atr": {
+      "type": "variable"
+    },
+    "bar_index": {
+      "type": "variable"
+    },
+    "barssince": {
+      "type": "variable"
+    },
+    "bb": {
+      "type": "variable"
+    },
+    "bbw": {
+      "type": "variable"
+    },
+    "builtins": {
+      "type": "variable"
+    },
+    "cast": {
+      "type": "variable"
+    },
+    "cci": {
+      "type": "variable"
+    },
+    "change": {
+      "type": "variable"
+    },
+    "close": {
+      "type": "variable"
+    },
+    "cmo": {
+      "type": "variable"
+    },
+    "cog": {
+      "type": "variable"
+    },
+    "correlation": {
+      "type": "variable"
+    },
+    "cross": {
+      "type": "variable"
+    },
+    "crossover": {
+      "type": "variable"
+    },
+    "crossunder": {
+      "type": "variable"
+    },
+    "cum": {
+      "type": "variable"
+    },
+    "deque": {
+      "type": "variable"
+    },
+    "dev": {
+      "type": "variable"
+    },
+    "dmi": {
+      "type": "variable"
+    },
+    "ema": {
+      "type": "variable"
+    },
+    "falling": {
+      "type": "variable"
+    },
+    "heapq": {
+      "type": "variable"
+    },
+    "high": {
+      "type": "variable"
+    },
+    "highest": {
+      "type": "variable"
+    },
+    "highestbars": {
+      "type": "variable"
+    },
+    "hl2": {
+      "type": "variable"
+    },
+    "hma": {
+      "type": "variable"
+    },
     "iii": {
       "type": "property"
+    },
+    "kc": {
+      "type": "variable"
+    },
+    "kcw": {
+      "type": "variable"
+    },
+    "lib_math": {
+      "type": "variable"
+    },
+    "linreg": {
+      "type": "variable"
+    },
+    "low": {
+      "type": "variable"
+    },
+    "lowest": {
+      "type": "variable"
+    },
+    "lowestbars": {
+      "type": "variable"
+    },
+    "macd": {
+      "type": "variable"
+    },
+    "math": {
+      "type": "variable"
+    },
+    "max": {
+      "type": "variable"
+    },
+    "median": {
+      "type": "variable"
+    },
+    "mfi": {
+      "type": "variable"
+    },
+    "min": {
+      "type": "variable"
+    },
+    "mode": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "mom": {
+      "type": "variable"
     },
     "nvi": {
       "type": "property"
@@ -867,28 +2980,202 @@
     "obv": {
       "type": "property"
     },
+    "open": {
+      "type": "variable"
+    },
+    "overload": {
+      "type": "variable"
+    },
+    "percentile_linear_interpolation": {
+      "type": "variable"
+    },
+    "percentile_nearest_rank": {
+      "type": "variable"
+    },
+    "percentrank": {
+      "type": "variable"
+    },
+    "pivot_point_levels": {
+      "type": "variable"
+    },
+    "pivothigh": {
+      "type": "variable"
+    },
+    "pivotlow": {
+      "type": "variable"
+    },
     "pvi": {
       "type": "property"
     },
     "pvt": {
       "type": "property"
     },
+    "range": {
+      "type": "variable"
+    },
+    "rci": {
+      "type": "variable"
+    },
+    "rising": {
+      "type": "variable"
+    },
+    "rma": {
+      "type": "variable"
+    },
+    "roc": {
+      "type": "variable"
+    },
+    "rsi": {
+      "type": "variable"
+    },
+    "safe_convert": {
+      "type": "variable"
+    },
+    "sar": {
+      "type": "variable"
+    },
+    "session": {
+      "type": "variable"
+    },
+    "sma": {
+      "type": "variable"
+    },
+    "stdev": {
+      "type": "variable"
+    },
+    "stoch": {
+      "type": "variable"
+    },
+    "supertrend": {
+      "type": "variable"
+    },
+    "swma": {
+      "type": "variable"
+    },
     "tr": {
       "type": "property"
     },
+    "tsi": {
+      "type": "variable"
+    },
+    "valuewhen": {
+      "type": "variable"
+    },
+    "variance": {
+      "type": "variable"
+    },
+    "volume": {
+      "type": "variable"
+    },
+    "vwap": {
+      "type": "variable"
+    },
+    "vwma": {
+      "type": "variable"
+    },
     "wad": {
       "type": "property"
+    },
+    "wma": {
+      "type": "variable"
+    },
+    "wpr": {
+      "type": "variable"
     },
     "wvad": {
       "type": "property"
     }
   },
   "lib.table": {
+    "NA": {
+      "type": "variable"
+    },
+    "Table": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
+    },
+    "cell": {
+      "type": "variable"
+    },
+    "cell_set_bgcolor": {
+      "type": "variable"
+    },
+    "cell_set_height": {
+      "type": "variable"
+    },
+    "cell_set_text": {
+      "type": "variable"
+    },
+    "cell_set_text_color": {
+      "type": "variable"
+    },
+    "cell_set_text_font_family": {
+      "type": "variable"
+    },
+    "cell_set_text_formatting": {
+      "type": "variable"
+    },
+    "cell_set_text_halign": {
+      "type": "variable"
+    },
+    "cell_set_text_size": {
+      "type": "variable"
+    },
+    "cell_set_text_valign": {
+      "type": "variable"
+    },
+    "cell_set_tooltip": {
+      "type": "variable"
+    },
+    "cell_set_width": {
+      "type": "variable"
+    },
+    "clear": {
+      "type": "variable"
+    },
+    "delete": {
+      "type": "variable"
+    },
+    "merge_cells": {
+      "type": "variable"
+    },
+    "module_property": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "set_bgcolor": {
+      "type": "variable"
+    },
+    "set_border_color": {
+      "type": "variable"
+    },
+    "set_border_width": {
+      "type": "variable"
+    },
+    "set_frame_color": {
+      "type": "variable"
+    },
+    "set_frame_width": {
+      "type": "variable"
+    },
+    "set_position": {
+      "type": "variable"
     }
   },
   "lib.text": {
+    "AlignEnum": {
+      "type": "variable"
+    },
+    "FormatEnum": {
+      "type": "variable"
+    },
+    "WrapEnum": {
+      "type": "variable"
+    },
     "align_bottom": {
       "type": "variable"
     },
@@ -920,8 +3207,57 @@
       "type": "variable"
     }
   },
-  "lib.ticker": {},
+  "lib.ticker": {
+    "heikinashi": {
+      "type": "variable"
+    },
+    "inherit": {
+      "type": "variable"
+    },
+    "kagi": {
+      "type": "variable"
+    },
+    "linebreak": {
+      "type": "variable"
+    },
+    "modify": {
+      "type": "variable"
+    },
+    "new": {
+      "type": "variable"
+    },
+    "pointfigure": {
+      "type": "variable"
+    },
+    "renko": {
+      "type": "variable"
+    },
+    "standard": {
+      "type": "variable"
+    },
+    "syminfo": {
+      "type": "variable"
+    }
+  },
   "lib.timeframe": {
+    "TYPE_CHECKING": {
+      "type": "variable"
+    },
+    "UTC": {
+      "type": "variable"
+    },
+    "change": {
+      "type": "variable"
+    },
+    "datetime": {
+      "type": "variable"
+    },
+    "from_seconds": {
+      "type": "variable"
+    },
+    "in_seconds": {
+      "type": "variable"
+    },
     "isdaily": {
       "type": "property"
     },
@@ -946,18 +3282,55 @@
     "isweekly": {
       "type": "property"
     },
+    "lib": {
+      "type": "variable"
+    },
+    "lru_cache": {
+      "type": "variable"
+    },
     "main_period": {
       "type": "property"
+    },
+    "module_property": {
+      "type": "variable"
     },
     "multiplier": {
       "type": "property"
     },
     "period": {
       "type": "property"
+    },
+    "timedelta": {
+      "type": "variable"
     }
   },
-  "lib.volume_row": {},
+  "lib.volume_row": {
+    "VolumeRow": {
+      "type": "variable"
+    },
+    "buy_volume": {
+      "type": "variable"
+    },
+    "delta": {
+      "type": "variable"
+    },
+    "down_price": {
+      "type": "variable"
+    },
+    "sell_volume": {
+      "type": "variable"
+    },
+    "total_volume": {
+      "type": "variable"
+    },
+    "up_price": {
+      "type": "variable"
+    }
+  },
   "lib.xloc": {
+    "XLoc": {
+      "type": "variable"
+    },
     "bar_index": {
       "type": "variable"
     },
@@ -966,6 +3339,9 @@
     }
   },
   "lib.yloc": {
+    "YLoc": {
+      "type": "variable"
+    },
     "abovebar": {
       "type": "variable"
     },

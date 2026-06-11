@@ -23,6 +23,7 @@ from ..types.na import NA
 from ..types import Series, PyneInt
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
+from .plot import plot as _plot
 from . import timeframe as timeframe_module
 from . import session as session_module
 from ._fixnan import fixnan
@@ -116,13 +117,14 @@ _is_live = False
 _strategy_suppressed = False
 
 #
-# Callable modules
+# Function-and-namespace modules — the IDE-facing rebinding; at runtime the AST
+# transformer routes ``hline(...)``-style calls to the module's self-named function
 #
 
 if TYPE_CHECKING:
-    from hline import hline
-    from plot import plot
-    from alert import alert
+    from .hline import hline
+    from .plot import plot
+    from .alert import alert
 
 
 #
@@ -262,7 +264,7 @@ def plotcandle(*_, **__):
 
 
 def plotchar(series: Any, title: str | None = None, *_, **__):
-    plot(series, title)
+    _plot(series, title)
 
 
 def plotshape(*_, **__):

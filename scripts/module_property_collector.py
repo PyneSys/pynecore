@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-from typing import cast, Any
+"""
+Generate ``pynecore/transformers/module_properties.json`` from the lib source tree.
+
+The registry is the single source of truth for the ModulePropertyTransformer: it must
+list EVERY public module-level name under ``pynecore/lib`` — ``@module_property``
+functions as ``property``, everything else (plain functions, classes, constants,
+imported names) as ``variable``. Names missing from the registry make the transformer
+raise at transform time, so rerun this script whenever lib gains or loses a name
+(the test suite verifies the committed JSON is current).
+"""
+from typing import Any
 import ast
 import json
 from pathlib import Path
@@ -10,8 +20,8 @@ class ModulePropertyCollector:
     Collect module properties and variables from all files under pynecore/lib
     """
 
-    def __init__(self):
-        self.project_root = self._find_project_root()
+    def __init__(self, project_src: Path | None = None):
+        self.project_root = project_src if project_src is not None else self._find_project_root()
         self.lib_path = self.project_root / 'pynecore' / 'lib'
         self.json_path = self.project_root / 'pynecore' / 'transformers' / 'module_properties.json'
         self.module_info: dict[str, dict[str, dict[str, Any]]] = {}
@@ -45,28 +55,30 @@ class ModulePropertyCollector:
                 print(f"Syntax error in {file_path}: {e}")
                 return
 
-        # Process AST
-        transformer = ModulePropertyCollectorTransformer(module_path)
-        transformer.visit(tree)
+        # Collect every public module-level name
+        self.module_info[module_path.replace('.__init__', '')] = collect_module_names(tree)
 
-        # Update module info
-        if transformer.current_module_info:
-            self.module_info[module_path.replace('.__init__', '')] = transformer.current_module_info
-        else:
-            self.module_info[module_path.replace('.__init__', '')] = {}
-
-    def process_all_files(self) -> None:
-        """Process all Python files under lib directory"""
-        for file_path in self.lib_path.rglob('*.py'):
+    def collect(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Collect the full registry from the lib source tree (no file output)."""
+        self.module_info = {}
+        for file_path in sorted(self.lib_path.rglob('*.py')):
             if file_path.name.startswith('_') and file_path.name != '__init__.py':
                 continue
-            print(f"Processing {file_path}")
             self.process_file(file_path)
 
         # na is a special case force it to be a property
         self.module_info['lib']['na'] = {
             "type": "property",
         }
+
+        # Drop plain-variable entries that shadow a submodule of the same name
+        # (e.g. ``from . import plot`` in lib/__init__.py) — the transformer treats
+        # those paths as module references.
+        for module_path, attrs in self.module_info.items():
+            for name in [n for n, info in attrs.items()
+                         if info["type"] == "variable"
+                         and f"{module_path}.{n}" in self.module_info]:
+                del attrs[name]
 
         # Promote submodule self-named properties to parent module.
         # E.g., lib.strategy.opentrades has property "opentrades" →
@@ -83,96 +95,94 @@ class ModulePropertyCollector:
                         and parent_path in self.module_info):
                     self.module_info[parent_path][submodule_name] = attrs[submodule_name]
 
+        return self.module_info
+
+    def process_all_files(self) -> None:
+        """Collect the registry and write it next to the transformers"""
+        self.collect()
+
         # Save results
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.json_path, 'w') as f:
             json.dump(self.module_info, f, indent=2, sort_keys=True)  # noqa
+            f.write('\n')
 
 
-class ModulePropertyCollectorTransformer(ast.NodeTransformer):
-    """AST transformer to collect module properties and variables"""
+def _is_type_checking(test: ast.expr) -> bool:
+    """Whether an ``if`` test is the TYPE_CHECKING guard."""
+    return ((isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING')
+            or (isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'))
 
-    def __init__(self, module_path: str):
-        self.module_path = module_path
-        self.current_module_info: dict[str, dict[str, Any]] = {}
-        self.in_class = False
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
-        """Skip class definitions"""
-        old_in_class = self.in_class
-        self.in_class = True
-        self.generic_visit(node)
-        self.in_class = old_in_class
-        return node
+def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
+    """Collect every public module-level name of a parsed lib module.
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        """Process function definitions for @module_property"""
-        if self.in_class:
-            return node
+    ``@module_property`` functions are recorded as ``property``; plain functions,
+    classes, assignments (including conditional ones) and imported names as
+    ``variable``. ``_``-prefixed names and ``TYPE_CHECKING`` blocks are skipped.
 
-        # Check if it has @module_property
-        has_module_property = any(
-            isinstance(d, ast.Name) and d.id == 'module_property'
-            for d in node.decorator_list
-        )
+    :param tree: Parsed module AST.
+    :return: name -> {"type": "property"|"variable"} mapping.
+    """
+    info: dict[str, dict[str, Any]] = {}
 
-        if has_module_property:
-            self.current_module_info[node.name] = {
-                "type": "property",
-            }
+    def record(name: str, kind: str) -> None:
+        if name.startswith('_'):
+            return
+        # A property entry always wins over a variable one
+        if kind == 'variable' and info.get(name, {}).get('type') == 'property':
+            return
+        info[name] = {"type": kind}
 
-        return self.generic_visit(node)
+    def record_target(target: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            record(target.id, 'variable')
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                record_target(elt)
 
-    def visit_Assign(self, node: ast.Assign) -> ast.AST:
-        """Process any module level assignments"""
-        if self.in_class:
-            return node
+    def walk(body: list[ast.stmt]) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                is_property = any(
+                    isinstance(d, ast.Name) and d.id == 'module_property'
+                    for d in node.decorator_list
+                )
+                record(node.name, 'property' if is_property else 'variable')
+            elif isinstance(node, ast.ClassDef):
+                record(node.name, 'variable')
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    record_target(target)
+            elif isinstance(node, ast.AnnAssign):
+                # Annotation-only declarations count too: the runner injects
+                # their values at run time (e.g. syminfo.opening_hours)
+                record_target(node.target)
+            elif isinstance(node, ast.AugAssign):
+                record_target(node.target)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    record(alias.asname or alias.name.split('.')[0], 'variable')
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == '*':
+                        continue
+                    record(alias.asname or alias.name, 'variable')
+            elif isinstance(node, ast.If):
+                if not _is_type_checking(node.test):
+                    walk(node.body)
+                    walk(node.orelse)
+            elif isinstance(node, ast.Try):
+                walk(node.body)
+                for handler in node.handlers:
+                    walk(handler.body)
+                walk(node.orelse)
+                walk(node.finalbody)
+            elif isinstance(node, ast.With):
+                walk(node.body)
 
-        # Only handle single target assigns at module level
-        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-            return node
-
-        # Check if we're at module level
-        parent = getattr(node, 'parent', None)
-        if not isinstance(parent, ast.Module):
-            return node
-
-        name = cast(ast.Name, node.targets[0]).id
-        # Skip dunders and uppercase constants
-        if not name.startswith('_') and not name.isupper():
-            self.current_module_info[name] = {
-                "type": "variable",
-            }
-
-        return self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
-        """Process annotated assignments at module level"""
-        if self.in_class:
-            return node
-
-        # Only handle Name targets at module level
-        if not isinstance(node.target, ast.Name):
-            return node
-
-        parent = getattr(node, 'parent', None)
-        if not isinstance(parent, ast.Module):
-            return node
-
-        name = node.target.id
-        # Skip dunders and uppercase constants
-        if not name.startswith('_') and not name.isupper() and not name[0].isupper():
-            self.current_module_info[name] = {
-                "type": "variable",
-            }
-
-        return self.generic_visit(node)
-
-    def visit_Module(self, node: ast.Module) -> ast.AST:
-        """Set parent for all nodes to track module level"""
-        for child in ast.iter_child_nodes(node):
-            setattr(child, 'parent', node)
-        return self.generic_visit(node)
+    walk(tree.body)
+    return info
 
 
 if __name__ == '__main__':

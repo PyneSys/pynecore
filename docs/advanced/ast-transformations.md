@@ -222,25 +222,36 @@ If you import a variable from a library, it does not know if it is a series or n
 
 ### Module Property Transformer
 
-The Module Property transformer handles attributes that should be called as functions based on configuration.
+The Module Property transformer handles attributes that should be called as functions based on
+the generated `module_properties.json` registry.
 
 **Original code:**
 ```python
+t = lib.time
 bar_index = lib.bar_index
-time = lib.time
+plot(close, "Close")
+d = dayofweek
 ```
 
 **Transformed code:**
 ```python
-bar_index = lib.bar_index()
-time = lib.time
+t = lib.time()
+bar_index = lib.bar_index
+lib.plot.plot(lib.close, "Close")
+d = lib.dayofweek.dayofweek()
 ```
 
 Key aspects:
-- Uses configuration to determine which attributes are properties
-- Automatically adds parentheses for property calls
-- Preserves normal attributes as is
-- Handles dynamic cases with a runtime `hasattr(..., '__module_property__')` check
+- The registry (`module_properties.json`, generated from the lib source by
+  `scripts/module_property_collector.py`) determines which attributes are properties
+- Automatically adds parentheses for property calls; explicit calls are left untouched
+- Normal attributes (variables, constants, function references) stay plain attribute reads
+- Calls and promoted bare reads of function-and-namespace modules (`plot`, `hline`, `alert`,
+  `dayofweek`, `strategy.opentrades`, `strategy.closedtrades`) are routed to the module's
+  self-named function
+- Unknown names on known `pynecore.lib` modules raise at transform time — this catches typos
+  and a stale registry early (the test suite keeps the committed registry current)
+- Unknown module paths (user `lib.*` workdir libraries) and `_`-prefixed names are plain reads
 
 ### Closure Arguments Transformer
 
@@ -516,7 +527,7 @@ Let's see a full example of how a simple Pyne code is transformed:
 @pyne
 """
 from pynecore import Series, Persistent
-from pynecore.lib import script, ta, close, open_, high, low, plot, color
+from pynecore.lib import script, ta, close, open, high, low, plot, color
 
 
 @script.indicator("Example")
@@ -529,7 +540,7 @@ def main():
     ma: Series[float] = ta.sma(close, 14)
 
     # Safe division that could cause division by zero
-    range_ratio = (close - open_) / (high - low)
+    range_ratio = (close - open) / (high - low)
 
     # Plot results
     plot(ma, "MA", color=color.blue)
@@ -548,17 +559,17 @@ import pynecore.lib.ta
 from pynecore.core.instance_state import __bind_any__, __resolve_slot__
 from pynecore.core import safe_convert
 from pynecore.core.instance_state import __attach_layout__
-__pyne_slot_layout__ = {'main': {'init': (0, None, None), 'series': (), 'varip': (), 'children': ((1, 'main·lib.ta.sma·0', False), (2, 'main·lib.open_·1', False)), 'names': ('count', 'main·lib.ta.sma·0', 'main·lib.open_·1')}}
+__pyne_slot_layout__ = {'main': {'init': (0, None), 'series': (), 'varip': (), 'children': ((1, 'main·lib.ta.sma·0', False),), 'names': ('count', 'main·lib.ta.sma·0')}}
 
 @lib.script.indicator('Example')
 @__attach_layout__(__pyne_slot_layout__['main'])
 def main(__state__):
     __state__[0] += 1
     ma: float = lib.ta.sma(__st__ if (__st__ := __state__[1]) is not None else __resolve_slot__(__state__, 1, lib.ta.sma), lib.close, 14)
-    range_ratio = safe_convert.safe_div(lib.close - ((__b__[1] if (__b__ := __state__[2]) is not None and __b__[0] is lib.open_ else __bind_any__(__state__, 2, lib.open_))() if hasattr(lib.open_, '__module_property__') else lib.open_), lib.high - lib.low)
-    lib.plot(ma, 'MA', color=lib.color.blue)
-    lib.plot(__state__[0], 'Count', color=lib.color.red)
-    lib.plot(range_ratio, 'Range Ratio', color=lib.color.green)
+    range_ratio = safe_convert.safe_div(lib.close - lib.open, lib.high - lib.low)
+    lib.plot.plot(ma, 'MA', color=lib.color.blue)
+    lib.plot.plot(__state__[0], 'Count', color=lib.color.red)
+    lib.plot.plot(range_ratio, 'Range Ratio', color=lib.color.green)
 ```
 
 Worth noting in the output:
@@ -567,7 +578,7 @@ Worth noting in the output:
 - `ma` lost its Series annotation (never indexed — Unused Series Detector), so no series slot was allocated for it.
 - The `ta.sma` call got child slot 1: the first call creates the callee's state vector there, subsequent calls reuse it.
 - Since `main` is decorated, the layout attach uses the `@__attach_layout__` decorator form (innermost position, so it tags the raw function before other decorators wrap it).
-- `lib.open_` could not be proven a plain value at transform time, so the Module Property transformer emitted the dynamic `hasattr(..., '__module_property__')` check for it.
+- The `plot(...)` calls were routed to the module's self-named function (`lib.plot.plot`) by the Module Property transformer and stay direct calls — `plot` is a function-and-namespace module.
 
 This example demonstrates how the different transformers work together to convert a simple Pyne code into equivalent Python code that provides Pine Script-like behavior through PyneCore's runtime system.
 
