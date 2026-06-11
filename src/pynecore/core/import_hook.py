@@ -156,7 +156,6 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         import ast
 
         tree = ast.parse(data_str)
-        tree._module_file_path = str(path.resolve())  # type: ignore
 
         # Strict check: the module docstring must START with @pyne (whitespace-stripped),
         # followed by whitespace or end of string. Substring matches don't count — they
@@ -193,6 +192,11 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.input_transformer import InputTransformer
             from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
+            from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+
+            # Shared slot allocator of the module (see slot_layout.py); the
+            # state-contributing transformers fill it, apply_layout emits it
+            slot_layout = ModuleLayout()
 
             transformed = ImportLifterTransformer().visit(transformed)
             transformed = TypeCheckingStripperTransformer().visit(transformed)
@@ -202,36 +206,69 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = LibrarySeriesTransformer().visit(transformed)
             transformed = ModulePropertyTransformer().visit(transformed)
             transformed = ClosureArgumentsTransformer().visit(transformed)
-            transformed = FunctionIsolationTransformer().visit(transformed)
-            transformed = ScriptRequirementsTransformer().visit(transformed)
             transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
-            transformed = SeriesTransformer().visit(transformed)
-            transformed = PersistentTransformer().visit(transformed)
+            transformed = SeriesTransformer(slot_layout).visit(transformed)
+            transformed = PersistentTransformer(slot_layout).visit(transformed)
+            # Call-site classification needs the var/series slots, so the
+            # isolation transformer must run after Persistent and Series
+            transformed = FunctionIsolationTransformer(slot_layout).visit(transformed)
+            transformed = ScriptRequirementsTransformer().visit(transformed)
             transformed = InputTransformer().visit(transformed)
             transformed = SafeConvertTransformer().visit(transformed)
             transformed = SafeDivisionTransformer().visit(transformed)
+            transformed = apply_layout(transformed, slot_layout)
 
             ast.fix_missing_locations(transformed)
 
-            # Debug output if requested
+            # Debug output if requested. The pretty dump and the saved copy go
+            # through the display rewrite (named index constants instead of
+            # literal slot indexes); the RAW dump stays the exact emission —
+            # the AST golden tests compare against it.
             if os.environ.get('PYNE_AST_DEBUG'):
+                from pynecore.transformers.display_rewrite import display_dump
                 print("-" * 100)
                 print(f"Transformed {path}:")
                 try:
                     from rich.syntax import Syntax  # type: ignore
                     from rich import print as rprint  # type: ignore
-                    rprint(Syntax(ast.unparse(transformed), "python", word_wrap=True, line_numbers=False))
+                    rprint(Syntax(display_dump(transformed, slot_layout), "python",
+                                  word_wrap=True, line_numbers=False))
                 except ImportError:
-                    print(ast.unparse(transformed))
+                    print(display_dump(transformed, slot_layout))
                 print("-" * 100)
-            elif os.environ.get('PYNE_AST_DEBUG_RAW'):
-                print(ast.unparse(transformed))
+            elif raw_filter := os.environ.get('PYNE_AST_DEBUG_RAW'):
+                # '1' dumps every transformed module; any other value is a source
+                # path filter so a capture is not polluted by modules imported
+                # during the transform (callee resolution imports lib submodules)
+                if raw_filter == '1' or Path(raw_filter).resolve() == path.resolve():
+                    print(ast.unparse(transformed))
 
             if os.environ.get('PYNE_AST_SAVE'):
+                from pynecore.transformers.display_rewrite import display_dump
                 Path("/tmp/pyne").mkdir(parents=True, exist_ok=True)
 
                 with open(f"/tmp/pyne/{path.stem}.py", "w") as f:
-                    f.write(ast.unparse(transformed))
+                    f.write(display_dump(transformed, slot_layout))
+
+            # Bake a pipeline-identity sentinel into the module body so a loaded code
+            # object can be distinguished from foreign or stale bytecode (see get_code).
+            # It must survive into the .pyc, so it is a plain assignment the compiler
+            # marshals like any other constant — no .pyc-format surgery needed. Added
+            # after the debug/save dumps above so those keep showing the semantic
+            # transform, free of this loader-level bookkeeping.
+            sentinel = ast.Assign(
+                targets=[ast.Name(id=_PYNE_SENTINEL, ctx=ast.Store())],
+                value=ast.Constant(value=_get_transform_pipeline_hash()),
+            )
+            # is_pyne_module guarantees body[0] is the module docstring; keep it first,
+            # and stay after any ``from __future__`` imports (which must lead the module).
+            insert_at = 1
+            while (insert_at < len(transformed.body)
+                   and isinstance(transformed.body[insert_at], ast.ImportFrom)
+                   and cast(ast.ImportFrom, transformed.body[insert_at]).module == '__future__'):
+                insert_at += 1
+            transformed.body.insert(insert_at, sentinel)
+            ast.fix_missing_locations(transformed)
 
             # Bake a pipeline-identity sentinel into the module body so a loaded code
             # object can be distinguished from foreign or stale bytecode (see get_code).

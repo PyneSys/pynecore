@@ -45,6 +45,10 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     ohlcv_path: Path | None = None
     """Path to the OHLCV data file."""
 
+    syminfo: SymInfo | None = None
+    """Symbol info pre-fetched by the chart side (security subprocesses store
+    it here instead of issuing a second REST round-trip)."""
+
     fetch_all_by_default: bool = False
     """If True, fetch all available data when no start date is given (instead of 1 year)."""
 

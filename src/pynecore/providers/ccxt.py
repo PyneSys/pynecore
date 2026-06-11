@@ -310,6 +310,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         :return: Tuple of (opening_hours, session_starts, session_ends).
         """
+        return cls._create_24_7_sessions()
+
+    @staticmethod
+    def _create_24_7_sessions() -> tuple[
+        list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]
+    ]:
+        """
+        Create 24/7 opening hours and sessions for crypto markets.
+
+        :return: Tuple of (opening_hours, session_starts, session_ends).
+        """
         opening_hours = []
         session_starts = []
         session_ends = []

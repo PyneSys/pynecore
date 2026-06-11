@@ -5,7 +5,7 @@ title: "Debugging"
 description: "Debugging techniques for PyneCore scripts"
 icon: "bug_report"
 date: "2025-07-05"
-lastmod: "2025-07-05"
+lastmod: "2026-06-10"
 draft: false
 toc: true
 ---
@@ -102,17 +102,40 @@ You can use your IDE's debugger with PyneCore scripts, but be aware of AST trans
 Before execution, PyneCore applies AST transformations (see [AST Transformations](./advanced/ast-transformations.md) for
 details). This affects debugging:
 
-- **Series variables**: May be stored in `globals()` dictionary
-- **Persistent variables**: Renamed with special prefixes
-- **Function isolation**: Functions may have additional parameters
+- **Persistent and Series variables**: Stored in the function's **state vector** — a plain list the function receives as a hidden first parameter (`__state__`), addressed with slot indexes (`__state__[0]`)
+- **Function isolation**: State-carrying functions have the extra `__state__` parameter, and calls to them pass a state slot of the caller
 
 ### Debugging with Transformations
 
 When using the debugger:
 
-1. **Series variables**: Look for them in `globals()` if not found in local scope
-2. **Persistent variables**: Check for renamed versions with `__persistent_` prefix
-3. **Function parameters**: May include additional isolation parameters
+1. **Persistent variables**: Look at the `__state__` list in the local scope; the slot order follows the function's `__pyne_layout__['names']` tuple
+2. **Series variables**: Series slots of `__state__` hold `SeriesImpl` circular buffers
+3. **Readable view**: In a watch window or debug console, render any state vector as a name -> value dict:
+
+```python
+from pynecore.core.instance_state import explain_state
+explain_state(my_function, __state__)
+# {'count': 7, 's': <SeriesImpl ...>, 'main·lib.ta.sma·0': [...], ...}
+```
+
+## Inspecting the Transformed Code
+
+To see what your script looks like after the AST transformations:
+
+```bash
+pyne debug ast my_script.py
+```
+
+This prints the transformed module without running it. For readability the dump replaces literal slot indexes with named constants (`__state__[__slot·main·count__]` instead of `__state__[0]`) — the executed code always uses the literal-index form.
+
+The same output is available through environment variables when running scripts:
+
+| Variable             | Effect                                                                                               |
+|----------------------|------------------------------------------------------------------------------------------------------|
+| `PYNE_AST_DEBUG=1`   | Print the transformed code of every `@pyne` module (with named slot constants)                        |
+| `PYNE_AST_DEBUG_RAW` | Print the exact emission (literal indexes); `1` dumps every module, a file path dumps only that file  |
+| `PYNE_AST_SAVE=1`    | Save the transformed modules to `/tmp/pyne/` (with named slot constants)                              |
 
 ## Debugging Security Contexts
 

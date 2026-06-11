@@ -25,6 +25,7 @@ from . import syminfo  # This should be imported before core.datetime to avoid c
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
 from . import timeframe as timeframe_module
 from . import session as session_module
+from ._fixnan import fixnan
 
 from pynecore.core.overload import overload
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
@@ -284,22 +285,6 @@ def alertcondition(*_, **__):
 
 
 ### Other ###
-
-__persistent_last_not_nan__: Any = NA(None)
-__persistent_function_vars__ = {'fixnan': ['__persistent_last_not_nan__']}
-
-
-def fixnan(source: Any) -> Any:
-    """
-    Fix NA values by replacing them with the last non-NA value
-
-    :param source: The source value
-    :return: The source value if it is not NA, otherwise the last non-NA value
-    """
-    global __persistent_last_not_nan__
-    __persistent_last_not_nan__ = source if not isinstance(source, NA) else __persistent_last_not_nan__
-    return __persistent_last_not_nan__
-
 
 def is_na(source: Any = None) -> bool | NA:
     """

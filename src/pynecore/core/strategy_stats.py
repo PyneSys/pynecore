@@ -194,7 +194,7 @@ def calculate_strategy_statistics(
     """
     Calculate comprehensive strategy statistics from position data.
 
-    :param position: Position object containing all trade data
+    :param position: PositionBase object containing all trade data
     :param initial_capital: Initial capital for percentage calculations
     :param equity_curve: List of equity values for Sharpe/Sortino calculations
     :param first_price: First price for buy & hold calculation

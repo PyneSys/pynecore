@@ -3,6 +3,7 @@
 """
 from pynecore import lib
 from pynecore.core import safe_convert
+__pyne_slot_layout__ = {}
 
 def main():
     na_value = lib.na(float)

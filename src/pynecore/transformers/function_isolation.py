@@ -1,11 +1,67 @@
-from typing import cast
+"""
+Transform function call sites to the slot-based instance-state scheme.
+
+Every isolated call site is classified at TRANSFORM time and emitted on one
+of three routes (see ``work/benchmark`` plan, section 3.4):
+
+- **fast** (provably state-carrying callee): the child instance's state
+  lives in a compile-time-assigned slot of the CALLER's state vector::
+
+      f((__st__ if (__st__ := __state__[5]) is not None
+         else __resolve_slot__(__state__, 5, f)), x, 12)
+
+  Loop-shaped sites hold a child list indexed by a per-invocation counter
+  (hoisted to the function prologue together with the list)::
+
+      f((__chl_0__[__i__] if (__i__ := (__cnt_0__ := __cnt_0__ + 1) - 1)
+         < len(__chl_0__) else __grow__(__chl_0__, f)), x)
+
+- **direct** (provably stateless callee): plain call, zero overhead.
+
+- **uniform** (anything not provable): the caller anchors a
+  ``(callee, bound)`` pair in its own slot; the hot path is one identity
+  check, ``__bind_any__`` / ``__bind_any_loop__`` (re)binds on a miss::
+
+      (__b__[1] if (__b__ := __state__[7]) is not None and __b__[0] is f
+       else __bind_any__(__state__, 7, f))(x)
+
+Classification sources:
+
+- same-module functions: the shared :class:`ModuleLayout` (this transformer
+  must run AFTER the Persistent and Series transformers) plus a carrier
+  fixpoint over the module's call graph — a function carries state if it has
+  own slots or any non-direct call site; a name whose LAST definition is
+  decorated routes uniform (the runtime value is the decorator's return
+  value — an ``overload`` dispatcher, an ``lru_cache`` wrapper, ...);
+- cross-module callees (``lib.*``, user Pyne libraries): the callee module
+  is imported at transform time and the object inspected —
+  ``__pyne_bind__`` marks an overload dispatcher (uniform),
+  ``__pyne_layout__`` proves state-carrying, a ``__pyne_slot_layout__``
+  marker in the function's globals with no layout attribute proves
+  stateless, everything else falls to uniform.
+
+Unprovable always degrades to uniform (correct, only slower) — an error can
+only come from a false proof, never from missing knowledge.
+
+Deliberately left untouched (raw calls): module-level call sites (a stateful
+callee there raises a transform error), decorator and default-argument
+expressions, class bodies, ``__test_*__`` functions (the test framework
+calls them with fixtures, they must not grow a hidden parameter), and calls
+whose callee is not a plain name/attribute. Calls inside lambdas are
+anchored on the straight-line uniform route (a loop counter would bind
+lambda-local and break).
+"""
+from typing import cast, Any
 import ast
 import builtins
+import importlib
 import types
-import hashlib
-from pathlib import Path
 
+from ..core.pine_export import Exported
 from ..utils.stdlib_checker import stdlib_checker
+from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
+
+__all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS']
 
 # Functions that should not be transformed because they:
 # - don't return anything (plotting, display)
@@ -107,390 +163,578 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'method_call', 'pine_range'
 }
 
+# Call-site routes decided at transform time. Same-module defs resolve to a
+# ('same', scope_id) tuple first and collapse to fast/direct through the
+# carrier fixpoint.
+_SKIP = 'skip'
+_DIRECT = 'direct'
+_FAST = 'fast'
+_UNIFORM = 'uniform'
+
+_Route = str | tuple[str, str]
+
+
+def _is_test_function(name: str) -> bool:
+    """Whether a function follows the ``__test_*__`` convention (called by
+    the test framework with fixtures — must stay untouched)."""
+    return name.startswith('__test_') and name.endswith('__')
+
+
+def _get_func_path(func: ast.expr) -> str | None:
+    """Get the full dotted path of a callee expression."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        parts = []
+        current: ast.expr = func
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            return '.'.join(reversed(parts))
+    return None
+
+
+class _ScopeIndex(ast.NodeVisitor):
+    """Pass 1a: per-scope name bindings (defs, classes, everything else
+    assigned) and the module-level import map."""
+
+    def __init__(self, layout: ModuleLayout):
+        self.layout = layout
+        # scope -> name -> (target scope id of the LAST def, has decorators);
+        # the last definition wins, like the runtime name binding does
+        self.defs: dict[str, dict[str, tuple[str, bool]]] = {'': {}}
+        self.classes: dict[str, set[str]] = {'': set()}
+        self.assigned: dict[str, set[str]] = {'': set()}
+        # name -> (module path, attribute or None)
+        self.import_map: dict[str, tuple[str, str | None]] = {}
+        self._stack: list[str] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        outer = '·'.join(self._stack)
+        segment = self.layout.scope_segment(node)
+        target = f'{outer}·{segment}' if outer else segment
+        self.defs[outer][node.name] = (target, bool(node.decorator_list))
+        self._stack.append(segment)
+        scope = '·'.join(self._stack)
+        self.defs.setdefault(scope, {})
+        self.classes.setdefault(scope, set())
+        assigned = self.assigned.setdefault(scope, set())
+        args = node.args
+        for arg in args.args + args.posonlyargs + args.kwonlyargs:
+            assigned.add(arg.arg)
+        if args.vararg:
+            assigned.add(args.vararg.arg)
+        if args.kwarg:
+            assigned.add(args.kwarg.arg)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.classes['·'.join(self._stack)].add(node.name)
+        # Class bodies are not isolation scopes — don't index their content
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.assigned['·'.join(self._stack)].add(node.id)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name:
+            self.assigned['·'.join(self._stack)].add(node.name)
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        scope = '·'.join(self._stack)
+        for alias in node.names:
+            bound = alias.asname or alias.name.split('.')[0]
+            if scope:
+                self.assigned[scope].add(bound)
+            else:
+                module = alias.name if alias.asname else alias.name.split('.')[0]
+                self.import_map[bound] = (module, None)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        scope = '·'.join(self._stack)
+        for alias in node.names:
+            bound = alias.asname or alias.name
+            if scope:
+                self.assigned[scope].add(bound)
+            elif node.module and not node.level:
+                self.import_map[bound] = (node.module, alias.name)
+
+
+class _RouteCollector(ast.NodeVisitor):
+    """Pass 1b: prelim route of every call site per scope, input of the
+    carrier fixpoint. Mirrors the transformer's skip rules (decorators,
+    defaults, class bodies, test functions are not isolation territory)."""
+
+    def __init__(self, transformer: 'FunctionIsolationTransformer'):
+        self.transformer = transformer
+        self.scope_routes: dict[str, list[_Route]] = {}
+        self._stack: list[str] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if _is_test_function(node.name):
+            return
+        self._stack.append(self.transformer.layout.scope_segment(node))
+        self.scope_routes.setdefault('·'.join(self._stack), [])
+        for stmt in node.body:
+            self.visit(stmt)
+        self._stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        pass
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if self._stack and isinstance(node.func, (ast.Name, ast.Attribute)):
+            route = self.transformer.route_for_callee(node.func, self._stack)
+            self.scope_routes['·'.join(self._stack)].append(route)
+
 
 class FunctionIsolationTransformer(ast.NodeTransformer):
-    """
-    Transform function calls to use the isolate_function() wrapper.
-    Every function call (except builtins and non-transformable functions)
-    is wrapped with isolate_function.
-    Also manages scope chain through __scope_id__ variable.
-    """
+    """Rewrite call sites to the parent-slot / anchored emission (pass 2)."""
 
-    def __init__(self):
-        # Track if isolation was used at all
-        self.has_call_usage = False
-        # Counter for unique call IDs
-        self._call_id_counter = 0
-        # Track function context for better call IDs
-        self.current_function = None
-        # Track parent functions to build the full scope path
-        self.parent_functions: list[str] = []
-        # Track context to avoid wrappers in certain places
-        self.in_decorator = False
-        self.in_default_arg = False
-        # Track dataclass classes
-        self.dataclass_classes: set[str] = set()
-        # Track inner functions that shadow builtins per scope
-        # Maps scope -> set of function names that shadow builtins
-        self.shadowed_builtins_by_scope: dict[str, set[str]] = {}
-        # Track counter variables that need to be initialized per function
-        self.function_counters: dict[str, set[str]] = {}
+    def __init__(self, layout: ModuleLayout):
+        self.layout = layout
+        self.index = _ScopeIndex(layout)
+        self.carrier: dict[str, bool] = {}
+        self._scope_stack: list[str] = []
+        self._loop_depth = 0
+        self._lambda_depth = 0
+        self._ordinals: dict[str, int] = {}
+        # per-function pending loop hoists: (counter name, list name, slot)
+        self._loop_hoists: list[list[tuple[str, str, int]]] = []
+        self._used_helpers: set[str] = set()
+        self._resolve_cache: dict[str, Any] = {}
 
-    def _is_dataclass_constructor(self, func: ast.Name | ast.Attribute) -> bool:
+    # --- classification ----------------------------------------------------
+
+    def route_for_callee(self, func: ast.expr, scope_stack: list[str]) -> _Route:
+        """Classify a callee expression in a scope context.
+
+        :param func: The callee (Name or Attribute).
+        :param scope_stack: Function-name path of the call site's scope.
+        :return: One of the route constants or ``('same', scope_id)``.
         """
-        Check if the function is a dataclass constructor by checking if it's a class name
-        that's been marked as a dataclass
+        if self._is_series_slot_method(func, scope_stack):
+            # Synthetic SeriesImpl method call emitted by the Series
+            # transformer (__state__[N].add / .set) — stateless by
+            # construction, and an anchor could never hit anyway (a bound
+            # method is a fresh object on every attribute access)
+            return _SKIP
+        path = _get_func_path(func)
+        if path is None:
+            return _UNIFORM
+        if path in NON_TRANSFORMABLE_FUNCTIONS:
+            return _SKIP
+        parts = path.split('.')
+        base = parts[0]
+
+        # Innermost-first scope-chain resolution of the base name
+        for i in range(len(scope_stack), -1, -1):
+            scope = '·'.join(scope_stack[:i])
+            is_assigned = base in self.index.assigned.get(scope, ())
+            entry = self.index.defs.get(scope, {}).get(base)
+            if entry is not None:
+                target, decorated = entry
+                if is_assigned or len(parts) > 1 or decorated:
+                    # Rebound name, attribute on a def, or a decorated def
+                    # (the runtime value is the decorator's return value —
+                    # an overload dispatcher, an lru_cache wrapper, ...)
+                    return _UNIFORM
+                return 'same', target
+            if base in self.index.classes.get(scope, ()):
+                # Constructor or class attribute — the legacy runtime guard
+                # returned types untouched, skipping is the same net effect
+                return _SKIP if not is_assigned else _UNIFORM
+            if is_assigned:
+                return _UNIFORM  # local value (function value, object, ...)
+
+        entry = self.index.import_map.get(base)
+        if entry is not None:
+            try:
+                is_stdlib = stdlib_checker.is_stdlib(entry[0].split('.')[0])
+            except Exception:  # noqa: BLE001 - e.g. dynamic modules without __spec__
+                is_stdlib = False
+            if is_stdlib:
+                return _SKIP
+            obj = self._resolve_imported(path, parts)
+            return self._classify_object(obj) if obj is not None else _UNIFORM
+        if len(parts) == 1 and base in vars(builtins):
+            return _SKIP
+        if base.startswith('_'):
+            return _SKIP  # unresolvable private name — legacy parity
+        return _UNIFORM
+
+    def _is_series_slot_method(self, func: ast.expr, scope_stack: list[str]) -> bool:
+        """Whether a callee is a method of a series slot
+        (``__state__[N].add`` / ``__state·scope__[N].set``).
+
+        :param func: The callee expression.
+        :param scope_stack: Function-name path of the call site's scope.
+        :return: True if the slot under the attribute is a series slot.
         """
-        func_path = self._get_func_path(func)
-        if not func_path:
+        if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Subscript)):
             return False
-
-        # Check if it's a known dataclass
-        if func_path in self.dataclass_classes:
-            return True
-
-        # Check if it's directly the dataclass function itself
-        if func_path == 'dataclass':
-            return True
-
-        return False
-
-    def _is_stdlib_function(self, func: ast.Name | ast.Attribute) -> bool:
-        """
-        Check if function is from standard library or is a builtin function/method
-        that cannot be wrapped (no __globals__ attribute)
-        """
-        # Get function path
-        func_path = self._get_func_path(func)
-        if not func_path:
+        sub = func.value
+        if not (isinstance(sub.value, ast.Name) and isinstance(sub.slice, ast.Constant)
+                and isinstance(sub.slice.value, int)):
             return False
+        param = sub.value.id
+        if param == DEFAULT_STATE_PARAM:
+            scope_id = '·'.join(scope_stack)
+        elif param.startswith('__state·') and param.endswith('__'):
+            scope_id = param[len('__state·'):-2]
+        else:
+            return False
+        scope = self.layout.scopes.get(scope_id)
+        if scope is None:
+            return False
+        index = sub.slice.value
+        return 0 <= index < len(scope.slots) and scope.slots[index].kind == 'series'
 
-        # Skip dataclass constructors
-        if self._is_dataclass_constructor(func):
-            return True
-
-        # Also skip if it's in NON_TRANSFORMABLE_FUNCTIONS
-        if func_path in NON_TRANSFORMABLE_FUNCTIONS:
-            return True
-
+    def _resolve_imported(self, path: str, parts: list[str]) -> Any | None:
+        """Resolve a dotted callee path through the module-level import map
+        at transform time (imports are cached in sys.modules)."""
         try:
-            # Try to evaluate the function path to get the actual object
-            obj = eval(func_path)
-            # Check if it's a builtin function/method
-            if isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
-                return True
-        except:  # noqa
+            return self._resolve_cache[path]
+        except KeyError:
             pass
-
-        # Handle direct builtin functions
-        if '.' not in func_path:
-            # Check if this is an inner function that shadows a builtin
-            if func_path in vars(builtins):
-                # Check in current scope if this builtin is shadowed
-                if self.current_function and self.current_function in self.shadowed_builtins_by_scope:
-                    if func_path in self.shadowed_builtins_by_scope[self.current_function]:
-                        # This is a shadowed builtin, so we should isolate it
-                        return False
-                # It's a real builtin
-                return True
-            # Not a builtin at all
-            return False
-
-        # Get module path
-        module_path = func_path.split('.')[0]
-        return stdlib_checker.is_stdlib(module_path)
+        module_name, attr = self.index.import_map[parts[0]]
+        obj: Any | None
+        try:
+            obj = importlib.import_module(module_name)
+            for name in ([attr] if attr else []) + parts[1:]:
+                try:
+                    obj = getattr(obj, name)
+                except AttributeError:
+                    # Submodule not yet loaded: the script's own import only
+                    # runs after compilation, so import it here — otherwise
+                    # the route would depend on what happens to be in
+                    # sys.modules and the emission would not be deterministic
+                    if not isinstance(obj, types.ModuleType):
+                        raise
+                    obj = importlib.import_module(f'{obj.__name__}.{name}')
+        except Exception:  # noqa: BLE001 - any resolution failure means "unprovable"
+            obj = None
+        self._resolve_cache[path] = obj
+        return obj
 
     @staticmethod
-    def _get_func_path(func: ast.expr) -> str | None:
-        """Get the full path of a function as a string"""
-        if isinstance(func, ast.Name):
-            return func.id
-        elif isinstance(func, ast.Attribute):
-            parts = []
-            current = func
-            while isinstance(current, ast.Attribute):
-                parts.append(current.attr)
-                current = current.value
-            if isinstance(current, ast.Name):
-                parts.append(current.id)
-            return '.'.join(reversed(parts))
-        return None
+    def _classify_object(obj: Any) -> str:
+        """Classify a transform-time resolved callee object."""
+        if isinstance(obj, Exported):
+            return _UNIFORM  # the anchor's bind unwraps it
+        if isinstance(obj, type):
+            return _SKIP
+        bound_self = getattr(obj, '__self__', None)
+        if bound_self is not None and isinstance(bound_self, type):
+            return _SKIP  # classmethod
+        if isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+            return _SKIP
+        if getattr(obj, '__pyne_bind__', None) is not None:
+            # Overload dispatcher — the implementation is chosen at runtime.
+            # Must be checked BEFORE the layout: functools.wraps copies the
+            # first implementation's __dict__ (its __pyne_layout__ included)
+            # onto the dispatcher.
+            return _UNIFORM
+        if getattr(obj, '__pyne_layout__', None) is not None:
+            return _FAST
+        if getattr(obj, '__module_property__', False):
+            return _SKIP  # Pine-style module property getter — stateless by design
+        if isinstance(obj, types.FunctionType) and '__pyne_slot_layout__' in obj.__globals__:
+            return _DIRECT  # transformed module, no layout -> provably stateless
+        return _UNIFORM
 
-    def _create_call_id(self, func: ast.expr) -> str | None:
-        """Create a unique call ID for a function with full scope path"""
-        func_path = self._get_func_path(func)
-        if not func_path:
-            return None
+    def _is_carrier(self, scope_id: str) -> bool:
+        """Whether a same-module scope carries state (fixpoint result)."""
+        try:
+            return self.carrier[scope_id]
+        except KeyError:
+            return self.layout.state_carrying(scope_id)
 
-        # Build parts for the full call path ID
-        parts = []
+    def _run_fixpoint(self, scope_routes: dict[str, list[_Route]]) -> dict[str, bool]:
+        """Carrier fixpoint: a scope carries state if it has own slots or any
+        non-direct call site (fast/uniform, or same-module to a carrier)."""
+        carrier = {scope: self.layout.state_carrying(scope) for scope in scope_routes}
+        for routes in scope_routes.values():
+            for route in routes:
+                if isinstance(route, tuple):
+                    carrier.setdefault(route[1], self.layout.state_carrying(route[1]))
+        changed = True
+        while changed:
+            changed = False
+            for scope, routes in scope_routes.items():
+                if carrier[scope]:
+                    continue
+                for route in routes:
+                    if (route in (_FAST, _UNIFORM)
+                            or (isinstance(route, tuple) and carrier.get(route[1], False))):
+                        carrier[scope] = True
+                        changed = True
+                        break
+        return carrier
 
-        # Include all parent functions in the path
-        if self.parent_functions:
-            parts.extend(self.parent_functions)
+    # --- emission helpers ----------------------------------------------------
 
-        # Include current function
-        if self.current_function:
-            parts.append(self.current_function)
+    def _state_param(self) -> str:
+        return self.layout.state_param('·'.join(self._scope_stack))
 
-        # Add the function name
-        parts.append(func_path)
+    @staticmethod
+    def _copy_callee(func: ast.expr) -> ast.expr:
+        """Fresh, attribute-free copy of a callee expression. Other
+        transformers hang ``parent`` backlinks on nodes, which would make a
+        ``deepcopy`` drag the entire module tree along — rebuilding from
+        source sidesteps that."""
+        return cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
 
-        # Add counter for uniqueness
-        parts.append(str(self._call_id_counter))
-        self._call_id_counter += 1
+    @staticmethod
+    def _slot_ref(param: str, slot: int) -> ast.Subscript:
+        return ast.Subscript(value=ast.Name(id=param, ctx=ast.Load()),
+                             slice=ast.Constant(value=slot), ctx=ast.Load())
 
-        # Join all parts with unicode middle dot separator
-        # This makes the ID directly usable as a Python variable name
-        return '·'.join(parts)
+    @staticmethod
+    def _counter_walrus(counter: str) -> ast.NamedExpr:
+        """``(__i__ := (<counter> := <counter> + 1) - 1)``"""
+        increment = ast.NamedExpr(
+            target=ast.Name(id=counter, ctx=ast.Store()),
+            value=ast.BinOp(left=ast.Name(id=counter, ctx=ast.Load()),
+                            op=ast.Add(), right=ast.Constant(value=1)))
+        return ast.NamedExpr(
+            target=ast.Name(id='__i__', ctx=ast.Store()),
+            value=ast.BinOp(left=increment, op=ast.Sub(), right=ast.Constant(value=1)))
+
+    def _add_loop_hoist(self, slot: int) -> tuple[str, str]:
+        """Register a loop site's counter + hoisted list for the prologue."""
+        k = len(self._loop_hoists[-1])
+        counter, children = f'__cnt_{k}__', f'__chl_{k}__'
+        self._loop_hoists[-1].append((counter, children, slot))
+        return counter, children
+
+    def _emit_fast(self, node: ast.Call, slot: int, in_loop: bool) -> ast.Call:
+        """Prepend the child-state expression as the hidden first argument."""
+        param = self._state_param()
+        callee_copy = self._copy_callee(node.func)
+        if not in_loop:
+            self._used_helpers.add('__resolve_slot__')
+            state_expr = ast.IfExp(
+                test=ast.Compare(
+                    left=ast.NamedExpr(target=ast.Name(id='__st__', ctx=ast.Store()),
+                                       value=self._slot_ref(param, slot)),
+                    ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
+                body=ast.Name(id='__st__', ctx=ast.Load()),
+                orelse=ast.Call(func=ast.Name(id='__resolve_slot__', ctx=ast.Load()),
+                                args=[ast.Name(id=param, ctx=ast.Load()),
+                                      ast.Constant(value=slot), callee_copy],
+                                keywords=[]))
+        else:
+            self._used_helpers.add('__grow__')
+            counter, children = self._add_loop_hoist(slot)
+            state_expr = ast.IfExp(
+                test=ast.Compare(
+                    left=self._counter_walrus(counter), ops=[ast.Lt()],
+                    comparators=[ast.Call(func=ast.Name(id='len', ctx=ast.Load()),
+                                          args=[ast.Name(id=children, ctx=ast.Load())],
+                                          keywords=[])]),
+                body=ast.Subscript(value=ast.Name(id=children, ctx=ast.Load()),
+                                   slice=ast.Name(id='__i__', ctx=ast.Load()), ctx=ast.Load()),
+                orelse=ast.Call(func=ast.Name(id='__grow__', ctx=ast.Load()),
+                                args=[ast.Name(id=children, ctx=ast.Load()), callee_copy],
+                                keywords=[]))
+        node.args.insert(0, state_expr)
+        return node
+
+    def _emit_uniform(self, node: ast.Call, slot: int, in_loop: bool) -> ast.Call:
+        """Wrap the call in the anchored bind form."""
+        param = self._state_param()
+        callee, callee_copy = node.func, self._copy_callee(node.func)
+        pair = ast.Name(id='__b__', ctx=ast.Load())
+        if not in_loop:
+            self._used_helpers.add('__bind_any__')
+            test: ast.expr = ast.BoolOp(op=ast.And(), values=[
+                ast.Compare(
+                    left=ast.NamedExpr(target=ast.Name(id='__b__', ctx=ast.Store()),
+                                       value=self._slot_ref(param, slot)),
+                    ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
+                ast.Compare(
+                    left=ast.Subscript(value=pair, slice=ast.Constant(value=0), ctx=ast.Load()),
+                    ops=[ast.Is()], comparators=[callee]),
+            ])
+            rebind: ast.expr = ast.Call(
+                func=ast.Name(id='__bind_any__', ctx=ast.Load()),
+                args=[ast.Name(id=param, ctx=ast.Load()), ast.Constant(value=slot), callee_copy],
+                keywords=[])
+        else:
+            self._used_helpers.add('__bind_any_loop__')
+            counter, children = self._add_loop_hoist(slot)
+            test = ast.BoolOp(op=ast.And(), values=[
+                ast.Compare(
+                    left=self._counter_walrus(counter), ops=[ast.Lt()],
+                    comparators=[ast.Call(func=ast.Name(id='len', ctx=ast.Load()),
+                                          args=[ast.Name(id=children, ctx=ast.Load())],
+                                          keywords=[])]),
+                ast.Compare(
+                    left=ast.Subscript(
+                        value=ast.NamedExpr(
+                            target=ast.Name(id='__b__', ctx=ast.Store()),
+                            value=ast.Subscript(value=ast.Name(id=children, ctx=ast.Load()),
+                                                slice=ast.Name(id='__i__', ctx=ast.Load()),
+                                                ctx=ast.Load())),
+                        slice=ast.Constant(value=0), ctx=ast.Load()),
+                    ops=[ast.Is()], comparators=[callee]),
+            ])
+            rebind = ast.Call(
+                func=ast.Name(id='__bind_any_loop__', ctx=ast.Load()),
+                args=[ast.Name(id=children, ctx=ast.Load()),
+                      ast.Name(id='__i__', ctx=ast.Load()), callee_copy],
+                keywords=[])
+        bound = ast.IfExp(
+            test=test,
+            body=ast.Subscript(value=ast.Name(id='__b__', ctx=ast.Load()),
+                               slice=ast.Constant(value=1), ctx=ast.Load()),
+            orelse=rebind)
+        return ast.Call(func=bound, args=node.args, keywords=node.keywords)
+
+    # --- visitors ------------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        """Process module and add isolation import and scope_id"""
-        # Find all dataclass declarations
-        self._find_dataclass_declarations(node)
+        self.layout.assign_scope_ids(node)
+        self.index = _ScopeIndex(self.layout)
+        self.index.visit(node)
+        collector = _RouteCollector(self)
+        collector.visit(node)
+        self.carrier = self._run_fixpoint(collector.scope_routes)
 
-        # Process the module normally
         node = cast(ast.Module, self.generic_visit(node))
 
-        # Only add imports if we actually used isolation
-        if not self.has_call_usage:
-            return node
-
-        # Get file path from node (it's stored in _module_file_path by the import hook)
-        file_path = getattr(node, '_module_file_path', '')
-
-        # This will be the default scope ID for the module
-        scope_id = f"{hashlib.sha1(file_path.encode()).hexdigest()[:8]}_{Path(file_path).name}"
-
-        # Add scope_id initialization and import
-        scope_id_assign = ast.Assign(
-            targets=[ast.Name(id='__scope_id__', ctx=ast.Store())],
-            value=ast.Constant(value=scope_id)
-        )
-        import_stmt = ast.ImportFrom(
-            module='pynecore.core.function_isolation',
-            names=[ast.alias(name='isolate_function', asname=None)],
-            level=0
-        )
-
-        # Find the right position to insert new nodes
-        # First, check if there's a docstring
-        insert_pos = 0
-        first_stmt = node.body[0] if node.body else None
-        if (isinstance(first_stmt, ast.Expr) and
-                isinstance(first_stmt.value, ast.Constant) and
-                isinstance(first_stmt.value.value, str)):
-            insert_pos = 1
-
-        # Then find the last import statement after docstring
-        for i in range(insert_pos, len(node.body)):
-            if isinstance(node.body[i], (ast.Import, ast.ImportFrom)):
-                insert_pos = i + 1
-            elif not isinstance(node.body[i], ast.Expr):  # Skip other string literals
-                break
-
-        node.body.insert(insert_pos, scope_id_assign)
-        node.body.insert(insert_pos, import_stmt)
-
+        if self._used_helpers:
+            import_stmt = ast.ImportFrom(
+                module='pynecore.core.instance_state',
+                names=[ast.alias(name=name, asname=None)
+                       for name in sorted(self._used_helpers)],
+                level=0)
+            insert_pos = 0
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                insert_pos = 1
+            for i in range(insert_pos, len(node.body)):
+                if isinstance(node.body[i], (ast.Import, ast.ImportFrom)):
+                    insert_pos = i + 1
+                elif not isinstance(node.body[i], ast.Expr):
+                    break
+            node.body.insert(insert_pos, import_stmt)
         return node
 
-    def _find_dataclass_declarations(self, node: ast.AST) -> None:
-        """
-        Recursively search through the entire AST to find all classes decorated with @dataclass
-        at any level - module, function, or class scope
-        """
-        for n in ast.walk(node):
-            if not isinstance(n, ast.ClassDef):
-                continue
-
-            for decorator in n.decorator_list:
-                # Check for both 'dataclass' and 'dataclass(...)' forms
-                if (isinstance(decorator, ast.Name) and decorator.id == 'dataclass') or \
-                        (isinstance(decorator, ast.Call) and isinstance(decorator.func,
-                                                                        ast.Name) and decorator.func.id == 'dataclass'):
-                    # Add class name to dataclass classes set
-                    self.dataclass_classes.add(n.name)
-                    break
-
-    def _has_isolate_function_calls(self, node: ast.FunctionDef) -> bool:
-        """Check if function contains any isolate_function calls"""
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Call):
-                continue
-            if not isinstance(child.func, (ast.Name, ast.Attribute)):
-                continue
-
-            # Skip if we're in decorator or default arg context
-            if self.in_decorator or self.in_default_arg:
-                continue
-
-            # Skip stdlib and non-transformable functions
-            if self._is_stdlib_function(child.func):
-                continue
-
-            func_path = self._get_func_path(child.func)
-            if func_path in NON_TRANSFORMABLE_FUNCTIONS:
-                continue
-
-            # Found a potential call that would be transformed
-            return True
-        return False
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        return node  # class bodies stay raw (no hidden-parameter injection path)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        """Handle function scope and visit decorators with context"""
-        # Store old state
-        old_function = self.current_function
+        if _is_test_function(node.name):
+            return node
+        self._scope_stack.append(self.layout.scope_segment(node))
+        scope = '·'.join(self._scope_stack)
+        scope_for_function(self.layout, scope, node)
+        old_loop, self._loop_depth = self._loop_depth, 0
+        old_lambda, self._lambda_depth = self._lambda_depth, 0
+        self._loop_hoists.append([])
 
-        # Reset counter for each function to ensure synchronization with collector
-        self._call_id_counter = 0
+        # Only the body is isolation territory (decorators and argument
+        # defaults are evaluated outside the instance, legacy parity)
+        node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
 
-        # Update function hierarchy - add current function to parent list if not None
-        if self.current_function:
-            self.parent_functions.append(self.current_function)
-
-        # Set current function to this function's name
-        self.current_function = node.name
-
-        # Initialize counter collection for this function
-        func_key = '.'.join(self.parent_functions + [node.name]) if self.parent_functions else node.name
-        self.function_counters[func_key] = set()
-
-        # Check if this is an inner function that shadows a builtin
-        # Inner functions should be isolated if they shadow builtins
-        if self.parent_functions and node.name in vars(builtins):
-            # Track this function as shadowing a builtin in its parent scope
-            parent_scope = self.parent_functions[-1] if self.parent_functions else None
-            if parent_scope:
-                if parent_scope not in self.shadowed_builtins_by_scope:
-                    self.shadowed_builtins_by_scope[parent_scope] = set()
-                self.shadowed_builtins_by_scope[parent_scope].add(node.name)
-
-        # Process decorators in decorator context
-        old_decorator = self.in_decorator
-        self.in_decorator = True
-        if node.decorator_list:
-            node.decorator_list = [self.visit(cast(ast.AST, d)) for d in node.decorator_list]
-        self.in_decorator = old_decorator
-
-        # Process arguments in default arg context
-        old_default = self.in_default_arg
-        self.in_default_arg = True
-        if node.args.defaults:
-            node.args.defaults = [self.visit(cast(ast.AST, d)) for d in node.args.defaults]
-        self.in_default_arg = old_default
-
-        # Reset context flags for function body processing
-        self.in_decorator = False
-        self.in_default_arg = False
-
-        # Check if function needs isolation before processing body
-        needs_isolation = self._has_isolate_function_calls(node)
-
-        # Process the body
-        if node.body:
-            node.body = [self.visit(cast(ast.AST, stmt)) for stmt in node.body]
-
-        # Add global scope_id declaration and counter initializations only if function uses isolation
-        if needs_isolation:
-            # Find the right position after docstring if exists
+        hoists = self._loop_hoists.pop()
+        if hoists:
+            param = self.layout.state_param(scope)
+            prologue: list[ast.stmt] = []
+            for counter, children, slot in hoists:
+                prologue.append(ast.Assign(
+                    targets=[ast.Name(id=counter, ctx=ast.Store())],
+                    value=ast.Constant(value=0)))
+                prologue.append(ast.Assign(
+                    targets=[ast.Name(id=children, ctx=ast.Store())],
+                    value=self._slot_ref(param, slot)))
             insert_pos = 0
-
-            # Check for docstring
-            first_stmt = node.body[0] if node.body else None
-            if (isinstance(first_stmt, ast.Expr) and
-                    isinstance(first_stmt.value, ast.Constant) and
-                    isinstance(first_stmt.value.value, str)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
                 insert_pos = 1
+            node.body[insert_pos:insert_pos] = prologue
 
-            # Add global scope_id declaration
-            global_stmt = ast.Global(names=['__scope_id__'])
-            node.body.insert(insert_pos, global_stmt)
-
-            # Add counter variable initializations
-            func_key = '.'.join(self.parent_functions + [node.name]) if self.parent_functions else node.name
-            if func_key in self.function_counters:
-                for counter_name in sorted(self.function_counters[func_key]):
-                    counter_init = ast.Assign(
-                        targets=[ast.Name(id=counter_name, ctx=ast.Store())],
-                        value=ast.Constant(value=0)
-                    )
-                    node.body.insert(insert_pos + 1, counter_init)
-
-            self.has_call_usage = True
-
-        # Restore function context
-        if self.parent_functions:
-            self.parent_functions.pop()
-        self.current_function = old_function
-
+        self._loop_depth, self._lambda_depth = old_loop, old_lambda
+        self._scope_stack.pop()
         return node
 
-    def visit_Call(self, node: ast.Call) -> ast.Call:
-        """Transform function calls to use isolate_function wrapper"""
-        # First visit all arguments and keywords to handle nested calls
-        node.args = [self.visit(cast(ast.AST, arg)) for arg in node.args]
-        node.keywords = [self.visit(cast(ast.AST, kw)) for kw in node.keywords]
+    def visit_For(self, node: ast.For) -> ast.For:
+        node.iter = cast(ast.expr, self.visit(node.iter))
+        self._loop_depth += 1
+        node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+        node.orelse = [cast(ast.stmt, self.visit(stmt)) for stmt in node.orelse]
+        self._loop_depth -= 1
+        return node
 
-        # Skip if already processed or not a relevant call
-        if (getattr(node, '_call_processed', False) or
-                not isinstance(node.func, (ast.Name, ast.Attribute))):
+    def visit_While(self, node: ast.While) -> ast.While:
+        self._loop_depth += 1
+        node.test = cast(ast.expr, self.visit(node.test))
+        node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+        node.orelse = [cast(ast.stmt, self.visit(stmt)) for stmt in node.orelse]
+        self._loop_depth -= 1
+        return node
+
+    def _visit_comprehension(self, node: ast.AST) -> ast.AST:
+        """Comprehension parts run per element — loop context (walruses bind
+        in the enclosing function scope per PEP 572, so counters work)."""
+        self._loop_depth += 1
+        node = self.generic_visit(node)
+        self._loop_depth -= 1
+        return node
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+
+    def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
+        self._lambda_depth += 1
+        node.body = cast(ast.expr, self.visit(node.body))
+        self._lambda_depth -= 1
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.expr:
+        node.args = [cast(ast.expr, self.visit(arg)) for arg in node.args]
+        node.keywords = [cast(ast.keyword, self.visit(kw)) for kw in node.keywords]
+        if not isinstance(node.func, (ast.Name, ast.Attribute)):
+            # Immediately-called expressions stay raw (legacy parity), but
+            # calls inside the callee expression still get their own sites
+            node.func = cast(ast.expr, self.visit(node.func))
             return node
 
-        # Skip if starts with underscore
-        if isinstance(node.func, ast.Name) and node.func.id.startswith('_'):
+        route = self.route_for_callee(node.func, self._scope_stack)
+        if not self._scope_stack:
+            if route == _FAST or (isinstance(route, tuple) and self._is_carrier(route[1])):
+                raise SyntaxError("Stateful function calls are not supported at module level")
+            return node
+        if isinstance(route, tuple):
+            route = _FAST if self._is_carrier(route[1]) else _DIRECT
+        if route in (_SKIP, _DIRECT):
             return node
 
-        # Skip if we're in decorator, default arg context or module level
-        if self.in_decorator or self.in_default_arg or self.current_function is None:
-            return node
+        scope = '·'.join(self._scope_stack)
+        if self._lambda_depth:
+            # Loop counters would bind lambda-local; the straight-line
+            # anchor is the only emission that stays correct inside a lambda
+            route, in_loop = _UNIFORM, False
+        else:
+            in_loop = self._loop_depth > 0
 
-        # Skip stdlib and non-transformable functions
-        if self._is_stdlib_function(node.func):
-            return node
-
-        # Create call ID based on full scope path and function name
-        call_id = self._create_call_id(node.func)
-        if not call_id:
-            return node
-
-        # Check if this call has closure arguments (marked by ClosureArgumentsTransformer)
-        closure_vars_count = getattr(node, '_closure_vars_count', -1)
-
-        # Use the exact same call_id as the variable name (it's already a valid Python identifier)
-        counter_var_name = f"__call_counter·{call_id}__"
-
-        # Track this counter for initialization
-        func_key = ('.'.join(self.parent_functions + [self.current_function])
-                    if self.parent_functions else self.current_function)
-        if func_key in self.function_counters:
-            self.function_counters[func_key].add(counter_var_name)
-
-        # Create a walrus expression to increment the counter
-        # counter_var := counter_var + 1
-        counter_increment = ast.NamedExpr(
-            target=ast.Name(id=counter_var_name, ctx=ast.Store()),
-            value=ast.BinOp(
-                left=ast.Name(id=counter_var_name, ctx=ast.Load()),
-                op=ast.Add(),
-                right=ast.Constant(value=1)
-            )
-        )
-
-        # Create wrapper with scope_id, closure_argument_count, and the incremented counter value
-        wrapped = ast.Call(
-            func=ast.Call(
-                func=ast.Name(id='isolate_function', ctx=ast.Load()),
-                args=[
-                    node.func,
-                    ast.Constant(value=call_id),
-                    ast.Name(id='__scope_id__', ctx=ast.Load()),
-                    ast.Constant(value=closure_vars_count),  # closure_argument_count (4th param)
-                    counter_increment  # Pass the incremented counter value (5th param)
-                ],
-                keywords=[]
-            ),
-            args=node.args,
-            keywords=node.keywords
-        )
-        setattr(wrapped, '_call_processed', True)
-        return wrapped
+        ordinal = self._ordinals.get(scope, 0)
+        self._ordinals[scope] = ordinal + 1
+        call_id = f'{scope}·{_get_func_path(node.func) or "<callee>"}·{ordinal}'
+        scope_layout = self.layout.scope(scope)
+        if route == _FAST:
+            slot = scope_layout.add_child(call_id, in_loop=in_loop)
+            return self._emit_fast(node, slot, in_loop)
+        slot = scope_layout.add_anchor(call_id, in_loop=in_loop)
+        return self._emit_uniform(node, slot, in_loop)

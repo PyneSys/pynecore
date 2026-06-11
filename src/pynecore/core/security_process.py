@@ -40,16 +40,18 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
       in-progress HTF OHLCV via the SyncBlock. The subprocess re-runs ``main()``
       with ``barstate.isconfirmed=False`` against the same ``bar_index`` as the
       first developing tick of this period (Series.add → set, no new bar push).
-      ``VarSnapshot`` rolls var globals back to the period baseline before each
-      such re-execution; ``function_isolation.reset()`` clears per-call slots.
+      ``RootVarSnapshot`` rolls the root vectors' var slots back to the period
+      baseline before each such re-execution; ``instance_state.reset()`` drops
+      the function instances.
 """
 from __future__ import annotations
 
 import os
+from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .security_shm import (
     SyncBlock, ResultBlock, write_na,
@@ -396,8 +398,7 @@ def security_process_main(
     from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
     from pynecore import lib
     from pynecore.lib import barstate
-    from pynecore.core import function_isolation, script as script_mod
-    from .var_snapshot import VarSnapshot
+    from pynecore.core import instance_state, script as script_mod
     from ..types.ohlcv import OHLCV
 
     # Set syminfo BEFORE importing the script
@@ -421,8 +422,32 @@ def security_process_main(
     inject_protocol(script_module, signal_fn, write_fn, read_fn, wait_fn,
                     active_security=sec_id)
 
-    # Reset function isolation for fresh state
-    function_isolation.reset()
+    # Fresh per-process state: drop anything inherited (fork start method) and
+    # create the root state vectors of the entry points this process drives —
+    # the script's main and the registered library mains (same binding rules
+    # as the runner: state-carrying entries get a root vector as hidden first
+    # argument, stateless ones are called as-is)
+    instance_state.reset()
+    main_func = script_module.main
+    root_keys: list[str] = []
+    seen_keys: set[str] = set()
+    bound_entries: dict[int, Callable] = {}
+    # noinspection PyProtectedMember
+    for entry_func in [main_func] + [f for _title, f in script_mod._registered_libraries]:
+        if id(entry_func) in bound_entries:
+            continue
+        entry_layout = getattr(entry_func, '__pyne_layout__', None)
+        if entry_layout is None:
+            bound_entries[id(entry_func)] = entry_func
+            continue
+        entry_root_key = f'{entry_func.__module__}.{entry_func.__qualname__}'
+        if entry_root_key in seen_keys:
+            entry_root_key = f'{entry_root_key}#{len(root_keys)}'
+        seen_keys.add(entry_root_key)
+        root_keys.append(entry_root_key)
+        bound_entries[id(entry_func)] = partial(
+            entry_func, instance_state.create_root(entry_root_key, entry_layout))
+    run_main = bound_entries[id(main_func)]
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
@@ -436,8 +461,8 @@ def security_process_main(
         initialized". ``lib._lib_semaphore`` stays True for both (every side
         effect is suppressed in a security child)."""
         for _title, _lib_main in script_mod._registered_libraries:
-            _lib_main()
-        script_module.main()
+            bound_entries.get(id(_lib_main), _lib_main)()
+        run_main()
 
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")
@@ -446,10 +471,9 @@ def security_process_main(
         from pynecore.lib.log import setup_security_file_log
         setup_security_file_log(security_log_path, context_label)
 
-    # VarSnapshot is created lazily after the script's persistent-var
-    # globals are populated by the first ``main()`` run; before that the
-    # snapshot would capture nothing useful.
-    var_snapshot: VarSnapshot | None = None
+    # Snapshot of this process's root vectors' var slots — the rollback
+    # baseline for live re-executions of the same HTF period.
+    var_snapshot: instance_state.RootVarSnapshot | None = None
 
     # Tracks the last developing HTF period start (ms) the subprocess
     # advanced into. Used to distinguish "new dev period" (allocate a new
@@ -464,12 +488,10 @@ def security_process_main(
     # distinct HTF periods advance ``current_bar``.
     seen_live_bar: bool = False
 
-    def _ensure_snapshot() -> VarSnapshot | None:
+    def _ensure_snapshot() -> instance_state.RootVarSnapshot | None:
         nonlocal var_snapshot
         if var_snapshot is None:
-            var_snapshot = VarSnapshot(
-                script_module, script_mod._registered_libraries,
-            )
+            var_snapshot = instance_state.RootVarSnapshot(root_keys)
         return var_snapshot if var_snapshot.has_vars else None
 
     # Polymorphic bar source: file-backed reader (random access on a static
@@ -543,7 +565,7 @@ def security_process_main(
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.restore()
-                    function_isolation.reset()
+                    instance_state.reset()
 
                 _set_lib_properties(ohlcv, current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = current_bar
@@ -593,7 +615,7 @@ def security_process_main(
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.restore()
-                    function_isolation.reset()
+                    instance_state.reset()
                     is_new_closed_period = False
                 else:
                     if seen_live_bar:

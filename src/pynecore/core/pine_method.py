@@ -1,6 +1,19 @@
+"""
+Pine method dispatch on the slot-based instance-state scheme.
+
+``method_call`` is on the transformer's NON_TRANSFORMABLE list, so its call
+sites stay raw and there is no caller anchor — the method is selected at
+runtime and bound through a module-lifetime per-method cache instead: ONE
+shared instance per method function, cleared between runs. This formalizes
+what the legacy runtime did implicitly (its ``__scope_id__`` here was forever
+``''``, so every isolation it requested landed on the same empty-scope cache
+key, shared by all call sites of a method and dropped on ``reset()``).
+"""
 import sys
 from types import ModuleType
 from typing import Any, Callable
+from functools import partial
+
 from ..lib import array, matrix, box, line, label, table, linefill, polyline
 from ..lib import map as map_lib
 from ..types import matrix as matrix_types
@@ -11,10 +24,8 @@ from ..types import table as table_types
 from ..types import linefill as linefill_types
 from ..types import polyline as polyline_types
 
-from .function_isolation import isolate_function
+from .instance_state import _make_state, register_shared_cache
 from .pine_export import Exported
-
-__scope_id__ = ''
 
 
 def method(func: Callable) -> Callable:
@@ -62,8 +73,58 @@ def _get_builtin_method(method_name: str, var: Any) -> Callable | None:
     return None
 
 
+# Method key -> (function identity, state vector or None, bound callable).
+# A per-function key is essential: a constant key would make every method
+# share one cache entry, running one method with another method's state.
+# Registered so instance_state.reset() clears it between runs.
+_method_anchors: dict[str, tuple[Any, list | None, Callable]] = register_shared_cache({})
+
+
 # noinspection PyShadowingNames
-def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: int = -1, **kwargs) -> Any:
+def _bound_method(method: Any) -> Callable:
+    """Module-lifetime bound instance of a runtime-dispatched method.
+
+    The cache key is the method's qualified name and the entry survives
+    function-object re-creation: a method defined inside ``main()`` is a
+    fresh object every invocation, but its persistent state must live on —
+    on an identity miss the entry's state vector is rebound to the new
+    object (whose closure cells are the live ones). State from the cache,
+    closure from the passed object: the exact legacy split.
+
+    :param method: The method callable, or an ``Exported`` proxy of one.
+    :return: The callable to invoke with the visible arguments.
+    :raises ValueError: If an ``Exported`` proxy is not initialized yet.
+    """
+    target = method
+    if isinstance(target, Exported):
+        target = target.__fn__
+        if target is None:
+            raise ValueError("Exported proxy has not been initialized with a function yet")
+    key = f"{getattr(target, '__module__', '?')}.{getattr(target, '__qualname__', '?')}"
+    entry = _method_anchors.get(key)
+    if entry is not None and entry[0] is target:
+        return entry[2]
+    if isinstance(target, type) or (
+            hasattr(target, '__self__') and isinstance(target.__self__, type)):
+        return target  # types and classmethods are called as-is (legacy guard)
+    state: list | None = None
+    bind = getattr(target, '__pyne_bind__', None)
+    if bind is not None:
+        bound: Callable = bind()  # overload dispatcher: one shared anchored entry
+    else:
+        layout = getattr(target, '__pyne_layout__', None)
+        if layout is not None:
+            state = entry[1] if entry is not None and entry[1] is not None \
+                else _make_state(layout)
+            bound = partial(target, state)
+        else:
+            bound = target  # stateless — called raw
+    _method_anchors[key] = (target, state, bound)
+    return bound
+
+
+# noinspection PyShadowingNames
+def method_call(method: str | Callable, var: Any, *args, **kwargs) -> Any:
     """
     Dispatch a method call on a Pine Script variable to the appropriate handler.
 
@@ -72,19 +133,21 @@ def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: in
     It provides the Pine Script-like method calling syntax by routing calls to the correct
     implementation based on the variable type and method name.
 
+    Closure-converted methods need no special handling: the closure transform
+    prepends the closure parameters to the method's signature and inserts the
+    matching arguments BEFORE the receiver at the call site, so the plain
+    positional order already lines up.
+
     :param method: The method to call, either as a string name (for built-in methods) or a callable (for local methods)
     :param var: The object/variable on which the method is being called (e.g., array, matrix, or custom object)
-    :param _closure_vars_count: The number of closure variables to pass to the method
     :param args: Positional arguments to pass to the method
     :param kwargs: Keyword arguments to pass to the method
     :return: The result of the method call, or None if the method cannot be dispatched
     :raises AssertionError: If a string method name is provided but no matching method is found for the variable type
     """
-    global __scope_id__
-
     # If method is a string
     if isinstance(method, str):
-        # Support for builtin methods\
+        # Support for builtin methods
         _method = _get_builtin_method(method, var)
         if _method is not None:
             return _method(var, *args, **kwargs)
@@ -103,19 +166,16 @@ def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: in
         mod = sys.modules.get(type(var).__module__)
         _method = getattr(mod, method, None) if mod is not None else None
         if isinstance(_method, Exported):
-            return (isolate_function(_method, _method_call_id(_method), __scope_id__, _closure_vars_count)
-                    (var, *args, **kwargs))
+            return _bound_method(_method)(var, *args, **kwargs)
         caller_globals = sys._getframe(1).f_globals
         _method = caller_globals.get(method)
         if isinstance(_method, Exported):
-            return (isolate_function(_method, _method_call_id(_method), __scope_id__, _closure_vars_count)
-                    (var, *args, **kwargs))
+            return _bound_method(_method)(var, *args, **kwargs)
         for _gval in caller_globals.values():
             if isinstance(_gval, ModuleType) and _gval.__name__.startswith('lib.'):
                 _method = getattr(_gval, method, None)
                 if isinstance(_method, Exported):
-                    return (isolate_function(_method, _method_call_id(_method), __scope_id__,
-                                             _closure_vars_count)(var, *args, **kwargs))
+                    return _bound_method(_method)(var, *args, **kwargs)
 
         assert False, f'No such method: {var}->{method}'
 
@@ -127,27 +187,6 @@ def method_call(method: str | Callable, var: Any, *args, _closure_vars_count: in
         if _method:
             return _method(var, *args, **kwargs)
 
-        if _closure_vars_count > 0:
-            pre_args = args[-_closure_vars_count:]
-            args = args[:-_closure_vars_count]
-        else:
-            pre_args = ()
-
-        # If not in kwargs, check if the method has closure arguments information on the function itself
-        return (isolate_function(method, _method_call_id(method), __scope_id__, _closure_vars_count)
-                (*pre_args, var, *args, **kwargs))
+        return _bound_method(method)(var, *args, **kwargs)
 
     return None
-
-
-def _method_call_id(func: Callable) -> str:
-    """
-    Build a per-function isolation call id. A constant id would make every method
-    share one isolation cache slot, rebuilding one method's code with another
-    method's (even another module's) globals.
-
-    :param func: The method callable (possibly an Exported proxy)
-    :return: The call id string
-    """
-    target = func.__fn__ if isinstance(func, Exported) else func
-    return f"__method_call__·{getattr(target, '__module__', '?')}.{getattr(target, '__qualname__', '?')}"

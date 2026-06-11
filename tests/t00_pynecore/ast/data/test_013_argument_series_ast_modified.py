@@ -1,24 +1,22 @@
 """
 @pyne
 """
-from pynecore.core.series import SeriesImpl
-__series_main·t·s__ = SeriesImpl()
-__series_t2·s1__ = SeriesImpl()
-__series_t2·s__ = SeriesImpl()
-__series_function_vars__ = {'t2': ('__series_t2·s__', '__series_t2·s1__'), 'main.t': ('__series_main·t·s__',)}
+__pyne_slot_layout__ = {'t2': {'init': (None, None), 'series': ((0, None), (1, None)), 'varip': (), 'children': (), 'names': ('s', 's1')}, 'main·t': {'init': (None,), 'series': ((0, None),), 'varip': (), 'children': (), 'names': ('s',)}}
 
-def t2(s: float, s1: float):
-    s = __series_t2·s__.add(s)
-    s1 = __series_t2·s1__.add(s1)
-    s = __series_t2·s__.set(s + 1)
-    print(s, __series_t2·s__[1], s1, __series_t2·s1__[10])
-    return __series_t2·s__[2]
+def t2(__state__, s: float, s1: float):
+    s = __state__[0].add(s)
+    s1 = __state__[1].add(s1)
+    s = __state__[0].set(s + 1)
+    print(s, __state__[0][1], s1, __state__[1][10])
+    return __state__[0][2]
+t2.__pyne_layout__ = __pyne_slot_layout__['t2']
 
 def main():
 
-    def t(s: float):
-        s = __series_main·t·s__.add(s)
-        s = __series_main·t·s__.set(s + 1)
-        print(s, __series_main·t·s__[1])
+    def t(__state__, s: float):
+        s = __state__[0].add(s)
+        s = __state__[0].set(s + 1)
+        print(s, __state__[0][1])
         return s
+    t.__pyne_layout__ = __pyne_slot_layout__['main·t']
     s: float = 1

@@ -218,17 +218,11 @@ class SecurityTransformer(ast.NodeTransformer):
             ops=[ast.Eq()], comparators=[ast.Constant(value=sec_id)]
         )
 
-    @staticmethod
-    def _scope_id_ref() -> ast.Name:
-        """Build: __scope_id__"""
-        return ast.Name(id='__scope_id__', ctx=ast.Load())
-
     def _signal_block(self, sec_ids: list[str]) -> ast.If:
         """Build chart-context signal block for function start.
 
         Passes actual symbol and timeframe expressions to __sec_signal__
         so that runtime values (e.g., function parameters) are available.
-        Also passes __scope_id__ for call_id-based context disambiguation.
 
         Only includes sec_ids whose symbol/timeframe are module-level
         expressions (constants or lib.* refs). Runtime-dependent signals
@@ -242,7 +236,6 @@ class SecurityTransformer(ast.NodeTransformer):
                         else ast.Constant(value=None))
             args.append(copy.deepcopy(tf_expr) if tf_expr is not None
                         else ast.Constant(value=None))
-            args.append(self._scope_id_ref())
             body.append(ast.Expr(value=self._func_call('__sec_signal__', *args)))
         return ast.If(
             test=self._is_none_check(),
@@ -258,7 +251,6 @@ class SecurityTransformer(ast.NodeTransformer):
                     else ast.Constant(value=None))
         args.append(copy.deepcopy(tf_expr) if tf_expr is not None
                     else ast.Constant(value=None))
-        args.append(self._scope_id_ref())
         return ast.If(
             test=self._is_none_check(),
             body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
@@ -270,9 +262,7 @@ class SecurityTransformer(ast.NodeTransformer):
         return ast.If(
             test=self._is_none_check(),
             body=[
-                ast.Expr(value=self._func_call(
-                    '__sec_wait__', ast.Constant(value=s), self._scope_id_ref()
-                ))
+                ast.Expr(value=self._func_call('__sec_wait__', ast.Constant(value=s)))
                 for s in sec_ids
             ],
             orelse=[]
@@ -301,15 +291,14 @@ class SecurityTransformer(ast.NodeTransformer):
             ),
             body=[
                 ast.Expr(value=self._func_call(
-                    '__sec_write__', ast.Constant(value=sec_id), expression,
-                    self._scope_id_ref()
+                    '__sec_write__', ast.Constant(value=sec_id), expression
                 ))
             ],
             orelse=[]
         )
 
     def _sec_read_call(self, sec_id: str, tuple_len: int | None = None) -> ast.Call:
-        """Build: __sec_read__("sec_id", <default>, __scope_id__)
+        """Build: __sec_read__("sec_id", <default>)
 
         Default is ``lib.na`` for scalar reads, or an N-tuple of ``lib.na``
         when the LHS unpacks the result. Pine `request.security()` returns a
@@ -326,15 +315,13 @@ class SecurityTransformer(ast.NodeTransformer):
                 ctx=ast.Load()
             )
         return self._func_call(
-            '__sec_read__', ast.Constant(value=sec_id), default,
-            self._scope_id_ref()
+            '__sec_read__', ast.Constant(value=sec_id), default
         )
 
     def _sec_read_call_ltf(self, sec_id: str) -> ast.Call:
-        """Build: __sec_read__("sec_id", [], __scope_id__)"""
+        """Build: __sec_read__("sec_id", [])"""
         return self._func_call(
-            '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load()),
-            self._scope_id_ref()
+            '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load())
         )
 
     @staticmethod

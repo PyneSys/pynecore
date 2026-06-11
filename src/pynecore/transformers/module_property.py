@@ -12,14 +12,11 @@ class ModulePropertyTransformer(ast.NodeTransformer):
         - Leave variables as is
     If not in config:
         - Use callable() check
-    Skip transformation inside isolate_function arguments.
     """
 
     def __init__(self):
         # Structure: module -> name -> {"type": "property"|"variable"}
         self.module_info: dict[str, dict[str, dict[str, Any]]] = {}
-        # Track if we're inside isolate_function args
-        self.in_isolate_function = False
 
         # Load config
         try:
@@ -30,15 +27,9 @@ class ModulePropertyTransformer(ast.NodeTransformer):
 
     def visit(self, node: ast.AST) -> ast.AST:
         """
-        Override the generic visit method to:
-        1. Set .parent on each child node for chain detection
-        2. Track isolate_function context
+        Override the generic visit method to set .parent on each child node
+        for chain detection.
         """
-        # Check if entering isolate_function call
-        is_isolate_call = (isinstance(node, ast.Call) and
-                           isinstance(node.func, ast.Name) and
-                           node.func.id == 'isolate_function')
-
         # Set parent on children
         for field, value in ast.iter_fields(node):
             if isinstance(value, ast.AST):
@@ -48,23 +39,11 @@ class ModulePropertyTransformer(ast.NodeTransformer):
                     if isinstance(item, ast.AST):
                         setattr(item, "parent", node)
 
-        # Handle isolate_function context
-        if is_isolate_call:
-            old_context = self.in_isolate_function
-            self.in_isolate_function = True
-            result = super().visit(node)
-            self.in_isolate_function = old_context
-            return result
-
         return super().visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        """Process attribute access, but skip if inside isolate_function args or type annotations."""
+        """Process attribute access, but skip if inside type annotations."""
         node = cast(ast.Attribute, self.generic_visit(node))
-
-        # Skip if inside isolate_function
-        if self.in_isolate_function:
-            return node
 
         # Skip if inside type annotations
         if self._is_in_type_annotation(node):

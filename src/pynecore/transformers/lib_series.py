@@ -177,21 +177,12 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
                 if len(attr_chain) >= 2 and attr_chain[1] in NON_SERIES_LIB_ATTRS:
                     return self.generic_visit(node)
 
-                # Use the complete chain after 'lib'
+                # Use the complete chain after 'lib'. The declaration of a
+                # builtin price series is anchored in the outermost function
+                # (see process_series_usage); a nested reference resolves to
+                # that scope's series slot through the SeriesTransformer's
+                # scope-chain lookup, so the local name is always enough here.
                 local_name = self.process_series_usage('lib', attr_chain[1:])
-
-                # Determine if this is a builtin price series in a nested function
-                # In that case, we need to use the global series name directly
-                # because the local variable is a scalar (from .add() return value)
-                is_builtin_price = len(attr_chain) == 2 and attr_chain[1] in BUILTIN_PRICE_SERIES
-
-                if is_builtin_price and self.parent_functions:
-                    # Use the global series name directly (follows SeriesTransformer convention)
-                    target_function = self.parent_functions[0]
-                    global_series_name = f'__series_{target_function}·{local_name}__'
-                    node.value = cast(ast.expr, ast.Name(id=global_series_name, ctx=ast.Load()))
-                else:
-                    # Normal case: use the local variable name
-                    node.value = cast(ast.expr, ast.Name(id=local_name, ctx=ast.Load()))
+                node.value = cast(ast.expr, ast.Name(id=local_name, ctx=ast.Load()))
 
         return self.generic_visit(node)

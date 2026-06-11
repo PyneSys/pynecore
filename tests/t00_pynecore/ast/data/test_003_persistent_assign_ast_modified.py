@@ -1,14 +1,11 @@
 """
 @pyne
 """
-__persistent_main·p1__ = 1
-__persistent_main·p2__ = None
-__persistent_main·p2___initialized__ = False
-__persistent_function_vars__ = {'main': ('__persistent_main·p1__', '__persistent_main·p2__', '__persistent_main·p2___initialized__')}
+__pyne_slot_layout__ = {'main': {'init': (1, None, False), 'series': (), 'varip': (), 'children': (), 'names': ('p1', 'p2', 'p2·flag')}}
 
-def main():
-    global __persistent_main·p2__, __persistent_main·p2___initialized__
-    if not __persistent_main·p2___initialized__:
-        __persistent_main·p2__ = __persistent_main·p1__ + 1
-        __persistent_main·p2___initialized__ = True
-    print(__persistent_main·p2__)
+def main(__state__):
+    if not __state__[2]:
+        __state__[1] = __state__[0] + 1
+        __state__[2] = True
+    print(__state__[1])
+main.__pyne_layout__ = __pyne_slot_layout__['main']
