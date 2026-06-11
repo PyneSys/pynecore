@@ -427,6 +427,18 @@ def security_process_main(
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
 
+    # noinspection PyProtectedMember
+    def _run_script_main():
+        """Mirror the chart's ``_run_libs_and_main``: registered library mains
+        initialize their exported-function proxies, so they must run before the
+        script's ``main()`` on every bar — otherwise a script that calls an
+        imported library function dies here with "Exported proxy has not been
+        initialized". ``lib._lib_semaphore`` stays True for both (every side
+        effect is suppressed in a security child)."""
+        for _title, _lib_main in script_mod._registered_libraries:
+            _lib_main()
+        script_module.main()
+
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")
     if security_log_path:
@@ -549,7 +561,7 @@ def security_process_main(
                     if snap is not None:
                         snap.save()
 
-                script_module.main()
+                _run_script_main()
 
                 data_ready_event.set()
                 done_event.set()
@@ -601,7 +613,7 @@ def security_process_main(
                 barstate.islastconfirmedhistory = False
                 barstate.isnew = is_new_closed_period
 
-                script_module.main()
+                _run_script_main()
 
                 # Snapshot AFTER the closed run completes — baseline for
                 # subsequent developing iterations of the next HTF period.
@@ -675,7 +687,7 @@ def security_process_main(
                     barstate.ishistory = False
                     barstate.isrealtime = True
 
-                script_module.main()
+                _run_script_main()
 
                 current_bar += 1
                 bars_run = True

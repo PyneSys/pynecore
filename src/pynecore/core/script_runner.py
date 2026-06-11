@@ -1071,10 +1071,14 @@ class ScriptRunner:
                         # spawned.
                         no_process_ids.add(sid)
 
-                # Lazy spawn callback for static contexts
+                # Lazy spawn callback for static contexts. The ``sec_processes``
+                # check makes it safe to call after the deferred resolver too —
+                # a deferred context spawns its process inside ``_deferred_resolve``,
+                # and spawning it again would leak a duplicate child.
                 def _lazy_spawn(sid: str):
                     resolved_path = sec_ohlcv_paths.get(sid)
-                    if resolved_path is not None and sid not in no_process_ids:
+                    if (resolved_path is not None and sid not in no_process_ids
+                            and sid not in sec_processes):
                         _spawn_security_process(sid, resolved_path)
 
                 # Eager-spawn auto-rate-source contexts. These hidden
@@ -1134,7 +1138,12 @@ class ScriptRunner:
                     lazy_spawn_fn=_lazy_spawn if static_contexts else None,
                     same_context_ids=same_ctx_ref,
                     no_process_ids=no_process_ids,
-                    result_blocks=sec_result_blocks if same_context_ids else None,
+                    # Unconditional: ``same_context_ids`` can gain members AFTER setup
+                    # (a deferred context resolving to the chart's own symbol+TF), and
+                    # ``__sec_write__`` no-ops on ``result_blocks=None`` — gating on the
+                    # set being non-empty here would leave such a context's
+                    # ``data_ready`` forever unset and deadlock its ``__sec_read__``.
+                    result_blocks=sec_result_blocks,
                     currency_conversions=currency_conversions or None,
                     sec_processes=sec_processes,
                     auto_rate_sec_ids=auto_rate_sec_ids,
