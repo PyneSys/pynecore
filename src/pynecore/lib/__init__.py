@@ -31,7 +31,11 @@ from ._fixnan import fixnan
 from pynecore.core.overload import overload
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError
-from ..core.resampler import Resampler
+from ..core.resampler import (
+    Resampler, grid_mode as _grid_mode, overnight_opens as _overnight_opens,
+    trading_day as _trading_day, trading_day_open_sec as _trading_day_open_sec,
+    scheduled_day_ordinal as _scheduled_day_ordinal, first_monday as _first_monday,
+)
 
 __all__ = [
     # Other modules
@@ -556,6 +560,260 @@ def _intraday_session_args(timeframe: str) -> tuple:
     return tz, session_starts
 
 
+# Multi-period (nD/nW/nM) scheduled-grid tracker. TradingView counts scheduled
+# trading days per exchange calendar with a year-reset counter (see the
+# ``core.resampler`` module docs). 'calendar' (24/7) and 'weekday' (FX) grids
+# are pure arithmetic; 'observed' symbols (exchange-listed) count the actual
+# trading days streamed through the chart, which realizes TradingView's
+# holiday calendar. The tracker is fed from ``_set_lib_properties`` with a
+# single integer compare per bar (``_dg_next_roll``); the heavy path runs once
+# per trading day. It only activates for 'observed' symbols on charts of at
+# most daily resolution — everything else resolves arithmetically on demand.
+_dg_next_roll: float = 0.0  # epoch-sec threshold of the next possible day roll
+_dg_mode: str = ''
+_dg_eff: int = 0  # bar open -> last instant offset in seconds (intraday charts)
+_dg_tz = None
+_dg_overnight: dict = {}
+_dg_template: list | None = None  # identity guard, like the _ttd machinery
+_dg_day = None  # current trading day (datetime.date)
+_dg_ordinal: int = 0  # observed-day ordinal within the year
+_dg_day_starts: dict[int, dict[int, int]] = {}  # year -> {ordinal: bar-open ms}
+_dg_ord_by_day: dict = {}  # date -> ordinal (current + previous year)
+_dg_week_first: dict[tuple[int, int], int] = {}  # (monday-year, week ordinal) -> ms
+_dg_month_first: dict[tuple[int, int], int] = {}  # (year, month) -> first bar ms
+
+
+def _dg_reset() -> None:
+    """Reset the scheduled-grid tracker (new run / new script)."""
+    global _dg_next_roll, _dg_mode, _dg_eff, _dg_template, _dg_day
+    _dg_next_roll = 0.0
+    _dg_mode = ''
+    _dg_eff = 0
+    _dg_template = None
+    _dg_day = None
+    _dg_day_starts.clear()
+    _dg_ord_by_day.clear()
+    _dg_week_first.clear()
+    _dg_month_first.clear()
+
+
+# noinspection PyProtectedMember
+def _dg_on_roll(ts: float) -> None:
+    """
+    Advance the observed-day tracker to the bar at ``ts`` (epoch seconds).
+
+    Only called when a bar reaches ``_dg_next_roll`` — i.e. at most once per
+    trading day, plus once at configuration time. A bar belongs to the trading
+    day its *last* instant falls into (``_dg_eff`` offset): on intraday charts
+    the bar containing the session open starts the new day even when its own
+    timestamp precedes the open.
+
+    :param ts: Current bar open in epoch seconds
+    """
+    global _dg_next_roll, _dg_mode, _dg_eff, _dg_tz, _dg_overnight, \
+        _dg_template, _dg_day, _dg_ordinal
+
+    opening_hours = syminfo._opening_hours
+    if opening_hours is not _dg_template:
+        # (Re)configure from the symbol template
+        _dg_template = opening_hours
+        _dg_mode = _grid_mode(getattr(syminfo, 'type', None), opening_hours)
+        tz_name = getattr(syminfo, 'timezone', None)
+        _dg_tz = _parse_timezone(tz_name) if tz_name else None
+        _dg_overnight = _overnight_opens(opening_hours, syminfo._session_starts)
+        try:
+            chart_sec = timeframe_module.in_seconds(str(syminfo.period))
+            chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
+        except (ValueError, AssertionError):
+            chart_sec = 0
+            chart_mod = None
+        if _dg_mode != 'observed' or not 0 < chart_sec <= 86_400:
+            # Arithmetic grids need no tracking, and day counting needs a
+            # stream of at most daily bars
+            _dg_next_roll = _math.inf
+            return
+        _dg_eff = chart_sec - 1 if chart_mod in ('', 'S') else 0
+        _dg_day = None
+        _dg_day_starts.clear()
+        _dg_ord_by_day.clear()
+        _dg_week_first.clear()
+        _dg_month_first.clear()
+
+    eff = ts + _dg_eff
+    td = _trading_day(eff, _dg_tz, _dg_overnight)
+    prev = _dg_day
+    if td != prev:
+        if prev is None:
+            # Mid-year data start: the trading days between Jan 1 and the
+            # window are not observable — seed the counter from the weekday
+            # grid (exact when the data begins at the year's first session)
+            _dg_ordinal = _scheduled_day_ordinal(td, 'weekday')
+        elif td.year != prev.year:
+            _dg_ordinal = 0
+            # Keep only the current and previous year's records
+            for y in [y for y in _dg_day_starts if y < td.year - 1]:
+                del _dg_day_starts[y]
+            for d in [d for d in _dg_ord_by_day if d.year < td.year - 1]:
+                del _dg_ord_by_day[d]
+            for k in [k for k in _dg_week_first if k[0] < td.year - 1]:
+                del _dg_week_first[k]
+            for k in [k for k in _dg_month_first if k[0] < td.year - 1]:
+                del _dg_month_first[k]
+        else:
+            _dg_ordinal += 1
+        _dg_day = td
+
+        ms = int(ts * 1000)
+        _dg_day_starts.setdefault(td.year, {})[_dg_ordinal] = ms
+        _dg_ord_by_day[td] = _dg_ordinal
+        monday = td - timedelta(days=td.weekday())
+        week = (monday - _first_monday(monday.year)).days // 7
+        _dg_week_first.setdefault((monday.year, week), ms)
+        _dg_month_first.setdefault((td.year, td.month), ms)
+
+    # Next possible roll: the first chart bar whose span reaches a scheduled
+    # session open. Scheduled opens exist even on holidays — a threshold on a
+    # dataless day is harmless, the next real bar recomputes its trading day
+    # from scratch.
+    for i in range(1, 8):
+        open_sec = _trading_day_open_sec(
+            td + timedelta(days=i), _dg_tz, syminfo._session_starts, _dg_overnight)
+        if open_sec > eff:
+            _dg_next_roll = open_sec - _dg_eff
+            break
+    else:
+        _dg_next_roll = ts + 86_400
+
+
+def _dwm_change_key(timeframe: str, modifier: str, multiplier: int) -> int:
+    """
+    Period identity of the current bar on a multi-period (nD/nW/nM) grid —
+    the ``timeframe.change`` helper. Kept here so the transformed
+    ``_timeframe_change`` module only makes single-attribute ``lib.*`` calls.
+
+    :param timeframe: The requested timeframe string
+    :param modifier: 'D', 'W' or 'M' (from ``_process_tf``)
+    :param multiplier: Period multiplier (> 1)
+    :return: The period's opening time in milliseconds
+    """
+    return _dwm_bar_time(
+        Resampler.get_resampler(timeframe), modifier, multiplier, _time)
+
+
+def _chart_span_off_ms() -> int:
+    """
+    Offset from a chart bar's open to its last instant, in milliseconds.
+
+    A chart bar belongs to the D/W/M period its *last* instant falls into: the
+    bar containing a session open is the new trading day's first bar even when
+    its own timestamp precedes the open (e.g. a 17:05 session open on a
+    240-minute grid — the 17:00 bar starts the new day). D/W/M chart bars are
+    session-aligned by construction, so only intraday charts need the offset.
+
+    :return: ``chart bar span - 1`` for intraday chart periods, else 0
+    """
+    try:
+        # noinspection PyProtectedMember
+        chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
+        if chart_mod in ('', 'S'):
+            return timeframe_module.in_seconds(str(syminfo.period)) * 1000 - 1
+    except (ValueError, AssertionError):
+        pass
+    return 0
+
+
+def _dg_trading_day():
+    """
+    The current bar's trading day (``datetime.date``).
+
+    Uses the tracker's record when it is active ('observed' symbols on at most
+    daily charts); otherwise derives it from ``_datetime`` — the bar's
+    exchange-local datetime — advanced to the bar's last instant
+    (:func:`_chart_span_off_ms`), with the overnight roll (a bar reaching its
+    weekday's overnight open belongs to the next calendar day). The tracker's
+    configuration pass runs on the first bar of every run, so
+    ``_dg_overnight`` is populated whenever real data is streaming.
+
+    :return: Trading day of the current bar
+    """
+    if _dg_day is not None:
+        return _dg_day
+    dt_loc = _datetime
+    off = _chart_span_off_ms()
+    if off:
+        dt_loc = dt_loc + timedelta(milliseconds=off)
+    d = dt_loc.date()
+    if _dg_overnight:
+        t0 = _dg_overnight.get(dt_loc.weekday())
+        if t0 is not None and dt_loc.time() >= t0:
+            d += timedelta(days=1)
+    return d
+
+
+# noinspection PyProtectedMember
+def _dwm_bar_time(resampler: Resampler, modifier: str, multiplier: int,
+                  current_time_ms: int) -> int:
+    """
+    Multi-period (nD/nW/nM) bar open time on the scheduled grid.
+
+    'calendar'/'weekday' symbols resolve arithmetically; 'observed' symbols
+    look up the tracker's records and fall back to the weekday grid for
+    timestamps outside the tracked window (pre-data or future times).
+
+    ``current_time_ms`` is a chart bar open; the bar is resolved by its *last*
+    instant (:func:`_chart_span_off_ms`), so the bar containing a session open
+    counts as the new trading day's first bar.
+
+    :param resampler: Resampler of the requested timeframe
+    :param modifier: 'D', 'W' or 'M'
+    :param multiplier: Period multiplier (> 1)
+    :param current_time_ms: Chart bar open to resolve, in milliseconds
+    :return: Bar opening time in milliseconds
+    """
+    eff_ms = current_time_ms + _chart_span_off_ms()
+    if _dg_mode != 'observed' or _dg_next_roll == _math.inf:
+        # Pure arithmetic — also the fallback when the tracker is inactive
+        # (chart resolution above daily)
+        return resampler.get_bar_time(
+            eff_ms, _dg_tz, syminfo._session_starts,
+            syminfo._opening_hours, _dg_mode or None)
+
+    if current_time_ms == _time and _dg_day is not None:
+        td = _dg_day
+    else:
+        td = _trading_day(eff_ms // 1000, _dg_tz, _dg_overnight)
+
+    if modifier == 'D':
+        ordinal = _dg_ord_by_day.get(td)
+        if ordinal is not None:
+            base = (ordinal // multiplier) * multiplier
+            days = _dg_day_starts.get(td.year)
+            if days is not None:
+                for i in range(base, ordinal + 1):
+                    ms = days.get(i)
+                    if ms is not None:
+                        return ms
+    elif modifier == 'W':
+        monday = td - timedelta(days=td.weekday())
+        week = (monday - _first_monday(monday.year)).days // 7
+        base = (week // multiplier) * multiplier
+        for i in range(base, week + 1):
+            ms = _dg_week_first.get((monday.year, i))
+            if ms is not None:
+                return ms
+    else:  # 'M'
+        m0 = ((td.month - 1) // multiplier) * multiplier + 1
+        for m in range(m0, td.month + 1):
+            ms = _dg_month_first.get((td.year, m))
+            if ms is not None:
+                return ms
+
+    # Outside the tracked window — weekday-grid approximation
+    return resampler.get_bar_time(
+        eff_ms, _dg_tz, syminfo._session_starts,
+        syminfo._opening_hours, 'weekday')
+
+
 @module_property
 def time(timeframe: str | None = None, session: str | int | None = None,
          timezone: str | None = None, bars_back: int = 0) -> PyneInt:
@@ -610,7 +868,17 @@ def time(timeframe: str | None = None, session: str | int | None = None,
             current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
         except (ValueError, AssertionError):
             return NA(int)
-    bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+    # noinspection PyProtectedMember
+    modifier, multiplier = timeframe_module._process_tf(timeframe)
+    if modifier in ('D', 'W', 'M') and multiplier > 1:
+        # noinspection PyProtectedMember
+        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
+            # The chart's own bars are the requested grid
+            bar_time = current_time_ms
+        else:
+            bar_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
+    else:
+        bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     if session is None:
         # No session specified, return the bar time
@@ -795,7 +1063,16 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
             current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
         except (ValueError, AssertionError):
             return NA(int)
-    bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+    # noinspection PyProtectedMember
+    modifier, multiplier = timeframe_module._process_tf(timeframe)
+    if modifier in ('D', 'W', 'M') and multiplier > 1:
+        # noinspection PyProtectedMember
+        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
+            bar_start_time = current_time_ms
+        else:
+            bar_start_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
+    else:
+        bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
     # Calculate bar close time by adding timeframe duration
     try:

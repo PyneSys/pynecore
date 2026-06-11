@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from multiprocessing import Event, Lock
+from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -99,6 +100,20 @@ class SecurityState:
     session_starts: 'list[SymInfoSession] | None' = None
     session_tz: ZoneInfo | None = None
 
+    # Multi-period (nD/nW/nM) confirmation (chart-side). The child's data file
+    # realizes the scheduled grid exactly (TradingView's holiday calendar
+    # included — see the ``resampler`` module docs), so the chart walks the
+    # child's actual bar opens with a monotonic pointer instead of recomputing
+    # boundaries arithmetically. Populated by ``load_multiperiod_boundaries``
+    # at child spawn. ``chart_off`` resolves a chart bar by its last instant
+    # (the bar containing a session open is the new period's first bar);
+    # ``sec_grid_args`` are the security's own (tz, session_starts,
+    # opening_hours, mode) for the past-end-of-data fallback grid.
+    bar_opens: list[int] | None = None
+    bar_ptr: int = -1
+    chart_off: int = 0
+    sec_grid_args: tuple | None = None
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     prev_chart_time: int | None = None
@@ -112,7 +127,9 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
 
     For same timeframe: every chart bar is a confirmed bar (return chart_time).
     For HTF: a period is confirmed only when a NEW period starts — the previous
-    period's opening time is returned (lookahead_off semantics).
+    period's opening time is returned (lookahead_off semantics). Multi-period
+    (nD/nW/nM) timeframes walk the child's actual bar opens (see
+    ``SecurityState.bar_opens``); other timeframes compare resampler periods.
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
@@ -121,12 +138,35 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     if state.same_timeframe:
         return chart_time
 
+    resampler = state.resampler
+    assert resampler is not None
+
+    if state.bar_opens is not None:
+        # Multi-period: advance the pointer to the child bar the chart is in;
+        # entering bar ``ptr`` closes every bar before it
+        opens = state.bar_opens
+        eff = chart_time + state.chart_off
+        ptr = state.bar_ptr
+        n = len(opens)
+        advanced = False
+        while ptr + 1 < n and opens[ptr + 1] <= eff:
+            ptr += 1
+            advanced = True
+        state.bar_ptr = ptr
+        if advanced and ptr >= 1:
+            return opens[ptr - 1]
+        if n and ptr == n - 1 and state.sec_grid_args is not None:
+            # The chart marched past the child's last bar: no child bar
+            # realizes the next period, so the arithmetic grid decides when
+            # the last bar is closed
+            sec_tz, ss, oh, mode = state.sec_grid_args
+            if resampler.get_bar_time(eff, sec_tz, ss, oh, mode) > opens[-1]:
+                return opens[-1]
+        return state.last_confirmed
+
     prev_chart_time = state.prev_chart_time
     if prev_chart_time is None:
         return state.last_confirmed
-
-    resampler = state.resampler
-    assert resampler is not None
     if state.session_starts is not None:
         # Off-grid intraday session → anchor HTF bars to the session open,
         # using the security's own exchange timezone.
@@ -418,6 +458,52 @@ def resolve_session_anchor(
     return None, None
 
 
+def load_multiperiod_boundaries(state: SecurityState, data_path: str) -> None:
+    """
+    Load the child's bar opens for multi-period (nD/nW/nM) confirmation.
+
+    No-op for any other timeframe. The child's data file realizes the
+    scheduled grid exactly (TradingView's holiday calendar included), so
+    ``_get_confirmed_time`` walks these opens with a monotonic pointer instead
+    of recomputing the boundaries arithmetically. The security's own grid
+    parameters are loaded from its TOML for the past-end-of-data fallback.
+
+    :param state: Security context state (``state.timeframe`` already resolved)
+    :param data_path: Path to the child's OHLCV data file
+    """
+    # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle.
+    from ..lib import timeframe as tf_module
+    # noinspection PyProtectedMember
+    modifier, multiplier = tf_module._process_tf(state.timeframe)
+    if modifier not in ('D', 'W', 'M') or multiplier <= 1:
+        return
+
+    from .ohlcv_file import OHLCVReader
+    from .resampler import grid_mode
+    from .syminfo import SymInfo
+
+    with OHLCVReader(data_path) as reader:
+        start_ts = reader.start_timestamp
+        opens = ([] if start_ts is None else
+                 [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
+    state.bar_opens = opens
+    state.bar_ptr = -1
+
+    sec_tz: ZoneInfo | None = state.tz
+    sec_starts = sec_hours = mode = None
+    toml_path = Path(data_path).with_suffix('.toml')
+    if toml_path.exists():
+        si = SymInfo.load_toml(toml_path)
+        try:
+            sec_tz = parse_timezone(si.timezone) if si.timezone else state.tz
+        except (ValueError, KeyError):
+            sec_tz = state.tz
+        sec_starts = si.session_starts or None
+        sec_hours = si.opening_hours or None
+        mode = grid_mode(si.type, si.opening_hours)
+    state.sec_grid_args = (sec_tz, sec_starts, sec_hours, mode)
+
+
 def setup_security_states(
     contexts: dict[str, dict],
     chart_timeframe: str,
@@ -437,7 +523,17 @@ def setup_security_states(
     :return: (states, sync_block, result_blocks)
     """
     from pynecore.lib import barmerge
+    from pynecore.lib import timeframe as tf_module
     from .resampler import Resampler
+
+    # Chart bar open -> last instant offset: multi-period boundaries resolve a
+    # chart bar by the instant it ends at, so the bar containing a session
+    # open counts as the new period's first bar. D/W/M chart bars are
+    # session-aligned by construction and need no offset.
+    # noinspection PyProtectedMember
+    chart_mod, _ = tf_module._process_tf(chart_timeframe)
+    chart_off = (tf_module.in_seconds(chart_timeframe) * 1000 - 1
+                 if chart_mod in ('', 'S') else 0)
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)
@@ -482,6 +578,7 @@ def setup_security_states(
             is_ltf=is_ltf,
             session_starts=anchor_starts,
             session_tz=anchor_tz,
+            chart_off=chart_off,
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()

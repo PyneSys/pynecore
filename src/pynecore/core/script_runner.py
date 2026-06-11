@@ -131,6 +131,11 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, tz)
     lib._time = lib.last_bar_time = int(ohlcv.timestamp * 1000)  # PineScript representation of time
 
+    # Multi-period scheduled-grid tracker (lib._dg_*): one compare per bar,
+    # the roll path runs at most once per trading day
+    if ohlcv.timestamp >= lib._dg_next_roll:
+        lib._dg_on_roll(ohlcv.timestamp)
+
 
 # noinspection PyUnusedLocal
 def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
@@ -192,6 +197,7 @@ def _reset_lib_vars(lib: ModuleType):
 
     lib.extra_fields = {}
     lib._lib_semaphore = False
+    lib._dg_reset()
 
     lib.barstate.isfirst = True
     lib.barstate.islast = False
@@ -213,7 +219,8 @@ class ScriptRunner:
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
-                 '_script_path', '_security_data', '_magnifier_iter', '_round_decimals')
+                 '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
+                 '_round_decimals')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -222,7 +229,8 @@ class ScriptRunner:
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  inputs: dict[str, Any] | None = None,
                  security_data: dict[str, str | Path] | None = None,
-                 magnifier_iter: Iterable[OHLCV] | None = None):
+                 magnifier_iter: Iterable[OHLCV] | None = None,
+                 magnifier_source_tf: str | None = None):
         """
         Initialize the script runner
 
@@ -244,6 +252,9 @@ class ScriptRunner:
         :param magnifier_iter: Optional sub-timeframe OHLCV iterator for bar magnifier mode.
                                When provided with use_bar_magnifier=true, order fills are checked
                                against each sub-bar for more accurate backtesting.
+        :param magnifier_source_tf: Timeframe string of the ``magnifier_iter`` data —
+                               multi-period (nD/nW/nM) chart timeframes resolve a sub-bar
+                               by its last instant (see the ``resampler`` module docs).
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -251,6 +262,7 @@ class ScriptRunner:
         self._script_path = script_path
         self._security_data = security_data or {}
         self._magnifier_iter = magnifier_iter
+        self._magnifier_source_tf = magnifier_source_tf
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -446,6 +458,7 @@ class ScriptRunner:
                 from .security import (
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory,
+                    load_multiperiod_boundaries,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -506,6 +519,9 @@ class ScriptRunner:
 
                 def _spawn_security_process(sid: str, data_path: str):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    # Multi-period (nD/nW/nM) contexts confirm boundaries by
+                    # walking the child's actual bar opens (no-op otherwise)
+                    load_multiperiod_boundaries(sec_state, data_path)
                     proc = Process(
                         target=security_process_main,
                         args=(
@@ -646,7 +662,10 @@ class ScriptRunner:
                     from .bar_magnifier import BarMagnifier
                     chart_tf = str(lib.syminfo.period)
                     magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
-                                             session_starts=self.syminfo.session_starts)
+                                             session_starts=self.syminfo.session_starts,
+                                             opening_hours=self.syminfo.opening_hours,
+                                             sym_type=self.syminfo.type,
+                                             source_tf=self._magnifier_source_tf)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
             # Peek-ahead pattern: look one step ahead to detect the last bar accurately
@@ -932,7 +951,10 @@ class ScriptRunner:
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
         magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
-                                 session_starts=self.syminfo.session_starts)
+                                 session_starts=self.syminfo.session_starts,
+                                 opening_hours=self.syminfo.opening_hours,
+                                 sym_type=self.syminfo.type,
+                                 source_tf=self._magnifier_source_tf)
 
         trade_num = 0
 

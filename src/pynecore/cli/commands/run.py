@@ -285,6 +285,7 @@ def run(
 
     # Validate and process --timeframe option
     magnifier_mode = False
+    magnifier_source_tf: str | None = None
     if timeframe:
         chart_tf: str = timeframe.upper()
         try:
@@ -304,6 +305,7 @@ def run(
             # Override syminfo period to the chart timeframe
             syminfo.period = chart_tf
             magnifier_mode = True  # Will be checked against script.use_bar_magnifier later
+            magnifier_source_tf = data_tf
 
     # Open data file
     with OHLCVReader(data) as reader:
@@ -379,7 +381,8 @@ def run(
                 runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                       plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                       security_data=security_data,
-                                      magnifier_iter=magnifier_iter)
+                                      magnifier_iter=magnifier_iter,
+                                      magnifier_source_tf=magnifier_source_tf)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:

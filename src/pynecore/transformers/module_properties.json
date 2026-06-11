@@ -3243,9 +3243,6 @@
     "TYPE_CHECKING": {
       "type": "variable"
     },
-    "UTC": {
-      "type": "variable"
-    },
     "change": {
       "type": "variable"
     },

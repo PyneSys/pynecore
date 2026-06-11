@@ -230,3 +230,49 @@ def __test_aggregate_session_anchored__():
     assert [c.timestamp for c in result] == [ts(9, 30), ts(10, 30)]
     assert result[0].volume == pytest.approx(3.0)   # 1 + 2
     assert result[1].volume == pytest.approx(7.0)   # 3 + 4
+
+
+def __test_aggregate_observed_holiday_grouping__():
+    """'Observed' symbols group by trading days present — holidays consume no slot."""
+    from datetime import datetime, time, timedelta, date
+    from zoneinfo import ZoneInfo
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+
+    ny = ZoneInfo("America/New_York")
+    t17 = time(17, 0)
+    hours = [SymInfoInterval(day=d, start=t17, end=t17) for d in (6, 0, 1, 2, 3)]
+    starts = [SymInfoSession(day=d, time=t17) for d in (6, 0, 1, 2, 3)]
+
+    def open_ts(trading_day: date) -> int:
+        prev = trading_day - timedelta(days=1)
+        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp())
+
+    # Two weeks of daily bars; Mon Jan 13 2025 is a holiday (no bar)
+    days = [date(2025, 1, d) for d in (6, 7, 8, 9, 10, 14, 15, 16, 17)]
+    candles = [
+        OHLCV(timestamp=open_ts(d), open=10.0, high=11.0, low=9.0, close=10.5,
+              volume=float(i + 1))
+        for i, d in enumerate(days)
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "src.ohlcv"
+        target = Path(tmp) / "tgt.ohlcv"
+        _create_ohlcv_file(source, candles)
+        aggregate_ohlcv(source, target, "2D", tz=ny, session_starts=starts,
+                        opening_hours=hours, sym_type='futures', source_tf='1D')
+        result = _read_all(target)
+
+    # Jan 6 is weekday ordinal 3 (odd), so it pairs with the dataless Jan 5
+    # slot; afterwards the observed days pair up — the Jan 13 holiday consumes
+    # no slot, so Jan 14+15 and Jan 16+17 group together (TradingView grid)
+    expected_groups = [
+        [date(2025, 1, 6)],
+        [date(2025, 1, 7), date(2025, 1, 8)],
+        [date(2025, 1, 9), date(2025, 1, 10)],
+        [date(2025, 1, 14), date(2025, 1, 15)],
+        [date(2025, 1, 16), date(2025, 1, 17)],
+    ]
+    assert [c.timestamp for c in result] == [open_ts(g[0]) for g in expected_groups]
+    expected_vols = [sum(float(days.index(d) + 1) for d in g) for g in expected_groups]
+    assert [c.volume for c in result] == pytest.approx(expected_vols)
