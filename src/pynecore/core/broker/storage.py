@@ -36,9 +36,11 @@ update orders + delete order_refs + insert events) runs in a single
 ``BEGIN IMMEDIATE ... COMMIT`` block. No half-written state, no
 half-lost log.
 """
+import contextlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -355,11 +357,18 @@ class BrokerStore:
         self._path = Path(path)
         self._plugin_name = plugin_name
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # The connection is shared by the run thread and the broker
+        # event-loop thread (``check_same_thread=False``). ``sqlite3``'s
+        # implicit-transaction state is connection-global, so every
+        # BEGIN…COMMIT span must be serialized through this re-entrant
+        # lock — see :meth:`transaction`.
+        self._lock = threading.RLock()
         # ``isolation_level=""`` = default; we open explicit transactions
-        # via ``with conn:`` blocks. The sqlite3 module's autocommit
-        # mode is not what it looks like at first glance — the default
-        # behaviour is to start an implicit BEGIN before DML and close
-        # it on the next commit. That fits our needs.
+        # via :meth:`transaction` (which wraps ``with conn:``). The
+        # sqlite3 module's autocommit mode is not what it looks like at
+        # first glance — the default behaviour is to start an implicit
+        # BEGIN before DML and close it on the next commit. That fits our
+        # needs.
         # noinspection PyTypeChecker
         self._conn: sqlite3.Connection = sqlite3.connect(
             str(self._path),
@@ -384,6 +393,27 @@ class BrokerStore:
         # 5 s wait on lock collision — rare with a single writer, but
         # parallel debug-CLI invocations can trigger it.
         self._conn.execute("PRAGMA busy_timeout=5000")
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Serialized write transaction over the shared connection.
+
+        The connection is shared by the run thread (per-bar
+        :meth:`OrderSyncEngine.sync` → ``record_envelope`` etc.) and the
+        broker event-loop thread (``watch_orders`` PUSH events →
+        ``log_event`` / ``upsert_order`` / ``set_filled``). ``sqlite3``'s
+        implicit-transaction state is connection-global: two overlapping
+        ``with conn:`` blocks let one thread's COMMIT close the other's
+        transaction, so the late COMMIT raises ``OperationalError: cannot
+        commit - no transaction is active``. The re-entrant lock makes
+        each BEGIN…COMMIT span mutually exclusive across the two threads.
+
+        Standalone reads need no lock: SQLite's default serialized
+        threading mode guards the connection, and a read opens no
+        transaction, so it can neither corrupt nor mis-commit.
+        """
+        with self._lock, self._conn:
+            yield self._conn
 
     # --- Lifecycle ---------------------------------------------------------
 
@@ -454,7 +484,7 @@ class BrokerStore:
         run_tag = identity.make_run_tag(script_source)
         now = _now_ms()
 
-        with self._conn:
+        with self.transaction():
             # (1) Stale cleanup — close every expired live row
             self._cleanup_stale_runs_inside_tx(now=now)
 
@@ -515,7 +545,7 @@ class BrokerStore:
     ) -> int:
         """Re-point live orders + refs from previous instances onto the new one.
 
-        Caller owns the surrounding ``with self._conn`` block. Idempotent
+        Caller owns the surrounding :meth:`transaction` block. Idempotent
         for an empty input (no orphan rows → no-op). Every adopted COID
         gets a per-row ``order_adopted`` audit event tied to the new
         ``run_instance_id`` (the new owner), with a payload carrying the
@@ -684,7 +714,7 @@ class BrokerStore:
         :return: Number of rows closed.
         """
         now = _now_ms()
-        with self._conn:
+        with self.transaction():
             return self._cleanup_stale_runs_inside_tx(
                 now=now, stale_threshold_ms=stale_threshold_ms,
             )
@@ -692,11 +722,11 @@ class BrokerStore:
     def _cleanup_stale_runs_inside_tx(
             self, *, now: int, stale_threshold_ms: int = STALE_THRESHOLD_MS,
     ) -> int:
-        """Stale-cleanup inside a transaction. Caller owns the ``with self._conn``.
+        """Stale-cleanup inside a transaction. Caller owns the :meth:`transaction` block.
 
         Split from the public ``cleanup_stale_runs`` because
         ``open_run`` calls this inside an already-open transaction — a
-        nested ``with self._conn`` would open a block savepoint, adding
+        nested :meth:`transaction` would open a block savepoint, adding
         complexity for no benefit here.
         """
         threshold = now - stale_threshold_ms
@@ -779,7 +809,7 @@ class RunContext:
         conflict only occurs on a retry_seq bump.
         """
         now = _now_ms()
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "INSERT INTO envelopes ("
                 "  run_id, intent_key, bar_ts_ms, retry_seq, updated_ts_ms"
@@ -834,7 +864,7 @@ class RunContext:
             )
         now = _now_ms()
         ids_json = json.dumps(order_ids) if order_ids else '[]'
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "INSERT INTO pending_verifications ("
                 "  run_id, client_order_id, intent_key, parked_ts_ms, "
@@ -851,7 +881,7 @@ class RunContext:
 
     def record_unpark(self, coid: str) -> None:
         """Remove a parked dispatch (it has shown up at the broker)."""
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "DELETE FROM pending_verifications "
                 "WHERE run_id = ? AND client_order_id = ?",
@@ -893,7 +923,7 @@ class RunContext:
                 f"record_resolution: unknown resolution {resolution!r}; "
                 f"expected 'attached' or 'rejected'"
             )
-        with self._store._conn:
+        with self._store.transaction():
             if resolution == 'attached':
                 self._store._conn.execute(
                     "UPDATE pending_verifications "
@@ -916,7 +946,7 @@ class RunContext:
         Atomically deletes the envelope and every parked dispatch
         attached to it within the ``run_id`` logical scope.
         """
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "DELETE FROM envelopes "
                 "WHERE run_id = ? AND intent_key = ?",
@@ -1024,7 +1054,7 @@ class RunContext:
         extras = fields.pop('extras', None)
         extras_json = json.dumps(extras) if extras is not None else None
 
-        with self._store._conn:
+        with self._store.transaction():
             existing = self._store._conn.execute(
                 "SELECT 1 FROM orders "
                 "WHERE run_instance_id = ? AND client_order_id = ?",
@@ -1150,7 +1180,7 @@ class RunContext:
             rows and the method returns silently.
         """
         now = _now_ms()
-        with self._store._conn:
+        with self._store.transaction():
             existing = self._store._conn.execute(
                 "SELECT closed_ts_ms FROM orders "
                 "WHERE run_instance_id = ? AND client_order_id = ?",
@@ -1186,7 +1216,7 @@ class RunContext:
         valid at close time.
         """
         now = _now_ms()
-        with self._store._conn:
+        with self._store.transaction():
             exchange_order_id: str | None = None
             row = self._store._conn.execute(
                 "SELECT exchange_order_id FROM orders "
@@ -1230,7 +1260,7 @@ class RunContext:
         ``(run_instance_id, ref_type, ref_value)`` triplet is unique.
         """
         now = _now_ms()
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "INSERT INTO order_refs ("
                 "  run_instance_id, ref_type, ref_value, client_order_id, created_ts_ms"
@@ -1337,7 +1367,7 @@ class RunContext:
         """
         now = _now_ms()
         payload_json = json.dumps(payload) if payload is not None else None
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "INSERT INTO events ("
                 "  run_instance_id, ts_ms, plugin_name, kind,"
@@ -1464,7 +1494,7 @@ class RunContext:
         now = _now_ms()
         if now - self._last_heartbeat_write_ms < HEARTBEAT_INTERVAL_MS:
             return
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "UPDATE runs SET last_heartbeat_ts_ms = ? "
                 "WHERE run_instance_id = ?",
@@ -1481,7 +1511,7 @@ class RunContext:
         the controlled-shutdown path.
         """
         now = _now_ms()
-        with self._store._conn:
+        with self._store.transaction():
             self._store._conn.execute(
                 "UPDATE runs SET ended_ts_ms = ?, last_heartbeat_ts_ms = ? "
                 "WHERE run_instance_id = ? AND ended_ts_ms IS NULL",

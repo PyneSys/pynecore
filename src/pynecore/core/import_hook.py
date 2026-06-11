@@ -270,26 +270,6 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed.body.insert(insert_at, sentinel)
             ast.fix_missing_locations(transformed)
 
-            # Bake a pipeline-identity sentinel into the module body so a loaded code
-            # object can be distinguished from foreign or stale bytecode (see get_code).
-            # It must survive into the .pyc, so it is a plain assignment the compiler
-            # marshals like any other constant — no .pyc-format surgery needed. Added
-            # after the debug/save dumps above so those keep showing the semantic
-            # transform, free of this loader-level bookkeeping.
-            sentinel = ast.Assign(
-                targets=[ast.Name(id=_PYNE_SENTINEL, ctx=ast.Store())],
-                value=ast.Constant(value=_get_transform_pipeline_hash()),
-            )
-            # is_pyne_module guarantees body[0] is the module docstring; keep it first,
-            # and stay after any ``from __future__`` imports (which must lead the module).
-            insert_at = 1
-            while (insert_at < len(transformed.body)
-                   and isinstance(transformed.body[insert_at], ast.ImportFrom)
-                   and cast(ast.ImportFrom, transformed.body[insert_at]).module == '__future__'):
-                insert_at += 1
-            transformed.body.insert(insert_at, sentinel)
-            ast.fix_missing_locations(transformed)
-
             tree = transformed
 
         # Let Python handle bytecode caching
