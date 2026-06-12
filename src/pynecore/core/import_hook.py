@@ -182,6 +182,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.import_lifter import ImportLifterTransformer
             from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+            from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
             from pynecore.transformers.security import SecurityTransformer
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
             from pynecore.transformers.lib_series import LibrarySeriesTransformer
@@ -204,6 +205,9 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = ImportLifterTransformer().visit(transformed)
             transformed = TypeCheckingStripperTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
+            # Lazy-context history hoist must run before call-site anchoring:
+            # the hoisted statements are the anchorable call sites
+            transformed = InlineSeriesHoistTransformer().visit(transformed)
             transformed = SecurityTransformer().visit(transformed)
             transformed = PersistentSeriesTransformer().visit(transformed)
             transformed = LibrarySeriesTransformer().visit(transformed)
