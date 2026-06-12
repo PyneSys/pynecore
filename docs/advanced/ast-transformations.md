@@ -5,7 +5,7 @@ title: "AST Transformation"
 description: "How PyneCore uses AST transformation to implement Pine Script behavior"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2026-06-10"
+lastmod: "2026-06-12"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
@@ -42,20 +42,21 @@ PyneCore applies several key transformations to Python code to make it behave li
 
 1. **Import Lifter** - Moves function-level imports to module level
 2. **TYPE_CHECKING Stripper** - Removes `if TYPE_CHECKING:` blocks (IDE-only hints)
-3. **Import Normalizer** - Standardizes import statements
-4. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
+3. **Builtin Shadow Transformer** - Routes shadowed-alias accesses the library cannot serve back to the built-in namespace
+4. **Import Normalizer** - Standardizes import statements
+5. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
    (see [request.security() Internals](./request-security-internals.md))
-5. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
-6. **Library Series Transformer** - Prepares library Series variables
-7. **Module Property Transformer** - Handles module properties
-8. **Closure Arguments Transformer** - Converts closure variables to function arguments
-9. **Unused Series Detector** - Removes unnecessary Series annotations for performance
-10. **Series Transformer** - Handles Series variables
-11. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
-12. **Function Isolation Transformer** - Ensures separate state for each function call
-13. **Input Transformer** - Processes input parameters
-14. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
-15. **Safe Division Transformer** - Protects against division by zero
+6. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
+7. **Library Series Transformer** - Prepares library Series variables
+8. **Module Property Transformer** - Handles module properties
+9. **Closure Arguments Transformer** - Converts closure variables to function arguments
+10. **Unused Series Detector** - Removes unnecessary Series annotations for performance
+11. **Series Transformer** - Handles Series variables
+12. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
+13. **Function Isolation Transformer** - Ensures separate state for each function call
+14. **Input Transformer** - Processes input parameters
+15. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
+16. **Safe Division Transformer** - Protects against division by zero
 
 This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
 
@@ -107,6 +108,40 @@ Key aspects:
 ### TYPE_CHECKING Stripper
 
 Removes `if TYPE_CHECKING:` blocks and the `TYPE_CHECKING` import itself. These blocks carry IDE-only type hints (casts, re-annotations) that have no runtime role, so stripping them keeps the transformed module free of dead code.
+
+### Builtin Shadow Transformer
+
+The Builtin Shadow transformer resolves workdir-library imports whose alias shadows a built-in namespace.
+
+On TradingView, an `import TradingView/ta/7 as ta` does **not** hide the built-in `ta.*` namespace: Pine resolves `ta.x` against the library's exports first and falls back to the built-in namespace for everything the library does not export. So `ta.valuewhen(...)` keeps working even though the `TradingView/ta` library has no `valuewhen` export (TV's own library deliberately names its functions `ema2`/`atr2`/`rma2` to avoid colliding with the built-ins). A compiled workdir library is imported as `import lib.tv.ta.v7 as ta`, which would route *every* access to the library module — and break the shadowed built-in accesses.
+
+This transformer rewrites only the accesses the library cannot serve to the canonical built-in form, so the downstream transformers (import normalizer, module properties, isolation, series) handle them like any other built-in reference.
+
+**Original code (compiled workdir-library import):**
+```python
+import lib.tv.ta.v7 as ta
+
+a = ta.valuewhen(cond, src, 0)   # not exported by the library
+b = ta.t3(src, length)           # exported by the library
+```
+
+**Transformed code:**
+```python
+import lib.tv.ta.v7 as ta
+
+a = lib.ta.valuewhen(cond, src, 0)   # falls back to the built-in ta namespace
+b = ta.t3(src, length)               # served by the library, left untouched
+```
+
+Key aspects:
+- Only aliases that shadow a known built-in namespace are considered (the namespace must exist in `module_properties.json`, with `str` mapping to the `string` module); a non-shadowing alias like `as myta` is left untouched
+- Library membership is **runtime** knowledge: the library module is imported at transform time — the same pattern function-isolation callee resolution already uses. Its `__all__` is the membership test (matching TV, where non-exported names are unreachable through the alias), with a `hasattr` fallback for hand-written libraries that have no `__all__`
+- Members the library serves stay on the library; members it cannot serve but the built-in namespace can are rewritten to `lib.<namespace>.<member>` (the nested-key check also covers sub-namespaces like `strategy.commission`)
+- Runs **before** the Import Normalizer so the rewritten `lib.<namespace>.<member>` chains get their `from pynecore import lib` and `import pynecore.lib.<namespace>` statements added there
+- A function parameter named like the alias masks the fallback inside that scope only
+- If the library cannot be imported, the alias is left untouched and the script fails at its own import statement, exactly as before; a member in neither the library nor the built-in namespace is also left on the library to fail at runtime, as before
+
+This keeps the compiler library-agnostic: PyneComp never needs to know a library's contents to compile a script that imports it (libraries compile independently), and all library-dependent resolution happens here at transform time, where the library is importable.
 
 ### Import Normalizer
 
