@@ -162,7 +162,9 @@ def __test_overload_direct_call_fallback__():
 
 def __test_overload_reexec_keeps_dispatcher__():
     """ Re-executing a module re-decorates the same lines: the dispatcher
-    survives and rebinds to the fresh implementation functions """
+    survives, rebinds to the fresh implementation functions and keeps the
+    accumulated instance state of existing anchors (library mains re-run
+    every bar, so state must survive the function swap) """
     src = ACC_SRC + '''
 def main(v):
     return acc(v)
@@ -175,6 +177,7 @@ def main(v):
     ns2, _ = _transform(src, 'ovl_mod_g')
     assert ns2['acc'] is ns1['acc']  # same dispatcher object
     state2 = _make_state(ns2['__pyne_slot_layout__']['main'])
-    assert ns2['main'](state2, 4) == 4  # fresh state, rebound implementation
-    # the old anchor detects the swapped function and rebinds with fresh state
-    assert ns1['main'](state1, 1) == 1
+    assert ns2['main'](state2, 4) == 4  # fresh anchor, fresh state
+    # the old anchor detects the swapped function, rebinds the new closure
+    # and keeps its accumulated state (1 + 2 from above, + 1 now)
+    assert ns1['main'](state1, 1) == 4
