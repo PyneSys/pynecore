@@ -181,6 +181,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # Transform AST - lazy import transformers only when needed
             from pynecore.transformers.import_lifter import ImportLifterTransformer
             from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
+            from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
             from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
             from pynecore.transformers.security import SecurityTransformer
@@ -204,6 +205,9 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
 
             transformed = ImportLifterTransformer().visit(transformed)
             transformed = TypeCheckingStripperTransformer().visit(transformed)
+            # The builtin-namespace fallback must run before import normalization
+            # so the lib.<ns>.<name> chains it emits get their imports added there
+            transformed = BuiltinShadowTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
             # Lazy-context history hoist must run before call-site anchoring:
             # the hoisted statements are the anchorable call sites
