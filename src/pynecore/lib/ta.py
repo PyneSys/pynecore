@@ -421,7 +421,10 @@ def crossover(source1: float, source2: float) -> PyneBool:
     """
     l1_lte_l2: Persistent[bool] = NA(bool)
     res = source1 > source2 and l1_lte_l2
-    l1_lte_l2 = source1 <= source2
+    # Only refresh the relation on bars where it is defined; TV compares against the
+    # last bar with both sources present, so na gaps must not reset the state
+    if not (isinstance(source1, NA) or isinstance(source2, NA)):
+        l1_lte_l2 = source1 <= source2
     return res
 
 
@@ -436,7 +439,10 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     """
     l1_gte_l2: Persistent[bool] = NA(bool)
     res = source1 < source2 and l1_gte_l2
-    l1_gte_l2 = source1 >= source2
+    # Only refresh the relation on bars where it is defined; TV compares against the
+    # last bar with both sources present, so na gaps must not reset the state
+    if not (isinstance(source1, NA) or isinstance(source2, NA)):
+        l1_gte_l2 = source1 >= source2
     return res
 
 
