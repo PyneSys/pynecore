@@ -263,6 +263,26 @@ _INTRA_BAR_SOFT_CAP = 32
 # can shrink it without spending the full 30s per gated timeout.
 _CLOSED_WINDOW_SLEEP_S = 30.0
 
+# Floor for the feed-staleness threshold (``feed_timeout_bars`` periods,
+# but never less than this). Keeps tiny timeframes from flapping into a
+# reconnect on a few quiet seconds. Exposed at module scope so tests can
+# shrink it.
+_FEED_STALE_FLOOR_S = 90.0
+
+# Cadence of WARNING-level idle-synth reminders within one idle streak:
+# the first synth of a streak warns, then every Nth; the rest are DEBUG.
+_SYNTH_WARN_EVERY = 10
+
+
+def _warn_this_attempt(attempts: int) -> bool:
+    """Reconnect-log rate policy: WARNING for the first attempts of an
+    outage, then one WARNING per ten attempts (the rest log at DEBUG).
+    With the backoff saturated at ``max_reconnect_delay`` (default 60 s)
+    this works out to roughly one console line every ten minutes during
+    a long outage instead of one per attempt.
+    """
+    return attempts <= 3 or attempts % 10 == 0
+
 
 def live_ohlcv_generator(
         provider: LiveProviderPlugin,
@@ -409,6 +429,16 @@ def live_ohlcv_generator(
     # sitting on idle gaps too long.
     bar_grace = max(15.0, min(tf_seconds * 0.5, 30.0))
 
+    # Feed-liveness watchdog threshold: how long ``watch_ohlcv`` may stay
+    # silent during an open session before the feed is declared dead and a
+    # reconnect is forced even though ``is_connected`` still reports True
+    # (half-open socket, lost server-side subscription). ``None`` disables.
+    feed_stale_after: float | None = None
+    if provider.feed_timeout_bars:
+        feed_stale_after = max(
+            provider.feed_timeout_bars * tf_seconds, _FEED_STALE_FLOOR_S
+        )
+
     # Resolve the symbol timezone once. ``syminfo.opening_hours`` times are
     # expressed in this zone; epoch timestamps must be converted before
     # session checks.
@@ -448,8 +478,8 @@ def live_ohlcv_generator(
         Does not extend wall-clock by one timeframe, so it does not
         report a session as open one timeframe before its real start.
         Used by the reconnect gate so a long timeframe (e.g. 1h, 1D)
-        cannot burn ``max_reconnect_attempts`` during the final
-        timeframe of a closed window.
+        does not spend the final timeframe of a closed window churning
+        through pointless reconnect cycles.
         """
         if not _has_calendar:
             return True
@@ -469,6 +499,23 @@ def live_ohlcv_generator(
         # False on the first synth-skip in a closed period (emits a single
         # INFO log) and back to True when a real bar arrives.
         market_open_state = True
+        # Wall-clock of the last REAL ``watch_ohlcv`` update (closed bar or
+        # intra-bar tick). The feed-liveness watchdog measures staleness
+        # against this — ``last_closed_bar`` is unusable for that because
+        # idle-bar synthesis keeps rolling it forward on a dead feed.
+        # First stamped once ``connect()`` succeeds, then rebased on every
+        # reconnect and while the market is known-closed, so the staleness
+        # clock only runs against a live, in-session feed.
+        last_real_update: float
+        # Wall-clock when the current outage began (first failed attempt
+        # of a reconnect streak); ``None`` while connected. Lets the
+        # rate-limited reconnect logs and the recovery line report how
+        # long the feed was actually down.
+        outage_started: float | None = None
+        # Consecutive idle-synth bars since the last real closed bar.
+        # Drives the rate-limited synth warning: first of a streak warns,
+        # then every ``_SYNTH_WARN_EVERY``th, the rest log at DEBUG.
+        synth_streak = 0
         try:
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
@@ -488,6 +535,7 @@ def live_ohlcv_generator(
             broker_info("WS connected and subscribed: %s %s@%s",
                         type(provider).__name__, symbol, timeframe)
             connected_event.set()
+            last_real_update = time.time()
 
             # Broker mode: attach the Order Sync Engine's event stream as
             # a background task so OrderEvents land in its queue without
@@ -512,19 +560,20 @@ def live_ohlcv_generator(
                 ConnectionError`` pattern would escape past
                 ``except Exception`` and kill the live iterator.
                 """
-                nonlocal market_open_state
+                nonlocal market_open_state, last_real_update, outage_started
                 # Session-gate: when the market is in a known-closed
-                # window (e.g. FX weekend), do not burn reconnect
-                # attempts on a connection error. We sleep ~30s and
-                # re-enter the loop without incrementing
-                # ``reconnect_attempts`` so ``max_reconnect_attempts``
-                # is never exhausted across a long closed window.
+                # window (e.g. FX weekend), do not churn through
+                # reconnect cycles on a connection error. We sleep ~30s
+                # and re-enter the loop without incrementing
+                # ``reconnect_attempts`` so the backoff (and the
+                # rate-limited logging keyed on the attempt count) does
+                # not run away across a long closed window.
                 # Logs the connection error once on the closed→still-
                 # closed transition for post-mortem visibility.
                 # Uses the point-in-time helper (not the slot-aware
                 # ``_market_open_at``) so a long timeframe cannot report
                 # the market as already open one TF before the real
-                # session start and exhaust reconnect attempts.
+                # session start.
                 if not _market_open_now():
                     if market_open_state:
                         broker_info(
@@ -539,20 +588,29 @@ def live_ohlcv_generator(
                         await asyncio.sleep(min(1.0, 30.0 - slept))
                         slept += 1.0
                     return attempts, stop_event.is_set()
+                # No attempt limit: a live session must ride out an
+                # arbitrarily long outage (router restart, ISP drop,
+                # provider maintenance) and resume on its own. The
+                # exponential backoff saturates at
+                # ``provider.max_reconnect_delay`` and the per-attempt
+                # logging is rate-limited so a multi-hour outage costs
+                # a handful of log lines, not one per attempt.
                 attempts += 1
-                if attempts > provider.max_reconnect_attempts:
-                    logger.error(
-                        "Max reconnect attempts reached (%d), stopping",
-                        provider.max_reconnect_attempts,
-                    )
-                    bar_queue.put(err)
-                    return attempts, True
-                logger.warning(
-                    "Connection error (attempt %d/%d): %s",
-                    attempts, provider.max_reconnect_attempts, err,
+                if attempts == 1:
+                    outage_started = time.time()
+                offline_s = time.time() - (outage_started or time.time())
+                log = logger.warning if _warn_this_attempt(attempts) else logger.debug
+                log(
+                    "Connection error (attempt %d, offline %.0fs): %s",
+                    attempts, offline_s, err,
                 )
                 await provider.on_disconnect()
-                delay = provider.reconnect_delay * (2 ** (attempts - 1))
+                # The exponent is clamped so the power stays a small int;
+                # the delay saturates at ``max_reconnect_delay`` anyway.
+                delay = min(
+                    provider.reconnect_delay * (2 ** min(attempts - 1, 16)),
+                    provider.max_reconnect_delay,
+                )
                 slept = 0.0
                 while slept < delay and not stop_event.is_set():
                     await asyncio.sleep(min(0.5, delay - slept))
@@ -569,12 +627,17 @@ def live_ohlcv_generator(
                 try:
                     await provider.connect()
                     await provider.on_reconnect()
-                    logger.info("Reconnected successfully")
+                    # Give the freshly (re)subscribed feed a full
+                    # staleness window to deliver before the liveness
+                    # watchdog may declare it dead again.
+                    last_real_update = time.time()
+                    logger.info("Reconnected successfully (attempt %d)", attempts)
                 except Exception as reconn_err:
-                    logger.error(
-                        "Reconnect failed (attempt %d/%d): %s",
-                        attempts,
-                        provider.max_reconnect_attempts,
+                    log = (logger.warning if _warn_this_attempt(attempts)
+                           else logger.debug)
+                    log(
+                        "Reconnect failed (attempt %d, offline %.0fs): %s",
+                        attempts, time.time() - (outage_started or time.time()),
                         reconn_err,
                     )
                 return attempts, False
@@ -619,6 +682,21 @@ def live_ohlcv_generator(
                         provider.watch_ohlcv(watch_symbol, timeframe),
                         timeout=effective_timeout,
                     )
+                    last_real_update = time.time()
+                    if reconnect_attempts:
+                        # Data-level recovery marker: ``Reconnected
+                        # successfully`` above only proves the socket came
+                        # back, not that data flows again (a reconnect can
+                        # succeed onto a feed that stays silent). This is
+                        # the line that closes an outage in the log, so it
+                        # is WARNING like the failure lines it answers.
+                        logger.warning(
+                            "Live feed restored after %d reconnect attempt(s)"
+                            " (offline %.0fs)",
+                            reconnect_attempts,
+                            time.time() - (outage_started or time.time()),
+                        )
+                        outage_started = None
                     reconnect_attempts = 0
 
                     # Filter duplicates from the historical phase. Strict
@@ -649,6 +727,7 @@ def live_ohlcv_generator(
 
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
+                        synth_streak = 0
                         if not market_open_state:
                             broker_info(
                                 "market reopened: resuming live stream "
@@ -739,7 +818,19 @@ def live_ohlcv_generator(
                                 pending_connection_error = ConnectionError(
                                     "Provider reports disconnected state"
                                 )
-                            else:
+                            elif not _market_open_now():
+                                # The staleness clock must not run while the
+                                # market is closed — a weekend of legitimate
+                                # feed silence would otherwise trip the
+                                # liveness watchdog right at session open.
+                                # Keyed on the CURRENT session state, not the
+                                # slot calendar: ``synth_ts`` never advances
+                                # in this branch, so after the session
+                                # reopens on a dead feed the slot stays
+                                # pinned at the pre-close boundary and an
+                                # unconditional rebase here would disarm the
+                                # watchdog forever.
+                                last_real_update = time.time()
                                 slept = 0.0
                                 while (slept < _CLOSED_WINDOW_SLEEP_S
                                        and not stop_event.is_set()):
@@ -751,25 +842,76 @@ def live_ohlcv_generator(
                                     slept += step
                                 if stop_event.is_set():
                                     break
-                            # Skip synth in both branches — either we are
-                            # waiting out the closed window (WS alive) or
-                            # we deferred the connection error so the next
-                            # iteration's top-of-loop dispatch drives the
-                            # reconnect path.
+                            else:
+                                # Slot pinned in a closed window while the
+                                # session is open NOW: no real bar has
+                                # advanced the boundary since the close —
+                                # e.g. Monday morning on a feed that died
+                                # over the weekend. The staleness clock was
+                                # last rebased during the closed window, so
+                                # it measures in-session silence since the
+                                # reopen: trip the liveness watchdog once it
+                                # expires, otherwise wait coarsely for the
+                                # feed's first post-open bar.
+                                if (feed_stale_after is not None
+                                        and time.time() - last_real_update
+                                        >= feed_stale_after):
+                                    pending_connection_error = ConnectionError(
+                                        f"feed stale: no data from provider "
+                                        f"for "
+                                        f"{time.time() - last_real_update:.0f}s "
+                                        f"during open session"
+                                    )
+                                else:
+                                    slept = 0.0
+                                    while (slept < _CLOSED_WINDOW_SLEEP_S
+                                           and not stop_event.is_set()):
+                                        step = min(
+                                            1.0,
+                                            _CLOSED_WINDOW_SLEEP_S - slept,
+                                        )
+                                        await asyncio.sleep(step)
+                                        slept += step
+                                    if stop_event.is_set():
+                                        break
+                            # Skip synth in all branches — we are waiting
+                            # out the closed window (WS alive), or we
+                            # deferred a connection / stale-feed error so
+                            # the next iteration's top-of-loop dispatch
+                            # drives the reconnect path.
                             continue
-                        # Dead WS during an open session: reconnect instead
+                        # Dead feed during an open session: reconnect instead
                         # of synthesising a frozen idle bar. Idle-bar synth is
                         # for a live-but-quiet feed; manufacturing bars on a
                         # dead socket would run the strategy on stale prices
                         # while the real market keeps moving, and the steady
                         # synth cadence keeps the boundary deadline perpetually
                         # "just passed" so the dead-WS check below never fires.
+                        # ``is_connected`` only sees the transport, so the
+                        # feed-liveness watchdog additionally treats a healthy-
+                        # looking connection with no real ``watch_ohlcv`` data
+                        # for a whole staleness window as dead (half-open
+                        # socket, lost server-side subscription). The
+                        # ``_market_open_now()`` guard covers the slot-vs-now
+                        # mismatch: a backlog slot can still be in-session
+                        # right after the market closed, and the staleness
+                        # clock only counts in-session silence.
                         # Defer via the flag — a ``raise`` here would escape the
                         # sibling ``except Exception`` reconnect block (same
                         # reason as the session-gated branch above).
                         if not provider.is_connected:
                             pending_connection_error = ConnectionError(
                                 "Provider reports disconnected state"
+                            )
+                            continue
+                        if (feed_stale_after is not None
+                                and time.time() - last_real_update
+                                >= feed_stale_after
+                                and _market_open_now()):
+                            pending_connection_error = ConnectionError(
+                                f"feed stale: no data from provider for "
+                                f"{time.time() - last_real_update:.0f}s "
+                                f"during open session"
                             )
                             continue
                         last_close = last_closed_bar.close
@@ -790,11 +932,24 @@ def live_ohlcv_generator(
                         # ``_tick_volume`` happened to be zero. Carries
                         # the synth timestamp + frozen close so a
                         # post-mortem can see exactly which TF slot the
-                        # watchdog filled and at what price.
-                        broker_warning(
+                        # watchdog filled and at what price. Rate-limited
+                        # within an idle streak — a legitimately quiet
+                        # market can idle for hours and one WARNING per
+                        # bar would flood the console; the first synth of
+                        # a streak and every ``_SYNTH_WARN_EVERY``th warn,
+                        # the rest log at DEBUG.
+                        synth_streak += 1
+                        synth_log = (
+                            broker_warning
+                            if (synth_streak == 1
+                                or synth_streak % _SYNTH_WARN_EVERY == 0)
+                            else logger.debug
+                        )
+                        synth_log(
                             "idle-bar synth emitted: ts=%d close=%s "
-                            "(no real ohlc.event for >= 2*tf+grace)",
-                            synth_ts, last_close,
+                            "(%d consecutive; no real ohlc.event for "
+                            ">= 2*tf+grace)",
+                            synth_ts, last_close, synth_streak,
                         )
                         bar_queue.put(synth)
                         continue
@@ -808,6 +963,22 @@ def live_ohlcv_generator(
                         pending_connection_error = ConnectionError(
                             "Provider reports disconnected state"
                         )
+                    elif feed_stale_after is not None:
+                        # Feed-liveness watchdog on the regular polling
+                        # path (covers the pre-first-bar case too, where
+                        # the boundary watchdog is not armed yet). The
+                        # staleness clock pauses while the market is
+                        # closed: silence is legitimate there, and at
+                        # reopen the feed gets a fresh window.
+                        if not _market_open_now():
+                            last_real_update = time.time()
+                        elif (time.time() - last_real_update
+                              >= feed_stale_after):
+                            pending_connection_error = ConnectionError(
+                                f"feed stale: no data from provider for "
+                                f"{time.time() - last_real_update:.0f}s "
+                                f"during open session"
+                            )
                     continue
                 except asyncio.CancelledError:
                     break

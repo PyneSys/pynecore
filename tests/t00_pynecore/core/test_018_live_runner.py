@@ -45,7 +45,8 @@ class MockLiveProvider:
         self._index = 0
         self._connected = False
         self.reconnect_delay = 0.01
-        self.max_reconnect_attempts = 3
+        self.max_reconnect_delay = 0.05
+        self.feed_timeout_bars = 3
 
     async def connect(self):
         self._connected = True
@@ -283,24 +284,42 @@ def __test_reconnect_calls_disconnect_before_connect__():
     assert len(bars) >= 1
 
 
-def __test_reconnect_max_attempts_exceeded__():
-    """Generator raises after max reconnect attempts are exhausted"""
+def __test_reconnect_retries_indefinitely_and_recovers__():
+    """Reconnect has no attempt cap: an outage longer than any fixed limit
+    is ridden out and the stream resumes once the provider recovers.
 
-    class AlwaysFailProvider(MockLiveProvider):
-        def __init__(self):
-            super().__init__([])
-            self.max_reconnect_attempts = 2
-            self.reconnect_delay = 0.01
+    A live bot must never give up on a network outage — the historical
+    behaviour (raise after ``max_reconnect_attempts``, default 10) killed
+    the run ~17 minutes into a router restart. 15 consecutive failures
+    here is comfortably past that old cap, so passing proves the limit is
+    gone, and the final real bar proves the stream survives the outage.
+    """
+
+    class FlakyProvider(MockLiveProvider):
+        def __init__(self, fail_count: int):
+            super().__init__([_make_ohlcv(1000, is_closed=True, close=100.0)])
+            self.reconnect_delay = 0.001
+            self.max_reconnect_delay = 0.002
+            self.connect_calls = 0
+            self._remaining_failures = fail_count
+
+        async def connect(self):
+            self.connect_calls += 1
+            self._connected = True
 
         async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
-            raise ConnectionError("Permanent failure")
+            if self._remaining_failures > 0:
+                self._remaining_failures -= 1
+                raise ConnectionError("Simulated long outage")
+            return await super().watch_ohlcv(symbol, timeframe)
 
-    provider = AlwaysFailProvider()
-    try:
-        list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
-        assert False, "Should have raised"
-    except ConnectionError:
-        pass
+    provider = FlakyProvider(fail_count=15)
+    _, bars = _drain(provider, "BTC/USDT", "1D")
+
+    assert len(bars) == 1
+    assert bars[0].close == 100.0
+    # Initial connect + one reconnect per failed watch call.
+    assert provider.connect_calls >= 15
 
 
 # --- Queue overflow tests ---
@@ -674,3 +693,190 @@ def __test_synth_gate_passthrough_when_opening_hours_empty__():
     assert bars[2].volume == 0.0
     assert bars[1].timestamp == base_ts + 60
     assert bars[2].timestamp == base_ts + 120
+
+
+# --- Feed-liveness watchdog tests ---
+
+class _SilentFeedProvider(MockLiveProvider):
+    """Connected-looking provider whose feed goes silent after its bars.
+
+    ``watch_ohlcv`` serves the pre-canned bars, then parks forever (each
+    park is cancelled by the framework's ``wait_for`` timeout).
+    ``is_connected`` stays True throughout, so only the feed-liveness
+    watchdog can drive a reconnect — the dead-subscription / half-open-
+    socket failure mode. Ends the run by raising ``CancelledError`` once
+    ``connect()`` was called ``stop_after_connects`` times, or after
+    ``max_idle_calls`` silent ``watch_ohlcv`` invocations.
+    """
+
+    def __init__(self, bar_updates: list[OHLCV], *,
+                 stop_after_connects: int | None = None,
+                 max_idle_calls: int | None = None):
+        super().__init__(bar_updates)
+        self.connect_calls = 0
+        self._stop_after_connects = stop_after_connects
+        self._idle_calls = 0
+        self._max_idle_calls = max_idle_calls
+
+    async def connect(self):
+        self.connect_calls += 1
+        self._connected = True
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if (self._stop_after_connects is not None
+                and self.connect_calls >= self._stop_after_connects):
+            raise asyncio.CancelledError()
+        if self._index < len(self._bar_updates):
+            bar = self._bar_updates[self._index]
+            self._index += 1
+            await asyncio.sleep(0.001)
+            return bar
+        self._idle_calls += 1
+        if (self._max_idle_calls is not None
+                and self._idle_calls >= self._max_idle_calls):
+            raise asyncio.CancelledError()
+        await asyncio.sleep(10.0)
+        raise asyncio.CancelledError()
+
+
+def __test_feed_staleness_watchdog_forces_reconnect__():
+    """A connected-but-silent feed is reconnected during an open session.
+
+    The failure mode this guards: the transport looks healthy
+    (``is_connected`` True) but the server-side subscription is gone or
+    the socket is half-open, so ``watch_ohlcv`` never returns and idle-bar
+    synthesis would otherwise run the strategy on a frozen price forever.
+    With ``feed_timeout_bars=1`` on a 1-second timeframe (staleness floor
+    shrunk for test speed) the threshold is ~1 s, so the watchdog must
+    drive ``connect()`` again within the test's few-second budget without
+    the provider ever raising a ConnectionError.
+    """
+    base_ts = int(time.time()) - 30
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _SilentFeedProvider(updates, stop_after_connects=2)
+    provider.feed_timeout_bars = 1
+
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_floor = _live_runner_mod._FEED_STALE_FLOOR_S
+    _live_runner_mod._FEED_STALE_FLOOR_S = 0.2
+    try:
+        _drain(provider, "TEST", "1S")
+    finally:
+        _live_runner_mod._FEED_STALE_FLOOR_S = _orig_floor
+
+    assert provider.connect_calls >= 2, (
+        "feed-liveness watchdog should have forced a reconnect on a "
+        "connected-but-silent feed"
+    )
+
+
+def __test_feed_staleness_watchdog_disabled_with_none__():
+    """``feed_timeout_bars=None`` keeps a silent-but-connected feed running.
+
+    Same silent-feed setup as the positive test, but with the watchdog
+    disabled there must be no reconnect — idle-bar synthesis keeps
+    filling slots on the single original connection.
+
+    ``base_ts`` is far enough in the past that all 40 idle calls run in
+    the synth catch-up phase (~0.05 s effective timeout each), keeping
+    the test at ~2 s of wall clock — well past the ~1 s staleness
+    threshold the positive test reconnects under.
+    """
+    base_ts = int(time.time()) - 200
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _SilentFeedProvider(updates, max_idle_calls=40)
+    provider.feed_timeout_bars = None
+
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_floor = _live_runner_mod._FEED_STALE_FLOOR_S
+    _live_runner_mod._FEED_STALE_FLOOR_S = 0.2
+    try:
+        _, bars = _drain(provider, "TEST", "1S")
+    finally:
+        _live_runner_mod._FEED_STALE_FLOOR_S = _orig_floor
+
+    assert provider.connect_calls == 1, (
+        "watchdog disabled: no reconnect may happen on a silent feed"
+    )
+    # Idle synthesis must keep working without the watchdog interfering.
+    assert any(b.volume == 0.0 for b in bars)
+
+
+def __test_feed_staleness_fires_when_slot_pinned_in_closed_window__():
+    """A feed that dies across a session close trips the watchdog after reopen.
+
+    Regression test for the pinned-slot blind spot: when the feed dies
+    near a session close, ``last_closed_bar`` stops advancing, so the
+    pending synth slot stays calendar-closed forever and the closed-window
+    branch runs on every iteration — even after the session has reopened.
+    That branch used to rebase the staleness clock unconditionally, which
+    disarmed the liveness watchdog for good (frozen strategy on an open
+    market); it must instead trip the watchdog once the session is open
+    again.
+
+    Calendar: one interval covering "now" (session open) but NOT the
+    pinned synth slot ~139 s in the past (slot closed). With the staleness
+    floor shrunk and ``feed_timeout_bars=1`` on a 1-second timeframe the
+    threshold is ~1 s, so the forced reconnect must arrive within the
+    test's few-second budget.
+    """
+    from pynecore.core.syminfo import SymInfoInterval
+    from datetime import datetime as ddatetime, time as dtime, timedelta, UTC
+
+    now_dt = ddatetime.now(tz=UTC)
+    open_start = now_dt - timedelta(seconds=60)
+    if open_start.date() != now_dt.date():
+        # Just after midnight: clamp the window to today so the single
+        # same-day interval still covers "now".
+        open_start = now_dt.replace(hour=0, minute=0, second=0)
+    open_end = now_dt + timedelta(minutes=6)
+    start_time = dtime(open_start.hour, open_start.minute, open_start.second)
+    if open_end.date() != now_dt.date():
+        # Just before midnight: split the window at the day boundary —
+        # clamping the end to 23:59:59 would close the synthetic session
+        # again seconds after the test starts, before the ~1 s staleness
+        # trip can fire, and the run would never terminate. The post-
+        # midnight segment starts at 00:00, so it cannot reach back to
+        # the pinned slot ~139 s in the past (previous day).
+        intervals = [
+            SymInfoInterval(day=d, start=start_time, end=dtime(23, 59, 59))
+            for d in range(7)
+        ] + [
+            SymInfoInterval(
+                day=d, start=dtime(0, 0, 0),
+                end=dtime(open_end.hour, open_end.minute, open_end.second),
+            )
+            for d in range(7)
+        ]
+    else:
+        intervals = [
+            SymInfoInterval(
+                day=d, start=start_time,
+                end=dtime(open_end.hour, open_end.minute, open_end.second),
+            )
+            for d in range(7)
+        ]
+    syminfo = _make_syminfo(intervals, timezone="UTC")
+
+    # The synth slot (base_ts + 1s) lies ~79 s before the session window
+    # opens -> calendar-closed, while wall-clock "now" is in-session.
+    base_ts = int(time.time()) - 140
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
+    provider = _SilentFeedProvider(updates, stop_after_connects=2)
+    provider.feed_timeout_bars = 1
+
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_floor = _live_runner_mod._FEED_STALE_FLOOR_S
+    _orig_sleep = _live_runner_mod._CLOSED_WINDOW_SLEEP_S
+    _live_runner_mod._FEED_STALE_FLOOR_S = 0.2
+    _live_runner_mod._CLOSED_WINDOW_SLEEP_S = 0.05
+    try:
+        _drain(provider, "TEST", "1S", syminfo=syminfo)
+    finally:
+        _live_runner_mod._FEED_STALE_FLOOR_S = _orig_floor
+        _live_runner_mod._CLOSED_WINDOW_SLEEP_S = _orig_sleep
+
+    assert provider.connect_calls >= 2, (
+        "staleness watchdog must fire when the pinned synth slot is "
+        "calendar-closed but the session is open now"
+    )

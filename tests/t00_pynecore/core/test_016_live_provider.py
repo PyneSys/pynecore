@@ -39,9 +39,10 @@ def __test_live_provider_inherits_provider_abstract_methods__():
 
 
 def __test_live_provider_default_reconnect_values__():
-    """LiveProviderPlugin has default reconnect configuration"""
+    """LiveProviderPlugin has default reconnect / feed-liveness configuration"""
     assert LiveProviderPlugin.reconnect_delay == 1.0
-    assert LiveProviderPlugin.max_reconnect_attempts == 10
+    assert LiveProviderPlugin.max_reconnect_delay == 60.0
+    assert LiveProviderPlugin.feed_timeout_bars == 3
 
 
 def __test_ohlcv_is_closed_field__():

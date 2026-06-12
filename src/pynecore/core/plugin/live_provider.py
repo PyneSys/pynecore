@@ -122,16 +122,45 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
     """
 
     reconnect_delay: float = 1.0
-    """Initial delay in seconds before reconnection attempt."""
+    """Initial delay in seconds before a reconnection attempt. Doubles per
+    consecutive failure (exponential backoff) up to :attr:`max_reconnect_delay`."""
 
-    max_reconnect_attempts: int = 10
-    """Maximum number of consecutive reconnection attempts."""
+    max_reconnect_delay: float = 60.0
+    """Ceiling in seconds for the exponential reconnect backoff.
+
+    Reconnection is retried indefinitely — a live session must survive
+    arbitrarily long network / provider outages and resume on its own once
+    connectivity returns — so there is no attempt limit; the backoff simply
+    saturates at this delay.
+    """
+
+    feed_timeout_bars: int | None = 3
+    """Feed-liveness watchdog threshold, in timeframe periods.
+
+    When the provider reports a healthy connection but :meth:`watch_ohlcv`
+    has produced no update (closed bar or intra-bar) for this many timeframe
+    periods (floored at 90 s) during an open trading session, the framework
+    assumes the data feed is dead even though the transport looks alive
+    (half-open socket, lost server-side subscription) and drives a full
+    ``disconnect()`` → ``connect()`` cycle. ``None`` disables the watchdog —
+    only justified for providers whose feed legitimately stays silent for
+    long in-session stretches AND whose own liveness machinery already
+    covers the dead-feed case.
+    """
 
     # --- Connection lifecycle ---
 
     @abstractmethod
     async def connect(self) -> None:
-        """Establish connection to the data source."""
+        """Establish connection to the data source.
+
+        Called for the initial connection AND again on every reconnect (the
+        framework drives ``disconnect()`` → ``connect()`` after a connection
+        error or a stale feed). Implementations must therefore fully
+        re-initialize every piece of connection-scoped state here —
+        authentication, server-side subscriptions, partially accumulated
+        quote state — rather than assuming a first-call-only environment.
+        """
 
     @abstractmethod
     async def disconnect(self) -> None:

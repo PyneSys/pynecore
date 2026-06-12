@@ -117,6 +117,14 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     Config = CCXTConfig
     multi_broker = True
 
+    # ``watch_ohlcv`` is trade-driven on many exchanges (ccxt.pro builds
+    # candles from trades where no native kline stream pushes idle
+    # updates), so an illiquid 24/7 pair can legitimately stay silent for
+    # several bars. The framework default (3 bars) would reconnect-churn
+    # on every quiet stretch; 30 bars keeps the dead-feed safety net while
+    # making false positives rare.
+    feed_timeout_bars = 30
+
     @classmethod
     @override
     def get_list_of_brokers(cls) -> list[Broker]:
@@ -562,6 +570,15 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             raise ImportError(
                 "CCXT Pro is required for live data. Install it with: pip install ccxt"
             )
+
+        # ``connect()`` runs on every reconnect too, so the candle-close
+        # tracker must be wiped: a leftover ``_last_bar_*`` from the dead
+        # websocket would make the first ``watch_ohlcv`` after a forced
+        # reconnect (e.g. the stale-feed watchdog) emit that pre-outage
+        # partial bar as a confirmed close once a new-timestamp candle
+        # arrives.
+        self._last_bar_timestamp = None
+        self._last_bar_ohlcv = None
 
         exchange_name = self._client.id
 
