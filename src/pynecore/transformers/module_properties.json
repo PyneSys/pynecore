@@ -2308,6 +2308,9 @@
     "max_drawdown": {
       "type": "property"
     },
+    "max_drawdown_percent": {
+      "type": "property"
+    },
     "max_runup": {
       "type": "property"
     },
@@ -2323,7 +2326,13 @@
     "netprofit": {
       "type": "property"
     },
+    "netprofit_percent": {
+      "type": "property"
+    },
     "openprofit": {
+      "type": "property"
+    },
+    "openprofit_percent": {
       "type": "property"
     },
     "opentrades": {
