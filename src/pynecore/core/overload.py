@@ -31,12 +31,12 @@ the caller.
 """
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
-from functools import wraps
+from functools import wraps, partial
 from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
-from .instance_state import _bind_target, register_shared_cache
+from .instance_state import _bind_target, _make_state, register_shared_cache
 from ..types.base import StrLiteral
 from ..types.na import NA
 
@@ -57,15 +57,15 @@ def _is_state_param(name: str) -> bool:
 
 class Implementation:
     __slots__ = ('func', 'sig', 'type_hints', 'param_types')
-    func: Callable
+    func: FunctionType
     sig: Any  # Signature object of the VISIBLE parameters
     type_hints: dict
     param_types: tuple  # Cached visible parameter types for quick checking
 
-    def __init__(self, func: Callable):
+    def __init__(self, func: FunctionType):
         self.update(func)
 
-    def update(self, func: Callable) -> None:
+    def update(self, func: FunctionType) -> None:
         """(Re)bind to the implementation function and cache its matching
         metadata. Re-running a module re-decorates the same source lines —
         the dispatcher and the Implementation objects survive, only the
@@ -73,6 +73,13 @@ class Implementation:
 
         :param func: The (possibly re-created) implementation function.
         """
+        if getattr(self, 'func', None) is not None and func.__code__ is self.func.__code__:
+            # The same source line re-executed (library mains and nested
+            # scopes re-run every bar): only the closure cells and default
+            # values are new, the matching metadata is unchanged — skip the
+            # expensive signature()/get_type_hints() recompute
+            self.func = func
+            return
         sig = signature(func)
         params = list(sig.parameters.values())
         if params and _is_state_param(params[0].name):
@@ -197,7 +204,8 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
 
 
 def _anchored(impls: list[Implementation], qualname: str,
-              cache: dict[Implementation, tuple[Callable, Callable]] | None = None) -> Callable:
+              cache: dict[Implementation, tuple[Callable, list | None, Callable]] | None = None
+              ) -> Callable:
     """Create an anchored dispatch entry with its own per-implementation
     bound cache. ``__pyne_bind__`` hands these out, one per anchor; the
     dispatcher itself is one too (the shared, anchorless fallback, whose
@@ -210,19 +218,29 @@ def _anchored(impls: list[Implementation], qualname: str,
         one); per-anchor entries create their own.
     :return: The dispatch callable.
     """
-    if cache is None:
-        cache = {}
+    _cache: dict[Implementation, tuple[Callable, list | None, Callable]] = \
+        {} if cache is None else cache
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
         impl = _select(impls, args, kwargs)
         if impl is None:
             raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
-        entry = cache.get(impl)
+        entry = _cache.get(impl)
         if entry is None or entry[0] is not impl.func:
-            # First win at this anchor, or the module was re-executed and
-            # the implementation function was swapped under us
-            entry = cache[impl] = (impl.func, _bind_target(impl.func))
-        return entry[1](*args, **kwargs)
+            # First win at this anchor, or the implementation function was
+            # re-created by a re-execution of its defining scope (library
+            # mains re-run every bar). Keep the existing instance state and
+            # take the closure from the new function object — the same
+            # split pine_method._bound_method does
+            func = impl.func
+            layout: dict[str, Any] | None = getattr(func, '__pyne_layout__', None)
+            if layout is not None:
+                state = entry[1] if entry is not None and entry[1] is not None \
+                    else _make_state(layout)
+                entry = _cache[impl] = (func, state, partial(func, state))
+            else:
+                entry = _cache[impl] = (func, None, _bind_target(func))
+        return entry[2](*args, **kwargs)
 
     return dispatch
 
@@ -245,13 +263,13 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
     if _dispatcher is not None:
         impl = _implementations.get(qualname_with_line)
         if impl is not None:
-            impl.update(func)
+            impl.update(_func)
             return _dispatcher
 
     # Register with typing.overload for IDE support
     typing_overload(func)
 
-    impl = Implementation(func)
+    impl = Implementation(_func)
     _implementations[qualname_with_line] = impl
     _registry[qualname].append(impl)
 
