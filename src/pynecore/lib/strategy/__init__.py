@@ -2886,7 +2886,13 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # Same-tick fill is a backtest concept; in broker mode the order is already
     # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
     if immediately and isinstance(position, SimPosition):
+        closed_before = len(position.new_closed_trades)
         position.fill_order(order, position.c, position.h, position.l)
+        # The bar's regular settle already ran in process_orders(); a same-tick
+        # close lands in new_closed_trades after it, and the next bar's clear()
+        # would drop it with cum_profit never booked — settle it now, the same
+        # mirror the close pass uses
+        position._settle_close_pass_trades(closed_before)
 
 
 # noinspection PyProtectedMember,PyShadowingNames
@@ -2915,7 +2921,13 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     # Same-tick fill is a backtest concept; in broker mode the order is already
     # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
     if immediately and isinstance(position, SimPosition):
+        closed_before = len(position.new_closed_trades)
         position.fill_order(order, position.c, position.h, position.l)
+        # The bar's regular settle already ran in process_orders(); a same-tick
+        # close lands in new_closed_trades after it, and the next bar's clear()
+        # would drop it with cum_profit never booked — settle it now, the same
+        # mirror the close pass uses
+        position._settle_close_pass_trades(closed_before)
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,DuplicatedCode
