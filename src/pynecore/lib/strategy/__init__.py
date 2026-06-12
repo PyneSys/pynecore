@@ -3518,6 +3518,17 @@ def max_drawdown() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
+def max_drawdown_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    initial = lib._script.initial_capital
+    if initial == 0.0:
+        return 0.0
+    return lib._script.position.max_drawdown / initial * 100.0
+
+
+# noinspection PyProtectedMember
+@module_property
 def max_runup() -> PyneFloat:
     if lib._script is None:
         return 0.0
@@ -3534,10 +3545,32 @@ def netprofit() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
+def netprofit_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    initial = lib._script.initial_capital
+    if initial == 0.0:
+        return 0.0
+    return lib._script.position.netprofit / initial * 100.0
+
+
+# noinspection PyProtectedMember
+@module_property
 def openprofit() -> PyneFloat:
     if lib._script is None:
         return 0.0
     return lib._script.position.openprofit
+
+
+# noinspection PyProtectedMember
+@module_property
+def openprofit_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    initial = lib._script.initial_capital
+    if initial == 0.0:
+        return 0.0
+    return lib._script.position.openprofit / initial * 100.0
 
 
 # noinspection PyProtectedMember
