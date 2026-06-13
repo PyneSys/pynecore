@@ -72,6 +72,76 @@ def __test_period_boundary_emits_closed_then_starts_fresh__(log):
     )
 
 
+def __test_completing_bar_closes_period__(log):
+    """The confirmed chart bar whose close reaches the period end closes the HTF bar.
+
+    TV ``lookahead_off`` merge rule: the closed HTF bar is delivered together
+    with the period's LAST chart bar, not with the next period's first one.
+    """
+    agg = HTFAggregator("60", _UTC, chart_span_ms=30 * 60_000)  # 30m chart
+    agg.update(_ms(2026, 5, 21, 10, 0), 1.0, 1.2, 0.9, 1.1, 10.0)
+    # The 10:30 chart bar closes at 11:00 — exactly the period end.
+    is_new, dev, closed = agg.update(
+        _ms(2026, 5, 21, 10, 30), 1.1, 1.5, 1.0, 1.3, 5.0,
+    )
+    assert is_new is False
+    assert dev is None  # no fresh developing bar until the next chart bar
+    assert closed is not None
+    assert closed.period_start == _ms(2026, 5, 21, 10, 0)
+    assert (closed.open, closed.high, closed.low, closed.close) == (
+        1.0, 1.5, 0.9, 1.3,
+    )
+    assert closed.volume == 15.0
+    assert agg.current is None
+    # The next chart bar seeds the fresh period — no duplicate close.
+    is_new, dev, closed = agg.update(
+        _ms(2026, 5, 21, 11, 0), 1.3, 1.4, 1.25, 1.35, 4.0,
+    )
+    assert is_new is True
+    assert closed is None
+    assert dev is not None
+    assert dev.period_start == _ms(2026, 5, 21, 11, 0)
+
+
+def __test_developing_tick_does_not_close_period__(log):
+    """An unconfirmed intra-bar tick of the completing chart bar must not close the period."""
+    agg = HTFAggregator("60", _UTC, chart_span_ms=30 * 60_000)
+    agg.update(_ms(2026, 5, 21, 10, 0), 1.0, 1.2, 0.9, 1.1, 10.0)
+    # Developing tick of the 10:30 bar: the HTF close is not final yet.
+    is_new, dev, closed = agg.update(
+        _ms(2026, 5, 21, 10, 30), 1.1, 1.5, 1.0, 1.2, 3.0,
+        chart_confirmed=False,
+    )
+    assert closed is None
+    assert dev is not None
+    assert dev.close == 1.2
+    # The confirmed final form of the same chart bar closes the period
+    # (cumulative same-bar volume replaces the tick's contribution).
+    is_new, dev, closed = agg.update(
+        _ms(2026, 5, 21, 10, 30), 1.1, 1.6, 1.0, 1.3, 5.0,
+    )
+    assert dev is None
+    assert closed is not None
+    assert closed.high == 1.6
+    assert closed.close == 1.3
+    assert closed.volume == 15.0
+
+
+def __test_gap_still_closes_on_next_period_bar__(log):
+    """Without a completing chart bar (gap), the close falls back to the next period's first bar."""
+    agg = HTFAggregator("60", _UTC, chart_span_ms=30 * 60_000)
+    agg.update(_ms(2026, 5, 21, 10, 0), 1.0, 1.2, 0.9, 1.1, 10.0)
+    # The 10:30 bar never arrives; the next chart bar is already at 12:00.
+    is_new, dev, closed = agg.update(
+        _ms(2026, 5, 21, 12, 0), 1.1, 1.3, 1.05, 1.2, 6.0,
+    )
+    assert is_new is True
+    assert closed is not None
+    assert closed.period_start == _ms(2026, 5, 21, 10, 0)
+    assert dev is not None
+    assert dev.period_start == _ms(2026, 5, 21, 12, 0)
+
+
 def __test_current_property_returns_state__(log):
     """``current`` is None before any update and after reset, else the developing bar."""
     agg = HTFAggregator("60", _UTC)

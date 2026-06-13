@@ -1134,7 +1134,9 @@ class ScriptRunner:
                         from .htf_aggregator import HTFAggregator
                         sec_state.htf_aggregator = HTFAggregator(
                             resolved_tf, self.tz,
-                            session_starts=sec_state.session_starts)
+                            session_starts=sec_state.session_starts,
+                            chart_span_ms=(sec_state.chart_off + 1
+                                           if sec_state.chart_off else 0))
                     elif not needs_aggregator and sec_state.htf_aggregator is not None:
                         sec_state.htf_aggregator = None
                     elif (needs_aggregator
@@ -1145,7 +1147,9 @@ class ScriptRunner:
                         from .htf_aggregator import HTFAggregator
                         sec_state.htf_aggregator = HTFAggregator(
                             resolved_tf, self.tz,
-                            session_starts=sec_state.session_starts)
+                            session_starts=sec_state.session_starts,
+                            chart_span_ms=(sec_state.chart_off + 1
+                                           if sec_state.chart_off else 0))
                     # Cross-symbol HTF + lookahead_on: developing bar cannot be
                     # aggregated from chart OHLCV (wrong instrument). Chart-side
                     # read returns ``na`` for every chart bar inside an open HTF
@@ -2120,9 +2124,9 @@ class ScriptRunner:
             # Mirror _resolve_security_data's key precedence: "SYMBOL:TF",
             # then "SYMBOL", then "TF".
             has_mapping = (
-                f"{sym_str}:{tf_str}" in keys
-                or sym_str in keys
-                or tf_str in keys
+                    f"{sym_str}:{tf_str}" in keys
+                    or sym_str in keys
+                    or tf_str in keys
             )
             req = SecurityRequirement(
                 sec_id=sec_id, symbol=sym_str, timeframe=tf_str, is_ltf=is_ltf,

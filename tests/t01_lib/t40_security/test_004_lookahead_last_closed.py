@@ -68,7 +68,8 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
 
     Live ``Lookahead.ON`` targets the CONTAINING (developing) period so the
     subprocess steps into the open HTF bar. Historical/off/last_closed target
-    the previously closed period.
+    the most recent period CLOSED by the chart bar's close instant — the HTF
+    period's last chart bar already confirms it (TV ``lookahead_off``).
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -80,15 +81,14 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
 
     utc = ZoneInfo('UTC')
     tf = '60'
+    chart_off = 15 * 60 * 1000 - 1  # 15-minute chart bars
 
     def _ms(year, month, day, hour, minute=0):
         return int(datetime(year, month, day, hour, minute, tzinfo=utc).timestamp() * 1000)
 
-    prev_chart = _ms(2026, 5, 21, 10, 30)
-    curr_chart = _ms(2026, 5, 21, 10, 45)  # still in 10:00-11:00 HTF period
+    curr_chart = _ms(2026, 5, 21, 10, 45)  # last chart bar of 10:00-11:00 HTF
     expected_current_period = _ms(2026, 5, 21, 10, 0)
-    expected_prev_period = expected_current_period  # same containing period
-    # Use a chart_time across the boundary for the "prev_period changes" case
+    expected_prev_period = _ms(2026, 5, 21, 9, 0)
     curr_chart_boundary = _ms(2026, 5, 21, 11, 5)
     expected_period_after_boundary = _ms(2026, 5, 21, 11, 0)
 
@@ -98,7 +98,7 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
         lookahead=Lookahead.ON,
         htf_aggregator=HTFAggregator(tf, utc),
         is_live=True,
-        prev_chart_time=prev_chart, last_confirmed=expected_prev_period,
+        last_confirmed=expected_prev_period, chart_off=chart_off,
     )
     assert _get_confirmed_time(state_on_live, curr_chart) == expected_current_period
     assert _get_confirmed_time(state_on_live, curr_chart_boundary) == \
@@ -110,22 +110,28 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
         lookahead=Lookahead.ON,
         htf_aggregator=HTFAggregator(tf, utc),
         is_live=False,  # historical
-        prev_chart_time=prev_chart, last_confirmed=0,
+        last_confirmed=0, chart_off=chart_off,
     )
-    # Historical lookahead_on falls back to OFF semantics — no new period
-    # opens between curr_chart (10:45) and prev_chart (10:30), so the function
-    # returns last_confirmed (0 here, no period closed yet).
-    assert _get_confirmed_time(state_on_historical, curr_chart) == 0
+    # Historical lookahead_on falls back to OFF semantics — the 10:45 bar
+    # closes at 11:00, exactly when the 10:00-11:00 HTF bar closes, so that
+    # period is already confirmed here (not on the next chart bar).
+    assert _get_confirmed_time(state_on_historical, curr_chart) == \
+        expected_current_period
 
     state_off_live = SecurityState(
         sec_id='s3', timeframe=tf, gaps_on=False, same_timeframe=False,
         resampler=Resampler.get_resampler(tf), tz=utc,
         lookahead=Lookahead.OFF,
         is_live=True,
-        prev_chart_time=prev_chart, last_confirmed=expected_prev_period,
+        last_confirmed=expected_prev_period, chart_off=chart_off,
     )
-    # Lookahead.OFF never steps into a developing bar.
-    assert _get_confirmed_time(state_off_live, curr_chart) == expected_prev_period
+    # Lookahead.OFF never steps into a developing bar: a mid-period chart bar
+    # (10:15, closing 10:30) still targets the closed 09:00 period.
+    assert _get_confirmed_time(state_off_live, _ms(2026, 5, 21, 10, 15)) == \
+        expected_prev_period
+    # The period's last chart bar (10:45, closing 11:00) confirms 10:00.
+    assert _get_confirmed_time(state_off_live, curr_chart) == \
+        expected_current_period
 
     # Cross-symbol HTF + Lookahead.ON has no aggregator (the chart OHLCV would
     # be the wrong instrument). Even after LIVE_TRANSITION the subprocess must
@@ -138,13 +144,14 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
         htf_aggregator=None,  # cross-symbol: no chart-side aggregator
         na_on_developing=True,
         is_live=True,
-        prev_chart_time=prev_chart, last_confirmed=0,
+        last_confirmed=0, chart_off=chart_off,
     )
-    # Inside an open HTF period — no new period opened between prev_chart
-    # (10:30) and curr_chart (10:45), so the function holds last_confirmed.
-    assert _get_confirmed_time(state_on_live_no_agg, curr_chart) == 0
-    # Crossing an HTF boundary: chart steps from 10:30 to 11:05; the function
-    # returns the just-closed prev_period (10:00), NOT the developing 11:00.
+    # Mid-period chart bar (10:15, closing 10:30): the function returns the
+    # closed 09:00 period, NOT the developing 10:00 one.
+    assert _get_confirmed_time(state_on_live_no_agg, _ms(2026, 5, 21, 10, 15)) == \
+        expected_prev_period
+    # Past the HTF boundary (11:05 bar): still the just-closed 10:00 period,
+    # NOT the developing 11:00 one.
     assert _get_confirmed_time(state_on_live_no_agg, curr_chart_boundary) == \
         expected_current_period
 

@@ -190,14 +190,17 @@ Under the hood, each `request.security()` call spawns a separate OS process:
 
 ### HTF Period Confirmation
 
-For higher-timeframe data, values are confirmed with **lookahead_off** semantics: a daily value
-becomes available only when the next daily bar opens (i.e., when the period boundary is crossed).
+For higher-timeframe data, values are confirmed with **lookahead_off** semantics following
+TradingView's historical merge rule: an HTF bar is confirmed on the chart bar whose **close
+instant** reaches the HTF bar's close — the period's last chart bar already carries the
+period's final value, not the next period's first bar.
 
 ```
-Chart bars (5m):    10:00  10:05  10:10 ... 23:55  00:00  00:05
+Chart bars (5m):    10:00  10:05  10:10 ... 23:50  23:55  00:00
                                                     ^
-                                              New daily period starts
-                                              Yesterday's daily value is now confirmed
+                                              Closes at 00:00 — exactly when the
+                                              daily bar closes, so the day's value
+                                              is confirmed on THIS chart bar
 ```
 
 For same-timeframe contexts (different symbol), values are confirmed on every bar.

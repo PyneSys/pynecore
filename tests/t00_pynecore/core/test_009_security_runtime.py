@@ -25,6 +25,7 @@ def _make_state(
     same_timeframe=False,
     gaps_on=False,
     tz_str="UTC",
+    chart_off=0,
 ) -> SecurityState:
     """Helper to create a SecurityState for testing."""
     tz = ZoneInfo(tz_str)
@@ -36,9 +37,14 @@ def _make_state(
         same_timeframe=same_timeframe,
         resampler=resampler,
         tz=tz,
+        chart_off=chart_off,
     )
     state.data_ready.set()
     return state
+
+
+# 5-minute chart bar span minus one ms (see ``setup_security_states``)
+_CHART_OFF_5M = 5 * 60 * 1000 - 1
 
 
 def __test_confirmed_time_same_tf__(log):
@@ -50,58 +56,42 @@ def __test_confirmed_time_same_tf__(log):
     assert result == 1000
 
     # Bar 1: still returns chart_time
-    state.prev_chart_time = 1000
     result = _get_confirmed_time(state, 2000)
     assert result == 2000
 
 
-def __test_confirmed_time_htf_no_new_period__(log):
-    """_get_confirmed_time returns last_confirmed when HTF period hasn't changed"""
-    state = _make_state(timeframe="1D")
-    state.last_confirmed = 0
+def __test_confirmed_time_htf_mid_period__(log):
+    """Mid-period chart bars target the previous HTF period's open"""
+    state = _make_state(timeframe="1D", chart_off=_CHART_OFF_5M)
 
-    # Bar 0: prev is None → returns last_confirmed
-    result = _get_confirmed_time(state, 1_000_000)
-    assert result == 0
-
-    # Bars within same daily period → returns last_confirmed
-    # Use timestamps within the same UTC day
-    # 2024-01-15 10:00 UTC = 1705312800000 ms
-    # 2024-01-15 10:05 UTC = 1705313100000 ms
-    state.prev_chart_time = 1705312800000
-    state.last_confirmed = 0
-    result = _get_confirmed_time(state, 1705313100000)
-    assert result == 0  # same day, no new period
+    # Chart bars inside Jan 15 (close instant stays within the day) keep
+    # targeting Jan 14 — the most recently closed daily bar. The caller's
+    # ``target > last_confirmed`` gate turns the repeats into no-ops.
+    jan_14 = 1705190400000  # 2024-01-14T00:00:00Z
+    assert _get_confirmed_time(state, 1705312800000) == jan_14  # Jan 15 10:00
+    assert _get_confirmed_time(state, 1705313100000) == jan_14  # Jan 15 10:05
 
 
-def __test_confirmed_time_htf_new_period__(log):
-    """_get_confirmed_time returns prev_period when a new HTF period starts"""
-    state = _make_state(timeframe="1D", tz_str="UTC")
-    state.last_confirmed = 0
+def __test_confirmed_time_htf_period_close__(log):
+    """The HTF bar is confirmed on its own LAST chart bar (TV lookahead_off)"""
+    state = _make_state(timeframe="1D", chart_off=_CHART_OFF_5M)
 
-    # 2024-01-15 23:55 UTC = end of Jan 15
-    prev_time = 1705362900000  # 2024-01-15T23:55:00Z in ms
-    # 2024-01-16 00:05 UTC = start of Jan 16
-    curr_time = 1705363500000  # 2024-01-16T00:05:00Z in ms
-
-    state.prev_chart_time = prev_time
-    result = _get_confirmed_time(state, curr_time)
-
-    # Should return the opening time of Jan 15 (the period that just closed)
-    resampler = Resampler.get_resampler("1D")
-    expected = resampler.get_bar_time(prev_time, ZoneInfo("UTC"))
-    assert result == expected
-    assert result > 0
+    jan_15 = 1705276800000  # 2024-01-15T00:00:00Z
+    # 2024-01-15 23:55 — the day's last 5m bar, closing exactly at midnight:
+    # Jan 15 is confirmed HERE, not on the next bar.
+    assert _get_confirmed_time(state, 1705362900000) == jan_15
+    # 2024-01-16 00:05 — the next day's bars keep the same target.
+    assert _get_confirmed_time(state, 1705363500000) == jan_15
 
 
 def __test_confirmed_time_first_bar_htf__(log):
-    """_get_confirmed_time on first bar with HTF returns 0 (no confirmed period)"""
-    state = _make_state(timeframe="1W")
-    state.last_confirmed = 0
-    state.prev_chart_time = None
+    """The first chart bar already targets the last closed HTF period"""
+    state = _make_state(timeframe="1W", chart_off=_CHART_OFF_5M)
 
-    result = _get_confirmed_time(state, 1705312800000)
-    assert result == 0
+    # 2024-01-15 (Monday) 10:00 — the previous week (Jan 8) is already closed,
+    # so even the very first chart bar targets it; whether a value arrives
+    # depends on how far back the child's data file reaches.
+    assert _get_confirmed_time(state, 1705312800000) == 1704672000000  # Jan 8
 
 
 def __test_chart_protocol_signal_read_flow__(log):

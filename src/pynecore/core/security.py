@@ -40,13 +40,15 @@ class Lookahead(Enum):
     """Lookahead mode for a security context.
 
     OFF
-        TV-faithful default. The security context advances only to the bar
-        that has CLOSED at or before the chart bar's time. In historical
-        mode this matches TradingView's ``barmerge.lookahead_off`` exactly.
-        In live mode the chart-side ``HTFAggregator`` ships each freshly
-        closed HTF bar to the subprocess via the SyncBlock (the static
-        ``.ohlcv`` file cannot grow at runtime), so the security series
-        advances on every HTF period close — no developing-bar exposure.
+        TV-faithful default. The security context advances to the most
+        recent HTF bar that has CLOSED at or before the chart bar's CLOSE
+        instant — the HTF period's last chart bar already carries the
+        period's final value. In historical mode this matches TradingView's
+        ``barmerge.lookahead_off`` exactly. In live mode the chart-side
+        ``HTFAggregator`` ships each freshly closed HTF bar to the
+        subprocess via the SyncBlock (the static ``.ohlcv`` file cannot
+        grow at runtime) as soon as the confirmed chart bar completing the
+        period is folded — no developing-bar exposure.
 
     LAST_CLOSED
         PyneSys-native, repaint-free alternative. Always returns the most
@@ -185,8 +187,9 @@ class SecurityState:
     # included — see the ``resampler`` module docs), so the chart walks the
     # child's actual bar opens with a monotonic pointer instead of recomputing
     # boundaries arithmetically. Populated by ``load_multiperiod_boundaries``
-    # at child spawn. ``chart_off`` resolves a chart bar by its last instant
-    # (the bar containing a session open is the new period's first bar);
+    # at child spawn. ``chart_off`` is the chart bar span minus one ms for
+    # intraday/seconds charts (0 for D/W/M charts); ``_get_confirmed_time``
+    # derives the chart bar's close instant from it for HTF confirmation.
     # ``sec_grid_args`` are the security's own (tz, session_starts,
     # opening_hours, mode) for the past-end-of-data fallback grid.
     bar_opens: list[int] | None = None
@@ -196,7 +199,6 @@ class SecurityState:
 
     # Tracking (chart-side only)
     last_confirmed: int = 0
-    prev_chart_time: int | None = None
     needs_wait: bool = False
     new_period: bool = False
 
@@ -212,9 +214,11 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     periods.
 
     HTF:
-      * ``OFF`` / ``LAST_CLOSED``: target is the previously CLOSED period's
-        opening time. The subprocess advances only when a new HTF period opens.
-        Historically these two modes are equivalent.
+      * ``OFF`` / ``LAST_CLOSED``: target is the most recent HTF period that has
+        CLOSED by the current chart bar's close instant. TradingView's historical
+        ``lookahead_off`` merge rule: an HTF bar's final value is carried already
+        by the chart bar whose close coincides with the HTF bar's close (the
+        period's last chart bar), not by the next period's first bar.
       * ``ON``: target is the CONTAINING period's opening time — the subprocess
         steps into the developing HTF bar (live mode supplies developing OHLCV
         via the SyncBlock; historical mode falls back to OFF semantics because
@@ -230,15 +234,19 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     resampler = state.resampler
     assert resampler is not None
 
+    # The chart bar's close instant. ``chart_off`` is span-1 for intraday and
+    # seconds charts; D/W/M chart bars have no fixed arithmetic span
+    # (``chart_off == 0``), so confirmation degrades to the bar's open instant.
+    close_time = chart_time + state.chart_off + 1
+
     if state.bar_opens is not None:
-        # Multi-period: advance the pointer to the child bar the chart is in;
-        # entering bar ``ptr`` closes every bar before it
+        # Multi-period: advance the pointer to the child bar the chart bar's
+        # close instant falls in; entering bar ``ptr`` closes every bar before it
         opens = state.bar_opens
-        eff = chart_time + state.chart_off
         ptr = state.bar_ptr
         n = len(opens)
         advanced = False
-        while ptr + 1 < n and opens[ptr + 1] <= eff:
+        while ptr + 1 < n and opens[ptr + 1] <= close_time:
             ptr += 1
             advanced = True
         state.bar_ptr = ptr
@@ -249,23 +257,9 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
             # realizes the next period, so the arithmetic grid decides when
             # the last bar is closed
             sec_tz, ss, oh, mode = state.sec_grid_args
-            if resampler.get_bar_time(eff, sec_tz, ss, oh, mode) > opens[-1]:
+            if resampler.get_bar_time(close_time, sec_tz, ss, oh, mode) > opens[-1]:
                 return opens[-1]
         return state.last_confirmed
-
-    prev_chart_time = state.prev_chart_time
-    if prev_chart_time is None:
-        return state.last_confirmed
-    if state.session_starts is not None:
-        # Off-grid intraday session → anchor HTF bars to the session open,
-        # using the security's own exchange timezone.
-        current_period = resampler.get_bar_time(
-            chart_time, state.session_tz, state.session_starts)
-        prev_period = resampler.get_bar_time(
-            prev_chart_time, state.session_tz, state.session_starts)
-    else:
-        current_period = resampler.get_bar_time(chart_time, state.tz)
-        prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
 
     if (state.lookahead is Lookahead.ON and state.is_live
             and state.htf_aggregator is not None):
@@ -274,13 +268,27 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         # (chart OHLCV is the wrong instrument), so the subprocess keeps
         # closed-bar semantics instead and the chart-side read returns ``na``
         # while a period is open (``na_on_developing``).
-        return current_period
+        if state.session_starts is not None:
+            # Off-grid intraday session → anchor HTF bars to the session open,
+            # using the security's own exchange timezone.
+            return resampler.get_bar_time(
+                chart_time, state.session_tz, state.session_starts)
+        return resampler.get_bar_time(chart_time, state.tz)
 
-    if current_period != prev_period:
-        # New period started → previous period is now confirmed
-        return prev_period
-    else:
-        return state.last_confirmed
+    # OFF / LAST_CLOSED (and the historical ON fallback): the period preceding
+    # the one ``close_time`` falls in. When the chart bar's close lands exactly
+    # on a period boundary, ``get_bar_time`` floors it to that boundary and the
+    # period ending there is returned — the just-closed HTF bar is confirmed on
+    # its own last chart bar.
+    if state.session_starts is not None:
+        # Off-grid intraday session → anchor HTF bars to the session open,
+        # using the security's own exchange timezone.
+        period = resampler.get_bar_time(
+            close_time, state.session_tz, state.session_starts)
+        return resampler.get_bar_time(
+            period - 1, state.session_tz, state.session_starts)
+    period = resampler.get_bar_time(close_time, state.tz)
+    return resampler.get_bar_time(period - 1, state.tz)
 
 
 def create_chart_protocol(
@@ -399,11 +407,10 @@ def create_chart_protocol(
             _, dev_bar, closed_bar = state.htf_aggregator.update(
                 chart_time, chart_open, chart_high, chart_low,
                 chart_close, chart_volume,
+                chart_confirmed=bool(lib.barstate.isconfirmed),
             )
 
             if state.is_live:
-                state.prev_chart_time = chart_time
-
                 # Phase 1: synchronously deliver any just-closed HTF bar
                 if closed_bar is not None:
                     sync_block.set_developing_bar(
@@ -428,7 +435,10 @@ def create_chart_protocol(
                     state.done_event.clear()
 
                 # Phase 2: developing bar — only for ``Lookahead.ON``.
-                if state.lookahead is Lookahead.ON:
+                # ``dev_bar`` is None when the confirmed chart bar just
+                # completed the period (Phase 1 delivered it); no fresh
+                # developing bar exists until the next chart bar.
+                if state.lookahead is Lookahead.ON and dev_bar is not None:
                     sync_block.set_developing_bar(
                         sec_id,
                         dev_bar.open, dev_bar.high, dev_bar.low,
@@ -466,7 +476,6 @@ def create_chart_protocol(
 
         # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
         target_time = _get_confirmed_time(state, chart_time)
-        state.prev_chart_time = chart_time
 
         if target_time > state.last_confirmed:
             state.last_confirmed = target_time
@@ -879,7 +888,8 @@ def setup_security_states(
 
                 if is_same_symbol:
                     htf_aggregator = HTFAggregator(
-                        timeframe, tz, session_starts=anchor_starts)
+                        timeframe, tz, session_starts=anchor_starts,
+                        chart_span_ms=chart_off + 1 if chart_off else 0)
                 elif lookahead_mode is Lookahead.ON:
                     # Cross-symbol HTF + lookahead_on: developing bar cannot
                     # be aggregated from chart OHLCV (wrong instrument). The

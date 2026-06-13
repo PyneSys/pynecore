@@ -233,6 +233,21 @@ def __test_confirmed_time_multiperiod_pointer__():
     assert _get_confirmed_time(state, 1_016 * day) == opens[1]
 
 
+def __test_confirmed_time_multiperiod_closing_bar__():
+    """The chart bar closing exactly on a child-bar boundary already confirms.
+
+    TV ``lookahead_off`` merge rule: the period's last chart bar (whose close
+    instant equals the next child bar's open) carries the confirmation — not
+    the next period's first bar.
+    """
+    day = 86_400_000
+    opens = [1_000 * day, 1_007 * day, 1_014 * day]
+    state = _multiperiod_state(opens, chart_off=4 * 3_600_000 - 1)
+    # The 4h chart bar opening at 1_007*day - 4h closes exactly at the bar-1
+    # open → bar 0 is confirmed on this bar.
+    assert _get_confirmed_time(state, 1_007 * day - 4 * 3_600_000) == opens[0]
+
+
 def __test_confirmed_time_multiperiod_first_bar__():
     """The first chart bar confirms all child bars before its own period."""
     day = 86_400_000

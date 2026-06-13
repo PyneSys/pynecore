@@ -22,9 +22,12 @@ carrying the *cumulative* candle volume. ``update()`` is therefore keyed on
 contribution of that bar is subtracted from the HTF developing volume and
 replaced with the latest cumulative reading — preventing double counting.
 
-When a chart bar crosses into a new HTF period, the previously-accumulated bar
-is the *closed* HTF bar for the period just ended, and a fresh developing bar
-starts from the new chart bar.
+A period closes following TradingView's ``lookahead_off`` merge rule: the
+confirmed chart bar whose close instant reaches the HTF period end completes
+the bar, so the closed HTF bar is delivered together with the period's LAST
+chart bar — not with the next period's first one. When no such completing bar
+arrives (data gap, or the chart bar span is unknown — D/W/M charts), the close
+falls back to the first chart bar that crosses into a new HTF period.
 """
 from __future__ import annotations
 
@@ -76,10 +79,12 @@ class DevelopingBar:
 class HTFAggregator:
     """Per-sec_id aggregator of chart OHLCV into a developing HTF bar."""
 
-    __slots__ = ('_timeframe', '_tz', '_resampler', '_state', '_session_starts')
+    __slots__ = ('_timeframe', '_tz', '_resampler', '_state', '_session_starts',
+                 '_chart_span_ms')
 
     def __init__(self, timeframe: str, tz: 'ZoneInfo',
-                 session_starts: 'list | None' = None):
+                 session_starts: 'list | None' = None,
+                 chart_span_ms: int = 0):
         self._timeframe = timeframe
         self._tz = tz
         self._resampler = Resampler.get_resampler(timeframe)
@@ -87,6 +92,10 @@ class HTFAggregator:
         # Intraday session anchoring (TradingView aligns HTF bars to the session
         # open). ``None`` keeps the pure clock-floor — see ``Resampler.get_bar_time``.
         self._session_starts = session_starts
+        # Chart bar span in ms for the close-instant period completion check.
+        # 0 (D/W/M charts: no fixed arithmetic span) disables it — the period
+        # then closes on the first chart bar of the next period instead.
+        self._chart_span_ms = chart_span_ms
 
     @property
     def timeframe(self) -> str:
@@ -102,7 +111,8 @@ class HTFAggregator:
         chart_time_ms: int,
         chart_open: float, chart_high: float, chart_low: float,
         chart_close: float, chart_volume: float,
-    ) -> tuple[bool, DevelopingBar, DevelopingBar | None]:
+        chart_confirmed: bool = True,
+    ) -> tuple[bool, DevelopingBar | None, DevelopingBar | None]:
         """
         Fold one chart bar into the developing HTF bar.
 
@@ -113,43 +123,58 @@ class HTFAggregator:
         :param chart_close: Chart bar close price.
         :param chart_volume: Chart bar volume (cumulative within the bar for
             live providers; the aggregator deduplicates same-bar updates).
-        :return: ``(is_new_period, developing, closed_or_none)``
+        :param chart_confirmed: Whether the folded chart bar is final
+            (``barstate.isconfirmed``). Only a confirmed chart bar may complete
+            the period — a developing intra-bar tick must not freeze a
+            non-final HTF close.
+        :return: ``(is_new_period, developing_or_none, closed_or_none)``
 
             - ``is_new_period`` — True iff the chart bar opens a fresh HTF period.
-            - ``developing`` — the (now possibly fresh) accumulated HTF bar
-              including this chart bar.
-            - ``closed_or_none`` — the previous period's final accumulated bar
-              when ``is_new_period`` is True, else None.
+            - ``developing_or_none`` — the accumulated HTF bar including this
+              chart bar, or None when this chart bar just completed the period
+              (no fresh developing bar exists until the next chart bar).
+            - ``closed_or_none`` — the completed period's final accumulated bar:
+              delivered with the confirmed chart bar whose close instant reaches
+              the period end (TV ``lookahead_off`` merge rule), or — when no
+              such bar arrived — with the first chart bar of the next period.
         """
         period_start = self._resampler.get_bar_time(
             chart_time_ms, self._tz, self._session_starts)
 
-        if self._state is None:
-            fresh = DevelopingBar(
+        closed: DevelopingBar | None = None
+        state = self._state
+        is_new = state is None or period_start != state.period_start
+        if is_new:
+            if state is not None:
+                # The period was left without its completing chart bar (data
+                # gap) — deliver its accumulated final form one bar late.
+                closed = state
+            state = DevelopingBar(
                 period_start=period_start,
                 open=chart_open, high=chart_high, low=chart_low,
                 close=chart_close, volume=chart_volume,
                 last_chart_time_ms=chart_time_ms,
                 last_chart_volume=chart_volume,
             )
-            self._state = fresh
-            return True, fresh, None
+            self._state = state
+        else:
+            state.update(chart_time_ms, chart_high, chart_low,
+                         chart_close, chart_volume)
 
-        if period_start != self._state.period_start:
-            closed = self._state
-            fresh = DevelopingBar(
-                period_start=period_start,
-                open=chart_open, high=chart_high, low=chart_low,
-                close=chart_close, volume=chart_volume,
-                last_chart_time_ms=chart_time_ms,
-                last_chart_volume=chart_volume,
-            )
-            self._state = fresh
-            return True, fresh, closed
+        # TV ``lookahead_off`` merge rule: the confirmed chart bar whose close
+        # instant reaches the period end completes the HTF bar — deliver it
+        # now, one chart bar earlier than the next-period fallback above.
+        # Skipped when a gap-closed bar is already pending (one closed bar per
+        # update; the fresh period then closes via the fallback) or when the
+        # chart bar span is unknown (``chart_span_ms == 0``).
+        if (closed is None and chart_confirmed and self._chart_span_ms
+                and self._resampler.get_bar_time(
+                    chart_time_ms + self._chart_span_ms, self._tz,
+                    self._session_starts) != period_start):
+            self._state = None
+            return is_new, None, state
 
-        self._state.update(chart_time_ms, chart_high, chart_low,
-                           chart_close, chart_volume)
-        return False, self._state, None
+        return is_new, state, closed
 
     def reset(self) -> None:
         """Discard any in-flight developing bar (used on context teardown)."""
