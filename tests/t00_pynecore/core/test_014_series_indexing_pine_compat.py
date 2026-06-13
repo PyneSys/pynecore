@@ -3,7 +3,7 @@
 
 Direct unit tests for SeriesImpl.__getitem__ Pine-compat semantics:
 
-- ``series[na]``       -> na      (regression for NA-key TypeError)
+- ``series[na]``       -> series[0]  (TradingView treats an na offset as the current bar)
 - ``series[neg_int]``  -> na      (regression for issue #57: IndexError on negative key)
 - ``series[>=size]``   -> na      (pre-existing behavior — must not regress)
 - ``series[float]``    -> coerces to int and returns the bar at that offset
@@ -29,26 +29,28 @@ def _populate(values: list[float]) -> SeriesImpl:
 
 
 #
-# NA-key indexing — Pine: series[na] -> na
+# NA-key indexing — Pine: series[na] -> series[0] (na offset is the current bar)
 #
 
-def __test_na_key_returns_na__():
-    """SeriesImpl[NA] must return NA(T), not raise TypeError"""
+def __test_na_key_returns_current_bar__():
+    """SeriesImpl[NA] returns the current bar (offset 0), matching TradingView.
+
+    Verified against TradingView: ``high[na]`` returns ``high[0]`` (the current
+    bar's value), not na. The subscript must also not raise TypeError on an NA key."""
     s = _populate([10.0, 20.0, 30.0])
-    result = s[NA(int)]
-    assert isinstance(result, NA)
+    assert s[NA(int)] == 30.0
 
 
-def __test_na_float_key_returns_na__():
-    """Subscript with an NA[float] key must return na (math.abs(NA[int]) yields NA[float]).
+def __test_na_float_key_returns_current_bar__():
+    """Subscript with an NA[float] key returns the current bar (offset 0).
 
-    math.abs(NA[int]) yields NA[float]; subscript with NA[float] must still return na.
-    This is the exact case that crashed ict_entry_v2 — ta.highestbars(...) returns na on
-    early bars, math.abs propagates as NA[float], and the resulting bar_index[NA[float]]
-    used to raise TypeError."""
+    math.abs(NA[int]) yields NA[float]; subscript with NA[float] must behave like
+    any na offset and return series[0]. This is the exact case from ict_entry_v2 —
+    ta.highestbars(...) returns na on early bars, math.abs propagates as NA[float],
+    and the resulting high[NA[float]] must resolve to the current bar (it used to
+    raise TypeError, was then wrongly made na, and TradingView in fact returns offset 0)."""
     s = _populate([10.0, 20.0, 30.0])
-    result = s[NA(float)]
-    assert isinstance(result, NA)
+    assert s[NA(float)] == 30.0
 
 
 def __test_na_key_on_empty_series_returns_na__():
