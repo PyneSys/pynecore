@@ -191,18 +191,21 @@ class SeriesImpl(Generic[T]):
         """
         Get item(s) using Pine indexing with slice support.
 
-        Pine semantics: subscripting with `na` or with an out-of-range integer
-        (negative = forward of the current bar, positive >= size = before
-        available history) returns `na` rather than raising.
+        Pine semantics: subscripting with `na` returns the current bar's value
+        (offset 0) — TradingView's history-referencing operator treats an `na`
+        offset as 0. An out-of-range integer (negative = forward of the current
+        bar, positive >= size = before available history) returns `na` rather
+        than raising.
 
         :param key: Integer index, NA, or slice
         :return: Single value for integer index, ReadOnlySeriesView for slice
         :raises TypeError: If key is not int, NA, or slice
         """
-        # Pine: series[na] -> na. Must come before any int(key) coercion
-        # because int(NA) raises.
+        # Pine: series[na] -> series[0] (an na offset is treated as the current
+        # bar). Coerce to 0 here, before the int(key) path, since int(NA) raises;
+        # the bounds check below then returns na only for a genuinely empty series.
         if isinstance(key, NA):
-            return cast(NA[T], NA(T))
+            key = 0
 
         if isinstance(key, float):
             key = int(key)
