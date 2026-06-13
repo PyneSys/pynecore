@@ -6,7 +6,7 @@ from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _s
 from .na import NA
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Box:
     # Required parameters - coordinates (``na`` when set from a chart.point that lacks the
     # corresponding coordinate for the active xloc)

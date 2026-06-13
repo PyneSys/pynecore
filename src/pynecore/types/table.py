@@ -27,7 +27,7 @@ class TableCell:
     merge_end_row: int = -1
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Table:
     # Required parameters
     position: _position.Position  # Position of the table

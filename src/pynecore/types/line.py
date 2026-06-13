@@ -10,7 +10,7 @@ class LineEnum(StrLiteral):
     ...
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Line:
     # Required parameters - coordinates (``na`` when set from a chart.point that lacks the
     # corresponding coordinate for the active xloc)
