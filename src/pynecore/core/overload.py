@@ -203,6 +203,36 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
     return None
 
 
+def _type_token(value: Any) -> Any:
+    """Hashable token capturing exactly the properties ``_check_type``
+    discriminates on, so that two arguments with equal tokens are
+    interchangeable for implementation selection.
+
+    Scalars map to their type; NA carries its ``type`` marker; parameterized
+    containers sample one element, mirroring ``_check_type``'s element probe.
+    The token is conservative: distinct tokens never merge arguments that
+    ``_check_type`` could treat differently.
+
+    :param value: A call argument.
+    :return: A hashable selection token.
+    """
+    t = type(value)
+    if t is int or t is float or t is str or t is bool:
+        return t
+    if isinstance(value, NA):
+        return NA, value.type
+    if t is dict:
+        if value:
+            _k, _v = next(iter(value.items()))
+            return dict, type(_k), type(_v)
+        return (dict,)
+    if t is list or t is tuple:
+        if value:
+            return t, type(value[0])
+        return (t,)
+    return t
+
+
 def _anchored(impls: list[Implementation], qualname: str,
               cache: dict[Implementation, tuple[Callable, list | None, Callable]] | None = None
               ) -> Callable:
@@ -220,11 +250,27 @@ def _anchored(impls: list[Implementation], qualname: str,
     """
     _cache: dict[Implementation, tuple[Callable, list | None, Callable]] = \
         {} if cache is None else cache
+    # Per-anchor selection memo: a call site invokes the dispatcher with the
+    # same argument shape every bar, so the matching implementation is cached
+    # by call shape and the full _select (with inspect binding) runs once.
+    # Implementation objects are module-lifetime stable (re-runs swap only
+    # impl.func, handled below), so this never goes stale across resets.
+    _select_cache: dict[tuple, Implementation] = {}
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
-        impl = _select(impls, args, kwargs)
+        # Selection key, inlined (this is per-bar hot code): a uniform hashable
+        # ``(positional_tokens, keyword_tokens)`` pair so the no-kwargs and
+        # with-kwargs forms can never collide. map() over _type_token beats a
+        # generator expression here. Equal keys guarantee the same impl.
+        pos = tuple(map(_type_token, args))
+        key = (pos, ()) if not kwargs else \
+            (pos, tuple((k, _type_token(v)) for k, v in kwargs.items()))
+        impl = _select_cache.get(key)
         if impl is None:
-            raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
+            impl = _select(impls, args, kwargs)
+            if impl is None:
+                raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
+            _select_cache[key] = impl
         entry = _cache.get(impl)
         if entry is None or entry[0] is not impl.func:
             # First win at this anchor, or the implementation function was
