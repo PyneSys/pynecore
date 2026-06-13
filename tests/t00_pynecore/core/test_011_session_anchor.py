@@ -109,6 +109,9 @@ def __test_get_confirmed_time_session_anchored__(log):
     """
     The chart-side OFF/historical advance confirms HTF periods on the
     session-anchored boundaries (10:30, 11:30) — not the clock-floor (10:00…).
+    Each HTF period is confirmed on its own LAST chart bar (the one whose
+    close lands on the period boundary), per TV's historical ``lookahead_off``
+    merge rule.
     """
     ss = _rth_0930()
     state = SecurityState(
@@ -120,37 +123,40 @@ def __test_get_confirmed_time_session_anchored__(log):
         tz=_NY,
         session_starts=ss,
         session_tz=_NY,
+        chart_off=30 * 60 * 1000 - 1,  # 30m chart bars
     )
+
+    o0930 = _ms(_NY, 2024, 1, 17, 9, 30)
+    o1030 = _ms(_NY, 2024, 1, 17, 10, 30)
+    # Seed past the previous session so the first bar's target (a prior-day
+    # period) does not register as a fresh confirmation.
+    state.last_confirmed = o0930 - 1
 
     # 30m chart bars from the 09:30 open.
     chart_bars = [
         _ms(_NY, 2024, 1, 17, 9, 30),
-        _ms(_NY, 2024, 1, 17, 10, 0),
-        _ms(_NY, 2024, 1, 17, 10, 30),   # opens the 10:30 HTF period → confirms 09:30
-        _ms(_NY, 2024, 1, 17, 11, 0),
-        _ms(_NY, 2024, 1, 17, 11, 30),   # opens the 11:30 HTF period → confirms 10:30
+        _ms(_NY, 2024, 1, 17, 10, 0),    # closes at 10:30 → confirms 09:30
+        _ms(_NY, 2024, 1, 17, 10, 30),
+        _ms(_NY, 2024, 1, 17, 11, 0),    # closes at 11:30 → confirms 10:30
+        _ms(_NY, 2024, 1, 17, 11, 30),
     ]
     confirmed: list[int | None] = []
     for ct in chart_bars:
         target = _get_confirmed_time(state, ct)
-        state.prev_chart_time = ct
         if target > state.last_confirmed:
             state.last_confirmed = target
             confirmed.append(target)
         else:
             confirmed.append(None)
 
-    o0930 = _ms(_NY, 2024, 1, 17, 9, 30)
-    o1030 = _ms(_NY, 2024, 1, 17, 10, 30)
-    # First bar has no previous → no confirmation yet.
+    # Inside the 09:30 period → no fresh confirmation.
     assert confirmed[0] is None
-    # No new HTF period inside 09:30..10:29 → no confirmation on the 10:00 bar.
-    assert confirmed[1] is None
-    # The 10:30 chart bar opens a new HTF period → confirms the 09:30 period.
-    assert confirmed[2] == o0930
-    assert confirmed[3] is None
-    # The 11:30 chart bar confirms the 10:30 period.
-    assert confirmed[4] == o1030
+    # The 10:00 bar closes exactly at the 10:30 boundary → confirms 09:30.
+    assert confirmed[1] == o0930
+    assert confirmed[2] is None
+    # The 11:00 bar closes at 11:30 → confirms 10:30.
+    assert confirmed[3] == o1030
+    assert confirmed[4] is None
 
 
 def __test_dst_overnight_absolute_stepping__(log):

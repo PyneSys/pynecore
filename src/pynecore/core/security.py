@@ -105,8 +105,9 @@ class SecurityState:
     # included — see the ``resampler`` module docs), so the chart walks the
     # child's actual bar opens with a monotonic pointer instead of recomputing
     # boundaries arithmetically. Populated by ``load_multiperiod_boundaries``
-    # at child spawn. ``chart_off`` resolves a chart bar by its last instant
-    # (the bar containing a session open is the new period's first bar);
+    # at child spawn. ``chart_off`` is the chart bar span minus one ms for
+    # intraday/seconds charts (0 for D/W/M charts); ``_get_confirmed_time``
+    # derives the chart bar's close instant from it for HTF confirmation.
     # ``sec_grid_args`` are the security's own (tz, session_starts,
     # opening_hours, mode) for the past-end-of-data fallback grid.
     bar_opens: list[int] | None = None
@@ -116,7 +117,6 @@ class SecurityState:
 
     # Tracking (chart-side only)
     last_confirmed: int = 0
-    prev_chart_time: int | None = None
     needs_wait: bool = False
     new_period: bool = False
 
@@ -126,10 +126,12 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     Determine which security period is confirmed at the current chart time.
 
     For same timeframe: every chart bar is a confirmed bar (return chart_time).
-    For HTF: a period is confirmed only when a NEW period starts — the previous
-    period's opening time is returned (lookahead_off semantics). Multi-period
-    (nD/nW/nM) timeframes walk the child's actual bar opens (see
-    ``SecurityState.bar_opens``); other timeframes compare resampler periods.
+    For HTF: the period is confirmed on its own LAST chart bar — the one whose
+    CLOSE instant (``chart_time + chart_off + 1``) reaches the period end —
+    per TradingView's historical ``lookahead_off`` merge rule, not one bar late
+    on the next period's first bar. Multi-period (nD/nW/nM) timeframes walk the
+    child's actual bar opens (see ``SecurityState.bar_opens``); other timeframes
+    floor the close instant to the preceding resampler period.
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
@@ -141,15 +143,19 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     resampler = state.resampler
     assert resampler is not None
 
+    # The chart bar's close instant. ``chart_off`` is span-1 for intraday and
+    # seconds charts; D/W/M chart bars have no fixed arithmetic span
+    # (``chart_off == 0``), so confirmation degrades to the bar's open instant.
+    close_time = chart_time + state.chart_off + 1
+
     if state.bar_opens is not None:
-        # Multi-period: advance the pointer to the child bar the chart is in;
-        # entering bar ``ptr`` closes every bar before it
+        # Multi-period: advance the pointer to the child bar the chart bar's
+        # close instant falls in; entering bar ``ptr`` closes every bar before it
         opens = state.bar_opens
-        eff = chart_time + state.chart_off
         ptr = state.bar_ptr
         n = len(opens)
         advanced = False
-        while ptr + 1 < n and opens[ptr + 1] <= eff:
+        while ptr + 1 < n and opens[ptr + 1] <= close_time:
             ptr += 1
             advanced = True
         state.bar_ptr = ptr
@@ -160,29 +166,23 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
             # realizes the next period, so the arithmetic grid decides when
             # the last bar is closed
             sec_tz, ss, oh, mode = state.sec_grid_args
-            if resampler.get_bar_time(eff, sec_tz, ss, oh, mode) > opens[-1]:
+            if resampler.get_bar_time(close_time, sec_tz, ss, oh, mode) > opens[-1]:
                 return opens[-1]
         return state.last_confirmed
 
-    prev_chart_time = state.prev_chart_time
-    if prev_chart_time is None:
-        return state.last_confirmed
+    # OFF / lookahead_off: the period preceding the one ``close_time`` falls in.
+    # When the chart bar's close lands exactly on a period boundary,
+    # ``get_bar_time`` floors it to that boundary and the period ending there is
+    # returned — the just-closed HTF bar is confirmed on its own last chart bar.
     if state.session_starts is not None:
         # Off-grid intraday session → anchor HTF bars to the session open,
         # using the security's own exchange timezone.
-        current_period = resampler.get_bar_time(
-            chart_time, state.session_tz, state.session_starts)
-        prev_period = resampler.get_bar_time(
-            prev_chart_time, state.session_tz, state.session_starts)
-    else:
-        current_period = resampler.get_bar_time(chart_time, state.tz)
-        prev_period = resampler.get_bar_time(prev_chart_time, state.tz)
-
-    if current_period != prev_period:
-        # New period started → previous period is now confirmed
-        return prev_period
-    else:
-        return state.last_confirmed
+        period = resampler.get_bar_time(
+            close_time, state.session_tz, state.session_starts)
+        return resampler.get_bar_time(
+            period - 1, state.session_tz, state.session_starts)
+    period = resampler.get_bar_time(close_time, state.tz)
+    return resampler.get_bar_time(period - 1, state.tz)
 
 
 def create_chart_protocol(
@@ -261,7 +261,6 @@ def create_chart_protocol(
             state.needs_wait = True
         else:
             target_time = _get_confirmed_time(state, chart_time)
-            state.prev_chart_time = chart_time
 
             if target_time > state.last_confirmed:
                 state.last_confirmed = target_time
