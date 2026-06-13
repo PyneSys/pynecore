@@ -134,8 +134,10 @@ def all() -> list[Box]:
 def delete(id):
     if isinstance(id, NA):
         return
-    if id in _registry:
+    try:
         _registry.remove(id)
+    except ValueError:
+        pass
 
 
 # noinspection PyShadowingBuiltins

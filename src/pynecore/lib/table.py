@@ -62,8 +62,10 @@ def delete(table_id: Table) -> None:
     """
     if isinstance(table_id, NA):
         return
-    if table_id in _registry:
+    try:
         _registry.remove(table_id)
+    except ValueError:
+        pass
 
 
 def cell(table_id: Table, column: int, row: int, text: str = "", width: int | float = 0,

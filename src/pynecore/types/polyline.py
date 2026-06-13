@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from .chart import ChartPoint
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Polyline:
     # Array of chart.point objects for the drawing to sequentially connect
     points: list["ChartPoint"]

@@ -38,8 +38,10 @@ def delete(id: LineFill) -> None:
     """
     if isinstance(id, NA):
         return
-    if id in _registry:
+    try:
         _registry.remove(id)
+    except ValueError:
+        pass
 
 
 # noinspection PyShadowingBuiltins

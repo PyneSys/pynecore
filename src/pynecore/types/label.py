@@ -10,7 +10,7 @@ class LabelStyleEnum(StrLiteral):
     ...
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Label:
     # Required parameters (``na`` when set from a chart.point that lacks the corresponding
     # coordinate for the active xloc)
