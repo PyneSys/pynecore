@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 import sys
 import math as _math
 
-from functools import lru_cache
 from datetime import datetime, timedelta, time as dt_time, UTC
 
 from pynecore.types.source import Source
@@ -158,7 +157,6 @@ def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime | 
     return dt.astimezone(_parse_timezone(timezone))
 
 
-@lru_cache(maxsize=1024)
 @overload
 def timestamp(date_string: DateStr) -> int:  # It is more pythonic, but not supported by Pine Script
     """
