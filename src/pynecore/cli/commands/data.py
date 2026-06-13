@@ -4,13 +4,14 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime, timedelta, UTC
 
-from typer import Typer, Option, Argument, Exit, secho, colors, confirm, BadParameter
+from typer import Typer, Option, Argument, Exit, Context, secho, colors, confirm, BadParameter
 
 from rich import print as rprint
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
                            TimeElapsedColumn, TimeRemainingColumn)
 
 from ..app import app, app_state
+from ..pluggable import PluggableCommand
 from ...core.plugin import discover_plugins, load_plugin, PluginNotFoundError
 from ...core.plugin import ProviderPlugin, ProviderError
 from ...core.provider_string import is_provider_string, parse_provider_string
@@ -156,8 +157,9 @@ def _format_date_default(value, fallback: str) -> str:
     return fallback
 
 
-@app_data.command()
+@app_data.command(cls=PluggableCommand)
 def download(
+        ctx: Context,
         provider: str = Argument(..., show_default=False,
                                  help="Provider name (e.g. 'ccxt') or a full provider string "
                                       "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D')"),
@@ -398,6 +400,10 @@ def download(
             sym_info = provider_instance.get_symbol_info()
             if show_info:
                 rprint(sym_info)
+
+        # Hand any plugin-injected CLI flags to the provider; it reads only its
+        # own keys (see CLIPlugin.cli_params / PluggableCommand).
+        provider_instance.plugin_params = getattr(ctx, "plugin_params", {})
 
         # Open the OHLCV file and start downloading
         with provider_instance as ohlcv_writer:

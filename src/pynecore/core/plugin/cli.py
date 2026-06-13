@@ -35,8 +35,11 @@ class CLIPlugin(Plugin[ConfigT]):
         Return extra parameters for an existing command.
 
         Override to inject flags/options into commands like ``pyne run``.
+        Nested subcommands are addressed by their space-separated path, so
+        ``pyne data download`` is matched as ``"data download"``.
 
-        :param command_name: The command to extend (e.g. ``"run"``).
+        :param command_name: The command to extend (e.g. ``"run"`` or
+            ``"data download"``).
         :return: List of Click parameters, or ``[]`` if no hooks for this command.
         """
         return []

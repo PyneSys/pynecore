@@ -265,7 +265,24 @@ timeout = 30
 # CLIPlugin loading: subcommands and parameter hooks
 # ---------------------------------------------------------------------------
 _BUILTIN_COMMANDS = {'run', 'data', 'compile', 'benchmark', 'debug', 'plugin'}
-_PLUGGABLE_COMMANDS = {'run': run}
+# Commands plugins may inject parameters into, as space-separated paths so a
+# nested subcommand (e.g. ``data download``) can be reached as well.
+_PLUGGABLE_COMMANDS = ('run', 'data download')
+
+
+def _resolve_command(group: "click.Group", path: str) -> "click.Command | None":
+    """Walk a space-separated command path into nested Click groups."""
+    node: click.Command = group
+    parts = path.split()
+    for part in parts[:-1]:
+        if not isinstance(node, click.Group):
+            return None
+        node = node.commands.get(part)  # type: ignore[assignment]
+        if node is None:
+            return None
+    if not isinstance(node, click.Group):
+        return None
+    return node.commands.get(parts[-1])
 
 
 def _register_cli_plugins():
@@ -293,14 +310,14 @@ def _register_cli_plugins():
                     app.add_typer(cli_app, name=name)
 
             # 2. Parameter hook registration
-            for cmd_name, cmd_func in _PLUGGABLE_COMMANDS.items():
-                params = plugin_cls.cli_params(cmd_name)
+            for cmd_path in _PLUGGABLE_COMMANDS:
+                params = plugin_cls.cli_params(cmd_path)
                 if not params:
                     continue
 
                 group = typer.main.get_command(app)
                 assert isinstance(group, click.Group)
-                click_cmd = group.commands.get(cmd_name)
+                click_cmd = _resolve_command(group, cmd_path)
                 if not isinstance(click_cmd, PluggableCommand):
                     continue
 
@@ -308,7 +325,7 @@ def _register_cli_plugins():
                     if not click_cmd.register_plugin_param(param):
                         typer.secho(
                             f"Warning: plugin '{name}' param '{param.name}' "
-                            f"conflicts on '{cmd_name}'",
+                            f"conflicts on '{cmd_path}'",
                             fg="yellow", err=True,
                         )
 

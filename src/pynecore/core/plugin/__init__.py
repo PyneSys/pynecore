@@ -31,7 +31,7 @@ Discovery::
 import inspect
 import re
 import sys
-from typing import TypeVar, Generic
+from typing import TypeVar, Generic, Any
 
 # noinspection PyProtectedMember
 from importlib.metadata import entry_points, EntryPoint
@@ -68,6 +68,11 @@ class Plugin(Generic[ConfigT]):
 
     plugin_name: str = ""
     """Optional display name override.  If empty, the entry point name is used."""
+
+    plugin_params: dict[str, Any] = {}
+    """Values of plugin-injected CLI flags for the running command, populated by
+    the core CLI before invoking the plugin (see :class:`CLIPlugin.cli_params`).
+    Each plugin reads only its own keys; empty when no command set it."""
 
 
 class PluginNotFoundError(ImportError):
