@@ -1,10 +1,20 @@
 """Tests for the PluggableCommand CLI parameter injection system."""
 
 import click
+import pytest
 import typer
 from click.testing import CliRunner
 
 from pynecore.cli.pluggable import PluggableCommand
+
+
+@pytest.fixture(autouse=True)
+def _reset_plugin_param_registry():
+    """Isolate tests: the registry is class-level (survives Typer rebuilds), so it
+    must be cleared between tests that reuse the same command leaf name."""
+    PluggableCommand._plugin_param_registry.clear()
+    yield
+    PluggableCommand._plugin_param_registry.clear()
 
 
 def _make_app():
