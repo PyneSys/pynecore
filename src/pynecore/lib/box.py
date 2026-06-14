@@ -8,8 +8,9 @@ from ..types.na import NA, na_int, na_float
 from ..types.chart import ChartPoint
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
+from .. import lib
 
-_registry: list[Box] = []
+_registry: dict[Box, None] = {}
 
 
 @overload
@@ -119,7 +120,10 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
         text_formatting=text_formatting,
         force_overlay=force_overlay,
     )
-    _registry.append(box)
+    _registry[box] = None
+    # Enforce Pine's max_boxes_count cap: drop the oldest box (FIFO) past the limit
+    if lib._script is not None and len(_registry) > lib._script.max_boxes_count:
+        del _registry[next(iter(_registry))]
     return box
 
 
@@ -127,17 +131,14 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
 @module_property
 def all() -> list[Box]:
     """Returns all box objects"""
-    return _registry
+    return list(_registry)
 
 
 # noinspection PyShadowingBuiltins
 def delete(id):
     if isinstance(id, NA):
         return
-    try:
-        _registry.remove(id)
-    except ValueError:
-        pass
+    _registry.pop(id, None)
 
 
 # noinspection PyShadowingBuiltins
