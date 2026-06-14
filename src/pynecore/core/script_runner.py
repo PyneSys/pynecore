@@ -98,14 +98,15 @@ def _round_price(price: float, tick_decimals: int | None):
 
 # noinspection PyShadowingNames,PyUnusedLocal
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
-                        round_decimals: int | None):
+                        round_decimals: int | None, last_bar_index: int | None = None):
     """
     Set lib properties from OHLCV
     """
     if TYPE_CHECKING:  # This is needed for the type checker to work
         from .. import lib
 
-    lib.bar_index = lib.last_bar_index = bar_index
+    lib.bar_index = bar_index
+    lib.last_bar_index = bar_index if last_bar_index is None else last_bar_index
 
     lib.open = o = _round_price(ohlcv.open, round_decimals)
     lib.high = h = _round_price(ohlcv.high, round_decimals)
@@ -685,7 +686,10 @@ class ScriptRunner:
                 barstate.islast = (next_candle is None)
 
                 # Update lib properties
-                _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals)
+                _set_lib_properties(
+                    candle, self.bar_index, self.tz, lib, self._round_decimals,
+                    self.last_bar_index,
+                )
 
                 # Store first price for buy & hold calculation
                 if self.first_price is None:
