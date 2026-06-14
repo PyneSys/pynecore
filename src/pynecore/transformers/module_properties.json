@@ -114,9 +114,6 @@
     "low": {
       "type": "variable"
     },
-    "lru_cache": {
-      "type": "variable"
-    },
     "max_bars_back": {
       "type": "variable"
     },
