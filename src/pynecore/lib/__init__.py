@@ -537,24 +537,27 @@ def _intraday_session_args(timeframe: str) -> tuple:
     """
     Build the ``(tz, session_starts)`` arguments for :meth:`Resampler.get_bar_time`
     that anchor an intraday ``timeframe`` to the exchange session open, the way
-    TradingView aligns intraday HTF bars. Returns an empty tuple for daily/weekly/
-    monthly timeframes and when no session is known, keeping the pure UTC
-    clock-floor. Anchoring is a no-op for on-hour / 24-7 markets, so it is always
-    safe to pass for intraday.
+    TradingView aligns intraday HTF bars. Anchoring is a no-op for on-hour / 24-7
+    markets, so it is always safe to pass for intraday.
+
+    Daily/weekly/monthly timeframes get ``(tz,)`` instead: their calendar floor
+    must run in the exchange timezone (TradingView day/week/month boundaries are
+    exchange-local), not in the machine's local time.
 
     :param timeframe: The requested timeframe string (already validated).
-    :return: ``(tz, session_starts)`` for intraday with a session, else ``()``.
+    :return: ``(tz, session_starts)`` for intraday with a session, ``(tz,)`` for
+             daily/weekly/monthly, else ``()``.
     """
-    # noinspection PyProtectedMember
-    session_starts = getattr(syminfo, '_session_starts', None)
-    if not session_starts:
-        return ()
+    tz_name = getattr(syminfo, 'timezone', None)
+    tz = _parse_timezone(tz_name) if tz_name else None
     # noinspection PyProtectedMember
     modifier, _ = timeframe_module._process_tf(timeframe)
     if modifier not in ('S', ''):
-        return ()
-    tz_name = getattr(syminfo, 'timezone', None)
-    tz = _parse_timezone(tz_name) if tz_name else None
+        return (tz,) if tz is not None else ()
+    # noinspection PyProtectedMember
+    session_starts = getattr(syminfo, '_session_starts', None)
+    if not session_starts:
+        return (tz,) if tz is not None else ()
     return tz, session_starts
 
 
@@ -812,6 +815,43 @@ def _dwm_bar_time(resampler: Resampler, modifier: str, multiplier: int,
         syminfo._opening_hours, 'weekday')
 
 
+# Single-day ("D"/"1D") bar open cache: TradingView daily bars open at the
+# trading day's session open (FX Monday opens Sunday 17:00, TSE 09:00), not at
+# the calendar-midnight floor. Rebuilt when the session template is replaced
+# (identity guard, like the ``_ttd``/``_tdc`` machinery).
+_dbt_guard: tuple | None = None  # (opening_hours, session_starts) identities
+_dbt_tz = None
+_dbt_on: dict = {}
+_dbt_starts: list | None = None
+
+
+# noinspection PyProtectedMember
+def _d_bar_time(current_time_ms: int) -> int:
+    """
+    Daily ("D") bar open time: the session open of the bar's trading day.
+
+    The bar is resolved by its *last* instant (:func:`_chart_span_off_ms`), so
+    the chart bar containing a session open counts as the new trading day's
+    first bar. Falls back to the trading day's local midnight when no session
+    template is known.
+
+    :param current_time_ms: Chart bar open to resolve, in milliseconds
+    :return: Bar opening time in milliseconds
+    """
+    global _dbt_guard, _dbt_tz, _dbt_on, _dbt_starts
+    oh = syminfo._opening_hours
+    ss = syminfo._session_starts
+    if _dbt_guard is None or _dbt_guard[0] is not oh or _dbt_guard[1] is not ss:
+        tz_name = getattr(syminfo, 'timezone', None)
+        _dbt_tz = _parse_timezone(tz_name) if tz_name else None
+        _dbt_on = _overnight_opens(oh or None, ss or None)
+        _dbt_starts = ss or None
+        _dbt_guard = (oh, ss)
+    eff_sec = (current_time_ms + _chart_span_off_ms()) // 1000
+    td = _trading_day(eff_sec, _dbt_tz, _dbt_on)
+    return _trading_day_open_sec(td, _dbt_tz, _dbt_starts, _dbt_on) * 1000
+
+
 @module_property
 def time(timeframe: str | None = None, session: str | int | None = None,
          timezone: str | None = None, bars_back: int = 0) -> PyneInt:
@@ -875,6 +915,14 @@ def time(timeframe: str | None = None, session: str | int | None = None,
             bar_time = current_time_ms
         else:
             bar_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
+    elif modifier == 'D':
+        # noinspection PyProtectedMember
+        if ('D', 1) == timeframe_module._process_tf(str(syminfo.period)):
+            bar_time = current_time_ms
+        else:
+            # TradingView daily bars open at the trading day's session open
+            # (the previous evening for overnight markets), not at midnight
+            bar_time = _d_bar_time(current_time_ms)
     else:
         bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
@@ -1003,6 +1051,115 @@ def time_tradingday() -> PyneInt:
     return result
 
 
+# Trading-day close cap for ``time_close``. TradingView closes a bar at
+# ``min(bar open + timeframe span, end of the bar's trading day)``: the last —
+# possibly shortened — bar of the day closes when the trading day ends, while
+# intra-day gaps (lunch breaks) and continuous overnight sessions do not cap.
+# ``_tdc_by_wd`` maps a trading day's weekday to its closing instant as a
+# (time-of-day, calendar-day offset from the trading-day date) pair; rebuilt
+# whenever ``syminfo._opening_hours`` is replaced (identity guard, like the
+# ``_ttd`` machinery above).
+_tdc_hours: list | None = None  # identity guard
+_tdc_by_wd: dict[int, tuple[dt_time, int]] = {}  # weekday -> (end tod, +days)
+_tdc_overnight_by_wd: dict[int, list[dt_time]] = {}
+_tdc_tz = None
+
+
+def _tdc_rebuild(opening_hours: list) -> None:
+    """
+    Rebuild the per-weekday trading-day close table from ``opening_hours``.
+
+    Each interval's end instant is assigned to the trading day it closes —
+    rolled to the next day when the instant lies inside an overnight session —
+    and the latest end per trading day wins (the lunch-break morning end loses
+    to the afternoon close).
+
+    :param opening_hours: ``syminfo._opening_hours`` (``SymInfoInterval`` list)
+    """
+    global _tdc_hours, _tdc_by_wd, _tdc_overnight_by_wd, _tdc_tz
+
+    midnight = dt_time(0, 0, 0)
+    overnight: dict[int, list[dt_time]] = {}
+    for day, start, end in opening_hours:
+        if end <= start and start != midnight:
+            overnight.setdefault(day, []).append(start)
+
+    best: dict[int, tuple[int, dt_time, int]] = {}  # td_wd -> (sort key, tod, +days)
+    for day, start, end in opening_hours:
+        crosses = end <= start  # the interval ends on the next calendar day
+        if end == midnight:
+            # The instant just before the end is still on the opening day
+            eps_day = day
+            rolled = bool(overnight.get(eps_day))
+        else:
+            eps_day = (day + 1) % 7 if crosses else day
+            rolled = any(end > o for o in overnight.get(eps_day, ()))
+        td_wd = (eps_day + 1) % 7 if rolled else eps_day
+        end_cal_day = (day + 1) % 7 if crosses else day
+        offset = (end_cal_day - td_wd) % 7
+        key = offset * 86_400 + end.hour * 3600 + end.minute * 60 + end.second
+        prev = best.get(td_wd)
+        if prev is None or key > prev[0]:
+            best[td_wd] = (key, end, offset)
+
+    _tdc_by_wd = {wd: (tod, offset) for wd, (_key, tod, offset) in best.items()}
+    _tdc_overnight_by_wd = overnight
+    tz_name = getattr(syminfo, 'timezone', None)
+    _tdc_tz = _parse_timezone(tz_name) if tz_name else None
+    _tdc_hours = opening_hours
+
+
+# noinspection PyProtectedMember
+def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
+    """
+    Cap a computed bar close at the end of the bar's trading day.
+
+    :param bar_open_ms: Bar opening time (UNIX ms)
+    :param bar_close_ms: Uncapped close, i.e. open + timeframe span (UNIX ms)
+    :return: ``min(bar_close_ms, trading day end)``; ``bar_close_ms`` unchanged
+             when no session template is known or none ends on the bar's day
+    """
+    opening_hours = syminfo._opening_hours
+    if not opening_hours:
+        return bar_close_ms
+    if opening_hours is not _tdc_hours:
+        _tdc_rebuild(opening_hours)
+    if not _tdc_by_wd:
+        return bar_close_ms
+
+    # The current chart bar (the hot path) reuses the runner-installed local
+    # datetime instead of converting again.
+    dt_local = _datetime if bar_open_ms == _time \
+        else datetime.fromtimestamp(bar_open_ms / 1000, tz=_tdc_tz)
+    trade_date = dt_local.date()
+
+    # Overnight roll: a bar whose window reaches into a session opening this
+    # calendar day and crossing midnight belongs to the next trading day
+    # (same rule as ``time_tradingday``).
+    opens = _tdc_overnight_by_wd.get(dt_local.weekday())
+    if opens:
+        for o in opens:
+            session_open = dt_local.replace(
+                hour=o.hour, minute=o.minute, second=o.second, microsecond=0)
+            if bar_close_ms > session_open.timestamp() * 1000:
+                trade_date += timedelta(days=1)
+                break
+
+    entry = _tdc_by_wd.get(trade_date.weekday())
+    if entry is None:
+        return bar_close_ms
+    end_tod, offset = entry
+    end_date = trade_date + timedelta(days=offset)
+    day_end_ms = int(datetime(
+        end_date.year, end_date.month, end_date.day,
+        end_tod.hour, end_tod.minute, end_tod.second,
+        tzinfo=_tdc_tz,
+    ).timestamp() * 1000)
+    if day_end_ms <= bar_open_ms:  # degenerate template — never close before the open
+        return bar_close_ms
+    return min(bar_close_ms, day_end_ms)
+
+
 @module_property
 def time_close(timeframe: str | None = None, session: str | int | None = None,
                timezone: str | None = None, bars_back: int = 0) -> PyneInt:
@@ -1037,11 +1194,17 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         session = None
 
     if timeframe is None:
-        # Close time of the current chart bar
+        # Close time of the current chart bar — capped at the trading-day end,
+        # because the last bar of a session may be shortened
         try:
-            return _time + timeframe_module.in_seconds(str(syminfo.period)) * 1000
+            close_ms = _time + timeframe_module.in_seconds(str(syminfo.period)) * 1000
+            # noinspection PyProtectedMember
+            chart_mod, chart_mult = timeframe_module._process_tf(str(syminfo.period))
         except (ValueError, AssertionError):
             return NA(int)
+        if chart_mod in ('', 'S') or (chart_mod == 'D' and chart_mult == 1):
+            close_ms = _tdc_cap_ms(_time, close_ms)
+        return close_ms
 
     # An empty string selects the chart's timeframe
     if timeframe == '':
@@ -1069,6 +1232,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
             bar_start_time = current_time_ms
         else:
             bar_start_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
+    elif modifier == 'D':
+        # noinspection PyProtectedMember
+        if ('D', 1) == timeframe_module._process_tf(str(syminfo.period)):
+            bar_start_time = current_time_ms
+        else:
+            # TradingView daily bars open at the trading day's session open
+            # (the previous evening for overnight markets), not at midnight
+            bar_start_time = _d_bar_time(current_time_ms)
     else:
         bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
 
@@ -1078,6 +1249,12 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         bar_close_time = bar_start_time + (tf_seconds * 1000)  # Convert to milliseconds
     except (ValueError, AssertionError):
         return NA(int)
+
+    if modifier in ('', 'S') or (modifier == 'D' and multiplier == 1):
+        # TradingView closes the (possibly shortened) last bar of the day at
+        # the trading-day end; weekly/monthly and multi-period close times
+        # are not session-capped.
+        bar_close_time = _tdc_cap_ms(bar_start_time, bar_close_time)
 
     if session is None:
         # No session specified, return the bar close time
