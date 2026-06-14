@@ -522,6 +522,9 @@
     "get_top": {
       "type": "variable"
     },
+    "lib": {
+      "type": "variable"
+    },
     "module_property": {
       "type": "variable"
     },
@@ -1148,6 +1151,9 @@
     "get_y": {
       "type": "variable"
     },
+    "lib": {
+      "type": "variable"
+    },
     "module_property": {
       "type": "variable"
     },
@@ -1295,6 +1301,9 @@
       "type": "variable"
     },
     "get_y2": {
+      "type": "variable"
+    },
+    "lib": {
       "type": "variable"
     },
     "module_property": {
@@ -1930,6 +1939,9 @@
       "type": "property"
     },
     "delete": {
+      "type": "variable"
+    },
+    "lib": {
       "type": "variable"
     },
     "module_property": {
