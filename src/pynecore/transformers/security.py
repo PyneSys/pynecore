@@ -49,6 +49,7 @@ class SecurityTransformer(ast.NodeTransformer):
         self._all_contexts: dict[str, dict[str, ast.expr]] = {}
         self._signal_args: dict[str, tuple[ast.expr | None, ast.expr | None]] = {}
         self._needs_barmerge = False
+        self._needs_ltf_unzip = False
         self._ltf_sec_ids: set[str] = set()
         self._module_file: str = '<script>'
 
@@ -312,11 +313,20 @@ class SecurityTransformer(ast.NodeTransformer):
             '__sec_read__', ast.Constant(value=sec_id), default
         )
 
-    def _sec_read_call_ltf(self, sec_id: str) -> ast.Call:
-        """Build: __sec_read__("sec_id", [])"""
-        return self._func_call(
+    def _sec_read_call_ltf(self, sec_id: str, arity: int | None = None) -> ast.Call:
+        """Build the LTF read expression.
+
+        Scalar expression: ``__sec_read__("sec_id", [])`` returns the array
+        directly. Tuple expression (``arity`` set): wrap in
+        ``__ltf_unzip__(__sec_read__("sec_id", []), arity)`` to transpose the
+        row-major intrabar buffer into ``arity`` column arrays.
+        """
+        read = self._func_call(
             '__sec_read__', ast.Constant(value=sec_id), ast.List(elts=[], ctx=ast.Load())
         )
+        if arity is None:
+            return read
+        return self._func_call('__ltf_unzip__', read, ast.Constant(value=arity))
 
     @staticmethod
     def _detect_tuple_arity(stmt: ast.stmt, call: ast.Call) -> int | None:
@@ -474,6 +484,13 @@ class SecurityTransformer(ast.NodeTransformer):
                     self._extract_ltf_args(call)
                 )
                 gaps = None
+                # A tuple/list expression makes security_lower_tf() return one
+                # array per element (column-major). The arity is authoritative
+                # from the expression itself, independent of how the result is
+                # unpacked. Mark the call so the read is wrapped in __ltf_unzip__.
+                if isinstance(expression, (ast.Tuple, ast.List)):
+                    call._ltf_arity = len(expression.elts)  # type: ignore[attr-defined]
+                    self._needs_ltf_unzip = True
             else:
                 symbol, timeframe, expression, gaps, ignore_invalid, currency = (
                     self._extract_args(call)
@@ -583,6 +600,14 @@ class SecurityTransformer(ast.NodeTransformer):
                     names=[ast.alias(name='pynecore.lib.barmerge', asname=None)]
                 ))
 
+            # __ltf_unzip__ transposes tuple-valued security_lower_tf() results.
+            if self._needs_ltf_unzip:
+                node.body.insert(0, ast.ImportFrom(
+                    module='pynecore.core.security',
+                    names=[ast.alias(name='__ltf_unzip__', asname=None)],
+                    level=0,
+                ))
+
             node.body.append(ast.Assign(
                 targets=[ast.Name(id='__security_contexts__', ctx=ast.Store())],
                 value=ast.Dict(
@@ -612,7 +637,8 @@ class _CallReplacer(ast.NodeTransformer):
         if hasattr(node, '_sec_id'):
             sec_id = getattr(node, '_sec_id')
             if sec_id in self._parent._ltf_sec_ids:
-                return self._parent._sec_read_call_ltf(sec_id)
+                ltf_arity = getattr(node, '_ltf_arity', None)
+                return self._parent._sec_read_call_ltf(sec_id, ltf_arity)
             tuple_len = getattr(node, '_tuple_len', None)
             return self._parent._sec_read_call(sec_id, tuple_len)
         return node

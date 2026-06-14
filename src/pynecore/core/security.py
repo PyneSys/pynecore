@@ -356,6 +356,30 @@ def create_chart_protocol(
     return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup
 
 
+def __ltf_unzip__(rows, n):
+    """Transpose a row-major LTF tuple buffer into Pine's column-major arrays.
+
+    ``request.security_lower_tf(sym, tf, (e0, ..., e{n-1}))`` returns a tuple of
+    ``n`` arrays, where array ``i`` holds the per-intrabar values of ``e_i``. The
+    LTF subprocess accumulates one ``(e0, ..., e{n-1})`` tuple per intrabar, so the
+    raw result is row-major (a list of ``n``-tuples). This transposes it into the
+    ``n`` column arrays the tuple-unpack expects, returning ``n`` empty arrays when
+    the chart bar has no intrabars (e.g. the lower-timeframe feed does not reach
+    that period).
+
+    Inserted by ``SecurityTransformer`` only for tuple-valued
+    ``request.security_lower_tf()`` calls; scalar calls read the array directly.
+
+    :param rows: Per-intrabar value tuples (possibly empty when there are no
+        intrabars).
+    :param n: Tuple arity (number of expression elements).
+    :return: Tuple of ``n`` lists, column-major.
+    """
+    if not rows:
+        return tuple([] for _ in range(n))
+    return tuple(list(col) for col in zip(*rows))
+
+
 def create_security_protocol(
     sec_id: str,
     sync_block: SyncBlock,
