@@ -255,3 +255,19 @@ def __test_isinstance_na_guards_still_work__():
     if not isinstance(mfv, NA):
         ad += mfv  # would poison ad
     assert ad == 100.0  # unchanged, correct
+
+
+#
+# ``in`` must not iterate na forever (__getitem__ returns self unboundedly)
+#
+
+def __test_in_operator_on_na_is_false_not_infinite__():
+    """``x in na`` returns False immediately via __contains__.
+
+    Without __contains__ the ``in`` operator falls back to the sequence
+    protocol, and NA.__getitem__ (returns self for every index, never raising
+    IndexError) makes it loop forever.
+    """
+    assert ('anything' in NA(str)) is False
+    assert (42 in na_float) is False
+    assert (None in NA(bool)) is False

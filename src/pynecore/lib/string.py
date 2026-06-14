@@ -262,14 +262,21 @@ def _datatime_fmt_tv2py(fmt: str) -> str:
 # Exported functions
 #
 
-def contains(source: str, str_: str) -> bool:
+def contains(source: str | NA[str], str_: str | NA[str]) -> bool | NA[bool]:
     """
     Returns true if the source string contains the str substring, false otherwise.
 
     :param source: Source string
     :param str_: Substring to search for
-    :return: True if the source string contains the str substring, false otherwise.
+    :return: True if the source string contains the str substring, na if either
+        argument is na.
     """
+    # na-propagation (Pine): a na source/substring yields na, never a search.
+    # Without this guard ``str_ in na`` would loop forever, since NA.__getitem__
+    # returns self for every index and the ``in`` operator falls back to the
+    # sequence protocol.
+    if isinstance(source, NA) or source is None or isinstance(str_, NA) or str_ is None:
+        return NA(bool)
     return str_ in source
 
 
