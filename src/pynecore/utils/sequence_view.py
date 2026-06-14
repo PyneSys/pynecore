@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, MutableSequence, Iterator, cast
+from typing import TypeVar, Generic, MutableSequence, Iterator, cast, overload
 
 T = TypeVar('T')
 
@@ -17,6 +17,12 @@ class SequenceView(Generic[T]):
     def __init__(self, sequence: MutableSequence[T], range_object: range | None = None) -> None:
         self.range: range = range_object if range_object is not None else range(len(sequence))
         self.sequence = sequence
+
+    @overload
+    def __getitem__(self, key: int) -> T: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> SequenceView[T]: ...
 
     def __getitem__(self, key: int | slice) -> T | SequenceView[T]:
         if isinstance(key, slice):
