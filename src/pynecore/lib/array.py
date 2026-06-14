@@ -289,7 +289,7 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     :param index: Index of the element to return
     :return: Element at the specified index in the array
     """
-    return cast(T, id[index])  # noqa
+    return id[index]
 
 
 # noinspection PyShadowingBuiltins
