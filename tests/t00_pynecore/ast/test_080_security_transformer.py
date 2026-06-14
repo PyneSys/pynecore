@@ -379,6 +379,52 @@ def main():
     assert default_arg.elts == []
 
 
+def __test_ltf_tuple_expression_unzip__(log):
+    """A tuple expression makes security_lower_tf() return one array per element.
+
+    The read is wrapped in ``__ltf_unzip__(__sec_read__(...), N)`` so the
+    row-major intrabar buffer is transposed into N column arrays, and the helper
+    import is added.
+    """
+    source = """
+def main():
+    a, b, c = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", (lib.high, lib.low, lib.close))
+    lib.plot(a.size())
+"""
+    result = _transform(source)
+
+    assert 'lib.request.security_lower_tf' not in result
+    assert '__ltf_unzip__' in result
+    assert 'from pynecore.core.security import __ltf_unzip__' in result
+
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+
+    # Find the tuple-unpack assignment; its RHS is __ltf_unzip__(__sec_read__, 3)
+    unpack = next(
+        s for s in func.body
+        if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Tuple)
+    )
+    call = unpack.value
+    assert isinstance(call, ast.Call)
+    assert call.func.id == '__ltf_unzip__'
+    inner = call.args[0]
+    assert isinstance(inner, ast.Call) and inner.func.id == '__sec_read__'
+    assert isinstance(call.args[1], ast.Constant) and call.args[1].value == 3
+
+
+def __test_ltf_scalar_no_unzip__(log):
+    """A scalar security_lower_tf() expression is read directly, never wrapped."""
+    source = """
+def main():
+    intrabars = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.close)
+    lib.plot(intrabars.size())
+"""
+    result = _transform(source)
+    assert '__ltf_unzip__' not in result
+    assert 'import __ltf_unzip__' not in result
+
+
 def __test_ltf_context_metadata__(log):
     """security_lower_tf context has is_ltf=True and no gaps key"""
     source = """

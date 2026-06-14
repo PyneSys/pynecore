@@ -75,3 +75,20 @@ def __test_list_data__(runner, dummy_ohlcv_iter, log):
     assert req.dynamic[0].symbol is None
 
     log.info("list_data_requirements buckets verified")
+
+
+def __test_ltf_unzip__():
+    """__ltf_unzip__ transposes the row-major intrabar buffer of a tuple
+    security_lower_tf() result into column arrays; an empty buffer (a chart bar
+    with no intrabars) yields N empty arrays so the tuple-unpack still succeeds.
+    """
+    from pynecore.core.security import __ltf_unzip__
+
+    # Three intrabars, arity 2: row-major (h, l) pairs -> two column arrays.
+    cols = __ltf_unzip__([(1, 10), (2, 20), (3, 30)], 2)
+    assert cols == ([1, 2, 3], [10, 20, 30])
+    assert all(isinstance(c, list) for c in cols)  # mutable arrays, not tuples
+
+    # No intrabars -> N empty arrays; the unpack must not raise.
+    a, b, c = __ltf_unzip__([], 3)
+    assert a == [] and b == [] and c == []
