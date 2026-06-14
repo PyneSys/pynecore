@@ -925,7 +925,7 @@ class ScriptRunner:
                 from .security import (
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory, Lookahead,
-                    load_multiperiod_boundaries,
+                    load_htf_bar_opens,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -1034,12 +1034,13 @@ class ScriptRunner:
 
                 def _spawn_security_process(sid: str, data_source):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
-                    # Multi-period (nD/nW/nM) contexts confirm boundaries by
-                    # walking the child's actual bar opens. Backtest only: a
-                    # file-backed child realizes the scheduled grid; a live
-                    # PluginSymbol stream has no static file to walk.
+                    # D/W/M HTF contexts confirm boundaries by walking the
+                    # child's actual bar opens (correct for sparse series).
+                    # Backtest only: a file-backed child realizes the real
+                    # trading calendar; a live PluginSymbol stream has no static
+                    # file to walk.
                     if not isinstance(data_source, PluginSymbol):
-                        load_multiperiod_boundaries(sec_state, str(data_source))
+                        load_htf_bar_opens(sec_state, str(data_source))
                     proc = Process(
                         target=security_process_main,
                         args=(
