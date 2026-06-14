@@ -213,7 +213,17 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     :return: UNIX timestamp in milliseconds
     """
     tz = _parse_timezone(timezone)
-    dt = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second), tzinfo=tz)
+    # Pine accepts out-of-range components and rolls them over (e.g. hour 26 ->
+    # next day + 2h, month 13 -> next January). Normalize the month into the
+    # year, then carry day/hour/minute/second through timedelta so the wall
+    # clock overflows before the timezone conversion.
+    y = int(year)
+    m = int(month)
+    y += (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
+        days=int(day) - 1, hours=int(hour), minutes=int(minute), seconds=int(second)
+    )
     return int(dt.timestamp() * 1000)
 
 
