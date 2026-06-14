@@ -345,6 +345,12 @@ class NA(Generic[T]):
     def __getitem__(self, _: Any) -> Self:
         return self
 
+    def __contains__(self, _: Any) -> bool:
+        # ``x in na`` must short-circuit to False: ``__getitem__`` returns self
+        # for every index and never raises IndexError, so the ``in`` operator's
+        # sequence-protocol fallback would iterate forever.
+        return False
+
     def __call__(self, *_, **__) -> Self:
         return self
 
