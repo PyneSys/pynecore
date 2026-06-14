@@ -16,6 +16,7 @@ from functools import partial
 
 from ..lib import array, matrix, box, line, label, table, linefill, polyline
 from ..lib import map as map_lib
+from ..utils.sequence_view import SequenceView
 from ..types import matrix as matrix_types
 from ..types import line as line_types
 from ..types import box as box_types
@@ -48,6 +49,10 @@ def _get_builtin_method(method_name: str, var: Any) -> Callable | None:
         var_type = type(var)
         match var_type:
             case _ if var_type is list:
+                return getattr(array, method_name)
+            case _ if var_type is SequenceView:
+                # array.slice() returns a view; method calls on it (e.g.
+                # slice(...).max()) dispatch to the array namespace too.
                 return getattr(array, method_name)
             case _ if var_type is dict:
                 return getattr(map_lib, method_name)

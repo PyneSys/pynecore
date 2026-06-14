@@ -140,6 +140,24 @@ def __test_dispatcher_method__():
     assert len(calls) == 1  # bound once, cached for the module lifetime
 
 
+def __test_builtin_array_method__():
+    """ A string method on a plain list dispatches to the array namespace """
+    xs = [3.0, 1.0, 4.0, 1.0, 5.0]
+    assert method_call('max', xs) == 5.0
+    assert method_call('min', xs) == 1.0
+
+
+def __test_sequence_view_method_dispatch__():
+    """ array.slice() returns a SequenceView; method calls on the view
+    (slice(...).max() / .min() / .size()) dispatch to the array namespace,
+    not just plain lists """
+    from pynecore.lib import array
+    view = array.slice([3.0, 1.0, 4.0, 1.0, 5.0], 1, 4)  # -> [1.0, 4.0, 1.0]
+    assert method_call('max', view) == 4.0
+    assert method_call('min', view) == 1.0
+    assert method_call('size', view) == 3
+
+
 def __test_no_such_method_asserts__():
     """ An unresolvable string method fails loudly """
     with pytest.raises(AssertionError, match='No such method'):
