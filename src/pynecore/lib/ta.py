@@ -286,7 +286,7 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB | NA[TFIB]:
     # We need to round to prevent problems caused by floating point precision
     if isinstance(source, (float, int)):
         source = round(source, 14)
-    prev_val = source[length]
+    prev_val = source[length]  # noqa
 
     if isinstance(source, NA) or isinstance(prev_val, NA):
         return NA(cast(type[TFIB], type(source)))
@@ -361,8 +361,6 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     :return: The correlation of the source series
     """
     assert length > 0, "Length must be greater than 0"
-    if isinstance(source1, NA) or isinstance(source2, NA):
-        return NA(float)
     length = int(length)
 
     sum_x: Persistent[float] = 0.0
@@ -371,31 +369,62 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     sum_x2: Persistent[float] = 0.0
     sum_y2: Persistent[float] = 0.0
     count: Persistent[int] = 0
+    na_window: Persistent[int] = 0
+
+    cur_na = isinstance(source1, NA) or isinstance(source2, NA)
 
     if count < length:
-        sum_x += source1
-        sum_y += source2
-        sum_xy += source1 * source2
-        sum_x2 += source1 * source1
-        sum_y2 += source2 * source2
+        # Still filling the window; no bar leaves it yet.
+        if cur_na:
+            na_window += 1
+        else:
+            sum_x += source1
+            sum_y += source2
+            sum_xy += source1 * source2
+            sum_x2 += source1 * source1
+            sum_y2 += source2 * source2
         count += 1
         if count < length:
             return NA(float)
     else:
-        x_toremove = source1[length]
-        y_toremove = source2[length]
+        old1 = source1[length]
+        old2 = source2[length]
+        old_na = isinstance(old1, NA) or isinstance(old2, NA)
+        if not cur_na and not old_na:
+            # na-free fast path: same operations and order as before, to keep the
+            # documented ~7-digit match with Pine's correlation.
+            sum_x += source1 - old1
+            sum_y += source2 - old2
+            sum_xy += (source1 * source2) - (old1 * old2)
+            sum_x2 += (source1 * source1) - (old1 * old1)
+            sum_y2 += (source2 * source2) - (old2 * old2)
+        else:
+            # A na entered or left the window: keep the running sums over the
+            # valid bars only and track how many na sit in the window.
+            if cur_na:
+                na_window += 1
+            else:
+                sum_x += source1
+                sum_y += source2
+                sum_xy += source1 * source2
+                sum_x2 += source1 * source1
+                sum_y2 += source2 * source2
+            if old_na:
+                na_window -= 1
+            else:
+                sum_x -= old1
+                sum_y -= old2
+                sum_xy -= old1 * old2
+                sum_x2 -= old1 * old1
+                sum_y2 -= old2 * old2
 
-        sum_x += source1 - source1[length]
-        sum_y += source2 - source2[length]
-
-        sum_xy += (source1 * source2) - (x_toremove * y_toremove)
-        sum_x2 += (source1 * source1) - (x_toremove * x_toremove)
-        sum_y2 += (source2 * source2) - (y_toremove * y_toremove)
+    if na_window:
+        return NA(float)
     try:
         numerator = (length * sum_xy) - (sum_x * sum_y)
         denominator = math.sqrt((length * sum_x2 - sum_x * sum_x) * (length * sum_y2 - sum_y * sum_y))
         return numerator / denominator
-    except ValueError:
+    except (ValueError, ZeroDivisionError):
         return NA(float)
 
 
