@@ -27,3 +27,11 @@ def __test_str_format_time__(runner, dummy_ohlcv_iter, file_reader, log_comparat
     }).run_iter()
     with log_comparator(tv_log_out):
         next(run_iter)
+
+
+def __test_str_format_time_na__():
+    """ str.format_time(na) returns na (Pine na-propagation), not a string """
+    from pynecore.lib import string as _string
+    from pynecore.types.na import NA
+    assert isinstance(_string.format_time(NA(int), "yyyy-MM-dd HH:mm"), NA)
+    assert isinstance(_string.format_time(None), NA)

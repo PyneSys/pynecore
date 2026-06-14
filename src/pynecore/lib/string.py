@@ -372,15 +372,20 @@ def format(formatString: str, *args: Any) -> str:
 
 
 # noinspection PyProtectedMember
-def format_time(time: int, fmt: str | None = None, tz: str | None = None) -> str:
+def format_time(time: int | NA[int], fmt: str | None = None,
+                tz: str | None = None) -> str | NA[str]:
     """
     Format timestamp according to format string and timezone
 
     :param time: UNIX timestamp in milliseconds
     :param fmt: Format string (Pine format)
     :param tz: Timezone string (UTC±HHMM, GMT±HHMM or IANA name)
-    :return: Formatted time string
+    :return: Formatted time string, or na when ``time`` is na
     """
+    # na timestamp formats to na (Pine na-propagation)
+    if isinstance(time, NA) or time is None:
+        return NA(str)
+
     # Default format
     fmt: str = fmt if fmt else "yyyy-MM-ddTHH:mm:ssZ"
 
