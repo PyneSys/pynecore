@@ -6,8 +6,9 @@ from ..types.chart import ChartPoint
 from ..types.label import LabelStyleEnum, Label
 from ..types.na import NA, na_int, na_float
 from ..lib import xloc as _xloc, yloc as _yloc, color as _color, size as _size, text as _text, font as _font
+from .. import lib
 
-_registry: list[Label] = []
+_registry: dict[Label, None] = {}
 
 # Label style constants
 style_none = LabelStyleEnum('n')
@@ -119,7 +120,10 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
         force_overlay=force_overlay,
         text_formatting=text_formatting or _text.format_none
     )
-    _registry.append(label_obj)
+    _registry[label_obj] = None
+    # Enforce Pine's max_labels_count cap: drop the oldest label (FIFO) past the limit
+    if lib._script is not None and len(_registry) > lib._script.max_labels_count:
+        del _registry[next(iter(_registry))]
     return label_obj
 
 
@@ -127,7 +131,7 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
 @module_property
 def all() -> list[Label]:
     """Returns all label objects"""
-    return _registry
+    return list(_registry)
 
 
 # noinspection PyShadowingBuiltins
@@ -135,10 +139,7 @@ def delete(id):
     """Delete label object"""
     if isinstance(id, NA):
         return
-    try:
-        _registry.remove(id)
-    except ValueError:
-        pass
+    _registry.pop(id, None)
 
 
 # noinspection PyShadowingBuiltins

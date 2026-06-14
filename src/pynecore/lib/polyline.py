@@ -1,13 +1,12 @@
-from copy import copy as _copy
-
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.polyline import Polyline
 from ..types.na import NA
 from ..lib import xloc as _xloc, color as _color
 from ..types.line import LineEnum
+from .. import lib
 
-_registry: list[Polyline] = []
+_registry: dict[Polyline, None] = {}
 
 # Line style constants (same as in line.py)
 style_arrow_both = LineEnum()
@@ -56,7 +55,10 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
         line_width=line_width,
         force_overlay=force_overlay
     )
-    _registry.append(polyline_obj)
+    _registry[polyline_obj] = None
+    # Enforce Pine's max_polylines_count cap: drop the oldest polyline (FIFO) past the limit
+    if lib._script is not None and len(_registry) > lib._script.max_polylines_count:
+        del _registry[next(iter(_registry))]
     return polyline_obj
 
 
@@ -69,10 +71,7 @@ def delete(id: Polyline) -> None:
     """
     if isinstance(id, NA):
         return
-    try:
-        _registry.remove(id)
-    except ValueError:
-        pass
+    _registry.pop(id, None)
 
 
 # noinspection PyShadowingBuiltins
@@ -83,4 +82,4 @@ def all() -> list[Polyline]:
 
     :return: Array of all polyline objects
     """
-    return _copy(_registry)
+    return list(_registry)

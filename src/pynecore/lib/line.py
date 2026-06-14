@@ -6,8 +6,9 @@ from ..types.chart import ChartPoint
 from ..types.line import LineEnum, Line
 from ..types.na import NA, na_int, na_float
 from ..lib import xloc as _xloc, extend as _extend, color as _color
+from .. import lib
 
-_registry: list[Line] = []
+_registry: dict[Line, None] = {}
 
 style_arrow_both = LineEnum('ab')
 style_arrow_left = LineEnum('al')
@@ -94,7 +95,10 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
         width=width,
         force_overlay=force_overlay
     )
-    _registry.append(line_obj)
+    _registry[line_obj] = None
+    # Enforce Pine's max_lines_count cap: drop the oldest line (FIFO) past the limit
+    if lib._script is not None and len(_registry) > lib._script.max_lines_count:
+        del _registry[next(iter(_registry))]
     return line_obj
 
 
@@ -102,7 +106,7 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
 @module_property
 def all() -> list[Line]:
     """Returns all line objects"""
-    return _registry
+    return list(_registry)
 
 
 # noinspection PyShadowingBuiltins
@@ -110,10 +114,7 @@ def delete(id):
     """Delete line object"""
     if isinstance(id, NA):
         return
-    try:
-        _registry.remove(id)
-    except ValueError:
-        pass
+    _registry.pop(id, None)
 
 
 # noinspection PyShadowingBuiltins
