@@ -209,6 +209,20 @@ def _multiperiod_state(opens: list[int], chart_off: int = 0) -> SecurityState:
         resampler=Resampler.get_resampler('5D'), tz=_UTC,
     )
     state.bar_opens = opens
+    state.bar_opens_multiperiod = True
+    state.chart_off = chart_off
+    return state
+
+
+def _single_period_state(tf: str, opens: 'list[int] | None',
+                         chart_off: int = 30 * 60 * 1000 - 1) -> SecurityState:
+    """Single-period (1D/1W/1M) state: grid + clamp when ``opens`` is loaded."""
+    state = SecurityState(
+        sec_id='s', timeframe=tf, gaps_on=False, same_timeframe=False,
+        resampler=Resampler.get_resampler(tf), tz=_UTC,
+    )
+    state.bar_opens = opens
+    state.bar_opens_multiperiod = False
     state.chart_off = chart_off
     return state
 
@@ -269,3 +283,81 @@ def __test_confirmed_time_multiperiod_past_end__():
     assert _get_confirmed_time(state, _ms(_UTC, 2025, 1, 10)) == opens[0]
     # The Jan 11 slot starts -> the last child bar is confirmed
     assert _get_confirmed_time(state, _ms(_UTC, 2025, 1, 11)) == opens[1]
+
+
+def __test_confirmed_time_single_period_sparse_forward_fill__():
+    """Sparse single-period daily confirms at the CALENDAR close and holds.
+
+    A monthly-cadence series queried at ``1D`` carries a bar only on scattered
+    days (Jan 31, Feb 28, Mar 31). TradingView confirms each daily bar at its
+    own calendar close (the next midnight) and forward-fills it across the gap;
+    the grid+clamp path reproduces this. Between real bars the target does not
+    move, so the chart-side ``target > last_confirmed`` gate keeps ``new_period``
+    False — ``gaps_off`` holds the value while ``gaps_on`` emits ``na``. (The
+    extent-walk used for multi-period would instead delay Jan 31 all the way to
+    the next real bar Feb 28, lagging a full gap — the bug this path fixes.)
+    """
+    opens = [_ms(_UTC, 2025, 1, 31), _ms(_UTC, 2025, 2, 28), _ms(_UTC, 2025, 3, 31)]
+    state = _single_period_state('1D', opens)
+
+    # Jan 31's last 30m bar closes at Feb 1 00:00 -> Jan 31 confirmed here.
+    jan31_last = _ms(_UTC, 2025, 2, 1) - 30 * 60 * 1000
+    assert _get_confirmed_time(state, jan31_last) == opens[0]
+    state.last_confirmed = opens[0]
+    # Mid-gap chart bars (no real child bar) hold Jan 31 -> new_period stays False.
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 2, 14)) == opens[0]
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 2, 27)) == opens[0]
+    # Feb 28's last 30m bar closes at Mar 1 00:00 -> Feb 28 confirmed on its own
+    # calendar close, NOT delayed to the next real bar (Mar 31).
+    feb28_last = _ms(_UTC, 2025, 3, 1) - 30 * 60 * 1000
+    assert _get_confirmed_time(state, feb28_last) == opens[1]
+
+
+def __test_confirmed_time_single_period_dense_matches_bare_grid__():
+    """Dense daily: the clamp is a no-op — identical to the bare arithmetic grid.
+
+    A real bar on every calendar day means every grid target coincides with an
+    open, so grid+clamp must agree bar-for-bar with the ``bar_opens is None``
+    arithmetic path. This is the zero-regression guarantee for the common case.
+    """
+    opens = [_ms(_UTC, 2025, 3, d) for d in range(1, 28)]  # bar every day in March
+    clamped = _single_period_state('1D', opens)
+    bare = _single_period_state('1D', None)  # bar_opens None -> bare grid
+
+    t = _ms(_UTC, 2025, 3, 2)
+    end = _ms(_UTC, 2025, 3, 27)
+    step = 6 * 3_600_000  # 6h cadence crosses every daily boundary
+    while t <= end:
+        a = _get_confirmed_time(clamped, t)
+        b = _get_confirmed_time(bare, t)
+        assert a == b, f"clamp {a} != bare grid {b} at {t}"
+        for st in (clamped, bare):
+            if a > st.last_confirmed:
+                st.last_confirmed = a
+        t += step
+
+
+def __test_confirmed_time_single_period_past_end_holds_last__():
+    """Past the last sparse bar the value holds (forward-fill), never goes na."""
+    opens = [_ms(_UTC, 2025, 1, 31), _ms(_UTC, 2025, 2, 28)]
+    state = _single_period_state('1D', opens)
+
+    feb28_last = _ms(_UTC, 2025, 3, 1) - 30 * 60 * 1000
+    assert _get_confirmed_time(state, feb28_last) == opens[1]
+    state.last_confirmed = opens[1]
+    # Weeks past the last child bar: still Feb 28 (held), not na.
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 3, 20)) == opens[1]
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 4, 10)) == opens[1]
+
+
+def __test_confirmed_time_single_period_before_first_bar__():
+    """Before the first real child open nothing is confirmed (stays na)."""
+    opens = [_ms(_UTC, 2025, 2, 10)]
+    state = _single_period_state('1D', opens)
+
+    # Chart bars before the Feb 10 child bar exists -> no confirmation yet.
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 2, 3)) == 0
+    assert _get_confirmed_time(state, _ms(_UTC, 2025, 2, 9)) == 0
+    # Feb 10's last 30m bar closes Feb 11 00:00 -> confirmed.
+    feb10_last = _ms(_UTC, 2025, 2, 11) - 30 * 60 * 1000
+    assert _get_confirmed_time(state, feb10_last) == opens[0]

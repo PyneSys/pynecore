@@ -100,17 +100,26 @@ class SecurityState:
     session_starts: 'list[SymInfoSession] | None' = None
     session_tz: ZoneInfo | None = None
 
-    # Multi-period (nD/nW/nM) confirmation (chart-side). The child's data file
-    # realizes the scheduled grid exactly (TradingView's holiday calendar
-    # included — see the ``resampler`` module docs), so the chart walks the
-    # child's actual bar opens with a monotonic pointer instead of recomputing
-    # boundaries arithmetically. Populated by ``load_multiperiod_boundaries``
-    # at child spawn. ``chart_off`` is the chart bar span minus one ms for
+    # Daily/weekly/monthly HTF confirmation (chart-side). The child's data file
+    # realizes the actual trading calendar, so confirmation rides the child's
+    # real bar opens instead of an arithmetic grid that assumes a bar on every
+    # calendar period — essential for sparse daily series (ECONOMICS macro data,
+    # dividends) where the grid would confirm phantom periods and the subprocess
+    # would ``write_na`` into empty windows, wiping the ``gaps_off`` forward-fill.
+    # Two strategies, by ``bar_opens_multiperiod`` (see ``_get_confirmed_time``):
+    #   * multi-period (nD/nW/nM): WALK the opens — the grid cannot reproduce
+    #     TradingView's scheduled multi-period boundaries (holiday calendar).
+    #   * single-period (1D/1W/1M): the grid gives the correct calendar close
+    #     instant; CLAMP it to the latest real open so a sparse child still
+    #     forward-fills its last value between bars instead of confirming late.
+    # Populated by ``load_htf_bar_opens`` at child spawn (backtest only).
+    # ``chart_off`` is the chart bar span minus one ms for
     # intraday/seconds charts (0 for D/W/M charts); ``_get_confirmed_time``
     # derives the chart bar's close instant from it for HTF confirmation.
     # ``sec_grid_args`` are the security's own (tz, session_starts,
     # opening_hours, mode) for the past-end-of-data fallback grid.
     bar_opens: list[int] | None = None
+    bar_opens_multiperiod: bool = False
     bar_ptr: int = -1
     chart_off: int = 0
     sec_grid_args: tuple | None = None
@@ -129,9 +138,13 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     For HTF: the period is confirmed on its own LAST chart bar — the one whose
     CLOSE instant (``chart_time + chart_off + 1``) reaches the period end —
     per TradingView's historical ``lookahead_off`` merge rule, not one bar late
-    on the next period's first bar. Multi-period (nD/nW/nM) timeframes walk the
-    child's actual bar opens (see ``SecurityState.bar_opens``); other timeframes
-    floor the close instant to the preceding resampler period.
+    on the next period's first bar. Daily/weekly/monthly HTF rides the child's
+    actual bar opens when loaded (see ``SecurityState.bar_opens``) so a sparse
+    child forward-fills its last value instead of confirming phantom calendar
+    periods: multi-period (nD/nW/nM) walks the opens directly, single-period
+    (1D/1W/1M) clamps the arithmetic grid's calendar-close target to the latest
+    real open. Without loaded opens, the close instant is floored to the
+    preceding resampler period (intraday HTF, live streams, unit tests).
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
@@ -148,8 +161,8 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     # (``chart_off == 0``), so confirmation degrades to the bar's open instant.
     close_time = chart_time + state.chart_off + 1
 
-    if state.bar_opens is not None:
-        # Multi-period: advance the pointer to the child bar the chart bar's
+    if state.bar_opens is not None and state.bar_opens_multiperiod:
+        # Multi-period walk: advance the pointer to the child bar the chart bar's
         # close instant falls in; entering bar ``ptr`` closes every bar before it
         opens = state.bar_opens
         ptr = state.bar_ptr
@@ -179,10 +192,36 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         # using the security's own exchange timezone.
         period = resampler.get_bar_time(
             close_time, state.session_tz, state.session_starts)
-        return resampler.get_bar_time(
+        grid_target = resampler.get_bar_time(
             period - 1, state.session_tz, state.session_starts)
-    period = resampler.get_bar_time(close_time, state.tz)
-    return resampler.get_bar_time(period - 1, state.tz)
+    else:
+        period = resampler.get_bar_time(close_time, state.tz)
+        grid_target = resampler.get_bar_time(period - 1, state.tz)
+
+    if state.bar_opens is None:
+        return grid_target
+
+    # Single-period D/W/M with a loaded child: the grid above gives the correct
+    # calendar close instant, but the child may carry a bar only on scattered
+    # days (sparse macro series). Clamp the grid target to the latest real child
+    # open so the subprocess never advances into an empty window (which would
+    # ``write_na`` and wipe the forward-fill). Dense data has a bar on every
+    # period, so the clamp is a no-op and behaviour is identical to the bare
+    # grid; sparse data holds its last real value, matching TV ``gaps_off``.
+    # ``grid_target`` is monotonically non-decreasing across chart bars (it is
+    # ``get_bar_time(period - 1)`` of a monotonically increasing ``close_time``),
+    # so the persistent ``bar_ptr`` only ever advances. ``last_confirmed`` is a
+    # timestamp (0 = before any bar), returned while the chart precedes the first
+    # real open so nothing is confirmed yet.
+    opens = state.bar_opens
+    ptr = state.bar_ptr
+    n = len(opens)
+    while ptr + 1 < n and opens[ptr + 1] <= grid_target:
+        ptr += 1
+    state.bar_ptr = ptr
+    if ptr >= 0 and opens[ptr] <= grid_target:
+        return opens[ptr]
+    return state.last_confirmed
 
 
 def create_chart_protocol(
@@ -457,15 +496,23 @@ def resolve_session_anchor(
     return None, None
 
 
-def load_multiperiod_boundaries(state: SecurityState, data_path: str) -> None:
+def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     """
-    Load the child's bar opens for multi-period (nD/nW/nM) confirmation.
+    Load the child's bar opens for daily/weekly/monthly HTF confirmation.
 
-    No-op for any other timeframe. The child's data file realizes the
-    scheduled grid exactly (TradingView's holiday calendar included), so
-    ``_get_confirmed_time`` walks these opens with a monotonic pointer instead
-    of recomputing the boundaries arithmetically. The security's own grid
-    parameters are loaded from its TOML for the past-end-of-data fallback.
+    No-op for any other timeframe (intraday HTF data is dense enough that the
+    arithmetic grid is the correct model; loading every open would also be
+    unbounded). For D/W/M — including the single-period ``D``/``W``/``M`` case —
+    the child's data file realizes the *actual* trading calendar, which the
+    arithmetic grid cannot: macro aggregates (ECONOMICS series, dividends) carry
+    a bar only on scattered days. The arithmetic grid would emit a confirmation
+    boundary for every calendar period, so a chart bar landing on a day with no
+    real child bar advances the subprocess into an empty window — it writes
+    ``na`` and destroys the forward-fill that ``gaps_off`` (TV default) requires.
+    Walking the child's actual bar opens makes ``new_period`` fire only on real
+    bars: between them ``gaps_off`` holds the last value and ``gaps_on`` emits
+    ``na``, both matching TradingView. The security's own grid parameters are
+    loaded from its TOML for the past-end-of-data fallback.
 
     :param state: Security context state (``state.timeframe`` already resolved)
     :param data_path: Path to the child's OHLCV data file
@@ -474,8 +521,13 @@ def load_multiperiod_boundaries(state: SecurityState, data_path: str) -> None:
     from ..lib import timeframe as tf_module
     # noinspection PyProtectedMember
     modifier, multiplier = tf_module._process_tf(state.timeframe)
-    if modifier not in ('D', 'W', 'M') or multiplier <= 1:
+    if modifier not in ('D', 'W', 'M'):
         return
+    # Multi-period (nD/nW/nM) walks the opens directly (the arithmetic grid
+    # cannot reproduce TradingView's scheduled multi-period calendar). Single
+    # period (1D/1W/1M) instead uses the grid for the calendar close instant and
+    # only *clamps* to these opens — see ``_get_confirmed_time``.
+    state.bar_opens_multiperiod = multiplier > 1
 
     from .ohlcv_file import OHLCVReader
     from .resampler import grid_mode
