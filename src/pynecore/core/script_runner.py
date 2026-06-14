@@ -459,7 +459,7 @@ class ScriptRunner:
                 from .security import (
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory,
-                    load_htf_bar_opens,
+                    load_htf_bar_opens, load_ltf_first_ms,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -523,6 +523,7 @@ class ScriptRunner:
                     # D/W/M HTF contexts confirm boundaries by walking the child's
                     # actual bar opens (correct for sparse series; no-op otherwise)
                     load_htf_bar_opens(sec_state, data_path)
+                    load_ltf_first_ms(sec_state, data_path)
                     proc = Process(
                         target=security_process_main,
                         args=(
