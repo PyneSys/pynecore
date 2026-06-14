@@ -925,7 +925,7 @@ class ScriptRunner:
                 from .security import (
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory, Lookahead,
-                    load_htf_bar_opens,
+                    load_htf_bar_opens, load_ltf_first_ms,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -1041,6 +1041,7 @@ class ScriptRunner:
                     # file to walk.
                     if not isinstance(data_source, PluginSymbol):
                         load_htf_bar_opens(sec_state, str(data_source))
+                        load_ltf_first_ms(sec_state, str(data_source))
                     proc = Process(
                         target=security_process_main,
                         args=(
