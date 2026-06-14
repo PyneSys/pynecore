@@ -89,13 +89,15 @@ def abs(id: list[int | float]) -> list[int | float]:
 
 
 # noinspection PyShadowingBuiltins
-def avg(id: list[Number]) -> float:
+def avg(id: list[Number]) -> float | NA[float]:
     """
     Returns the average value of the elements in the array.
 
     :param id: Input array
-    :return: Average value of the elements in the array
+    :return: Average value of the elements in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return builtins.sum(id) / len(id)
 
 
@@ -210,16 +212,18 @@ def copy(id: list[T]) -> list[T]:
 
 
 # noinspection PyShadowingBuiltins
-def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> float:
+def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> float | NA[float]:
     """
     Returns the covariance between the elements in the two arrays.
 
     :param id1: First input array
     :param id2: Second input array
     :param biased: If True, calculates the biased covariance. If False, calculates the unbiased covariance.
-    :return: Covariance between the elements in the two arrays
+    :return: Covariance between the elements in the two arrays, or na if the arrays are empty
     """
     assert len(id1) == len(id2), "Input arrays must have the same length!"
+    if not id1:
+        return NA(float)
     mean1 = statistics.mean(id1)
     mean2 = statistics.mean(id2)
     length = len(id1)
@@ -373,46 +377,54 @@ def lastindexof(id: list[T], value: T) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def max(id: list[Number]) -> Number:
+def max(id: list[Number]) -> Number | NA[float]:
     """
     Returns the maximum value in the array.
 
     :param id: Input array
-    :return: Maximum value in the array
+    :return: Maximum value in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return builtins.max(id)
 
 
 # noinspection PyShadowingBuiltins
-def median(id: list[Number]) -> float:
+def median(id: list[Number]) -> float | NA[float]:
     """
     Returns the median value of the elements in the array.
 
     :param id: Input array
-    :return: Median value of the elements in the array
+    :return: Median value of the elements in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return statistics.median(id)
 
 
 # noinspection PyShadowingBuiltins
-def min(id: list[Number]) -> float:
+def min(id: list[Number]) -> float | NA[float]:
     """
     Returns the minimum value in the array.
 
     :param id: Input array
-    :return: Minimum value in the array
+    :return: Minimum value in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return builtins.min(id)
 
 
 # noinspection PyShadowingBuiltins
-def mode(id: list[T]) -> T:
+def mode(id: list[T]) -> T | NA[float]:
     """
     Returns the most frequently occurring element in the array.
 
     :param id: Input array
-    :return: Most frequently occurring element in the array
+    :return: Most frequently occurring element in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return statistics.mode(id)
 
 
@@ -678,13 +690,15 @@ def push(id: list[T], value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def range(id: list[Number]) -> Number:
+def range(id: list[Number]) -> Number | NA[float]:
     """
     Returns the range of the elements in the array.
 
     :param id: Input array
-    :return: Range of the elements in the array
+    :return: Range of the elements in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return cast(Number, max(id) - min(id))  # noqa
 
 
@@ -821,7 +835,11 @@ def standardize(id: list[float | int]) -> list[float | int]:
 
     mean = statistics.mean(id)
     stdev = math.sqrt(statistics.mean([(v - mean) ** 2 for v in id]))
-    z_scores = [(v - mean) / stdev for v in id]
+    if stdev == 0:
+        # All elements are equal: TV's standardize() yields 1.0 for every element.
+        z_scores = [1.0 for _ in id]
+    else:
+        z_scores = [(v - mean) / stdev for v in id]
 
     # If all values are integers, apply the thresholding to get -1, 0, or 1.
     if all(isinstance(v, int) for v in id):
@@ -838,16 +856,18 @@ def standardize(id: list[float | int]) -> list[float | int]:
 
 
 # noinspection PyShadowingBuiltins
-def stdev(id: list[Number], biased: bool = True) -> float:
+def stdev(id: list[Number], biased: bool = True) -> float | NA[float]:
     """
     Returns the standard deviation of the elements in the array.
 
     :param id: Input array
     :param biased: If True, calculates the biased standard deviation. If False, calculates the
                    unbiased standard deviation.
-    :return: Standard deviation of the elements in the array
+    :return: Standard deviation of the elements in the array, or na if the array is empty
     """
     a = cast(list[Number], [i for i in id if not isinstance(i, NA)])
+    if not a:
+        return NA(float)
     if len(a) < 2:
         return 0.0
     if not biased:
@@ -857,13 +877,15 @@ def stdev(id: list[Number], biased: bool = True) -> float:
 
 
 # noinspection PyShadowingBuiltins
-def sum(id: list[float | int]) -> float | int:
+def sum(id: list[float | int]) -> float | int | NA[float]:
     """
     Returns the sum of the elements in the array.
 
     :param id: Input array
-    :return: Sum of the elements in the array
+    :return: Sum of the elements in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     return builtins.sum(id)
 
 
@@ -879,14 +901,16 @@ def unshift(id: list[T], value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def variance(id: list[Number], biased: bool = True) -> float:
+def variance(id: list[Number], biased: bool = True) -> float | NA[float]:
     """
     Returns the variance of the elements in the array.
 
     :param id: Input array
     :param biased: If True, calculates the biased variance. If False, calculates the unbiased variance.
-    :return: Variance of the elements in the array
+    :return: Variance of the elements in the array, or na if the array is empty
     """
+    if not id:
+        return NA(float)
     if not biased:
         return statistics.variance(id)
 
