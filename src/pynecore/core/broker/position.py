@@ -124,6 +124,9 @@ class BrokerPosition(PositionBase):
         self.risk_halt_trading: bool = False
 
         self._current_price: float = 0.0
+        # Inherited from PositionBase; unused on the live path (close stacking is
+        # backtest-only), initialized so _next_close_seq() never raises if called.
+        self._close_seq_counter: int = 0
 
     # === Pine API compatibility shims ======================================
     # Pine strategy.* functions read ``position.c`` / ``.o`` / ``.h`` / ``.l``
