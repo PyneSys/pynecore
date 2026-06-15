@@ -688,7 +688,7 @@ class SimPosition(PositionBase):
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
-        '_deferred_margin_call', '_fill_counter'
+        '_deferred_margin_call', '_fill_counter', '_partial_close_bar'
     )
 
     def __init__(self):
@@ -768,6 +768,10 @@ class SimPosition(PositionBase):
         self._fill_counter: int = 0
         # Monotonic stamp source for same-bar stacking of partial closes.
         self._close_seq_counter: int = 0
+        # bar_index of the most recent filled partial strategy.close() (a stamped
+        # close with an entry id); lets a same-bar close_all clamp to flat instead
+        # of overshooting when the partial already shed part of the position.
+        self._partial_close_bar: int = -1
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
@@ -888,6 +892,18 @@ class SimPosition(PositionBase):
         # Close orders cannot fill when no position exists
         if order.order_type == _order_type_close and self.size == 0.0:
             return
+
+        # Record same-bar partial strategy.close() fills (stamped close carrying an
+        # entry id) so a later same-bar close_all clamps to flat instead of
+        # overshooting on the size it captured before this partial shed part of it.
+        # Only a fill that actually sheds size arms the marker: a consumed/zero-size
+        # tombstone (a fired partial-exit leg kept alive while its entry stays open)
+        # is re-filled as a no-op every bar and must NOT re-arm it, or it would
+        # wrongly clamp an unrelated deferred-margin-call close_all overshoot.
+        if (order.order_type == _order_type_close and order.order_id is not None
+                and order.book_seq is not None
+                and not order.consumed and _size_round(order.size) != 0.0):
+            self._partial_close_bar = int(lib.bar_index)
 
         self._fill_counter += 1
 
@@ -1254,9 +1270,16 @@ class SimPosition(PositionBase):
             new_size = 0.0
         new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
         if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
-            # Exit orders should never reverse position direction
-            # Only entry orders can open new positions or reverse direction
-            if (order.order_type == _order_type_close or close_only) and order.order_id is not None:
+            # Exit orders should never reverse position direction; only entry
+            # orders open or reverse. A close_all (order_id None) is normally
+            # allowed to overshoot — a deferred margin call can shrink the
+            # position after close_all captured its size, and TV opens the
+            # overshoot as an opposite trade. But when the shrink came from a
+            # same-bar partial strategy.close() (which stamps book_seq), TV
+            # closes only what remains, so clamp to flat instead of reversing.
+            if (order.order_type == _order_type_close or close_only) and (
+                    order.order_id is not None
+                    or self._partial_close_bar == int(lib.bar_index)):
                 # Limit the exit order size to just close the position
                 order.size = -self.size
                 self._fill_order(order, price, h, l)
