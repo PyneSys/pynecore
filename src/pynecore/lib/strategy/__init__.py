@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, Literal, overload
+from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
 
 import math
 from abc import ABC, abstractmethod
@@ -68,6 +69,16 @@ _order_type_normal = _OrderType()
 _order_type_entry = _OrderType()
 _order_type_close = _OrderType()
 
+# Order-book dict key shapes. A close placed by ``strategy.close()`` /
+# ``strategy.close_all()`` in BACKTEST carries a unique ``book_seq`` stamp so
+# that multiple same-bar partial closes on one entry STACK instead of colliding
+# on a shared key; that stamp becomes the optional last tuple element. Sticky
+# ``strategy.exit`` brackets, risk/defensive closes and the live broker path
+# leave ``book_seq`` None and keep the bare 2-/3-tuple key unchanged.
+_ExitOrderKey: _TypeAlias = tuple[str | None, str | None] | tuple[str | None, str | None, int]
+_MarketOrderKey: _TypeAlias = (tuple[_OrderType, str | None, str | None]
+                               | tuple[_OrderType, str | None, str | None, int])
+
 #
 # Imports after constants
 #
@@ -94,6 +105,28 @@ def _na_to_none(value):  # type: ignore[misc]
     return None if isinstance(value, NA) else value
 
 
+def _exit_order_key(order_: 'Order') -> '_ExitOrderKey':
+    """Order-book key for an exit/close order.
+
+    A backtest partial close stamped with a ``book_seq`` (see
+    :meth:`PositionBase._next_close_seq`) appends it as a 3rd element so several
+    same-bar closes on one entry get distinct keys and STACK; every other order
+    (sticky ``strategy.exit``, risk/defensive close, live broker close) keeps the
+    bare ``(exit_id, order_id)`` key, leaving their dedup-by-id semantics intact.
+    Insert and pop sites MUST both route through this helper so they never drift.
+    """
+    if order_.book_seq is None:
+        return order_.exit_id, order_.order_id
+    return order_.exit_id, order_.order_id, order_.book_seq
+
+
+def _market_order_key(order_: 'Order') -> '_MarketOrderKey':
+    """Market-orders key, mirroring :func:`_exit_order_key`'s ``book_seq`` rule."""
+    if order_.book_seq is None:
+        return order_.order_type, order_.order_id, order_.exit_id
+    return order_.order_type, order_.order_id, order_.exit_id, order_.book_seq
+
+
 #
 # Classes
 #
@@ -118,6 +151,8 @@ class Order:
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
         "reserved_size",  # Exit-leg slice of the entry's original size (frozen at creation)
         "consumed",  # True once an exit leg fired its slice while its entry is still open
+        "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
+                     # (backtest only); None for non-stacking sticky-exit / risk / live orders
     )
 
     def __init__(
@@ -188,12 +223,16 @@ class Order:
         self.from_entry_na = False
         self.reserved_size = abs(size)
         self.consumed = False
+        # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
+        # left None everywhere else so the order-book key keeps its bare shape.
+        self.book_seq: int | None = None
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
                f"limit={self.limit}; stop={self.stop}; " \
                f"trail_price={self.trail_price}; trail_offset={self.trail_offset}; " \
-               f"oca_name={self.oca_name}; comment={self.comment}; bar_index={self.bar_index})"
+               f"oca_name={self.oca_name}; comment={self.comment}; book_seq={self.book_seq}; " \
+               f"bar_index={self.bar_index})"
 
 
 class Trade:
@@ -417,7 +456,7 @@ class PositionBase(ABC):
     etc. — reads the attributes declared here, so concrete subclasses MUST
     initialize all of them in ``__init__``.
     """
-    __slots__ = ()
+    __slots__ = ('_close_seq_counter',)
 
     # Attribute surface (declared for documentation and type-checking only —
     # concrete subclasses declare these in ``__slots__`` and initialize them).
@@ -444,8 +483,22 @@ class PositionBase(ABC):
     closed_trades: 'deque[Trade]'
     new_closed_trades: list['Trade']
     entry_orders: dict[str | None, 'Order']
-    exit_orders: dict[tuple[str | None, str | None], 'Order']
+    exit_orders: dict['_ExitOrderKey', 'Order']
     risk_halt_trading: bool
+    # Monotonic counter feeding _next_close_seq(); initialized by each subclass.
+    _close_seq_counter: int
+
+    def _next_close_seq(self) -> int:
+        """Return a fresh monotonic stamp for a same-bar partial close.
+
+        ``strategy.close()`` / ``strategy.close_all()`` use this so that several
+        partial closes issued on one bar against the same entry id get DISTINCT
+        order-book keys and therefore STACK (all fill) instead of the later call
+        silently evicting the earlier one. Backtest only — the live broker path
+        leaves ``Order.book_seq`` None (handled in a separate change).
+        """
+        self._close_seq_counter += 1
+        return self._close_seq_counter
 
     # Risk management state shared by Sim and Broker positions. Setters
     # in :mod:`pynecore.lib.strategy.risk` populate the ``risk_max_*`` fields;
@@ -652,13 +705,16 @@ class SimPosition(PositionBase):
         self.grossloss: PyneFloat = 0.0
 
         # Order books
-        self.market_orders: dict[tuple[_OrderType, str | None, str | None], Order] = {}  # Market orders from strategy.market()
+        self.market_orders: dict[_MarketOrderKey, Order] = {}  # Market orders from strategy.market()
         self.entry_orders: dict[str | None, Order] = {}  # Entry orders from strategy.entry()
         # Exit orders from strategy.exit(), strategy.close(), etc.
         # Key is (exit_id, from_entry) — both partial-TP fan-out (same from_entry,
         # different ids) and from_entry_na fan-out (same id, different from_entry)
         # must coexist; only repeated calls with both fields equal modify-in-place.
-        self.exit_orders: dict[tuple[str | None, str | None], Order] = {}
+        # A backtest strategy.close()/close_all() order additionally carries a
+        # book_seq stamp appended as a 3rd key element, so same-bar partial closes
+        # on one entry stack instead of evicting each other (see _add_order).
+        self.exit_orders: dict[_ExitOrderKey, Order] = {}
         self.orderbook = PriceOrderBook()
 
         # Trades
@@ -710,6 +766,8 @@ class SimPosition(PositionBase):
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
         self._fill_counter: int = 0
+        # Monotonic stamp source for same-bar stacking of partial closes.
+        self._close_seq_counter: int = 0
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
@@ -719,13 +777,14 @@ class SimPosition(PositionBase):
         # Add market order to market orders dict. Key on exit_id too: two
         # brackets sharing the same from_entry (order_id) would otherwise
         # collide on the same key, so a second gap-through exit would evict
-        # the first and only one of them would fill on the gap bar.
+        # the first and only one of them would fill on the gap bar. A stacked
+        # partial close additionally keys on book_seq (see _market_order_key).
         if order.is_market_order:
-            self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
+            self.market_orders[_market_order_key(order)] = order
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
-            exit_key = (order.exit_id, order.order_id)
+            exit_key = _exit_order_key(order)
             existing_order = self.exit_orders.get(exit_key)
             self.exit_orders[exit_key] = order
         else:
@@ -744,13 +803,13 @@ class SimPosition(PositionBase):
         """ Remove an order from the strategy """
         order.cancelled = True
         if order.order_type == _order_type_close:
-            self.exit_orders.pop((order.exit_id, order.order_id), None)
+            self.exit_orders.pop(_exit_order_key(order), None)
         else:
             # Both entry and normal orders are stored in entry_orders dict
             self.entry_orders.pop(order.order_id, None)
         # Remove market order from market orders dict
         if order.is_market_order:
-            self.market_orders.pop((order.order_type, order.order_id, order.exit_id), None)
+            self.market_orders.pop(_market_order_key(order), None)
         # Remove order from order book
         self.orderbook.remove_order(order)
 
@@ -2121,7 +2180,7 @@ class SimPosition(PositionBase):
                 # Convert to market order
                 order.is_market_order = True
                 # Add to market orders dict
-                self.market_orders[(order.order_type, order.order_id, order.exit_id)] = order
+                self.market_orders[_market_order_key(order)] = order
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -2866,6 +2925,12 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
 
+    # Stamp a unique book_seq so several same-bar partial closes on this entry
+    # stack instead of colliding on a shared exit-order key. Backtest only —
+    # the live broker close-dispatch path is handled separately and stays None.
+    if isinstance(position, SimPosition):
+        order.book_seq = position._next_close_seq()
+
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
     # Same-tick fill is a backtest concept; in broker mode the order is already
@@ -2900,6 +2965,11 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     exit_id = 'Close position order'
     order = Order(None, -position.size, exit_id=exit_id, order_type=_order_type_close,
                   comment=comment, alert_message=alert_message)
+
+    # Stamp book_seq so a close_all stacked behind a same-bar partial close fills
+    # too (backtest only; live close-dispatch handled separately, stays None).
+    if isinstance(position, SimPosition):
+        order.book_seq = position._next_close_seq()
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
@@ -3144,8 +3214,12 @@ def exit(id: str, from_entry: str = "",
             # No-qty "rest" leg: the entry size minus the slices reserved by
             # sibling legs (consumed siblings keep their reservation until the
             # entry fully closes), so it never over-closes the position.
+            # Only sticky exit legs (book_seq is None) count as siblings; a
+            # stacked strategy.close()/close_all() partial (book_seq set) is an
+            # immediate market close, not a reservation against this rest leg.
             sibling = sum(o.reserved_size for o in position.exit_orders.values()
-                          if o.order_id == from_entry and o is not existing)
+                          if o.order_id == from_entry and o is not existing
+                          and o.book_seq is None)
             reserved = abs(init_size) - sibling
 
         reserved = _size_round(reserved)
