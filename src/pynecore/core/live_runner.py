@@ -495,6 +495,16 @@ def live_ohlcv_generator(
         # watchdog only arms after the first real bar so we never
         # fabricate state without a baseline.
         last_closed_bar: OHLCV | None = None
+        # Latest FORMING (intra-bar) update for the currently open slot.
+        # Tracked independently of the intra-bar queue soft-cap so the
+        # boundary watchdog can finalise it with its real accumulated
+        # OHLCV when no close event arrives — providers that close a bar
+        # only on the next bar's timestamp (cTrader) never emit a closing
+        # event across a session boundary, so without this the real last
+        # bar of a session would be lost and replaced by a frozen V=0
+        # synth. Cleared when a closed bar supersedes its slot or once it
+        # has been finalised.
+        last_forming_bar: OHLCV | None = None
         # Tracks whether the last observed market state was open. Flips to
         # False on the first synth-skip in a closed period (emits a single
         # INFO log) and back to True when a real bar arrives.
@@ -728,6 +738,16 @@ def live_ohlcv_generator(
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
                         synth_streak = 0
+                        # A real close for this slot (or a newer one)
+                        # supersedes the tracked forming bar — drop it so
+                        # the watchdog never re-finalises an already-closed
+                        # slot. Timestamp-guarded so a late/duplicate older
+                        # closed bar cannot wipe the current open slot's
+                        # forming state.
+                        if (last_forming_bar is not None
+                                and bar_update.timestamp
+                                >= last_forming_bar.timestamp):
+                            last_forming_bar = None
                         if not market_open_state:
                             broker_info(
                                 "market reopened: resuming live stream "
@@ -754,6 +774,13 @@ def live_ohlcv_generator(
                                 qsize_before, put_ms, bar_update.timestamp,
                             )
                     else:
+                        # Remember the latest forming bar BEFORE the queue
+                        # soft-cap. Finalisation state must not depend on
+                        # queue admission: when the consumer lags the cap
+                        # drops the queued update, but the watchdog must
+                        # still be able to close this slot with its real
+                        # accumulated OHLCV at the session boundary.
+                        last_forming_bar = bar_update
                         # Intra-bar updates are advisory — closed bars
                         # carry authoritative state. With an unbounded
                         # queue, ``put_nowait`` would never raise
@@ -879,6 +906,35 @@ def live_ohlcv_generator(
                             # deferred a connection / stale-feed error so
                             # the next iteration's top-of-loop dispatch
                             # drives the reconnect path.
+                            continue
+                        # Real-data finalisation: if the provider already
+                        # delivered a forming bar for exactly this slot,
+                        # close it with its accumulated OHLCV instead of
+                        # fabricating a frozen V=0 filler. Providers that
+                        # close a bar only when the next bar's timestamp
+                        # arrives (cTrader) never emit a closing event for
+                        # the last bar before a session boundary or a feed
+                        # gap — the close event simply never comes. Without
+                        # this the real last-session bar would be discarded
+                        # and replaced by a frozen synth (O=H=L=C=prev
+                        # close, V=0), shifting the strategy's view of the
+                        # close. The finalised bar is REAL data, so it ends
+                        # the idle streak rather than counting as synth, and
+                        # keeps its own ``extra_fields`` (ask/spread).
+                        if (last_forming_bar is not None
+                                and last_forming_bar.timestamp == synth_ts):
+                            finalized = last_forming_bar._replace(is_closed=True)
+                            last_closed_bar = finalized
+                            last_forming_bar = None
+                            synth_streak = 0
+                            broker_info(
+                                "idle-bar finalized forming bar: ts=%d "
+                                "close=%s vol=%s (real accumulated data; no "
+                                "close event arrived before boundary)",
+                                finalized.timestamp, finalized.close,
+                                finalized.volume,
+                            )
+                            bar_queue.put(finalized)
                             continue
                         # Dead feed during an open session: reconnect instead
                         # of synthesising a frozen idle bar. Idle-bar synth is

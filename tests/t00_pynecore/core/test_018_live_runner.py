@@ -880,3 +880,232 @@ def __test_feed_staleness_fires_when_slot_pinned_in_closed_window__():
         "staleness watchdog must fire when the pinned synth slot is "
         "calendar-closed but the session is open now"
     )
+
+
+# --- Forming-bar finalisation tests ---
+#
+# Providers that close a bar only when the NEXT bar's timestamp arrives
+# (cTrader) never emit a close event for the last bar before a session
+# boundary or a feed gap — that close simply never comes. The boundary
+# watchdog must finalise the real forming bar it already received with
+# its accumulated OHLCV instead of discarding it and fabricating a frozen
+# V=0 synth. The no-forming-bar V=0 fallback (the watchdog's behaviour
+# when no forming bar was tracked for the slot) is covered by
+# ``__test_live_generator_synthesises_idle_bars_at_tf_boundary__``.
+
+
+def __test_idle_watchdog_finalises_forming_bar_with_real_data__():
+    """A forming bar for the boundary slot is closed with its real OHLCV.
+
+    The provider delivers a closed bar then a forming (is_closed=False)
+    bar for the next slot carrying real accumulated volume, then goes
+    silent — no close event ever follows. The watchdog must emit a CLOSED
+    bar at the forming slot with the forming bar's own OHLCV/volume, NOT
+    a frozen V=0 filler at the previous close.
+    """
+    base_ts = int(time.time()) - 200
+    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+                    low=99.0, close=105.0, volume=500.0, is_closed=False)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0), forming]
+    provider = _IdleAfterFirstBar(updates)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if any(b.timestamp == base_ts + 60 and b.is_closed for b in bars):
+            break
+        if len(bars) >= 8:
+            break
+
+    finalised = [b for b in bars if b.timestamp == base_ts + 60 and b.is_closed]
+    assert len(finalised) == 1, (
+        f"expected one finalised closed bar at the forming slot, "
+        f"got {len(finalised)}"
+    )
+    assert finalised[0].close == 105.0  # real close, not the previous 100.0
+    assert finalised[0].high == 106.0
+    assert finalised[0].low == 99.0
+    assert finalised[0].volume == 500.0  # real volume, not a V=0 synth
+
+
+class _FormingThenLateClose(MockLiveProvider):
+    """closed -> forming(next slot) -> stall (watchdog finalises) -> late
+    real close for the same slot (conflicting values) -> exhausted.
+
+    Models a provider whose own delayed close for a slot lands only after
+    the watchdog already finalised that slot from the forming bar (e.g.
+    the close event arrives after a session reopens).
+    """
+
+    def __init__(self, bar_updates: list[OHLCV], stall_seconds: float = 0.3):
+        super().__init__(bar_updates)
+        self._stall_seconds = stall_seconds
+        self._stalled = False
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        # Stall once between the forming bar (index 2) and the late close
+        # so the watchdog finalises the forming slot before it is served.
+        if self._index == 2 and not self._stalled:
+            self._stalled = True
+            await asyncio.sleep(self._stall_seconds)
+        return await super().watch_ohlcv(symbol, timeframe)
+
+
+def __test_late_real_close_dropped_after_forming_finalisation__():
+    """A provider's late close for an already-finalised slot is dropped.
+
+    After the watchdog finalises the forming slot, the provider finally
+    emits its own CLOSED bar for the same timestamp with conflicting
+    values. The existing same-/older-timestamp dedup must drop it so the
+    consumer keeps exactly one closed bar for the slot — the real forming
+    data, not the late conflicting close.
+    """
+    base_ts = int(time.time()) - 200
+    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+                    low=99.0, close=105.0, volume=500.0, is_closed=False)
+    late_close = OHLCV(timestamp=base_ts + 60, open=100.0, high=200.0,
+                       low=50.0, close=999.0, volume=777.0, is_closed=True)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0),
+               forming, late_close]
+    provider = _FormingThenLateClose(updates, stall_seconds=0.3)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if len(bars) >= 8:
+            break
+
+    closed_at_slot = [b for b in bars
+                      if b.timestamp == base_ts + 60 and b.is_closed]
+    assert len(closed_at_slot) == 1, (
+        f"late real close must be dropped; got {len(closed_at_slot)} "
+        f"closed bars at the slot"
+    )
+    assert closed_at_slot[0].close == 105.0  # forming data wins
+    assert closed_at_slot[0].volume == 500.0
+
+
+def __test_forming_bar_finalised_even_when_soft_cap_drops_queue_updates__():
+    """Forming tracking is independent of the intra-bar queue soft-cap.
+
+    With the soft cap forced to zero every forming (is_closed=False)
+    update is dropped from the consumer queue, so the consumer sees no
+    intra-bar updates at all. The watchdog must still finalise the slot
+    with the forming bar's real OHLCV, because finalisation state is
+    tracked BEFORE the cap, not via queue admission.
+    """
+    base_ts = int(time.time()) - 200
+    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+                    low=99.0, close=105.0, volume=500.0, is_closed=False)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0), forming]
+    provider = _IdleAfterFirstBar(updates)
+
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_cap = _live_runner_mod._INTRA_BAR_SOFT_CAP
+    _live_runner_mod._INTRA_BAR_SOFT_CAP = 0
+    try:
+        bars: list[OHLCV] = []
+        seen_transition = False
+        for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+            if item is LIVE_TRANSITION:
+                seen_transition = True
+                continue
+            if not seen_transition:
+                continue
+            bars.append(item)
+            if any(b.timestamp == base_ts + 60 and b.is_closed for b in bars):
+                break
+            if len(bars) >= 8:
+                break
+    finally:
+        _live_runner_mod._INTRA_BAR_SOFT_CAP = _orig_cap
+
+    # The soft cap (0) dropped every forming update from the queue.
+    assert all(b.is_closed for b in bars), (
+        "soft cap=0 must drop all intra-bar (forming) updates from the queue"
+    )
+    # ...but the watchdog still finalised the slot with real data.
+    finalised = [b for b in bars if b.timestamp == base_ts + 60 and b.is_closed]
+    assert len(finalised) == 1
+    assert finalised[0].close == 105.0
+    assert finalised[0].volume == 500.0
+
+
+def __test_forming_finalised_at_session_end_then_next_slot_skipped__():
+    """Session-boundary case: last in-session slot finalises, next is skipped.
+
+    Models the cTrader Friday-close bug: the last bar of the session is
+    delivered as a forming bar (no close event ever follows, because the
+    next bar only arrives after the weekend). The watchdog must finalise
+    that slot with its real OHLCV (the session's true close), while the
+    slot AFTER the session end is gated out — neither finalised nor
+    frozen-synth.
+    """
+    from pynecore.core.syminfo import SymInfoInterval
+    from datetime import datetime as ddatetime, time as dtime, UTC
+
+    base_ts = int(time.time()) - 260
+    synth_ts = base_ts + 60  # last in-session slot start
+    # Session ends exactly at the slot boundary after ``synth_ts`` so
+    # [synth_ts, synth_ts+60) is in-session and [synth_ts+60, +120) is not.
+    start_dt = ddatetime.fromtimestamp(synth_ts - 1800, tz=UTC)
+    end_dt = ddatetime.fromtimestamp(synth_ts + 60, tz=UTC)
+    start_t = dtime(start_dt.hour, start_dt.minute, start_dt.second)
+    end_t = dtime(end_dt.hour, end_dt.minute, end_dt.second)
+    if start_dt.date() == end_dt.date():
+        intervals = [SymInfoInterval(day=d, start=start_t, end=end_t)
+                     for d in range(7)]
+    else:
+        # Window straddles UTC midnight: split at the day boundary so the
+        # pre/post-midnight halves stay contiguous and the post-end slot
+        # remains closed.
+        intervals = [
+            SymInfoInterval(day=d, start=start_t, end=dtime(23, 59, 59))
+            for d in range(7)
+        ] + [
+            SymInfoInterval(day=d, start=dtime(0, 0, 0), end=end_t)
+            for d in range(7)
+        ]
+    syminfo = _make_syminfo(intervals, timezone="UTC")
+
+    forming = OHLCV(timestamp=synth_ts, open=100.0, high=106.0,
+                    low=99.0, close=105.0, volume=500.0, is_closed=False)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0), forming]
+    provider = _IdleThenCancelProvider(updates, max_idle_calls=20)
+
+    from pynecore.core import live_runner as _live_runner_mod
+    _orig_sleep = _live_runner_mod._CLOSED_WINDOW_SLEEP_S
+    _live_runner_mod._CLOSED_WINDOW_SLEEP_S = 0.05
+    try:
+        _, bars = _drain(provider, "TEST", "1", syminfo=syminfo)
+    finally:
+        _live_runner_mod._CLOSED_WINDOW_SLEEP_S = _orig_sleep
+
+    # The last in-session slot was finalised once with its real OHLCV.
+    finalised = [b for b in bars if b.timestamp == synth_ts and b.is_closed]
+    assert len(finalised) == 1, (
+        f"last in-session slot must be finalised once, got {len(finalised)}"
+    )
+    assert finalised[0].close == 105.0
+    assert finalised[0].volume == 500.0
+    # The slot past the session end must not be emitted at all.
+    assert all(b.timestamp != synth_ts + 60 for b in bars), (
+        "the out-of-session slot must be neither finalised nor synthesised"
+    )
+    # No frozen V=0 synth was produced — the only closed-bar fill was the
+    # real-data finalisation.
+    assert all(b.volume > 0.0 for b in bars if b.is_closed), (
+        "no frozen V=0 synth expected; only the real-data finalisation"
+    )
