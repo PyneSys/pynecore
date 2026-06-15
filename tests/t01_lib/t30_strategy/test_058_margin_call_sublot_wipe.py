@@ -1,16 +1,12 @@
 """
 @pyne
 
-Regression test for the sub-lot margin-call shortfall wiping the position.
+Regression test for the sub-lot margin-call shortfall minimum liquidation.
 
-On fractional-lot symbols TradingView liquidates 4x the cover amount in lot
-units — but when the shortfall is smaller than one lot's notional (the cover
-truncates to zero lots), it closes the ENTIRE position instead of trimming a
-minimum slice. Verified against TradingView references on BINANCE:BTCUSDT
-(2026-04-09 15:00 and 2026-05-11 16:30: a sub-1-USD shortfall at the bar high
-wiped 0.93 / 0.80 BTC shorts in one margin-call fill, while larger shortfalls
-produced fractional 4x-cover slices). PyneCore previously liquidated a
-minimum of one lot.
+On fractional-lot symbols TradingView liquidates 4x the cover amount in lot units.
+When the shortfall is smaller than one lot's notional (the cover truncates to
+zero lots), it closes one whole contract, capped by the current position size.
+For sub-1.0 BTC positions that still wipes the whole trade.
 """
 from pynecore.lib import script, strategy, bar_index
 
@@ -48,7 +44,7 @@ def _make_syminfo():
 # noinspection PyShadowingNames
 def __test_sublot_shortfall_wipes_whole_position__(script_path, module_key):
     """
-    A margin shortfall under one lot's notional closes the entire short.
+    A margin shortfall under one lot's notional closes this entire sub-1.0 short.
 
     * bar 0: entry signal (market) -> fills bar 1 open at 100.00 with
       qty = 100% equity = 40 / 100.00 = 0.4 (available funds exactly zero).
