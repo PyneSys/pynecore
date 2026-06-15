@@ -1805,16 +1805,17 @@ class SimPosition(PositionBase):
         # (crypto) liquidate fractional amounts the way TV does instead of
         # force-closing a minimum of one whole contract.
         rfactor = 1 if whole_contracts else syminfo._size_round_factor  # noqa
-        cover_lots = int(abs(loss) / (check_price * pv) * rfactor)
+        raw_cover_lots = abs(loss) / (check_price * pv) * rfactor
+        if rfactor > 1:
+            # TV snaps fractional-lot cover amounts that land just below the next
+            # lot boundary; ordinary fractional parts remain truncated.
+            raw_cover_lots += 0.001
+        cover_lots = int(raw_cover_lots)
         if cover_lots == 0 and rfactor > 1:
             # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
-            # the ENTIRE position instead of trimming a minimum slice. Verified
-            # against TV references on BINANCE:BTCUSDT — a shortfall under one
-            # lot's notional at the bar extreme wiped a 0.93 BTC short in one
-            # margin-call fill, while shortfalls of one lot or more liquidate
-            # 4x the cover amount in lot units.
+            # one whole contract, capped by the current position size.
             mc_lots = 0
-            margin_call_size = quantity
+            margin_call_size = min(1.0, quantity)
         else:
             mc_lots = max(1, cover_lots * 4)
             margin_call_size = mc_lots / rfactor
@@ -1880,6 +1881,52 @@ class SimPosition(PositionBase):
             except ZeroDivisionError:
                 closed_trade.cum_profit_percent = 0.0
             self.entry_equity += closed_trade.profit
+
+    def _entry_exceeds_margin_after_fill(self, order: Order, fill_price: float) -> bool:
+        """
+        Check whether an entry's resulting position is affordable at its fill price.
+
+        TV rejects the entry before filling when the position that would remain after
+        the fill cannot be margined. Once an entry has filled, later open/high/low
+        margin breaches are handled by the margin-call path.
+        """
+        script = lib._script
+        margin_percent = script.margin_short if order.sign < 0 else script.margin_long
+        if margin_percent <= 0:
+            return False
+
+        pv = syminfo.pointvalue
+        margin_ratio = margin_percent / 100.0
+
+        new_qty = abs(self.size + order.size)
+        if new_qty == 0.0:
+            return False
+
+        equity = self.equity
+        margin_needed = new_qty * fill_price * pv * margin_ratio
+        return margin_needed > equity
+
+    def _cancel_same_bar_reversal_closes(self, entry_order: Order) -> None:
+        """
+        Cancel market closes made redundant by a same-bar opposite entry.
+
+        A reversing ``strategy.entry`` is itself the close request for the current
+        position. If that entry is rejected at its fill, TV does not then fill a
+        same-bar ``strategy.close`` for the old position as a fallback.
+        """
+        if self.size == 0.0 or self.sign == entry_order.sign:
+            return
+
+        open_entry_ids = {trade.entry_id for trade in self.open_trades}
+        for close_order in list(self.market_orders.values()):
+            if close_order.order_type != _order_type_close:
+                continue
+            if close_order.bar_index != entry_order.bar_index:
+                continue
+            if close_order.sign != entry_order.sign:
+                continue
+            if close_order.order_id is None or close_order.order_id in open_entry_ids:
+                self._remove_order(close_order)
 
     def _check_low_stop(self, order: Order) -> bool:
         """ Check low stop """
@@ -2078,6 +2125,8 @@ class SimPosition(PositionBase):
 
         # Process Market orders
         for order in list(self.market_orders.values()):
+            if order.cancelled:
+                continue
             if order.order_type == _order_type_entry:
                 if order.limit is None and order.stop is None:
                     # We need to check pyramiding and flip quantity here for market orders :-/
@@ -2104,52 +2153,10 @@ class SimPosition(PositionBase):
             # Pre-fill margin check for entry orders (TradingView behavior)
             # TV rejects entry orders BEFORE filling if the position would exceed margin
             if order.order_type == _order_type_entry:
-                margin_percent = (script.margin_short if order.sign < 0
-                                  else script.margin_long)
-                if margin_percent > 0:
-                    margin_ratio = margin_percent / 100.0
-                    # Margin/equity live in account currency; convert price * qty into
-                    # account-currency units via the futures pointvalue.
-                    pv = syminfo.pointvalue
-                    # On fractional-lot symbols a margin overshoot does not reject
-                    # the order outright: TV fills it and the bar-open margin call
-                    # immediately trims whole contracts at the fill price; only an
-                    # overshoot whose immediate margin call would wipe the entire
-                    # position is rejected (verified on a BINANCE:BTCUSDT export).
-                    # On whole-lot symbols TV rejects the overshooting entry and
-                    # the signal has to re-fire later (verified on a BATS:SRFM
-                    # stock export: the gapped-up fill was rejected, the entry
-                    # landed two bars later -- the ganzalgo_v2_pro pynecomp test).
-                    whole_lot = syminfo._size_round_factor <= 1  # noqa
-
-                    def _mc_wipes_position(equity_: float, margin_needed_: float,
-                                           qty_after_fill: float) -> bool:
-                        loss = (equity_ - margin_needed_) / margin_ratio
-                        cover = int(abs(loss) / (fill_price * pv))
-                        return max(1, cover * 4) >= qty_after_fill
-
-                    if self.size == 0.0:
-                        equity = script.initial_capital + self.netprofit
-                        margin_needed = abs(order.size) * fill_price * pv * margin_ratio
-                        if (margin_needed > equity
-                                and (whole_lot
-                                     or _mc_wipes_position(equity, margin_needed, abs(order.size)))):
-                            self._remove_order(order)
-                            continue
-                    elif self.sign == order.sign:
-                        new_qty = abs(self.size) + abs(order.size)
-                        money_spent = (abs(self.size) * self.avg_price
-                                       + abs(order.size) * fill_price) * pv
-                        mvs = new_qty * fill_price * pv
-                        open_profit = ((mvs - money_spent) if self.sign > 0
-                                       else (money_spent - mvs))
-                        equity = script.initial_capital + self.netprofit + open_profit
-                        margin_needed = mvs * margin_ratio
-                        if (margin_needed > equity
-                                and (whole_lot
-                                     or _mc_wipes_position(equity, margin_needed, new_qty))):
-                            self._remove_order(order)
-                            continue
+                if self._entry_exceeds_margin_after_fill(order, fill_price):
+                    self._cancel_same_bar_reversal_closes(order)
+                    self._remove_order(order)
+                    continue
 
             # open → high → low → close
             if ohlc:
@@ -2603,31 +2610,9 @@ class SimPosition(PositionBase):
                 order.filled_by_type = 'profit'
 
             if order.order_type == _order_type_entry:
-                margin_percent = (script.margin_short if order.sign < 0
-                                  else script.margin_long)
-                if margin_percent > 0:
-                    margin_ratio = margin_percent / 100.0
-                    # Same pointvalue conversion as _process_at_bar_open — margin and
-                    # equity live in account currency, not price units.
-                    pv = syminfo.pointvalue
-                    if self.size == 0.0:
-                        equity = script.initial_capital + self.netprofit
-                        margin_needed = abs(order.size) * fill_price * pv * margin_ratio
-                        if margin_needed > equity:
-                            self._remove_order(order)
-                            return
-                    elif self.sign == order.sign:
-                        new_qty = abs(self.size) + abs(order.size)
-                        money_spent = (abs(self.size) * self.avg_price
-                                       + abs(order.size) * fill_price) * pv
-                        mvs = new_qty * fill_price * pv
-                        open_profit = ((mvs - money_spent) if self.sign > 0
-                                       else (money_spent - mvs))
-                        equity = script.initial_capital + self.netprofit + open_profit
-                        margin_needed = mvs * margin_ratio
-                        if margin_needed > equity:
-                            self._remove_order(order)
-                            return
+                if self._entry_exceeds_margin_after_fill(order, fill_price):
+                    self._remove_order(order)
+                    return
 
             self.fill_order(order, fill_price, h_after, l_after)
 
