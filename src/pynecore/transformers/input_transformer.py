@@ -119,11 +119,15 @@ class InputTransformer(ast.NodeTransformer):
         # Add getattr for each source input in this function
         source_vars = self.function_source_vars.get(self.current_function, {})
         for var_name, source_str in source_vars.items():
-            # Create: var_name = getattr(lib, var_name, lib.na)
+            # Create: var_name = __pyne_getattr__(lib, var_name, lib.na)
+            # A reserved module-level alias of the builtin is used instead of a
+            # bare ``getattr``: a script variable named ``getattr`` would shadow
+            # the builtin in the function scope and break this resolution (same
+            # class of bug as a ``len`` input shadowing the loop-guard length).
             assign = ast.Assign(
                 targets=[ast.Name(id=var_name, ctx=ast.Store())],
                 value=ast.Call(
-                    func=ast.Name(id='getattr', ctx=ast.Load()),
+                    func=ast.Name(id='__pyne_getattr__', ctx=ast.Load()),
                     args=[
                         ast.Name(id='lib', ctx=ast.Load()),
                         ast.Name(id=var_name, ctx=ast.Load()),
@@ -149,5 +153,23 @@ class InputTransformer(ast.NodeTransformer):
 
         if not self.has_source_inputs:
             return node
+
+        # Source-input resolution emits ``__pyne_getattr__(lib, name, lib.na)``;
+        # bind that reserved alias to the builtin at module scope so a
+        # function-local ``getattr`` variable cannot shadow it.
+        alias_import = ast.ImportFrom(
+            module='builtins',
+            names=[ast.alias(name='getattr', asname='__pyne_getattr__')],
+            level=0)
+        insert_pos = 0
+        first = node.body[0] if node.body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            insert_pos = 1  # keep the module docstring first
+        while (insert_pos < len(node.body)
+               and isinstance(node.body[insert_pos], ast.ImportFrom)
+               and getattr(node.body[insert_pos], 'module', None) == '__future__'):
+            insert_pos += 1  # stay after any ``from __future__`` imports
+        node.body.insert(insert_pos, alias_import)
 
         return node

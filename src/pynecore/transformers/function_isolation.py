@@ -508,6 +508,22 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             target=ast.Name(id='__i__', ctx=ast.Store()),
             value=ast.BinOp(left=increment, op=ast.Sub(), right=ast.Constant(value=1)))
 
+    @staticmethod
+    def _list_len(children: str) -> ast.Call:
+        """``<children>.__len__()`` — the loop-site counter guard's list length.
+
+        A bare ``len(...)`` is unsafe here: a script variable named ``len``
+        (one of the most common Pine input names) shadows the builtin in the
+        function scope, so the emitted ``len`` would resolve to that value
+        (e.g. an ``int``) and the guard would raise ``'int' object is not
+        callable``. ``<children>`` is always our own hoisted list, so calling
+        its ``__len__`` slot directly sidesteps name resolution entirely.
+        """
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id=children, ctx=ast.Load()),
+                               attr='__len__', ctx=ast.Load()),
+            args=[], keywords=[])
+
     def _add_loop_hoist(self, slot: int) -> tuple[str, str]:
         """Register a loop site's counter + hoisted list for the prologue."""
         k = len(self._loop_hoists[-1])
@@ -537,9 +553,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             state_expr = ast.IfExp(
                 test=ast.Compare(
                     left=self._counter_walrus(counter), ops=[ast.Lt()],
-                    comparators=[ast.Call(func=ast.Name(id='len', ctx=ast.Load()),
-                                          args=[ast.Name(id=children, ctx=ast.Load())],
-                                          keywords=[])]),
+                    comparators=[self._list_len(children)]),
                 body=ast.Subscript(value=ast.Name(id=children, ctx=ast.Load()),
                                    slice=ast.Name(id='__i__', ctx=ast.Load()), ctx=ast.Load()),
                 orelse=ast.Call(func=ast.Name(id='__grow__', ctx=ast.Load()),
@@ -574,9 +588,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             test = ast.BoolOp(op=ast.And(), values=[
                 ast.Compare(
                     left=self._counter_walrus(counter), ops=[ast.Lt()],
-                    comparators=[ast.Call(func=ast.Name(id='len', ctx=ast.Load()),
-                                          args=[ast.Name(id=children, ctx=ast.Load())],
-                                          keywords=[])]),
+                    comparators=[self._list_len(children)]),
                 ast.Compare(
                     left=ast.Subscript(
                         value=ast.NamedExpr(

@@ -86,6 +86,23 @@ def main():
     assert '__grow__(__chl_0__, t1)' in dump
 
 
+def __test_fast_path_loop_len_shadow__():
+    """ A script variable named ``len`` must not break the loop counter guard """
+    ns, dump = _transform(COUNTER_FUNC + '''
+def main():
+    len = 7  # shadows the builtin, like a common Pine input name
+    total = 0
+    for _ in range(3):
+        total += t1()
+    return total + len
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 10   # three fresh instances (1+1+1) + len(7)
+    assert ns['main'](state) == 13   # same three instances (2+2+2 -> 6) + 7
+    assert 'len(__chl_0__)' not in dump   # never a shadowable builtin call
+    assert '__chl_0__.__len__()' in dump
+
+
 def __test_direct_path_stateless__():
     """ Provably stateless callees stay plain calls, nobody grows a layout """
     ns, dump = _transform('''
@@ -164,6 +181,29 @@ def main(flag):
     assert ns['main'](state, True) == 4     # 2 + 2, both persisted
     assert ns['main'](state, False) == 202  # both iterations rebound to t2
     assert '__bind_any_loop__(__chl_0__, __i__, f)' in dump
+
+
+def __test_uniform_loop_len_shadow__():
+    """ The anchored loop guard is shadow-proof against a ``len`` variable too """
+    ns, dump = _transform(COUNTER_FUNC + '''
+def t2():
+    p: Persistent[int] = 100
+    p += 1
+    return p
+
+def main(flag):
+    len = 5  # shadows the builtin
+    f = t1 if flag else t2
+    total = 0
+    for _ in range(2):
+        total += f()
+    return total + len
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, True) == 7      # 1 + 1 + len(5)
+    assert ns['main'](state, True) == 9      # 2 + 2 + 5
+    assert 'len(__chl_0__)' not in dump
+    assert '__chl_0__.__len__()' in dump
 
 
 def __test_nested_def_fast_path__():

@@ -111,9 +111,11 @@ def main(__state__):
     __chl_0__ = __state__[0]
     total = 0
     for length in (5, 10, 20):
-        total += counter(__chl_0__[__i__] if (__i__ := ((__cnt_0__ := (__cnt_0__ + 1)) - 1)) < len(__chl_0__)
+        total += counter(__chl_0__[__i__] if (__i__ := ((__cnt_0__ := (__cnt_0__ + 1)) - 1)) < __chl_0__.__len__()
                          else __grow__(__chl_0__, counter))
 ```
+
+The counter guard calls `__chl_0__.__len__()` rather than `len(__chl_0__)` on purpose: a script variable named `len` (a common Pine input name) would shadow the builtin in the function scope, so a bare `len(...)` could resolve to that value and fail. Calling the list's `__len__` slot directly sidesteps name resolution.
 
 ### Uniform path
 
