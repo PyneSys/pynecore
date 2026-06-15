@@ -429,7 +429,25 @@ def mode(id: list[T]) -> T | NA[float]:
 
 
 # noinspection PyShadowingNames
-def new_box(size: int = 0, initial_value: Box | NA = NA(Box)) -> list[Box | NA[Box]]:
+def _na_size(size: int | NA) -> int:
+    """
+    Normalize an array constructor ``size`` argument.
+
+    TradingView treats an ``na`` size (e.g. ``array.new<line>(na)``) as 0,
+    producing an empty array, so mirror that instead of failing. A genuinely
+    negative size is still rejected.
+
+    :param size: Requested array size, possibly ``na``
+    :return: Non-negative integer size
+    """
+    if isinstance(size, NA):
+        return 0
+    assert size >= 0, "Size must be >=0!"
+    return size
+
+
+# noinspection PyShadowingNames
+def new_box(size: int | NA = 0, initial_value: Box | NA = NA(Box)) -> list[Box | NA[Box]]:
     """
     Creates a new array of box objects of the specified size, with each element initialized
     to the specified value.
@@ -438,13 +456,13 @@ def new_box(size: int = 0, initial_value: Box | NA = NA(Box)) -> list[Box | NA[B
     :param initial_value: Initial value to set for each element in the array
     :return: New array of box objects
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (Box, NA)), "Initial value must be Box!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_line(size: int = 0, initial_value: Line | NA = NA(Line)) -> list[Line | NA[Line]]:
+def new_line(size: int | NA = 0, initial_value: Line | NA = NA(Line)) -> list[Line | NA[Line]]:
     """
     Creates a new array of line objects of the specified size, with each element initialized
     to the specified value.
@@ -453,13 +471,13 @@ def new_line(size: int = 0, initial_value: Line | NA = NA(Line)) -> list[Line | 
     :param initial_value: Initial value to set for each element in the array
     :return: New array of line objects
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (Line, NA)), "Initial value must be Line!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_label(size: int = 0, initial_value: Label | NA = NA(Label)) -> list[Label | NA[Label]]:
+def new_label(size: int | NA = 0, initial_value: Label | NA = NA(Label)) -> list[Label | NA[Label]]:
     """
     Creates a new array of label objects of the specified size, with each element initialized
     to the specified value.
@@ -468,13 +486,13 @@ def new_label(size: int = 0, initial_value: Label | NA = NA(Label)) -> list[Labe
     :param initial_value: Initial value to set for each element in the array
     :return: New array of label objects
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (Label, NA)), "Initial value must be Label!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_linefill(size: int = 0,
+def new_linefill(size: int | NA = 0,
                  initial_value: LineFill | NA = NA(LineFill)) -> list[LineFill | NA[LineFill]]:
     """
     Creates a new array of linefill objects of the specified size, with each element initialized
@@ -484,13 +502,13 @@ def new_linefill(size: int = 0,
     :param initial_value: Initial value to set for each element in the array
     :return: New array of linefill objects
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (LineFill, NA)), "Initial value must be LineFill!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new(size: int = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]:
+def new(size: int | NA = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -498,12 +516,12 @@ def new(size: int = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_bool(size: int = 0, initial_value: bool | NA = NA(bool)) -> list[PyneBool]:
+def new_bool(size: int | NA = 0, initial_value: bool | NA = NA(bool)) -> list[PyneBool]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -511,13 +529,13 @@ def new_bool(size: int = 0, initial_value: bool | NA = NA(bool)) -> list[PyneBoo
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (bool, NA)), "Initial value must be bool!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_color(size: int = 0, initial_value: Color | NA = NA(Color)) -> list[Color | NA[Color]]:
+def new_color(size: int | NA = 0, initial_value: Color | NA = NA(Color)) -> list[Color | NA[Color]]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -525,13 +543,13 @@ def new_color(size: int = 0, initial_value: Color | NA = NA(Color)) -> list[Colo
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (Color, NA)), "Initial value must be Color!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> list[PyneFloat]:
+def new_float(size: int | NA = 0, initial_value: float | int | NA = NA(float)) -> list[PyneFloat]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -539,7 +557,7 @@ def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> lis
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (float, int, NA)), "Initial value must be float!"
     if isinstance(initial_value, int):
         initial_value = float(initial_value)
@@ -547,7 +565,7 @@ def new_float(size: int = 0, initial_value: float | int | NA = NA(float)) -> lis
 
 
 # noinspection PyShadowingNames
-def new_int(size: int = 0, initial_value: int | NA = NA(int)) -> list[PyneInt]:
+def new_int(size: int | NA = 0, initial_value: int | NA = NA(int)) -> list[PyneInt]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -555,13 +573,13 @@ def new_int(size: int = 0, initial_value: int | NA = NA(int)) -> list[PyneInt]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (int, NA)), "Initial value must be int!"
     return [initial_value] * size
 
 
 # noinspection PyShadowingNames
-def new_string(size: int = 0, initial_value: str | NA = NA(str)) -> list[PyneStr]:
+def new_string(size: int | NA = 0, initial_value: str | NA = NA(str)) -> list[PyneStr]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -569,7 +587,7 @@ def new_string(size: int = 0, initial_value: str | NA = NA(str)) -> list[PyneStr
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    assert size >= 0, "Size must be >=0!"
+    size = _na_size(size)
     assert isinstance(initial_value, (str, NA)), "Initial value must be str!"
     return [initial_value] * size
 

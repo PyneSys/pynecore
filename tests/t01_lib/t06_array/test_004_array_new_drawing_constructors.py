@@ -81,3 +81,25 @@ def __test_new_linefill_with_size__():
     assert len(result) == 4
     for el in result:
         assert isinstance(el, NA)
+
+
+def __test_new_with_na_size_is_empty__():
+    """ A na size (Pine's ``array.new<line>(na)`` idiom) yields an empty array.
+
+    TradingView treats an ``na`` size argument as 0; the bare ``na`` reaches the
+    constructor as an ``NA`` instance, which must not trip the size assertion.
+    """
+    assert array.new_box(NA(Box)) == []
+    assert array.new_line(NA(Line)) == []
+    assert array.new_label(NA(Label)) == []
+    assert array.new_linefill(NA(LineFill)) == []
+    assert array.new(NA(None)) == []
+    assert array.new_int(NA(int)) == []
+    assert array.new_float(NA(float)) == []
+
+
+def __test_new_negative_size_rejected__():
+    """ A genuinely negative size is still rejected. """
+    import pytest
+    with pytest.raises(AssertionError):
+        array.new_line(-1)
