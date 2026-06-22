@@ -2205,6 +2205,16 @@ class SimPosition(PositionBase):
                 # Add to market orders dict
                 self.market_orders[_market_order_key(order)] = order
 
+        # Reversal context for the pre-fill margin reject below. A genuine fresh entry
+        # that cannot be margined at its fill price is rejected outright (TV-verified).
+        # But the new leg of a reversal — an opposite-direction entry processed after a
+        # same-bar close has already flattened the previous position — is NOT rejected:
+        # TV fills it and lets the bar-open margin call trim the over-margin excess to a
+        # viable remainder. Track the bar-start position sign and whether a same-bar close
+        # has filled, so the reject can distinguish the two cases.
+        reversal_pre_sign = self.sign
+        reversal_close_filled = False
+
         # Process Market orders
         for order in list(self.market_orders.values()):
             if order.cancelled:
@@ -2236,9 +2246,16 @@ class SimPosition(PositionBase):
             # TV rejects entry orders BEFORE filling if the position would exceed margin
             if order.order_type == _order_type_entry:
                 if self._entry_exceeds_margin_after_fill(order, fill_price):
-                    self._cancel_same_bar_reversal_closes(order)
-                    self._remove_order(order)
-                    continue
+                    # The reversal's new leg (opposite the bar-start position, with a
+                    # same-bar close already filled) is allowed to fill and is trimmed by
+                    # the bar-open margin call below; only a fresh entry is hard-rejected.
+                    is_reversal_leg = (reversal_close_filled
+                                       and reversal_pre_sign != 0.0
+                                       and order.sign == -reversal_pre_sign)
+                    if not is_reversal_leg:
+                        self._cancel_same_bar_reversal_closes(order)
+                        self._remove_order(order)
+                        continue
 
             # open → high → low → close
             if ohlc:
@@ -2246,6 +2263,11 @@ class SimPosition(PositionBase):
             # open → low → high → close
             else:
                 self.fill_order(order, fill_price, self.l, self.o)
+
+            # A same-bar close that reduced the bar-start position arms the reversal-leg
+            # bypass for a subsequent opposite over-margin entry on this bar.
+            if order.order_type == _order_type_close and reversal_pre_sign != 0.0:
+                reversal_close_filled = True
 
         # Convert tick-based exit prices for entries that just filled this bar
         for order in self.exit_orders.values():
