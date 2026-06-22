@@ -1,7 +1,12 @@
 import logging
+import sys
 from pathlib import Path
 
-import click
+try:
+    import click
+except ImportError:
+    print("You need to install click to run Pyne CLI. Please run `pip install click`.", file=sys.stderr)
+    raise SystemExit(1)
 import typer
 
 from ..app import app, app_state

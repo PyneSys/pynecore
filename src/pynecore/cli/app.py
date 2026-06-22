@@ -6,7 +6,8 @@ from dataclasses import dataclass
 try:
     import typer
 except ImportError:
-    print("You need to install typer to run Pyne CLI. Please run `pip install typer`.", file=sys.stderr)
+    print("You need the Pyne CLI dependencies to run Pyne CLI. "
+          "Please run `pip install pynesys-pynecore[cli]`.", file=sys.stderr)
     raise SystemExit(1)
 
 __all__ = ["app", "app_state"]
