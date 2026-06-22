@@ -11,6 +11,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from pynecore import lib
+from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
 from pynecore.core.broker.models import LegType
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
@@ -51,6 +52,10 @@ class BrokerPosition(PositionBase):
         'max_drawdown', 'max_runup', 'max_equity',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
+        # Per-evaluation set of close keys already seen this script run, so a
+        # second same-key ``strategy.close()`` THIS evaluation nets onto the
+        # first while a next-tick re-issue (calc_on_every_tick) replaces it.
+        '_closes_this_eval',
         # === Risk management state (mirrors SimPosition) ===
         # Configuration set by ``strategy.risk.*`` setters:
         'risk_allowed_direction',
@@ -99,6 +104,11 @@ class BrokerPosition(PositionBase):
         # keys collide on partial-TP fan-out (multiple exits for one entry)
         # and on ``from_entry=na`` fan-out (one exit_id, many per-entry rows).
         self.exit_orders: dict[tuple[str | None, str | None], 'Order'] = {}
+
+        # Close keys (``(exit_id, order_id)``) already issued in the current
+        # script evaluation; reset by :meth:`begin_evaluation`. See
+        # :meth:`_add_order` for the same-eval netting it drives.
+        self._closes_this_eval: set[tuple[str | None, str | None]] = set()
 
         # === Risk management state ===
         # Configuration (filled by the ``strategy.risk.*`` setters via
@@ -169,6 +179,20 @@ class BrokerPosition(PositionBase):
 
     # === Pine-side order book ===
 
+    def begin_evaluation(self) -> None:
+        """Mark the start of a fresh script evaluation (one ``main()`` run).
+
+        Called by the runner before the libraries / ``main`` execute, in broker
+        mode only. It clears the per-evaluation close-key set so that two
+        ``strategy.close()`` calls issued in the SAME evaluation net onto one
+        order, while the SAME close re-issued on the next ``calc_on_every_tick``
+        evaluation replaces the pending order instead of doubling it. There is
+        no other per-evaluation order-book reset in live mode (the Pine order
+        book is purely event-driven), so this is the netting's idempotency
+        anchor.
+        """
+        self._closes_this_eval.clear()
+
     def _add_order(self, order: 'Order') -> None:
         """Register an order locally (the sync engine forwards it to the exchange).
 
@@ -195,7 +219,35 @@ class BrokerPosition(PositionBase):
             if self.size == 0.0 and not self._is_direction_allowed(order.sign):
                 return
         if order.order_type == _order_type_close:
-            self.exit_orders[(order.exit_id, order.order_id)] = order
+            key = (order.exit_id, order.order_id)
+            existing = self.exit_orders.get(key)
+            # Netting is for market closes only (``strategy.close(id)`` /
+            # ``strategy.close_all()``), identified by their reserved exit-id
+            # patterns. A sticky ``strategy.exit`` bracket re-issued in the SAME
+            # evaluation must still REPLACE: summing its size would dispatch an
+            # oversized protective order and the first leg's stale limit/stop/
+            # trailing levels would survive (netting only carries metadata).
+            exit_id = order.exit_id
+            is_market_close = exit_id == CLOSE_ALL_EXIT_ID or (
+                exit_id is not None and exit_id.startswith(CLOSE_EXIT_ID_PREFIX)
+            )
+            if is_market_close and key in self._closes_this_eval and existing is not None:
+                # Second+ same-key close THIS evaluation: net the slices into
+                # one reduce-only market close. Both ``strategy.close`` qty
+                # expressions are evaluated against the same ``position.size``
+                # (no fill lands mid-evaluation), so the slices simply sum; the
+                # over-close cap is applied later by the sync engine. Metadata
+                # is last-wins, matching the prior overwrite behaviour for this
+                # collision class. A NEXT-evaluation re-issue takes the ``else``
+                # branch (``begin_evaluation`` cleared the key) and replaces the
+                # pending order, keeping calc_on_every_tick idempotent.
+                existing.size += order.size
+                existing.reserved_size = abs(existing.size)
+                existing.comment = order.comment
+                existing.alert_message = order.alert_message
+            else:
+                self._closes_this_eval.add(key)
+                self.exit_orders[key] = order
         else:
             self.entry_orders[order.order_id] = order
 

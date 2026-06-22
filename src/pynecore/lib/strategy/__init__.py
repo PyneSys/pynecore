@@ -500,6 +500,15 @@ class PositionBase(ABC):
         self._close_seq_counter += 1
         return self._close_seq_counter
 
+    def begin_evaluation(self) -> None:
+        """Hook fired once per script evaluation; overridden in broker mode.
+
+        :class:`~pynecore.core.broker.position.BrokerPosition` uses it to reset
+        its per-evaluation close-netting scope so two same-bar ``strategy.close``
+        calls net into one live order. The simulator dispatches nothing live and
+        needs no reset, so the base implementation is a no-op.
+        """
+
     # Risk management state shared by Sim and Broker positions. Setters
     # in :mod:`pynecore.lib.strategy.risk` populate the ``risk_max_*`` fields;
     # the ``risk_*`` runtime counters are updated by the concrete subclass.

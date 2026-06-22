@@ -1298,6 +1298,12 @@ class ScriptRunner:
 
             # noinspection PyProtectedMember
             def _run_libs_and_main():
+                # Broker mode only: open a fresh order-evaluation scope before
+                # any strategy.close() runs, so two same-bar closes net into one
+                # order while a calc_on_every_tick re-issue replaces rather than
+                # doubles the pending close (see BrokerPosition.begin_evaluation).
+                if self._order_sync_engine is not None:
+                    position.begin_evaluation()
                 # Advance hidden ``__auto_rate_*`` subprocesses before
                 # libraries/main run so any ``request.currency_rate`` /
                 # ``currency=`` conversion looks up a freshly-written

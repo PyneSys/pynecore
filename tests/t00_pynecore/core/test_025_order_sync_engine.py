@@ -26,7 +26,7 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.position import BrokerPosition
-from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.core.broker.sync_engine import OrderSyncEngine, _SEEN_FILL_IDS_CAP
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     BrokerEvent,
@@ -50,6 +50,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.lib.strategy import (
     Order,
+    Trade,
     _order_type_entry,
     _order_type_close,
     oca as _oca,
@@ -279,17 +280,21 @@ def _sync(engine: OrderSyncEngine, *, bar_ts: int = BAR_TS) -> None:
 
 def _fill_event(side: str, qty: float, price: float, *,
                 pine_id: str, leg: LegType = LegType.ENTRY,
-                xchg_id: str = "xchg-1") -> OrderEvent:
+                xchg_id: str = "xchg-1", fill_id: str | None = None,
+                event_type: str = 'filled', filled_qty: float | None = None,
+                remaining_qty: float = 0.0) -> OrderEvent:
     exch = ExchangeOrder(
         id=xchg_id, symbol=SYMBOL, side=side,
-        order_type=OrderType.MARKET, qty=qty, filled_qty=qty,
-        remaining_qty=0.0, price=None, stop_price=None,
+        order_type=OrderType.MARKET, qty=qty,
+        filled_qty=qty if filled_qty is None else filled_qty,
+        remaining_qty=remaining_qty, price=None, stop_price=None,
         average_fill_price=price, status=OrderStatus.FILLED,
         timestamp=0.0, fee=0.0, fee_currency="",
     )
     return OrderEvent(
-        order=exch, event_type='filled', fill_price=price,
+        order=exch, event_type=event_type, fill_price=price,
         fill_qty=qty, timestamp=0.0, pine_id=pine_id, leg_type=leg,
+        fill_id=fill_id,
     )
 
 
@@ -1175,6 +1180,489 @@ def __test_close_intent_dispatches_execute_close__():
     assert len(b.close_calls) == 1
     assert b.close_calls[0].intent.pine_id == "L"
     assert b.close_calls[0].intent.side == "sell"
+
+
+def _long_trade(entry_id: str, size: float) -> Trade:
+    return Trade(size=size, entry_id=entry_id, entry_bar_index=0,
+                 entry_time=0, entry_price=50_000.0, commission=0.0)
+
+
+def __test_netted_over_close_clamps_to_flat__():
+    """A netted close exceeding the position (70%+70%) clamps to flat, never reverses."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    # BrokerPosition already netted the two 70% slices into one 14-unit close.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -14.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 10.0  # clamped to the 10-unit long, not 14
+
+
+def __test_close_plus_close_all_clamps_total__():
+    """close(id) is honoured first; close_all flattens only the residual exposure."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -3.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -10.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+
+    engine.sync(BAR_TS)
+
+    qty_by_id = {c.intent.pine_id: c.intent.qty for c in b.close_calls}
+    assert qty_by_id == {"L": 3.0, "": 7.0}  # 3 keyed + 7 residual = 10, never 13
+
+
+def __test_single_close_within_exposure_unchanged__():
+    """A close within the position exposure is dispatched untouched by the clamp."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -4.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 4.0
+
+
+def __test_close_clamped_by_per_id_exposure__():
+    """A keyed close is capped by its entry id's open qty, not the whole position."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # Pyramid: L1=6 + L2=4 = 10 net long.
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L1", 6.0), _long_trade("L2", 4.0)]
+    # An oversized close of L1 (8) must clamp to L1's 6-unit exposure.
+    pos.exit_orders[("Close entry(s) order L1", "L1")] = Order(
+        "L1", -8.0, order_type=_order_type_close, exit_id="Close entry(s) order L1",
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 6.0
+
+
+def __test_clamped_away_close_all_is_removed_from_order_book__():
+    """A close_all that clamps to zero is dropped from ``exit_orders``, never re-emitted.
+
+    ``close(id)`` consumes the whole position and a same-evaluation ``close_all``
+    has nothing left to flatten (clamps to zero). The backing close_all order
+    must not survive in ``exit_orders``: otherwise the next sync (position now
+    flat) re-derives it, hits the flat-position passthrough and dispatches a
+    reduce-only close onto an already-flat account.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    # close("L") takes the full 10; close_all has nothing left -> clamps to 0.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -10.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -10.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+
+    engine.sync(BAR_TS)
+
+    # Only the keyed close is dispatched; close_all flattens nothing.
+    qty_by_id = {c.intent.pine_id: c.intent.qty for c in b.close_calls}
+    assert qty_by_id == {"L": 10.0}
+    # The clamped-away close_all order must be gone from the Pine order book.
+    assert ("Close position order", None) not in pos.exit_orders
+    # The keyed close that actually dispatched stays until its fill cleanup.
+    assert ("Close entry(s) order L", "L") in pos.exit_orders
+
+
+def __test_stale_keyed_close_for_flattened_entry_drops_not_redispatches__():
+    """A keyed ``close(id)`` whose entry is gone clamps to zero, never to the residual.
+
+    L1's ``close`` already flattened L1 while L2 remains, so the whole position
+    is NOT flat and the close-fill cleanup never popped the stale close Order.
+    On this sync ``qty_by_entry`` has no ``L1`` key. Capping to the residual
+    (L2's exposure) would re-dispatch the close against an UNRELATED entry — the
+    missing per-id exposure must clamp to zero and drop the backing order.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # L1 was fully closed; only L2=4 remains open.
+    pos.size = 4.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L2", 4.0)]
+    # The stale close("L1") order still sits in exit_orders (no flat cleanup ran).
+    pos.exit_orders[("Close entry(s) order L1", "L1")] = Order(
+        "L1", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L1",
+    )
+
+    engine.sync(BAR_TS)
+
+    # No close dispatched against L2's residual exposure.
+    assert b.close_calls == []
+    # The stale close order is dropped from the Pine order book.
+    assert ("Close entry(s) order L1", "L1") not in pos.exit_orders
+
+
+def __test_keyed_close_flattens_startup_adopted_position__():
+    """A keyed ``close(id)`` flattens a startup-adopted position, never dropped.
+
+    After a restart the real Pine entry id could not be recovered, so adoption
+    seeded the open FIFO under the synthetic ``__adopted_startup__`` parent. The
+    script then signals ``strategy.close("L")``: ``qty_by_entry`` has no ``L``
+    key, but the FIFO is NOT faithful (it carries the synthetic id), so the close
+    must dispatch against the adopted exposure rather than clamp to zero — else
+    the live position can never be flattened by the script (reduce-only backstop
+    guards over-close).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("__adopted_startup__", 5.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+
+    # The close dispatches and flattens the adopted position (capped to 5).
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.pine_id == "L"
+    assert b.close_calls[0].intent.qty == 5.0
+    # The backing close order survives until its fill cleanup (it dispatched).
+    assert ("Close entry(s) order L", "L") in pos.exit_orders
+
+
+def __test_in_flight_close_not_redispatched_after_partial_fill__():
+    """An in-flight market close is NOT re-dispatched when a partial fill shrinks the residual.
+
+    ``strategy.close("L")`` dispatches a 10-unit market close. The broker
+    partially fills 6 (residual 4 still working); ``record_fill`` reduces
+    ``position.size`` to 4 but leaves the backing close ``Order`` in
+    ``exit_orders`` (the natural-close cleanup only runs at ``size == 0``), and
+    the original full-qty ``CloseIntent`` stays in ``_active_intents``. The next
+    sync re-derives the same close at full qty; the clamp caps it to the 4-unit
+    residual, so it differs from the active intent and the diff routes it to the
+    modify branch — where the ``CloseIntent`` -> ``CloseIntent`` guard recognises
+    the irreversible in-flight market close and skips re-dispatch. Routing it
+    through ``_dispatch_modify`` (cancel + re-execute) would otherwise issue a
+    second ``execute_close`` (a market close cannot be cancelled) and double it.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -10.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 10.0
+
+    # Broker partially fills 6; residual 4 still working on the same close.
+    pos.size = 4.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 4.0)]
+
+    engine.sync(BAR_TS + 60_000)
+
+    # No second close: the original is left to settle its residual.
+    assert len(b.close_calls) == 1
+    assert b.cancel_calls == []
+    assert b.modify_exit_calls == []
+
+
+def __test_in_flight_clamped_close_not_redispatched_after_partial_fill__():
+    """A close CLAMPED on its first sync is not re-dispatched after a partial fill.
+
+    ``strategy.close("L", qty=14)`` against a 10-unit long is clamped to 10 on
+    the first sync; the 10-unit close is the intent stored in
+    ``_active_intents``. The backing close ``Order`` still carries the
+    script-declared full ``-14`` (the clamp never rewrites the Pine order book).
+    A partial fill of 6 reduces ``position.size`` to 4, but the natural-close
+    cleanup only runs at ``size == 0`` so the close Order survives. On the next
+    sync ``build_intents`` re-derives the close at the full ``order.size`` (14):
+    emitting that rebuilt intent unchanged would differ from the clamped active
+    slot (qty 10) and route through ``_dispatch_modify`` (cancel + re-execute),
+    doubling the market close. The diff-loop's ``CloseIntent`` -> ``CloseIntent``
+    guard skips re-dispatching the irreversible in-flight close regardless of the
+    first-sync clamp.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    # Pine order book carries the full script-declared 14 (clamp never rewrites it).
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -14.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 10.0  # clamped to the 10-unit long
+
+    # Broker partially fills 6; residual 4 still working on the same close.
+    pos.size = 4.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 4.0)]
+
+    engine.sync(BAR_TS + 60_000)
+
+    # No second close, no modify/cancel: the clamped original settles its residual.
+    assert len(b.close_calls) == 1
+    assert b.cancel_calls == []
+    assert b.modify_exit_calls == []
+
+
+def __test_inflight_smaller_close_reserves_only_working_qty_for_close_all__():
+    """A same-evaluation ``close_all`` still flattens the residual past an in-flight close.
+
+    ``strategy.close("L", qty=5)`` dispatches a 5-unit market close against a
+    10-unit long; it is on the wire (``_active_intents['L']`` holds the 5-unit
+    ``CloseIntent``) but not yet filled. The next evaluation grows the backing
+    keyed close to the full 10 AND adds ``strategy.close_all()``. The diff-loop
+    guard skips re-dispatching the in-flight keyed close (a market close cannot
+    be cancelled / re-dispatched), so the clamp must reserve only the 5 actually
+    working — not the rebuilt 10 — leaving the
+    other 5 as residual for ``close_all`` to flatten. If it reserved the rebuilt
+    10, ``close_all`` would clamp to zero and be dropped, stranding 5 units open.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    # Sync 1: close("L", qty=5) — a 5-unit slice goes on the wire.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.pine_id == "L"
+    assert b.close_calls[0].intent.qty == 5.0
+
+    # Sync 2: no fill yet; script grows close("L") to the full 10 and adds close_all().
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -10.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -10.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    # The keyed close is NOT re-dispatched (still the in-flight 5), and close_all
+    # flattens the remaining 5 — total close coverage equals the 10-unit position.
+    new_close = [c for c in b.close_calls[1:]]
+    qty_by_id = {c.intent.pine_id: c.intent.qty for c in new_close}
+    assert qty_by_id == {"": 5.0}  # only the close_all residual is newly dispatched
+    assert b.cancel_calls == []
+    assert b.modify_exit_calls == []
+    total_active = sum(
+        v.qty for v in engine.active_intents.values() if isinstance(v, CloseIntent)
+    )
+    assert total_active == 10.0  # 5 in-flight keyed + 5 close_all = full position
+
+
+def __test_fully_filled_inflight_keyed_close_drops_stale_order_no_redispatch__():
+    """A fully-filled keyed close on a still-open multi-entry book drops its stale
+    backing order and is never re-dispatched.
+
+    Two entries L1=6 + L2=4 (10 long). ``strategy.close("L1")`` dispatches a
+    6-unit market close; the broker fills all 6, so ``record_fill`` flattens L1
+    (position 10 -> 4) but the whole-position cleanup never runs (L2 keeps the
+    book non-flat), leaving the now-fully-filled ``CloseIntent`` in
+    ``_active_intents`` and its backing ``Order`` in ``exit_orders``. On the next
+    sync the close's working remainder is 0 (``active.qty 6 - filled 6``): the
+    clamp drops the stale backing ``Order``, so the rebuilt close vanishes from
+    the diff and the cancellation pass retires the active slot via a local-only
+    market-close cancel — never a second ``execute_close``.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L1", 6.0), _long_trade("L2", 4.0)]
+    pos.exit_orders[("Close entry(s) order L1", "L1")] = Order(
+        "L1", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L1",
+    )
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.pine_id == "L1"
+    assert b.close_calls[0].intent.qty == 6.0
+    assert "L1" in engine.active_intents
+
+    # Broker FULLY fills the 6-unit keyed close (position 10 -> 4); L2 stays open.
+    full = OrderEvent(
+        order=ExchangeOrder(
+            id="xchg-1", symbol=SYMBOL, side="sell",
+            order_type=OrderType.MARKET, qty=6.0, filled_qty=6.0,
+            remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='filled', fill_price=50_000.0,
+        fill_qty=6.0, timestamp=0.0, pine_id="L1", leg_type=LegType.CLOSE,
+    )
+    engine._route_event(full)
+    assert pos.size == 4.0  # L1 flattened, L2 (4) remains
+
+    # Sync 2: the script still re-derives close("L1") from the stale backing Order.
+    engine.sync(BAR_TS + 60_000)
+
+    # No second close; the stale backing order is gone and the active slot retired.
+    assert len(b.close_calls) == 1
+    assert b.cancel_calls == []
+    assert b.modify_exit_calls == []
+    assert ("Close entry(s) order L1", "L1") not in pos.exit_orders
+    assert "L1" not in engine.active_intents
+
+
+# === Duplicate-fill idempotency gate ===
+
+
+def __test_duplicate_fill_id_applied_once__():
+    """A redelivered fill carrying an already-applied ``fill_id`` is dropped.
+
+    A broker can deliver the same execution twice (poll+stream race,
+    reconnect replay, a cTrader correlated dispatch-response colliding with
+    its uncorrelated push copy). The engine drops the second delivery on its
+    broker-native ``fill_id`` BEFORE ``record_fill`` runs, so the position is
+    not over-applied and the intraday risk counter is not double-counted.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    first = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                        leg=LegType.ENTRY, fill_id="deal-1")
+    engine._route_event(first)
+    assert pos.size == 1.0
+    assert len(pos.open_trades) == 1
+    assert pos.risk_intraday_filled_orders == 1
+
+    # Exact redelivery (same fill_id) — dropped, no mutation.
+    dup = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                      leg=LegType.ENTRY, fill_id="deal-1")
+    engine._route_event(dup)
+    assert pos.size == 1.0
+    assert len(pos.open_trades) == 1
+    assert pos.risk_intraday_filled_orders == 1
+
+
+def __test_distinct_fill_ids_same_order_id_both_apply__():
+    """Two genuine partials of ONE order (shared ``order.id``) both apply.
+
+    ``order.id`` is per-ORDER and shared across an order's partial fills, so
+    it must NOT be the dedupe key. Two slices with distinct broker ``fill_id``
+    values but the same ``order.id`` are both legitimate and must both apply —
+    a naive order-id seen-set would wrongly drop the second partial.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    p1 = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                     leg=LegType.ENTRY, xchg_id="ord-1", fill_id="deal-1",
+                     event_type='partial', filled_qty=1.0, remaining_qty=1.0)
+    p2 = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                     leg=LegType.ENTRY, xchg_id="ord-1", fill_id="deal-2",
+                     event_type='partial', filled_qty=2.0, remaining_qty=0.0)
+    engine._route_event(p1)
+    engine._route_event(p2)
+    assert pos.size == 2.0
+    assert pos.risk_intraday_filled_orders == 2
+
+
+def __test_fill_id_none_applies_every_time__():
+    """``fill_id=None`` is a gate no-op — fills apply exactly as before.
+
+    Cumulative-only reconcile emissions (no broker-native execution id) and
+    the paper-trading simulator leave ``fill_id`` unset; the gate must not
+    silently swallow such fills — those paths guarantee single delivery via
+    their own persisted ``filled_qty`` cursor, not via this gate.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    e1 = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                     leg=LegType.ENTRY, fill_id=None)
+    e2 = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                     leg=LegType.ENTRY, fill_id=None)
+    engine._route_event(e1)
+    engine._route_event(e2)
+    assert pos.size == 2.0
+    assert pos.risk_intraday_filled_orders == 2
+
+
+def __test_malformed_fill_does_not_burn_id_for_corrected_redelivery__():
+    """A malformed first delivery (qty/price <= 0, which record_fill ignores)
+    must not burn its fill_id and block a later corrected redelivery.
+
+    The gate only remembers a fill it will actually apply (mirrors record_fill's
+    qty>0/price>0 gate), so a corrected event carrying the same id still applies.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    # Malformed: zero qty -> record_fill ignores it AND the gate must not
+    # remember the id.
+    malformed = _fill_event("buy", qty=0.0, price=50_000.0, pine_id="L",
+                            leg=LegType.ENTRY, fill_id="deal-1")
+    engine._route_event(malformed)
+    assert pos.size == 0.0
+
+    # Corrected redelivery with the SAME id -> applied (not dropped).
+    corrected = _fill_event("buy", qty=1.0, price=50_000.0, pine_id="L",
+                            leg=LegType.ENTRY, fill_id="deal-1")
+    engine._route_event(corrected)
+    assert pos.size == 1.0
+
+
+def __test_seen_fill_ids_ring_evicts_oldest_at_cap__():
+    """The seen-set is a bounded FIFO ring capped at ``_SEEN_FILL_IDS_CAP``.
+
+    Within the cap a known id is a duplicate; once the cap is exceeded the
+    oldest id is evicted and treated as new again — the documented bound.
+    Duplicates always arrive close behind the original, so an id thousands of
+    fills old can never reappear in practice.
+    """
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+
+    def _ev(fid: str) -> OrderEvent:
+        return _fill_event("buy", qty=1.0, price=1.0, pine_id="L",
+                           leg=LegType.ENTRY, fill_id=fid)
+
+    for i in range(_SEEN_FILL_IDS_CAP):
+        assert engine._is_duplicate_fill(_ev(f"f{i}")) is False
+    # f1 is still in the ring -> duplicate (a True check does not mutate).
+    assert engine._is_duplicate_fill(_ev("f1")) is True
+    # One past the cap -> evicts the oldest (f0).
+    assert engine._is_duplicate_fill(_ev(f"f{_SEEN_FILL_IDS_CAP}")) is False
+    # f0 was evicted -> treated as new again.
+    assert engine._is_duplicate_fill(_ev("f0")) is False
+    # Bounded.
+    assert len(engine._seen_fill_ids) == _SEEN_FILL_IDS_CAP
 
 
 def __test_exit_with_prices_dispatches_execute_exit__():
@@ -5444,3 +5932,66 @@ def __test_drain_connection_failure_preserves_already_released_keys__(tmp_path):
         assert "A\0L" not in engine._envelopes
         assert "A\0L" not in engine._order_mapping
         assert "B\0M" in engine._envelopes  # still owns a live clearing row
+
+
+def __test_partially_filled_inflight_close_reserves_only_working_qty_for_close_all__():
+    """A same-evaluation ``close_all`` covers the full residual past a PARTIALLY filled close.
+
+    ``strategy.close("L", qty=5)`` dispatches a 5-unit market close against a
+    10-unit long; it is on the wire (``_active_intents['L']``). The broker then
+    PARTIALLY fills 3 of those 5: ``record_fill`` drops ``position.size`` to 7 and
+    shrinks ``open_trades`` but never shrinks the active 5-unit ``CloseIntent``.
+    The next evaluation keeps ``close("L")`` and adds ``strategy.close_all()``.
+
+    The diff-loop guard skips re-dispatching the in-flight close (a market close
+    cannot be cancelled / re-dispatched), so the clamp must reserve only the
+    still-WORKING 2 units (``active.qty 5 - filled 3``) — NOT the full active 5.
+    Reserving 5 would double-debit the 3 already filled (``position.size`` is
+    already net of them), leaving ``close_all`` only 2 instead of the 5 it must
+    flatten and stranding 3 units of live exposure. Coverage must equal the
+    7-unit residual: 2 (in-flight working) + 5 (close_all).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    # Sync 1: close("L", qty=5) — a 5-unit slice goes on the wire.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.pine_id == "L"
+    assert b.close_calls[0].intent.qty == 5.0
+
+    # Broker PARTIALLY fills 3 of the 5-unit keyed close (position 10 -> 7),
+    # routed through the real fill path so the engine accumulates the close-fill
+    # ledger and ``record_fill`` shrinks the FIFO.
+    partial = OrderEvent(
+        order=ExchangeOrder(
+            id="xchg-1", symbol=SYMBOL, side="sell",
+            order_type=OrderType.MARKET, qty=5.0, filled_qty=3.0,
+            remaining_qty=2.0, price=None, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.PARTIALLY_FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='partial', fill_price=50_000.0,
+        fill_qty=3.0, timestamp=0.0, pine_id="L", leg_type=LegType.CLOSE,
+    )
+    engine._route_event(partial)
+    assert pos.size == 7.0  # record_fill reduced the position by the 3 filled
+
+    # Sync 2: script keeps close("L") and adds close_all() against the 7 residual.
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -7.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    # The keyed close is NOT re-dispatched (still the in-flight 5); close_all
+    # flattens the full residual minus the 2 still working = 5.
+    new_close = [c for c in b.close_calls[1:]]
+    qty_by_id = {c.intent.pine_id: c.intent.qty for c in new_close}
+    assert qty_by_id == {"": 5.0}  # only the close_all residual is newly dispatched
+    assert b.cancel_calls == []
+    assert b.modify_exit_calls == []

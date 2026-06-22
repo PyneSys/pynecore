@@ -1444,6 +1444,9 @@
     "UTC": {
       "type": "variable"
     },
+    "broker_debug": {
+      "type": "variable"
+    },
     "broker_error": {
       "type": "variable"
     },

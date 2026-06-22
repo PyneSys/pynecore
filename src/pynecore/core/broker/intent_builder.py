@@ -38,13 +38,15 @@ __all__ = [
     'build_entry_intent',
     'build_exit_intent',
     'build_close_intent',
+    'CLOSE_EXIT_ID_PREFIX',
+    'CLOSE_ALL_EXIT_ID',
 ]
 
 # Prefixes set by ``strategy.close`` / ``strategy.close_all`` in
 # ``lib/strategy/__init__.py``. Used to distinguish a CloseIntent from an
 # ExitIntent when both share ``_order_type_close``.
-_CLOSE_EXIT_ID_PREFIX = "Close entry(s) order "
-_CLOSE_ALL_EXIT_ID = "Close position order"
+CLOSE_EXIT_ID_PREFIX = "Close entry(s) order "
+CLOSE_ALL_EXIT_ID = "Close position order"
 
 
 def _side_from_size(size: float) -> str:
@@ -224,9 +226,9 @@ def build_close_intent(order: Order, symbol: str, *, is_close_all: bool) -> Clos
 
 def _classify_exit_side(order: Order) -> str:
     """``'close_all' | 'close' | 'exit'`` — the exit_orders dict is polymorphic."""
-    if order.exit_id == _CLOSE_ALL_EXIT_ID:
+    if order.exit_id == CLOSE_ALL_EXIT_ID:
         return 'close_all'
-    if order.exit_id and order.exit_id.startswith(_CLOSE_EXIT_ID_PREFIX):
+    if order.exit_id and order.exit_id.startswith(CLOSE_EXIT_ID_PREFIX):
         return 'close'
     return 'exit'
 

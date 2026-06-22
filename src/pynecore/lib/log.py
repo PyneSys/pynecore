@@ -17,7 +17,7 @@ except ImportError:
 
 __all__ = (
     'info', 'warning', 'error', 'logger', 'setup_security_file_log',
-    'broker_info', 'broker_warning', 'broker_error', 'ohlcv_info',
+    'broker_debug', 'broker_info', 'broker_warning', 'broker_error', 'ohlcv_info',
     'sim_info',
 )
 
@@ -274,6 +274,16 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
 def _emit_tagged(level: int, prefix: str, message: str, args: tuple) -> None:
     text = prefix + (message % args if args else message)
     logger.log(level, text)
+
+
+def broker_debug(message: str, *args: Any) -> None:
+    """Emit a DEBUG-level broker event (``[BROKER]`` tag).
+
+    For high-frequency or by-design-expected events (e.g. dropping a
+    redelivered duplicate fill) that must stay inspectable without flooding
+    the operator's INFO log.
+    """
+    _emit_tagged(logging.DEBUG, "[BROKER] ", message, args)
 
 
 def broker_info(message: str, *args: Any) -> None:

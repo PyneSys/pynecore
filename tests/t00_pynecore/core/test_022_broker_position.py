@@ -18,6 +18,13 @@ from pynecore.core.broker.models import (
     OrderType,
     LegType,
 )
+from pynecore.lib.strategy import Order, _order_type_close
+
+
+def _close_order(order_id, size, *, exit_id, comment=None, alert_message=None):
+    """Build a Pine close Order as ``strategy.close`` / ``close_all`` would."""
+    return Order(order_id, size, order_type=_order_type_close, exit_id=exit_id,
+                 comment=comment, alert_message=alert_message)
 
 
 @pytest.fixture(autouse=True)
@@ -169,3 +176,92 @@ def __test_record_liquidation_closes_everything__():
     # Liquidated at loss → netprofit negative
     assert p.netprofit == pytest.approx(-10_000.0)
     assert p.losstrades == 1
+
+
+# === Same-bar close netting (live close-dispatch fix) ===
+
+
+def __test_same_eval_closes_net_into_one_order__():
+    """Two same-key ``strategy.close`` calls in one evaluation net into one order.
+
+    The live broker fix replaces the old dict-overwrite (which lost the first
+    slice) with summing: two 3-unit closes of "L" become one 6-unit close that
+    keeps a single bare exit-order key.
+    """
+    p = BrokerPosition()
+    p.begin_evaluation()
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    assert len(p.exit_orders) == 1
+    o = next(iter(p.exit_orders.values()))
+    assert o.size == -6.0
+    assert o.reserved_size == 6.0
+
+
+def __test_next_eval_close_replaces_not_doubles__():
+    """A close re-issued on the next evaluation replaces, never doubles.
+
+    Guards the ``calc_on_every_tick`` case: the same two closes re-firing on the
+    next tick must stay at 6, not accumulate to 12, because ``begin_evaluation``
+    reset the per-evaluation close scope.
+    """
+    p = BrokerPosition()
+    p.begin_evaluation()
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    assert next(iter(p.exit_orders.values())).size == -6.0
+    # Next tick: same two closes re-emit → replaced, not accumulated.
+    p.begin_evaluation()
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    assert len(p.exit_orders) == 1
+    assert next(iter(p.exit_orders.values())).size == -6.0
+
+
+def __test_netted_close_metadata_last_wins__():
+    """Netting keeps the last slice's comment/alert — matches prior overwrite."""
+    p = BrokerPosition()
+    p.begin_evaluation()
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L",
+                              comment="TP1", alert_message="a1"))
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L",
+                              comment="TP2", alert_message="a2"))
+    o = next(iter(p.exit_orders.values()))
+    assert o.size == -6.0
+    assert o.comment == "TP2"
+    assert o.alert_message == "a2"
+
+
+def __test_close_and_close_all_stay_separate__():
+    """close(id) and close_all() use different keys and are not netted together."""
+    p = BrokerPosition()
+    p.begin_evaluation()
+    p._add_order(_close_order("L", -3.0, exit_id="Close entry(s) order L"))
+    p._add_order(_close_order(None, -10.0, exit_id="Close position order"))
+    assert len(p.exit_orders) == 2
+
+
+def __test_same_eval_exit_bracket_replaces_not_nets__():
+    """A re-issued ``strategy.exit`` leg in one evaluation REPLACES, never nets.
+
+    ``strategy.exit`` orders share ``_order_type_close`` with ``strategy.close``
+    but use the bare user exit-id (no ``"Close entry(s) order "`` prefix). Only
+    market closes net; a same-evaluation re-issue of a sticky bracket leg must
+    overwrite so its size stays the leg size and the latest limit/stop levels
+    win instead of the first call's stale levels surviving.
+    """
+    p = BrokerPosition()
+    p.begin_evaluation()
+    first = Order("L", -6.0, order_type=_order_type_close, exit_id="tp",
+                  limit=100.0, stop=90.0)
+    second = Order("L", -6.0, order_type=_order_type_close, exit_id="tp",
+                   limit=105.0, stop=95.0)
+    p._add_order(first)
+    p._add_order(second)
+    assert len(p.exit_orders) == 1
+    o = next(iter(p.exit_orders.values()))
+    # Replaced, not summed: size stays the leg size, not -12.0.
+    assert o.size == -6.0
+    # Latest levels win — the first call's stale 100/90 must not survive.
+    assert o.limit == 105.0
+    assert o.stop == 95.0

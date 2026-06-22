@@ -234,11 +234,32 @@ class OrderEvent:
     Pine-level identity. A single Pine exit intent may become multiple
     exchange orders (e.g. Bybit Partial TP/SL pairs), and only the plugin
     knows the mapping.
+
+    **fill_qty is INCREMENTAL.** It is the quantity of *this* fill event,
+    not a running total. :meth:`BrokerPosition.record_fill` *adds* it to the
+    position (it never diffs against the cumulative ``order.filled_qty``), so
+    a plugin that reported ``fill_qty`` cumulatively across partials would
+    over-apply. The cumulative-on-the-order total lives in
+    :attr:`ExchangeOrder.filled_qty`; the per-event slice lives here.
+
+    **fill_id is the canonical idempotency key.** The sync engine keeps a
+    bounded seen-set keyed on ``fill_id`` and drops a fill whose ``fill_id``
+    it has already applied, as a final defence against a broker delivering
+    the same execution twice (live-push/dispatch-response replay, poll+stream
+    race, reconnect). For this gate to work the invariant is: *the same real
+    broker execution MUST carry the same ``fill_id`` across every path that
+    can surface it.* Use the broker-native execution/deal id whenever one
+    exists. ``fill_id`` may be ``None`` only when the plugin has no
+    broker-native execution id for that path (e.g. a cumulative-only
+    reconcile/bridge emission); in that case the plugin MUST guarantee via
+    its persisted ``filled_qty`` cursor that no other path re-emits the same
+    execution. A ``None`` ``fill_id`` is a no-op for the gate (applied as-is),
+    so it must never be used for a path that a duplicate could also reach.
     """
     order: ExchangeOrder
     event_type: str  # "created" | "filled" | "partial" | "cancelled" | "rejected"
     fill_price: float | None
-    fill_qty: float | None
+    fill_qty: float | None  # INCREMENTAL qty of THIS event (see class docstring)
     timestamp: float
     # Pine-level identity (filled by the plugin, used by sync engine + BrokerPosition)
     pine_id: str | None = None  # Pine order ID (entry id or exit id)
@@ -246,6 +267,10 @@ class OrderEvent:
     leg_type: LegType | None = None  # Which leg of a bracket filled
     fee: float = 0.0
     fee_currency: str = ""
+    # Stable broker-native execution/deal id (see class docstring). Canonical
+    # across every path that can surface the same execution; the sync engine's
+    # duplicate-fill gate keys on it. ``None`` => no-op for the gate.
+    fill_id: str | None = None
 
     def __str__(self) -> str:
         parts = [

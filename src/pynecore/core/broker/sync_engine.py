@@ -29,6 +29,7 @@ import itertools
 import logging
 import queue
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
@@ -53,8 +54,13 @@ from pynecore.core.broker.idempotency import (
     hash_pine_id,
     parse_client_order_id,
 )
-from pynecore.core.broker.intent_builder import build_intents
+from pynecore.core.broker.intent_builder import (
+    build_intents,
+    CLOSE_ALL_EXIT_ID,
+    CLOSE_EXIT_ID_PREFIX,
+)
 from pynecore.lib.log import (
+    broker_debug as _blog_debug,
     broker_info as _blog_info,
     broker_warning as _blog_warning,
     broker_error as _blog_error,
@@ -144,6 +150,19 @@ _T = TypeVar('_T')
 
 Intent = EntryIntent | ExitIntent | CloseIntent
 
+ADOPTED_STARTUP_ENTRY_ID = "__adopted_startup__"
+"""Synthetic FIFO parent-trade id seeded by startup adoption.
+
+When a fresh process restarts over an existing broker position and the real
+Pine parent entry id cannot be recovered (no bracket, or a pyramided
+multi-parent position), :meth:`OrderSyncEngine.reconcile` seeds the adopted
+size under this synthetic id (see :meth:`_recover_adopted_parent_entry_id`).
+The id deliberately does NOT match any real ``strategy.entry`` id, so the
+close-quantity clamp must treat an open FIFO that carries it as untracked
+exposure: a keyed ``strategy.close(id)`` that misses every faithful id must
+still be allowed to flatten the adopted position rather than be dropped.
+"""
+
 CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
 """Default stale-grace window (seconds) for cancel-tentative resolution.
 
@@ -212,6 +231,21 @@ override the value via
 ``BrokerPlugin.defensive_close_resolution_grace_s``. A pending marker
 older than the grace window means the FILL we are waiting on has not
 arrived in time and the engine halts so an operator can investigate.
+"""
+
+
+_SEEN_FILL_IDS_CAP = 8192
+"""Upper bound on the engine's duplicate-fill seen-set (:attr:`OrderSyncEngine._seen_fill_ids`).
+
+A bounded FIFO ring: when the set reaches this many distinct ``fill_id``
+values the oldest is evicted. The cap only needs to exceed the number of
+distinct fills a broker could redeliver within one duplicate-delivery
+window (poll+stream race, reconnect replay) — duplicates always arrive
+close behind the original, so evicting ids thousands of fills old cannot
+cause a missed dedupe in practice. Sized generously (≈8k fills) so the
+ring is effectively unbounded for any realistic single-session fill count
+while still capping memory. In-memory only — cross-restart dedupe is owned
+by the plugins' persisted ``filled_qty`` cursors.
 """
 
 
@@ -393,6 +427,17 @@ class OrderSyncEngine:
         self._pine_bracket_reconstruct_done: bool = False
 
         self._active_intents: dict[str, Intent] = {}
+        # Cumulative fill qty already applied to each in-flight ``CloseIntent``,
+        # keyed by ``CloseIntent.intent_key`` (the bare ``pine_id``). ``record_fill``
+        # reduces ``_position.size`` / ``open_trades`` on a partial close but never
+        # shrinks the active ``CloseIntent.qty``, so the clamp in
+        # :meth:`_clamp_close_intents` cannot tell an unfilled in-flight close
+        # (``working == qty``) from a partially-filled one (``working < qty``) and
+        # would over-reserve the already-filled slice, starving a same-evaluation
+        # ``close_all`` of the true residual. Seeded to ``0.0`` when the close goes
+        # live in :meth:`_dispatch_new` and accumulated on every matching CLOSE-leg
+        # FILL in :meth:`_route_event`.
+        self._active_close_filled_qty: dict[str, float] = {}
         self._order_mapping: dict[str, list[str]] = {}
         self._envelopes: dict[str, DispatchEnvelope] = {}
         self._pending_verification: dict[str, DispatchEnvelope] = {}
@@ -538,6 +583,24 @@ class OrderSyncEngine:
         # polled-orders identity path used by
         # :meth:`_route_defensive_close_fill`.
         self._settled_defensive_close_client_order_ids: set[str] = set()
+
+        # General duplicate-fill gate (superset of the defensive-close caches
+        # above, which only cover synthetic ``__pyne_defensive_close__`` legs).
+        # A bounded FIFO ring of broker-native ``OrderEvent.fill_id`` values
+        # already applied this session; consulted by :meth:`_is_duplicate_fill`
+        # in :meth:`_route_event` BEFORE :meth:`BrokerPosition.record_fill` so a
+        # redelivered ordinary ENTRY/CLOSE/TP/SL fill (poll+stream race,
+        # reconnect replay, a cTrader correlated dispatch-response colliding
+        # with its uncorrelated push copy) cannot double-apply — over-closing,
+        # double-counting P&L/``closed_trades``/risk counters, or (on an ENTRY)
+        # opening a phantom second trade. ``_seen_fill_ids`` is the O(1)
+        # membership set; ``_seen_fill_ids_order`` mirrors insertion order so
+        # the oldest id can be evicted once the set exceeds
+        # :data:`_SEEN_FILL_IDS_CAP`. In-memory only — cross-restart dedupe is
+        # owned by the plugins' persisted ``filled_qty`` cursors (this gate is
+        # defence-in-depth over the plugins' own per-fill dedup).
+        self._seen_fill_ids: set[str] = set()
+        self._seen_fill_ids_order: deque[str] = deque()
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -1259,6 +1322,7 @@ class OrderSyncEngine:
         )
         resolved = [self._resolve_ticks(i) for i in raw]
         final = self._apply_interceptors(resolved)
+        final = self._clamp_close_intents(final)
 
         dispatchable: list[Intent] = []
         new_deferred: dict[str, ExitIntent] = {}
@@ -2297,7 +2361,7 @@ class OrderSyncEngine:
                     # multi-parent position).
                     adopted_entry_id = (
                         self._recover_adopted_parent_entry_id()
-                        or "__adopted_startup__"
+                        or ADOPTED_STARTUP_ENTRY_ID
                     )
                     self._position.reconstruct_parent_trade(
                         entry_id=adopted_entry_id,
@@ -2740,6 +2804,28 @@ class OrderSyncEngine:
                     event.order.id if event.order is not None else None,
                 )
                 return
+            # General duplicate-fill gate. The two guards above only cover
+            # synthetic defensive-close / neutralised-parent identities; an
+            # ordinary ENTRY/CLOSE/TP/SL/TRAILING fill redelivered by the
+            # broker (poll+stream race, reconnect replay, a cTrader correlated
+            # dispatch-response colliding with its uncorrelated push copy)
+            # matches neither and would otherwise reach ``record_fill`` and
+            # double-apply — over-closing, double-counting P&L / closed_trades
+            # / the intraday risk counter, or (on an ENTRY) opening a phantom
+            # second trade. Drop it on a broker-native ``fill_id`` we already
+            # applied this session, before any state mutation. Runs after the
+            # defensive guards so a genuine first delivery of a defensive
+            # close still reaches its dedicated settle branch below.
+            if self._is_duplicate_fill(event):
+                _blog_debug(
+                    "duplicate %s ignored (fill_id=%s, pine=%r, order_id=%s) "
+                    "— already applied this session",
+                    t,
+                    event.fill_id,
+                    event.pine_id,
+                    event.order.id if event.order is not None else None,
+                )
+                return
             # Post-restart settling-close guard. When a defensive close
             # FILL arrives matching a re-armed marker AND
             # :attr:`_position` has no FIFO state to walk, the FILL is
@@ -3081,6 +3167,26 @@ class OrderSyncEngine:
                 for trade in self._position.new_closed_trades[closed_count_before:]
                 if trade.entry_id is not None
             ]
+            # Accumulate the fill against the in-flight ``CloseIntent`` ledger so
+            # :meth:`_clamp_close_intents` reserves only the close's still-working
+            # qty (``active.qty - filled``) rather than its full dispatched qty.
+            # ``record_fill`` has already moved this slice out of
+            # ``_position.size`` / ``open_trades``; without the symmetric ledger
+            # bump a same-evaluation ``close_all`` would be starved of the
+            # already-filled portion and leave live exposure stranded. Mirror
+            # ``record_fill``'s own gate (``fill_qty > 0``) and cap at the active
+            # qty so a duplicated / over-reported FILL cannot drive working below
+            # zero.
+            if event.leg_type == LegType.CLOSE and event.pine_id is not None:
+                active_close = self._active_intents.get(event.pine_id)
+                if isinstance(active_close, CloseIntent):
+                    fill_qty_value = event.fill_qty or 0.0
+                    if fill_qty_value > 0.0:
+                        prev = self._active_close_filled_qty.get(event.pine_id, 0.0)
+                        total = prev + fill_qty_value
+                        if total > active_close.qty:
+                            total = active_close.qty
+                        self._active_close_filled_qty[event.pine_id] = total
             # Persist defensive-close ``partial`` FIFO closures onto the
             # marker. The transient ``_last_fifo_closed_entry_ids`` list is
             # reset at the top of every :meth:`_route_event`, so a
@@ -3421,6 +3527,13 @@ class OrderSyncEngine:
         # ``set.discard`` is O(1) and idempotent — safe to call for
         # every retired key.
         self._recovered_close_anchor_keys.discard(key)
+        # Retire the in-flight-close fill ledger in lockstep: it is seeded to 0.0
+        # in :meth:`_dispatch_new` when a close goes live and read by
+        # :meth:`_clamp_close_intents` to size a same-evaluation ``close_all`` to
+        # the residual. Popping it here (rather than relying on the next
+        # ``_dispatch_new`` reset) keeps lifecycle ownership explicit and prevents
+        # unbounded growth across many distinct close ids.
+        self._active_close_filled_qty.pop(key, None)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 
@@ -4187,6 +4300,46 @@ class OrderSyncEngine:
             if (coid is not None
                     and coid in self._neutralised_parent_entry_coids):
                 return True
+        return False
+
+    def _is_duplicate_fill(self, event: OrderEvent) -> bool:
+        """``True`` if ``event`` is a redelivery of an already-applied fill.
+
+        The general duplicate-fill gate, consulted by :meth:`_route_event`
+        BEFORE :meth:`BrokerPosition.record_fill` (and before the risk
+        counter bumps inside it) so a duplicate cannot double-apply. Keys on
+        the broker-native :attr:`OrderEvent.fill_id` — canonical across every
+        path that can surface the same execution (see :class:`OrderEvent`).
+
+        On a first sighting the id is recorded in the bounded FIFO ring
+        (:attr:`_seen_fill_ids` / :attr:`_seen_fill_ids_order`, capped at
+        :data:`_SEEN_FILL_IDS_CAP`) and ``False`` is returned so the fill is
+        applied. A second sighting returns ``True`` (drop). When
+        ``fill_id`` is ``None`` the gate is a no-op (``False``): the plugin
+        either has no broker-native execution id and guarantees single
+        delivery via its ``filled_qty`` cursor, or the event is a synthetic
+        engine-side fill — in both cases there is no id to dedupe on and the
+        legacy apply-as-is behaviour is preserved.
+
+        Safe without a lock: :meth:`_route_event` is single-consumer (only
+        :meth:`_drain_events` calls it, on the sync thread); producers hand
+        events over through the thread-safe :attr:`_event_queue` only.
+        """
+        fill_id = event.fill_id
+        if fill_id is None:
+            return False
+        if fill_id in self._seen_fill_ids:
+            return True
+        # Only remember a fill we will actually apply. ``record_fill`` silently
+        # ignores a malformed slice (``fill_qty <= 0`` or ``fill_price <= 0``,
+        # position.py); recording such an id here would burn it and drop a
+        # later corrected redelivery carrying the same id. Mirror record_fill's
+        # own gate so the seen-set tracks applied fills only.
+        if (event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0:
+            self._seen_fill_ids.add(fill_id)
+            self._seen_fill_ids_order.append(fill_id)
+            if len(self._seen_fill_ids_order) > _SEEN_FILL_IDS_CAP:
+                self._seen_fill_ids.discard(self._seen_fill_ids_order.popleft())
         return False
 
     def _mark_parent_entry_neutralised(
@@ -6408,13 +6561,209 @@ class OrderSyncEngine:
                 mods['stop'] = result.modified_stop
         return dataclasses.replace(intent, **mods) if mods else intent
 
+    def _clamp_close_intents(self, intents: list[Intent]) -> list[Intent]:
+        """Cap total close quantity to the current exposure before dispatch.
+
+        Two same-key ``strategy.close`` slices already net in
+        :class:`~pynecore.core.broker.position.BrokerPosition`, but
+        ``strategy.close(id)`` + ``strategy.close_all()`` (or an oversized
+        explicit ``qty``) can still ask to close more than the position holds.
+        TradingView never reverses on a close — it flattens at most to zero — so
+        this pass caps the total close quantity to ``abs(position.size)``: keyed
+        ``close(id)`` slices are honoured first (each also capped by that id's
+        open exposure) and ``close_all`` flattens whatever remains. A close that
+        clamps to zero is dropped. Broker reduce-only is a backstop only; the
+        engine itself never emits an over-close.
+
+        Exception: when the open FIFO carries a ``None`` or
+        :data:`ADOPTED_STARTUP_ENTRY_ID` parent (a restart adopted the net size
+        without the real ``strategy.entry`` ids), a keyed ``close(id)`` that
+        matches no known id is capped to the residual rather than clamped away —
+        otherwise the adopted live position could never be flattened by the
+        script. Only a fully faithful FIFO (every open trade under a real id)
+        clamps an unmatched keyed close to zero.
+
+        Scope: this guards SCRIPT-emitted closes (the ``build_intents`` list).
+        Engine-synthesised closes (partial-bracket WATCH triggers, bracket-reject
+        defensive closes) dispatch via :meth:`_dispatch_new` and keep their own
+        broker-snapshot reduce-only protection; they are intentionally not folded
+        into this cap.
+
+        Runs after the interceptors and on the post-drain ``position.size``, so
+        the cap reflects fills already reconciled this sync.
+        """
+        if not any(isinstance(i, CloseIntent) for i in intents):
+            return intents
+
+        remaining = abs(self._position.size)
+        if remaining <= 1e-12:
+            # No locally-known exposure: the engine cannot safely cap, and a
+            # close-when-flat is a reduce-only no-op at the broker. Suppressing
+            # the close here would risk STRANDING a real exchange position the
+            # local view has not yet caught up to (restart / adoption lag), so
+            # let the closes through untouched. Surface it for diagnostics.
+            _log.debug(
+                "close intent present while local position is flat — passing "
+                "through uncapped (reduce-only backstop applies)",
+            )
+            return intents
+        qty_by_entry: dict[str, float] = {}
+        fifo_faithful = True
+        for trade in self._position.open_trades:
+            entry_id = trade.entry_id
+            if entry_id is None:
+                # A ``None`` entry id means the FIFO does NOT faithfully map real
+                # Pine entry ids to exposure (a restart adopted the net size
+                # without the original ``strategy.entry`` ids). A keyed
+                # ``close(id)`` that misses every known id must then NOT be clamped
+                # to zero — it has to flatten the adopted position, not be dropped.
+                fifo_faithful = False
+                continue
+            if entry_id == ADOPTED_STARTUP_ENTRY_ID:
+                # The synthetic startup-adoption parent id is likewise not a real
+                # Pine entry id — same FIFO-unfaithful reasoning as ``None``.
+                fifo_faithful = False
+            # PyCharm does not narrow ``entry_id`` to ``str`` after the ``is None``
+            # continue above (a slot-attribute narrowing quirk on ``Trade.entry_id``);
+            # basedpyright narrows it correctly and reports this line clean.
+            # noinspection PyTypeChecker
+            qty_by_entry[entry_id] = qty_by_entry.get(entry_id, 0.0) + abs(trade.size)
+
+        # ``capped`` is keyed by the intent's list index (unambiguous and easy to
+        # audit) — never by value, since two close intents can compare equal.
+        capped: dict[int, float] = {}
+        # Keyed strategy.close(id) first: each capped by that id's open exposure
+        # and by the running residual, so they keep their slice before close_all.
+        for idx, intent in enumerate(intents):
+            if not isinstance(intent, CloseIntent) or not intent.pine_id:
+                continue
+            active_close = self._active_intents.get(intent.pine_id)
+            if isinstance(active_close, CloseIntent):
+                # This keyed close is already on the wire. The diff loop skips
+                # re-dispatching an in-flight market close (it is irreversible —
+                # see the CloseIntent->CloseIntent guard in ``_diff_and_dispatch``),
+                # so this keyed close will NOT go out again. The capping must
+                # therefore reserve only what is still WORKING at the broker — NOT
+                # the rebuilt ``intent.qty`` (which can be larger when the script
+                # grew the close, e.g. an in-flight ``close("L", qty=5)`` replaced
+                # by ``close("L")`` + ``close_all()``) — so a same-evaluation
+                # ``close_all`` sees the true residual and covers it. Debiting the
+                # full rebuilt qty would starve ``close_all`` of the residual and
+                # clamp it to zero, leaving live exposure uncovered.
+                #
+                # A PARTIAL fill of the active close shrinks its still-working qty
+                # but neither ``record_fill`` nor the diff loop shrinks
+                # ``active_close.qty``. ``_position.size`` (``remaining``) is ALREADY
+                # net of that fill, so reserving the full ``active_close.qty`` here
+                # double-debits the filled slice and again starves ``close_all``:
+                # e.g. ``close("L", qty=5)`` with 3 filled leaves the position at 7
+                # but the close working only 2 — reserving 5 leaves ``close_all``
+                # just 2 instead of the 5 it must flatten. Reserve the working
+                # remainder ``active_close.qty - filled`` (tracked in
+                # ``_active_close_filled_qty``), still capped by ``remaining``.
+                filled = self._active_close_filled_qty.get(intent.pine_id, 0.0)
+                working = active_close.qty - filled
+                if working > remaining:
+                    working = remaining
+                if working < 0.0:
+                    working = 0.0
+                capped[idx] = working
+                remaining -= working
+                continue
+            per_id = qty_by_entry.get(intent.pine_id)
+            if per_id is None:
+                if fifo_faithful:
+                    # The keyed entry has no open exposure while the FIFO faithfully
+                    # tracks real ids: its ``close(id)`` has already flattened that
+                    # entry while OTHER entries remain (so the whole-position flat
+                    # cleanup never ran and the stale close Order still sits in
+                    # ``exit_orders``). Capping to ``remaining`` here would
+                    # re-dispatch the close against the unrelated residual exposure.
+                    # Clamp to zero so the drop loop below removes the backing close.
+                    cap = 0.0
+                else:
+                    # Startup-adopted (synthetic / unmapped) exposure: the missing
+                    # id does not mean the entry was already flattened — the real
+                    # ids were never recovered. Cap to the residual so the close can
+                    # actually flatten the adopted position; broker reduce-only is
+                    # the backstop against any over-close.
+                    cap = remaining
+            else:
+                cap = remaining if remaining < per_id else per_id
+            qty = intent.qty if intent.qty < cap else cap
+            if qty < 0.0:
+                qty = 0.0
+            capped[idx] = qty
+            remaining -= qty
+        # close_all (empty pine_id) flattens the residual exposure.
+        for idx, intent in enumerate(intents):
+            if not isinstance(intent, CloseIntent) or intent.pine_id:
+                continue
+            qty = intent.qty if intent.qty < remaining else remaining
+            if qty < 0.0:
+                qty = 0.0
+            capped[idx] = qty
+            remaining -= qty
+
+        out: list[Intent] = []
+        for idx, intent in enumerate(intents):
+            if isinstance(intent, CloseIntent):
+                qty = capped.get(idx, intent.qty)
+                if qty <= 1e-12:
+                    # The whole close clamped away — either ``close(id)`` consumed
+                    # the position and a same-evaluation ``close_all`` has nothing
+                    # left to flatten, or an in-flight keyed close has FULLY filled
+                    # (working == 0) while other entries keep the position
+                    # non-flat. Dropping it from the intent list is not enough:
+                    # the backing ``Order`` still sits in ``_position.exit_orders``,
+                    # so the next ``sync`` re-derives the same ``CloseIntent`` from
+                    # it, hits the flat-position passthrough above and dispatches a
+                    # reduce-only close onto an already-flat account (rejected /
+                    # retried by some plugins). Remove the backing order so it is
+                    # not re-emitted; the diff loop's cancellation pass then retires
+                    # any active slot whose key has vanished from the rebuilt intent
+                    # list — and a market-close cancel is a local no-op (see
+                    # :meth:`_dispatch_cancel`), so this never sends a second close.
+                    self._drop_close_order_for_intent(intent)
+                    continue
+                if qty != intent.qty:
+                    intent = dataclasses.replace(intent, qty=qty)
+            out.append(intent)
+        return out
+
+    def _drop_close_order_for_intent(self, intent: CloseIntent) -> None:
+        """Delete the Pine-side close :class:`Order` backing a clamped-away close.
+
+        ``CloseIntent`` carries only ``pine_id`` while
+        :attr:`BrokerPosition.exit_orders` is keyed by the composite
+        ``(exit_id, order_id)``. ``build_intents`` derives a close's ``pine_id``
+        as ``""`` for ``strategy.close_all`` (``exit_id == 'Close position
+        order'``) and ``order_id`` for ``strategy.close(id)`` (``exit_id``
+        prefixed with ``'Close entry(s) order '``), so invert that mapping to
+        find and drop every matching close order. Only close / close_all orders
+        are touched — persistent ``strategy.exit`` brackets never produce a
+        ``CloseIntent`` and are left intact.
+        """
+        exit_orders = self._position.exit_orders
+        for ex_key in list(exit_orders.keys()):
+            order = exit_orders[ex_key]
+            exit_id = order.exit_id
+            if exit_id == CLOSE_ALL_EXIT_ID:
+                order_pine_id = ""
+            elif exit_id and exit_id.startswith(CLOSE_EXIT_ID_PREFIX):
+                order_pine_id = order.order_id or ""
+            else:
+                continue
+            if order_pine_id == intent.pine_id:
+                exit_orders.pop(ex_key, None)
+
     # === Restart-time Pine-side bracket reconstruction ===
 
     def _recover_adopted_parent_entry_id(self) -> str | None:
         """Recover the single real Pine parent entry id for a startup adoption.
 
         When startup adoption seeds the FIFO parent trade for a position opened
-        in a prior process, the synthetic ``__adopted_startup__`` id breaks any
+        in a prior process, the synthetic :data:`ADOPTED_STARTUP_ENTRY_ID` breaks any
         later ``strategy.exit(..., from_entry='L')`` that targets the real entry:
         the Pine helper (:func:`~pynecore.lib.strategy.exit`) resolves
         ``from_entry`` by scanning ``entry_orders`` then ``open_trades`` for a
@@ -7808,6 +8157,42 @@ class OrderSyncEngine:
                     # would send a second flatten that races the synthetic
                     # defensive close on the wire.
                     continue
+                active_intent = self._active_intents[key]
+                if (isinstance(intent, CloseIntent)
+                        and isinstance(active_intent, CloseIntent)):
+                    # A script close already on the wire is an irreversible
+                    # market order. ``_dispatch_modify``'s ``CloseIntent`` branch
+                    # is cancel + re-execute, but a market close cannot be
+                    # cancelled (``_dispatch_cancel_strict`` no-ops it), so
+                    # re-executing would issue a SECOND ``execute_close`` and
+                    # double-flatten. ``build_intents`` re-derives the full
+                    # ``order.size`` qty every sync (``record_fill`` shrinks
+                    # ``position.size`` but never the backing close ``Order``),
+                    # so a qty difference vs the active slot is an artifact of
+                    # in-flight blindness, not a genuine script change — and there
+                    # is nothing to modify on an executed/filling market close.
+                    # Leave the active slot intact: its FILL settles the position
+                    # (natural-close cleanup pops the slot), or the next sync's
+                    # cancellation diff retires it once the backing order is gone
+                    # (see ``_clamp_close_intents``' working == 0 drop). This
+                    # generalises the synthetic defensive-close guards above to
+                    # script-emitted closes — the layer that already owns the
+                    # "never re-dispatch an in-flight irreversible close" invariant.
+                    if (active_intent.side != intent.side
+                            or active_intent.symbol != intent.symbol):
+                        # A side/symbol change while the prior reduce-only market
+                        # close is still live signals incoherent local state.
+                        # Still skip the re-dispatch (never double-close), but
+                        # surface it for diagnosis.
+                        _blog_warning(
+                            "in-flight close %s differs in side/symbol from the "
+                            "re-emitted close (active=%s/%s new=%s/%s) — skipping "
+                            "re-dispatch of the irreversible market close; local "
+                            "state may be incoherent",
+                            format_intent_key(key), active_intent.side,
+                            active_intent.symbol, intent.side, intent.symbol,
+                        )
+                    continue
                 try:
                     self._dispatch_modify(self._active_intents[key], intent)
                 except OrderSkippedByPlugin as e:
@@ -8490,6 +8875,10 @@ class OrderSyncEngine:
                 else:
                     order = self._run_async_write(self._broker.execute_close(envelope))
                     self._order_mapping[intent.intent_key] = [order.id]
+                # This close is now live on the wire — reset its cumulative-fill
+                # ledger so a stale value from an earlier close cycle on the same
+                # ``pine_id`` cannot make the clamp under-reserve the fresh close.
+                self._active_close_filled_qty[intent.intent_key] = 0.0
             # The dispatch reached the broker. If this envelope carries a
             # reject bump (retry_seq > 0) it was NOT journaled at build time —
             # persist it now so the live order's bumped COID survives a restart.
