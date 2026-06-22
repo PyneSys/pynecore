@@ -33,6 +33,16 @@ import ast
 from typing import Set, Dict, List, Optional, cast, Any
 
 
+def _is_persistent_annotation(annotation: ast.AST) -> bool:
+    """Check if annotation is Persistent[T] or just Persistent."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id == 'Persistent'
+    elif isinstance(annotation, ast.Subscript):
+        if isinstance(annotation.value, ast.Name):
+            return annotation.value.id == 'Persistent'
+    return False
+
+
 class ClosureArgumentsTransformer(ast.NodeTransformer):
     """Transform closure variables in inner functions to function arguments."""
 
@@ -51,6 +61,8 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
         self.closure_vars: Dict[str, Set[str]] = {}
         # Track type annotations for closure variables
         self.closure_var_types: Dict[str, ast.AST] = {}
+        # ``scope.var`` keys declared Persistent (a PersistentSeries is both)
+        self.persistent_vars: Set[str] = set()
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         # First pass: collect all function definitions and their closure variables
@@ -59,9 +71,37 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
         self.scope_variables = collector.scope_variables
         self.closure_vars = collector.closure_vars
         self.closure_var_types = collector.closure_var_types
+        self.persistent_vars = collector.persistent_vars
+
+        # A plain-Series free variable (a parent-scope ``s: Series`` or a
+        # builtin price series anchored in main by LibrarySeriesTransformer) is
+        # resolved through the scope chain — the SeriesTransformer rewrites its
+        # reads to the parent's state slot, reached via the parent state param
+        # captured as a Python closure. Value-passing it as an argument instead
+        # would give the inner function its own per-call history buffer
+        # (advancing once per call, not once per bar), so a function invoked a
+        # bar-varying number of times reads the wrong history (issue #67). Drop
+        # them here so neither the parameter list nor the call sites thread them.
+        self._drop_series_closures()
 
         # Second pass: transform the functions
         return cast(ast.Module, self.generic_visit(node))
+
+    def _drop_series_closures(self) -> None:
+        """Remove plain-Series closure variables — they resolve through the
+        scope chain, not through argument passing.
+
+        A PersistentSeries is left threaded: its Series slot in the parent is
+        pruned by the UnusedSeriesDetector (the only history read sits in the
+        inner function), so the scope-chain path has no slot to reach and the
+        value argument is what carries the per-bar history into the call."""
+        for scope_key, closure_vars in self.closure_vars.items():
+            parent_scope = scope_key.rsplit('.', 1)[0]
+            kept = {var for var in closure_vars
+                    if f"{parent_scope}.{var}" in self.persistent_vars
+                    or not self._is_series_annotation(
+                        self.closure_var_types.get(f"{parent_scope}.{var}"))}
+            closure_vars.intersection_update(kept)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         # Check if this is the main function with required decorators
@@ -102,7 +142,7 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
                     annotation = self.closure_var_types.get(var_key, None)
 
                     # If annotation is Persistent[T], extract the inner type T
-                    if annotation and self._is_persistent_annotation(annotation):
+                    if annotation and _is_persistent_annotation(annotation):
                         annotation = self._extract_inner_type(annotation)
 
                     # Add closure vars at the beginning with processed annotation
@@ -211,14 +251,12 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
         return 'main.' + func_name
 
     @staticmethod
-    def _is_persistent_annotation(annotation: ast.AST) -> bool:
-        """Check if annotation is Persistent[T] or just Persistent."""
-        if isinstance(annotation, ast.Name):
-            return annotation.id == 'Persistent'
-        elif isinstance(annotation, ast.Subscript):
-            if isinstance(annotation.value, ast.Name):
-                return annotation.value.id == 'Persistent'
-        return False
+    def _is_series_annotation(annotation: ast.AST | None) -> bool:
+        """Check if annotation is Series or Series[T]."""
+        if isinstance(annotation, ast.Subscript):
+            return (isinstance(annotation.value, ast.Name)
+                    and annotation.value.id == 'Series')
+        return isinstance(annotation, ast.Name) and annotation.id == 'Series'
 
     @staticmethod
     def _extract_inner_type(annotation: ast.AST) -> Optional[ast.AST]:
@@ -248,6 +286,11 @@ class ClosureVariableCollector(ast.NodeVisitor):
         self.closure_vars: Dict[str, Set[str]] = {}
         # Type annotations for closure variables
         self.closure_var_types: Dict[str, ast.AST] = {}
+        # ``scope.var`` keys declared with a Persistent annotation. A
+        # PersistentSeries splits into a Persistent + a Series declaration (see
+        # PersistentSeriesTransformer), so such a var carries BOTH annotations;
+        # this set distinguishes it from a plain Series.
+        self.persistent_vars: Set[str] = set()
         # Track if we're in the main function
         self.in_main_function = False
 
@@ -332,6 +375,8 @@ class ClosureVariableCollector(ast.NodeVisitor):
             # Store type annotation for potential closure variable
             var_key = f"{scope_key}.{var_name}"
             self.closure_var_types[var_key] = node.annotation
+            if _is_persistent_annotation(node.annotation):
+                self.persistent_vars.add(var_key)
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
