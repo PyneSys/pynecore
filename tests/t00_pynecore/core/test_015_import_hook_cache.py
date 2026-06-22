@@ -66,6 +66,22 @@ def __test_foreign_pyc_is_retransformed__(tmp_path):
     assert _is_current_transform(code)
 
 
+def __test_single_line_pyne_marker_is_transformed__(tmp_path):
+    """A single-line ``\"\"\"@pyne\"\"\"`` docstring still triggers the transform pipeline"""
+    # The closing quote follows @pyne immediately, with no whitespace, so the fast
+    # prefilter must accept a quote (not only whitespace / end-of-input) as the token
+    # terminator. This is the form used throughout the docs and tests; getting it wrong
+    # skipped the transform and surfaced as ``TypeError: 'module' object is not callable``.
+    mod = tmp_path / "single_line_mod.py"
+    mod.write_text('"""@pyne"""\nx = 1\n')
+
+    loader = PyneLoader("single_line_mod", str(mod))
+    code = loader.source_to_code(mod.read_bytes(), str(mod))
+
+    # The sentinel is baked in only when the transform pipeline actually runs.
+    assert _is_current_transform(code)
+
+
 def __test_current_pyc_is_kept__(tmp_path):
     """Bytecode carrying the current pipeline sentinel is reused, not recompiled"""
     mod = tmp_path / "current_mod.py"

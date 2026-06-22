@@ -149,11 +149,14 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         path: Path = Path(path)
 
         # Fast prefilter: require @pyne as a standalone token, not just any substring.
-        # Compiled Pyne code always has it as the first non-whitespace content of
-        # the module docstring, e.g. `"""\n@pyne\n…"""`. A loose check would AST-transform
-        # ordinary modules that merely *mention* @pyne in a docstring (e.g. standalone.py).
+        # Compiled Pyne code always has it as the first non-whitespace content of the
+        # module docstring, either multi-line (`"""\n@pyne\n…"""`) or single-line
+        # (`"""@pyne"""`); the latter puts the closing quote right after the token, so a
+        # quote must terminate the match alongside whitespace / end-of-input. A loose
+        # check would AST-transform ordinary modules that merely *mention* @pyne in a
+        # docstring (e.g. standalone.py); the strict docstring check below still gates it.
         data_str = data.decode('utf-8') if isinstance(data, bytes) else data
-        if not re.search(r'@pyne(\s|$)', data_str):
+        if not re.search(r'@pyne(\s|["\']|$)', data_str):
             return compile(data, path, 'exec', optimize=_optimize)
 
         import ast
