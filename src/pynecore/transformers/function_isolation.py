@@ -58,7 +58,8 @@ import importlib
 import types
 
 from ..core.pine_export import Exported
-from ..utils.stdlib_checker import stdlib_checker
+from ..utils.stdlib_checker import is_stdlib
+# noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
 __all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS']
@@ -356,11 +357,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
 
         entry = self.index.import_map.get(base)
         if entry is not None:
-            try:
-                is_stdlib = stdlib_checker.is_stdlib(entry[0].split('.')[0])
-            except Exception:  # noqa: BLE001 - e.g. dynamic modules without __spec__
-                is_stdlib = False
-            if is_stdlib:
+            if is_stdlib(entry[0]):
                 return _SKIP
             obj = self._resolve_imported(path, parts)
             return self._classify_object(obj) if obj is not None else _UNIFORM
@@ -419,7 +416,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                     if not isinstance(obj, types.ModuleType):
                         raise
                     obj = importlib.import_module(f'{obj.__name__}.{name}')
-        except Exception:  # noqa: BLE001 - any resolution failure means "unprovable"
+        except Exception:  # noqa: any resolution failure means "unprovable"
             obj = None
         self._resolve_cache[path] = obj
         return obj
