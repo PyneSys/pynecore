@@ -25,10 +25,13 @@ _CHART_STEP = 300
 _LTF_STEP = 60
 _LTF_FIRST = _TS0 + 1500  # == chart bar 5 open
 
-# Analytic expectation, identical for the optimised (prefix-skip) and the
+# Each chart bar returns the intrabars of its OWN period ``[T, T+tf)`` (matching
+# TradingView): chart bar 5 collects LTF j=0..4, bar 6 j=5..9, and so on, so all
+# 25 LTF bars distribute 5-per-bar across chart bars 5..9 (closes 1..5 -> sum 15,
+# 6..10 -> 40, ...). Identical for the optimised (prefix-skip) and the
 # unoptimised (every-bar-signal) path — see __test_ltf_prefix_skip__ below.
-_EXPECTED_SIZE = [0, 0, 0, 0, 0, 1, 5, 5, 5, 5]
-_EXPECTED_SUM = [None, None, None, None, None, 1, 20, 45, 70, 95]
+_EXPECTED_SIZE = [0, 0, 0, 0, 0, 5, 5, 5, 5, 5]
+_EXPECTED_SUM = [None, None, None, None, None, 15, 40, 65, 90, 115]
 
 
 def _build_ltf_file(tmp_path):
@@ -156,9 +159,13 @@ def __test_ltf_prefix_skip__(runner, monkeypatch, log):
     arrays without a cross-process handshake; the boundary bar and the bars
     after it carry the correct intrabar counts and close sums.
 
-    Run 2 (unoptimised): with ``load_ltf_first_ms`` neutralised the chart
-    signals every bar (the original behaviour). Asserting both runs against the
-    same analytic table proves the prefix-skip changes no output.
+    Run 2 (unoptimised): ``load_ltf_first_ms`` is overridden to record a first
+    open at/before chart bar 0, so no bar falls in the idle prefix and every
+    chart bar does the full signal+wait handshake (the idle bars simply collect
+    an empty intrabar array). The file-backed period-end target is unchanged, so
+    asserting both runs against the same analytic table proves the prefix-skip
+    changes no output. (Setting it to ``None`` would instead select the live
+    chart-open target — a different mode, covered by Phase 3 — not a skip toggle.)
 
     Both runs share one ``runner`` fixture (its ``del sys.modules`` runs once);
     the stem module is dropped between runs so ``import_script`` re-imports a
@@ -176,8 +183,13 @@ def __test_ltf_prefix_skip__(runner, monkeypatch, log):
     # pytest's dotted module key; import_script caches under the file stem).
     sys.modules.pop(Path(__file__).stem, None)
 
-    # Run 2 — optimisation neutralised (every chart bar signals, as before).
-    # Both runs matching the same analytic table is the equivalence proof.
-    monkeypatch.setattr(sec_mod, "load_ltf_first_ms", lambda state, path: None)
+    # Run 2 — prefix-skip neutralised (every chart bar signals). Record a first
+    # open at/before chart bar 0 so no bar is in the idle prefix; the file-backed
+    # period-end target is kept, so the table is unchanged. Both runs matching it
+    # is the equivalence proof.
+    def _force_no_skip(state, _path):
+        state.ltf_first_ms = _TS0 * 1000
+
+    monkeypatch.setattr(sec_mod, "load_ltf_first_ms", _force_no_skip)
     unoptimised = _run_collect(runner)
     _assert_matches_expected(unoptimised, log)
