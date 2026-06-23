@@ -92,16 +92,17 @@ class SecurityState:
     is_ltf: bool = False
 
     # LTF prefix-skip (chart-side, backtest/file-backed only). The LTF child's
-    # ``.ohlcv`` feed first bar open, in ms. Chart bars whose open is strictly
-    # before this can never contain an intrabar: the child includes intrabars
-    # with ``bar_open <= target_time`` and ``target_time`` is the chart bar's own
-    # open, so a chart open below the feed's first open yields an empty array
-    # unconditionally (TradingView returns ``na`` before the LTF series begins).
-    # ``__sec_signal__`` then skips the per-bar signal+wait handshake for that
-    # idle prefix and ``__sec_read__`` returns the empty-array default without
-    # touching shared memory. ``None`` disables the optimization, restoring the
-    # original per-chart-bar signal. Populated by ``load_ltf_first_ms`` at child
-    # spawn.
+    # ``.ohlcv`` feed first bar open, in ms. The child includes intrabars with
+    # ``bar_open <= target_time`` and the historical target is the chart bar's
+    # last ms (``chart_off``), so a chart bar contains an intrabar only when its
+    # period end reaches the feed (``target_time >= ltf_first_ms``). A chart bar
+    # whose whole period ends before the feed's first open therefore yields an
+    # empty array unconditionally (TradingView returns ``na`` before the LTF
+    # series begins). ``__sec_signal__`` then skips the per-bar signal+wait
+    # handshake for that idle prefix and ``__sec_read__`` returns the empty-array
+    # default without touching shared memory. ``None`` disables the optimization,
+    # restoring the original per-chart-bar signal. Populated by
+    # ``load_ltf_first_ms`` at child spawn.
     ltf_first_ms: int | None = None
 
     # Intraday session anchoring (chart-side). Populated by
@@ -310,13 +311,22 @@ def create_chart_protocol(
         chart_time = lib._time
 
         if state.is_ltf:
-            # Prefix skip: a chart bar opening strictly before the LTF feed's
-            # first bar cannot contain an intrabar (the child includes intrabars
-            # with ``open <= target_time = chart_time``), so the read is an empty
-            # array. Skip the cross-process signal+wait entirely — ``__sec_read__``
-            # returns the empty-array default. Disabled (``ltf_first_ms is None``)
-            # for live streams, which keep signalling every bar.
-            if state.ltf_first_ms is not None and chart_time < state.ltf_first_ms:
+            # Historical/file-backed LTF: the child includes intrabars with
+            # ``bar_open <= target_time``. Target the chart bar's last ms
+            # (``chart_off`` == span-1 for intraday/seconds charts) so the child
+            # returns the bar's OWN period ``[T, T+tf)`` — matching TradingView.
+            # Adjacent bars tile with no gap or overlap (the prior bar targeted
+            # ``T-1``). For live streams (``ltf_first_ms is None``) read-ahead is
+            # impossible, so keep targeting the chart open (Phase 3).
+            ltf_target_time = (chart_time + state.chart_off
+                               if state.ltf_first_ms is not None else chart_time)
+            # Prefix skip: a chart bar whose whole period ends before the LTF
+            # feed's first bar (``target_time < ltf_first_ms``) cannot contain an
+            # intrabar, so the read is an empty array. Skip the cross-process
+            # signal+wait entirely — ``__sec_read__`` returns the empty-array
+            # default. Disabled (``ltf_first_ms is None``) for live streams,
+            # which keep signalling every bar.
+            if state.ltf_first_ms is not None and ltf_target_time < state.ltf_first_ms:
                 state.ltf_skip = True
                 state.new_period = True
                 state.needs_wait = False
@@ -325,7 +335,7 @@ def create_chart_protocol(
                 # LTF: every chart bar needs intrabar data — always signal
                 state.new_period = True
                 state.data_ready.clear()
-                sync_block.set_target_time(sec_id, chart_time)
+                sync_block.set_target_time(sec_id, ltf_target_time)
                 state.advance_event.set()
                 state.needs_wait = True
         else:
@@ -624,15 +634,16 @@ def load_ltf_first_ms(state: SecurityState, data_path: str) -> None:
 
     ``request.security_lower_tf()`` makes the chart block on a cross-process
     handshake for *every* chart bar, because any chart bar may contain
-    intrabars. Chart bars whose open precedes the feed's very first bar never
-    can: the child includes intrabars with ``bar_open <= target_time`` and
-    ``target_time`` is the chart bar's own open, so a chart open strictly below
-    the feed's first open yields an empty intrabar array unconditionally —
-    matching TradingView, which returns ``na`` before the lower-timeframe series
-    begins. Recording that first open lets ``__sec_signal__`` skip the signal+
-    wait over the idle prefix and ``__sec_read__`` return the empty-array default
-    without touching shared memory. ``ltf_first_ms`` stays ``None`` (optimization
-    disabled) when the feed has no first bar. No-op for non-LTF contexts.
+    intrabars. Chart bars whose whole period ends before the feed's very first
+    bar never can: the child includes intrabars with ``bar_open <= target_time``
+    and the historical target is the chart bar's last ms, so a chart bar whose
+    period ends strictly below the feed's first open yields an empty intrabar
+    array unconditionally — matching TradingView, which returns ``na`` before the
+    lower-timeframe series begins. Recording that first open lets
+    ``__sec_signal__`` skip the signal+wait over the idle prefix and
+    ``__sec_read__`` return the empty-array default without touching shared
+    memory. ``ltf_first_ms`` stays ``None`` (optimization disabled) when the feed
+    has no first bar. No-op for non-LTF contexts.
 
     :param state: LTF security context state.
     :param data_path: Path to the child's OHLCV data file.
