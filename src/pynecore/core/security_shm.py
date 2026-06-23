@@ -228,7 +228,17 @@ class ResultBlock:
             new_version = self._version + 1
             new_name = _result_block_name(self._sec_id, new_version)
 
-            new_shm = SharedMemory(name=new_name, create=True, size=new_size)
+            try:
+                new_shm = SharedMemory(name=new_name, create=True, size=new_size)
+            except FileExistsError:
+                # A segment of this exact name leaked from an earlier run that
+                # was killed before cleanup (the name is deterministic per
+                # sec_id+version). Drop the stale block and recreate, mirroring
+                # the initial-allocation path above.
+                stale = SharedMemory(name=new_name, create=False)
+                stale.close()
+                stale.unlink()
+                new_shm = SharedMemory(name=new_name, create=True, size=new_size)
             new_buf = new_shm.buf
             assert new_buf is not None
             new_buf[:len(data)] = data
