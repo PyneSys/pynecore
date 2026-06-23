@@ -19,7 +19,8 @@ from pynecore.core.overload import overload
 from ..core import safe_convert
 
 # We need to use this kind of import to make transformer work
-from pynecore.lib import open, high, low, close, volume, hl2, bar_index, array, session, math as lib_math
+from pynecore.lib import (open, high, low, close, volume, hl2, bar_index, array, session,
+                          max_bars_back, math as lib_math)
 
 TFIB = TypeVar('TFIB', float, int, bool)
 TFI = TypeVar('TFI', float, int)
@@ -1121,9 +1122,13 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     :return: The percentile of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
+    length = int(length)
+    # The final slice reads ``length`` candles of history; grow the source
+    # buffer to fit it (the per-series default may be smaller). Done before the
+    # warmup guard so the oldest candles are kept from the first bar on.
+    max_bars_back(source, length)
     if isinstance(source, NA):
         return NA(float)
-    length = int(length)
 
     if bar_index < length - 1:
         return NA(float)
@@ -1142,9 +1147,13 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     :return: The percentile of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
+    length = int(length)
+    # The final slice reads ``length`` candles of history; grow the source
+    # buffer to fit it (the per-series default may be smaller). Done before the
+    # warmup guard so the oldest candles are kept from the first bar on.
+    max_bars_back(source, length)
     if isinstance(source, NA):
         return NA(float)
-    length = int(length)
 
     if bar_index < length - 1:
         return NA(float)
@@ -1162,9 +1171,16 @@ def percentrank(source: Series[float], length: int) -> PyneFloat:
     :return: The percentage of values less than or equal to the current value
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA) or bar_index < length:
-        return NA(float)
     length = int(length)
+    # The final slice reads ``length + 1`` candles of history; a buffer of
+    # ``max_bars_back == length`` (capacity ``length + 1``) holds exactly that.
+    # Done before the warmup guard so the oldest candles are kept from bar 0.
+    max_bars_back(source, length)
+    if isinstance(source, NA):
+        return NA(float)
+
+    if bar_index < length:
+        return NA(float)
 
     return array.percentrank(source[:length + 1], 0)  # type: ignore
 
@@ -1489,16 +1505,18 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
+    # The slice below reads ``length`` candles of history; grow the source
+    # buffer to fit it (the per-series default may be smaller). Done before the
+    # warmup guard so the oldest candles are kept from the first bar on.
+    max_bars_back(source, length)
+    if isinstance(source, NA):
+        return NA(float)
 
-    if isinstance(source, NA) or bar_index < length:
+    if bar_index < length:
         return NA(float)
 
     # Collect values for performance
-    try:
-        values = cast(list[float], source[:length])  # type: ignore
-        # log.warning("values: {0}", values)
-    except IndexError:
-        return NA(float)
+    values = cast(list[float], source[:length])  # type: ignore
 
     # Calculate sums for correlation
     sum_x = sum_y = sum_xy = sum_x2 = sum_y2 = 0.0
