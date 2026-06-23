@@ -143,11 +143,12 @@ def in_seconds(timeframe: str | None = None) -> int:
     """
     Convert the timeframe to seconds
 
-    :param timeframe: The timeframe to convert. If not provided, uses the current chart timeframe.
+    :param timeframe: The timeframe to convert. If not provided or an empty string,
+        uses the current chart timeframe (Pine treats ``""`` as the chart timeframe).
     :return: The timeframe in seconds
     :raises ValueError: If the timeframe is invalid
     """
-    if timeframe is None:
+    if not timeframe:
         timeframe: str = str(_syminfo.period)
     _modifier, _multiplier = _process_tf(timeframe)
     if _modifier == 'S':
