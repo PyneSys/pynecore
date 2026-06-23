@@ -138,6 +138,20 @@ class SecurityState:
     chart_off: int = 0
     sec_grid_args: tuple | None = None
 
+    # ``chart_resampler`` (with ``chart_dwm_modifier`` 'D'/'W'/'M') is set for
+    # every single-period D/W/M chart so ``__sec_signal__`` can target the chart
+    # bar's civil period end (``_next_civil_period_open`` minus one ms) — the
+    # bar's OWN period ``[T, next_civil_open)``. Both stay ``None``/``''`` for
+    # intraday charts (the ``chart_off`` fast path) and for multi-period D/W/M
+    # charts (excluded at setup). Session-anchored D/W/M charts DO get these set,
+    # but the per-bar civil-anchored guard in ``__sec_signal__``
+    # (``get_bar_time(chart_time) == chart_time``) falls back to ``chart_off``
+    # for a bar that does not open on the civil boundary — a correct window there
+    # needs the chart's real bar opens, not a civil-calendar guess, and no
+    # TradingView ground truth exists for it (documented limitation).
+    chart_resampler: Resampler | None = None
+    chart_dwm_modifier: str = ''
+
     # Tracking (chart-side only)
     last_confirmed: int = 0
     needs_wait: bool = False
@@ -243,6 +257,39 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     return state.last_confirmed
 
 
+def _next_civil_period_open(modifier: str, current_ms: int, tz: ZoneInfo) -> int:
+    """
+    Open time (ms) of the civil period immediately following the one that
+    contains ``current_ms``, for a single-period daily/weekly/monthly chart.
+
+    The next local calendar boundary (next day's midnight, next Monday, or the
+    first of next month) is constructed *directly* in ``tz`` and then converted
+    back to epoch ms — never by adding a fixed 24h / 7d / nominal-month delta —
+    so the result is correct across DST transitions and variable month lengths.
+    Used to window LTF intrabars into a D/W/M chart bar's own period
+    ``[T, next_open)`` (the caller targets ``next_open - 1``).
+
+    :param modifier: Chart timeframe modifier, one of ``'D'``, ``'W'``, ``'M'``.
+    :param current_ms: The chart bar's open time in milliseconds.
+    :param tz: The chart's timezone (defines where the civil boundary falls).
+    :return: The next civil period's open time in milliseconds.
+    """
+    cur = datetime.fromtimestamp(current_ms / 1000, tz)
+    if modifier == 'D':
+        nd = cur.date() + timedelta(days=1)
+        nxt = datetime(nd.year, nd.month, nd.day, tzinfo=tz)
+    elif modifier == 'W':
+        # Anchor to the bar's Monday, then step a full week — robust even if the
+        # bar open is not exactly the Monday boundary.
+        monday = cur.date() - timedelta(days=cur.weekday())
+        nd = monday + timedelta(days=7)
+        nxt = datetime(nd.year, nd.month, nd.day, tzinfo=tz)
+    else:  # 'M'
+        year, month = (cur.year + 1, 1) if cur.month == 12 else (cur.year, cur.month + 1)
+        nxt = datetime(year, month, 1, tzinfo=tz)
+    return int(nxt.timestamp()) * 1000
+
+
 def create_chart_protocol(
     states: dict[str, SecurityState],
     sync_block: SyncBlock,
@@ -312,14 +359,29 @@ def create_chart_protocol(
 
         if state.is_ltf:
             # Historical/file-backed LTF: the child includes intrabars with
-            # ``bar_open <= target_time``. Target the chart bar's last ms
-            # (``chart_off`` == span-1 for intraday/seconds charts) so the child
-            # returns the bar's OWN period ``[T, T+tf)`` — matching TradingView.
-            # Adjacent bars tile with no gap or overlap (the prior bar targeted
-            # ``T-1``). For live streams (``ltf_first_ms is None``) read-ahead is
-            # impossible, so keep targeting the chart open (Phase 3).
-            ltf_target_time = (chart_time + state.chart_off
-                               if state.ltf_first_ms is not None else chart_time)
+            # ``bar_open <= target_time``. Target the chart bar's last ms so the
+            # child returns the bar's OWN period — matching TradingView. Adjacent
+            # bars tile with no gap or overlap (the prior bar targeted that ms
+            # minus one). For live streams (``ltf_first_ms is None``) read-ahead
+            # is impossible, so keep targeting the chart open (Phase 3).
+            if state.ltf_first_ms is None:
+                ltf_target_time = chart_time
+            elif (state.chart_dwm_modifier and state.chart_resampler is not None
+                  and state.chart_resampler.get_bar_time(chart_time, state.tz)
+                  == chart_time):
+                # Single-period civil D/W/M chart: ``chart_off`` is 0, so the
+                # period end is the next civil open minus one ms (not a fixed
+                # span). The civil-anchored guard above means we only do this
+                # when the chart bar actually opens on the civil boundary; an
+                # off-grid (session-anchored) D/W/M bar falls through to the
+                # ``chart_off`` path, keeping the documented limitation rather
+                # than mis-windowing on a civil-calendar guess.
+                ltf_target_time = _next_civil_period_open(
+                    state.chart_dwm_modifier, chart_time, state.tz) - 1
+            else:
+                # Intraday/seconds chart: ``chart_off`` == span-1 gives the
+                # bar's own period ``[T, T+tf)``.
+                ltf_target_time = chart_time + state.chart_off
             # Prefix skip: a chart bar whose whole period ends before the LTF
             # feed's first bar (``target_time < ltf_first_ms``) cannot contain an
             # intrabar, so the read is an empty array. Skip the cross-process
@@ -683,9 +745,19 @@ def setup_security_states(
     # open counts as the new period's first bar. D/W/M chart bars are
     # session-aligned by construction and need no offset.
     # noinspection PyProtectedMember
-    chart_mod, _ = tf_module._process_tf(chart_timeframe)
+    chart_mod, chart_mult = tf_module._process_tf(chart_timeframe)
     chart_off = (tf_module.in_seconds(chart_timeframe) * 1000 - 1
                  if chart_mod in ('', 'S') else 0)
+
+    # Single-period civil daily/weekly/monthly chart: the LTF window cannot use
+    # the (zero) ``chart_off`` span; ``__sec_signal__`` instead targets the
+    # chart bar's civil period end via this resampler. Multi-period and
+    # intraday charts keep the ``chart_off`` path. Only attached to LTF states.
+    chart_ltf_resampler = None
+    chart_ltf_modifier = ''
+    if chart_mod in ('D', 'W', 'M') and chart_mult == 1:
+        chart_ltf_resampler = Resampler.get_resampler(chart_timeframe)
+        chart_ltf_modifier = chart_mod
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)
@@ -731,6 +803,8 @@ def setup_security_states(
             session_starts=anchor_starts,
             session_tz=anchor_tz,
             chart_off=chart_off,
+            chart_resampler=chart_ltf_resampler if is_ltf else None,
+            chart_dwm_modifier=chart_ltf_modifier if is_ltf else '',
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()
