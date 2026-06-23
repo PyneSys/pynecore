@@ -192,7 +192,13 @@ class ResultBlock:
             new_version = self._version + 1
             new_name = _result_block_name(self._sec_id, new_version)
 
-            new_shm = SharedMemory(name=new_name, create=True, size=new_size)
+            try:
+                new_shm = SharedMemory(name=new_name, create=True, size=new_size)
+            except FileExistsError:
+                stale = SharedMemory(name=new_name, create=False)
+                stale.close()
+                stale.unlink()
+                new_shm = SharedMemory(name=new_name, create=True, size=new_size)
             new_buf = new_shm.buf
             assert new_buf is not None
             new_buf[:len(data)] = data
