@@ -64,6 +64,7 @@ scripts.pyne = "pynecore.cli:app"
 
 [project.entry-points."pyne.plugin"]
 ccxt = "pynecore.providers.ccxt:CCXTProvider"
+replay = "pynecore.providers.replay:ReplayProvider"
 
 
 #
