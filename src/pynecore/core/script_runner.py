@@ -1042,6 +1042,12 @@ class ScriptRunner:
                     if not isinstance(data_source, PluginSymbol):
                         load_htf_bar_opens(sec_state, str(data_source))
                         load_ltf_first_ms(sec_state, str(data_source))
+                    elif sec_state.is_ltf:
+                        # Live streaming LTF: no static first bar to load, so the
+                        # subprocess pulls intrabars from its own streamer and
+                        # ``__sec_signal__`` drives the LTF-window path for every
+                        # round (warmup replay and live alike).
+                        sec_state.ltf_live_stream = True
                     proc = Process(
                         target=security_process_main,
                         args=(

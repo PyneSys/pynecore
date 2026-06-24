@@ -46,21 +46,26 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
 """
 from __future__ import annotations
 
+import logging
 import os
 from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from time import monotonic
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, cast
 
 from .security_shm import (
     SyncBlock, ResultBlock, write_na,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
+    is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
     create_security_protocol, inject_protocol,
 )
+from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Lock as LockType
@@ -285,7 +290,8 @@ def security_process_main(
         return
 
     # Create protocol functions for security context
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn = create_security_protocol(
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
+     ltf_take_value, ltf_publish) = create_security_protocol(
         sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
     )
 
@@ -308,6 +314,9 @@ def security_process_main(
     # blocking here the loop would emit ``na`` and never get re-signaled.
     # Set when the live cross-symbol path is initialised below.
     live_bar_grace_seconds: float = 0.0
+    # Warmup horizon (ms): the instant the REST warmup ended. The live LTF-window
+    # path uses it to drop a still-forming warmup tail bar. Set in the live branch.
+    warmup_horizon_ms: int = 0
 
     if isinstance(data_source, PluginSymbol):
         # Live cross-symbol path: own provider + warmup download + WS stream.
@@ -347,6 +356,7 @@ def security_process_main(
         # to the bar period (sub-15s windows would race against jitter).
         live_bar_grace_seconds = max(15.0, min(tf_seconds * 0.5, 30.0))
         time_to = datetime.now(UTC)
+        warmup_horizon_ms = int(time_to.timestamp() * 1000)
         if data_source.time_from is not None:
             time_from = data_source.time_from
             if time_from.tzinfo is None:
@@ -371,11 +381,15 @@ def security_process_main(
         # REST window includes the currently forming candle deliver the true
         # final close via WS at the same timestamp, so overwrite rather than
         # drop. Mirrors the chart's live path (``live_ohlcv_generator``) which
-        # lets equal timestamps through for refinement.
+        # lets equal timestamps through for refinement. A tail refined this way
+        # is authoritative *and* already consumed from the streamer queue, so the
+        # LTF pop loop below must keep it (the stream will not redeliver it).
+        ws_refined_tail_ts: float | None = None
         if last_warmup_ts is not None:
             for _bar in live_streamer.pop_new_closed_bars():
                 if _bar.timestamp == last_warmup_ts and bar_buffer:
                     bar_buffer[-1] = _bar
+                    ws_refined_tail_ts = _bar.timestamp
                 elif _bar.timestamp > last_warmup_ts:
                     bar_buffer.append(_bar)
         else:
@@ -500,30 +514,187 @@ def security_process_main(
             var_snapshot = instance_state.RootVarSnapshot(root_keys)
         return var_snapshot if var_snapshot.has_vars else None
 
+    # Append a streamer bar to ``bar_buffer``, deduped against ``last_warmup_ts``:
+    # the WS was subscribed before the REST warmup ran, so the initial batch may
+    # overlap the warmup tail (replace it) and anything older is a duplicate.
+    def _ingest_streamer_bar(_bar: 'OHLCV') -> None:
+        if last_warmup_ts is None:
+            bar_buffer.append(_bar)
+        elif _bar.timestamp == last_warmup_ts and bar_buffer:
+            bar_buffer[-1] = _bar
+        elif _bar.timestamp > last_warmup_ts:
+            bar_buffer.append(_bar)
+
     # Polymorphic bar source: file-backed reader (random access on a static
     # ``.ohlcv``) or in-memory buffer fed by a live WS streamer (append-only,
-    # grows over time as new closed bars arrive). New bars from the streamer
-    # are deduped against ``last_warmup_ts`` because the WS was subscribed
-    # before the REST warmup ran, so the initial batch may overlap warmup.
+    # grows over time as new closed bars arrive).
     def _read_bar(idx: int) -> 'OHLCV | None':
         if reader is not None:
             if idx < reader.size:
                 return reader.read(idx)
             return None
         if live_streamer is not None:
-            for _bar in live_streamer.pop_new_closed_bars():
-                if last_warmup_ts is None:
-                    bar_buffer.append(_bar)
-                elif _bar.timestamp == last_warmup_ts and bar_buffer:
-                    bar_buffer[-1] = _bar
-                elif _bar.timestamp > last_warmup_ts:
-                    bar_buffer.append(_bar)
+            for _sb in live_streamer.pop_new_closed_bars():
+                _ingest_streamer_bar(_sb)
         return bar_buffer[idx] if idx < len(bar_buffer) else None
 
     def _current_total() -> int:
         if reader is not None:
             return reader.size
         return len(bar_buffer)
+
+    # ── Live LTF-window machinery (request.security_lower_tf on a streaming
+    # source) ──────────────────────────────────────────────────────────────
+    # A streaming LTF context accumulates each chart period's intrabars into a
+    # window (closed intrabars plus the developing intrabar as the live last
+    # element) via :class:`LiveLtfCollector`. Warmup replay (confirmed chart
+    # bars) and live both flow through this one path; the collector owns the
+    # monotonic LTF ``bar_index`` and the snapshot discipline, while ``_ltf_round``
+    # supplies bars from this process's own streamer and publishes the window.
+    ltf_next_idx = 0
+    ltf_span_ms = 0
+    ltf_phase_live = False
+    _ltf_round: 'Callable[[int], None] | None' = None
+    if (is_ltf and live_streamer is not None
+            and isinstance(data_source, PluginSymbol)):
+        from pynecore.lib.timeframe import in_seconds
+        assert ltf_take_value is not None and ltf_publish is not None
+        _streamer = cast('LiveBarStreamer', live_streamer)
+        _take_value = ltf_take_value
+        _publish = ltf_publish
+        ltf_span_ms = int(in_seconds(data_source.timeframe) * 1000)
+
+        # The REST warmup may end on a still-forming tail bar. On the window
+        # path the developing intrabar must come ONLY from the live stream's
+        # developing slot (re-run per tick), never from the closed buffer — a
+        # forming tail left here would be consumed as a closed intrabar AND
+        # surface again via ``peek_developing_bar``. Drop any such tail; the live
+        # stream delivers it authoritatively (developing, then closed). Time
+        # eligibility (period not ended by the warmup horizon) is the primary,
+        # provider-agnostic test; the ``is_closed`` flag catches providers that
+        # stamp it explicitly. WS closes consumed during the catch-up drain are
+        # exempt: those bars were taken off the streamer queue and will not be
+        # redelivered, so popping them would permanently lose intrabars that
+        # closed during warmup. That covers both the equal-timestamp refinement
+        # of the REST tail (``ws_refined_tail_ts``) and any later closes appended
+        # past the REST tail (``timestamp > rest_warmup_tail_ts``) whose period
+        # end can fall after ``warmup_horizon_ms`` — the horizon was sampled
+        # before the warmup download, so a bar that closed mid-download would
+        # otherwise look future-dated and be dropped despite being authoritative.
+        rest_warmup_tail_ts = last_warmup_ts
+        while bar_buffer and bar_buffer[-1].timestamp != ws_refined_tail_ts and not (
+                rest_warmup_tail_ts is not None
+                and bar_buffer[-1].timestamp > rest_warmup_tail_ts) and (
+                not bar_buffer[-1].is_closed
+                or int(bar_buffer[-1].timestamp * 1000) + ltf_span_ms > warmup_horizon_ms):
+            bar_buffer.pop()
+        last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
+
+        def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new):
+            _set_lib_properties(intrabar, bar_index, tz, lib, round_decimals)
+            lib.last_bar_index = bar_index
+            barstate.isfirst = (bar_index == 0)
+            barstate.islast = not confirmed
+            barstate.isconfirmed = confirmed
+            barstate.ishistory = not ltf_phase_live
+            barstate.isrealtime = ltf_phase_live
+            barstate.islastconfirmedhistory = False
+            barstate.isnew = is_new
+            _run_script_main()
+            return _take_value()
+
+        def _save_ltf_baseline():
+            _snap = _ensure_snapshot()
+            if _snap is not None:
+                _snap.save()
+
+        def _restore_ltf_baseline():
+            _snap = _ensure_snapshot()
+            if _snap is not None:
+                _snap.restore()
+            instance_state.reset()
+
+        _ltf_collector = LiveLtfCollector(
+            _run_ltf_intrabar, _save_ltf_baseline, _restore_ltf_baseline,
+        )
+
+        def _ltf_round(slot_flags: int) -> None:
+            nonlocal ltf_next_idx, ltf_phase_live
+            period_start = sync_block.get_target_time(sec_id)
+            period_end_exclusive = sync_block.get_ltf_period_end(sec_id)
+            chart_developing = is_ltf_chart_developing(slot_flags)
+            chart_confirmed = not chart_developing
+            ltf_phase_live = is_ltf_live_phase(slot_flags)
+
+            for _sb in _streamer.pop_new_closed_bars():
+                _ingest_streamer_bar(_sb)
+
+            # Collect not-yet-consumed closed intrabars up to the period end
+            # (future-period bars are deferred). On a confirmed chart bar the
+            # published array must be the FULL closed period, so wait (bounded)
+            # for the final in-period intrabar if the streamer lags — a no-op
+            # during warmup, where the REST bars are already buffered.
+            collected: list[OHLCV] = []
+            final_open = period_end_exclusive - ltf_span_ms
+            deadline = monotonic() + live_bar_grace_seconds
+            while True:
+                while ltf_next_idx < len(bar_buffer):
+                    _b = bar_buffer[ltf_next_idx]
+                    if int(_b.timestamp * 1000) >= period_end_exclusive:
+                        break
+                    collected.append(_b)
+                    ltf_next_idx += 1
+                if chart_developing:
+                    break
+                if collected and int(collected[-1].timestamp * 1000) >= final_open:
+                    break
+                # A bar beyond this period is already buffered: the stream has
+                # advanced past the period end, so the final in-period intrabar
+                # is genuinely missing (a gap) — stop waiting and publish what we
+                # have rather than burning the full grace.
+                if ltf_next_idx < len(bar_buffer):
+                    logger.warning(
+                        "Live LTF period ending %d ms missing its final intrabar "
+                        "(stream advanced past it); publishing the gap as-is",
+                        period_end_exclusive,
+                    )
+                    break
+                _remaining = deadline - monotonic()
+                if _remaining <= 0:
+                    logger.warning(
+                        "Live LTF period ending %d ms incomplete after %.0fs grace; "
+                        "publishing without the final intrabar",
+                        period_end_exclusive, live_bar_grace_seconds,
+                    )
+                    break
+                for _sb in _streamer.wait_for_bars(_remaining):
+                    _ingest_streamer_bar(_sb)
+
+            developing_bar: 'OHLCV | None' = None
+            if chart_developing:
+                _dev = _streamer.peek_developing_bar()
+                # Only a forming bar strictly after the last collected closed
+                # intrabar is a live developing tail; a stale tick at/under it
+                # (e.g. a late forming update for an already-closed intrabar)
+                # would otherwise allocate a spurious new bar_index.
+                _last_collected_ms = (
+                    int(collected[-1].timestamp * 1000) if collected else period_start - 1
+                )
+                if _dev is not None:
+                    _dev_ms = int(_dev.timestamp * 1000)
+                    if _last_collected_ms < _dev_ms < period_end_exclusive:
+                        developing_bar = _dev
+                    else:
+                        logger.debug(
+                            "LTF developing tick ts=%d ms outside (%d, %d) — skipped",
+                            _dev_ms, _last_collected_ms, period_end_exclusive,
+                        )
+
+            window_values = _ltf_collector.process_round(
+                period_start, period_end_exclusive, collected,
+                developing_bar, chart_confirmed=chart_confirmed,
+            )
+            _publish(window_values)
 
     try:
         current_bar = 0
@@ -541,6 +712,15 @@ def security_process_main(
             flags = sync_block.get_flags(sec_id)
             is_developing = bool(flags & FLAG_IS_DEVELOPING)
             closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
+
+            # ── (4) Live LTF window round ──
+            # Checked first: a streaming request.security_lower_tf round carries
+            # its own flag and never the HTF developing/closed-override flags.
+            if _ltf_round is not None and is_ltf_window(flags):
+                _ltf_round(flags)
+                data_ready_event.set()
+                done_event.set()
+                continue
 
             # ── (3) Live developing bar ──
             if is_developing:

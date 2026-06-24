@@ -4,7 +4,7 @@ Tests for the live runner async/sync bridge.
 import asyncio
 import time
 
-from pynecore.core.live_runner import live_ohlcv_generator
+from pynecore.core.live_runner import live_ohlcv_generator, LiveBarStreamer
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.types.ohlcv import OHLCV
 
@@ -1109,3 +1109,62 @@ def __test_forming_finalised_at_session_end_then_next_slot_skipped__():
     assert all(b.volume > 0.0 for b in bars if b.is_closed), (
         "no frozen V=0 synth expected; only the real-data finalisation"
     )
+
+
+def _drain_streamer(bars) -> LiveBarStreamer:
+    """Drive a LiveBarStreamer's drain loop synchronously over a fixed bar list.
+
+    Injects ``bars`` as the generator and calls ``_drain`` directly (no thread),
+    so the queue and developing slot reflect the full sequence deterministically.
+    The provider is never used here (``_gen`` is overridden), so an idle mock
+    satisfies the constructor's type.
+    """
+    streamer = LiveBarStreamer(provider=MockLiveProvider([]), symbol="X", timeframe="3")
+    streamer._gen = (_b for _b in bars)
+    streamer._drain()
+    return streamer
+
+
+def __test_streamer_exposes_developing_bar__():
+    """Forming bars feed the developing slot; closed bars go to the queue."""
+    bars = [
+        _make_ohlcv(0, close=100.0, is_closed=False),    # forming intrabar 0
+        _make_ohlcv(0, close=101.0, is_closed=False),    # forming update
+        _make_ohlcv(0, close=101.0, is_closed=True),     # intrabar 0 closes
+        _make_ohlcv(180, close=102.0, is_closed=False),  # forming intrabar 1
+    ]
+    streamer = _drain_streamer(bars)
+
+    closed = streamer.pop_new_closed_bars()
+    assert len(closed) == 1
+    assert closed[0].timestamp == 0 and closed[0].is_closed
+
+    dev = streamer.peek_developing_bar()
+    assert dev is not None
+    assert dev.timestamp == 180 and not dev.is_closed
+    assert dev.close == 102.0
+
+
+def __test_streamer_clears_developing_on_close__():
+    """A close supersedes the forming slot — peek returns None afterwards."""
+    bars = [
+        _make_ohlcv(0, close=100.0, is_closed=False),
+        _make_ohlcv(0, close=100.5, is_closed=False),
+        _make_ohlcv(0, close=100.5, is_closed=True),
+    ]
+    streamer = _drain_streamer(bars)
+
+    assert streamer.peek_developing_bar() is None
+    assert len(streamer.pop_new_closed_bars()) == 1
+
+
+def __test_streamer_developing_peek_does_not_consume__():
+    """peek_developing_bar is idempotent — repeated reads return the same bar."""
+    bars = [_make_ohlcv(60, close=50.0, is_closed=False)]
+    streamer = _drain_streamer(bars)
+
+    first = streamer.peek_developing_bar()
+    second = streamer.peek_developing_bar()
+    assert first is not None and second is not None
+    assert first.timestamp == second.timestamp == 60
+    assert streamer.pop_new_closed_bars() == []

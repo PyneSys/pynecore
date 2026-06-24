@@ -24,6 +24,7 @@ from .datetime import parse_timezone
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
+    FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
     write_result,
 )
 
@@ -187,6 +188,17 @@ class SecurityState:
     # Chart-side ``__sec_signal__`` consults this to gate the developing-bar
     # transport — historical bars never emit developing OHLCV.
     is_live: bool = False
+
+    # True when this is an LTF (``request.security_lower_tf``) context backed by a
+    # live streaming source (a :class:`PluginSymbol`, no static ``.ohlcv`` file).
+    # Such a context has no ``ltf_first_ms`` (the loader is skipped) and its
+    # subprocess pulls intrabars from its own streamer, so ``__sec_signal__``
+    # routes every round — warmup replay included — through the LTF-window path
+    # (``FLAG_LTF_WINDOW``) rather than the file-backed read-ahead path. Set at
+    # setup; distinct from ``is_live`` (a lifecycle phase that flips only after
+    # warmup) and from ``ltf_first_ms is None`` (which also matches an empty
+    # static feed that has no streamer).
+    ltf_live_stream: bool = False
 
     # Intraday session anchoring (chart-side). Populated by
     # ``setup_security_states`` only when this security's session opens off the
@@ -478,12 +490,50 @@ def create_chart_protocol(
         chart_time = lib._time
 
         if state.is_ltf:
+            # Live streaming LTF (PluginSymbol source): the chart bar may be
+            # developing, so read-ahead is impossible. The subprocess pulls
+            # intrabars from its own LTF streamer and builds the chart period's
+            # window (closed intrabars + the developing intrabar as the live last
+            # element). The parent ships only the period bounds and whether the
+            # chart bar is still developing; warmup replay (confirmed chart bars)
+            # flows through the same path and yields full closed periods.
+            if state.ltf_live_stream:
+                period_start = chart_time
+                if (state.chart_dwm_modifier and state.chart_resampler is not None
+                        and state.chart_resampler.get_bar_time(chart_time, state.tz)
+                        == chart_time):
+                    period_end_exclusive = _next_civil_period_open(
+                        state.chart_dwm_modifier, chart_time, state.tz)
+                else:
+                    period_end_exclusive = chart_time + state.chart_off + 1
+                ltf_flags = sync_block.get_flags(sec_id) & ~(
+                    FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                )
+                ltf_flags |= FLAG_LTF_WINDOW
+                if lib.barstate.isconfirmed:
+                    ltf_flags &= ~FLAG_LTF_CHART_DEVELOPING
+                else:
+                    ltf_flags |= FLAG_LTF_CHART_DEVELOPING
+                if state.is_live:
+                    ltf_flags |= FLAG_LTF_LIVE_PHASE
+                else:
+                    ltf_flags &= ~FLAG_LTF_LIVE_PHASE
+                sync_block.set_flags(sec_id, ltf_flags)
+                sync_block.set_target_time(sec_id, period_start)
+                sync_block.set_ltf_period_end(sec_id, period_end_exclusive)
+                state.ltf_skip = False
+                state.new_period = True
+                state.data_ready.clear()
+                state.advance_event.set()
+                state.needs_wait = True
+                return
+
             # Historical/file-backed LTF: the child includes intrabars with
             # ``bar_open <= target_time``. Target the chart bar's last ms so the
             # child returns the bar's OWN period — matching TradingView. Adjacent
             # bars tile with no gap or overlap (the prior bar targeted that ms
-            # minus one). For live streams (``ltf_first_ms is None``) read-ahead
-            # is impossible, so keep targeting the chart open (Phase 3).
+            # minus one). An empty static feed (no streamer) has no intrabars to
+            # window, so keep the legacy chart-open target there.
             if state.ltf_first_ms is None:
                 ltf_target_time = chart_time
             elif (state.chart_dwm_modifier and state.chart_resampler is not None
@@ -787,8 +837,10 @@ def create_security_protocol(
                          Writers acquire ``result_locks[sec_id]``; cross-context
                          readers acquire ``result_locks[<peer sid>]``.
     :param is_ltf: If True, enable LTF accumulation mode.
-    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush)
-             flush is None when is_ltf=False.
+    :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush,
+             ltf_take_value, ltf_publish). ``flush``/``ltf_take_value``/
+             ``ltf_publish`` are None when ``is_ltf=False``; ``flush`` serves the
+             file-backed array path, the latter two the live LTF-window path.
     """
     readers: dict[str, ResultReader] = {
         sid: ResultReader(sid) for sid in all_sec_ids
@@ -808,12 +860,30 @@ def create_security_protocol(
             with own_lock:
                 write_result(result_block, sync_block, _buffer.copy())
             _buffer.clear()
+
+        def ltf_take_value():
+            """Return the value written by the latest intrabar run, clearing the
+            buffer. Used by the live LTF-window path to capture one intrabar's
+            expression value per ``__run_script_main`` instead of the whole
+            accumulated array (which the path manages via its own window)."""
+            if not _buffer:
+                return None
+            value = _buffer[-1]
+            _buffer.clear()
+            return value
+
+        def ltf_publish(values):
+            """Write a live LTF-window array under the result lock."""
+            with own_lock:
+                write_result(result_block, sync_block, list(values))
     else:
         def __sec_write__(_sid: str, value, _scope_id=None):
             with own_lock:
                 write_result(result_block, sync_block, value)
 
         flush = None
+        ltf_take_value = None
+        ltf_publish = None
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
         with result_locks[sid]:
@@ -826,7 +896,8 @@ def create_security_protocol(
         for r in readers.values():
             r.close()
 
-    return __sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup, flush
+    return (__sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup,
+            flush, ltf_take_value, ltf_publish)
 
 
 # Representative dates for the off-grid session probe — one on each side of the

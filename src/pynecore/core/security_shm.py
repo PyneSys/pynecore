@@ -25,7 +25,9 @@ from multiprocessing.shared_memory import SharedMemory
 #   offset 48: float64 dev_low         (8 bytes)
 #   offset 56: float64 dev_close       (8 bytes)
 #   offset 64: float64 dev_volume      (8 bytes)
-#   offset 72: int64   dev_time        (8 bytes) — developing HTF bar timestamp (ms)
+#   offset 72: int64   dev_time        (8 bytes) — developing HTF bar timestamp (ms);
+#                       reused as period_end_exclusive (ms) by the live LTF-window
+#                       path, which carries no pushed OHLCV (see FLAG_LTF_WINDOW)
 #
 # Total per slot: 80 bytes
 SLOT_FORMAT = '<qIIqB'
@@ -42,6 +44,30 @@ FLAG_SAME_CONTEXT = 0x02  # same symbol + TF as chart (no process needed)
 FLAG_IS_DEVELOPING = 0x04  # current target_time refers to a developing (open) HTF bar
 FLAG_CLOSED_OVERRIDE = 0x08  # closed-bar OHLCV is supplied via SyncBlock (live mode);
                              # subprocess must use SyncBlock OHLCV, not the .ohlcv file
+FLAG_LTF_WINDOW = 0x10  # live request.security_lower_tf window round: subprocess pulls
+                        # intrabars from its own LTF streamer (not pushed OHLCV);
+                        # target_time = period_start, dev_time = period_end_exclusive
+FLAG_LTF_CHART_DEVELOPING = 0x20  # within an LTF-window round, the chart bar is still
+                                  # developing (keep the developing tail); clear means
+                                  # the chart bar has closed (finalize, publish full period)
+FLAG_LTF_LIVE_PHASE = 0x40  # within an LTF-window round, the chart has crossed the
+                            # warmup->live transition (barstate realtime, not history)
+
+
+def is_ltf_window(flags: int) -> bool:
+    """Whether a slot is in a live LTF-window round (see :data:`FLAG_LTF_WINDOW`)."""
+    return bool(flags & FLAG_LTF_WINDOW)
+
+
+def is_ltf_chart_developing(flags: int) -> bool:
+    """Whether the chart bar of an LTF-window round is still developing."""
+    return bool(flags & FLAG_LTF_CHART_DEVELOPING)
+
+
+def is_ltf_live_phase(flags: int) -> bool:
+    """Whether an LTF-window round is past the warmup->live transition."""
+    return bool(flags & FLAG_LTF_LIVE_PHASE)
+
 
 # Initial result block size
 INITIAL_RESULT_SIZE = 4096
@@ -104,6 +130,21 @@ class SyncBlock:
         """Read the target_time field for a slot."""
         off = self._offset(sec_id)
         return struct.unpack_from('<q', self._buf, off + 16)[0]
+
+    def set_ltf_period_end(self, sec_id: str, period_end_exclusive: int):
+        """Set the LTF chart-period end (ms, exclusive) for a slot.
+
+        Reuses the ``dev_time`` field (offset 72): the live LTF-window path
+        pushes no developing OHLCV, so this slot is free to carry the chart
+        bar's period end alongside ``target_time`` (the period start).
+        """
+        off = self._offset(sec_id)
+        struct.pack_into('<q', self._buf, off + 72, period_end_exclusive)
+
+    def get_ltf_period_end(self, sec_id: str) -> int:
+        """Read the LTF chart-period end (ms, exclusive) for a slot."""
+        off = self._offset(sec_id)
+        return struct.unpack_from('<q', self._buf, off + 72)[0]
 
     def set_timestamp(self, sec_id: str, timestamp: int):
         """Set the last_timestamp field."""

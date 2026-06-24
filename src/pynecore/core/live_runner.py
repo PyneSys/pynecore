@@ -68,9 +68,13 @@ class LiveBarStreamer:
     :meth:`pop_new_closed_bars` once per chart advance — receiving zero or
     more freshly-closed bars without ever blocking the chart-driven flow.
 
-    Intra-bar updates and the warmup→live transition sentinel are dropped:
-    cross-symbol :func:`request.security` only exposes closed bars, and the
-    subprocess does not switch modes mid-run.
+    Closed bars go to the queue; the latest still-forming (intra-bar) bar is
+    kept in a single slot read via :meth:`peek_developing_bar` (overwritten in
+    place, never queued). Cross-symbol :func:`request.security` ignores the
+    forming slot — it exposes closed bars only — while live
+    :func:`request.security_lower_tf` carries the forming bar as the developing
+    last element of its intrabar window. The warmup→live transition sentinel is
+    dropped (the subprocess does not switch modes mid-run).
     """
 
     def __init__(self, provider: LiveProviderPlugin, symbol: str, timeframe: str,
@@ -82,6 +86,10 @@ class LiveBarStreamer:
         self._syminfo = syminfo
         self._last_historical_timestamp = last_historical_timestamp
         self._queue: Queue[OHLCV] = Queue()
+        # Latest still-forming bar, overwritten in place by the drain thread and
+        # read by the subprocess via ``peek_developing_bar``. A single reference
+        # assignment/read is atomic under the GIL, so no lock is needed.
+        self._developing: OHLCV | None = None
         self._stopped = threading.Event()
         self._gen: Generator[OHLCV, None, None] | None = None
         self._thread: threading.Thread | None = None
@@ -116,9 +124,23 @@ class LiveBarStreamer:
                     break
                 if bar is LIVE_TRANSITION:
                     continue
-                if not getattr(bar, 'is_closed', True):
-                    continue
-                self._queue.put(bar)
+                if getattr(bar, 'is_closed', True):
+                    # A close supersedes the forming snapshot for its slot, but
+                    # only when it is not older than the tracked forming bar.
+                    # Providers that close a slot on the next slot's timestamp
+                    # (cTrader) — or simple stream reordering — can deliver the
+                    # forming tick of slot N+1 ahead of the late close of slot N;
+                    # an unconditional clear would erase the newer forming
+                    # snapshot and make ``peek_developing_bar`` read ``None``
+                    # until the next tick. Timestamp-guarded exactly like the
+                    # generator's ``last_forming_bar`` handling.
+                    dev = self._developing
+                    if dev is None or bar.timestamp >= dev.timestamp:
+                        self._developing = None
+                    self._queue.put(bar)
+                else:
+                    # Latest forming (intra-bar) snapshot for the open slot.
+                    self._developing = bar
         except Exception as exc:  # noqa: BLE001
             logger.exception("LiveBarStreamer drain raised")
             if not self._stopped.is_set():
@@ -146,6 +168,18 @@ class LiveBarStreamer:
             self._drain_error = None
             raise err
         return out
+
+    def peek_developing_bar(self) -> 'OHLCV | None':
+        """Return the latest still-forming bar without consuming it.
+
+        The forming bar is never queued — the drain thread overwrites this slot
+        in place as new intra-bar ticks arrive and clears it when the bar
+        closes. Live ``request.security_lower_tf`` reads it each chart tick to
+        carry the developing intrabar as the live last element of its window;
+        the eventual closed bar (delivered via :meth:`pop_new_closed_bars`)
+        finalizes that tail.
+        """
+        return self._developing
 
     def wait_for_bars(self, timeout: float) -> list[OHLCV]:
         """Block up to ``timeout`` seconds for at least one closed bar.
