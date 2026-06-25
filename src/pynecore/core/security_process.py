@@ -495,6 +495,15 @@ def security_process_main(
     # baseline for live re-executions of the same HTF period.
     var_snapshot: instance_state.RootVarSnapshot | None = None
 
+    # Companion series-slot snapshot, used ONLY by the live LTF-window path: a
+    # reordered feed can make the collector replay an earlier LTF ``bar_index``
+    # after a later one ran, which (unlike a same-index re-tick) would append to
+    # the root price/history series instead of overwriting. ``RootVarSnapshot``
+    # excludes series slots, so they get their own rollback. Captured only in the
+    # live phase (the warmup path is forward-only and never restores), seeded at
+    # the warmup->live transition so the first replay has a baseline.
+    series_snapshot: instance_state.RootSeriesSnapshot | None = None
+
     # Tracks the last developing HTF period start (ms) the subprocess
     # advanced into. Used to distinguish "new dev period" (allocate a new
     # bar_index) from "another tick within the same dev period" (re-run
@@ -513,6 +522,12 @@ def security_process_main(
         if var_snapshot is None:
             var_snapshot = instance_state.RootVarSnapshot(root_keys)
         return var_snapshot if var_snapshot.has_vars else None
+
+    def _ensure_series_snapshot() -> instance_state.RootSeriesSnapshot | None:
+        nonlocal series_snapshot
+        if series_snapshot is None:
+            series_snapshot = instance_state.RootSeriesSnapshot(root_keys)
+        return series_snapshot if series_snapshot.has_series else None
 
     # Append a streamer bar to ``bar_buffer``, deduped against ``last_warmup_ts``:
     # the WS was subscribed before the REST warmup ran, so the initial batch may
@@ -554,6 +569,7 @@ def security_process_main(
     ltf_next_idx = 0
     ltf_span_ms = 0
     ltf_phase_live = False
+    ltf_series_base_armed = False
     _ltf_round: 'Callable[[int], None] | None' = None
     if (is_ltf and live_streamer is not None
             and isinstance(data_source, PluginSymbol)):
@@ -590,11 +606,11 @@ def security_process_main(
             bar_buffer.pop()
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
 
-        def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new):
+        def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new, islast):
             _set_lib_properties(intrabar, bar_index, tz, lib, round_decimals)
             lib.last_bar_index = bar_index
             barstate.isfirst = (bar_index == 0)
-            barstate.islast = not confirmed
+            barstate.islast = islast
             barstate.isconfirmed = confirmed
             barstate.ishistory = not ltf_phase_live
             barstate.isrealtime = ltf_phase_live
@@ -607,11 +623,20 @@ def security_process_main(
             _snap = _ensure_snapshot()
             if _snap is not None:
                 _snap.save()
+            # Series rollback is needed only in the live phase, where a reordered
+            # feed can trigger a backward replay; the warmup path is forward-only
+            # and never restores, so copying buffers there would be wasted work.
+            if ltf_phase_live:
+                _ss = _ensure_series_snapshot()
+                if _ss is not None:
+                    _ss.save()
 
         def _restore_ltf_baseline():
             _snap = _ensure_snapshot()
             if _snap is not None:
                 _snap.restore()
+            if series_snapshot is not None and series_snapshot.saved:
+                series_snapshot.restore()
             instance_state.reset()
 
         _ltf_collector = LiveLtfCollector(
@@ -619,12 +644,22 @@ def security_process_main(
         )
 
         def _ltf_round(slot_flags: int) -> None:
-            nonlocal ltf_next_idx, ltf_phase_live
+            nonlocal ltf_next_idx, ltf_phase_live, ltf_series_base_armed
             period_start = sync_block.get_target_time(sec_id)
             period_end_exclusive = sync_block.get_ltf_period_end(sec_id)
             chart_developing = is_ltf_chart_developing(slot_flags)
             chart_confirmed = not chart_developing
             ltf_phase_live = is_ltf_live_phase(slot_flags)
+
+            # Seed the series baseline once, on the warmup->live transition: the
+            # warmup ran forward-only so the series now hold exactly the confirmed
+            # prefix, and the first live replay's restore needs that baseline even
+            # if it precedes the first live confirmed save.
+            if ltf_phase_live and not ltf_series_base_armed:
+                _ss = _ensure_series_snapshot()
+                if _ss is not None:
+                    _ss.save()
+                ltf_series_base_armed = True
 
             for _sb in _streamer.pop_new_closed_bars():
                 _ingest_streamer_bar(_sb)

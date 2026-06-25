@@ -179,6 +179,35 @@ class SeriesImpl(Generic[T]):
         self._buffer[pos] = value
         return value
 
+    def _snapshot(self) -> tuple[list[T | NA[T]], int, int, int, int, int, int]:
+        """Capture the full buffer state for a rollback baseline.
+
+        Used by the live ``request.security_lower_tf`` LTF baseline to roll a
+        series back when a reordered feed forces a replay that re-runs an
+        *earlier* ``bar_index`` after a later one already ran (see
+        :class:`~pynecore.core.live_ltf_collector.LiveLtfCollector`). A cursor-only
+        snapshot is not enough: at capacity a stray :meth:`add` overwrites the
+        oldest element circularly, which the cursor alone cannot reconstruct — so
+        the buffer contents are copied too. Cheap at live cadence (one copy per
+        confirmed intrabar), never used on the warmup forward-only path.
+
+        :return: An opaque tuple consumed only by :meth:`_restore`.
+        """
+        return (self._buffer.copy(), self._size, self._write_pos, self._last_bar_index,
+                self._max_bars_back, self._max_bars_back_set, self._capacity)
+
+    def _restore(self, snapshot: tuple[list[T | NA[T]], int, int, int, int, int, int]) -> None:
+        """Restore the buffer state captured by :meth:`_snapshot` (in place).
+
+        The same snapshot may be restored repeatedly (one save, many replay
+        re-runs), so the saved buffer is copied back rather than aliased.
+
+        :param snapshot: A value returned by :meth:`_snapshot`.
+        """
+        (buffer, self._size, self._write_pos, self._last_bar_index,
+         self._max_bars_back, self._max_bars_back_set, self._capacity) = snapshot
+        self._buffer = buffer.copy()
+
     @overload
     def __getitem__(self, key: int) -> T | NA[T]:
         ...

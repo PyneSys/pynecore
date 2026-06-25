@@ -83,7 +83,7 @@ __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
     '__attach_layout__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
-    'RootVarSnapshot', 'explain_state',
+    'RootVarSnapshot', 'RootSeriesSnapshot', 'explain_state',
 ]
 
 # Root state vectors by key; only roots are registered globally, every other
@@ -357,6 +357,59 @@ class RootVarSnapshot:
         for (state, slots), snapshot in zip(self._targets, self._snapshots):
             for i, value in zip(slots, snapshot):
                 state[i] = _copy_value(value)
+
+
+# noinspection PyProtectedMember
+class RootSeriesSnapshot:
+    """Snapshot/restore of the ``series`` slots of the root vectors.
+
+    Companion to :class:`RootVarSnapshot` for the live
+    ``request.security_lower_tf`` LTF baseline. A reordered feed can force the
+    collector to replay an *earlier* ``bar_index`` after a later one already ran;
+    since :meth:`SeriesImpl.add` only overwrites for the current ``bar_index``,
+    that backward re-run would append and grow the buffer. ``RootVarSnapshot``
+    deliberately excludes series slots, so they need their own rollback.
+
+    Only the ROOT series slots are captured: a builtin price series like
+    ``close`` (the backing of ``close[1]``) is anchored in ``main`` by
+    ``LibrarySeriesTransformer``, so it lives in a root series slot. Child
+    (function-instance) series are dropped by :func:`reset` before every replay
+    and re-created fresh, so they never carry a backward-append across a replay
+    and need no snapshot here.
+    """
+
+    __slots__ = ('_targets', '_snapshots')
+
+    def __init__(self, keys: Iterable[str] | None = None):
+        self._targets: list[tuple[list, tuple[int, ...]]] = []
+        self._snapshots: list[list] = []
+        entries = (_root_vectors.values() if keys is None
+                   else (_root_vectors[key] for key in keys if key in _root_vectors))
+        for state, layout in entries:
+            slots = tuple(slot for slot, _max_bars_back in layout['series'])
+            if slots:
+                self._targets.append((state, slots))
+
+    @property
+    def has_series(self) -> bool:
+        """Whether any root has series slots to roll back."""
+        return bool(self._targets)
+
+    @property
+    def saved(self) -> bool:
+        """Whether a snapshot has been captured (``save`` called since init)."""
+        return bool(self._snapshots)
+
+    def save(self) -> None:
+        """Snapshot the buffer state of every root series slot."""
+        self._snapshots = [[state[i]._snapshot() for i in slots]
+                           for state, slots in self._targets]
+
+    def restore(self) -> None:
+        """Restore every root series slot to the saved snapshot (in place)."""
+        for (state, slots), snapshot in zip(self._targets, self._snapshots):
+            for i, snap in zip(slots, snapshot):
+                state[i]._restore(snap)
 
 
 def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
