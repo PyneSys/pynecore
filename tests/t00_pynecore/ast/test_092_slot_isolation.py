@@ -161,6 +161,30 @@ def main(flag):
     assert '__bind_any__(__state__, 0, f)' in dump
 
 
+def __test_uniform_path_redefined_callee_keeps_state__():
+    """ A nested callee reached through the anchor is a NEW object every bar
+    (``main`` re-runs and re-executes its ``def``), so the identity check
+    misses every bar. The rebind must keep the callee's state — its layout is
+    unchanged — instead of resetting it, or every stateful Pine method/function
+    on the uniform path would silently lose its var/series/history each bar. """
+    ns, dump = _transform('''
+from pynecore import Persistent
+
+def main():
+    def acc():
+        p: Persistent[int] = 0
+        p += 1
+        return p
+    f = acc
+    return f()
+''')
+    assert '__bind_any__(__state·main__, 0, f)' in dump  # uniform, not fast path
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 1
+    assert ns['main'](state) == 2  # state survives the per-bar rebind
+    assert ns['main'](state) == 3
+
+
 def __test_uniform_loop__():
     """ An anchored site in a loop keeps one instance per iteration """
     ns, dump = _transform(COUNTER_FUNC + '''

@@ -65,11 +65,15 @@ Call shapes emitted by the transformer:
      and (__b__ := __chl_0__[__i__])[0] is f
      else __bind_any_loop__(__chl_0__, __i__, f))(x)
 
-Semantics note: when the callee at a uniform site changes (``g = a if c else
-b; g(x)``), the identity check misses and the site is rebound with FRESH
-state. State does not survive an a -> b -> a swap; the legacy scheme did not
-support that either (a cache hit there reused the first callee's instance
-regardless of the current value).
+Semantics note: when the callee at a uniform site genuinely changes (``g = a
+if c else b; g(x)``), the identity check misses and the site is rebound with
+FRESH state. State does not survive an a -> b -> a swap; the legacy scheme did
+not support that either (a cache hit there reused the first callee's instance
+regardless of the current value). A miss caused merely by a per-bar
+redefinition of the SAME logical callee (a method/function nested in ``main``
+is a new object every bar) is NOT a change: the rebind reuses the prior state
+vector (matched by the module-level layout object), so the callee's series /
+var / varip slots survive across bars — see :func:`_carry_state`.
 """
 from typing import Any, Callable, Iterable
 from copy import copy, deepcopy
@@ -175,10 +179,43 @@ def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
     return attach
 
 
-def _bind_target(func: Any) -> Callable:
+def _carry_state(prev: tuple | None, layout: dict[str, Any]) -> list:
+    """State vector for a state-carrying callee at an anchored site: reuse the
+    prior anchor's vector when it belongs to the SAME logical callee, else make
+    a fresh one.
+
+    An identity miss at a uniform site has two causes that must not be
+    conflated. A genuinely different callee (``g = a if c else b; g(x)``) must
+    get fresh state. But a method/function nested in a per-bar ``main`` is a
+    BRAND-NEW function object every bar while remaining the same logical
+    callee, so its anchor also misses every bar — and there its series / var /
+    varip slots must SURVIVE, not reset. The discriminator is the module-level
+    layout object: it is the same dict for the same scope across bars and a
+    distinct dict for every other scope, so ``prev``'s layout being the new
+    callee's layout means "same callee, redefined" -> keep the state vector,
+    take the closure from the new object. This is the split
+    :func:`pine_method._bound_method` and ``overload._anchored`` already use;
+    a real ``a -> b -> a`` swap still loses state (distinct layouts), matching
+    the documented uniform-site semantics.
+
+    :param prev: The ``(callee, bound)`` pair previously parked in the anchor
+        slot, or ``None`` on the first bind.
+    :param layout: The new callee's layout entry.
+    :return: The state vector to bind.
+    """
+    if prev is not None:
+        prev_bound = prev[1]
+        if type(prev_bound) is partial and prev_bound.args \
+                and getattr(prev_bound.func, '__pyne_layout__', None) is layout:
+            return prev_bound.args[0]
+    return _make_state(layout)
+
+
+def _bind_target(func: Any, prev: tuple | None = None) -> Callable:
     """Binding logic of the uniform path: the legacy per-call entry guards
     (type, classmethod, Exported unwrap) run here, once per binding, not per
-    call; state-carrying callees get a fresh state baked into a partial.
+    call; state-carrying callees get a state vector baked into a partial,
+    reused from ``prev`` across a per-bar redefinition (see :func:`_carry_state`).
 
     Callees that publish a ``__pyne_bind__`` factory (overload dispatchers)
     get a fresh per-anchor binding from it — that is how the dispatcher
@@ -186,6 +223,7 @@ def _bind_target(func: Any) -> Callable:
     in it.
 
     :param func: The callee as it appears at the call site.
+    :param prev: The anchor's previous ``(callee, bound)`` entry, if any.
     :return: The bound callable to invoke.
     """
     target = func
@@ -200,7 +238,7 @@ def _bind_target(func: Any) -> Callable:
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target
     layout = getattr(target, '__pyne_layout__', None)
-    return partial(target, _make_state(layout)) if layout is not None else target
+    return partial(target, _carry_state(prev, layout)) if layout is not None else target
 
 
 def __bind_any__(parent: list, slot: int, func: Any) -> Callable:
@@ -209,14 +247,16 @@ def __bind_any__(parent: list, slot: int, func: Any) -> Callable:
 
     The anchor key is the ORIGINAL call-site value (e.g. the ``Exported``
     proxy itself), never the unwrapped function — the hot-path identity
-    check compares against the call-site value.
+    check compares against the call-site value. A state-carrying callee
+    redefined for a new bar keeps its prior state vector (see
+    :func:`_carry_state`).
 
     :param parent: The caller's state vector.
     :param slot: Anchor slot index assigned at transform time.
     :param func: The callee as it appears at the call site.
     :return: The bound callable to invoke.
     """
-    bound = _bind_target(func)
+    bound = _bind_target(func, parent[slot])
     parent[slot] = (func, bound)
     return bound
 
@@ -225,7 +265,8 @@ def __bind_any_loop__(children: list, index: int, func: Any) -> Callable:
     """Bind a callee at a loop-shaped anchored call site: the anchor slot
     holds a list of ``(callee, bound)`` pairs indexed by the per-invocation
     counter, so each iteration keeps its own instance. Rebinds in place on
-    an identity miss (fresh state, same as the straight-line anchor).
+    an identity miss, reusing the iteration's prior state vector when the same
+    logical callee was redefined for a new bar (see :func:`_carry_state`).
 
     :param children: The pair list living in the parent's anchor slot.
     :param index: Current iteration index (counter is sequential, so the
@@ -233,7 +274,8 @@ def __bind_any_loop__(children: list, index: int, func: Any) -> Callable:
     :param func: The callee as it appears at the call site.
     :return: The bound callable to invoke.
     """
-    bound = _bind_target(func)
+    prev = children[index] if index < len(children) else None
+    bound = _bind_target(func, prev)
     entry = (func, bound)
     if index < len(children):
         children[index] = entry
