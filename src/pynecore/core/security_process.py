@@ -41,6 +41,8 @@ def security_process_main(
         stop_event,
         is_ltf: bool = False,
         result_locks: 'dict[str, LockType] | None' = None,
+        ohlcv_fields: 'list[str] | None' = None,
+        ohlcv_tuple: bool = False,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -59,6 +61,11 @@ def security_process_main(
     :param done_event: Event signaling this process finished its current round
     :param stop_event: Event signaling this process should shut down
     :param is_ltf: If True, accumulate expression values into array per round
+    :param ohlcv_fields: When set, the requested expression is only raw price
+        series (open/high/low/close/volume/hl2/hlc3/ohlc4/hlcc4); the per-bar
+        run skips main() and writes these fields straight from the bar.
+    :param ohlcv_tuple: True when ``ohlcv_fields`` came from a tuple/list
+        expression (write a tuple), False for a scalar expression.
     """
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
@@ -156,6 +163,24 @@ def security_process_main(
         for run_lib_main in lib_mains:
             run_lib_main()
         run_main()
+
+    # Plain-OHLCV fast path: the requested expression is only raw price series,
+    # all of which ``_set_lib_properties`` already wrote onto ``lib`` for the
+    # current bar (byte-identical to what main() would read). Replace the per-bar
+    # main() re-run with a direct write of those fields — every loop path
+    # (historical, live developing/closed, live LTF window) calls
+    # ``_run_script_main`` and so picks this up through the closure cell.
+    if ohlcv_fields:
+        if ohlcv_tuple:
+            _pt_fields = tuple(ohlcv_fields)
+
+            def _run_script_main():
+                write_fn(sec_id, tuple(getattr(lib, _f) for _f in _pt_fields))
+        else:
+            _pt_field = ohlcv_fields[0]
+
+            def _run_script_main():
+                write_fn(sec_id, getattr(lib, _pt_field))
 
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")

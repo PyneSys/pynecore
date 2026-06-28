@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any
+from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import sys
 from functools import partial
@@ -524,6 +524,13 @@ class ScriptRunner:
                     # actual bar opens (correct for sparse series; no-op otherwise)
                     load_htf_bar_opens(sec_state, data_path)
                     load_ltf_first_ms(sec_state, data_path)
+                    # Plain-OHLCV fast path: a context whose expression is only
+                    # raw price series is served straight from each bar in the
+                    # child, skipping the per-bar main() re-run (SecurityTransformer
+                    # records the field list in __security_contexts__).
+                    _ctx_meta = cast('dict[str, dict]', sec_contexts)[sid]
+                    _ohlcv_fields = _ctx_meta.get('ohlcv_fields')
+                    _ohlcv_tuple = bool(_ctx_meta.get('ohlcv_tuple'))
                     proc = Process(
                         target=security_process_main,
                         args=(
@@ -538,6 +545,8 @@ class ScriptRunner:
                             sec_state.stop_event,
                             sec_state.is_ltf,
                             sec_result_locks,
+                            _ohlcv_fields,
+                            _ohlcv_tuple,
                         ),
                         daemon=True,
                     )
