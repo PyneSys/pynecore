@@ -79,13 +79,23 @@ def __test_grow__():
 
 
 def __test_bind_any_stateful__():
-    """ __bind_any__: state-carrying callee gets a bound partial, state persists """
+    """ __bind_any__: state-carrying callee gets a bound partial, state persists;
+    a rebind keeps the state vector when the same logical callee was redefined
+    for a new bar (same layout), and resets only on a genuinely different
+    callee (distinct layout) """
     acc = _make_stateful()
     parent = _make_state(LAYOUT_PARENT)
     bound = __bind_any__(parent, 2, acc)
     assert parent[2] == (acc, bound)
     assert bound(1.0) == 1.0
     assert bound(2.0) == 3.0
+    # Same logical callee redefined for a new bar (new object, same layout):
+    # the identity check misses, but the state vector is kept.
+    rebound = __bind_any__(parent, 2, _make_stateful())
+    assert rebound(1.0) == 4.0  # continues the slot's state (3.0 + 1.0)
+    # A genuinely different callee (distinct layout) gets fresh state.
+    other = __bind_any__(parent, 2, _make_stateful(layout=dict(LAYOUT_LEAF)))
+    assert other(1.0) == 1.0
 
 
 def __test_bind_any_stateless__():
@@ -143,7 +153,9 @@ def __test_bind_any_dispatcher_hook__():
 
 
 def __test_bind_any_loop__():
-    """ __bind_any_loop__: per-iteration instances, in-place rebind on miss """
+    """ __bind_any_loop__: per-iteration instances; an in-place rebind keeps the
+    iteration's state when the same logical callee was redefined (same layout),
+    and resets only on a genuinely different callee (distinct layout) """
     acc = _make_stateful()
     children: list = []
     first = __bind_any_loop__(children, 0, acc)
@@ -152,12 +164,16 @@ def __test_bind_any_loop__():
     assert first(1.0) == 1.0
     assert first(2.0) == 3.0
     assert second(5.0) == 5.0  # own instance, untouched by first
-    # identity miss at an existing index rebinds in place with fresh state
-    other = _make_stateful()
-    rebound = __bind_any_loop__(children, 0, other)
-    assert children[0] == (other, rebound)
-    assert rebound(1.0) == 1.0
-    assert second(1.0) == 6.0  # the sibling entry keeps its state
+    # Same logical callee redefined for a new bar (new object, same layout):
+    # identity miss at index 0, but its per-iteration state is kept.
+    redefined = _make_stateful()
+    rebound = __bind_any_loop__(children, 0, redefined)
+    assert children[0] == (redefined, rebound)
+    assert rebound(1.0) == 4.0  # continues index 0's state (3.0 + 1.0)
+    assert second(1.0) == 6.0   # the sibling entry keeps its own state
+    # A genuinely different callee (distinct layout) resets to fresh state.
+    other = __bind_any_loop__(children, 0, _make_stateful(layout=dict(LAYOUT_LEAF)))
+    assert other(1.0) == 1.0
 
 
 def __test_reset__():
