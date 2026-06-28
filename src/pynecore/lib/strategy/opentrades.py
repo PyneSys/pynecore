@@ -234,7 +234,7 @@ def size(trade_num: int) -> PyneFloat:
     :return: The size and direction (<0 short >0 long) of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
