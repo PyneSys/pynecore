@@ -37,14 +37,18 @@ def copy(id: dict[TKey, TValue]) -> dict[TKey, TValue]:
 
 
 # noinspection PyShadowingBuiltins
-def get(id: dict[TKey, TValue], key: TKey) -> TValue:
+def get(id: dict[TKey, TValue], key: TKey) -> TValue | NA:
     """
     Get the value of a key in the map.
 
     :param id: The map to get the value from.
     :param key: The key to get the value from.
+    :return: The value associated with the key, or na when the key is absent.
     """
-    return id[key]
+    try:
+        return id[key]
+    except KeyError:
+        return NA(None)  # value type is unknown at run-time (see ``remove``)
 
 
 # noinspection PyShadowingBuiltins
