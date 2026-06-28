@@ -335,6 +335,46 @@ def __test_provisional_replay_is_not_islast__():
     assert flags[2] is True
 
 
+def __test_deferred_newer_bar_reports_isnew_once__():
+    """A deferred brand-new closed bar fires ``barstate.isnew`` exactly once.
+
+    A provider gap holds an older provisional's close open while a newer closed
+    bar arrives; the newer bar cannot join the closed segment yet, so it is
+    deferred into the provisional chain. Unlike a slot promoted from the
+    developing tail — which already fired ``barstate.isnew`` while forming — this
+    bar has never run, so its first replay must report ``is_new=True`` like the
+    normal closed path, then ``False`` on every later replay. The contrast guards
+    both directions: the deferred-new bar fires isnew once, the developing-
+    promoted provisional never re-fires it.
+    """
+    h = _Harness()
+    c = h.collector()
+    n_ms = T + LTF          # idx 1 (N, the gap)
+    n1_ms = T + 2 * LTF     # idx 2 (N+1, promoted from the developing tail)
+    b_ms = T + 3 * LTF      # idx 3 (B, brand-new closed bar deferred behind the gap)
+
+    c.process_round(T, PERIOD_END, [_Bar.at(T, 1.0)], _Bar.at(n_ms, 2.0),
+                    chart_confirmed=False)
+    c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 3.0), chart_confirmed=False)
+    # GAP: N's close is missing; B arrives brand-new with no developing tick and
+    # is deferred into the chain behind the stalled N+1. Its first run must fire
+    # isnew (it has never executed), while N+1's provisional replay must not.
+    c.process_round(T, PERIOD_END, [_Bar.at(b_ms, 4.0)], None, chart_confirmed=False)
+    assert [r[2] for r in h.runs if r[0] == 3] == [True]
+    assert [r[2] for r in h.runs if r[0] == 2] == [True, False]
+
+    # Drain the chain: N's late close, then N+1's and B's closes together. No
+    # replay, confirmed close, or re-tick re-fires isnew for any intrabar.
+    c.process_round(T, PERIOD_END, [_Bar.at(n_ms, 2.0)], None, chart_confirmed=False)
+    c.process_round(T, PERIOD_END, [_Bar.at(n1_ms, 3.0), _Bar.at(b_ms, 4.0)],
+                    None, chart_confirmed=False)
+    for idx in (1, 2, 3):
+        flags = [r[2] for r in h.runs if r[0] == idx]
+        assert flags[0] is True            # first run fires barstate.isnew
+        assert not any(flags[1:])          # every later replay/close is not isnew
+        assert sum(flags) == 1             # fired exactly once overall
+
+
 def __test_race_chain_replay_recomputes_var_state__():
     """A late close that differs from the dev tick propagates to later intrabars."""
     h = _AccHarness()                  # run does acc += value; value depends on state

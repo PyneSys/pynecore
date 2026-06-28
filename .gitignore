@@ -22,6 +22,11 @@ workdir/
 # Pytest cache
 .pytest_cache/
 
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+
 # dist directory
 dist/
 

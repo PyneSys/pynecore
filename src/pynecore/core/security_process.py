@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Lock as LockType
     from .live_runner import LiveBarStreamer
+    from ..types.ohlcv import OHLCV
 
 
 # Warmup window for cross-symbol live security contexts. 500 bars matches the
@@ -234,6 +235,93 @@ def _run_rate_source_loop(
         live_streamer.stop()
         result_block.close()
         sync_block.close()
+
+
+def _collect_in_period_intrabars(
+        bar_buffer: 'list[OHLCV]',
+        next_idx: int,
+        period_end_exclusive: int,
+        ltf_span_ms: int,
+        chart_developing: bool,
+        grace_seconds: float,
+        wait_for_bars: 'Callable[[float], list[OHLCV]]',
+        ingest: 'Callable[[OHLCV], None]',
+        *,
+        now: 'Callable[[], float] | None' = None,
+) -> 'tuple[list[OHLCV], int]':
+    """Collect a chart period's closed intrabars, blocking (bounded) for a lagging
+    final intrabar on a confirmed chart bar.
+
+    Advances ``next_idx`` through ``bar_buffer`` collecting every closed intrabar
+    inside ``[period_start, period_end_exclusive)`` (future-period bars are left
+    for the next round). On a developing chart bar the partial collection is
+    returned at once. On a confirmed chart bar the published array must be the
+    FULL closed period, so when the final in-period intrabar
+    (``ts >= period_end_exclusive - ltf_span_ms``) is still missing the loop waits
+    up to ``grace_seconds`` for the streamer to deliver it, ingesting late bars as
+    they arrive — unless a later-period bar is already buffered, which means the
+    final intrabar is genuinely gone (a provider gap) and waiting would only burn
+    the grace. Warmup is a no-op here (its bars are already buffered).
+
+    The clock (``now``) and the streamer wait/ingest are injected so the loop is
+    deterministically testable without real time; ``now`` defaults to
+    :func:`time.monotonic`.
+
+    :param bar_buffer: The shared, append-only intrabar buffer; ``ingest`` mutates
+        this same list, so bars delivered by ``wait_for_bars`` become visible to
+        the next collect pass.
+    :param next_idx: Cursor into ``bar_buffer`` of the first not-yet-consumed bar.
+    :param period_end_exclusive: Exclusive end of the chart period, in ms.
+    :param ltf_span_ms: One LTF intrabar span, in ms (defines the final-intrabar
+        open as ``period_end_exclusive - ltf_span_ms``).
+    :param chart_developing: True for a forming chart bar (return the partial
+        collection without waiting), False for a confirmed one.
+    :param grace_seconds: Maximum seconds to block for the lagging final intrabar.
+    :param wait_for_bars: ``(timeout) -> list[OHLCV]`` blocking wait on the
+        streamer, up to ``timeout`` seconds.
+    :param ingest: ``(bar) -> None`` appends a streamer bar into ``bar_buffer``.
+    :param now: ``() -> float`` monotonic clock; defaults to ``time.monotonic``.
+    :return: ``(collected, next_idx)`` — the in-period intrabars and the advanced
+        cursor.
+    """
+    if now is None:
+        now = monotonic
+    collected: 'list[OHLCV]' = []
+    final_open = period_end_exclusive - ltf_span_ms
+    deadline = now() + grace_seconds
+    while True:
+        while next_idx < len(bar_buffer):
+            _b = bar_buffer[next_idx]
+            if int(_b.timestamp * 1000) >= period_end_exclusive:
+                break
+            collected.append(_b)
+            next_idx += 1
+        if chart_developing:
+            break
+        if collected and int(collected[-1].timestamp * 1000) >= final_open:
+            break
+        # A bar beyond this period is already buffered: the stream has advanced
+        # past the period end, so the final in-period intrabar is genuinely
+        # missing (a gap) — stop waiting and publish what we have rather than
+        # burning the full grace.
+        if next_idx < len(bar_buffer):
+            logger.warning(
+                "Live LTF period ending %d ms missing its final intrabar "
+                "(stream advanced past it); publishing the gap as-is",
+                period_end_exclusive,
+            )
+            break
+        _remaining = deadline - now()
+        if _remaining <= 0:
+            logger.warning(
+                "Live LTF period ending %d ms incomplete after %.0fs grace; "
+                "publishing without the final intrabar",
+                period_end_exclusive, grace_seconds,
+            )
+            break
+        for _sb in wait_for_bars(_remaining):
+            ingest(_sb)
+    return collected, next_idx
 
 
 # noinspection PyProtectedMember
@@ -669,41 +757,11 @@ def security_process_main(
             # published array must be the FULL closed period, so wait (bounded)
             # for the final in-period intrabar if the streamer lags — a no-op
             # during warmup, where the REST bars are already buffered.
-            collected: list[OHLCV] = []
-            final_open = period_end_exclusive - ltf_span_ms
-            deadline = monotonic() + live_bar_grace_seconds
-            while True:
-                while ltf_next_idx < len(bar_buffer):
-                    _b = bar_buffer[ltf_next_idx]
-                    if int(_b.timestamp * 1000) >= period_end_exclusive:
-                        break
-                    collected.append(_b)
-                    ltf_next_idx += 1
-                if chart_developing:
-                    break
-                if collected and int(collected[-1].timestamp * 1000) >= final_open:
-                    break
-                # A bar beyond this period is already buffered: the stream has
-                # advanced past the period end, so the final in-period intrabar
-                # is genuinely missing (a gap) — stop waiting and publish what we
-                # have rather than burning the full grace.
-                if ltf_next_idx < len(bar_buffer):
-                    logger.warning(
-                        "Live LTF period ending %d ms missing its final intrabar "
-                        "(stream advanced past it); publishing the gap as-is",
-                        period_end_exclusive,
-                    )
-                    break
-                _remaining = deadline - monotonic()
-                if _remaining <= 0:
-                    logger.warning(
-                        "Live LTF period ending %d ms incomplete after %.0fs grace; "
-                        "publishing without the final intrabar",
-                        period_end_exclusive, live_bar_grace_seconds,
-                    )
-                    break
-                for _sb in _streamer.wait_for_bars(_remaining):
-                    _ingest_streamer_bar(_sb)
+            collected, ltf_next_idx = _collect_in_period_intrabars(
+                bar_buffer, ltf_next_idx, period_end_exclusive, ltf_span_ms,
+                chart_developing, live_bar_grace_seconds,
+                _streamer.wait_for_bars, _ingest_streamer_bar,
+            )
 
             developing_bar: 'OHLCV | None' = None
             if chart_developing:
