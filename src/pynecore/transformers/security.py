@@ -17,6 +17,18 @@ _FORBIDDEN_STRATEGY_STATE_ATTRS = frozenset({
     "position_avg_price", "position_size", "wintrades",
 })
 
+# Raw price series the security child can serve WITHOUT running the script's
+# ``main()``: every one is set straight from the bar by ``_set_lib_properties``
+# (the derived sources hl2/hlc3/ohlc4/hlcc4 are pure functions of that bar's
+# OHLC, also set there), so reading ``lib.<field>`` after the per-bar property
+# set is byte-identical to what ``main()`` would have produced. A
+# ``request.security[_lower_tf]`` whose expression is only these can take the
+# fast path (see ``security_process.security_process_main``).
+_OHLCV_PASSTHROUGH_FIELDS = frozenset({
+    "open", "high", "low", "close", "volume",
+    "hl2", "hlc3", "ohlc4", "hlcc4",
+})
+
 
 class SecurityTransformer(ast.NodeTransformer):
     """
@@ -174,6 +186,42 @@ class SecurityTransformer(ast.NodeTransformer):
         if isinstance(node, ast.Call):
             return SecurityTransformer._is_module_level_expr(node.func)
         return False
+
+    @staticmethod
+    def _ohlcv_field(node: ast.expr) -> str | None:
+        """Return the raw-OHLCV field name if ``node`` is a bare reference to one
+        (``close`` or ``lib.close``), else None. Conservative: only a plain
+        Name/``lib.<attr>`` matches — any computation falls through to the full
+        ``main()`` path."""
+        if isinstance(node, ast.Name) and node.id in _OHLCV_PASSTHROUGH_FIELDS:
+            return node.id
+        if (isinstance(node, ast.Attribute) and node.attr in _OHLCV_PASSTHROUGH_FIELDS
+                and isinstance(node.value, ast.Name) and node.value.id == 'lib'):
+            return node.attr
+        return None
+
+    @classmethod
+    def _ohlcv_passthrough(cls, expression: ast.expr | None) -> tuple[list[str], bool] | None:
+        """Detect a plain-OHLCV ``request.security[_lower_tf]`` expression.
+
+        Returns ``(field_names, is_tuple)`` when every element is a raw price
+        series (so the security child can serve it without running ``main()``),
+        or ``None`` otherwise. ``is_tuple`` is True for a tuple/list expression
+        (column-major arrays) and False for a scalar.
+        """
+        if expression is None:
+            return None
+        if isinstance(expression, (ast.Tuple, ast.List)):
+            if not expression.elts:
+                return None
+            fields = [cls._ohlcv_field(e) for e in expression.elts]
+            if all(f is not None for f in fields):
+                return [f for f in fields if f is not None], True
+            return None
+        field = cls._ohlcv_field(expression)
+        if field is not None:
+            return [field], False
+        return None
 
     # --- AST node builders ---
 
@@ -567,6 +615,17 @@ class SecurityTransformer(ast.NodeTransformer):
 
             if not is_ltf and currency is not None:
                 ctx['currency'] = copy.deepcopy(currency)
+
+            # Plain-OHLCV fast path: when the expression is only raw price
+            # series, the security child can serve it straight from each bar
+            # without running main() (see security_process.security_process_main).
+            passthrough = self._ohlcv_passthrough(expression)
+            if passthrough is not None:
+                fields, is_tuple = passthrough
+                ctx['ohlcv_fields'] = ast.List(
+                    elts=[ast.Constant(value=f) for f in fields], ctx=ast.Load()
+                )
+                ctx['ohlcv_tuple'] = ast.Constant(value=is_tuple)
 
             # Track if barmerge is used (only for non-LTF)
             if not is_ltf:

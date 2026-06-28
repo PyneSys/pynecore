@@ -1048,6 +1048,13 @@ class ScriptRunner:
                         # ``__sec_signal__`` drives the LTF-window path for every
                         # round (warmup replay and live alike).
                         sec_state.ltf_live_stream = True
+                    # Plain-OHLCV fast path: a context whose expression is only
+                    # raw price series is served straight from each bar in the
+                    # child, skipping the per-bar main() re-run (SecurityTransformer
+                    # records the field list in __security_contexts__).
+                    _ctx_meta = cast('dict[str, dict]', sec_contexts)[sid]
+                    _ohlcv_fields = _ctx_meta.get('ohlcv_fields')
+                    _ohlcv_tuple = bool(_ctx_meta.get('ohlcv_tuple'))
                     proc = Process(
                         target=security_process_main,
                         args=(
@@ -1062,6 +1069,8 @@ class ScriptRunner:
                             sec_state.stop_event,
                             sec_state.is_ltf,
                             sec_result_locks,
+                            _ohlcv_fields,
+                            _ohlcv_tuple,
                         ),
                         daemon=True,
                     )
