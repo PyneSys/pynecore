@@ -202,6 +202,138 @@ SymInfo(
 )
 ```
 
+### Effective-Dated Session Schedules
+
+Markets occasionally change their trading hours — a futures contract shortens its
+night session, an exchange shifts an open by half an hour, and so on. The fields
+above describe **one** static schedule. If a backtest range spans such a change,
+that single schedule confirms the bars on the *other* side of the change against
+the wrong hours, producing a small, quiet divergence on exactly the dates around
+the change.
+
+The optional `session_schedules` field fixes this. It is an **effective-dated
+history**: a list of schedule *variants*, each in effect from a given date until
+the next variant's date. It is entirely **opt-in** — leave it empty (the default)
+and the symbol keeps its single flat schedule, with no per-era refinement. When you
+do have the historical hours (from exchange notices,
+your data vendor, or your own records), add them by hand and every bar is
+confirmed against the schedule that was actually in effect on its trading day.
+
+> **Scope:** in the current release a history affects **session-bounded higher-
+> timeframe confirmation** — i.e. how `request.security()` confirms an intraday HTF
+> bar that is bounded by its trading session (see
+> [request.security() Internals](../advanced/request-security-internals.md)).
+> A symbol without a history confirms every such bar against its single flat
+> schedule; the history only refines *which* schedule applies on each side of a
+> change.
+
+#### Resolution rules
+
+- Each variant has an `effective_from` date (the exchange-local **trading-day**
+  date the new hours took effect) and its own `opening_hours` / `session_starts` /
+  `session_ends`.
+- A bar is matched to the **last** variant whose `effective_from` is on or before
+  the bar's trading day. A bar before the earliest variant uses the earliest one.
+- The trading-day key matters for overnight sessions: a night bar that opens the
+  evening before belongs to the **next** trading day, so it is confirmed against
+  that day's variant — not the calendar date of its open.
+- The flat `opening_hours` / `session_starts` / `session_ends` always mirror the
+  **newest** variant. When a history is present they are regenerated from it on
+  save, so **edit the variants, not the flat block** — the flat block is derived.
+
+#### In TOML
+
+A `.toml` written for a symbol *without* a history includes a commented-out
+example showing the exact layout. Uncomment and adapt it, or write the blocks
+directly. List variants oldest first; `effective_from` must be the **first line**
+of each block (an unquoted date), before its nested tables:
+
+```toml
+# A futures contract whose night session END moved 23:30 -> 23:00 on 2026-01-12.
+
+[[session_schedules]]
+effective_from = 2025-06-01
+[[session_schedules.opening_hours]]
+day = 0
+start = "10:00:00"
+end = "18:00:00"
+[[session_schedules.opening_hours]]
+day = 0
+start = "21:00:00"
+end = "23:30:00"
+[[session_schedules.session_starts]]
+day = 0
+time = "10:00:00"
+[[session_schedules.session_ends]]
+day = 0
+time = "23:30:00"
+
+[[session_schedules]]
+effective_from = 2026-01-12
+[[session_schedules.opening_hours]]
+day = 0
+start = "10:00:00"
+end = "18:00:00"
+[[session_schedules.opening_hours]]
+day = 0
+start = "21:00:00"
+end = "23:00:00"
+[[session_schedules.session_starts]]
+day = 0
+time = "10:00:00"
+[[session_schedules.session_ends]]
+day = 0
+time = "23:00:00"
+```
+
+`day` is the weekday of the session open (`0` = Monday … `6` = Sunday); an
+overnight interval is one whose `end` is at or before its `start`. `effective_from`
+also accepts a quoted `"YYYY-MM-DD"` string. Duplicate `effective_from` dates are
+rejected on load.
+
+#### In Python
+
+Build the same history programmatically with `SymInfoScheduleVariant`:
+
+```python
+from datetime import date, time
+from pynecore.core.syminfo import (
+    SymInfo, SymInfoInterval, SymInfoSession, SymInfoScheduleVariant,
+)
+
+def night_variant(effective_from, night_end):
+    return SymInfoScheduleVariant(
+        effective_from=effective_from,
+        opening_hours=[
+            SymInfoInterval(day=d, start=time(10, 0), end=time(18, 0)) for d in range(5)
+        ] + [
+            SymInfoInterval(day=d, start=time(21, 0), end=night_end) for d in range(5)
+        ],
+        session_starts=[SymInfoSession(day=d, time=time(10, 0)) for d in range(5)],
+        session_ends=[SymInfoSession(day=d, time=night_end) for d in range(5)],
+    )
+
+variants = [
+    night_variant(date(2025, 6, 1), time(23, 30)),   # old hours
+    night_variant(date(2026, 1, 12), time(23, 0)),   # new hours
+]
+
+syminfo = SymInfo(
+    prefix="EXCH", description="Palm Oil Future", ticker="FCPO1!",
+    currency="MYR", period="720", type="futures",
+    mintick=1.0, pricescale=1, minmove=1, pointvalue=25.0, mincontract=1.0,
+    timezone="Asia/Kuala_Lumpur", volumetype="base",
+    # The flat fields mirror the newest variant; the history is the source of truth.
+    opening_hours=variants[-1].opening_hours,
+    session_starts=variants[-1].session_starts,
+    session_ends=variants[-1].session_ends,
+    session_schedules=variants,
+)
+```
+
+`SymInfo` exposes `has_schedule_history`, `schedule_index_for(date)` and
+`schedule_for(date)` to inspect which variant applies on a given date.
+
 ### Period Values
 
 The `period` field uses the same values as TradingView's Pine Script `timeframe.period`:
