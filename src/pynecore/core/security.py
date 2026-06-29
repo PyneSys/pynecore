@@ -12,8 +12,9 @@ Architecture:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from enum import Enum, auto
 from multiprocessing import Event, Lock
 from pathlib import Path
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
     from typing import Callable
     from .resampler import Resampler
     from .htf_aggregator import HTFAggregator
-    from .syminfo import SymInfo, SymInfoSession
+    from .syminfo import SymInfo, SymInfoSession, SymInfoInterval
+
+logger = logging.getLogger(__name__)
 
 
 class Lookahead(Enum):
@@ -228,6 +231,13 @@ class SecurityState:
     # ``sec_grid_args`` are the security's own (tz, session_starts,
     # opening_hours, mode) for the past-end-of-data fallback grid.
     bar_opens: list[int] | None = None
+    # Session-bounded intraday HTF only: the scheduled session-end instant (ms)
+    # of each ``bar_opens`` entry, derived from ``opening_hours``.
+    # ``_get_confirmed_time`` then confirms such a bar on its session end
+    # (calendar-known) instead of the arithmetic next-period boundary, which a
+    # non-trading gap before the next session would push a full period late.
+    # ``None`` for D/W/M, sessionless and dense feeds (they keep the grid clamp).
+    bar_closes: list[int] | None = None
     bar_opens_multiperiod: bool = False
     bar_ptr: int = -1
     chart_off: int = 0
@@ -358,6 +368,29 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     if state.bar_opens is None:
         return grid_target
 
+    opens = state.bar_opens
+    n = len(opens)
+    ptr = state.bar_ptr
+
+    if state.bar_closes is not None:
+        # Session-bounded intraday HTF: each real bar closes at its session's
+        # scheduled end (calendar-known via ``opening_hours``), NOT at the
+        # arithmetic next-period boundary — a non-trading gap before the next
+        # session (e.g. the dead time between a futures day and night session)
+        # would otherwise delay confirmation by a full period. TradingView
+        # ``lookahead_off`` confirms the bar on its own last chart bar, whose
+        # close coincides with the session end. Confirm the latest real bar whose
+        # session end the chart bar's close (``close_time``) has reached.
+        # ``close_time`` and ``bar_closes`` are both monotonic across chart bars,
+        # so the persistent ``bar_ptr`` only ever advances.
+        closes = state.bar_closes
+        while ptr + 1 < n and closes[ptr + 1] <= close_time:
+            ptr += 1
+        state.bar_ptr = ptr
+        if ptr >= 0 and closes[ptr] <= close_time:
+            return opens[ptr]
+        return state.last_confirmed
+
     # Single-period D/W/M with a loaded child: the grid above gives the correct
     # calendar close instant, but the child may carry a bar only on scattered
     # days (sparse macro series). Clamp the grid target to the latest real child
@@ -370,9 +403,6 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     # so the persistent ``bar_ptr`` only ever advances. ``last_confirmed`` is a
     # timestamp (0 = before any bar), returned while the chart precedes the first
     # real open so nothing is confirmed yet.
-    opens = state.bar_opens
-    ptr = state.bar_ptr
-    n = len(opens)
     while ptr + 1 < n and opens[ptr + 1] <= grid_target:
         ptr += 1
     state.bar_ptr = ptr
@@ -985,6 +1015,130 @@ def resolve_session_anchor(
     return None, None
 
 
+def _session_bar_closes(
+        opens: list[int],
+        tz: ZoneInfo | None,
+        opening_hours: list[SymInfoInterval],
+        period_ms: int,
+) -> list[int] | None:
+    """
+    Close instant (epoch ms) of each intraday HTF bar: the earlier of its period
+    end and its session's scheduled end.
+
+    An HTF bar covers ``[open, open + period)`` but never extends past its trading
+    session, so it closes at ``min(open + period, session_end)``. When the period
+    is at least as long as the session (one bar per session, e.g. a 720-minute bar
+    on a 3-session palm-oil contract) the session end wins, and ``_get_confirmed_
+    time`` confirms the bar there instead of at the arithmetic next-period boundary
+    that the non-trading gap before the next session would push a full period late.
+    When several bars fit inside a session (e.g. a 60-minute HTF) the period end
+    wins and behaviour matches the plain grid. Each open's session end comes from
+    the ``opening_hours`` interval that contains it (overnight intervals — ``end <=
+    start`` — close on the following calendar day). A bar opening *after* midnight
+    is matched to the PREVIOUS calendar day's overnight interval, whose session it
+    belongs to (e.g. a ``21:00->02:00`` night session's ``01:00`` bar closes at the
+    ``02:00`` session end, not a full period later).
+
+    :param opens: HTF bar opens in epoch ms, ascending.
+    :param tz: The security's exchange timezone.
+    :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
+    :param period_ms: The HTF period length in milliseconds.
+    :return: A parallel list of close instants (epoch ms), or ``None`` if any open
+        has no containing interval — the schedule does not fully describe the
+        feed, so the caller keeps the arithmetic grid clamp rather than risk a
+        wrong session end.
+    """
+    closes: list[int] = []
+    for open_ms in opens:
+        open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
+        weekday = open_dt.weekday()
+        prev_weekday = (weekday - 1) % 7
+        open_time = open_dt.time()
+        end_ms: int | None = None
+        for interval in opening_hours:
+            overnight = interval.end <= interval.start
+            if (interval.day == weekday and interval.start <= open_time
+                    and (overnight or open_time < interval.end)):
+                # Same-day session, or the pre-midnight leg of an overnight one
+                # (which closes on the following calendar day).
+                end_date = open_dt.date() + timedelta(days=1 if overnight else 0)
+            elif overnight and interval.day == prev_weekday and open_time < interval.end:
+                # After-midnight leg of the PREVIOUS day's overnight session: the
+                # bar opens today but its session started yesterday and closes
+                # today (e.g. a 21:00->02:00 night session's 01:00 bar).
+                end_date = open_dt.date()
+            else:
+                continue
+            candidate = int(
+                datetime.combine(end_date, interval.end, tzinfo=tz).timestamp() * 1000)
+            if end_ms is None or candidate < end_ms:
+                end_ms = candidate
+        if end_ms is None:
+            return None
+        # Whichever comes first: the bar's own period end, or the session end (a
+        # non-trading gap before the next session must not delay confirmation).
+        closes.append(min(open_ms + period_ms, end_ms))
+    return closes
+
+
+def _dated_session_bar_closes(
+        opens: list[int],
+        tz: ZoneInfo | None,
+        si: SymInfo,
+        period_ms: int,
+        overnight: dict[int, time],
+) -> list[int] | None:
+    """
+    Close instants for an HTF feed whose exchange changed its session hours within
+    the data range (effective-dated schedule history).
+
+    Like :func:`_session_bar_closes`, but each bar open is matched to the session
+    schedule *variant* effective on its exchange-local trading day, so a backtest
+    spanning a session-hours change confirms each side with its own schedule. The
+    trading-day key (not the raw calendar date of the open) is what
+    ``request.security`` already uses to attribute overnight bars: a night bar
+    opening 21:00 the evening before belongs to the next trading day and must take
+    that day's variant -- keying on the raw open date would mis-assign the boundary
+    bar by one day, exactly where a schedule change lives.
+
+    Consecutive opens resolving to the same variant index are grouped into one
+    segment and handed to the UNCHANGED :func:`_session_bar_closes` with that
+    variant's ``opening_hours``, so every segment runs the same, already-tested
+    close-instant arithmetic. Grouping is by variant *index* (not object identity),
+    so an ``A -> B -> A`` history yields three segments and the result is stable
+    even if the resolver ever returns copies. Any segment the schedule cannot fully
+    describe returns ``None``, propagated so the caller keeps the arithmetic grid
+    clamp.
+
+    :param opens: HTF bar opens in epoch ms, ascending.
+    :param tz: The security's exchange timezone.
+    :param si: The security's :class:`SymInfo` (carries ``session_schedules``).
+    :param period_ms: The HTF period length in milliseconds.
+    :param overnight: Per-weekday rolling opens from ``overnight_opens``, used to
+        roll each open to its trading day.
+    :return: A parallel list of close instants, or ``None`` if any variant fails to
+        describe its bars.
+    """
+    from .resampler import trading_day
+    # Resolve every open's variant index in one pass (trading-day keyed), then walk
+    # maximal same-index runs. Setup-time only -- never on the per-bar hot path.
+    idx = [si.schedule_index_for(trading_day(o // 1000, tz, overnight)) for o in opens]
+    closes: list[int] = []
+    i, n = 0, len(opens)
+    while i < n:
+        k = idx[i]
+        j = i
+        while j < n and idx[j] == k:
+            j += 1
+        oh = si.session_schedules[k].opening_hours
+        seg = _session_bar_closes(opens[i:j], tz, oh, period_ms)
+        if seg is None:
+            return None
+        closes.extend(seg)
+        i = j
+    return closes
+
+
 def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     """
     Load the child's real bar opens for HTF confirmation against the actual feed.
@@ -1019,7 +1173,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle.
     from ..lib import timeframe as tf_module
     from .ohlcv_file import OHLCVReader
-    from .resampler import grid_mode
+    from .resampler import grid_mode, overnight_opens, trading_day
     from .syminfo import SymInfo
     # noinspection PyProtectedMember
     modifier, multiplier = tf_module._process_tf(state.timeframe)
@@ -1030,12 +1184,21 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # a dense feed keeps the arithmetic grid. LTF runs its own machinery.
         if state.is_ltf:
             return
+        period_sec = tf_module.in_seconds(state.timeframe)
         with OHLCVReader(data_path) as reader:
             start_ts = reader.start_timestamp
             if start_ts is None:
                 return
             opens = [candle.timestamp * 1000 for candle in reader.read_from(start_ts)]
-            if len(opens) == reader.size:
+            # A feed is dense only when its real bars tile the timeframe grid (file
+            # interval == period). The row count alone is not enough: a session-
+            # spaced feed whose bars sit wider than the period (e.g. a gap-free,
+            # 24h-spaced 720-minute night future) has no gap fills, so
+            # ``len(opens) == reader.size`` holds, yet its bars do NOT tile the
+            # period grid and must still ride the session-close path below. A
+            # single-record file has no interval to compare, so it keeps the dense
+            # fast path as before.
+            if len(opens) == reader.size and reader.interval in (None, period_sec):
                 return  # dense feed: the arithmetic grid is already correct
         # Gappy fixed-span intraday HTF: keep the arithmetic (fixed-span) grid for
         # the close instant, but CLAMP it to the latest real open so an empty
@@ -1068,6 +1231,58 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         sec_starts = si.session_starts or None
         sec_hours = si.opening_hours or None
         mode = grid_mode(si.type, si.opening_hours)
+
+        # Session-bounded intraday HTF (e.g. a futures contract's day/night
+        # sessions): confirm each bar on its scheduled session end instead of the
+        # arithmetic next-period boundary (see ``_get_confirmed_time``). Needs the
+        # session schedule; ``None`` (no schedule, or a bar outside it) keeps the
+        # grid clamp.
+        if not is_dwm and sec_hours:
+            period_ms = tf_module.in_seconds(state.timeframe) * 1000
+            if si.has_schedule_history:
+                # The trading-day roll keys off the flat (newest) session opens;
+                # this Core path assumes the session OPEN / trading-day attribution
+                # is stable across variants (close-only era changes, e.g. a futures
+                # contract that shortened its night session). A symbol that shifts
+                # its session START across eras needs the deferred session-anchoring
+                # work -- the assumption is stated here in code, not only the docs.
+                overnight = overnight_opens(sec_hours, sec_starts)
+                # Surface that unsupported shape instead of silently mis-confirming:
+                # an earlier variant whose overnight session OPENS at a different
+                # time than the newest one (a session-START shift, not a close-only
+                # change) is rolled to the wrong trading day by the newest-keyed
+                # ``overnight`` above and can pick the wrong variant. Only a weekday
+                # that is overnight in BOTH variants but at a different time counts;
+                # a structurally different (e.g. day-only) era is handled by the
+                # ``None`` fallback below, not a START shift.
+                for variant in si.session_schedules[:-1]:
+                    vo = overnight_opens(variant.opening_hours, variant.session_starts)
+                    if any(overnight.get(d) is not None and t != overnight[d]
+                           for d, t in vo.items()):
+                        logger.warning(
+                            "%s:%s session schedule history changes the overnight "
+                            "session OPEN at variant effective %s; the dated HTF "
+                            "path attributes every bar by the newest variant's open, "
+                            "so bars near that change may confirm against the wrong "
+                            "variant. Session-START shifts are not yet supported "
+                            "(close-only era changes are).",
+                            si.prefix, si.ticker, variant.effective_from)
+                        break
+                if opens:
+                    first_td = trading_day(opens[0] // 1000, sec_tz, overnight)
+                    earliest = si.session_schedules[0].effective_from
+                    if first_td < earliest:
+                        logger.warning(
+                            "%s:%s session schedule history starts %s but the HTF "
+                            "feed opens on trading day %s; the oldest variant was "
+                            "applied to the earlier bars. Add an earlier "
+                            "[[session_schedules]] variant for an exact backtest "
+                            "across that range.",
+                            si.prefix, si.ticker, earliest, first_td)
+                state.bar_closes = _dated_session_bar_closes(
+                    opens, sec_tz, si, period_ms, overnight)
+            else:
+                state.bar_closes = _session_bar_closes(opens, sec_tz, sec_hours, period_ms)
     state.sec_grid_args = (sec_tz, sec_starts, sec_hours, mode)
 
 
