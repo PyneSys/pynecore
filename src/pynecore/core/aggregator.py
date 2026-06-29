@@ -128,6 +128,22 @@ def aggregate_ohlcv(
 
             start_ts = reader.start_timestamp
             if start_ts is None:
+                if reader.size == 1:
+                    # A single-record source has no derivable interval (the reader
+                    # needs two timestamps to infer one), so ``start_timestamp`` is
+                    # None and ``read_from`` yields nothing — yet that lone bar IS a
+                    # whole target period and must be emitted. Floor its timestamp
+                    # onto the target grid (exactly as the loop below does) so HTF
+                    # confirmation (the ``bar_opens`` clamp) and
+                    # ``request.security(.., time)`` see the period boundary, not the
+                    # raw sub-bar instant.
+                    only = reader.read(0)
+                    only_bar_time = resampler.get_bar_time(
+                        (only.timestamp + src_off) * 1000, tz=tz,
+                        session_starts=session_starts,
+                        opening_hours=opening_hours, mode=mode) // 1000
+                    writer.write(_merge_candles([only], only_bar_time))
+                    return 1, 1
                 return 0, 0
 
             for candle in reader.read_from(start_ts):

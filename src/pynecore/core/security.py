@@ -1212,9 +1212,19 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # and only *clamps* to these opens — see ``_get_confirmed_time``.
         state.bar_opens_multiperiod = multiplier > 1
         with OHLCVReader(data_path) as reader:
-            start_ts = reader.start_timestamp
-            opens = ([] if start_ts is None else
-                     [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
+            if reader.size == 1:
+                # A single-record feed has no derivable interval, so
+                # ``start_timestamp`` stays ``None`` and ``read_from`` bails —
+                # ``opens`` would be empty and ``_get_confirmed_time`` would then
+                # never confirm the lone bar (the child reads ``na`` forever).
+                # This is reachable when a finer base feed spans exactly one
+                # requested D/W/M period and resamples to a single aggregate.
+                # Read the one bar directly so its open still anchors the clamp.
+                opens = [reader.read(0).timestamp * 1000]
+            else:
+                start_ts = reader.start_timestamp
+                opens = ([] if start_ts is None else
+                         [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
 
     state.bar_opens = opens
     state.bar_ptr = -1
