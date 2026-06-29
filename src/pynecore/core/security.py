@@ -633,45 +633,72 @@ def resolve_session_anchor(
 
 def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     """
-    Load the child's bar opens for daily/weekly/monthly HTF confirmation.
+    Load the child's real bar opens for HTF confirmation against the actual feed.
 
-    No-op for any other timeframe (intraday HTF data is dense enough that the
-    arithmetic grid is the correct model; loading every open would also be
-    unbounded). For D/W/M — including the single-period ``D``/``W``/``M`` case —
-    the child's data file realizes the *actual* trading calendar, which the
-    arithmetic grid cannot: macro aggregates (ECONOMICS series, dividends) carry
-    a bar only on scattered days. The arithmetic grid would emit a confirmation
-    boundary for every calendar period, so a chart bar landing on a day with no
-    real child bar advances the subprocess into an empty window — it writes
-    ``na`` and destroys the forward-fill that ``gaps_off`` (TV default) requires.
-    Walking the child's actual bar opens makes ``new_period`` fire only on real
-    bars: between them ``gaps_off`` holds the last value and ``gaps_on`` emits
-    ``na``, both matching TradingView. The security's own grid parameters are
-    loaded from its TOML for the past-end-of-data fallback.
+    The arithmetic grid in ``_get_confirmed_time`` assumes a child bar exists at
+    every grid period — true only for a DENSE feed. Two cases break it, and both
+    confirm by riding the child's real bar opens instead:
+
+    * D/W/M — including the single-period ``D``/``W``/``M`` case: macro aggregates
+      (ECONOMICS series, dividends) carry a bar only on scattered days, so the
+      grid would emit a confirmation boundary for every calendar period and a
+      chart bar landing on a day with no real child bar would advance the
+      subprocess into an empty window — writing ``na`` and destroying the
+      ``gaps_off`` (TV default) forward-fill.
+    * Gappy intraday HTF: ``OHLCVWriter`` forward-fills a session-gapped futures
+      feed (e.g. a 720-minute HTF on a 3-session palm-oil contract) to a
+      continuous grid, but the security child reads only the real bars
+      (gap-compacted, see ``security_process``). The grid would then confirm
+      phantom periods on the fills' timestamps. Dense intraday feeds keep the
+      cheaper arithmetic grid (this stays a no-op for them); LTF contexts run
+      their own intrabar machinery, not HTF confirmation.
+
+    Riding the real opens (clamp for single-period / intraday, walk for
+    multi-period D/W/M) makes ``new_period`` fire only on real bars: between them
+    ``gaps_off`` holds the last value and ``gaps_on`` emits ``na``, both matching
+    TradingView. The security's own grid parameters are loaded from its TOML for
+    the past-end-of-data fallback.
 
     :param state: Security context state (``state.timeframe`` already resolved)
     :param data_path: Path to the child's OHLCV data file
     """
     # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle.
     from ..lib import timeframe as tf_module
-    # noinspection PyProtectedMember
-    modifier, multiplier = tf_module._process_tf(state.timeframe)
-    if modifier not in ('D', 'W', 'M'):
-        return
-    # Multi-period (nD/nW/nM) walks the opens directly (the arithmetic grid
-    # cannot reproduce TradingView's scheduled multi-period calendar). Single
-    # period (1D/1W/1M) instead uses the grid for the calendar close instant and
-    # only *clamps* to these opens — see ``_get_confirmed_time``.
-    state.bar_opens_multiperiod = multiplier > 1
-
     from .ohlcv_file import OHLCVReader
     from .resampler import grid_mode
     from .syminfo import SymInfo
+    # noinspection PyProtectedMember
+    modifier, multiplier = tf_module._process_tf(state.timeframe)
+    is_dwm = modifier in ('D', 'W', 'M')
 
-    with OHLCVReader(data_path) as reader:
-        start_ts = reader.start_timestamp
-        opens = ([] if start_ts is None else
-                 [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
+    if not is_dwm:
+        # Intraday HTF: only a GAPPY feed needs the real-opens clamp (see above);
+        # a dense feed keeps the arithmetic grid. LTF runs its own machinery.
+        if state.is_ltf:
+            return
+        with OHLCVReader(data_path) as reader:
+            start_ts = reader.start_timestamp
+            if start_ts is None:
+                return
+            opens = [candle.timestamp * 1000 for candle in reader.read_from(start_ts)]
+            if len(opens) == reader.size:
+                return  # dense feed: the arithmetic grid is already correct
+        # Gappy fixed-span intraday HTF: keep the arithmetic (fixed-span) grid for
+        # the close instant, but CLAMP it to the latest real open so an empty
+        # (gap) period holds the last real bar instead of advancing into a phantom
+        # period and writing na — see ``_get_confirmed_time``.
+        state.bar_opens_multiperiod = False
+    else:
+        # Multi-period (nD/nW/nM) walks the opens directly (the arithmetic grid
+        # cannot reproduce TradingView's scheduled multi-period calendar). Single
+        # period (1D/1W/1M) instead uses the grid for the calendar close instant
+        # and only *clamps* to these opens — see ``_get_confirmed_time``.
+        state.bar_opens_multiperiod = multiplier > 1
+        with OHLCVReader(data_path) as reader:
+            start_ts = reader.start_timestamp
+            opens = ([] if start_ts is None else
+                     [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
+
     state.bar_opens = opens
     state.bar_ptr = -1
 
