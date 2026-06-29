@@ -2974,6 +2974,9 @@
     "max": {
       "type": "variable"
     },
+    "max_bars_back": {
+      "type": "variable"
+    },
     "median": {
       "type": "variable"
     },
