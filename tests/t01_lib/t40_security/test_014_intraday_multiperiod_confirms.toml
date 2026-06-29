@@ -1,0 +1,38 @@
+# Indicator / Strategy / Library Settings
+
+[script]
+#overlay = false
+#format = "inherit"
+#precision =
+#scale =
+#pyramiding = 1
+#calc_on_order_fills = false
+#calc_on_every_tick = false
+#max_bars_back = 0
+#timeframe =
+#timeframe_gaps = true
+#explicit_plot_zorder = false
+#max_lines_count = 50
+#max_labels_count = 50
+#max_boxes_count = 50
+#calc_bars_count = 0
+#max_polylines_count = 50
+#dynamic_requests = false
+#behind_chart = true
+#backtest_fill_limits_assumption = 0
+#default_qty_type = "cash"
+#default_qty_value = 1
+#initial_capital = 1000000
+#currency = "NONE"
+#slippage = 0
+#commission_type = "percent"
+#commission_value = 0.0
+#process_orders_on_close = false
+#close_entries_rule = "FIFO"
+#margin_long = 100.0
+#margin_short = 100.0
+#risk_free_rate = 2.0
+#use_bar_magnifier = true
+#fill_orders_on_standard_ohlc = false
+
+# Input Settings

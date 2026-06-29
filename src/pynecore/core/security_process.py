@@ -97,23 +97,26 @@ def security_process_main(
     toml_path = ohlcv_base.with_suffix('.toml')
     syminfo = SymInfo.load_toml(toml_path)
 
-    # Gap-compacted bar view for intraday HTF security contexts. ``OHLCVWriter``
-    # forward-fills non-trading session gaps with ``volume == -1`` flat bars, so a
-    # session-gapped futures feed (e.g. a 720-minute HTF on Bursa palm oil) becomes
-    # a continuous 24h grid. The chart side drops these via ``read_from(skip_gaps=
-    # True)``; the security child must too, or bar-count history reads
-    # (``ta.highest``/``ta.lowest``/``[n]``) inside the HTF context span fewer real
-    # periods than TradingView, which builds its HTF series from real bars only.
-    # LTF keeps the fills (its intrabar windows are intentionally continuous), and
-    # D/W/M HTF is excluded (its sparse-series forward-fill is handled chart-side
-    # via ``bar_opens``). Same-TF cross-symbol is also excluded: the chart signals
-    # every chart bar there, so compacting away the writer's fills would emit
-    # ``na`` in a gap instead of forward-filling the prior real bar (TV
-    # ``gaps_off``). ``None`` = no compaction (no gaps, LTF, D/W/M, or same-TF).
+    # Gap-compacted bar view for HTF security contexts. ``OHLCVWriter``
+    # forward-fills non-trading session/calendar gaps with ``volume == -1`` flat
+    # bars, so a session-gapped intraday feed (e.g. a 720-minute HTF on Bursa palm
+    # oil) becomes a continuous 24h grid, and a weekday-only D/W/M feed grows
+    # synthetic weekend/holiday bars. The chart side drops these via
+    # ``read_from(skip_gaps=True)`` (and ``bar_opens`` rides the real opens only);
+    # the security child must too. Otherwise the child re-runs ``main()`` over the
+    # phantom bars: bar-count history reads (``ta.highest``/``ta.lowest``/``[n]``)
+    # span fewer real periods than TradingView, and stateful series like
+    # ``ta.sma(close, 3)`` accumulate the flat fill bars (a Friday->Monday daily
+    # gap would otherwise average two synthetic weekend closes). TradingView builds
+    # its HTF series from real bars only. LTF keeps the fills (its intrabar windows
+    # are intentionally continuous). Same-TF cross-symbol is excluded: the chart
+    # signals every chart bar there, so compacting away the writer's fills would
+    # emit ``na`` in a gap instead of forward-filling the prior real bar (TV
+    # ``gaps_off``). ``None`` = no compaction (no gaps, LTF, or same-TF).
     real_index_map: list[int] | None = None
     if not is_ltf and not same_timeframe:
         from pynecore.lib.timeframe import in_seconds
-        if 0 < in_seconds(syminfo.period) < 86400:  # 86400 = one day in seconds
+        if in_seconds(syminfo.period) > 0:
             # Mirror ``read_from(skip_gaps=True)`` exactly: a gap is ``volume < 0``
             # (the writer's -1 fill). ``>= 0`` would also drop NaN-volume real bars
             # (no-volume instruments import as ``volume == na``), which the reader keeps.

@@ -212,6 +212,109 @@ def _reset_lib_vars(lib: ModuleType):
     request._reset_request_state()
 
 
+def _resample_finer_security_feed(data_path: str, target_tf: str,
+                                  tmp_dir_holder: 'list[str]') -> str:
+    """Pre-resample a finer ``--security`` base feed to the security timeframe.
+
+    The native ``request.security()`` child exposes the feed bar at the confirmed
+    period boundary — correct only when the feed is already at the security
+    resolution (one bar per period). When a FINER base feed is mapped to an HTF
+    context (the documented "resampled from the chart base data" usage), the child
+    would otherwise expose a single raw sub-bar of the period instead of the
+    period aggregate, so ``request.security(.., open/high/low/close)`` diverges
+    from TradingView. This resamples the base feed to ``target_tf`` (via
+    :func:`aggregate_ohlcv`) so the child reads ONE aggregated bar per period and
+    every field matches TradingView.
+
+    :return: Path to a temporary resampled ``.ohlcv`` (with a cloned ``.toml``
+        sidecar) when the feed is finer than ``target_tf``; otherwise ``data_path``
+        unchanged (feed already at/above the security resolution, or no syminfo
+        metadata to drive the grid). Temp files live in a per-run directory whose
+        path is stored in ``tmp_dir_holder`` and removed at run teardown.
+    """
+    import hashlib
+    import tempfile
+    from .aggregator import aggregate_ohlcv
+    from .ohlcv_file import OHLCVReader
+    from .datetime import parse_timezone
+    from ..lib.timeframe import in_seconds
+
+    src = Path(data_path)
+    toml_path = src.with_suffix('.toml')
+    if not toml_path.exists():
+        # No syminfo metadata to drive the resample grid — keep the existing feed.
+        return data_path
+    try:
+        target_sec = in_seconds(target_tf)
+    except (ValueError, AssertionError):
+        return data_path
+    si = SymInfo.load_toml(toml_path)
+    # Decide the source resolution from the DECLARED sidecar period, not the empirical
+    # first-bar delta. An at-resolution feed whose first two bars are shorter than the
+    # nominal period — a monthly feed's 28-day Feb->Mar gap, or a session-bounded
+    # intraday feed — would otherwise look "finer" than ``target_tf`` and get needlessly
+    # resampled, inserting synthetic gap-fill bars that corrupt the security history.
+    # ``period`` is authoritative (it already drives ``source_tf`` for the aggregator);
+    # fall back to the measured interval only when it is missing/unparseable.
+    source_sec: int | None
+    if si.period:
+        try:
+            source_sec = in_seconds(si.period)
+        except (ValueError, AssertionError):
+            source_sec = None
+    else:
+        source_sec = None
+    if source_sec is None:
+        with OHLCVReader(src) as reader:
+            source_sec = reader.interval
+    if source_sec is None or source_sec >= target_sec:
+        # Feed already at (or coarser than) the security resolution: the child
+        # reads the period bar directly, no aggregation needed.
+        return data_path
+
+    try:
+        tz = parse_timezone(si.timezone) if si.timezone else None
+    except (ValueError, KeyError):
+        tz = None
+
+    if not tmp_dir_holder:
+        tmp_dir_holder.append(tempfile.mkdtemp(prefix='pyne_sec_resample_'))
+    # Hash the resolved source path into the name so two same-stem feeds from
+    # different directories never collide on one temp file.
+    src_key = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    out = Path(tmp_dir_holder[0]) / f"{src.stem}__{src_key}__{target_tf}.ohlcv"
+    if out.exists():
+        # Another context already resampled this exact (source, target) earlier
+        # this run. Reuse it instead of re-running ``aggregate_ohlcv`` with
+        # ``truncate=True``, which would zero/rewrite a file a sibling security
+        # child has already mmap'ed (potential SIGBUS / wrong read). Spawning is
+        # serial on the chart process, so the file is fully written by now.
+        return str(out)
+
+    _, target_count = aggregate_ohlcv(
+        src, out, target_tf, tz=tz,
+        session_starts=si.session_starts or None,
+        opening_hours=si.opening_hours or None,
+        sym_type=si.type, source_tf=si.period,
+    )
+    if target_count == 0:
+        # An empty source (no bars) resamples to an empty file; swapping the child
+        # onto it would make ``request.security()`` read nothing and return ``na``.
+        # Keep the original feed and drop the empty temp so the reuse guard above
+        # never returns it later. (A single-record source does NOT reach here:
+        # ``aggregate_ohlcv`` emits its lone bar floored onto the target grid, which
+        # the child's ``size == 1`` ``load_htf_bar_opens`` path then confirms at the
+        # period boundary.)
+        out.unlink(missing_ok=True)
+        return data_path
+    # The resampled feed IS the security timeframe; the cloned sidecar keeps every
+    # other field (timezone, sessions, mintick, ...) so the child's syminfo and
+    # grid args stay correct.
+    si.period = target_tf
+    si.save_toml(out.with_suffix('.toml'))
+    return str(out)
+
+
 class ScriptRunner:
     """
     Script runner
@@ -407,6 +510,7 @@ class ScriptRunner:
                 _merged_contexts.update(_mod_contexts)
         sec_contexts: dict[str, dict] | None = _merged_contexts or None
         sec_processes: 'dict[str, Process]' = {}
+        sec_resample_dirs: 'list[str]' = []  # per-run temp dirs for HTF feed resampling
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
         sec_sync_block = None
@@ -520,6 +624,18 @@ class ScriptRunner:
 
                 def _spawn_security_process(sid: str, data_path: str):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    # Context fed a FINER base feed: pre-resample to the security
+                    # timeframe so the child exposes one AGGREGATED bar per period
+                    # (TradingView's "resampled from the chart base data") instead
+                    # of a single raw sub-bar. No-op for a feed already at/above the
+                    # security TF; never for LTF (needs sub-bars). Same-TF contexts
+                    # reaching here are ALWAYS cross-symbol (a same-symbol+same-TF
+                    # context is a no-child same_context), so a finer feed for them
+                    # must be aggregated to the chart TF too, or the child would
+                    # expose a raw sub-bar where TradingView resamples.
+                    if not sec_state.is_ltf:
+                        data_path = _resample_finer_security_feed(
+                            data_path, str(sec_state.timeframe), sec_resample_dirs)
                     # D/W/M HTF contexts confirm boundaries by walking the child's
                     # actual bar opens (correct for sparse series; no-op otherwise)
                     load_htf_bar_opens(sec_state, data_path)
@@ -944,6 +1060,12 @@ class ScriptRunner:
                 if sec_sync_block and sec_result_blocks:
                     from .security import cleanup_shared_memory
                     cleanup_shared_memory(sec_sync_block, sec_result_blocks)
+
+                # Remove temp dirs created for HTF security-feed resampling.
+                if sec_resample_dirs:
+                    import shutil
+                    for _tmp_dir in sec_resample_dirs:
+                        shutil.rmtree(_tmp_dir, ignore_errors=True)
 
             # Reset library variables
             _reset_lib_vars(lib)

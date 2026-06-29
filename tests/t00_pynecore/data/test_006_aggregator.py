@@ -276,3 +276,60 @@ def __test_aggregate_observed_holiday_grouping__():
     assert [c.timestamp for c in result] == [open_ts(g[0]) for g in expected_groups]
     expected_vols = [sum(float(days.index(d) + 1) for d in g) for g in expected_groups]
     assert [c.volume for c in result] == pytest.approx(expected_vols)
+
+
+# --- Single-record / empty-source edge cases (issue #70) ---
+
+def __test_aggregate_single_record_floors_to_period__(tmp_path):
+    """A one-record source aggregates to ONE bar floored onto the period grid.
+
+    A single-record file has no derivable interval, so ``start_timestamp`` is None
+    and ``read_from`` yields nothing — but that lone bar IS a whole target period
+    and must be emitted with a period-boundary timestamp, not the raw sub-bar
+    instant. Without this, a finer one-period ``--security`` feed would expose a
+    daily bar stamped mid-day, shifting single-period D/W/M confirmation and
+    ``request.security(.., time)`` by up to a full period (issue #70 edge case).
+    """
+    from datetime import timezone
+
+    source = tmp_path / "one.ohlcv"
+    target = tmp_path / "one_1D.ohlcv"
+
+    # A single 15-minute bar at 2024-01-02 14:30 UTC (mid-day, NOT civil midnight)
+    raw_ts = 1704205800  # 2024-01-02 14:30:00 UTC
+    _create_ohlcv_file(source, [
+        OHLCV(timestamp=raw_ts, open=100.0, high=110.0, low=90.0, close=105.0, volume=7.0),
+    ])
+
+    # The lone bar floors via the SAME ``get_bar_time`` call as the multi-bar loop,
+    # so it is consistent with a normal feed's stamping; pin UTC for a clean
+    # civil-midnight expectation.
+    src_count, tgt_count = aggregate_ohlcv(source, target, "1D", tz=timezone.utc,
+                                           source_tf="15")
+    assert src_count == 1
+    assert tgt_count == 1
+
+    # Output: exactly one bar, stamped at the civil daily open (00:00 UTC), with
+    # the lone bar's OHLCV preserved. ``_read_all`` cannot read a one-record file
+    # (its own ``read_from`` needs a derivable interval), so read by index.
+    with OHLCVReader(target) as reader:
+        assert reader.size == 1
+        bar = reader.read(0)
+    assert bar.timestamp == 1704153600  # 2024-01-02 00:00:00 UTC
+    assert bar.open == pytest.approx(100.0, rel=1e-5)
+    assert bar.high == pytest.approx(110.0, rel=1e-5)
+    assert bar.low == pytest.approx(90.0, rel=1e-5)
+    assert bar.close == pytest.approx(105.0, rel=1e-5)
+    assert bar.volume == pytest.approx(7.0, rel=1e-5)
+
+
+def __test_aggregate_empty_source_stays_empty__(tmp_path):
+    """A zero-record source aggregates to zero bars — the single-record fast path
+    must NOT fire for an empty file."""
+    source = tmp_path / "empty.ohlcv"
+    target = tmp_path / "empty_1D.ohlcv"
+    _create_ohlcv_file(source, [])
+
+    src_count, tgt_count = aggregate_ohlcv(source, target, "1D", source_tf="15")
+    assert src_count == 0
+    assert tgt_count == 0
