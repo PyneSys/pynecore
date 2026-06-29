@@ -340,6 +340,7 @@ def security_process_main(
         result_locks: 'dict[str, LockType] | None' = None,
         ohlcv_fields: 'list[str] | None' = None,
         ohlcv_tuple: bool = False,
+        same_timeframe: bool = False,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -365,6 +366,12 @@ def security_process_main(
         run skips main() and writes these fields straight from the bar.
     :param ohlcv_tuple: True when ``ohlcv_fields`` came from a tuple/list
         expression (write a tuple), False for a scalar expression.
+    :param same_timeframe: True when the security TF equals the chart TF. The
+        chart then signals every chart bar (``_get_confirmed_time`` returns the
+        bar time verbatim), so gap compaction must NOT apply — a gappy
+        cross-symbol feed forward-fills (``gaps_off``) through the chart's bars
+        instead of compacting to real bars (which is only correct for a true
+        HTF series).
     """
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
@@ -501,6 +508,30 @@ def security_process_main(
         ohlcv_base = Path(ohlcv_path)
         toml_path = ohlcv_base.with_suffix('.toml')
         syminfo = SymInfo.load_toml(toml_path)
+
+    # Gap-compacted bar view for intraday HTF security contexts. ``OHLCVWriter``
+    # forward-fills non-trading session gaps with ``volume == -1`` flat bars, so a
+    # session-gapped futures feed (e.g. a 720-minute HTF on Bursa palm oil) becomes
+    # a continuous 24h grid. The chart side drops these via ``read_from(skip_gaps=
+    # True)``; the security child must too, or bar-count history reads
+    # (``ta.highest``/``ta.lowest``/``[n]``) inside the HTF context span fewer real
+    # periods than TradingView, which builds its HTF series from real bars only.
+    # LTF keeps the fills (its intrabar windows are intentionally continuous), and
+    # D/W/M HTF is excluded (its sparse-series forward-fill is handled chart-side
+    # via ``bar_opens``). Same-TF cross-symbol is also excluded: the chart signals
+    # every chart bar there, so compacting away the writer's fills would emit
+    # ``na`` in a gap instead of forward-filling the prior real bar (TV
+    # ``gaps_off``). ``None`` = no compaction (no gaps, LTF, D/W/M, or same-TF).
+    real_index_map: list[int] | None = None
+    if reader is not None and not is_ltf and not same_timeframe:
+        from pynecore.lib.timeframe import in_seconds
+        if 0 < in_seconds(syminfo.period) < 86400:  # 86400 = one day in seconds
+            # Mirror ``read_from(skip_gaps=True)`` exactly: a gap is ``volume < 0``
+            # (the writer's -1 fill). ``>= 0`` would also drop NaN-volume real bars
+            # (no-volume instruments import as ``volume == na``), which the reader keeps.
+            rim = [i for i in range(reader.size) if not (reader.read(i).volume < 0)]
+            if len(rim) != reader.size:
+                real_index_map = rim
 
     # Import the script module (triggers AST transformation)
     from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
@@ -658,6 +689,8 @@ def security_process_main(
     # grows over time as new closed bars arrive).
     def _read_bar(idx: int) -> 'OHLCV | None':
         if reader is not None:
+            if real_index_map is not None:
+                return reader.read(real_index_map[idx]) if idx < len(real_index_map) else None
             if idx < reader.size:
                 return reader.read(idx)
             return None
@@ -668,7 +701,7 @@ def security_process_main(
 
     def _current_total() -> int:
         if reader is not None:
-            return reader.size
+            return len(real_index_map) if real_index_map is not None else reader.size
         return len(bar_buffer)
 
     # ── Live LTF-window machinery (request.security_lower_tf on a streaming
