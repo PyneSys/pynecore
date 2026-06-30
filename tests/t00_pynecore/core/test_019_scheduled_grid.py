@@ -188,6 +188,42 @@ def __test_observed_day_counter__():
     assert c.ordinal(date(2026, 1, 2)) == 0
 
 
+def __test_observed_day_counter_fold__():
+    """Holiday half-day fold: the day after an early close shares its ordinal.
+
+    Detected from data alone (no calendar): a trading day is an early close when
+    its last bar ends before the scheduled session close; the next calendar day
+    then folds into it instead of advancing. A folded day is itself not a trigger
+    (chain-stop).
+    """
+    tz = ZoneInfo("America/Chicago")
+    t17, t16 = time(17, 0), time(16, 0)
+    # CME-style: opens Sun-Thu 17:00, closes next day 16:00 (trading-day close)
+    hours = [SymInfoInterval(day=d, start=t17, end=t16) for d in (6, 0, 1, 2, 3)]
+
+    def close_sec(d: date, h: int, mi: int) -> int:
+        return int(datetime(d.year, d.month, d.day, h, mi, tzinfo=tz).timestamp())
+
+    mon, tue = date(2025, 6, 23), date(2025, 6, 24)
+    wed, thu = date(2025, 6, 25), date(2025, 6, 26)
+
+    c = ObservedDayCounter(tz, hours, fold=True)
+    o_mon = c.ordinal(mon, close_sec(mon, 16, 0))   # normal: ends at the close
+    o_tue = c.ordinal(tue, close_sec(tue, 13, 0))   # early close (13:00)
+    assert o_tue == o_mon + 1                        # Tuesday itself advances
+    o_wed = c.ordinal(wed, close_sec(wed, 13, 0))   # folds into early-close Tue
+    assert o_wed == o_tue                            # shares Tuesday's ordinal
+    o_thu = c.ordinal(thu, close_sec(thu, 16, 0))   # chain-stop: Wed was folded
+    assert o_thu == o_wed + 1
+
+    # Control: with folding off the same sequence advances every day
+    nf = ObservedDayCounter(tz, hours, fold=False)
+    n_mon = nf.ordinal(mon, close_sec(mon, 16, 0))
+    n_tue = nf.ordinal(tue, close_sec(tue, 13, 0))
+    n_wed = nf.ordinal(wed, close_sec(wed, 13, 0))
+    assert (n_tue, n_wed) == (n_mon + 1, n_mon + 2)
+
+
 def __test_chart_bar_containment__():
     """A chart bar belongs to the day its LAST instant falls into."""
     # CAPITALCOM-style late open (Mon-Thu 17:05): the 240-minute bar stamped

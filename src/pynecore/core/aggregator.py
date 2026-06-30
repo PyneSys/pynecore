@@ -7,14 +7,13 @@ n > 1) live on the year-reset scheduled grid (see ``resampler`` module docs);
 'observed' symbols (exchange-listed) count the actual trading days seen in the
 source stream, which reproduces TradingView's holiday-aware grid.
 """
-from datetime import timezone as dt_timezone, timedelta
+from datetime import timezone as dt_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .ohlcv_file import OHLCVReader, OHLCVWriter
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
-    first_monday,
 )
 from ..lib.timeframe import in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
@@ -105,16 +104,20 @@ def aggregate_ohlcv(
     mode = grid_mode(sym_type, opening_hours)
 
     src_off = 0
+    fold = False
     if modifier in ('D', 'W', 'M') and multiplier > 1 and source_tf:
         # noinspection PyProtectedMember
         src_mod, _ = _process_tf(source_tf)
         if src_mod in ('', 'S'):
             src_off = in_seconds(source_tf) - 1
+            # An intraday source carries the per-bar end instants the observed
+            # holiday half-day fold needs (a daily source is already folded).
+            fold = True
 
     if modifier in ('D', 'W', 'M') and multiplier > 1 and mode == 'observed':
         return _aggregate_observed(
             source_path, target_path, modifier, multiplier, tz,
-            session_starts, opening_hours, src_off)
+            session_starts, opening_hours, src_off, fold)
 
     resampler = Resampler.get_resampler(target_tf)
 
@@ -183,6 +186,7 @@ def _aggregate_observed(
         session_starts: list | None,
         opening_hours: list | None,
         src_off: int = 0,
+        fold: bool = False,
 ) -> tuple[int, int]:
     """
     Multi-period aggregation for 'observed' symbols (exchange-listed).
@@ -208,6 +212,8 @@ def _aggregate_observed(
     :param opening_hours: ``SymInfo.opening_hours`` template
     :param src_off: Source bar open -> last instant offset in seconds; a bar
                belongs to the trading day its last instant falls into
+    :param fold: Fold holiday half-days into the early-close day (intraday
+               source only; see :class:`ObservedDayCounter`)
     :return: Tuple of (source_candles_read, target_candles_written)
     """
     on = overnight_opens(opening_hours, session_starts)
@@ -220,7 +226,7 @@ def _aggregate_observed(
             window: list[OHLCV] = []
             window_start: int | None = None
             group_key: tuple | None = None
-            counter = ObservedDayCounter()
+            counter = ObservedDayCounter(tz, opening_hours, fold=fold)
 
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -229,18 +235,9 @@ def _aggregate_observed(
             for candle in reader.read_from(start_ts):
                 source_count += 1
                 td = trading_day(candle.timestamp + src_off, tz, on)
-
-                if modifier == 'D':
-                    # Count observed trading days, counter resets each year
-                    key = (td.year, counter.ordinal(td) // multiplier)
-                elif modifier == 'W':
-                    # Weeks are always realized — the scheduled week grid is
-                    # exact; only the stamp comes from the data
-                    monday = td - timedelta(days=td.weekday())
-                    weeks = (monday - first_monday(monday.year)).days // 7
-                    key = (monday.year, weeks // multiplier)
-                else:  # 'M'
-                    key = (td.year, (td.month - 1) // multiplier)
+                bar_end = candle.timestamp + src_off + 1 if fold else None
+                counter.ordinal(td, bar_end)
+                key = counter.key(modifier, multiplier)
 
                 if group_key is not None and key != group_key:
                     writer.write(_merge_candles(window, window_start))

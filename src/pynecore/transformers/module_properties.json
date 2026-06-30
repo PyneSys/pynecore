@@ -63,6 +63,9 @@
     "close": {
       "type": "variable"
     },
+    "date": {
+      "type": "variable"
+    },
     "datetime": {
       "type": "variable"
     },

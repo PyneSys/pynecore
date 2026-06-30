@@ -694,6 +694,7 @@ def _session_bar_closes(
         feed, so the caller keeps the arithmetic grid clamp rather than risk a
         wrong session end.
     """
+    from .resampler import crosses_midnight
     closes: list[int] = []
     for open_ms in opens:
         open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
@@ -702,7 +703,7 @@ def _session_bar_closes(
         open_time = open_dt.time()
         end_ms: int | None = None
         for interval in opening_hours:
-            overnight = interval.end <= interval.start
+            overnight = crosses_midnight(interval.start, interval.end)
             if (interval.day == weekday and interval.start <= open_time
                     and (overnight or open_time < interval.end)):
                 # Same-day session, or the pre-midnight leg of an overnight one
