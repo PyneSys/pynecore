@@ -169,6 +169,9 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # the roll path runs at most once per trading day
     if ohlcv.timestamp >= lib._dg_next_roll:
         lib._dg_on_roll(ohlcv.timestamp)
+    # Remember this bar so the next roll can measure the day it closes (the
+    # holiday half-day fold needs the previous day's last bar end).
+    lib._dg_last_ts = ohlcv.timestamp
 
 
 # noinspection PyUnusedLocal

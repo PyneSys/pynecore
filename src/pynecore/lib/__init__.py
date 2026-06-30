@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 import sys
 import math as _math
 
-from datetime import datetime, timedelta, time as dt_time, UTC
+from datetime import datetime, timedelta, time as dt_time, date, UTC
 
 from pynecore.types.source import Source
 
@@ -31,9 +31,12 @@ from pynecore.core.overload import overload
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError
 from ..core.resampler import (
-    Resampler, grid_mode as _grid_mode, overnight_opens as _overnight_opens,
+    Resampler, ObservedDayCounter as _ObservedDayCounter,
+    grid_mode as _grid_mode, overnight_opens as _overnight_opens,
+    overnight_starts_by_weekday as _overnight_starts_by_weekday,
+    close_table_by_weekday as _close_table_by_weekday,
     trading_day as _trading_day, trading_day_open_sec as _trading_day_open_sec,
-    scheduled_day_ordinal as _scheduled_day_ordinal, first_monday as _first_monday,
+    observed_week_key as _observed_week_key,
 )
 
 __all__ = [
@@ -419,7 +422,6 @@ def _parse_session_string(session: str, timezone: str | None = None) -> 'Session
     :raises ValueError: If session string is invalid
     """
     from ..types.session import SessionInfo
-    from datetime import time as dt_time
 
     if not session or session.strip() == "":
         raise ValueError("Session string cannot be empty")
@@ -584,24 +586,28 @@ _dg_next_roll: float = 0.0  # epoch-sec threshold of the next possible day roll
 _dg_mode: str = ''
 _dg_eff: int = 0  # bar open -> last instant offset in seconds (intraday charts)
 _dg_tz = None
-_dg_overnight: dict = {}
+_dg_overnight: dict[int, dt_time] = {}
 _dg_template: list | None = None  # identity guard, like the _ttd machinery
-_dg_day = None  # current trading day (datetime.date)
-_dg_ordinal: int = 0  # observed-day ordinal within the year
+_dg_day: date | None = None  # current trading day
+_dg_counter: '_ObservedDayCounter | None' = None  # year-reset day counter (+ fold)
+_dg_last_ts: float = 0.0  # previous bar open (epoch sec) — fed to the fold detector
 _dg_day_starts: dict[int, dict[int, int]] = {}  # year -> {ordinal: bar-open ms}
-_dg_ord_by_day: dict = {}  # date -> ordinal (current + previous year)
+_dg_ord_by_day: dict[date, int] = {}  # date -> ordinal (current + previous year)
 _dg_week_first: dict[tuple[int, int], int] = {}  # (monday-year, week ordinal) -> ms
 _dg_month_first: dict[tuple[int, int], int] = {}  # (year, month) -> first bar ms
 
 
 def _dg_reset() -> None:
     """Reset the scheduled-grid tracker (new run / new script)."""
-    global _dg_next_roll, _dg_mode, _dg_eff, _dg_template, _dg_day
+    global _dg_next_roll, _dg_mode, _dg_eff, _dg_template, _dg_day, \
+        _dg_counter, _dg_last_ts
     _dg_next_roll = 0.0
     _dg_mode = ''
     _dg_eff = 0
     _dg_template = None
     _dg_day = None
+    _dg_counter = None
+    _dg_last_ts = 0.0
     _dg_day_starts.clear()
     _dg_ord_by_day.clear()
     _dg_week_first.clear()
@@ -622,7 +628,7 @@ def _dg_on_roll(ts: float) -> None:
     :param ts: Current bar open in epoch seconds
     """
     global _dg_next_roll, _dg_mode, _dg_eff, _dg_tz, _dg_overnight, \
-        _dg_template, _dg_day, _dg_ordinal
+        _dg_template, _dg_day, _dg_counter
 
     opening_hours = syminfo._opening_hours
     if opening_hours is not _dg_template:
@@ -644,23 +650,22 @@ def _dg_on_roll(ts: float) -> None:
             _dg_next_roll = _math.inf
             return
         _dg_eff = chart_sec - 1 if chart_mod in ('', 'S') else 0
+        # Intraday charts carry per-bar end instants for the holiday half-day
+        # fold; a daily chart stream is already folded.
+        _dg_counter = _ObservedDayCounter(
+            _dg_tz, opening_hours, fold=chart_mod in ('', 'S'))
         _dg_day = None
         _dg_day_starts.clear()
         _dg_ord_by_day.clear()
         _dg_week_first.clear()
         _dg_month_first.clear()
 
+    assert _dg_counter is not None
     eff = ts + _dg_eff
     td = _trading_day(eff, _dg_tz, _dg_overnight)
     prev = _dg_day
     if td != prev:
-        if prev is None:
-            # Mid-year data start: the trading days between Jan 1 and the
-            # window are not observable — seed the counter from the weekday
-            # grid (exact when the data begins at the year's first session)
-            _dg_ordinal = _scheduled_day_ordinal(td, 'weekday')
-        elif td.year != prev.year:
-            _dg_ordinal = 0
+        if prev is not None and td.year != prev.year:
             # Keep only the current and previous year's records
             for y in [y for y in _dg_day_starts if y < td.year - 1]:
                 del _dg_day_starts[y]
@@ -670,16 +675,20 @@ def _dg_on_roll(ts: float) -> None:
                 del _dg_week_first[k]
             for k in [k for k in _dg_month_first if k[0] < td.year - 1]:
                 del _dg_month_first[k]
-        else:
-            _dg_ordinal += 1
+        # Feed the previous day's last bar end so the fold can tell whether it
+        # closed early, then advance the year-reset counter.
+        if _dg_last_ts:
+            _dg_counter.note_bar_end(int(_dg_last_ts) + _dg_eff + 1)
+        ordinal = _dg_counter.ordinal(td)
         _dg_day = td
 
         ms = int(ts * 1000)
-        _dg_day_starts.setdefault(td.year, {})[_dg_ordinal] = ms
-        _dg_ord_by_day[td] = _dg_ordinal
-        monday = td - timedelta(days=td.weekday())
-        week = (monday - _first_monday(monday.year)).days // 7
-        _dg_week_first.setdefault((monday.year, week), ms)
+        # setdefault: a folded holiday half-day shares the early-close day's
+        # ordinal and must not overwrite that period's first session open.
+        _dg_day_starts.setdefault(td.year, {}).setdefault(ordinal, ms)
+        _dg_ord_by_day[td] = ordinal
+        wy, week = _observed_week_key(td)
+        _dg_week_first.setdefault((wy, week), ms)
         _dg_month_first.setdefault((td.year, td.month), ms)
 
     # Next possible roll: the first chart bar whose span reaches a scheduled
@@ -805,11 +814,10 @@ def _dwm_bar_time(resampler: Resampler, modifier: str, multiplier: int,
                     if ms is not None:
                         return ms
     elif modifier == 'W':
-        monday = td - timedelta(days=td.weekday())
-        week = (monday - _first_monday(monday.year)).days // 7
+        wy, week = _observed_week_key(td)
         base = (week // multiplier) * multiplier
         for i in range(base, week + 1):
-            ms = _dg_week_first.get((monday.year, i))
+            ms = _dg_week_first.get((wy, i))
             if ms is not None:
                 return ms
     else:  # 'M'
@@ -939,6 +947,10 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     if session is None:
         # No session specified, return the bar time
         return bar_time
+    if not isinstance(session, str):
+        # A bool slips past the int(bars_back) overload guard (bool is an int):
+        # it is not a valid session specification.
+        return NA(int)
 
     # Parse session string
     try:
@@ -1017,14 +1029,8 @@ def time_tradingday() -> PyneInt:
     period = syminfo.period
     if opening_hours is not _ttd_session_hours or period != _ttd_session_period:
         # Session structure changed — rebuild the per-weekday table of overnight
-        # session opens (the only entries that can roll the trading day: ones that
-        # end at or before their own start and do not begin exactly at midnight).
-        overnight: dict[int, list[dt_time]] = {}
-        for day, start, end in opening_hours:
-            starts_at_midnight = start.hour == 0 and start.minute == 0 and start.second == 0
-            if end <= start and not starts_at_midnight:
-                overnight.setdefault(day, []).append(start)
-        _ttd_overnight_by_wd = overnight
+        # session opens (the only entries that can roll the trading day).
+        _ttd_overnight_by_wd = _overnight_starts_by_weekday(opening_hours)
         _ttd_period_delta = timedelta(seconds=timeframe_module.in_seconds(period))
         _ttd_session_hours = opening_hours
         _ttd_session_period = period
@@ -1088,32 +1094,8 @@ def _tdc_rebuild(opening_hours: list) -> None:
     """
     global _tdc_hours, _tdc_by_wd, _tdc_overnight_by_wd, _tdc_tz
 
-    midnight = dt_time(0, 0, 0)
-    overnight: dict[int, list[dt_time]] = {}
-    for day, start, end in opening_hours:
-        if end <= start and start != midnight:
-            overnight.setdefault(day, []).append(start)
-
-    best: dict[int, tuple[int, dt_time, int]] = {}  # td_wd -> (sort key, tod, +days)
-    for day, start, end in opening_hours:
-        crosses = end <= start  # the interval ends on the next calendar day
-        if end == midnight:
-            # The instant just before the end is still on the opening day
-            eps_day = day
-            rolled = bool(overnight.get(eps_day))
-        else:
-            eps_day = (day + 1) % 7 if crosses else day
-            rolled = any(end > o for o in overnight.get(eps_day, ()))
-        td_wd = (eps_day + 1) % 7 if rolled else eps_day
-        end_cal_day = (day + 1) % 7 if crosses else day
-        offset = (end_cal_day - td_wd) % 7
-        key = offset * 86_400 + end.hour * 3600 + end.minute * 60 + end.second
-        prev = best.get(td_wd)
-        if prev is None or key > prev[0]:
-            best[td_wd] = (key, end, offset)
-
-    _tdc_by_wd = {wd: (tod, offset) for wd, (_key, tod, offset) in best.items()}
-    _tdc_overnight_by_wd = overnight
+    _tdc_overnight_by_wd = _overnight_starts_by_weekday(opening_hours)
+    _tdc_by_wd = _close_table_by_weekday(opening_hours, _tdc_overnight_by_wd)
     tz_name = getattr(syminfo, 'timezone', None)
     _tdc_tz = _parse_timezone(tz_name) if tz_name else None
     _tdc_hours = opening_hours
@@ -1269,6 +1251,10 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     if session is None:
         # No session specified, return the bar close time
         return bar_close_time
+    if not isinstance(session, str):
+        # A bool slips past the int(bars_back) overload guard (bool is an int):
+        # it is not a valid session specification.
+        return NA(int)
 
     # Parse session string
     try:

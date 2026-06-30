@@ -105,18 +105,57 @@ def grid_mode(sym_type: str | None,
     return 'observed'
 
 
+# Three midnight-crossing predicates on a session interval's (start, end)
+# times-of-day. They are deliberately distinct rules — kept here as the single
+# definition each so the same test is never re-spelled slightly differently
+# across modules (the historical source of trading-day grouping bugs):
+#
+#   crosses_midnight   end <= start            the interval ends on the next
+#                                              calendar day (close cap, security)
+#   rolls_trading_day  crosses & not midnight  the open belongs to the next
+#                                              trading day (overnight roll)
+#
+# The strict ``end < start`` session-overlap test (``lib.timeframe`` /
+# ``lib.session``) is a third, genuinely different rule and stays inline there.
+
+
+def crosses_midnight(start: dt_time, end: dt_time) -> bool:
+    """
+    Whether a session interval ends on the next calendar day.
+
+    :param start: Interval open time-of-day
+    :param end: Interval close time-of-day
+    :return: ``True`` when the close is at or before the open
+    """
+    return end <= start
+
+
+def rolls_trading_day(start: dt_time, end: dt_time) -> bool:
+    """
+    Whether an overnight session open rolls the trading day forward.
+
+    An interval rolls the trading day when it crosses midnight but does not open
+    exactly at midnight (a ``00:00`` open belongs to its own calendar day).
+
+    :param start: Interval open time-of-day
+    :param end: Interval close time-of-day
+    :return: ``True`` for evening opens of the following trading day
+    """
+    return crosses_midnight(start, end) and not (
+        start.hour == 0 and start.minute == 0 and start.second == 0)
+
+
 def overnight_opens(
         opening_hours: 'list[SymInfoInterval] | None',
         session_starts: 'list[SymInfoSession] | None' = None) -> dict[int, dt_time]:
     """
     Earliest trading-day-rolling session open per open-weekday.
 
-    Only sessions that cross midnight roll the trading day (end at or before
-    their start, not opening exactly at midnight) — same rule as
-    ``lib.time_tradingday``. Without ``opening_hours`` the overnight status is
-    inferred from ``session_starts`` alone: an open at or after 12:00 is an
-    evening open of the next trading day (true for every overnight market we
-    know — CME 17:00, FX 17:00 — while day sessions open in the morning).
+    Only sessions that roll the trading day count (:func:`rolls_trading_day`) —
+    same rule as ``lib.time_tradingday``. Without ``opening_hours`` the overnight
+    status is inferred from ``session_starts`` alone: an open at or after 12:00
+    is an evening open of the next trading day (true for every overnight market
+    we know — CME 17:00, FX 17:00 — while day sessions open in the morning).
 
     :param opening_hours: ``SymInfo.opening_hours`` (preferred source)
     :param session_starts: ``SymInfo.session_starts`` fallback
@@ -125,8 +164,7 @@ def overnight_opens(
     res: dict[int, dt_time] = {}
     if opening_hours:
         for day, start, end in opening_hours:
-            if end <= start and not (start.hour == 0 and start.minute == 0
-                                     and start.second == 0):
+            if rolls_trading_day(start, end):
                 cur = res.get(day)
                 if cur is None or start < cur:
                     res[day] = start
@@ -137,6 +175,63 @@ def overnight_opens(
                 if cur is None or start < cur:
                     res[day] = start
     return res
+
+
+def overnight_starts_by_weekday(
+        opening_hours: 'list[SymInfoInterval] | None') -> dict[int, list[dt_time]]:
+    """
+    All trading-day-rolling session opens per open-weekday (list shape).
+
+    Same selection as :func:`overnight_opens` (:func:`rolls_trading_day`) but
+    keeps every rolling open, not just the earliest — the per-bar overnight-roll
+    code in ``lib.time_tradingday`` / ``lib.time_close`` walks the full list.
+
+    :param opening_hours: ``SymInfo.opening_hours``
+    :return: weekday -> list of rolling open times
+    """
+    res: dict[int, list[dt_time]] = {}
+    if opening_hours:
+        for day, start, end in opening_hours:
+            if rolls_trading_day(start, end):
+                res.setdefault(day, []).append(start)
+    return res
+
+
+def close_table_by_weekday(
+        opening_hours: 'list[SymInfoInterval]',
+        overnight_by_wd: dict[int, list[dt_time]]) -> dict[int, tuple[dt_time, int]]:
+    """
+    Per-trading-day-weekday closing instant of the session that ends that day.
+
+    Each interval's end is assigned to the trading day it closes — rolled to the
+    next day when the end lies inside an overnight session — and the latest end
+    per trading day wins (a lunch-break morning end loses to the afternoon
+    close). The result maps a trading day's weekday to its close as a
+    ``(time-of-day, calendar-day offset from the trading-day date)`` pair.
+
+    :param opening_hours: ``SymInfo.opening_hours`` (``SymInfoInterval`` list)
+    :param overnight_by_wd: Rolling opens from :func:`overnight_starts_by_weekday`
+    :return: trading-day weekday -> (close time-of-day, +days offset)
+    """
+    midnight = dt_time(0, 0, 0)
+    best: dict[int, tuple[int, dt_time, int]] = {}  # td_wd -> (sort key, tod, +days)
+    for day, start, end in opening_hours:
+        crosses = crosses_midnight(start, end)  # the interval ends next calendar day
+        if end == midnight:
+            # The instant just before the end is still on the opening day
+            eps_day = day
+            rolled = bool(overnight_by_wd.get(eps_day))
+        else:
+            eps_day = (day + 1) % 7 if crosses else day
+            rolled = any(end > o for o in overnight_by_wd.get(eps_day, ()))
+        td_wd = (eps_day + 1) % 7 if rolled else eps_day
+        end_cal_day = (day + 1) % 7 if crosses else day
+        offset = (end_cal_day - td_wd) % 7
+        key = offset * 86_400 + end.hour * 3600 + end.minute * 60 + end.second
+        prev = best.get(td_wd)
+        if prev is None or key > prev[0]:
+            best[td_wd] = (key, end, offset)
+    return {wd: (tod, offset) for wd, (_key, tod, offset) in best.items()}
 
 
 def trading_day(ts_sec: float, tz: ZoneInfo | dt_timezone | None,
@@ -229,7 +324,7 @@ def trading_day_open_sec(d: date, tz: ZoneInfo | dt_timezone | None,
                 if best is None or sec < best:
                     best = sec
     if best is None:
-        best = int(datetime(d.year, d.month, d.day, tzinfo=tz).timestamp())
+        return int(datetime(d.year, d.month, d.day, tzinfo=tz).timestamp())
     return best
 
 
@@ -277,40 +372,155 @@ def first_monday(year: int) -> date:
     return jan1 + timedelta(days=0 if w0 == 0 else 7 - w0)
 
 
+def observed_week_key(d: date) -> tuple[int, int]:
+    """
+    Weekly grid coordinates of trading day ``d``.
+
+    A week belongs to its Monday's calendar year and weeks count from that
+    year's first Monday. The single definition of the nD/nW/nM weekly grouping
+    used by the aggregator, the bar magnifier and the ``_dg_*`` tracker.
+
+    :param d: Trading day date
+    :return: ``(week's year, 0-based week ordinal within that year)``
+    """
+    monday = d - timedelta(days=d.weekday())
+    return monday.year, (monday - first_monday(monday.year)).days // 7
+
+
 class ObservedDayCounter:
     """
     Year-reset observed-trading-day counter for multi-period grouping.
 
     Feed consecutive trading days; :meth:`ordinal` returns each day's in-year
-    scheduled ordinal. 'Observed' symbols realize TradingView's holiday
-    calendar through their actual daily data, so counting the days present in
-    the stream reproduces the grid. The first day seeds the counter from the
-    weekday grid — the days between Jan 1 and the stream start are not
-    observable (exact when the stream begins at the year's first session).
+    scheduled ordinal and :meth:`key` turns it into the nD/nW/nM grouping key.
+    'Observed' symbols realize TradingView's holiday calendar through their
+    actual daily data, so counting the days present in the stream reproduces the
+    grid. The first day seeds the counter from the weekday grid — the days
+    between Jan 1 and the stream start are not observable (exact when the stream
+    begins at the year's first session).
+
+    Holiday half-day fold (intraday source only): TradingView's daily feed does
+    not emit a separate bar for the holiday half-day adjacent to an early close
+    (e.g. the day after a 13:00 Thanksgiving close) — it folds into the
+    early-close day. Detected from data alone, no calendar: a trading day is an
+    early close when its last real bar ends before its scheduled session close
+    (:meth:`_is_early`); the immediately following day then shares its ordinal
+    instead of advancing. A folded day is itself not a trigger (chain-stop). Fold
+    needs the per-bar end instants — pass ``bar_end`` to :meth:`ordinal`, or feed
+    the previous day's last bar end via :meth:`note_bar_end` before rolling.
+
+    A bare ``ObservedDayCounter()`` (no template, ``fold=False``) is the plain
+    year-reset counter — ``ordinal(td)`` advances one slot per present day.
     """
 
-    __slots__ = ('_cur', '_ordinal')
+    __slots__ = ('_cur', '_ordinal', '_cur_end', '_folded', '_fold', '_tz',
+                 '_close_table')
 
-    def __init__(self) -> None:
+    def __init__(self,
+                 tz: 'ZoneInfo | dt_timezone | None' = None,
+                 opening_hours: 'list[SymInfoInterval] | None' = None,
+                 fold: bool = False) -> None:
+        """
+        :param tz: Exchange timezone (only needed when ``fold`` is on)
+        :param opening_hours: ``SymInfo.opening_hours`` for the fold's scheduled
+            close table (no template -> fold disabled)
+        :param fold: Enable holiday half-day folding (intraday source only)
+        """
         self._cur: date | None = None
         self._ordinal = 0
+        self._cur_end: int | None = None  # running max bar-end of the current day
+        self._folded = False  # current day folded into the previous (chain-stop)
+        self._fold = fold and bool(opening_hours)
+        self._tz = tz
+        if self._fold:
+            assert opening_hours is not None
+            self._close_table = close_table_by_weekday(
+                opening_hours, overnight_starts_by_weekday(opening_hours))
+        else:
+            self._close_table: dict[int, tuple[dt_time, int]] = {}
 
-    def ordinal(self, td: date) -> int:
+    def note_bar_end(self, bar_end: int | None) -> None:
+        """
+        Record a bar's end instant (epoch seconds) for the current trading day.
+
+        Keeps the running maximum so the fold can tell whether the day closed
+        early. Used when the counter does not see every bar (the ``_dg_*``
+        tracker fires once per trading day): feed the previous day's last bar end
+        before calling :meth:`ordinal` for the new day.
+
+        :param bar_end: Bar end instant in epoch seconds, or ``None`` (no-op)
+        """
+        if bar_end is not None and (self._cur_end is None or bar_end > self._cur_end):
+            self._cur_end = bar_end
+
+    def _is_early(self, day: date, end: int | None) -> bool:
+        """
+        Whether ``day``'s last real bar ``end`` precedes its scheduled close.
+
+        :param day: Trading day
+        :param end: The day's last bar end in epoch seconds
+        :return: ``True`` for an early-close (holiday half) day
+        """
+        if end is None:
+            return False
+        entry = self._close_table.get(day.weekday())
+        if entry is None:
+            return False
+        end_tod, offset = entry
+        close_date = day + timedelta(days=offset)
+        close_sec = int(datetime(
+            close_date.year, close_date.month, close_date.day,
+            end_tod.hour, end_tod.minute, end_tod.second,
+            tzinfo=self._tz).timestamp())
+        return end < close_sec
+
+    def ordinal(self, td: date, bar_end: int | None = None) -> int:
         """
         In-year scheduled ordinal of trading day ``td``.
 
         :param td: Trading day of the current bar (must not decrease)
+        :param bar_end: This bar's end instant in epoch seconds (fold only)
         :return: 0-based ordinal within ``td``'s year
         """
-        if td != self._cur:
-            if self._cur is None:
+        cur = self._cur
+        if td != cur:
+            if cur is None:
                 self._ordinal = weekday_ordinal(td)
-            elif td.year != self._cur.year:
+                self._folded = False
+            elif td.year != cur.year:
                 self._ordinal = 0
+                self._folded = False
+            elif (self._fold and not self._folded
+                  and (td - cur).days == 1
+                  and self._is_early(cur, self._cur_end)):
+                # td is the holiday half folding into the early-close day cur:
+                # share its ordinal, and do not let the next day fold too.
+                self._folded = True
             else:
                 self._ordinal += 1
+                self._folded = False
             self._cur = td
+            self._cur_end = bar_end
+        elif bar_end is not None and (self._cur_end is None or bar_end > self._cur_end):
+            self._cur_end = bar_end
         return self._ordinal
+
+    def key(self, modifier: str, multiplier: int) -> tuple[int, int]:
+        """
+        nD/nW/nM grouping key of the current trading day.
+
+        :param modifier: 'D', 'W' or 'M'
+        :param multiplier: Period multiplier (> 1)
+        :return: Period identity key
+        """
+        cur = self._cur
+        assert cur is not None
+        if modifier == 'D':
+            return cur.year, self._ordinal // multiplier
+        if modifier == 'W':
+            wy, week = observed_week_key(cur)
+            return wy, week // multiplier
+        return cur.year, (cur.month - 1) // multiplier
 
 
 class Resampler:

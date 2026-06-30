@@ -10,14 +10,13 @@ count the actual trading days seen in the sub-bar stream, which reproduces
 TradingView's holiday-aware grid.
 """
 from dataclasses import dataclass
-from datetime import timedelta, timezone as dt_timezone
+from datetime import timezone as dt_timezone
 from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from .aggregator import _merge_candles
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
-    first_monday,
 )
 from ..lib.timeframe import in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
@@ -83,15 +82,20 @@ class BarMagnifier:
         self._mode = grid_mode(sym_type, opening_hours) if multi else None
 
         self._src_off = 0
+        self._fold = False
         if multi and source_tf:
             # noinspection PyProtectedMember
             src_mod, _ = _process_tf(source_tf)
             if src_mod in ('', 'S'):
                 self._src_off = in_seconds(source_tf) - 1
+                # Intraday sub-bars carry the end instants the holiday half-day
+                # fold needs (a daily source stream is already folded).
+                self._fold = True
 
         if multi and self._mode == 'observed':
             self._overnight = overnight_opens(opening_hours, session_starts)
-            self._counter: ObservedDayCounter | None = ObservedDayCounter()
+            self._counter: ObservedDayCounter | None = ObservedDayCounter(
+                tz, opening_hours, fold=self._fold)
         else:
             self._overnight = {}
             self._counter = None
@@ -106,14 +110,9 @@ class BarMagnifier:
         """
         if self._counter is not None:
             td = trading_day(candle.timestamp + self._src_off, self._tz, self._overnight)
-            if self._modifier == 'D':
-                key = (td.year, self._counter.ordinal(td) // self._multiplier)
-            elif self._modifier == 'W':
-                monday = td - timedelta(days=td.weekday())
-                weeks = (monday - first_monday(monday.year)).days // 7
-                key = (monday.year, weeks // self._multiplier)
-            else:  # 'M'
-                key = (td.year, (td.month - 1) // self._multiplier)
+            bar_end = candle.timestamp + self._src_off + 1 if self._fold else None
+            self._counter.ordinal(td, bar_end)
+            key = self._counter.key(self._modifier, self._multiplier)
             return key, candle.timestamp
 
         bar_time_ms = self._resampler.get_bar_time(
