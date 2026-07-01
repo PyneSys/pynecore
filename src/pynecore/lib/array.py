@@ -1,4 +1,4 @@
-from typing import TypeVar, Any, cast
+from typing import TypeVar, Any
 
 import builtins
 
@@ -78,6 +78,22 @@ __all__ = [
 
 
 # noinspection PyShadowingBuiltins
+def _non_na(id: list[T]) -> list[T]:
+    """
+    Return the array's elements with na values removed.
+
+    TradingView's array math and statistics reductions ignore na elements and
+    reduce over the remaining values only, yielding na when none remain. Every
+    such reduction filters its input through this helper so their na handling
+    stays consistent with Pine.
+
+    :param id: Input array, possibly containing na elements
+    :return: New list containing only the non-na elements, in original order
+    """
+    return [i for i in id if not isinstance(i, NA)]
+
+
+# noinspection PyShadowingBuiltins
 def abs(id: list[int | float]) -> list[int | float]:
     """
     Returns an array containing the absolute value of each element in the original array.
@@ -96,9 +112,10 @@ def avg(id: list[Number]) -> float | NA[float]:
     :param id: Input array
     :return: Average value of the elements in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return builtins.sum(id) / len(id)
+    return builtins.sum(a) / len(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -222,15 +239,20 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
     :return: Covariance between the elements in the two arrays, or na if the arrays are empty
     """
     assert len(id1) == len(id2), "Input arrays must have the same length!"
-    if not id1:
+    pairs = [(v1, v2) for v1, v2 in zip(id1, id2)
+             if not isinstance(v1, NA) and not isinstance(v2, NA)]
+    if not pairs:
         return NA(float)
-    mean1 = statistics.mean(id1)
-    mean2 = statistics.mean(id2)
-    length = len(id1)
+    length = len(pairs)
+    mean1 = builtins.sum(p[0] for p in pairs) / length
+    mean2 = builtins.sum(p[1] for p in pairs) / length
     summ = 0.0
-    for v1, v2 in zip(id1, id2):
+    for v1, v2 in pairs:
         summ += (v1 - mean1) * (v2 - mean2)
-    return summ / ((length - 1) if not biased else length)
+    divisor = (length - 1) if not biased else length
+    if divisor == 0:
+        return 0.0
+    return summ / divisor
 
 
 # noinspection PyShadowingBuiltins
@@ -384,9 +406,10 @@ def max(id: list[Number]) -> Number | NA[float]:
     :param id: Input array
     :return: Maximum value in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return builtins.max(id)
+    return builtins.max(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -397,9 +420,10 @@ def median(id: list[Number]) -> float | NA[float]:
     :param id: Input array
     :return: Median value of the elements in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return statistics.median(id)
+    return statistics.median(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -410,9 +434,10 @@ def min(id: list[Number]) -> float | NA[float]:
     :param id: Input array
     :return: Minimum value in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return builtins.min(id)
+    return builtins.min(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -423,9 +448,10 @@ def mode(id: list[T]) -> T | NA[float]:
     :param id: Input array
     :return: Most frequently occurring element in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return statistics.mode(id)
+    return statistics.mode(a)
 
 
 # noinspection PyShadowingNames
@@ -593,13 +619,25 @@ def new_string(size: int | NA = 0, initial_value: str | NA = NA(str)) -> list[Py
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_linear_interpolation(id: list[float], percentage: float) -> float:
+def percentile_linear_interpolation(id: list[float], percentage: float) -> float | NA[float]:
     """
     Calculate the percentile value using linear interpolation, following TradingView's logic.
 
-    :param id: List of numeric values
+    Values are sorted ascending with na elements pushed to the end (as if they
+    were the largest values). The interpolation position is 1-based over the full
+    array length, ``pos = n * percentage / 100 + 0.5``, clamped to the array
+    bounds.
+
+    Without na the value is interpolated linearly between the two ranks
+    straddling ``pos``. TradingView diverges once the array holds any na element:
+    it then yields a value only for the low-end clamp or for a ``pos`` that lands
+    exactly on an integer rank, and returns na for every fractional position --
+    even when both neighbouring values are numeric. An exact rank falling in the
+    sorted-to-end na tail likewise yields na.
+
+    :param id: List of numeric values, possibly containing na elements
     :param percentage: Percentile (0-100, not 0-1)
-    :return: Interpolated value at the given percentile
+    :return: Interpolated value at the given percentile, or na (see above)
     :raises ValueError: If arr is empty or percentage is not in [0, 100]
     """
     if not id:
@@ -607,37 +645,45 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     if not (0 <= percentage <= 100):
         raise ValueError("Percentage must be between 0 and 100")
 
-    sorted_arr = sorted(id)
-    n = len(sorted_arr)
+    has_na = any(isinstance(v, NA) for v in id)
+    non_na = sorted(v for v in id if not isinstance(v, NA))
+    sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
+    n = len(id)
 
-    # Calculate position in 1-indexed system
-    pos = n * percentage / 100.0
+    # 1-based interpolation position over the full length
+    pos = n * percentage / 100.0 + 0.5
+    # Snap to an exact integer rank when floating-point noise leaves us just shy
+    nearest = round(pos)
+    if builtins.abs(pos - nearest) < 1e-9:
+        pos = float(nearest)
 
-    # Special cases for extreme percentiles
-    if pos < 1:
+    if pos <= 1:
         return sorted_arr[0]
     if pos >= n:
         return sorted_arr[-1]
 
-    # If pos is an integer, average the two adjacent values
-    if pos.is_integer():
-        pos_int = int(pos)
-        return (sorted_arr[pos_int - 1] + sorted_arr[pos_int]) / 2.0
-
-    # For non-integer positions, perform linear interpolation
-    lower_index = int(pos)  # floor of pos
-    frac = pos - lower_index
-    return sorted_arr[lower_index] + frac * (sorted_arr[lower_index + 1] - sorted_arr[lower_index])
+    lower = math.floor(pos)  # 1-based lower rank
+    frac = pos - lower
+    if frac == 0:
+        return sorted_arr[lower - 1]
+    if has_na:
+        return NA(float)
+    return sorted_arr[lower - 1] + frac * (sorted_arr[lower] - sorted_arr[lower - 1])
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_nearest_rank(id: list[float], percentage: float) -> float:
+def percentile_nearest_rank(id: list[float], percentage: float) -> float | NA[float]:
     """
     Calculate the nearest rank percentile without interpolation.
 
+    Matches TradingView: na elements are kept and sort to the end (as if they
+    were the largest values), so the full array length (na included) drives the
+    rank. A rank that lands on a na element yields na.
+
     :param id: List of numeric values
     :param percentage: Percentile (0-100)
-    :return: The value at the nearest rank for the specified percentile
+    :return: The value at the nearest rank for the specified percentile, or na
+             if that rank falls on a na element
     :raises ValueError: If arr is empty or percentage is not between 0 and 100
     """
     if not id:
@@ -645,8 +691,9 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
     if not (0 <= percentage <= 100):
         raise ValueError("Percentage must be between 0 and 100")
 
-    sorted_arr = sorted(id)
-    n = len(sorted_arr)
+    non_na = sorted(v for v in id if not isinstance(v, NA))
+    sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
+    n = len(id)
     if percentage == 0:
         return sorted_arr[0]
 
@@ -659,14 +706,18 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentrank(id: list[Number], index: int) -> float:
+def percentrank(id: list[Number], index: int) -> float | NA[float]:
     """
     Returns the percentile rank of the element at the specified index.
     The percentile rank is the percentage of values less than or equal to the value at index.
 
+    Matches TradingView: na elements are ignored when counting values at or below
+    the target, but still count toward the array length. If the element at
+    ``index`` is itself na, the rank is na.
+
     :param id: Input array
     :param index: Index of the element to calculate rank for
-    :return: Percentile rank (0-100)
+    :return: Percentile rank (0-100), or na if the element at index is na
     :raises ValueError: If input array is empty or index is out of range
     """
     if not id:
@@ -677,9 +728,11 @@ def percentrank(id: list[Number], index: int) -> float:
 
     # Get value at index
     value = id[index]
+    if isinstance(value, NA):
+        return NA(float)
 
-    # Count elements less than or equal
-    count = builtins.sum(1 for x in id if x <= value)
+    # Count non-na elements less than or equal to the target value
+    count = builtins.sum(1 for x in id if not isinstance(x, NA) and x <= value)
 
     # Calculate percentage
     return (count - 1) * 100 / (len(id) - 1)
@@ -715,9 +768,10 @@ def range(id: list[Number]) -> Number | NA[float]:
     :param id: Input array
     :return: Range of the elements in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return cast(Number, max(id) - min(id))  # noqa
+    return builtins.max(a) - builtins.min(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -883,7 +937,7 @@ def stdev(id: list[Number], biased: bool = True) -> float | NA[float]:
                    unbiased standard deviation.
     :return: Standard deviation of the elements in the array, or na if the array is empty
     """
-    a = cast(list[Number], [i for i in id if not isinstance(i, NA)])
+    a = _non_na(id)
     if not a:
         return NA(float)
     if len(a) < 2:
@@ -902,9 +956,10 @@ def sum(id: list[float | int]) -> float | int | NA[float]:
     :param id: Input array
     :return: Sum of the elements in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
-    return builtins.sum(id)
+    return builtins.sum(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -927,14 +982,17 @@ def variance(id: list[Number], biased: bool = True) -> float | NA[float]:
     :param biased: If True, calculates the biased variance. If False, calculates the unbiased variance.
     :return: Variance of the elements in the array, or na if the array is empty
     """
-    if not id:
+    a = _non_na(id)
+    if not a:
         return NA(float)
+    if len(a) < 2:
+        return 0.0
     if not biased:
-        return statistics.variance(id)
+        return statistics.variance(a)
 
-    length = len(id)
-    mean = statistics.mean(id)
+    length = len(a)
+    mean = statistics.mean(a)
     summ = 0.0
-    for v in id:
+    for v in a:
         summ += (v - mean) ** 2
     return summ / length
