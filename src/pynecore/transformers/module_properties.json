@@ -294,9 +294,6 @@
     "builtins": {
       "type": "variable"
     },
-    "cast": {
-      "type": "variable"
-    },
     "clear": {
       "type": "variable"
     },
