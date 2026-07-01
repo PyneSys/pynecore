@@ -26,6 +26,13 @@ class Color:
     def __eq__(self, other: 'Color') -> bool:
         return self.value == other.value
 
+    def __hash__(self) -> int:
+        # Value-based, consistent with __eq__. Defining __eq__ otherwise sets
+        # __hash__ to None (unhashable), which makes a Color an illegal
+        # dataclass field default (``@udt`` uses dataclass) and forbids use as a
+        # dict key / set member -- both of which Pine colors legitimately need.
+        return hash(self.value)
+
     @property
     def r(self) -> int:
         """Red component (0-255)"""
