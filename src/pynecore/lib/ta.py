@@ -323,16 +323,23 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the COG
     :return: The Center of Gravity (COG) of the source series
     """
-    if isinstance(source, NA):
-        return NA(float)
-
     count: Persistent[int] = 0
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
     val: Persistent[float] = NA(float)
 
-    # Warming up phase
+    isna = isinstance(source, NA)
+    if not isna:
+        # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
+        # indexes past NA gaps to the true oldest value still inside the window.
+        # Reading the parameter directly would step back ``length`` *bars* and land
+        # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
+        src: Series[float] = source
+
+    # Warming up phase — only non-NA samples advance the window
     if count < length:
+        if isna:
+            return NA(float)
         count += 1
         summ += source
         weighted_summ += source * (length - count)
@@ -341,8 +348,11 @@ def cog(source: Series[float], length: int) -> PyneFloat:
 
     # Normal calculation phase
     else:
-        new_summ = summ + source - source[length]
-        weighted_summ = weighted_summ + summ - length * source[length]
+        if isna:
+            # An NA bar leaves the window unchanged; hold the last full value
+            return val
+        new_summ = summ + source - src[length]
+        weighted_summ = weighted_summ + summ - length * src[length]
         summ = new_summ
     val = -weighted_summ / summ - 1.0
     return val
@@ -758,9 +768,6 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     :param offset: Number of bars to shift the result
     :return: Linear regression value
     """
-    if isinstance(source, NA):
-        return NA(float)
-
     assert length > 0, "Invalid length, must be greater than 0!"
     if length == 1:
         return source
@@ -776,8 +783,18 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     sum_y: Persistent[float] = 0.0  # Sum of source values in the window
     sum_xy: Persistent[float] = 0.0  # Weighted sum: sum((window_size - 1 - i) * source[i])
 
+    isna = isinstance(source, NA)
+    if not isna:
+        # NA values are NOT stored in the buffer, only skipped, so ``src[window_size]``
+        # indexes past NA gaps to the true oldest value still inside the window.
+        # Reading the parameter directly would step back ``window_size`` *bars* and
+        # land inside an NA gap, subtracting an NA that poisons ``sum_y`` forever.
+        src: Series[float] = source
+
     # Warm-up phase: accumulate values until the window is full
     if bar_count < window_size:
+        if isna:
+            return NA(float)
         prev_sum_y = sum_y
         sum_y = prev_sum_y + source
         sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y
@@ -787,11 +804,13 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
         if bar_count < window_size:
             return NA(float)
     else:
-        # Rolling update: remove the oldest value when the window is full
-        dropped_value = source[window_size]
-        prev_sum_y = sum_y
-        sum_y = prev_sum_y + source - dropped_value
-        sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y + dropped_value
+        # Rolling update: remove the oldest value when the window is full. An NA bar
+        # leaves the window unchanged; fall through to report the held value.
+        if not isna:
+            dropped_value = src[window_size]
+            prev_sum_y = sum_y
+            sum_y = prev_sum_y + source - dropped_value
+            sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y + dropped_value
 
     # Compute slope and intercept
     denominator = window_size * sum_x2 - sum_x * sum_x
@@ -2110,8 +2129,6 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     :return: The WMA of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
     length = int(length)
 
     # Calculate denominator only once
@@ -2121,8 +2138,18 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
 
-    # Warming up phase
+    isna = isinstance(source, NA)
+    if not isna:
+        # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
+        # indexes past NA gaps to the true oldest value still inside the window.
+        # Reading the parameter directly would step back ``length`` *bars* and land
+        # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
+        src: Series[float] = source
+
+    # Warming up phase — only non-NA samples advance the window
     if count < length:
+        if isna:
+            return NA(float)
         count += 1
         summ += source
         weighted_summ += source * count
@@ -2131,9 +2158,12 @@ def wma(source: Series[float], length: int) -> PyneFloat:
 
     # Normal calculation phase
     else:
+        if isna:
+            # An NA bar leaves the window unchanged; hold the last full value
+            return weighted_summ / denom
         old_summ = summ
         # Substract the oldest value and add the newest value
-        summ -= source[length] - source
+        summ -= src[length] - source
         # Substract the oldest weighted value and add the newest weighted value
         weighted_summ -= old_summ - length * source
 
