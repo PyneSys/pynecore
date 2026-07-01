@@ -1,6 +1,8 @@
 """
 @pyne
 """
+from dataclasses import dataclass
+
 import pytest
 
 from pynecore.lib import color
@@ -11,6 +13,32 @@ from pynecore.types.na import NA, na_float
 def main():
     """Dummy main to satisfy the @pyne script loader."""
     pass
+
+
+#
+# Color is a value type (RGBA packed into one int); defining __eq__ without
+# __hash__ would make it unhashable, which forbids it as a dataclass/``@udt``
+# field default and as a dict key. Both are needed by compiled UDTs whose fields
+# default to a color (e.g. ``color = color.blue``).
+#
+
+def __test_color_is_hashable_and_consistent_with_eq__():
+    """Equal colors hash equal; distinct colors are distinguishable."""
+    a = Color('#0000FFFF')
+    b = Color('#0000FFFF')
+    c = Color('#FF0000FF')
+    assert a == b and hash(a) == hash(b)
+    assert a != c
+    assert {a: 'blue'}[b] == 'blue'
+
+
+def __test_color_usable_as_dataclass_field_default__():
+    """A Color default on a dataclass field is allowed (no mutable-default error)."""
+    @dataclass(slots=True)
+    class Props:
+        col: Color = Color('#0000FFFF')
+
+    assert Props().col == Color('#0000FFFF')
 
 
 #
