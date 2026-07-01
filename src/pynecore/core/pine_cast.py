@@ -67,7 +67,7 @@ def cast_int(x: int | float | NA) -> int | NA[int]:
     :return: The casted value
     """
     if isinstance(x, NA):
-        return 0
+        return NA(int)
     return int(x)
 
 
