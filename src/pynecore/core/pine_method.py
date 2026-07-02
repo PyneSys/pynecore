@@ -128,6 +128,34 @@ def _bound_method(method: Any) -> Callable:
     return bound
 
 
+def _adapt_exported_kwargs(exported: Exported, kwargs: dict) -> dict:
+    """
+    Map keyword arguments onto a compiled library's canonically renamed
+    parameter names when needed.
+
+    A compiler cannot always know at emission time that a string-dispatched
+    method call targets a library export (the receiver may be untyped), so a
+    keyword argument can arrive under its original Pine spelling while the
+    library ``def`` declares ``name + '__ren__'``. The rename is applied only
+    when the raw name is absent from the target signature and the suffixed
+    one is present — a correct call is never altered.
+
+    :param exported: The resolved Exported proxy
+    :param kwargs: Keyword arguments as emitted at the call site
+    :return: Keyword arguments matching the target's parameter names
+    """
+    if not kwargs:
+        return kwargs
+    code: Any = getattr(exported.__fn__, '__code__', None)
+    if code is None:
+        return kwargs
+    params = code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
+    if all(k in params for k in kwargs):
+        return kwargs
+    return {(k + '__ren__' if k not in params and k + '__ren__' in params else k): v
+            for k, v in kwargs.items()}
+
+
 # noinspection PyShadowingNames
 def method_call(method: str | Callable, var: Any, *args, **kwargs) -> Any:
     """
@@ -167,20 +195,28 @@ def method_call(method: str | Callable, var: Any, *args, **kwargs) -> Any:
         # Try the module that defines the receiver's UDT class first, then the
         # caller's own module, then every library module the caller imports -- a
         # library can export methods on another library's UDT, so the defining
-        # module is not always the UDT's own
-        mod = sys.modules.get(type(var).__module__)
-        _method = getattr(mod, method, None) if mod is not None else None
-        if isinstance(_method, Exported):
-            return _bound_method(_method)(var, *args, **kwargs)
+        # module is not always the UDT's own.
+        # If the raw name misses everywhere, retry once with PyneComp's canonical
+        # rename suffix: a compiled library emits a method whose Pine name cannot
+        # live verbatim in Python (``lambda``, ``method_call``, ...) under
+        # ``name + '__ren__'``. A stub with that shape can only be the image of
+        # this Pine name (a Pine ``x__ren__`` compiles to ``x__ren____ren__``),
+        # so the retry can never hit a wrong export.
         caller_globals = sys._getframe(1).f_globals
-        _method = caller_globals.get(method)
-        if isinstance(_method, Exported):
-            return _bound_method(_method)(var, *args, **kwargs)
-        for _gval in caller_globals.values():
-            if isinstance(_gval, ModuleType) and _gval.__name__.startswith('lib.'):
-                _method = getattr(_gval, method, None)
-                if isinstance(_method, Exported):
-                    return _bound_method(_method)(var, *args, **kwargs)
+        mod = sys.modules.get(type(var).__module__)
+        for lookup_name in (method, method + '__ren__'):
+            _method = getattr(mod, lookup_name, None) if mod is not None else None
+            if not isinstance(_method, Exported):
+                _method = caller_globals.get(lookup_name)
+            if not isinstance(_method, Exported):
+                for _gval in caller_globals.values():
+                    if isinstance(_gval, ModuleType) and _gval.__name__.startswith('lib.'):
+                        _method = getattr(_gval, lookup_name, None)
+                        if isinstance(_method, Exported):
+                            break
+            if isinstance(_method, Exported):
+                return _bound_method(_method)(var, *args,
+                                              **_adapt_exported_kwargs(_method, kwargs))
 
         assert False, f'No such method: {var}->{method}'
 
