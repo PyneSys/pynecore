@@ -54,3 +54,33 @@ def __test_dispatch_with_unannotated_leading_param__():
     marker = object()
     assert _create(marker, _Dot()) == 'dot'
     assert _create(marker, _Candle()) == 'candle'
+
+
+#
+# An untyped call site emits keyword arguments under their original Pine
+# spelling, while a compiled library declares a trigger-named parameter under
+# its canonical image (``position`` -> ``position__ren__``). The dispatcher
+# must adapt such keywords the same way pine_method._adapt_exported_kwargs
+# does for plain exports (regression: string_utils ``announce(position=...)``
+# died with ``No matching implementation``).
+#
+
+# noinspection PyUnusedLocal
+@overload
+def _announce(this: str, height: float = 0.0, position__ren__: str = 'top'):  # type: ignore[no-redef]
+    return f'str:{position__ren__}'
+
+
+# noinspection PyUnusedLocal,PyRedeclaration
+@overload
+def _announce(this: int, height: float = 0.0, position__ren__: str = 'top'):  # type: ignore[no-redef]
+    return f'int:{position__ren__}'
+
+
+def __test_dispatch_adapts_canonical_kwargs__():
+    """a bare Pine keyword targets the canonically renamed parameter"""
+    assert _announce('x', position='mid') == 'str:mid'
+    assert _announce(3, position='mid') == 'int:mid'
+    # the canonical spelling keeps working, and a correct call is unaltered
+    assert _announce('x', position__ren__='low') == 'str:low'
+    assert _announce('x', height=1.0) == 'str:top'

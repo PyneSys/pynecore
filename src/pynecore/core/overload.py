@@ -233,6 +233,28 @@ def _type_token(value: Any) -> Any:
     return t
 
 
+def _canonical_kwarg_renames(impls: list[Implementation],
+                             names: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """Compute the keyword renames onto canonically renamed parameters.
+
+    An untyped call site emits a keyword argument under its original Pine
+    spelling while the library ``def`` declares ``name + '__ren__'``
+    (PyneComp's canonical rename; the same contract as
+    ``pine_method._adapt_exported_kwargs``, which cannot see through the
+    dispatcher). A keyword is renamed only when NO implementation declares
+    the raw name and at least one declares the suffixed image — a correct
+    call is never altered. Overloads of one export come from one compilation
+    unit, so a name's rename decision is identical across implementations.
+
+    :param impls: Registered implementations of the overload group.
+    :param names: Keyword argument names as emitted at the call site.
+    :return: ``(raw, canonical)`` pairs to apply; empty when nothing renames.
+    """
+    declared = {name for impl in impls for name, _ in impl.param_types}
+    return tuple((k, k + '__ren__') for k in names
+                 if k not in declared and k + '__ren__' in declared)
+
+
 def _anchored(impls: list[Implementation], qualname: str,
               cache: dict[Implementation, tuple[Callable, list | None, Callable]] | None = None
               ) -> Callable:
@@ -256,8 +278,19 @@ def _anchored(impls: list[Implementation], qualname: str,
     # Implementation objects are module-lifetime stable (re-runs swap only
     # impl.func, handled below), so this never goes stale across resets.
     _select_cache: dict[tuple, Implementation] = {}
+    # Keyword-name adaptation memo (see _canonical_kwarg_renames): keyed by
+    # the call's keyword-name tuple, stable for the same reason _select_cache
+    # is — implementation signatures only change with a recompile.
+    _kw_rename_cache: dict[tuple[str, ...], tuple[tuple[str, str], ...]] = {}
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
+        if kwargs:
+            names = tuple(kwargs)
+            renames = _kw_rename_cache.get(names)
+            if renames is None:
+                renames = _kw_rename_cache[names] = _canonical_kwarg_renames(impls, names)
+            for raw, canonical in renames:
+                kwargs[canonical] = kwargs.pop(raw)
         # Selection key, inlined (this is per-bar hot code): a uniform hashable
         # ``(positional_tokens, keyword_tokens)`` pair so the no-kwargs and
         # with-kwargs forms can never collide. map() over _type_token beats a
