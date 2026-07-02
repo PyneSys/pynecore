@@ -54,6 +54,13 @@ class BuiltinShadowTransformer(ast.NodeTransformer):
                 # --strict compilation suffixes every global binding
                 if name.endswith('__global__'):
                     name = name[:-len('__global__')]
+                # A builtin-named alias is emitted under its canonical image
+                # (``import ... as ta`` compiles to ``as ta__ren__``); the
+                # image can only come from the bare name (a Pine ``ta__ren__``
+                # alias compiles to ``ta__ren____ren__``), so stripping the
+                # suffix recovers the source alias.
+                if name.endswith('__ren__'):
+                    name = name[:-len('__ren__')]
                 namespace = _NAMESPACE_RENAMES.get(name, name)
                 if f'lib.{namespace}' not in self.registry:
                     continue
@@ -107,14 +114,22 @@ class BuiltinShadowTransformer(ast.NodeTransformer):
 
         # Built-in namespace fallback -> canonical lib.<namespace>.<attr> form;
         # the nested-key check covers sub-namespaces (e.g. strategy.commission)
-        if (node.attr in self.registry[f'lib.{namespace}']
-                or f'lib.{namespace}.{node.attr}' in self.registry):
+        attr = node.attr
+        if (attr not in self.registry[f'lib.{namespace}']
+                and f'lib.{namespace}.{attr}' not in self.registry
+                and attr.endswith('__ren__')):
+            # A trigger-named member is emitted under its canonical image
+            # (``math.max`` compiles to ``max__ren__``); when the library does
+            # not serve it, the built-in namespace knows the bare name only
+            attr = attr[:-len('__ren__')]
+        if (attr in self.registry[f'lib.{namespace}']
+                or f'lib.{namespace}.{attr}' in self.registry):
             return ast.copy_location(
                 ast.Attribute(
                     value=ast.Attribute(
                         value=ast.Name(id='lib', ctx=ast.Load()),
                         attr=namespace, ctx=ast.Load()),
-                    attr=node.attr, ctx=node.ctx),
+                    attr=attr, ctx=node.ctx),
                 node)
 
         # In neither -> leave it to fail at runtime, as before

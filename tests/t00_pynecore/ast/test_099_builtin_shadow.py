@@ -63,6 +63,34 @@ def __test_alias_differs_from_library_name__():
     assert 'b = ta.boost(x)' in dump
 
 
+def __test_canonical_alias_image_recognized__():
+    """ A builtin-named alias arrives under its canonical image
+    (``import ... as ta`` is emitted as ``as ta__ren__``); the fallback must
+    key on the recovered source alias """
+    with _fake_lib('lib.tv.ta.v9', exported=['supertrend'], supertrend=lambda: None):
+        dump = _shadow(
+            'import lib.tv.ta.v9 as ta__ren__\n'
+            'a = ta__ren__.crossover(c, s)\n'
+            'b = ta__ren__.supertrend(f, p)\n'
+        )
+    assert 'a = lib.ta.crossover(c, s)' in dump
+    assert 'b = ta__ren__.supertrend(f, p)' in dump
+
+
+def __test_canonical_member_image_falls_back_to_bare_name__():
+    """ A trigger-named member is emitted under its canonical image
+    (``math.max`` -> ``max__ren__``); when the library does not serve it, the
+    built-in namespace knows the bare name only """
+    with _fake_lib('lib.user.mymath.v1', exported=['pow__ren__'], pow__ren__=lambda: None):
+        dump = _shadow(
+            'import lib.user.mymath.v1 as math__ren__\n'
+            'a = math__ren__.max__ren__(x, y)\n'
+            'b = math__ren__.pow__ren__(x, y)\n'
+        )
+    assert 'a = lib.math.max(x, y)' in dump
+    assert 'b = math__ren__.pow__ren__(x, y)' in dump
+
+
 def __test_non_shadowing_alias_untouched__():
     """ An alias that is not a built-in namespace gets no fallback """
     with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
