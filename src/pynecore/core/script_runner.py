@@ -1549,6 +1549,14 @@ class ScriptRunner:
             last_warmup_timestamp: int | None = None
             warmup_bars_processed = 0
 
+            # calc_bars_count: Pine restricts calculation to the last N chart
+            # bars. Earlier bars are not calculated at all -- series start fresh
+            # (na warmup) at the first calculated bar, while bar_index keeps its
+            # absolute value and last_bar_index is unchanged. 0 (or a value that
+            # covers the whole history) calculates every bar.
+            calc_bars_count = getattr(self.script, 'calc_bars_count', 0) or 0
+            calc_start = self.last_bar_index + 1 - calc_bars_count if calc_bars_count > 0 else 0
+
             if is_live and self._broker_plugin is not None:
                 broker_info("warmup phase started — replaying historical bars")
 
@@ -1559,6 +1567,11 @@ class ScriptRunner:
                 # Pre-increment: bar_index becomes the index of the bar we
                 # are about to process (first bar -> 0).
                 self.bar_index += 1
+                # Skip bars before the calc_bars_count window: advance bar_index
+                # to keep it absolute, but feed no series, run no main, process
+                # no orders and emit no output for uncalculated history.
+                if self.bar_index < calc_start:
+                    continue
                 last_warmup_timestamp = candle.timestamp
                 warmup_bars_processed += 1
 
