@@ -809,9 +809,24 @@ class ScriptRunner:
             ohlcv_iterator = iter(self.ohlcv_iter)
             next_candle = next(ohlcv_iterator, None)
 
+            # calc_bars_count: Pine restricts calculation to the last N chart
+            # bars. Earlier bars are not calculated at all -- series start fresh
+            # (na warmup) at the first calculated bar, while bar_index keeps its
+            # absolute value and last_bar_index is unchanged. 0 (or a value that
+            # covers the whole history) calculates every bar.
+            calc_bars_count = getattr(self.script, 'calc_bars_count', 0) or 0
+            calc_start = self.last_bar_index + 1 - calc_bars_count if calc_bars_count > 0 else 0
+
             while next_candle is not None:
                 candle = next_candle
                 next_candle = next(ohlcv_iterator, None)
+
+                # Skip bars before the calc_bars_count window: advance bar_index
+                # to keep it absolute, but feed no series, run no main, process
+                # no orders and emit no output for uncalculated history.
+                if self.bar_index < calc_start:
+                    self.bar_index += 1
+                    continue
 
                 # Update syminfo lib properties if needed, other ScriptRunner instances may have changed them
                 if self.update_syminfo_every_run:
