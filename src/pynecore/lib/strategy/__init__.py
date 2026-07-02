@@ -146,6 +146,8 @@ class Order:
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
+        "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
+        "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
@@ -218,6 +220,8 @@ class Order:
                                 and self.trail_points_ticks is None)
 
         self.cancelled = False
+        self.deferred_qty = False
+        self.flip_extra = 0.0
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
         self.from_entry_na = False
@@ -1288,6 +1292,12 @@ class SimPosition(PositionBase):
         close_only = False
         # Apply risk management only to entry orders, not normal orders from strategy.order()
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
+            # A default-sized order settles its quantity at the actual fill price
+            if order.deferred_qty:
+                self._resolve_deferred_qty(order, price)
+                if order.size == 0.0:
+                    self._remove_order(order)
+                    return False
             # Pre-fill risk gates — shared with BrokerPosition pre-submit so
             # the same policy applies regardless of execution mode.
             if self._is_intraday_filled_cap_reached():
@@ -1560,6 +1570,32 @@ class SimPosition(PositionBase):
                 order.filled_by_type = 'profit'
                 self.fill_order(order, p, p, self.l)
                 return True
+        return False
+
+    def _check_close_leg_up(self, order: Order) -> bool:
+        """Fill on the closing ascent (low -> close) of the intrabar walk.
+
+        Only an order that became active mid-bar can still be pending here — an
+        exit whose entry filled on an earlier leg. The segment starts at the
+        bar's low, so fills land exactly at the trigger price (no open-gap
+        clamp like :meth:`_check_high` applies).
+        """
+        if self._exit_awaits_entry(order):
+            return False
+        # Short limit (sell back) triggers when price rises to the limit level
+        if order.limit is not None and order.size < 0 and order.limit <= self.c:
+            order.filled_by_type = 'profit'
+            self.fill_order(order, order.limit, order.limit, self.l)
+            return True
+        # Buy stop triggers when price rises to the stop level
+        if order.stop is not None and order.size > 0 and order.stop <= self.c:
+            p = order.stop
+            slippage = lib._script.slippage
+            if slippage > 0:
+                p += syminfo.mintick * slippage
+            order.filled_by_type = 'loss'
+            self.fill_order(order, p, p, self.l)
+            return True
         return False
 
     def _process_trailing_stop(self, order: Order, ohlc: bool) -> bool:
@@ -2036,6 +2072,55 @@ class SimPosition(PositionBase):
                 closed_trade.cum_profit_percent = 0.0
             self.entry_equity += closed_trade.profit
 
+    def _resolve_deferred_qty(self, order: Order, fill_price: float) -> None:
+        """Finalize a default-sized entry's quantity at its actual fill price.
+
+        TradingView resolves percent_of_equity / cash default sizing when the
+        order EXECUTES: the investment target is divided by the real fill
+        price, with equity measured at that moment. The placement-time size
+        was only the margin-check estimate — a marketable limit filling at the
+        open, or a gapped market order, re-sizes here. The reversal flip
+        component stays frozen from creation (TV computes the flip quantity at
+        order creation time).
+        """
+        order.deferred_qty = False
+        qty = _default_entry_qty(float(fill_price))
+        if qty <= 0.0:
+            order.size = 0.0
+            return
+        order.size = _size_round((qty + order.flip_extra) * order.sign)
+
+    def _cancel_unaffordable_entries(self) -> None:
+        """
+        Cancel pending price-based entry orders the account can no longer margin.
+
+        TradingView re-evaluates an unfilled entry order's required margin at the
+        CURRENT price (the "LastPrice" of its margin formula), cancelling the order
+        once the requirement exceeds equity. The sweep runs after the bar's fill
+        phases: a marketable order fills at the open before any check can touch it,
+        and a resting order gets this bar's fill window first. At 100%
+        percent_of_equity sizing this kills every resting buy limit below the
+        market (required = equity * price / limit > equity) while a resting sell
+        limit above the market survives (required < equity) -- exactly the
+        asymmetry TradingView's exported trade lists show.
+        """
+        if not self.entry_orders:
+            return
+        script = lib._script
+        pv = syminfo.pointvalue
+        for order in list(self.entry_orders.values()):
+            if order.order_type != _order_type_entry:
+                continue
+            if order.limit is None and order.stop is None:
+                continue
+            margin_percent = script.margin_short if order.sign < 0 else script.margin_long
+            if margin_percent <= 0:
+                continue
+            resulting_qty = abs(self.size + order.size)
+            margin_needed = resulting_qty * self.c * pv * (margin_percent / 100.0)
+            if margin_needed > self.equity:
+                self._remove_order(order)
+
     def _entry_exceeds_margin_after_fill(self, order: Order, fill_price: float) -> bool:
         """
         Check whether an entry's resulting position is affordable at its fill price.
@@ -2112,6 +2197,32 @@ class SimPosition(PositionBase):
                 return True
         return False
 
+    def _check_close_leg_down(self, order: Order) -> bool:
+        """Fill on the closing descent (high -> close) of the intrabar walk.
+
+        Only an order that became active mid-bar can still be pending here — an
+        exit whose entry filled on an earlier leg. The segment starts at the
+        bar's high, so fills land exactly at the trigger price (no open-gap
+        clamp like :meth:`_check_low` applies).
+        """
+        if self._exit_awaits_entry(order):
+            return False
+        # Long limit (buy back) triggers when price falls to the limit level
+        if order.limit is not None and order.size > 0 and order.limit >= self.c:
+            order.filled_by_type = 'profit'
+            self.fill_order(order, order.limit, self.h, order.limit)
+            return True
+        # Sell stop triggers when price falls to the stop level
+        if order.stop is not None and order.size < 0 and order.stop >= self.c:
+            p = order.stop
+            slippage = lib._script.slippage
+            if slippage > 0:
+                p -= syminfo.mintick * slippage
+            order.filled_by_type = 'loss'
+            self.fill_order(order, p, self.h, p)
+            return True
+        return False
+
     def process_orders(self):
         """ Process orders """
         # We need to round to the nearest tick to get the same results as in TradingView.
@@ -2149,6 +2260,7 @@ class SimPosition(PositionBase):
 
         self._process_at_bar_open(ohlc)
         self._process_limit_stop_orders(ohlc)
+        self._cancel_unaffordable_entries()
         self._finalize_bar_pnl()
         if (self.risk_max_drawdown_value is not None
                 or self.risk_max_intraday_loss_value is not None
@@ -2308,6 +2420,8 @@ class SimPosition(PositionBase):
                         # TradingView calculates the flip quantity 1st order processing
                         # then open a new one in the opposite direction.
                         order.size -= self.size  # Subtract because position.size has opposite sign
+                        if order.deferred_qty:
+                            order.flip_extra = abs(self.size)
 
             # Apply slippage to market orders
             fill_price = self.o
@@ -2321,6 +2435,13 @@ class SimPosition(PositionBase):
             # Pre-fill margin check for entry orders (TradingView behavior)
             # TV rejects entry orders BEFORE filling if the position would exceed margin
             if order.order_type == _order_type_entry:
+                # Settle a default-sized order's quantity at its fill price first,
+                # so the margin check judges the real fill, not the estimate
+                if order.deferred_qty:
+                    self._resolve_deferred_qty(order, fill_price)
+                    if order.size == 0.0:
+                        self._remove_order(order)
+                        continue
                 if self._entry_exceeds_margin_after_fill(order, fill_price):
                     # The reversal's new leg (opposite the bar-start position, with a
                     # same-bar close already filled) is allowed to fill and is trimmed by
@@ -2528,6 +2649,14 @@ class SimPosition(PositionBase):
                 if self.sign > 0:
                     self._check_margin_call(self.l, for_short=False, can_defer=False)
 
+                # low -> close (ascending): the walk's closing leg. Orders that
+                # became active mid-bar — an exit whose entry filled on an
+                # earlier leg — get the path's final segment, like TV does.
+                if self.orderbook.price_levels:
+                    for order in self.orderbook.iter_orders(min_price=self.l, max_price=self.c):
+                        if self._check_close_leg_up(order):
+                            continue
+
         # Process orders: open → low → high → close
         else:
             # open -> low (descending: the level nearest the open fills first)
@@ -2549,6 +2678,14 @@ class SimPosition(PositionBase):
 
                 if self.sign < 0:
                     self._check_margin_call(self.h, for_short=True, can_defer=False)
+
+                # high -> close (descending): the walk's closing leg. Orders that
+                # became active mid-bar — an exit whose entry filled on an
+                # earlier leg — get the path's final segment, like TV does.
+                if self.orderbook.price_levels:
+                    for order in self.orderbook.iter_orders(max_price=self.h, min_price=self.c, desc=True):
+                        if self._check_close_leg_down(order):
+                            continue
 
     def _finalize_bar_pnl(self):
         """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
@@ -3125,6 +3262,47 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
         position._settle_close_pass_trades(closed_before)
 
 
+# noinspection PyProtectedMember
+def _default_entry_qty(price: float) -> float:
+    """Contracts a default-sized (no explicit ``qty``) entry buys at ``price``.
+
+    TradingView calculates the position size so that the total investment
+    (position value + commission) equals the specified percentage of equity:
+
+    - percent commission: ``total_cost = qty * price * (1 + commission_rate)``
+    - cash per contract: ``total_cost = qty * price + qty * commission_value``
+
+    We want ``total_cost = equity * percent``, so
+    ``qty = (equity * percent) / (price * (1 + commission_factor))``.
+
+    The price-based types (percent_of_equity, cash) resolve when the order
+    EXECUTES — the caller passes the actual fill price at fill time, and only
+    an executable-price estimate at placement (for margin checks).
+    """
+    script = lib._script
+    default_qty_type = script.default_qty_type
+    if default_qty_type == fixed:
+        return script.default_qty_value
+
+    if default_qty_type == percent_of_equity:
+        target_investment = script.position.equity * script.default_qty_value * 0.01
+        if script.commission_type == _commission.percent:
+            commission_multiplier = 1.0 + script.commission_value * 0.01
+            return target_investment / (price * syminfo.pointvalue * commission_multiplier)
+        if script.commission_type == _commission.cash_per_contract:
+            return target_investment / (price * syminfo.pointvalue + script.commission_value)
+        if script.commission_type == _commission.cash_per_order:
+            return max(0.0, (target_investment - script.commission_value)
+                       / (price * syminfo.pointvalue))
+        # No commission
+        return target_investment / (price * syminfo.pointvalue)
+
+    if default_qty_type == cash:
+        return script.default_qty_value / (price * syminfo.pointvalue)
+
+    raise ValueError("Unknown default qty type: ", default_qty_type)
+
+
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,DuplicatedCode
 def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
@@ -3163,66 +3341,8 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     if position._is_intraday_filled_cap_reached():
         return
 
-    # Get default qty by script parameters if no qty is specified
-    if isinstance(qty, NA):
-        default_qty_type = script.default_qty_type
-        if default_qty_type == fixed:
-            qty = script.default_qty_value
-
-        elif default_qty_type == percent_of_equity:
-            default_qty_value = script.default_qty_value
-            # TradingView calculates position size so that the total investment
-            # (position value + commission) equals the specified percentage of equity
-            #
-            # For percent commission: total_cost = qty * price * (1 + commission_rate)
-            # For cash per contract: total_cost = qty * price + qty * commission_value
-            #
-            # We want: total_cost = equity * percent
-            # So: qty = (equity * percent) / (price * (1 + commission_factor))
-
-            equity_percent = default_qty_value * 0.01
-            target_investment = script.position.equity * equity_percent
-
-            # Calculate the commission factor based on commission type
-            if script.commission_type == _commission.percent:
-                # For percentage commission: qty * price * (1 + commission%)
-                commission_multiplier = 1.0 + script.commission_value * 0.01
-                qty = target_investment / (position.c * syminfo.pointvalue * commission_multiplier)
-
-            elif script.commission_type == _commission.cash_per_contract:
-                # For cash per contract: qty * price + qty * commission_value
-                # qty * (price + commission_value) = target_investment
-                price_plus_commission = position.c * syminfo.pointvalue + script.commission_value
-                qty = target_investment / price_plus_commission
-
-            elif script.commission_type == _commission.cash_per_order:
-                # For cash per order: qty * price + commission_value = target_investment
-                # qty = (target_investment - commission_value) / price
-                qty = (target_investment - script.commission_value) / (position.c * syminfo.pointvalue)
-                qty = max(0.0, qty)  # Ensure non-negative
-
-            else:
-                # No commission
-                qty = target_investment / (position.c * syminfo.pointvalue)
-
-        elif default_qty_type == cash:
-            default_qty_value = script.default_qty_value
-            qty = default_qty_value / (position.c * syminfo.pointvalue)
-
-        else:
-            raise ValueError("Unknown default qty type: ", default_qty_type)
-
-    # qty must be greater than 0
-    if qty <= 0.0:
-        return
-
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
-    size = qty * direction_sign
-
-    size = _size_round(size)
-    if size == 0.0:
-        return
 
     if isinstance(limit, NA):
         limit = None
@@ -3234,25 +3354,60 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
 
-    # Creation-time margin check for market entry orders (TradingView backtest behavior).
+    # A default-sized order (no explicit qty) resolves its quantity at the
+    # actual fill price (TradingView sizes percent_of_equity / cash when the
+    # order executes). The size computed here is the placement estimate used
+    # for the margin check and order bookkeeping: taken at the price the order
+    # would execute at NOW — the current price when immediately executable,
+    # the limit/stop price while it rests.
+    deferred_default = isinstance(qty, NA)
+    if deferred_default:
+        exec_price = position.c
+        if limit is not None:
+            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
+        elif stop is not None:
+            exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
+        qty = _default_entry_qty(exec_price)
+
+    # qty must be greater than 0
+    if qty <= 0.0:
+        return
+
+    size = qty * direction_sign
+
+    size = _size_round(size)
+    if size == 0.0:
+        return
+
+    # Creation-time margin check for entry orders (TradingView backtest behavior).
+    # TV cancels an entry order it cannot open: required margin is evaluated at
+    # the CURRENT price (the "LastPrice" of its margin formula), with the order
+    # sized at the price it would execute at now. A resting buy limit below the
+    # market at 100% percent_of_equity sizing therefore never opens (required =
+    # equity * price / limit > equity), while a resting sell limit above the
+    # market and any immediately executable order fit within equity.
     # Skip in broker mode: the exchange enforces margin authoritatively, and the script's
     # equity view can drift from the exchange (funding, fees, transfers) — making the
     # local check a source of silent false positives rather than a safety net.
-    if limit is None and stop is None and isinstance(position, SimPosition):
+    if isinstance(position, SimPosition):
         margin_percent = (script.margin_short if direction_sign < 0
                           else script.margin_long)
         if margin_percent > 0:
             margin_ratio = margin_percent / 100.0
-            slippage_amount = script.slippage * syminfo.mintick
-            expected_price = position.c + slippage_amount * direction_sign
+            if limit is None and stop is None:
+                slippage_amount = script.slippage * syminfo.mintick
+                check_price = position.c + slippage_amount * direction_sign
+            else:
+                check_price = position.c
             equity = script.initial_capital + position.netprofit + position.openprofit
             # Margin/equity are in account currency — convert via pointvalue.
-            margin_needed = abs(size) * expected_price * syminfo.pointvalue * margin_ratio
+            margin_needed = abs(size) * check_price * syminfo.pointvalue * margin_ratio
             if margin_needed > equity:
                 return
 
     # If it is not a market order, we should check pyramiding and flip conditions here
     # Market orders are checked at the order processing time
+    flip_extra = 0.0
     if limit is not None or stop is not None:
         # Check if the order has the same direction
         if position.sign == direction_sign:
@@ -3268,9 +3423,16 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             # This means the order will first close the existing position,
             # then open a new one in the opposite direction.
             size -= position.size  # Subtract because position.size has opposite sign
+            flip_extra = abs(position.size)
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
+    # Only price-based orders re-size at execution; a market entry keeps its
+    # placement-time (signal close) quantity — TV rejects it at the next open
+    # when that quantity can no longer be margined, rather than re-sizing.
+    if deferred_default and (limit is not None or stop is not None):
+        order.deferred_qty = True
+        order.flip_extra = flip_extra
     # Store in entry_orders dict
     position._add_order(order)
 
@@ -3558,56 +3720,8 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     if position.risk_halt_trading:
         return
 
-    # Get default qty by script parameters if no qty is specified
-    if isinstance(qty, NA):
-        default_qty_type = script.default_qty_type
-        if default_qty_type == fixed:
-            qty = script.default_qty_value
-
-        elif default_qty_type == percent_of_equity:
-            default_qty_value = script.default_qty_value
-            equity_percent = default_qty_value * 0.01
-            target_investment = script.position.equity * equity_percent
-
-            # Calculate the commission factor based on commission type
-            if script.commission_type == _commission.percent:
-                commission_multiplier = 1.0 + script.commission_value * 0.01
-                qty = target_investment / (lib.close * syminfo.pointvalue * commission_multiplier)
-
-            elif script.commission_type == _commission.cash_per_contract:
-                price_plus_commission = lib.close * syminfo.pointvalue + script.commission_value
-                qty = target_investment / price_plus_commission
-
-            elif script.commission_type == _commission.cash_per_order:
-                qty = (target_investment - script.commission_value) / (lib.close * syminfo.pointvalue)
-                qty = max(0.0, qty)  # Ensure non-negative
-
-            else:
-                # No commission
-                qty = target_investment / (lib.close * syminfo.pointvalue)
-
-        elif default_qty_type == cash:
-            default_qty_value = script.default_qty_value
-            qty = default_qty_value / (lib.close * syminfo.pointvalue)
-
-        else:
-            raise ValueError("Unknown default qty type: ", default_qty_type)
-
-    # qty must be greater than 0
-    if qty <= 0.0:
-        return
-
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
-    size = qty * direction_sign
-
-    # NOTE: Unlike strategy.entry, strategy.order is NOT affected by pyramiding limit
-    # This is a key difference - strategy.order can open unlimited trades in the same direction
-    # It uses _order_type_normal to distinguish it from entry/exit orders
-
-    size = _size_round(size)
-    if size == 0.0:
-        return
 
     if isinstance(limit, NA):
         limit = None
@@ -3618,12 +3732,43 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     elif stop is not None:
         stop = _price_round(stop, -direction_sign)  # TODO: test this if the direction here is correct
 
+    # A default-sized order resolves its quantity at the actual fill price
+    # (TradingView sizes percent_of_equity / cash when the order executes).
+    # The size computed here is the placement estimate, taken at the price the
+    # order would execute at NOW — the current price when immediately
+    # executable, the limit/stop price while it rests.
+    deferred_default = isinstance(qty, NA)
+    if deferred_default:
+        exec_price = float(lib.close)
+        if limit is not None:
+            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
+        elif stop is not None:
+            exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
+        qty = _default_entry_qty(exec_price)
+
+    # qty must be greater than 0
+    if qty <= 0.0:
+        return
+
+    size = qty * direction_sign
+
+    # NOTE: Unlike strategy.entry, strategy.order is NOT affected by pyramiding limit
+    # This is a key difference - strategy.order can open unlimited trades in the same direction
+    # It uses _order_type_normal to distinguish it from entry/exit orders
+
+    size = _size_round(size)
+    if size == 0.0:
+        return
+
     # Create the order with _order_type_normal
     # This is a "normal" order that simply adds to or subtracts from position
     # It doesn't follow entry/exit rules and can freely modify positions
     order = Order(id, size, order_type=_order_type_normal, limit=limit, stop=stop,
                   oca_name=oca_name, oca_type=oca_type, comment=comment,
                   alert_message=alert_message)
+    # Only price-based orders re-size at execution (see strategy.entry)
+    if deferred_default and (limit is not None or stop is not None):
+        order.deferred_qty = True
     position._add_order(order)
 
 
