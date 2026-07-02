@@ -13,10 +13,11 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum, auto
-from multiprocessing import Event, Lock
+from multiprocessing import Event, Lock, connection
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -92,29 +93,80 @@ class Lookahead(Enum):
     ON = auto()
 
 
-# Liveness poll interval for security-process waits. Short enough to detect a
-# crashed child quickly, large enough that the wakeup overhead is negligible
-# vs. the typical per-bar processing time.
+# Liveness poll interval for security-process waits without a death watcher
+# (legacy fallback). Short enough to detect a crashed child quickly.
 _LIVENESS_POLL_SECONDS = 0.5
+
+
+def watch_security_child(
+    sec_id: str,
+    proc: 'BaseProcess',
+    failed_children: set[str],
+    events: 'tuple[EventType, ...]',
+) -> None:
+    """
+    Start a daemon thread that watches a security child for abnormal death.
+
+    The per-bar chart waits must be UNTIMED ``event.wait()`` calls: macOS has
+    no ``sem_timedwait``, so a timed multiprocessing wait falls back to
+    CPython's ``sem_timedwait_save`` emulation — a ``sem_trywait`` +
+    ``select()`` polling loop with millisecond-growing sleeps that adds up to
+    ~20ms of wake latency PER WAIT regardless of the timeout value. On a per-
+    bar signalled context that quantization dominated the whole run (measured
+    ~2ms/bar, >80% of wall time). Death detection therefore moves out of the
+    wait: this watcher blocks on the process sentinel (no polling), and on a
+    non-zero exit registers the sec_id in ``failed_children`` BEFORE setting
+    the events, so a blocked ``_wait_with_liveness`` wakes immediately and
+    raises instead of deadlocking. A clean exit (code 0) registers nothing —
+    a child never exits cleanly while the chart still waits on it.
+
+    :param sec_id: Security context id the process serves
+    :param proc: The started child process
+    :param failed_children: Shared registry of abnormally died sec_ids
+    :param events: Events a chart wait may block on for this context
+    """
+    def _watch() -> None:
+        connection.wait([proc.sentinel])
+        if proc.exitcode not in (0, None):
+            failed_children.add(sec_id)
+            for ev in events:
+                ev.set()
+
+    threading.Thread(target=_watch, daemon=True,
+                     name=f"sec-watch-{sec_id}").start()
 
 
 def _wait_with_liveness(
     event: 'EventType',
     sec_id: str,
     sec_processes: 'dict[str, BaseProcess] | None',
+    failed_children: 'set[str] | None' = None,
 ) -> None:
     """
-    Wait for ``event`` while polling the owning security process for liveness.
+    Wait for ``event`` without deadlocking on a dead security process.
 
-    If the security process dies before signalling the event, raise
-    ``RuntimeError`` instead of deadlocking the chart forever.
+    With a ``failed_children`` registry (see :func:`watch_security_child`)
+    the wait is a plain unbounded ``event.wait()`` — the cheap, non-polling
+    path (macOS emulates TIMED multiprocessing waits with a select() polling
+    loop whose wake latency is disastrous per bar) — and a wake caused by the
+    death watcher raises ``RuntimeError``. Without a registry, fall back to
+    polling ``proc.is_alive()`` on a timed wait.
 
-    Same-context and ignored sec_ids have no associated Process — they fall
-    back to a plain unbounded ``event.wait()`` because their signalling is
-    driven by the chart itself, not a separate process.
+    Same-context and ignored sec_ids have no associated Process — they use
+    the plain unbounded ``event.wait()`` because their signalling is driven
+    by the chart itself, not a separate process.
     """
     if sec_processes is None or sec_id not in sec_processes:
         event.wait()
+        return
+    if failed_children is not None:
+        event.wait()
+        if sec_id in failed_children:
+            proc = sec_processes[sec_id]
+            raise RuntimeError(
+                f"Security process for '{sec_id}' died unexpectedly "
+                f"(exit code: {proc.exitcode})"
+            )
         return
     proc = sec_processes[sec_id]
     while not event.wait(timeout=_LIVENESS_POLL_SECONDS):
@@ -455,6 +507,7 @@ def create_chart_protocol(
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
     auto_rate_sec_ids: frozenset[str] = frozenset(),
+    failed_children: 'set[str] | None' = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -482,6 +535,10 @@ def create_chart_protocol(
                               once per bar to advance their subprocess and
                               refresh the ResultBlock the
                               :class:`CurrencyRateProvider` reads from.
+    :param failed_children: Shared registry filled by
+                            :func:`watch_security_child` when a child dies
+                            abnormally. Enables the cheap UNTIMED waits; when
+                            None the waits fall back to liveness polling.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup,
               signal_rate_sources)
     """
@@ -658,7 +715,7 @@ def create_chart_protocol(
                     # bar (writes result, saves var_snapshot). For ON, this also
                     # ensures the developing-bar phase below cannot race ahead
                     # of the closed phase.
-                    _wait_with_liveness(state.done_event, sec_id, sec_processes)
+                    _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
                     state.done_event.clear()
 
                 # Phase 2: developing bar — only for ``Lookahead.ON``.
@@ -743,7 +800,7 @@ def create_chart_protocol(
             # ``__sec_read__``, so each read observes this bar's flag — the same
             # signal-before-read invariant ``new_period``/``needs_wait`` rely on.
             return default
-        _wait_with_liveness(state.data_ready, sec_id, sec_processes)
+        _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
         if not state.is_ltf and not state.new_period:
             # gaps_on emits ``na`` between HTF closes (Pine semantics).
@@ -775,7 +832,7 @@ def create_chart_protocol(
     def __sec_wait__(sec_id: str, _scope_id=None):
         state = states[sec_id]
         if state.needs_wait:
-            _wait_with_liveness(state.done_event, sec_id, sec_processes)
+            _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
             state.done_event.clear()
             state.needs_wait = False
 
@@ -808,7 +865,7 @@ def create_chart_protocol(
             sync_block.set_target_time(sec_id, chart_time)
             state.data_ready.clear()
             state.advance_event.set()
-            _wait_with_liveness(state.data_ready, sec_id, sec_processes)
+            _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
     return (
         __sec_signal__, __sec_write__, __sec_read__, __sec_wait__,
