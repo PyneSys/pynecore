@@ -82,7 +82,15 @@ class AppState:
 
     @property
     def data_dir(self):
-        return self.workdir / "data"
+        """Directory for OHLCV data files.
+
+        Honours the ``PYNE_DATA_DIR`` environment variable so a caller can direct
+        downloads to an explicit location (e.g. a per-run cache) without moving the
+        whole workdir; credentials and config keep resolving from ``config_dir``.
+        Defaults to ``workdir/data``.
+        """
+        env = os.environ.get("PYNE_DATA_DIR")
+        return Path(env) if env else self.workdir / "data"
 
     @property
     def config_dir(self):
