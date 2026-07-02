@@ -697,7 +697,8 @@ class SimPosition(PositionBase):
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
-        '_deferred_margin_call', '_fill_counter', '_partial_close_bar'
+        '_deferred_margin_call', '_fill_counter', '_partial_close_bar',
+        '_entry_open_ledger'
     )
 
     def __init__(self):
@@ -730,6 +731,9 @@ class SimPosition(PositionBase):
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)  # 9000 is the limit of TV
         self.new_closed_trades: list[Trade] = []
+        # Per-entry bound open quantity — drives the exit-order lifecycle (see
+        # _reduce_entry_ledger); the trade rows themselves are attributed FIFO.
+        self._entry_open_ledger: dict[str, float] = {}
 
         # Trade statistics
         self.closed_trades_count: int = 0
@@ -882,6 +886,31 @@ class SimPosition(PositionBase):
                 else:
                     order.size = new_size * order.sign
 
+    def _reduce_entry_ledger(self, entry_id: str | None, qty: float) -> None:
+        """Settle a closing fill against the entry it was bound to.
+
+        TradingView keeps two ledgers: closed TRADES are attributed FIFO
+        across the whole position, but each exit/close order still settles
+        against its own ``from_entry``. Only when that bound quantity is
+        exhausted are the entry's remaining exit legs cancelled — a bracket
+        survives its entry's trade rows being consumed FIFO by another
+        entry's close, and conversely dies once its entry's quantity is
+        spent even while those rows still sit open under other entries.
+        """
+        if entry_id is None:
+            return
+        left = self._entry_open_ledger.get(entry_id)
+        if left is None:
+            return
+        left -= qty
+        if _size_round(left) <= 0.0:
+            del self._entry_open_ledger[entry_id]
+            for exit_order in list(self.exit_orders.values()):
+                if exit_order.order_id == entry_id:
+                    self._remove_order(exit_order)
+        else:
+            self._entry_open_ledger[entry_id] = left
+
     def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat,
                     counts_as_filled_order: bool = True):
         """
@@ -932,13 +961,16 @@ class SimPosition(PositionBase):
         if self.size and order.sign != self.sign:
             delete = False
 
-            # Check list of open trades
+            # Check list of open trades.
+            # close_entries_rule='ANY': an entry-bound close consumes only its
+            # own entry's trades. FIFO (TV default): a closing fill consumes
+            # open trades oldest-first regardless of the from_entry binding —
+            # the binding only sizes the order and gates its activation.
+            close_any = (order.order_type == _order_type_close and order.order_id is not None
+                         and script.close_entries_rule == 'ANY')
             new_open_trades = []
             for trade in self.open_trades:
-                # Only use if its order id is the same
-                if order.size != 0.0 and ((trade.entry_id == order.order_id and order.order_type == _order_type_close)
-                                          or order.order_type != _order_type_close
-                                          or order.order_id is None):
+                if order.size != 0.0 and (not close_any or trade.entry_id == order.order_id):
                     delete = True
 
                     size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
@@ -1043,17 +1075,6 @@ class SimPosition(PositionBase):
                         trade.size = 0.0
                     order.size -= size
 
-                    # Cancel exit orders for closed trades (TradingView behavior)
-                    # When a trade is fully closed, remove its associated exit orders
-                    if trade.size == 0.0:
-                        # Remove exit orders that have from_entry matching this trade's entry_id
-                        exit_orders_to_remove = []
-                        for exit_order_id, exit_order in self.exit_orders.items():
-                            if exit_order.order_id == trade.entry_id:
-                                exit_orders_to_remove.append(exit_order_id)
-                        for exit_order_id in exit_orders_to_remove:
-                            self._remove_order(self.exit_orders[exit_order_id])
-
                     # Gross P/L and counters
                     if closed_trade.profit == 0.0:
                         self.eventrades += 1
@@ -1093,16 +1114,33 @@ class SimPosition(PositionBase):
 
             self.open_trades = new_open_trades
 
+            # Settle the closed quantity against the entry ledger. A close
+            # bound to a from_entry settles that entry regardless of which
+            # trades the FIFO fill consumed; an unbound close (close_all,
+            # reversal, margin call) settles entries oldest-first, mirroring
+            # the trade rows.
+            closed_qty = filled_size - abs(order.size)
+            if closed_qty > 0.0:
+                if order.order_type == _order_type_close and order.order_id is not None:
+                    self._reduce_entry_ledger(order.order_id, closed_qty)
+                else:
+                    for eid in list(self._entry_open_ledger):
+                        if closed_qty <= 0.0:
+                            break
+                        take = min(self._entry_open_ledger[eid], closed_qty)
+                        self._reduce_entry_ledger(eid, take)
+                        closed_qty -= take
+
             if delete:
                 # A partial-exit leg that fired its whole slice while its entry's
-                # position is still open becomes a tombstone: kept in exit_orders
-                # (so its reservation still counts against sibling "rest" legs and
-                # a per-bar strategy.exit() re-call cannot resurrect it) and only
-                # pulled from the order book. It is purged when the entry fully
-                # closes (the trade.size == 0.0 block above).
+                # bound quantity is still open becomes a tombstone: kept in
+                # exit_orders (so its reservation still counts against sibling
+                # "rest" legs and a per-bar strategy.exit() re-call cannot
+                # resurrect it) and only pulled from the order book. It is purged
+                # when the entry's bound quantity is exhausted (_reduce_entry_ledger).
                 if (order.order_type == _order_type_close and order.order_id is not None
                         and _size_round(order.size) == 0.0
-                        and any(t.entry_id == order.order_id for t in self.open_trades)):
+                        and self._entry_open_ledger.get(order.order_id, 0.0) > 0.0):
                     order.consumed = True
                     self.orderbook.remove_order(order)
                 else:
@@ -1130,6 +1168,9 @@ class SimPosition(PositionBase):
                     entry_equity=self.equity
                 )
                 self.open_trades.append(overshoot_trade)
+                if entry_id is not None:
+                    self._entry_open_ledger[entry_id] = (
+                        self._entry_open_ledger.get(entry_id, 0.0) + abs(overshoot_trade.size))
                 self.size += overshoot_trade.size
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self.entry_summ = price * abs(overshoot_trade.size)
@@ -1180,6 +1221,9 @@ class SimPosition(PositionBase):
             )
 
             self.open_trades.append(trade)
+            if entry_id is not None:
+                self._entry_open_ledger[entry_id] = (
+                    self._entry_open_ledger.get(entry_id, 0.0) + abs(order.size))
             self.size += trade.size
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
@@ -1204,6 +1248,7 @@ class SimPosition(PositionBase):
             self.avg_price = na_float
             self.openprofit = 0.0
             self.open_commission = 0.0
+            self._entry_open_ledger.clear()
 
             # Cancel all exit orders when position is closed (TradingView behavior)
             # Skip exits that have a pending entry (needed during position flips)
@@ -1475,9 +1520,23 @@ class SimPosition(PositionBase):
 
         return False
 
+    def _exit_awaits_entry(self, order: Order) -> bool:
+        """True while an exit leg bound to a ``from_entry`` has no open trade to act on.
+
+        TradingView activates a ``strategy.exit`` bracket only after its bound
+        entry fills. Until then (entry pending, cancelled or rejected) the leg
+        must not trigger: a fill would cancel its sibling OCA legs and count
+        toward the filled-order caps even though there is nothing it can close.
+        """
+        if order.order_type != _order_type_close or order.order_id is None or order.from_entry_na:
+            return False
+        return order.order_id not in self._entry_open_ledger
+
     def _check_high_stop(self, order: Order) -> bool:
         """ Check high stop and trailing trigger """
         if order.stop is None:
+            return False
+        if self._exit_awaits_entry(order):
             return False
         # Stop order (size > 0) triggers when price rises to stop level
         if order.size > 0 and order.stop <= self.h:
@@ -1493,6 +1552,8 @@ class SimPosition(PositionBase):
     def _check_high(self, order: Order) -> bool:
         """ Check high limit """
         if order.limit is not None:
+            if self._exit_awaits_entry(order):
+                return False
             # Short limit order (size < 0) triggers when price rises to limit level
             if order.size < 0 and order.limit <= self.h:
                 p = max(order.limit, self.o)
@@ -1538,6 +1599,8 @@ class SimPosition(PositionBase):
         :return: True if the order filled this bar.
         """
         if order.trail_price is None:
+            return False
+        if self._exit_awaits_entry(order):
             return False
         round_to_mintick = lib.math.round_to_mintick
         offset_price = syminfo.mintick * order.trail_offset
@@ -2023,6 +2086,8 @@ class SimPosition(PositionBase):
         """ Check low stop """
         if order.stop is None:
             return False
+        if self._exit_awaits_entry(order):
+            return False
         # Stop order (size < 0) triggers when price falls to stop level
         if order.size < 0 and order.stop >= self.l:
             p = min(self.o, order.stop)
@@ -2037,6 +2102,8 @@ class SimPosition(PositionBase):
     def _check_low(self, order: Order) -> bool:
         """ Check low limit """
         if order.limit is not None:
+            if self._exit_awaits_entry(order):
+                return False
             # Long limit order (size > 0) triggers when price falls to limit level
             if order.size > 0 and order.limit >= self.l:
                 p = min(self.o, order.limit)
@@ -2194,10 +2261,10 @@ class SimPosition(PositionBase):
             # Check if the order would be filled immediately (e.g. due to a gap)
             if self._check_already_filled(order):
                 if order.exit_id is not None:
-                    # Exit order gaps through — check if it's for an open position
-                    has_open_trade = any(
-                        t.entry_id == order.order_id for t in self.open_trades
-                    )
+                    # Exit order gaps through — check if its bound entry still
+                    # has open quantity on the ledger (the FIFO fill may have
+                    # consumed its trade rows while the binding stays live)
+                    has_open_trade = order.order_id in self._entry_open_ledger
                     if not has_open_trade:
                         associated_entry = self.entry_orders.get(order.order_id)
                         if associated_entry is not None:
@@ -2310,11 +2377,18 @@ class SimPosition(PositionBase):
             for order in list(self.exit_orders.values()):
                 if order.is_market_order:
                     continue
-                # Skip exits that match an open trade (they belong to the current position)
-                if any(t.entry_id == order.order_id for t in self.open_trades):
+                # Skip exits whose bound entry still has open quantity on the
+                # ledger (they belong to the current position)
+                if order.order_id in self._entry_open_ledger:
                     continue
                 # Skip exits whose entry is still pending
                 if order.order_id in self.entry_orders:
+                    continue
+                # Only a from_entry-less exit adapts to the surviving position
+                # (TV keeps such an exit alive across a rejected entry). A leg
+                # bound to an explicit from_entry can only ever close trades
+                # from that entry — when the entry is gone it stays dormant.
+                if not order.from_entry_na:
                     continue
                 new_sign = -self.sign
                 self._remove_order(order)
@@ -2372,10 +2446,7 @@ class SimPosition(PositionBase):
         for order in list(self.exit_orders.values()):
             if order.is_market_order:
                 continue
-            has_open_trade = any(
-                t.entry_id == order.order_id for t in self.open_trades
-            )
-            if not has_open_trade:
+            if order.order_id not in self._entry_open_ledger:
                 continue
             # Check limit gap-through
             if order.limit is not None:
@@ -2657,6 +2728,8 @@ class SimPosition(PositionBase):
             if order.is_market_order:
                 return
             if order.order_type == _order_type_close:
+                if self._exit_awaits_entry(order):
+                    return
                 _materialize_tick_exit(order)
             trigger: str | None = None
             if order.stop is not None:
@@ -2963,13 +3036,26 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     if position.size == 0.0:
         return
 
+    # TV closes only the part of the position opened by entries with this id.
+    # Under the default FIFO close_entries_rule the FILL may consume older
+    # trades first, but the amount closed is still the bound entry's open size
+    # — sizing off the whole position would flatten unrelated entries.
+    if isinstance(position, SimPosition):
+        # noinspection PyProtectedMember
+        bound_size = position.sign * position._entry_open_ledger.get(id, 0.0)
+    else:
+        bound_size = 0.0
+        for trade in position.open_trades:
+            if trade.entry_id == id:
+                bound_size += trade.size
+
     if isinstance(qty, NA):
         if not isinstance(qty_percent, NA):
-            size = _size_round(-position.size * (qty_percent * 0.01))
+            size = _size_round(-bound_size * (qty_percent * 0.01))
         else:
-            size = -position.size
+            size = -bound_size
     else:
-        size = _size_round(-position.sign * qty)
+        size = _size_round(-position.sign * min(qty, abs(bound_size)))
 
     if size == 0.0:
         return
