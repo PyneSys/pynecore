@@ -513,6 +513,9 @@ class ScriptRunner:
                 _merged_contexts.update(_mod_contexts)
         sec_contexts: dict[str, dict] | None = _merged_contexts or None
         sec_processes: 'dict[str, Process]' = {}
+        # Abnormally died children, filled by ``watch_security_child`` — lets
+        # the chart's per-bar waits stay UNTIMED (see ``_wait_with_liveness``)
+        sec_failed_children: set[str] = set()
         sec_resample_dirs: 'list[str]' = []  # per-run temp dirs for HTF feed resampling
         sec_cleanup_fn: Callable[[], None] | None = None
         sec_states = None
@@ -566,7 +569,7 @@ class ScriptRunner:
                 from .security import (
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory,
-                    load_htf_bar_opens, load_ltf_first_ms,
+                    load_htf_bar_opens, load_ltf_first_ms, watch_security_child,
                 )
                 from .security_process import security_process_main
                 from multiprocessing import Process
@@ -672,6 +675,8 @@ class ScriptRunner:
                     )
                     proc.start()
                     sec_processes[sid] = proc
+                    watch_security_child(sid, proc, sec_failed_children,
+                                         (sec_state.data_ready, sec_state.done_event))
 
                 # Callback for lazy resolution of deferred security contexts
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
@@ -765,6 +770,7 @@ class ScriptRunner:
                     result_blocks=sec_result_blocks,
                     currency_conversions=currency_conversions or None,
                     sec_processes=sec_processes,
+                    failed_children=sec_failed_children,
                 )
                 for _sec_mod in sec_modules:
                     inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
