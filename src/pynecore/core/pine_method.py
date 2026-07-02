@@ -24,6 +24,7 @@ from ..types import label as label_types
 from ..types import table as table_types
 from ..types import linefill as linefill_types
 from ..types import polyline as polyline_types
+from ..types.na import NA
 
 from .instance_state import _make_state, register_shared_cache
 from .pine_export import Exported
@@ -47,6 +48,16 @@ def _get_builtin_method(method_name: str, var: Any) -> Callable | None:
     """
     try:
         var_type = type(var)
+        if var_type is NA:
+            # An na value carries its DECLARED type. A builtin method invoked on
+            # an na builtin object (e.g. ``naLine.delete()`` on a line that was
+            # never drawn) must dispatch to that builtin namespace, which treats
+            # na as a no-op the way Pine does. An na of a UDT (or untyped) type
+            # matches nothing here and falls through to user-method dispatch.
+            declared = var.type
+            if declared is None:
+                return None
+            var_type = declared if isinstance(declared, type) else type(declared)
         match var_type:
             case _ if var_type is list:
                 return getattr(array, method_name)
