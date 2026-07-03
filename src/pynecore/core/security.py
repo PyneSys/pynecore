@@ -203,10 +203,10 @@ class SecurityState:
     is_ltf: bool = False
 
     # Synthetic chart type requested via ``ticker.heikinashi()`` etc. ``None`` is
-    # an ordinary feed. When set (currently only ``"heikinashi"``), the chart
-    # process transforms this context's ``.ohlcv`` before the child reads it, so
-    # the subprocess consumes the chart-type bars with no child-side change.
-    # Backtest (file-backed) only — a live source raises at spawn.
+    # an ordinary feed. When set (currently only ``"heikinashi"``), it is passed
+    # to the security child, which applies the chart-type transform per bar
+    # (backtest and live alike) and flips the matching ``chart.*`` builtin. LTF
+    # (sub-bar) chart types are rejected at spawn.
     chart_type: str | None = None
 
     # LTF prefix-skip (chart-side, backtest/file-backed only). The LTF child's
@@ -1492,6 +1492,12 @@ def setup_security_states(
             # real feed bars instead of staying inert.
             if not same_tf and resampler is not None:
                 sym = ctx.get('symbol')
+                if sym is not None:
+                    # Strip any chart-type marker (``ticker.heikinashi()``) so a
+                    # static same-symbol chart-type HTF resolves as same-symbol
+                    # (and gets an aggregator), not misrouted as cross-symbol.
+                    from ..lib.ticker import _split_chart_type
+                    sym, _ = _split_chart_type(str(sym))
                 is_same_symbol = (
                     chart_symbol is None
                     or sym is None

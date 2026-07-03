@@ -1,7 +1,8 @@
 """
 @pyne
 """
-from pynecore.lib import close, open, high, low, format, plot, request, script, syminfo, timeframe, ticker
+from pynecore.lib import (close, open, high, low, format, plot, request, script, syminfo,
+                          timeframe, ticker, chart)
 
 
 @script.indicator(title="Heikin Ashi Test", shorttitle="HA", format=format.price, precision=8)
@@ -11,6 +12,9 @@ def main():
     plot(request.security(ha, timeframe.period, open), title="haOpen")
     plot(request.security(ha, timeframe.period, high), title="haHigh")
     plot(request.security(ha, timeframe.period, low), title="haLow")
+    # Evaluated in the security child: the chart-type builtin must read true there.
+    plot(request.security(ha, timeframe.period, 1.0 if chart.is_heikinashi else 0.0),
+         title="isHA")
 
 
 def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
@@ -82,6 +86,9 @@ def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
             f"bar {i}: haHigh={plot_values['haHigh']} != expected {exp_high[i]}"
         assert math.isclose(plot_values['haLow'], exp_low[i], rel_tol=1e-6, abs_tol=1e-6), \
             f"bar {i}: haLow={plot_values['haLow']} != expected {exp_low[i]}"
+        assert plot_values.get('isHA') == 1.0, \
+            f"bar {i}: chart.is_heikinashi must be True in the HA security child, " \
+            f"got {plot_values.get('isHA')}"
         checked += 1
 
     assert checked >= len(bars) - 1, \

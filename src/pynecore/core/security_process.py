@@ -324,6 +324,22 @@ def _collect_in_period_intrabars(
     return collected, next_idx
 
 
+def _heikinashi_step(prev_open: float | None, prev_close: float | None,
+                     o: float, h: float, lo: float, c: float
+                     ) -> tuple[float, float, float, float]:
+    """One Heikin Ashi recurrence step over ordinary OHLC.
+
+    ``prev_open``/``prev_close`` are the previous bar's Heikin Ashi open/close
+    (``None`` on the seed bar, where the open falls back to ``(o + c) / 2``).
+
+    :return: ``(ha_open, ha_high, ha_low, ha_close)``.
+    """
+    ha_close = (o + h + lo + c) / 4.0
+    ha_open = (o + c) / 2.0 if (prev_open is None or prev_close is None) \
+        else (prev_open + prev_close) / 2.0
+    return ha_open, max(h, ha_open, ha_close), min(lo, ha_open, ha_close), ha_close
+
+
 # noinspection PyProtectedMember
 def security_process_main(
         sec_id: str,
@@ -341,6 +357,7 @@ def security_process_main(
         ohlcv_fields: 'list[str] | None' = None,
         ohlcv_tuple: bool = False,
         same_timeframe: bool = False,
+        chart_type: 'str | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -372,6 +389,10 @@ def security_process_main(
         cross-symbol feed forward-fills (``gaps_off``) through the chart's bars
         instead of compacting to real bars (which is only correct for a true
         HTF series).
+    :param chart_type: Synthetic chart type requested via ``ticker.heikinashi()``
+        etc. (currently only ``"heikinashi"``). When set, the child applies the
+        per-bar chart-type transform to every bar before the script reads it (so
+        backtest and live both work) and flips the matching ``chart.*`` builtin.
     """
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
@@ -546,6 +567,15 @@ def security_process_main(
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo)
 
+    # Chart-type context (``ticker.heikinashi()``): this child evaluates the
+    # script on Heikin Ashi candles, so the chart-type builtins must reflect the
+    # security context, not the parent's standard chart. The ``chart`` module is
+    # this process's own replica, so the parent's flags stay untouched.
+    if chart_type == 'heikinashi':
+        from pynecore.lib import chart
+        chart.is_heikinashi = True
+        chart.is_standard = False
+
     # Parse timezone
     from pynecore.lib import _parse_timezone
     tz = _parse_timezone(syminfo.timezone)
@@ -630,6 +660,48 @@ def security_process_main(
 
             def _run_script_main():
                 write_fn(sec_id, getattr(lib, _pt_field))
+
+    # Chart-type (Heikin Ashi) per-bar transform. The two carried HA values ride
+    # a synthetic root vector whose var slots are captured/rolled back by the
+    # existing ``RootVarSnapshot`` (create_root + root_keys.append) — so a
+    # developing bar recomputes from the fixed prior-close baseline with no
+    # bespoke logic. ``_ha_apply`` reads the baseline and returns the HA bar;
+    # ``_ha_commit`` writes the new HA open/close AFTER ``_run_script_main()`` in
+    # each branch (before any ``snap.save()``), so ``save()`` captures the
+    # previous committed values and ``restore()`` rolls a re-tick back to them.
+    # Registering the HA root also makes ``RootVarSnapshot.has_vars`` True for an
+    # otherwise var-less plain-OHLCV context, activating the snapshot exactly
+    # where the recurrence needs it.
+    if chart_type == 'heikinashi':
+        _ha_key = f'__heikinashi__{sec_id}'
+        _ha_root = instance_state.create_root(_ha_key, {
+            'init': (None, None), 'series': (), 'varip': (), 'children': (),
+            'names': ('prevHaOpen', 'prevHaClose'),
+        })
+        root_keys.append(_ha_key)
+        _ha_pending: 'list[float | None]' = [None, None]
+
+        def _ha_apply(_b: OHLCV) -> OHLCV:
+            if _b.volume < 0:
+                # Gap-fill bar: forward-fill the last HA close flat and do NOT
+                # advance the recurrence (mirrors the removed feed transform's
+                # ``volume < 0`` skip + the writer's gap re-fill).
+                _fill = _ha_root[1] if _ha_root[1] is not None else _b.close
+                _ha_pending[0], _ha_pending[1] = _ha_root[0], _ha_root[1]
+                return _b._replace(open=_fill, high=_fill, low=_fill, close=_fill)
+            _ho, _hh, _hl, _hc = _heikinashi_step(
+                _ha_root[0], _ha_root[1], _b.open, _b.high, _b.low, _b.close)
+            _ha_pending[0], _ha_pending[1] = _ho, _hc
+            return _b._replace(open=_ho, high=_hh, low=_hl, close=_hc)
+
+        def _ha_commit() -> None:
+            _ha_root[0], _ha_root[1] = _ha_pending[0], _ha_pending[1]
+    else:
+        def _ha_apply(_b: OHLCV) -> OHLCV:
+            return _b
+
+        def _ha_commit() -> None:
+            pass
 
     # Set up file-based logging if PYNE_SECURITY_LOG is set
     security_log_path = os.environ.get("PYNE_SECURITY_LOG")
@@ -907,7 +979,7 @@ def security_process_main(
                         snap.restore()
                     instance_state.reset()
 
-                _set_lib_properties(ohlcv, current_bar, tz, lib, round_decimals)
+                _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = current_bar
 
                 barstate.isfirst = (current_bar == 0)
@@ -924,6 +996,10 @@ def security_process_main(
                         snap.save()
 
                 _run_script_main()
+                # Commit the developing HA open/close AFTER the run and the
+                # new-period ``save()`` above; a same-period re-tick's
+                # ``snap.restore()`` rolls these back to the period baseline.
+                _ha_commit()
 
                 data_ready_event.set()
                 done_event.set()
@@ -965,7 +1041,7 @@ def security_process_main(
 
                 last_dev_period_start = None
 
-                _set_lib_properties(ohlcv, current_bar, tz, lib, round_decimals)
+                _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = current_bar
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = False
@@ -976,6 +1052,9 @@ def security_process_main(
                 barstate.isnew = is_new_closed_period
 
                 _run_script_main()
+                # Commit the closed HA open/close BEFORE the baseline ``save()``
+                # below, so the confirmed values become the next period's seed.
+                _ha_commit()
 
                 # Snapshot AFTER the closed run completes — baseline for
                 # subsequent developing iterations of the next HTF period.
@@ -1031,7 +1110,7 @@ def security_process_main(
                     break
 
                 total_bars = _current_total()
-                _set_lib_properties(ohlcv_file_bar, current_bar, tz, lib, round_decimals)
+                _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = total_bars - 1
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = (current_bar == total_bars - 1)
@@ -1049,6 +1128,9 @@ def security_process_main(
                     barstate.isrealtime = True
 
                 _run_script_main()
+                # Advance the HA recurrence for this confirmed bar; the batch
+                # ``save()`` below captures the last bar's HA as the baseline.
+                _ha_commit()
 
                 current_bar += 1
                 bars_run = True

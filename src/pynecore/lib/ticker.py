@@ -20,8 +20,9 @@ __all__ = [
 # appear in a real ticker identifier, so a marked ticker never collides with a
 # genuine symbol and never compares equal to the chart symbol — which keeps a
 # Heikin Ashi request out of the same-context inline fast path and routes it to
-# a subprocess reading a transformed feed. ``_split_chart_type`` strips the
-# marker back to the base symbol wherever the ticker is resolved to data.
+# a subprocess that applies the chart-type transform per bar.
+# ``_split_chart_type`` strips the marker back to the base symbol wherever the
+# ticker is resolved to data.
 _CHART_TYPE_SEP = '\x1f'
 
 
@@ -132,12 +133,13 @@ def heikinashi(symbol: str) -> str:
     Create a ticker identifier for requesting Heikin Ashi bar values.
 
     The returned identifier carries an internal chart-type marker (see
-    :data:`_CHART_TYPE_SEP`). When passed to ``request.security()``, the feed is
-    transformed to Heikin Ashi candles for that context; every other consumer
-    strips the marker back to the base symbol via :func:`_split_chart_type`.
+    :data:`_CHART_TYPE_SEP`). When passed to ``request.security()``, the security
+    child transforms each bar to Heikin Ashi before the script reads it; every
+    other consumer strips the marker back to the base symbol via
+    :func:`_split_chart_type`.
 
-    Heikin Ashi is currently supported in backtest (file-backed) mode only; a
-    live-streaming Heikin Ashi request raises at security-context setup.
+    Works in both backtest and live mode. ``request.security_lower_tf()`` with a
+    chart type is not supported (it would need per-intrabar transformation).
 
     :param symbol: The ticker identifier
     :return: The base ticker identifier with the Heikin Ashi chart-type marker
