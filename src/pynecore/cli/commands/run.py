@@ -1085,7 +1085,8 @@ def run(
                                           log_ohlcv=live and not no_log_ohlcv,
                                           chart_provider_name=chart_provider_name,
                                           chart_provider_instance=chart_provider_instance,
-                                          time_from=time_from_dt)
+                                          time_from=time_from_dt,
+                                          chart_data_path=data_path)
                 finally:
                     # Remove lib directory from Python path
                     if lib_path_added:

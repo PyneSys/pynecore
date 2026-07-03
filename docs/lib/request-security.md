@@ -176,6 +176,8 @@ security_data = {
 | `barmerge.lookahead_on`          | supported | Same-symbol HTF: TV-compatible (live steps into developing HTF bar). Cross-symbol HTF: `close[0]` is `na` inside an open HTF period, `close[1]` at boundary delivers just-closed bar |
 | `ignore_invalid_symbol`          | supported | Returns `na` for missing symbols                                                 |
 | `currency` parameter             | supported | Auto-converts result using `CurrencyRateProvider`                                |
+| `ticker.heikinashi()`            | supported | Backtest only — feed transformed to Heikin Ashi bars (see below)                 |
+| `ticker.renko()` / `pointfigure()` / `kagi()` / `linebreak()` | unsupported | Path-dependent chart types need tick data PyneCore does not have |
 
 ## How It Works
 
@@ -204,6 +206,37 @@ Chart bars (5m):    10:00  10:05  10:10 ... 23:50  23:55  00:00
 ```
 
 For same-timeframe contexts (different symbol), values are confirmed on every bar.
+
+### Chart types (Heikin Ashi)
+
+`request.security(ticker.heikinashi(symbol), timeframe, expr)` returns `expr`
+evaluated on **Heikin Ashi** candles instead of ordinary ones. Heikin Ashi is a
+deterministic recurrence over the requested timeframe's candles:
+
+```
+haClose = (open + high + low + close) / 4
+haOpen  = (haOpen[1] + haClose[1]) / 2       # first bar: (open + close) / 2
+haHigh  = max(high, haOpen, haClose)
+haLow   = min(low,  haOpen, haClose)
+```
+
+There is no special evaluation path: the whole feed is transformed to Heikin Ashi
+bars once, up front, and the security process reads the transformed feed like any
+other symbol. So `close` returns `haClose`, `open` returns `haOpen`, and any
+indicator (`ta.sma(close, 20)`, `ta.atr(14)`, …) is computed on the Heikin Ashi
+series. On a higher timeframe the bars are aggregated to the period first, then
+transformed — matching TradingView, which builds Heikin Ashi from the requested
+timeframe's candles.
+
+The source feed is the chart's own `.ohlcv` when the symbol is the chart symbol
+(no `--security` mapping needed), or the mapped file for a cross-symbol request.
+`ticker.heikinashi()` evaluates on **every bar** in Pine — a `cond ? security(...)
+: x` still runs the transform even when `cond` is false, exactly as TradingView
+does.
+
+Only Heikin Ashi is supported: `renko`, `pointfigure`, `kagi` and `linebreak` are
+path-dependent chart types that need intrabar tick data PyneCore does not carry,
+and they raise a clear error.
 
 ### gaps_on vs gaps_off
 
@@ -280,6 +313,9 @@ htf_close_prev = lib.request.security(
   coverage of a cross-symbol HTF, run that context as a separate same-symbol chart.
 - **Standalone mode** — `python script.py data.csv` does not support `--security` yet.
   Use `pyne run` or the ScriptRunner API.
+- **Heikin Ashi in live mode** — `ticker.heikinashi()` is transformed only for
+  file-backed (backtest) feeds. A live streaming Heikin Ashi request raises at
+  security-context setup; run it as a backtest, or read ordinary bars live.
 
 ## Debugging Security Contexts
 

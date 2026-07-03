@@ -202,6 +202,13 @@ class SecurityState:
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
 
+    # Synthetic chart type requested via ``ticker.heikinashi()`` etc. ``None`` is
+    # an ordinary feed. When set (currently only ``"heikinashi"``), the chart
+    # process transforms this context's ``.ohlcv`` before the child reads it, so
+    # the subprocess consumes the chart-type bars with no child-side change.
+    # Backtest (file-backed) only — a live source raises at spawn.
+    chart_type: str | None = None
+
     # LTF prefix-skip (chart-side, backtest/file-backed only). The LTF child's
     # ``.ohlcv`` feed first bar open, in ms. The child includes intrabars with
     # ``bar_open <= target_time`` and the historical target is the chart bar's

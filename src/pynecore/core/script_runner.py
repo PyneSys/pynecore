@@ -346,6 +346,82 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     return str(out)
 
 
+def _heikinashi_transform_feed(data_path: str, tmp_dir_holder: 'list[str]') -> str:
+    """Transform an OHLCV feed to Heikin Ashi candles for a security context.
+
+    ``ticker.heikinashi()`` requests Heikin Ashi bar values. Heikin Ashi is a
+    deterministic full-history recurrence over ordinary candles::
+
+        haClose = (open + high + low + close) / 4
+        haOpen  = (haOpen[1] + haClose[1]) / 2      # seed: (open + close) / 2
+        haHigh  = max(high, haOpen, haClose)
+        haLow   = min(low,  haOpen, haClose)
+
+    Instead of special-casing the security child, the whole feed is transformed
+    up front into a temporary ``.ohlcv`` (with a cloned ``.toml`` sidecar) so the
+    existing ``request.security()`` machinery consumes Heikin Ashi bars
+    unchanged. The recurrence runs over real bars only — gap-fill records
+    (``volume < 0``) are skipped and the writer re-fills gaps from the Heikin Ashi
+    close, so the child's bar grid stays identical to the source.
+
+    Called AFTER :func:`_resample_finer_security_feed`, so on an HTF context the
+    Heikin Ashi bars are computed on the aggregated period bars (matching
+    TradingView, which builds Heikin Ashi from the requested timeframe's candles).
+
+    :param data_path: Source ``.ohlcv`` path (already at the security timeframe).
+    :param tmp_dir_holder: Single-element list holding the per-run temp dir,
+        shared with :func:`_resample_finer_security_feed`; created on first use.
+    :return: Path to the temporary Heikin Ashi ``.ohlcv``.
+    """
+    import hashlib
+    import shutil
+    import tempfile
+    from .ohlcv_file import OHLCVReader, OHLCVWriter
+
+    src = Path(data_path)
+    if not tmp_dir_holder:
+        tmp_dir_holder.append(tempfile.mkdtemp(prefix='pyne_sec_resample_'))
+    # Hash the resolved source path into the name so two same-stem feeds from
+    # different directories never collide on one temp file.
+    src_key = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    out = Path(tmp_dir_holder[0]) / f"{src.stem}__{src_key}__heikinashi.ohlcv"
+    if out.exists():
+        # Another context already transformed this exact source earlier this run
+        # (a sibling security child may already have mmap'ed it). Reuse it instead
+        # of rewriting with ``truncate=True``.
+        return str(out)
+
+    prev_ha_open: float | None = None
+    prev_ha_close: float | None = None
+    with OHLCVReader(src) as reader, OHLCVWriter(out, truncate=True) as writer:
+        for bar in reader:
+            if bar.volume < 0:
+                # Gap-fill record: the writer re-inserts gaps from the previous
+                # Heikin Ashi close, so the recurrence stays on real bars.
+                continue
+            ha_close = (bar.open + bar.high + bar.low + bar.close) / 4.0
+            if prev_ha_open is None or prev_ha_close is None:
+                ha_open = (bar.open + bar.close) / 2.0
+            else:
+                ha_open = (prev_ha_open + prev_ha_close) / 2.0
+            ha_high = max(bar.high, ha_open, ha_close)
+            ha_low = min(bar.low, ha_open, ha_close)
+            writer.write(OHLCV(
+                timestamp=bar.timestamp,
+                open=ha_open, high=ha_high, low=ha_low, close=ha_close,
+                volume=bar.volume,
+            ))
+            prev_ha_open, prev_ha_close = ha_open, ha_close
+
+    toml_src = src.with_suffix('.toml')
+    if toml_src.exists():
+        # Heikin Ashi keeps every symbol attribute (period, session, mintick,
+        # timezone); clone the sidecar unchanged so the child's syminfo/grid
+        # stay correct.
+        shutil.copyfile(toml_src, out.with_suffix('.toml'))
+    return str(out)
+
+
 @dataclass(frozen=True)
 class SecurityRequirement:
     """A single ``request.security()`` / ``request.security_lower_tf()`` data
@@ -397,7 +473,7 @@ class ScriptRunner:
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
-                 '_chart_provider_name', '_chart_provider_instance',
+                 '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
                  '_time_from', '_sec_syminfos', '_signal_rate_sources_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
@@ -420,7 +496,8 @@ class ScriptRunner:
                  log_ohlcv: bool = False,
                  chart_provider_name: str | None = None,
                  chart_provider_instance: Any = None,
-                 time_from: datetime | None = None):
+                 time_from: datetime | None = None,
+                 chart_data_path: Path | None = None):
         """
         Initialize the script runner
 
@@ -478,6 +555,12 @@ class ScriptRunner:
         # supply an explicit ``--security`` mapping.
         self._chart_provider_name: str | None = chart_provider_name
         self._chart_provider_instance: Any = chart_provider_instance
+        # Chart's own ``.ohlcv`` path (backtest/file mode). Used as the source
+        # feed for a ``ticker.heikinashi()`` request on the chart's own symbol
+        # when no explicit ``--security`` mapping supplies one — the runner is
+        # otherwise handed only an OHLCV iterator, not a file the security child
+        # can open. ``None`` in live/provider streaming mode (no static file).
+        self._chart_data_path: Path | None = chart_data_path
         # Chart-side ``--from`` (already datetime). Forwarded into every
         # live-mode :class:`PluginSymbol` so each security context's warmup
         # window inherits the chart's look-back range instead of the
@@ -1113,6 +1196,15 @@ class ScriptRunner:
                     chart_syminfo=self.syminfo, sec_syminfos=self._sec_syminfos,
                 )
 
+                # Tag static (module-level) chart-type contexts so the feed is
+                # transformed at spawn. Deferred contexts (symbol only known at
+                # runtime) are tagged in ``_deferred_resolve`` instead.
+                from ..lib.ticker import _split_chart_type
+                for _sid, _ctx in static_contexts.items():
+                    _, _ct = _split_chart_type(str(_ctx.get('symbol', '')))
+                    if _ct is not None:
+                        sec_states[_sid].chart_type = _ct
+
                 # Currency rate provider — built after the SyncBlock exists so
                 # security-context lookups can read the latest pickled close
                 # from the matching ``ResultBlock``. Only **rate-source**
@@ -1144,6 +1236,21 @@ class ScriptRunner:
 
                 def _spawn_security_process(sid: str, data_source):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    # Chart-type request (``ticker.heikinashi()``): backtest-only
+                    # in v1. A live streaming source has no static feed to
+                    # transform, and an LTF (sub-bar) chart type needs per-intrabar
+                    # transformation — both raise a clear error rather than
+                    # silently returning ordinary bars.
+                    if sec_state.chart_type is not None:
+                        if isinstance(data_source, PluginSymbol):
+                            raise NotImplementedError(
+                                f"ticker.{sec_state.chart_type}() is not supported "
+                                f"in live mode yet — only backtest (file-backed) "
+                                f"data can be transformed.")
+                        if sec_state.is_ltf:
+                            raise NotImplementedError(
+                                f"request.security_lower_tf() with "
+                                f"ticker.{sec_state.chart_type}() is not supported.")
                     # D/W/M HTF contexts confirm boundaries by walking the
                     # child's actual bar opens (correct for sparse series).
                     # Backtest only: a file-backed child realizes the real
@@ -1164,6 +1271,12 @@ class ScriptRunner:
                             data_source = _resample_finer_security_feed(
                                 str(data_source), str(sec_state.timeframe),
                                 sec_resample_dirs)
+                            if sec_state.chart_type == 'heikinashi':
+                                # Transform the (already period-aggregated) feed
+                                # to Heikin Ashi bars so the child reads chart-type
+                                # candles with no child-side change.
+                                data_source = _heikinashi_transform_feed(
+                                    str(data_source), sec_resample_dirs)
                         load_htf_bar_opens(sec_state, str(data_source))
                         load_ltf_first_ms(sec_state, str(data_source))
                     elif sec_state.is_ltf:
@@ -1209,13 +1322,24 @@ class ScriptRunner:
                     if sid not in deferred_sec_ids:
                         return
                     deferred_sec_ids.discard(sid)
+                    # Strip any chart-type marker (``ticker.heikinashi()``) so the
+                    # same-context / same-symbol decisions run on the base symbol,
+                    # and record the chart type so the feed is transformed at
+                    # spawn. ``symbol`` keeps the marker for ``_resolve_security_data``
+                    # (which needs it to route a same-symbol request to the chart
+                    # feed).
+                    from ..lib.ticker import _split_chart_type
+                    base_symbol, chart_type = _split_chart_type(symbol)
                     # Resolve actual timeframe
                     current_chart_tf = str(lib.syminfo.period)
                     resolved_tf = timeframe if timeframe else current_chart_tf
                     # The context may turn out to be the chart's own symbol and
                     # timeframe: no subprocess and no data file is needed, the
-                    # inline same-context write/read path serves it
-                    if (chart_ticker is not None and str(symbol) == chart_ticker
+                    # inline same-context write/read path serves it. A chart-type
+                    # request (Heikin Ashi) is excluded — it always needs a
+                    # subprocess reading the transformed feed.
+                    if (chart_type is None and chart_ticker is not None
+                            and str(base_symbol) == chart_ticker
                             and resolved_tf == current_chart_tf):
                         _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                         _state.timeframe = resolved_tf
@@ -1226,6 +1350,7 @@ class ScriptRunner:
                         return
                     # Update SecurityState with correct timeframe info
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    sec_state.chart_type = chart_type
                     sec_state.timeframe = resolved_tf
                     same_tf = (resolved_tf == current_chart_tf)
                     sec_state.same_timeframe = same_tf
@@ -1273,7 +1398,7 @@ class ScriptRunner:
                     # is cross-symbol, or attach one if the timeframe just
                     # promoted from chart-TF to HTF.
                     is_same_symbol = (chart_ticker is None
-                                      or str(symbol) == chart_ticker)
+                                      or str(base_symbol) == chart_ticker)
                     needs_aggregator = (not same_tf) and is_same_symbol
                     if needs_aggregator and sec_state.htf_aggregator is None:
                         from .htf_aggregator import HTFAggregator
@@ -2351,9 +2476,13 @@ class ScriptRunner:
         :raises ValueError: If no data found and ignore_invalid_symbol is not True
         """
         from dataclasses import replace as dc_replace
+        from ..lib.ticker import _split_chart_type
         result: dict[str, str | PluginSymbol | None] = {}
         for sec_id, ctx in contexts.items():
-            symbol = str(ctx.get('symbol', ''))
+            # Strip any chart-type marker (``ticker.heikinashi()``) so the data
+            # source resolves on the base symbol; the transform is applied later
+            # at spawn from ``SecurityState.chart_type``.
+            symbol, chart_type = _split_chart_type(str(ctx.get('symbol', '')))
             timeframe = str(ctx.get('timeframe', ''))
 
             entry: str | Path | PluginSymbol | None = None
@@ -2373,6 +2502,18 @@ class ScriptRunner:
                 continue
             if entry is not None:
                 result[sec_id] = self._ensure_ohlcv_ext(entry)
+                continue
+
+            # Chart-type request (Heikin Ashi) on the chart's own symbol with no
+            # explicit ``--security`` mapping: transform the chart's own feed.
+            # Backtest only — in live mode ``_chart_provider_instance`` is set, so
+            # this falls through to the chart-provider branch and is rejected at
+            # spawn (streaming chart-type transform is not supported yet).
+            if (chart_type is not None
+                    and self._chart_provider_instance is None
+                    and self._chart_data_path is not None
+                    and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
+                result[sec_id] = str(self._chart_data_path)
                 continue
 
             # No explicit mapping — fall back to chart-provider resolution
