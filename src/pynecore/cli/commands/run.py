@@ -382,7 +382,8 @@ def run(
                                       plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                       security_data=security_data,
                                       magnifier_iter=magnifier_iter,
-                                      magnifier_source_tf=magnifier_source_tf)
+                                      magnifier_source_tf=magnifier_source_tf,
+                                      chart_data_path=data)
             finally:
                 # Remove lib directory from Python path
                 if lib_path_added:
