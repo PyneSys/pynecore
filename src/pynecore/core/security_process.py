@@ -9,9 +9,12 @@ Communication with the chart process uses shared memory + Events (see security.p
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from functools import partial
 from pathlib import Path
+from time import sleep
 from typing import TYPE_CHECKING
 
 from .security_shm import (
@@ -21,10 +24,48 @@ from .security import (
     create_security_protocol, inject_protocol,
 )
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Any
     from multiprocessing.synchronize import Lock as LockType
+
+# Seconds between parent-liveness checks in the orphan watchdog.
+_ORPHAN_CHECK_INTERVAL = 2.0
+
+
+def _start_parent_death_watchdog() -> None:
+    """Hard-exit this security process if its parent dies without cleaning up.
+
+    A security context runs as a ``daemon=True`` :class:`multiprocessing.Process`.
+    A *clean* parent exit tears it down (daemon atexit + the runner's ``finally``
+    that sets ``stop_event`` and joins). But a *hard* kill of the parent — a
+    ``SIGKILL``, or a ``subprocess`` timeout that kills only the direct child —
+    skips all of that: the child reparents to init, never receives ``stop_event``,
+    and on macOS (where timed Event waits fall back to select() polling) spins at
+    100% CPU while pinning its OHLCV and interpreter memory. macOS has no
+    ``PR_SET_PDEATHSIG``, so the portable safety net is a watchdog thread that
+    notices the reparent and exits.
+
+    The captured parent PID is the spawning runner; when ``os.getppid()`` changes,
+    the parent is gone and this orphan exits via ``os._exit`` — skipping
+    atexit/``finally``, which could deadlock on shared memory the dead parent
+    still holds.
+    """
+    parent_pid = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            sleep(_ORPHAN_CHECK_INTERVAL)  # watchdog tick, not a poll-retry
+            if os.getppid() != parent_pid:
+                logger.warning(
+                    "Security process %d orphaned (parent %d gone); exiting.",
+                    os.getpid(), parent_pid,
+                )
+                os._exit(1)
+
+    threading.Thread(target=_watch, daemon=True, name="sec-parent-watchdog").start()
 
 
 # noinspection PyProtectedMember
@@ -74,6 +115,9 @@ def security_process_main(
         instead of compacting to real bars (which is only correct for a true
         HTF series).
     """
+    # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
+    _start_parent_death_watchdog()
+
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
 
