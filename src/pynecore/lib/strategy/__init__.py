@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Literal, overload
 from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
 
 import math
+import struct
 from abc import ABC, abstractmethod
 from datetime import datetime, UTC
 from collections import deque, defaultdict
@@ -68,6 +69,11 @@ short = direction.short
 _order_type_normal = _OrderType()
 _order_type_entry = _OrderType()
 _order_type_close = _OrderType()
+
+# Trailing-stop walk results (see ``SimPosition._process_trailing_stop``)
+_trail_filled = 0
+_trail_deferred = 1
+_trail_pending = 2
 
 # Order-book dict key shapes. A close placed by ``strategy.close()`` /
 # ``strategy.close_all()`` in BACKTEST carries a unique ``book_seq`` stamp so
@@ -634,9 +640,9 @@ class PositionBase(ABC):
             return allowed == short
         return True
 
-    def _seed_trail_at_issue(self, order: 'Order') -> None:
-        """Sim-only hook: fold the issue bar's extreme into a freshly issued
-        trailing exit's water mark.
+    def _seed_trail_at_issue(self, order: 'Order', *, fold_extreme: bool = True) -> None:
+        """Sim-only hook: fold the issue bar into a freshly issued trailing
+        exit's water mark.
 
         This is a backtest price-walk concern. The live broker path tracks the
         trailing stop through the exchange / order-sync engine, so the base
@@ -1589,7 +1595,7 @@ class SimPosition(PositionBase):
             return True
         return False
 
-    def _process_trailing_stop(self, order: Order, ohlc: bool) -> bool:
+    def _process_trailing_stop(self, order: Order, ohlc: bool, close_leg: bool = False) -> int:
         """Process a trailing-stop exit for the current bar (TradingView model).
 
         TradingView's broker emulator moves the market price along the assumed
@@ -1621,14 +1627,27 @@ class SimPosition(PositionBase):
         fill at a not-stricter activation level precedes the limit on the same
         segment.
 
+        The walk is two-phase so it interleaves with the intrabar margin-call
+        checkpoints in :meth:`_process_limit_stop_orders`: the default call
+        handles the open tick and the legs up to the second extreme, persists
+        the armed/water-mark state on the order and reports ``_trail_pending``;
+        a ``close_leg=True`` call resumes from the second extreme and walks the
+        final (extreme -> close) segment. A fill on that closing leg happens
+        chronologically after a margin call at the adverse extreme, which may
+        have already trimmed the position by then.
+
         :param order: The exit order carrying ``trail_price``.
         :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`).
-        :return: True if the order filled this bar.
+        :param close_leg: If True, walk only the closing (second extreme ->
+            close) segment, resuming the state a prior default call persisted.
+        :return: ``_trail_filled`` if the order filled, ``_trail_deferred`` if
+            the walk defers to the price walk (or cannot act this bar),
+            ``_trail_pending`` if the closing leg is still outstanding.
         """
         if order.trail_price is None:
-            return False
+            return _trail_deferred
         if self._exit_awaits_entry(order):
-            return False
+            return _trail_deferred
         round_to_mintick = lib.math.round_to_mintick
         offset_price = syminfo.mintick * order.trail_offset
         slippage = lib._script.slippage
@@ -1638,7 +1657,7 @@ class SimPosition(PositionBase):
             armed = order.trail_triggered
             stop = order.trail_stop if armed else None
 
-            if armed and stop is not None:
+            if not close_leg and armed and stop is not None:
                 # A carried stop gapped through between bars fills at the open.
                 if self.o <= stop:
                     p = self.o
@@ -1646,7 +1665,7 @@ class SimPosition(PositionBase):
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, self.h, p)
-                    return True
+                    return _trail_filled
                 # The open tick advances the water mark; with trail_offset == 0
                 # the stop lands on the open itself and fills there.
                 new_stop = round_to_mintick(self.o - offset_price)
@@ -1658,8 +1677,8 @@ class SimPosition(PositionBase):
                             p -= syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, self.h, p)
-                        return True
-            elif not armed and self.o >= order.trail_price:
+                        return _trail_filled
+            elif not close_leg and not armed and self.o >= order.trail_price:
                 # The bar opens beyond the activation level: the trail arms on
                 # the first tick with the open as its water mark.
                 armed = True
@@ -1670,13 +1689,18 @@ class SimPosition(PositionBase):
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, self.h, p)
-                    return True
+                    return _trail_filled
 
             # Walk the assumed intrabar path: rising segments arm the trail and
             # ratchet the water mark, a falling segment fills at the trailed
             # stop when it reaches it.
-            prev = self.o
-            for nxt in ((self.h, self.l, self.c) if ohlc else (self.l, self.h, self.c)):
+            if close_leg:
+                prev = self.l if ohlc else self.h
+                path: tuple[float, ...] = (self.c,)
+            else:
+                prev = self.o
+                path = (self.h, self.l) if ohlc else (self.l, self.h)
+            for nxt in path:
                 if nxt > prev:
                     if order.limit is not None and nxt >= order.limit and not (
                             not armed and offset_price <= 0
@@ -1691,7 +1715,7 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if not armed and nxt >= order.trail_price:
                         armed = True
                         stop = round_to_mintick(order.trail_price - offset_price)
@@ -1703,7 +1727,7 @@ class SimPosition(PositionBase):
                                 p -= syminfo.mintick * slippage
                             order.filled_by_type = 'trailing'
                             self.fill_order(order, p, self.h, p)
-                            return True
+                            return _trail_filled
                     if armed:
                         new_stop = round_to_mintick(nxt - offset_price)
                         if stop is None or new_stop > stop:
@@ -1716,7 +1740,7 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if order.stop is not None and nxt <= order.stop and (
                             not armed or stop is None or order.stop >= stop):
                         # The hard stop leg is reached earlier in intrabar time:
@@ -1725,28 +1749,29 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if armed and stop is not None and nxt <= stop:
                         p = stop
                         if slippage > 0:
                             p -= syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, self.h, p)
-                        return True
+                        return _trail_filled
                 prev = nxt
 
-            # No fill: carry the ratcheted stop into the next bar.
+            # No fill: persist the ratcheted state — the default call hands it
+            # to the closing-leg call, which in turn carries it into the next bar.
             if armed:
                 order.trail_triggered = True
                 order.trail_stop = stop
-            return False
+            return _trail_pending
 
         if order.sign > 0:
             # Short position: trailing buy-stop riding above the low-water mark.
             armed = order.trail_triggered
             stop = order.trail_stop if armed else None
 
-            if armed and stop is not None:
+            if not close_leg and armed and stop is not None:
                 # A carried stop gapped through between bars fills at the open.
                 if self.o >= stop:
                     p = self.o
@@ -1754,7 +1779,7 @@ class SimPosition(PositionBase):
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, p, self.l)
-                    return True
+                    return _trail_filled
                 # The open tick advances the water mark; with trail_offset == 0
                 # the stop lands on the open itself and fills there.
                 new_stop = round_to_mintick(self.o + offset_price)
@@ -1766,8 +1791,8 @@ class SimPosition(PositionBase):
                             p += syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, p, self.l)
-                        return True
-            elif not armed and self.o <= order.trail_price:
+                        return _trail_filled
+            elif not close_leg and not armed and self.o <= order.trail_price:
                 # The bar opens beyond the activation level: the trail arms on
                 # the first tick with the open as its water mark.
                 armed = True
@@ -1778,13 +1803,18 @@ class SimPosition(PositionBase):
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, p, self.l)
-                    return True
+                    return _trail_filled
 
             # Walk the assumed intrabar path: falling segments arm the trail and
             # ratchet the water mark, a rising segment fills at the trailed stop
             # when it reaches it.
-            prev = self.o
-            for nxt in ((self.h, self.l, self.c) if ohlc else (self.l, self.h, self.c)):
+            if close_leg:
+                prev = self.l if ohlc else self.h
+                path = (self.c,)
+            else:
+                prev = self.o
+                path = (self.h, self.l) if ohlc else (self.l, self.h)
+            for nxt in path:
                 if nxt < prev:
                     if order.limit is not None and nxt <= order.limit and not (
                             not armed and offset_price <= 0
@@ -1799,7 +1829,7 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if not armed and nxt <= order.trail_price:
                         armed = True
                         stop = round_to_mintick(order.trail_price + offset_price)
@@ -1811,7 +1841,7 @@ class SimPosition(PositionBase):
                                 p += syminfo.mintick * slippage
                             order.filled_by_type = 'trailing'
                             self.fill_order(order, p, p, self.l)
-                            return True
+                            return _trail_filled
                     if armed:
                         new_stop = round_to_mintick(nxt + offset_price)
                         if stop is None or new_stop < stop:
@@ -1824,7 +1854,7 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if order.stop is not None and nxt >= order.stop and (
                             not armed or stop is None or order.stop <= stop):
                         # The hard stop leg is reached earlier in intrabar time:
@@ -1833,26 +1863,27 @@ class SimPosition(PositionBase):
                         order.trail_triggered = armed
                         if armed:
                             order.trail_stop = stop
-                        return False
+                        return _trail_deferred
                     if armed and stop is not None and nxt >= stop:
                         p = stop
                         if slippage > 0:
                             p += syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, p, self.l)
-                        return True
+                        return _trail_filled
                 prev = nxt
 
-            # No fill: carry the ratcheted stop into the next bar.
+            # No fill: persist the ratcheted state — the default call hands it
+            # to the closing-leg call, which in turn carries it into the next bar.
             if armed:
                 order.trail_triggered = True
                 order.trail_stop = stop
-            return False
+            return _trail_pending
 
-        return False
+        return _trail_deferred
 
-    def _seed_trail_at_issue(self, order: Order) -> None:
-        """Fold the issue bar's extreme into a trailing exit's high/low-water mark.
+    def _seed_trail_at_issue(self, order: Order, *, fold_extreme: bool = True) -> None:
+        """Fold the issue bar into a trailing exit's high/low-water mark.
 
         ``process_orders`` runs before the script body, so an exit issued in the
         script on bar N -- e.g. one gated on ``strategy.position_size``, which is
@@ -1867,7 +1898,18 @@ class SimPosition(PositionBase):
         trade is open yet) are skipped: ``process_orders`` seeds those on their
         fill bar exactly as before, so the single-issue path is unchanged.
 
+        With ``fold_extreme=False`` (a changed-params re-issue) the water mark
+        anchors to the issue bar's CLOSE tick instead of its extreme: the
+        replaced leg sees only the current price, so it arms there when the
+        activation is already met, and the next bar's open advances the stop
+        only when favorable. TV-verified both ways on BINANCE:BTCUSDT 30m
+        (per-bar ``atr*mult`` trail): a long re-issue filled at
+        ``next open - offset`` (open above close, mark advanced) and a short
+        re-issue filled at ``close + offset`` (open above close, mark kept).
+
         :param order: The freshly (re-)issued trailing exit order.
+        :param fold_extreme: If True, ratchet the issue bar's H/L extreme into
+            the water mark; if False, anchor the water mark to the bar close.
         """
         if order.trail_points_ticks is None and order.trail_price is None:
             return
@@ -1905,7 +1947,7 @@ class SimPosition(PositionBase):
                     return
                 order.trail_triggered = True
                 order.trail_stop = round_to_mintick(trail_price - offset_price)
-            new_stop = round_to_mintick(self.h - offset_price)
+            new_stop = round_to_mintick((self.h if fold_extreme else self.c) - offset_price)
             if order.trail_stop is None or new_stop > order.trail_stop:
                 order.trail_stop = new_stop
         elif order.sign > 0:
@@ -1915,7 +1957,7 @@ class SimPosition(PositionBase):
                     return
                 order.trail_triggered = True
                 order.trail_stop = round_to_mintick(trail_price + offset_price)
-            new_stop = round_to_mintick(self.l + offset_price)
+            new_stop = round_to_mintick((self.l if fold_extreme else self.c) + offset_price)
             if order.trail_stop is None or new_stop < order.trail_stop:
                 order.trail_stop = new_stop
 
@@ -1976,22 +2018,69 @@ class SimPosition(PositionBase):
         margin = mvs * margin_ratio
         available_funds = equity - margin
 
-        if available_funds >= 0:
+        # From 1e7 account-currency units of equity upward the margin-call
+        # trigger is an integer-tick comparison on the STRICT side: it fires
+        # once the truncated equity tick-count no longer covers the required
+        # margin rounded half-up to a tick, even while the float difference
+        # is still a positive surplus. Measured on BINANCE:BTCUSDT 30m,
+        # Hybrid 2025-10-02 16:00: available funds +0.0047 USD at every bar
+        # price, yet TV liquidated one whole contract at H=120300 — exactly
+        # the first walk point where this comparison fails (open and low
+        # both pass it). From 1e10 margin ticks upward the margin rounds to
+        # the nearest multiple of 10 ticks instead (Hybrid 2026-02-28 20:30:
+        # available funds +0.0132 USD at the bar low, yet TV liquidated one
+        # whole contract — the margin rounded up to the next multiple of 10
+        # ticks while the equity truncated 4 ticks below it; the open and
+        # high of the same bar stayed on grid and passed).
+        mintick = syminfo.mintick
+        big_equity = equity >= 1e7 and mintick and mintick > 0
+        big_margin = False
+        equity_ticks = 0.0
+        margin_ticks = 0.0
+        if big_equity:
+            equity_ticks = math.floor(equity / mintick)
+            margin_ticks = margin / mintick
+            big_margin = margin_ticks >= 1e10
+            if big_margin:
+                margin_ticks = 10.0 * round(margin_ticks / 10.0)
+            else:
+                margin_ticks = math.floor(margin_ticks + 0.5)
+            if equity_ticks >= margin_ticks:
+                return False
+        elif available_funds >= 0:
             return False
 
-        loss = available_funds / margin_ratio
         # One contract is worth `check_price * pv` in account currency. Work in
         # lot units (1 / _size_round_factor): whole-lot symbols (stocks) keep
         # TV's integer-contract truncation, while fractional-lot symbols
         # (crypto) liquidate fractional amounts the way TV does instead of
         # force-closing a minimum of one whole contract.
         rfactor = 1 if whole_contracts else syminfo._size_round_factor  # noqa
-        raw_cover_lots = abs(loss) / (check_price * pv) * rfactor
-        if rfactor > 1:
-            # TV snaps fractional-lot cover amounts that land just below the next
-            # lot boundary; ordinary fractional parts remain truncated.
-            raw_cover_lots += 0.001
-        cover_lots = int(raw_cover_lots)
+        if big_margin:
+            # Above 1e10 margin ticks the cover comes from the same tick-shadow
+            # shortfall as the trigger, then a plain truncation with no float
+            # snap (Hybrid 2026-02-16 15:30 and 2026-02-20 13:30 both round the
+            # margin up to an odd tick-count that a half-up or half-to-even
+            # rounding would keep down).
+            shortfall = (margin_ticks - equity_ticks) * mintick
+            loss = shortfall / margin_ratio
+            cover_lots = int(loss / (check_price * pv) * rfactor)
+            if cover_lots < 0:
+                cover_lots = 0
+        else:
+            loss = available_funds / margin_ratio
+            raw_cover_lots = abs(loss) / (check_price * pv) * rfactor
+            # TV truncates the fractional cover amount, but snaps a raw value
+            # that lands within ~2^-26 (relative) of an integer to that
+            # integer. Measured on BINANCE:BTCUSDT 30m corpus margin calls:
+            # 21840.99976 (rel dist 1.10e-8) covered 21841 lots on TV, while
+            # 26510.99945 (rel dist 2.08e-8) truncated to 26510; 2^-26 =
+            # 1.49e-8 lies between them.
+            nearest_cover = round(raw_cover_lots)
+            if abs(raw_cover_lots - nearest_cover) <= raw_cover_lots * 2.0 ** -26 + 1e-9:
+                cover_lots = nearest_cover
+            else:
+                cover_lots = int(raw_cover_lots)
         if cover_lots == 0 and rfactor > 1:
             # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
             # one whole contract, capped by the current position size.
@@ -2040,17 +2129,29 @@ class SimPosition(PositionBase):
 
     def process_deferred_margin_call(self):
         """
-        Execute a deferred margin call (after the user script has run).
+        Execute a deferred margin call (after the user script has run), then
+        re-check margin at the bar close the way TradingView does.
         Called from script_runner after the user script's main() completes.
+
+        TV evaluates margin at every bar close and books the liquidation on
+        that bar at the close price; without this check the same liquidation
+        only fires at the next bar's open — one bar late, and at the open
+        price on gapped data (Hybrid 2026-05-07 02:00: TV trims 1.0 contract
+        at C=80898.0 on the 02:00 bar while the O/H/L walk points all pass
+        the margin comparison). Sized like the bar-open check in whole
+        contracts; every observed instance trimmed exactly 1.0 contract, so
+        the whole-contract choice is untested beyond that.
         """
-        if self._deferred_margin_call is None:
-            return
-
-        check_price, for_short = self._deferred_margin_call
-        self._deferred_margin_call = None
-
         prev_count = len(self.new_closed_trades)
-        self._check_margin_call(check_price, for_short=for_short, at_open=True)
+
+        if self._deferred_margin_call is not None:
+            check_price, for_short = self._deferred_margin_call
+            self._deferred_margin_call = None
+            self._check_margin_call(check_price, for_short=for_short, at_open=True)
+
+        if self.open_trades:
+            self._check_margin_call(self.c, for_short=self.sign < 0, at_open=True,
+                                    whole_contracts=True)
 
         initial_capital = lib._script.initial_capital
         for closed_trade in self.new_closed_trades[prev_count:]:
@@ -2063,7 +2164,8 @@ class SimPosition(PositionBase):
                 closed_trade.cum_profit_percent = 0.0
             self.entry_equity += closed_trade.profit
 
-    def _resolve_deferred_qty(self, order: Order, fill_price: float) -> None:
+    @staticmethod
+    def _resolve_deferred_qty(order: Order, fill_price: float) -> None:
         """Finalize a default-sized entry's quantity at its actual fill price.
 
         TradingView resolves percent_of_equity / cash default sizing when the
@@ -2079,7 +2181,14 @@ class SimPosition(PositionBase):
         if qty <= 0.0:
             order.size = 0.0
             return
-        order.size = _size_round((qty + order.flip_extra) * order.sign)
+        size = _size_round((qty + order.flip_extra) * order.sign)
+        if size != 0.0:
+            # The big-money sizing judgment applies to the money-sized part of
+            # the order only; the reversal flip component is the old position,
+            # already an exact lot multiple.
+            flip = order.flip_extra * order.sign
+            size = _judge_money_entry(size - flip, float(fill_price)) + flip
+        order.size = size
 
     def _cancel_unaffordable_entries(self) -> None:
         """
@@ -2134,7 +2243,21 @@ class SimPosition(PositionBase):
 
         equity = self.equity
         margin_needed = new_qty * fill_price * pv * margin_ratio
-        return margin_needed > equity
+        # From 1e7 account-currency units of equity upward TV decides the fill
+        # with an integer-tick comparison on the PERMISSIVE side: the entry
+        # fills while the equity rounded half-up to a tick still covers the
+        # truncated tick-count of the required margin — a sub-tick shortfall
+        # fills and the bar-open margin-call path then trims the position (a
+        # sub-lot shortfall liquidates one whole contract). Measured on
+        # BINANCE:BTCUSDT 30m: Hybrid 2025-06-12 22:30 (shortfall 0.0076 USD,
+        # 0.76 tick) FILLED + 1-contract MC at the open, while one-shot
+        # initial_capital replicas 1.00 and 1.81 ticks short both REJECTED.
+        # Below the 1e7 gate the legacy relative tolerance stands (fitted on
+        # corpus rejects at 1.75e-9..1.06e-7 relative shortfall).
+        mintick = syminfo.mintick
+        if equity >= 1e7 and mintick and mintick > 0:
+            return math.floor(equity / mintick + 0.5) < math.floor(margin_needed / mintick)
+        return margin_needed - equity > abs(equity) * 7.5e-10
 
     def _cancel_same_bar_reversal_closes(self, entry_order: Order) -> None:
         """
@@ -2413,6 +2536,11 @@ class SimPosition(PositionBase):
                         order.size -= self.size  # Subtract because position.size has opposite sign
                         if order.deferred_qty:
                             order.flip_extra = abs(self.size)
+                    if order.size == 0.0:
+                        # Closing-leg-only reversal marker whose opposite position
+                        # is already gone: nothing left to close.
+                        self._remove_order(order)
+                        continue
 
             # Apply slippage to market orders
             fill_price = self.o
@@ -2605,18 +2733,28 @@ class SimPosition(PositionBase):
         # skipping the generator is exactly behaviour-preserving. The margin
         # checks are gated on the position sign, mirroring the callee's own
         # direction guards — a mismatched direction is a guaranteed ``False``.
+        # Trailing stops walk the assumed intrabar path themselves (arming,
+        # water-mark ratchet and fill in chronological order), so they are
+        # processed here rather than inside the level-indexed walk — but only
+        # up to the second extreme. A fill on the walk's closing leg happens
+        # chronologically AFTER the intrabar margin-call checkpoints at the
+        # extremes, so orders still pending after the first two legs are
+        # collected and resumed at the closing-leg site below; walking them
+        # to completion here would flatten the position before a margin call
+        # TV fires at the adverse extreme (verified against a TV export where
+        # a partial 'Margin call' at the high preceded the trailing exit
+        # filling near the low of the same bar).
+        # Iterate a snapshot since fills mutate the order book; an order indexed at
+        # several price levels is yielded once per level, so dedupe by identity.
+        trail_close_leg: list[Order] = []
         if self.orderbook.price_levels:
-            # Trailing stops walk the assumed intrabar path themselves (arming,
-            # water-mark ratchet and fill in chronological order), so they are
-            # processed once per bar here rather than inside the level-indexed walk.
-            # Iterate a snapshot since fills mutate the order book; an order indexed at
-            # several price levels is yielded once per level, so dedupe by identity.
             seen: set[Order] = set()
             for order in list(self.orderbook.iter_orders()):
                 if order in seen or order.cancelled or order.trail_price is None:
                     continue
                 seen.add(order)
-                self._process_trailing_stop(order, ohlc)
+                if self._process_trailing_stop(order, ohlc) == _trail_pending:
+                    trail_close_leg.append(order)
 
         # Process orders: open → high → low → close
         if ohlc:
@@ -2628,7 +2766,18 @@ class SimPosition(PositionBase):
                     if self._check_high(order):
                         continue
 
-            if not (self.sign < 0 and self._check_margin_call(self.h, for_short=True)):
+            mc_deferred = self.sign < 0 and self._check_margin_call(self.h, for_short=True)
+            if not mc_deferred:
+                # The checkpoint at the position's FAVORABLE extreme runs
+                # before this leg's fills. Under the float trigger it is a
+                # no-op (available funds only improve toward the favorable
+                # side at margin <= 100%), but the >=1e7 integer-tick trigger
+                # can trip there: TV liquidated one contract of a LONG at
+                # H=120300 (Hybrid 2025-10-02 16:00) before the exit limit at
+                # 120290.7 — lower on the same leg — filled the rest.
+                if self.sign < 0:
+                    self._check_margin_call(self.l, for_short=True, can_defer=False)
+
                 # open -> low (descending: the level nearest the open fills first)
                 if self.orderbook.price_levels:
                     for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
@@ -2640,6 +2789,17 @@ class SimPosition(PositionBase):
                 if self.sign > 0:
                     self._check_margin_call(self.l, for_short=False, can_defer=False)
 
+            # Trailing fills on the closing leg — chronologically after both
+            # margin-call checkpoints, so a partial liquidation at the extreme
+            # trims the position the trailing exit then closes. A deferred
+            # margin call stops the level walks but not the trail: its fill
+            # precedes the close-price liquidation.
+            for order in trail_close_leg:
+                if order.cancelled or order.filled_by_type is not None:
+                    continue
+                self._process_trailing_stop(order, ohlc, close_leg=True)
+
+            if not mc_deferred:
                 # low -> close (ascending): the walk's closing leg. Orders that
                 # became active mid-bar — an exit whose entry filled on an
                 # earlier leg — get the path's final segment, like TV does.
@@ -2658,7 +2818,14 @@ class SimPosition(PositionBase):
                     if self._check_low(order):
                         continue
 
-            if not (self.sign > 0 and self._check_margin_call(self.l, for_short=False)):
+            mc_deferred = self.sign > 0 and self._check_margin_call(self.l, for_short=False)
+            if not mc_deferred:
+                # Favorable-extreme checkpoint before this leg's fills — see
+                # the mirrored comment in the OHLC branch (TV-verified on the
+                # Hybrid 2025-10-02 16:00 long margin call at the high).
+                if self.sign > 0:
+                    self._check_margin_call(self.h, for_short=False, can_defer=False)
+
                 # open -> high
                 if self.orderbook.price_levels:
                     for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
@@ -2670,6 +2837,17 @@ class SimPosition(PositionBase):
                 if self.sign < 0:
                     self._check_margin_call(self.h, for_short=True, can_defer=False)
 
+            # Trailing fills on the closing leg — chronologically after both
+            # margin-call checkpoints, so a partial liquidation at the extreme
+            # trims the position the trailing exit then closes. A deferred
+            # margin call stops the level walks but not the trail: its fill
+            # precedes the close-price liquidation.
+            for order in trail_close_leg:
+                if order.cancelled or order.filled_by_type is not None:
+                    continue
+                self._process_trailing_stop(order, ohlc, close_leg=True)
+
+            if not mc_deferred:
                 # high -> close (descending): the walk's closing leg. Orders that
                 # became active mid-bar — an exit whose entry filled on an
                 # earlier leg — get the path's final segment, like TV does.
@@ -3254,6 +3432,37 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
 
 
 # noinspection PyProtectedMember
+def _default_entry_budget(price: float) -> tuple[float, float] | None:
+    """Money amount and per-unit cost of a default-sized entry at ``price``.
+
+    Returns ``(money, unit_cost)`` so that the raw quantity is
+    ``money / unit_cost``, or None for fixed sizing (not money-based).
+    """
+    script = lib._script
+    default_qty_type = script.default_qty_type
+    if default_qty_type == fixed:
+        return None
+
+    if default_qty_type == percent_of_equity:
+        target_investment = script.position.equity * script.default_qty_value * 0.01
+        if script.commission_type == _commission.percent:
+            commission_multiplier = 1.0 + script.commission_value * 0.01
+            return target_investment, price * syminfo.pointvalue * commission_multiplier
+        if script.commission_type == _commission.cash_per_contract:
+            return target_investment, price * syminfo.pointvalue + script.commission_value
+        if script.commission_type == _commission.cash_per_order:
+            return (max(0.0, target_investment - script.commission_value),
+                    price * syminfo.pointvalue)
+        # No commission
+        return target_investment, price * syminfo.pointvalue
+
+    if default_qty_type == cash:
+        return script.default_qty_value, price * syminfo.pointvalue
+
+    raise ValueError("Unknown default qty type: ", default_qty_type)
+
+
+# noinspection PyProtectedMember
 def _default_entry_qty(price: float) -> float:
     """Contracts a default-sized (no explicit ``qty``) entry buys at ``price``.
 
@@ -3270,28 +3479,162 @@ def _default_entry_qty(price: float) -> float:
     EXECUTES — the caller passes the actual fill price at fill time, and only
     an executable-price estimate at placement (for margin checks).
     """
-    script = lib._script
-    default_qty_type = script.default_qty_type
-    if default_qty_type == fixed:
-        return script.default_qty_value
+    budget = _default_entry_budget(price)
+    if budget is None:
+        return lib._script.default_qty_value
+    money, unit_cost = budget
+    return money / unit_cost
 
-    if default_qty_type == percent_of_equity:
-        target_investment = script.position.equity * script.default_qty_value * 0.01
-        if script.commission_type == _commission.percent:
-            commission_multiplier = 1.0 + script.commission_value * 0.01
-            return target_investment / (price * syminfo.pointvalue * commission_multiplier)
-        if script.commission_type == _commission.cash_per_contract:
-            return target_investment / (price * syminfo.pointvalue + script.commission_value)
-        if script.commission_type == _commission.cash_per_order:
-            return max(0.0, (target_investment - script.commission_value)
-                       / (price * syminfo.pointvalue))
-        # No commission
-        return target_investment / (price * syminfo.pointvalue)
 
-    if default_qty_type == cash:
-        return script.default_qty_value / (price * syminfo.pointvalue)
+# Distance threshold (in ticks) of the big-money gate's down-step: an
+# inflated threshold landing on an even grid multiple steps down one grid
+# unit only when it cleared the inflated cost by more than this. Bracketed
+# in (0.0783, 0.1034) ticks on TV probes; 3/32 is the binary-exact candidate.
+_GATE_DOWN_STEP_DELTA = 0.09375
 
-    raise ValueError("Unknown default qty type: ", default_qty_type)
+
+def _ceil_to_grid(value: float, grid: float) -> tuple[int, float]:
+    """Exact smallest multiple of ``grid`` that is >= ``value``.
+
+    ``value / grid`` alone can round across an integer near a grid point; the
+    correction loops re-check with ``k * grid`` products, which are exact for
+    the tick grids (0.5, 5) and magnitudes (< 2^53) involved.
+
+    :param value: The value to quantize upward
+    :param grid: The grid step
+    :return: ``(k, k * grid)`` where ``k * grid`` is the quantized value
+    """
+    k = math.ceil(value / grid)
+    while (k - 1) * grid >= value:
+        k -= 1
+    while k * grid < value:
+        k += 1
+    return k, k * grid
+
+
+def _price_has_odd_f32_offset(price: float) -> bool:
+    """Whether ``price`` sits an odd number of float32-ULP/25 quanta above
+    its float32 lower neighbour, within seven quanta.
+
+    TV's big-money gate inflates its cost threshold only on bars whose close
+    has this float32 relationship (measured 38/38 on BINANCE:BTCUSDT 30m; in
+    the [2^16, 2^17) binade the quantum is 1/32 tick). A close exactly
+    representable in float32 (offset 0) does not inflate.
+
+    :param price: The bar close driving the gate
+    :return: True when the odd-offset relationship holds
+    """
+    if price <= 0.0 or not math.isfinite(price):
+        return False
+    f32 = struct.unpack('<f', struct.pack('<f', price))[0]
+    bits = struct.unpack('<I', struct.pack('<f', f32))[0]
+    if f32 > price:
+        bits -= 1
+        f32 = struct.unpack('<f', struct.pack('<I', bits))[0]
+    ulp = struct.unpack('<f', struct.pack('<I', bits + 1))[0] - f32
+    if ulp <= 0.0 or not math.isfinite(ulp):
+        return False
+    quanta = (price - f32) * 25.0 / ulp
+    k = round(quanta)
+    return k % 2 == 1 and k <= 7 and abs(quanta - k) < 0.25
+
+
+def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
+                     unit_cost: float, mintick: float, price: float) -> int | None:
+    """Judge an entry of ``lots`` lots against TV's big-money margin gate.
+
+    From 1e9 cost ticks upward TV quantizes the order cost onto a tick grid
+    (0.5 tick, 5 ticks from 1e10 cost ticks) and compares the raw equity tick
+    count against the quantized threshold:
+
+    - equity >= threshold: the entry fills as sized;
+    - equity below threshold but at least the plain grid ceiling of the cost
+      (possible only when the threshold was inflated): the entry is rejected;
+    - equity below the plain grid ceiling: the parity of the grid multiple
+      decides — even rejects, odd fills one lot less.
+
+    On odd-float32-offset bars (see :func:`_price_has_odd_f32_offset`) with
+    price >= 1e5 the threshold is the grid ceiling of the cost inflated by
+    2^-31 relative; an inflated threshold landing on an EVEN grid multiple
+    steps one grid unit down when it cleared the inflated cost by more than
+    ``_GATE_DOWN_STEP_DELTA`` (never below the plain ceiling, and not when
+    the cost sits exactly on the grid). Reverse-engineered on BINANCE:BTCUSDT
+    30m one-shot probes: 19,613 of 19,614 measurements reproduced, boundary
+    decade 21/22 (below C 1e5 rare inflated bars exist whose slope selector
+    is unmapped; they are treated as uninflated here).
+
+    :param equity_ticks: Raw equity tick count (equity / mintick)
+    :param lots: Entry size in lot units
+    :param rfactor: Lots per contract (``syminfo._size_round_factor``)
+    :param unit_cost: Account-currency cost of one contract
+    :param mintick: Tick size
+    :param price: The bar close driving the gate (inflation selector)
+    :return: Granted lot count (``lots`` or ``lots - 1``) or None when the
+        entry is rejected
+    """
+    cost = lots / rfactor * unit_cost / mintick
+    grid = 5.0 if cost >= 1e10 else 0.5
+    k0, m0 = _ceil_to_grid(cost, grid)
+    m_eff = m0
+    if price >= 1e5 and _price_has_odd_f32_offset(price):
+        inflated = cost * (1.0 + 2.0 ** -31)
+        k_eff, m_eff = _ceil_to_grid(inflated, grid)
+        if k_eff % 2 == 0 and m_eff - inflated > _GATE_DOWN_STEP_DELTA:
+            down = m_eff - grid
+            if not (down == m0 == cost):
+                m_eff = max(m0, down)
+    if equity_ticks >= m_eff:
+        return lots
+    if equity_ticks >= m0:
+        return None
+    if k0 % 2 == 0:
+        return None
+    return lots - 1
+
+
+# noinspection PyProtectedMember
+def _judge_money_entry(size: float, price: float) -> float:
+    """Apply TV's big-money sizing and margin gate to a money-sized entry.
+
+    From 1e7 account-currency units of order money upward (equivalently 1e9
+    ticks at mintick 0.01; the gate is bracketed in (9.0e6, 1.01e7] and is
+    indistinguishable between the two at mintick 0.01) TV re-judges the
+    floor-sized quantity: when the truncated money tick count reaches one
+    grid unit below the NEXT lot's quantized cost, the gate is evaluated at
+    that larger size (which its own cost then always exceeds, so the outcome
+    is the parity branch: reject or fill the floor size); otherwise the gate
+    runs at the floor size directly. See :func:`_gate_entry_lots` for the
+    gate itself and the measurement provenance.
+
+    :param size: Signed floor-sized quantity in contracts
+    :param price: The sizing/gate price (placement close for market entries,
+        fill price for price-based orders resolving at execution)
+    :return: The granted signed quantity, or 0.0 when the entry is rejected
+    """
+    budget = _default_entry_budget(price)
+    if budget is None:
+        return size
+    money, unit_cost = budget
+    if money < 1e7:
+        return size
+    mintick = syminfo.mintick
+    if not mintick or mintick <= 0:
+        return size
+    rfactor = syminfo._size_round_factor  # noqa
+    lots = round(abs(size) * rfactor)
+    if lots <= 0:
+        return size
+    money_ticks = money / mintick
+    next_cost = (lots + 1) / rfactor * unit_cost / mintick
+    next_grid = 5.0 if next_cost >= 1e10 else 0.5
+    _, next_m0 = _ceil_to_grid(next_cost, next_grid)
+    if math.floor(money_ticks) >= next_m0 - next_grid:
+        lots += 1
+    granted = _gate_entry_lots(money_ticks, lots, rfactor, unit_cost, mintick, price)
+    if granted is None or granted <= 0:
+        return 0.0
+    sign = 1.0 if size > 0 else -1.0
+    return sign * granted / rfactor
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,DuplicatedCode
@@ -3352,12 +3695,15 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # would execute at NOW — the current price when immediately executable,
     # the limit/stop price while it rests.
     deferred_default = isinstance(qty, NA)
+    market_sizing_price: float | None = None
     if deferred_default:
         exec_price = position.c
         if limit is not None:
             exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
         elif stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
+        else:
+            market_sizing_price = float(exec_price)
         qty = _default_entry_qty(exec_price)
 
     # qty must be greater than 0
@@ -3369,6 +3715,26 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     size = _size_round(size)
     if size == 0.0:
         return
+
+    # Market entries keep their placement-close sizing (price-based orders
+    # re-resolve at fill), so the big-money sizing gate is judged here.
+    if market_sizing_price is not None:
+        size = _judge_money_entry(float(size), market_sizing_price)
+        if size == 0.0:
+            if position.size == 0.0 or position.sign == direction_sign:
+                return
+            # A nofill judgment does not cancel a reversal outright: TV keeps
+            # the order alive as its closing leg, so the opposite position
+            # still closes at the next open while the opening leg stays
+            # suppressed (Hybrid 2026-05-14 15:00: the short closes at the
+            # bar open, the long only fills a bar later from the re-issued,
+            # re-judged entry). The zero size nets to a pure close through
+            # the reversal flip at order processing.
+            order = Order(id, 0.0, order_type=_order_type_entry, oca_name=oca_name,
+                          oca_type=oca_type, comment=comment, alert_message=alert_message)
+            order.sign = direction_sign
+            position._add_order(order)
+            return
 
     # Creation-time margin check for entry orders (TradingView backtest behavior).
     # TV cancels an entry order it cannot open: required margin is evaluated at
@@ -3393,7 +3759,30 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             equity = script.initial_capital + position.netprofit + position.openprofit
             # Margin/equity are in account currency — convert via pointvalue.
             margin_needed = abs(size) * check_price * syminfo.pointvalue * margin_ratio
-            if margin_needed > equity:
+            # From 1e7 account-currency units of equity upward TV runs this
+            # creation-time check as the quantized big-money gate (see
+            # _gate_entry_lots): the order is cancelled unless the equity tick
+            # count reaches the grid threshold of the required margin. A
+            # money-sized market entry already passed _judge_money_entry, and
+            # its granted cost always clears this equity-side gate at 100%
+            # margin; explicit-qty and resting orders are judged here (the
+            # placement estimate — price-based orders re-size at fill).
+            # Measured on BINANCE:BTCUSDT 30m: Hybrid 2025-08-25 05:00
+            # (equity 18.58M, surplus 0.19 tick) was rejected on TV and
+            # refilled one bar later; MAB corpus entries at 1.06M/1.32M
+            # equity fill despite the same tick geometry, bracketing the gate
+            # below 1e7 together with the sizing-law gate in (9.0e6, 1.01e7].
+            mintick = syminfo.mintick
+            if equity >= 1e7 and mintick and mintick > 0:
+                rfactor = syminfo._size_round_factor  # noqa
+                lots = round(abs(size) * rfactor)
+                unit_margin = check_price * syminfo.pointvalue * margin_ratio
+                if lots > 0:
+                    granted = _gate_entry_lots(equity / mintick, lots, rfactor,
+                                               unit_margin, mintick, check_price)
+                    if granted != lots:
+                        return
+            elif margin_needed > equity:
                 return
 
     # If it is not a market order, we should check pyramiding and flip conditions here
@@ -3524,6 +3913,17 @@ def exit(id: str, from_entry: str = "",
         profit_ticks: float | None = _na_to_none(profit)
         loss_ticks: float | None = _na_to_none(loss)
         trail_points_ticks: float | None = _na_to_none(trail_points)
+        # TradingView truncates a fractional ``trail_offset`` tick count to
+        # whole ticks (like its qty precision). Verified against a TV
+        # reference (BINANCE:BTCUSDT 30m, ``trail_points=trail_offset=
+        # atr*mult``): TV's trailing fills land at ``water mark -/+
+        # floor(offset_ticks) * mintick``, while fractional ticks would round
+        # half the fills one tick further. ``trail_points`` stays fractional:
+        # the activation price resolves with directional tick-rounding
+        # (bracket trail probe 91, ``trail_points=atr``, matches TV that way).
+        _trail_offset = _na_to_none(trail_offset)
+        if _trail_offset is not None:
+            _trail_offset = float(int(_trail_offset))
         _trail_price = _na_to_none(trail_price)
 
         # A missing ``trail_offset`` does NOT disable the trailing leg. TradingView's
@@ -3567,7 +3967,7 @@ def exit(id: str, from_entry: str = "",
         order = Order(
             from_entry, size, exit_id=id, order_type=_order_type_close,
             limit=_limit, stop=_stop,
-            trail_price=_trail_price, trail_offset=_na_to_none(trail_offset),
+            trail_price=_trail_price, trail_offset=_trail_offset,
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
             oca_name=_na_to_none(oca_name), oca_type=oca_type,
             comment=_na_to_none(comment),
@@ -3581,43 +3981,45 @@ def exit(id: str, from_entry: str = "",
         )
 
         # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
-        # activated high/low-water mark. TradingView carries ONE logical trailing
-        # stop across re-issues -- only the activation level tracks the
-        # (entry-anchored) trail_points -- so a fresh Order must inherit the
-        # ratcheted ``trail_stop`` instead of re-arming at the bare activation
-        # level every bar, which would leave the stop permanently one or more bars
-        # behind the carried water mark. EXCEPTION: when the script re-issues the
-        # leg with a STRICTER activation level (above the high-water mark for a
-        # long, below the low-water mark for a short — e.g. a take-profit rebased
-        # on a pyramid add), TradingView treats the moved activation as not yet
-        # reached and the trail re-arms at the new level.
-        if existing is not None and existing.trail_triggered:
-            inherit = True
-            # The stricter-activation check needs the re-issued activation level
-            # in price terms: the explicit ``trail_price``, or the entry-anchored
-            # ``trail_points`` form resolved against the bound entry's fill price
-            # (the existing leg is armed, so its entry has filled).
-            new_trail_price = _trail_price
-            if new_trail_price is None and trail_points_ticks is not None:
-                for open_trade in position.open_trades:
-                    if open_trade.entry_id == from_entry:
-                        new_trail_price = _price_round(
-                            open_trade.entry_price
-                            + direction * syminfo.mintick * trail_points_ticks,
-                            direction)
-                        break
-            if new_trail_price is not None and existing.trail_stop is not None:
-                old_offset_price = syminfo.mintick * existing.trail_offset
-                if direction > 0:
-                    inherit = new_trail_price <= existing.trail_stop + old_offset_price
-                else:
-                    inherit = new_trail_price >= existing.trail_stop - old_offset_price
-            if inherit:
+        # activated high/low-water mark ONLY when the trailing parameters are
+        # unchanged. TradingView carries ONE logical trailing stop across
+        # identical re-issues -- a fresh Order must inherit the ratcheted
+        # ``trail_stop`` instead of re-arming at the bare activation level every
+        # bar, which would leave the stop permanently one or more bars behind
+        # the carried water mark. A re-issue with CHANGED trailing parameters
+        # (a per-bar recomputed atr-based trail, a stricter activation rebased
+        # on a pyramid add, ...) is a cancel+replace: the armed state and the
+        # carried water mark are dropped and the replaced leg re-arms from the
+        # issue bar's CLOSE tick (see ``_seed_trail_at_issue``); the prior
+        # bars' extremes stay out of its water mark. Verified against a TV
+        # reference (BINANCE:BTCUSDT 30m, per-bar ``trail_points=atr*mult``):
+        # TV's re-armed stop anchored to the issue bar's close instead of
+        # carrying the prior high-water mark. The activation is compared in
+        # the form it was given -- ``existing.trail_price`` may hold a
+        # points-resolved value, so the entry-anchored ``trail_points`` form
+        # compares tick counts.
+        had_trail = False
+        trail_unchanged = False
+        if existing is not None and (
+                existing.trail_price is not None or existing.trail_points_ticks is not None):
+            had_trail = True
+            trail_unchanged = (
+                existing.trail_offset == order.trail_offset
+                and ((order.trail_points_ticks is not None
+                      and existing.trail_points_ticks == order.trail_points_ticks)
+                     or (order.trail_points_ticks is None
+                         and existing.trail_points_ticks is None
+                         and existing.trail_price == order.trail_price)))
+            if trail_unchanged and existing.trail_triggered:
                 order.trail_triggered = True
                 order.trail_stop = existing.trail_stop
 
         position._add_order(order)
-        position._seed_trail_at_issue(order)
+        # A brand-new trailing leg (first issue, or trailing added to a live
+        # bracket) and an identical re-issue fold the issue bar's extreme into
+        # the water mark; a changed-params re-issue re-arms anchored to the
+        # issue bar's close only (see above).
+        position._seed_trail_at_issue(order, fold_extreme=not had_trail or trail_unchanged)
 
     def _bound_size(entry_id: str) -> tuple[float, float]:
         """Combined sign and ORIGINAL size of everything bound to an entry id:
@@ -3729,12 +4131,15 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # order would execute at NOW — the current price when immediately
     # executable, the limit/stop price while it rests.
     deferred_default = isinstance(qty, NA)
+    market_sizing_price: float | None = None
     if deferred_default:
         exec_price = float(lib.close)
         if limit is not None:
             exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
         elif stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
+        else:
+            market_sizing_price = exec_price
         qty = _default_entry_qty(exec_price)
 
     # qty must be greater than 0
@@ -3750,6 +4155,13 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     size = _size_round(size)
     if size == 0.0:
         return
+
+    # Market orders keep their placement-close sizing (price-based orders
+    # re-resolve at fill), so the big-money sizing gate is judged here.
+    if market_sizing_price is not None:
+        size = _judge_money_entry(float(size), market_sizing_price)
+        if size == 0.0:
+            return
 
     # Create the order with _order_type_normal
     # This is a "normal" order that simply adds to or subtracts from position
