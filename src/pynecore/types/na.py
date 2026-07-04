@@ -351,6 +351,14 @@ class NA(Generic[T]):
         # sequence-protocol fallback would iterate forever.
         return False
 
+    def __iter__(self) -> Any:
+        # NA is not a sequence. Without an explicit __iter__, ``iter(na)``
+        # (e.g. ``str.join(na)``, ``list(na)``, tuple unpacking) falls back to
+        # the sequence protocol and — since ``__getitem__`` returns self for
+        # every index — spins forever while building an unbounded list.
+        # Failing loudly is the only safe behavior here.
+        raise TypeError("na is not iterable")
+
     def __call__(self, *_, **__) -> Self:
         return self
 

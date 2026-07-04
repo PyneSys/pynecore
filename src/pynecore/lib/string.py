@@ -456,7 +456,7 @@ def pos(source: str, str_: str) -> int | NA[int]:
 
 
 # noinspection PyShadowingNames
-def repeat(source: str, repeat: int, separator: str = '') -> str:
+def repeat(source: str, repeat: int, separator: str = '') -> str | NA[str]:
     """
     Returns a new string consisting of the source string repeated the specified number of times,
     separated by the separator string.
@@ -465,12 +465,23 @@ def repeat(source: str, repeat: int, separator: str = '') -> str:
     :param repeat: Number of times to repeat the source string
     :param separator: Separator string
     :return: New string consisting of the source string repeated the specified number of times,
-             separated by the separator string.
+             separated by the separator string. A na source or repeat count — and a repeat
+             count of zero — yields na (TV-verified); a na separator behaves as ''.
     """
-    return separator.join([source] * repeat)
+    # na-propagation (Pine): without this guard ``[source] * repeat`` with a na
+    # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
+    # back to the sequence protocol, which never terminates (NA.__getitem__
+    # returns self for every index).
+    if isinstance(source, NA) or source is None or isinstance(repeat, NA) or repeat is None:
+        return NA(str)
+    if repeat <= 0:
+        return NA(str)
+    if isinstance(separator, NA) or separator is None:
+        separator = ''
+    return separator.join([source] * int(repeat))
 
 
-def replace(source: str, target: str, replacement: str, occurence=0) -> str:
+def replace(source: str, target: str, replacement: str, occurence=0) -> str | NA[str]:
     """
     Replaces the nth occurence of target string with the replacement string in the source string.
 
@@ -478,8 +489,14 @@ def replace(source: str, target: str, replacement: str, occurence=0) -> str:
     :param target: Target string
     :param replacement: Replacement string
     :param occurence: Occurence to replace
-    :return: New string with the nth occurence of target string replaced with the replacement string.
+    :return: New string with the nth occurence of target string replaced with the replacement
+             string, or na if source or target is na.
     """
+    # na-propagation (Pine): a na source would flow through ``source.split``
+    # (NA.__getattr__ -> na) into ``target.join(na)``, whose sequence-protocol
+    # fallback never terminates — same trap as in ``repeat``/``contains``.
+    if isinstance(source, NA) or source is None or isinstance(target, NA) or target is None:
+        return NA(str)
     if occurence == 0:
         return source.replace(target, replacement, 1)
     a = source.split(target)

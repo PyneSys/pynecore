@@ -255,6 +255,20 @@ class SeriesImpl(Generic[T]):
         """
         return self._size
 
+    def __iter__(self) -> Iterator[T | NA[T]]:
+        """
+        Iterate valid items from newest to oldest (Pine index order).
+
+        Without an explicit __iter__, ``iter(series)`` would fall back to the
+        sequence protocol, and since ``__getitem__`` returns na for every
+        out-of-range index (never IndexError), that iteration never terminates.
+        """
+        for i in range(self._size):
+            pos = self._write_pos - 1 - i
+            if pos < 0:
+                pos += self._capacity
+            yield self._buffer[pos]
+
 
 class ReadOnlySeriesView(Generic[T]):
     """
