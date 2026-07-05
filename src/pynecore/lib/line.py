@@ -31,6 +31,7 @@ def new(x1: int | float, y1: float, x2: int | float, y2: float,
         width: int = 1, force_overlay: bool = False) -> Line: ...
 
 
+# noinspection PyProtectedMember
 def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | None = None,
         x2: int | float | None = None, y2: float | None = None,
         xloc: _xloc.XLoc = _xloc.bar_index, extend: _extend.Extend = _extend.none,
@@ -96,8 +97,11 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
         force_overlay=force_overlay
     )
     _registry[line_obj] = None
-    # Enforce Pine's max_lines_count cap: drop the oldest line (FIFO) past the limit
-    if lib._script is not None and len(_registry) > lib._script.max_lines_count:
+    # Enforce Pine's max_lines_count cap: drop the oldest line (FIFO) past the limit.
+    # A security child never sets ``lib._script``; fall back to TV's hard maximum
+    # (500) there, otherwise the registry grows without bound (the child re-runs
+    # main() for every bar of its own series, accumulating every drawing ever made).
+    if len(_registry) > (lib._script.max_lines_count if lib._script is not None else 500):
         del _registry[next(iter(_registry))]
     return line_obj
 

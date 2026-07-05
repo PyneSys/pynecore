@@ -98,7 +98,8 @@ def _round_price(price: float, tick_decimals: int | None):
 
 # noinspection PyShadowingNames,PyUnusedLocal
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
-                        round_decimals: int | None, last_bar_index: int | None = None):
+                        round_decimals: int | None, last_bar_index: int | None = None,
+                        last_bar_time: int | None = None):
     """
     Set lib properties from OHLCV
     """
@@ -130,7 +131,11 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # instant as a UTC roundtrip), and the epoch milliseconds come directly from
     # the raw timestamp — no astimezone/timestamp C calls per bar.
     lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, tz)
-    lib._time = lib.last_bar_time = int(ohlcv.timestamp * 1000)  # PineScript representation of time
+    lib._time = t = int(ohlcv.timestamp * 1000)  # PineScript representation of time
+    # Historical runs anchor ``last_bar_time`` to the chart's final bar (Pine
+    # semantics — the whole history is known up front); live updates pass
+    # ``None`` so it tracks the current (realtime) bar, which IS the last bar.
+    lib.last_bar_time = t if last_bar_time is None else last_bar_time
 
     # Multi-period scheduled-grid tracker (lib._dg_*): one compare per bar,
     # the roll path runs at most once per trading day
@@ -401,6 +406,7 @@ class ScriptRunner:
 
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
+                 'last_bar_time',
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_data_path', '_round_decimals')
@@ -410,6 +416,7 @@ class ScriptRunner:
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
+                 last_bar_time: int | None = None,
                  inputs: dict[str, Any] | None = None,
                  security_data: dict[str, str | Path] | None = None,
                  magnifier_iter: Iterable[OHLCV] | None = None,
@@ -427,6 +434,9 @@ class ScriptRunner:
         :param update_syminfo_every_run: If it is needed to update the syminfo lib in every run,
                                          needed for parallel script executions
         :param last_bar_index: Last bar index, the index of the last bar of the historical data
+        :param last_bar_time: UNIX time (ms) of the last bar of the historical data. Pine fixes
+                              ``last_bar_time`` on historical bars to the chart's final bar;
+                              ``None`` falls back to tracking the current bar (live semantics)
         :param inputs: Optional dictionary of input values to pass to the script,
                        overrides values from .toml files
         :param security_data: Optional dict mapping ``"[SYMBOL:]TIMEFRAME"`` keys to
@@ -486,6 +496,7 @@ class ScriptRunner:
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
         self.last_bar_index = last_bar_index
+        self.last_bar_time = last_bar_time
         self.bar_index = 0
 
         # Decimals used to snap OHLC to the mintick grid (see ``_round_price``).
@@ -961,7 +972,7 @@ class ScriptRunner:
                 # Update lib properties
                 _set_lib_properties(
                     candle, self.bar_index, self.tz, lib, self._round_decimals,
-                    self.last_bar_index,
+                    self.last_bar_index, self.last_bar_time,
                 )
 
                 # Store first price for buy & hold calculation

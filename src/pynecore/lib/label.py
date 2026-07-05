@@ -52,6 +52,7 @@ def new(x: int | float, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label: ...
 
 
+# noinspection PyProtectedMember
 def new(x: ChartPoint | int | float | None = None, y: int | float | str | None = None,
         text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
         yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
@@ -121,8 +122,11 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
         text_formatting=text_formatting or _text.format_none
     )
     _registry[label_obj] = None
-    # Enforce Pine's max_labels_count cap: drop the oldest label (FIFO) past the limit
-    if lib._script is not None and len(_registry) > lib._script.max_labels_count:
+    # Enforce Pine's max_labels_count cap: drop the oldest label (FIFO) past the limit.
+    # A security child never sets ``lib._script``; fall back to TV's hard maximum
+    # (500) there, otherwise the registry grows without bound (the child re-runs
+    # main() for every bar of its own series, accumulating every drawing ever made).
+    if len(_registry) > (lib._script.max_labels_count if lib._script is not None else 500):
         del _registry[next(iter(_registry))]
     return label_obj
 

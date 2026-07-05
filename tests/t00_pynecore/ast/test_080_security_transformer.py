@@ -425,6 +425,65 @@ def main():
     assert 'import __ltf_unzip__' not in result
 
 
+def __test_ltf_opaque_tuple_expression_lhs_arity__(log):
+    """An opaque (function-call) tuple expression gets its arity from the
+    LHS unpack target.
+
+    Pine enforces LHS-arity == RHS-arity, so ``a, b = security_lower_tf(...,
+    fn())`` must wrap the read in ``__ltf_unzip__(..., 2)`` even though the
+    expression itself reveals no arity.
+    """
+    source = """
+def main():
+    up, dn = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", upDnVolumes())
+    lib.plot(up.size())
+"""
+    result = _transform(source)
+
+    assert '__ltf_unzip__' in result
+    assert 'from pynecore.core.security import __ltf_unzip__' in result
+
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    unpack = next(
+        s for s in func.body
+        if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Tuple)
+    )
+    call = unpack.value
+    assert isinstance(call, ast.Call)
+    assert call.func.id == '__ltf_unzip__'
+    assert isinstance(call.args[1], ast.Constant) and call.args[1].value == 2
+
+
+def __test_sec_ids_unique_across_modules__(log):
+    """The sec id embeds a hash of ``_module_file_path``, so a script and an
+    imported library with their own security calls get distinct contexts.
+
+    Without a distinct per-module hash the ids collide (same counter, same
+    fallback hash) and the runner merges different contexts under one id.
+    """
+    source = """
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+"""
+
+    def _ids(module_path: str | None) -> list[str]:
+        tree = ast.parse(source)
+        if module_path is not None:
+            tree._module_file_path = module_path
+        tree = SecurityTransformer().visit(tree)
+        ast.fix_missing_locations(tree)
+        ctx = _find_contexts(tree)
+        return [k.value for k in ctx.value.keys]
+
+    ids_a = _ids('/some/where/script.py')
+    ids_b = _ids('/some/where/lib_module.py')
+    ids_a2 = _ids('/some/where/script.py')
+
+    assert ids_a != ids_b
+    assert ids_a == ids_a2  # same module path -> stable ids (parent vs child process)
+
+
 def __test_ltf_context_metadata__(log):
     """security_lower_tf context has is_ltf=True and no gaps key"""
     source = """

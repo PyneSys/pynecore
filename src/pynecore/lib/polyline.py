@@ -17,6 +17,7 @@ style_dotted = LineEnum()
 style_solid = LineEnum()
 
 
+# noinspection PyProtectedMember
 def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
         xloc: _xloc.XLoc = _xloc.bar_index, line_color: _color.Color = _color.blue,
         fill_color: _color.Color | None = None, line_style: LineEnum = style_solid,
@@ -56,8 +57,11 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
         force_overlay=force_overlay
     )
     _registry[polyline_obj] = None
-    # Enforce Pine's max_polylines_count cap: drop the oldest polyline (FIFO) past the limit
-    if lib._script is not None and len(_registry) > lib._script.max_polylines_count:
+    # Enforce Pine's max_polylines_count cap: drop the oldest polyline (FIFO) past the limit.
+    # A security child never sets ``lib._script``; fall back to TV's hard maximum
+    # (500) there, otherwise the registry grows without bound (the child re-runs
+    # main() for every bar of its own series, accumulating every drawing ever made).
+    if len(_registry) > (lib._script.max_polylines_count if lib._script is not None else 500):
         del _registry[next(iter(_registry))]
     return polyline_obj
 

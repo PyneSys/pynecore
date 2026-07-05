@@ -470,6 +470,15 @@ class SecurityTransformer(ast.NodeTransformer):
                     arity = self._detect_tuple_arity(stmt, call_node)
                     if arity is not None:
                         call_node._tuple_len = arity  # type: ignore[attr-defined]
+                        # LTF call with an opaque tuple expression (a function
+                        # call, not a literal): the expression's own arity is
+                        # unknowable here, but Pine enforces LHS-arity ==
+                        # RHS-arity, so the unpack target is just as
+                        # authoritative — wire the __ltf_unzip__ wrap from it.
+                        if (getattr(call_node, '_sec_id') in self._ltf_sec_ids
+                                and not hasattr(call_node, '_ltf_arity')):
+                            call_node._ltf_arity = arity  # type: ignore[attr-defined]
+                            self._needs_ltf_unzip = True
 
                 for call_node in call_nodes_here:
                     sid = getattr(call_node, '_sec_id')

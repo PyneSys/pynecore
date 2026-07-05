@@ -658,9 +658,6 @@
     },
     "right_visible_bar_time": {
       "type": "property"
-    },
-    "timedelta": {
-      "type": "variable"
     }
   },
   "lib.color": {
@@ -2342,6 +2339,9 @@
       "type": "property"
     },
     "short": {
+      "type": "variable"
+    },
+    "struct": {
       "type": "variable"
     },
     "syminfo": {

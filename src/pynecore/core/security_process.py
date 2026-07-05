@@ -279,6 +279,18 @@ def security_process_main(
         from pynecore.lib.log import setup_security_file_log
         setup_security_file_log(security_log_path, context_label)
 
+    # Fixed ``last_bar_time`` anchor: Pine fixes it to the security series'
+    # final bar, known up front from the static file. Scan back over the
+    # writer's gap-fill tail (``volume == -1`` records; ``not (volume < 0)``
+    # keeps NaN-volume real bars) for the last real bar — the last
+    # ``real_index_map`` entry when the map already compacted the gaps away.
+    file_last_bar_time_ms = 0
+    for _pos in range(reader.size - 1, -1, -1):
+        _tail_bar = reader.read(_pos)
+        if not (_tail_bar.volume < 0):
+            file_last_bar_time_ms = int(_tail_bar.timestamp * 1000)
+            break
+
     try:
         current_bar = 0
         total_bars = len(real_index_map) if real_index_map is not None else reader.size
@@ -311,6 +323,7 @@ def security_process_main(
                 # Set lib properties for this bar
                 _set_lib_properties(ohlcv, current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = total_bars - 1
+                lib.last_bar_time = file_last_bar_time_ms
 
                 # Set barstate
                 barstate.isfirst = (current_bar == 0)
