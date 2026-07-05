@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from functools import partial
 from pathlib import Path
@@ -637,9 +638,20 @@ def security_process_main(
     # Import the script
     script_module = import_script(Path(script_path))
 
-    # Inject security protocol into module globals
-    inject_protocol(script_module, signal_fn, write_fn, read_fn, wait_fn,
-                    active_security=sec_id)
+    # Inject security protocol into module globals. Imported library modules can
+    # contain request.security() calls too, so their transformed code references
+    # __active_security__ / __sec_read__ / … — every module whose main runs in
+    # this child needs the protocol, exactly like the chart side (see
+    # ScriptRunner's sec_modules). Injecting only the main module leaves a
+    # library main raising NameError on __active_security__.
+    sec_modules: list = [script_module]
+    for _reg_title, _reg_main in script_mod._registered_libraries:
+        _reg_mod = sys.modules.get(getattr(_reg_main, '__module__', ''))
+        if _reg_mod is not None and _reg_mod is not script_module:
+            sec_modules.append(_reg_mod)
+    for _sec_mod in sec_modules:
+        inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
+                        active_security=sec_id)
 
     # Fresh per-process state: drop anything inherited (fork start method) and
     # create the root state vectors of the entry points this process drives —

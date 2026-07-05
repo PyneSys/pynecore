@@ -261,7 +261,8 @@ def main_period() -> str:
 
     :return: The main period
     """
-    assert lib._script is not None
+    if lib._script is None:
+        return str(_syminfo.period)
     return lib._script.timeframe or str(_syminfo.period)
 
 

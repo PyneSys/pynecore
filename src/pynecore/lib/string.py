@@ -427,6 +427,27 @@ def lower(source: str) -> str:
     return source.lower()
 
 
+# Matches a ``\z`` escape that is a real escape (an even number of preceding
+# backslashes) rather than a literal ``\\z``. Captures the leading backslash
+# pairs so they are preserved in the replacement.
+_PINE_END_ANCHOR_RE = re.compile(r'(?<!\\)((?:\\\\)*)\\z')
+
+
+def _pine_regex_to_python(regex: str) -> str:
+    """
+    Adapt a Pine (Java-flavoured) regular expression to Python's ``re`` syntax.
+
+    Pine's ``str.match`` uses Java regex semantics, which accept ``\\z`` (end of
+    input); Python's ``re`` has no ``\\z`` and raises ``PatternError: bad escape``
+    for it. Java's ``\\z`` maps to Python's ``\\Z`` (end of string). Only a real
+    escape is rewritten — a literal ``\\\\z`` is left untouched.
+
+    :param regex: The Pine regular expression.
+    :return: An equivalent Python regular expression.
+    """
+    return _PINE_END_ANCHOR_RE.sub(lambda m: m.group(1) + r'\Z', regex)
+
+
 def match(source: str, regex: str) -> str:
     """
     Returns the new substring of the source string if it matches a regex regular expression, an empty string otherwise.
@@ -435,7 +456,7 @@ def match(source: str, regex: str) -> str:
     :param regex: Regular expression
     :return: New substring of the source string if it matches a regex regular expression, an empty string otherwise.
     """
-    m = re.match(regex, source)
+    m = re.match(_pine_regex_to_python(regex), source)
     if m is None:
         return ""
     return m.group()
