@@ -2247,13 +2247,22 @@ class SimPosition(PositionBase):
             if margin_needed > self.equity:
                 self._remove_order(order)
 
-    def _entry_exceeds_margin_after_fill(self, order: Order, fill_price: float) -> bool:
+    def _entry_exceeds_margin_after_fill(self, order: Order, fill_price: float,
+                                         base_size: float | None = None,
+                                         base_equity: float | None = None) -> bool:
         """
         Check whether an entry's resulting position is affordable at its fill price.
 
         TV rejects the entry before filling when the position that would remain after
         the fill cannot be margined. Once an entry has filled, later open/high/low
         margin breaches are handled by the margin-call path.
+
+        ``base_size``/``base_equity`` override the position size the fill adds to and
+        the equity it is margined against (both default to the current values).
+        Passing the bar-start size AND equity tests whether the order would have been
+        affordable on its own — an over-margin caused only by a prior same-bar fill
+        (which also shifts ``self.equity`` via its open P&L) is handled by the
+        margin-call path, not a hard reject.
         """
         script = lib._script
         margin_percent = script.margin_short if order.sign < 0 else script.margin_long
@@ -2263,11 +2272,13 @@ class SimPosition(PositionBase):
         pv = syminfo.pointvalue
         margin_ratio = margin_percent / 100.0
 
-        new_qty = abs(self.size + order.size)
+        if base_size is None:
+            base_size = self.size
+        new_qty = abs(base_size + order.size)
         if new_qty == 0.0:
             return False
 
-        equity = self.equity
+        equity = self.equity if base_equity is None else base_equity
         margin_needed = new_qty * fill_price * pv * margin_ratio
         # From 1e7 account-currency units of equity upward TV decides the fill
         # with an integer-tick comparison on the PERMISSIVE side: the entry
@@ -2278,12 +2289,22 @@ class SimPosition(PositionBase):
         # BINANCE:BTCUSDT 30m: Hybrid 2025-06-12 22:30 (shortfall 0.0076 USD,
         # 0.76 tick) FILLED + 1-contract MC at the open, while one-shot
         # initial_capital replicas 1.00 and 1.81 ticks short both REJECTED.
-        # Below the 1e7 gate the legacy relative tolerance stands (fitted on
-        # corpus rejects at 1.75e-9..1.06e-7 relative shortfall).
+        # Below the 1e7 gate TV rejects on a strict "margin exceeds equity":
+        # a percent_of_equity entry sized at the signal close fills at the next
+        # open, so a positive shortfall means the fill price rose above the
+        # sizing price and the position no longer fits — TV rejects it (there is
+        # no legitimate positive-shortfall fill; only the fill-price move can
+        # create one). The tolerance is float noise only. Measured on
+        # BINANCE:BTCUSDT 30m: Master Trend 2025-04-17 05:00 rejected at a
+        # +0.00045 USD / 4.7e-10 relative shortfall (a 1-tick fill-open move
+        # eating the mincontract rounding buffer), tighter than the earlier
+        # corpus rejects at 1.75e-9..1.06e-7; the accumulated netprofit float
+        # error over a full run stays ~1e-13 relative, so 1e-11 separates real
+        # overages from noise.
         mintick = syminfo.mintick
         if equity >= 1e7 and mintick and mintick > 0:
             return math.floor(equity / mintick + 0.5) < math.floor(margin_needed / mintick)
-        return margin_needed - equity > abs(equity) * 7.5e-10
+        return margin_needed - equity > abs(equity) * 1e-11
 
     def _cancel_same_bar_reversal_closes(self, entry_order: Order) -> None:
         """
@@ -2542,6 +2563,14 @@ class SimPosition(PositionBase):
         # has filled, so the reject can distinguish the two cases.
         reversal_pre_sign = self.sign
         reversal_close_filled = False
+        # Position size AND equity before any market order fills this bar. A
+        # same-direction entry that only over-margins because a PRIOR same-bar
+        # entry already filled (a pyramid stack) is affordable against this base —
+        # TV fills it and the bar-open margin call trims the aggregate, so it is
+        # not rejected. The first fill also shifts self.equity via its open P&L,
+        # so the standalone affordability test must use the bar-start equity too.
+        bar_start_size = self.size
+        bar_start_equity = self.equity
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -2594,7 +2623,16 @@ class SimPosition(PositionBase):
                     is_reversal_leg = (reversal_close_filled
                                        and reversal_pre_sign != 0.0
                                        and order.sign == -reversal_pre_sign)
-                    if not is_reversal_leg:
+                    # A same-direction entry that fits against the bar-start position
+                    # and only over-margins because a prior same-bar entry already
+                    # filled (a pyramid stack) is likewise filled + margin-call trimmed,
+                    # not hard-rejected: it cleared its placement-time margin check.
+                    stacks_on_same_bar_fill = (
+                        self.size != bar_start_size
+                        and not self._entry_exceeds_margin_after_fill(
+                            order, fill_price, base_size=bar_start_size,
+                            base_equity=bar_start_equity))
+                    if not is_reversal_leg and not stacks_on_same_bar_fill:
                         self._cancel_same_bar_reversal_closes(order)
                         self._remove_order(order)
                         continue
