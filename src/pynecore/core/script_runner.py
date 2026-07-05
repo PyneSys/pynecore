@@ -2,7 +2,7 @@ from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import sys
 from functools import partial
-from math import log10, floor
+from math import log10, floor, frexp
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -96,6 +96,30 @@ def _round_price(price: float, tick_decimals: int | None):
     return round(price, precision)
 
 
+def _round_volume(volume: float) -> float:
+    """
+    Clean float32 ``.ohlcv`` storage artifacts from a volume, mirroring
+    :func:`_round_price` for the volume field.
+
+    Data feeds serve volume as a short decimal (e.g. Binance BTCUSDT lot step
+    ``1e-5``: ``0.56881``), which has no exact binary float32 form — the raw
+    stored value reads back as ``0.568809986...``, and the ~1e-7 per-bar dust
+    accumulates in every volume sum a script computes. Rounding restores the
+    original decimal exactly wherever float32 can vouch for it: keep the
+    decimals whose grid is no finer than the float32 ulp at this magnitude
+    (from ``frexp``: ulp = 2^(exp-24)), but never fewer than 5 (the finest
+    common lot grid at magnitudes where restoration is still exact). Above
+    that magnitude the 5-decimal grid is finer than the float32 spacing, so
+    rounding adds nothing to the storage error; clean feed values (e.g.
+    integer share counts) pass through unchanged.
+    """
+    if volume == 0.0 or volume != volume:  # zero or na
+        return volume
+    ulp_exp = frexp(volume)[1] - 24  # float32 ulp = 2**ulp_exp
+    precision = max(5, floor(-ulp_exp * 0.30102999566398120))  # log10(2)
+    return round(volume, precision)
+
+
 # noinspection PyShadowingNames,PyUnusedLocal
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
                         round_decimals: int | None, last_bar_index: int | None = None,
@@ -114,7 +138,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.low = lo = _round_price(ohlcv.low, round_decimals)
     lib.close = c = _round_price(ohlcv.close, round_decimals)
 
-    lib.volume = ohlcv.volume
+    lib.volume = _round_volume(ohlcv.volume)
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
     # Pine's ``bid``/``ask`` only carry real values on the ``"1T"`` (tick) feed; on every
