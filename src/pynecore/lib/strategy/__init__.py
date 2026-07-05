@@ -158,6 +158,7 @@ class Order:
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
         "reserved_size",  # Exit-leg slice of the entry's original size (frozen at creation)
+        "rest_leg",  # Exit leg with no explicit qty/qty_percent: closes the WHOLE bound entry
         "consumed",  # True once an exit leg fired its slice while its entry is still open
         "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
                      # (backtest only); None for non-stacking sticky-exit / risk / live orders
@@ -232,6 +233,7 @@ class Order:
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
         self.from_entry_na = False
         self.reserved_size = abs(size)
+        self.rest_leg = False
         self.consumed = False
         # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
         # left None everywhere else so the order-book key keeps its bare shape.
@@ -2164,8 +2166,7 @@ class SimPosition(PositionBase):
                 closed_trade.cum_profit_percent = 0.0
             self.entry_equity += closed_trade.profit
 
-    @staticmethod
-    def _resolve_deferred_qty(order: Order, fill_price: float) -> None:
+    def _resolve_deferred_qty(self, order: Order, fill_price: float) -> None:
         """Finalize a default-sized entry's quantity at its actual fill price.
 
         TradingView resolves percent_of_equity / cash default sizing when the
@@ -2177,6 +2178,7 @@ class SimPosition(PositionBase):
         order creation time).
         """
         order.deferred_qty = False
+        old_abs = abs(order.size)
         qty = _default_entry_qty(float(fill_price))
         if qty <= 0.0:
             order.size = 0.0
@@ -2189,6 +2191,30 @@ class SimPosition(PositionBase):
             flip = order.flip_extra * order.sign
             size = _judge_money_entry(size - flip, float(fill_price)) + flip
         order.size = size
+        # A default-sized entry that resolves LARGER than its placement estimate
+        # would strand a sliver: the bracket's no-qty "rest" leg reserved off the
+        # smaller estimate and would under-close the fill. Grow those legs by the
+        # extra so they still cover the whole entry, matching TradingView (which
+        # sizes the entry at fill and closes all of it). A smaller resolution
+        # never strands — the over-reservation is clamped by the FIFO close.
+        extra = abs(order.size) - old_abs
+        if extra > 0.0 and order.order_id is not None:
+            self._grow_rest_exit_legs(order.order_id, extra)
+
+    def _grow_rest_exit_legs(self, entry_id: str, extra: float) -> None:
+        """Extend an entry's full-close bracket legs by ``extra`` contracts.
+
+        Only ``rest_leg`` exits (no explicit qty / qty_percent — the "close the
+        whole entry" leg) grow; an absolute-qty or qty_percent leg keeps the
+        slice it was given. A grown reservation is clamped by the FIFO close to
+        the actually open size, so over-reserving is safe.
+        """
+        for o in self.exit_orders.values():
+            if (o.rest_leg and o.order_id == entry_id
+                    and not o.consumed and o.book_seq is None and o.size != 0.0):
+                grown = _size_round(o.reserved_size + extra)
+                o.reserved_size = grown
+                o.size = math.copysign(grown, o.size)
 
     def _cancel_unaffordable_entries(self) -> None:
         """
@@ -3888,6 +3914,7 @@ def exit(id: str, from_entry: str = "",
         if existing is not None and existing.consumed:
             return
 
+        is_rest_leg = isinstance(qty, NA) and isinstance(qty_percent, NA)
         if not isinstance(qty, NA):
             reserved = abs(qty)
         elif not isinstance(qty_percent, NA):
@@ -4014,6 +4041,7 @@ def exit(id: str, from_entry: str = "",
                 order.trail_triggered = True
                 order.trail_stop = existing.trail_stop
 
+        order.rest_leg = is_rest_leg
         position._add_order(order)
         # A brand-new trailing leg (first issue, or trailing added to a live
         # bracket) and an identical re-issue fold the issue bar's extreme into
