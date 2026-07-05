@@ -2962,6 +2962,9 @@
     "hl2": {
       "type": "variable"
     },
+    "hlc3": {
+      "type": "variable"
+    },
     "hma": {
       "type": "variable"
     },
@@ -3113,7 +3116,7 @@
       "type": "variable"
     },
     "vwap": {
-      "type": "variable"
+      "type": "property"
     },
     "vwma": {
       "type": "variable"
