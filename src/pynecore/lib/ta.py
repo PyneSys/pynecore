@@ -19,7 +19,7 @@ from pynecore.core.overload import overload
 from ..core import safe_convert
 
 # We need to use this kind of import to make transformer work
-from pynecore.lib import (open, high, low, close, volume, hl2, bar_index, array, session,
+from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
                           max_bars_back, math as lib_math)
 
 TFIB = TypeVar('TFIB', float, int, bool)
@@ -2048,16 +2048,23 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
 
 
 # noinspection PyUnusedLocal
-def vwap(source: Series[float], anchor: bool | None = None, stdev_mult: float | None = None) -> \
-        PyneFloat | tuple[PyneFloat, PyneFloat, PyneFloat]:
+@module_property
+def vwap(source: Series[float] | None = None, anchor: bool | None = None,
+         stdev_mult: float | None = None) -> PyneFloat | tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Volume weighted average price.
 
-    :param source: The source series
+    Referenced bare (``ta.vwap``) this is the Pine built-in variable: the VWAP of
+    ``hlc3`` anchored to the session. Passing an explicit ``source`` selects the
+    function form ``ta.vwap(source)``.
+
+    :param source: The source series; defaults to ``hlc3`` for the bare variable form
     :param anchor: The condition that triggers the reset of VWAP calculation
     :param stdev_mult: If specified, the function will calculate the standard deviation bands based on the main VWAP
     :return: The VWAP value or tuple of (vwap, upper_band, lower_band) if stdev_mult is specified
     """
+    if source is None:
+        source = hlc3
     if isinstance(source, NA):
         return NA(float) if stdev_mult is None else (NA(float), NA(float), NA(float))
 
