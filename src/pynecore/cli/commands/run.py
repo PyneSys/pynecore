@@ -855,6 +855,17 @@ def run(
 
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
+        # Pine anchors ``last_bar_time`` on historical bars to the chart's final
+        # bar, known up front from the data window. Scan back over the writer's
+        # gap-fill tail (``volume == -1`` records; ``not (volume < 0)`` keeps
+        # NaN-volume real bars) for the last real bar of the window.
+        last_bar_time = None
+        start_pos, end_pos = reader.get_positions(time_from_ts, time_to_ts)
+        for pos in range(end_pos - 1, start_pos - 1, -1):
+            window_tail_bar = reader.read(pos)
+            if not (window_tail_bar.volume < 0):
+                last_bar_time = int(window_tail_bar.timestamp * 1000)
+                break
         magnifier_iter = None
         if magnifier_mode:
             # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)
@@ -1075,6 +1086,7 @@ def run(
                         chart_provider_name = provider_data.parsed_string.provider
                         chart_provider_instance = provider_data.provider_instance
                     runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
+                                          last_bar_time=last_bar_time,
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                           security_data=security_data,
                                           magnifier_iter=magnifier_iter,

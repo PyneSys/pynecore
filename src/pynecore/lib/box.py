@@ -35,6 +35,7 @@ def new(left: int | float, top: float, right: int | float, bottom: float,
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
 
 
+# noinspection PyProtectedMember
 def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | None = None,
         right: int | float | None = None, bottom: float | None = None,
         border_color: _color.Color = _color.blue, border_width: int = 1,
@@ -121,8 +122,11 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
         force_overlay=force_overlay,
     )
     _registry[box] = None
-    # Enforce Pine's max_boxes_count cap: drop the oldest box (FIFO) past the limit
-    if lib._script is not None and len(_registry) > lib._script.max_boxes_count:
+    # Enforce Pine's max_boxes_count cap: drop the oldest box (FIFO) past the limit.
+    # A security child never sets ``lib._script``; fall back to TV's hard maximum
+    # (500) there, otherwise the registry grows without bound (the child re-runs
+    # main() for every bar of its own series, accumulating every drawing ever made).
+    if len(_registry) > (lib._script.max_boxes_count if lib._script is not None else 500):
         del _registry[next(iter(_registry))]
     return box
 

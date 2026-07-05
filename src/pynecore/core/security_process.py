@@ -974,6 +974,21 @@ def security_process_main(
             )
             _publish(window_values)
 
+    # Fixed ``last_bar_time`` anchor for file-backed (historical) runs: Pine
+    # fixes it to the security series' final bar, known up front from the
+    # static file. Scan back over the writer's gap-fill tail (``volume == -1``
+    # records; ``not (volume < 0)`` keeps NaN-volume real bars) — a no-op when
+    # ``real_index_map`` already compacted the gaps away. Streamer-fed (live)
+    # contexts keep the per-bar value from ``_set_lib_properties``: the
+    # realtime bar IS the last bar there.
+    file_last_bar_time_ms = 0
+    if reader is not None:
+        for _pos in range(_current_total() - 1, -1, -1):
+            _tail_bar = _read_bar(_pos)
+            if _tail_bar is not None and not (_tail_bar.volume < 0):
+                file_last_bar_time_ms = int(_tail_bar.timestamp * 1000)
+                break
+
     try:
         current_bar = 0
 
@@ -1164,6 +1179,8 @@ def security_process_main(
                 total_bars = _current_total()
                 _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals)
                 lib.last_bar_index = total_bars - 1
+                if reader is not None:
+                    lib.last_bar_time = file_last_bar_time_ms
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = (current_bar == total_bars - 1)
                 barstate.isconfirmed = True

@@ -661,9 +661,6 @@
     },
     "right_visible_bar_time": {
       "type": "property"
-    },
-    "timedelta": {
-      "type": "variable"
     }
   },
   "lib.color": {

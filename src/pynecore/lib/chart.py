@@ -1,5 +1,4 @@
 from copy import copy as _copy
-from datetime import timedelta
 
 from ..types.color import Color
 from ..types.chart import ChartPoint
@@ -38,16 +37,19 @@ is_renko = False
 is_standard = True
 
 
-# noinspection PyProtectedMember
+# The visible range is anchored to the chart's LAST bar (a chart scrolled to
+# its right edge — TradingView's default viewport). ``lib.last_bar_time`` is
+# fixed to the final bar on historical runs and tracks the realtime bar live,
+# so ``time == chart.right_visible_bar_time`` is true once per historical run
+# (on the final bar) and on every realtime bar — matching TV.
 @module_property
 def left_visible_bar_time() -> int:
-    return int((lib._datetime - timedelta(seconds=in_seconds(lib.syminfo.period) * _visible_bars)).timestamp() * 1000)
+    return lib.last_bar_time - int(in_seconds(lib.syminfo.period) * 1000) * _visible_bars
 
 
-# noinspection PyProtectedMember
 @module_property
 def right_visible_bar_time() -> int:
-    return int(lib._datetime.timestamp() * 1000)
+    return lib.last_bar_time
 
 
 # noinspection PyShadowingBuiltins

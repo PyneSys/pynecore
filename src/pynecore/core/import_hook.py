@@ -177,6 +177,11 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
 
             # Remove test cases from the output, because they can coorupt the output
             transformed = tree
+            # Source path for the transformers (SecurityTransformer hashes it into
+            # the per-module sec ids, so security contexts stay unique across the
+            # script and its imported library modules). Resolved so the chart
+            # process and its security children derive identical ids.
+            transformed._module_file_path = str(path.resolve())  # type: ignore[attr-defined]
             transformed.body = [node for node in transformed.body
                                 if not (isinstance(node, ast.FunctionDef)
                                         and node.name.startswith('__test_') and node.name.endswith('__'))]
