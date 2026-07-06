@@ -197,7 +197,12 @@ def islastbar_regular() -> bool:
         if se.day == lib._datetime.weekday():
             sedt = lib._datetime.replace(hour=se.time.hour, minute=se.time.minute, second=se.time.second,
                                          microsecond=se.time.microsecond)
-            if lib._datetime < sedt < lib._datetime + timedelta(seconds=tf_sec):
+            # A session end at/before the bar's start denotes the day boundary
+            # (00:00 = 24:00 for 24/7 markets); roll it to the next day so it
+            # lands on the closing bar's end instead of the day's own start.
+            if sedt <= lib._datetime:
+                sedt += timedelta(days=1)
+            if lib._datetime < sedt <= lib._datetime + timedelta(seconds=tf_sec):
                 return True
     return False
 
@@ -217,7 +222,12 @@ def islastbar() -> bool:
         if se.day == lib._datetime.weekday():
             sedt = lib._datetime.replace(hour=se.time.hour, minute=se.time.minute, second=se.time.second,
                                          microsecond=se.time.microsecond)
-            if lib._datetime < sedt < lib._datetime + timedelta(seconds=tf_sec):
+            # A session end at/before the bar's start denotes the day boundary
+            # (00:00 = 24:00 for 24/7 markets); roll it to the next day so it
+            # lands on the closing bar's end instead of the day's own start.
+            if sedt <= lib._datetime:
+                sedt += timedelta(days=1)
+            if lib._datetime < sedt <= lib._datetime + timedelta(seconds=tf_sec):
                 return True
     return False
 
