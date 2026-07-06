@@ -12,6 +12,9 @@ from typing import TypeVar
 
 from pynecore.types import NA, Persistent, PyneFloat, PyneInt, Series
 from pynecore.core.random import PineRandom as _PineRandom
+# lib import (normalized to ``from pynecore import lib``) so the statement-position
+# ``max_bars_back`` call below is anchored and converted to a buffer resize.
+from pynecore.lib import max_bars_back
 
 TFI = TypeVar('TFI', float, int)
 
@@ -58,6 +61,14 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         # most recent non-na value — exactly the "last N non-na" window Pine's
         # sum/sma use.
         src: Series[float] = source
+        # The sliding window drops the value leaving it via ``src[length]`` (``length``
+        # non-na bars back). Grow the na-compacted buffer so that index stays addressable
+        # for lengths beyond the per-series default ``max_bars_back`` (500); otherwise the
+        # removal reads na and poisons ``summ`` permanently, collapsing any ``ta.sma`` /
+        # ``ta.sum`` with length > 500 to na right after warmup. Capacity persists across
+        # bars, so setting it on each non-na bar (from the first on) suffices — the window
+        # never removes before ``length`` non-na values have accumulated.
+        max_bars_back(src, int(length))
 
     if length == 1:  # Shortcut
         # The sliding accumulator is left untouched here; record length == 1 so a
