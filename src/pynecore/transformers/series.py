@@ -175,8 +175,8 @@ class SeriesTransformer(ast.NodeTransformer):
             value=self._buffer_call(self.current_scope, slot, 'add',
                                     [cast(ast.expr, self.visit(node.value))]))
 
-    def visit_Assign(self, node: ast.Assign) -> ast.AST:
-        """Convert assignments to same-scope series variables into ``set()``."""
+    def visit_Assign(self, node: ast.Assign) -> ast.AST | list[ast.stmt]:
+        """Convert assignments to same-scope series variables into buffer writes."""
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             var_name = cast(ast.Name, node.targets[0]).id
             slots = self.series_slots.get(self.current_scope)
@@ -187,6 +187,29 @@ class SeriesTransformer(ast.NodeTransformer):
                                             [cast(ast.expr, self.visit(node.value))]))
             if self.current_scope:
                 self.local_vars.setdefault(self.current_scope, set()).add(var_name)
+
+        # Tuple/list unpacking (``a, b = f()``): a series element is declared bare
+        # (``a: Series`` with no initializer, so no per-bar ``add()``) and the
+        # unpack only binds the local name — its buffer never advances. Emit an
+        # ``add()`` per series element to record history so ``a[1]`` works.
+        target = node.targets[0] if len(node.targets) == 1 else None
+        if (isinstance(target, (ast.Tuple, ast.List))
+                and self.current_scope
+                and all(isinstance(e, ast.Name) for e in target.elts)):
+            slots = self.series_slots.get(self.current_scope, {})
+            node.value = cast(ast.expr, self.visit(node.value))
+            stmts: list[ast.stmt] = [node]
+            for elt in target.elts:
+                name = cast(ast.Name, elt).id
+                if name in slots:
+                    stmts.append(ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=self._buffer_call(self.current_scope, slots[name], 'add',
+                                                [ast.Name(id=name, ctx=ast.Load())])))
+                else:
+                    self.local_vars.setdefault(self.current_scope, set()).add(name)
+            return stmts if len(stmts) > 1 else node
+
         return cast(ast.AST, self.generic_visit(node))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
