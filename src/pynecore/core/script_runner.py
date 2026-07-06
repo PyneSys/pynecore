@@ -1685,6 +1685,13 @@ class ScriptRunner:
                 # Execute libraries + script
                 _run_libs_and_main()
 
+                # Fill strategy.close(_all)(immediately=true) orders enqueued during
+                # the body, at this bar's close — after the body so position series
+                # stayed constant for the rest of the bar. Simulator-only.
+                if (is_strat and position and not self._broker_mode
+                        and not lib._strategy_suppressed):
+                    cast('SimPosition', position).settle_immediate_closes()
+
                 # Pine `process_orders_on_close=true` — extra fill attempt at the bar
                 # close for current-bar orders, before the next bar's open arrives.
                 # No COOF re-run here: Pine disables `calc_on_order_fills` when this
@@ -1973,6 +1980,11 @@ class ScriptRunner:
                             lib._plot_data.clear()
                             _run_libs_and_main()
 
+                            # Fill immediate closes enqueued during the body, at
+                            # this bar's close — after the body (backtest/paper).
+                            if is_strat and position and not lib._strategy_suppressed:
+                                cast('SimPosition', position).settle_immediate_closes()
+
                         if is_strat and position:
                             self._process_deferred_margin_call(position)
 
@@ -2209,6 +2221,11 @@ class ScriptRunner:
 
             # Run the script
             res = run_main()
+
+            # Fill immediate closes enqueued during the body, at this bar's close —
+            # after the body (magnified is backtest-only, position is SimPosition).
+            if position:
+                position.settle_immediate_closes()
 
             # Pine `process_orders_on_close=true` — extra fill attempt at the bar
             # close for current-bar orders. No COOF re-run: Pine disables
