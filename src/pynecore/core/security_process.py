@@ -396,6 +396,7 @@ def security_process_main(
         ohlcv_tuple: bool = False,
         same_timeframe: bool = False,
         chart_type: 'str | None' = None,
+        chart_timeframe: 'str | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -431,6 +432,10 @@ def security_process_main(
         etc. (currently only ``"heikinashi"``). When set, the child applies the
         per-bar chart-type transform to every bar before the script reads it (so
         backtest and live both work) and flips the matching ``chart.*`` builtin.
+    :param chart_timeframe: The chart's (main-series) timeframe. Stored in
+        ``lib._main_timeframe`` so ``timeframe.main_period`` in this child reports
+        the chart TF instead of the context's own period (the child has no
+        ``lib._script`` to carry it).
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
@@ -607,6 +612,11 @@ def security_process_main(
 
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo)
+
+    # ``timeframe.main_period`` must report the chart TF, not this context's own
+    # period — the child has no ``lib._script`` to carry it, so propagate it here.
+    if chart_timeframe is not None:
+        lib._main_timeframe = chart_timeframe
 
     # Chart-type context (``ticker.heikinashi()``): this child evaluates the
     # script on Heikin Ashi candles, so the chart-type builtins must reflect the

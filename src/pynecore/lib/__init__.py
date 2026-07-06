@@ -107,6 +107,11 @@ _datetime: datetime = datetime.fromtimestamp(0, UTC)
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
 _script: script = None  # type: ignore[assignment]
 
+# Chart (main-series) timeframe, propagated into request.security children so
+# ``timeframe.main_period`` there reports the chart TF instead of the context's
+# own period. ``None`` on the chart side, where ``_script`` carries it directly.
+_main_timeframe: str | None = None
+
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
 

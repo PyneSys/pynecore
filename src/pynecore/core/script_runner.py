@@ -1257,6 +1257,7 @@ class ScriptRunner:
                             _ohlcv_tuple,
                             sec_state.same_timeframe,
                             sec_state.chart_type,
+                            chart_tf,
                         ),
                         daemon=True,
                     )

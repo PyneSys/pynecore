@@ -261,6 +261,12 @@ def main_period() -> str:
 
     :return: The main period
     """
+    # Inside a request.security child ``_script`` is None, but the main period
+    # must still report the chart TF (propagated via ``_main_timeframe``), not the
+    # context's own period, so ``timeframe.change(timeframe.main_period)`` rolls
+    # over on chart bars rather than on every intrabar.
+    if lib._main_timeframe is not None:
+        return lib._main_timeframe
     if lib._script is None:
         return str(_syminfo.period)
     return lib._script.timeframe or str(_syminfo.period)
