@@ -24,6 +24,10 @@ class Footprint:
         """Volume delta (buy - sell) for the bar."""
         raise NotImplementedError("Footprint.delta() is not yet implemented in PyneCore")
 
+    def total_volume(self) -> float:
+        """Total volume (buy + sell) for the bar."""
+        raise NotImplementedError("Footprint.total_volume() is not yet implemented in PyneCore")
+
     def vah(self) -> VolumeRow:
         """Value Area High row."""
         raise NotImplementedError("Footprint.vah() is not yet implemented in PyneCore")
