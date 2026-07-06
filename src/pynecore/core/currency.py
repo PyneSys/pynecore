@@ -247,11 +247,16 @@ class CurrencyRateProvider:
 
     @staticmethod
     def _resolve_ohlcv_path(path: str | Path) -> str | None:
-        """Resolve OHLCV file path, adding .ohlcv extension if needed."""
+        """Resolve OHLCV file path, adding the ``.ohlcv`` extension if needed.
+
+        A dot inside the name belongs to the symbol (e.g. a perpetual
+        ``BTCUSDT.P``), so append by name rather than ``with_suffix`` which
+        would clobber the symbol's own dotted tail.
+        """
         p = Path(path)
-        if p.suffix == '.ohlcv':
+        if p.name.endswith('.ohlcv'):
             return str(p) if p.exists() else None
-        ohlcv_p = p.with_suffix('.ohlcv')
+        ohlcv_p = p.with_name(p.name + '.ohlcv')
         if ohlcv_p.exists():
             return str(ohlcv_p)
         return str(p) if p.exists() else None

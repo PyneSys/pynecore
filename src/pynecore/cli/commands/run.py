@@ -1042,9 +1042,14 @@ def run(
                         sec_path = Path(value)
                         if len(sec_path.parts) == 1:
                             sec_path = app_state.data_dir / sec_path
-                        if sec_path.suffix:
-                            sec_path = sec_path.with_suffix('')
-                        ohlcv_check = sec_path.with_suffix('.ohlcv')
+                        # ``value`` may carry the ``.ohlcv`` data extension or be a
+                        # bare stem. Only ``.ohlcv`` is meaningful — a dot inside the
+                        # name belongs to the symbol (e.g. a perpetual ``BTCUSDT.P``),
+                        # so append/strip by name instead of ``with_suffix`` which
+                        # would clobber the symbol's own dotted tail.
+                        if sec_path.name.endswith('.ohlcv'):
+                            sec_path = sec_path.with_name(sec_path.name[:-len('.ohlcv')])
+                        ohlcv_check = sec_path.with_name(sec_path.name + '.ohlcv')
                         if not ohlcv_check.exists():
                             secho(
                                 f"Security data not found: {ohlcv_check}",
