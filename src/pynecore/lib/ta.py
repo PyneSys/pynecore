@@ -283,6 +283,9 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB | NA[TFIB]:
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
+    # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
+    # per-series default max_bars_back (500); otherwise it reads na and the change is na.
+    max_bars_back(source, length)
 
     # We need to round to prevent problems caused by floating point precision
     if isinstance(source, (float, int)):
@@ -335,6 +338,10 @@ def cog(source: Series[float], length: int) -> PyneFloat:
         # Reading the parameter directly would step back ``length`` *bars* and land
         # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
         src: Series[float] = source
+        # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
+        # beyond the per-series default max_bars_back (500); otherwise the window-drop
+        # read returns na and poisons ``summ`` permanently.
+        max_bars_back(src, int(length))
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
@@ -373,6 +380,11 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     """
     assert length > 0, "Length must be greater than 0"
     length = int(length)
+    # Grow both buffers so ``source1/source2[length]`` stay addressable for lengths beyond
+    # the per-series default max_bars_back (500); otherwise the window-drop reads na and
+    # poisons the running sums permanently.
+    max_bars_back(source1, length)
+    max_bars_back(source2, length)
 
     sum_x: Persistent[float] = 0.0
     sum_y: Persistent[float] = 0.0
@@ -1608,6 +1620,9 @@ def roc(source: Series[float], length: int) -> PyneFloat:
     if isinstance(source, NA):
         return NA(float)
     length = int(length)
+    # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
+    # per-series default max_bars_back (500); otherwise it reads na and the roc is na.
+    max_bars_back(source, length)
 
     prev_val = source[length]
     chg = change(source, length)
@@ -1958,6 +1973,11 @@ def variance(source: Series[float],
     length = int(length)
     if length == 1:
         return 0.0
+    # Grow the buffer so the decremental read ``source[length]`` stays addressable for
+    # lengths beyond the per-series default max_bars_back (500); otherwise it reads na and
+    # poisons the Welford accumulators permanently (feeds stdev/bb/bbw/kc). Runs before the
+    # na guard so the buffer keeps growing on na bars too, ahead of any wrap.
+    max_bars_back(source, length)
     if isinstance(source, NA):
         return NA(float)
 
@@ -2152,6 +2172,10 @@ def wma(source: Series[float], length: int) -> PyneFloat:
         # Reading the parameter directly would step back ``length`` *bars* and land
         # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
         src: Series[float] = source
+        # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
+        # beyond the per-series default max_bars_back (500); otherwise the window-drop
+        # read returns na and poisons ``summ`` permanently.
+        max_bars_back(src, int(length))
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
