@@ -1474,12 +1474,18 @@ class ScriptRunner:
 
     @staticmethod
     def _ensure_ohlcv_ext(path: str | Path) -> str:
-        """Add .ohlcv extension if not present."""
+        """Add the ``.ohlcv`` extension if not already present.
+
+        A dot inside the name belongs to the symbol (e.g. a perpetual
+        ``BTCUSDT.P``), so append by name rather than ``with_suffix`` which
+        would clobber the symbol's own dotted tail.
+        """
         p = Path(path)
-        if p.suffix != '.ohlcv':
-            ohlcv_path = p.with_suffix('.ohlcv')
-            if ohlcv_path.exists():
-                return str(ohlcv_path)
+        if p.name.endswith('.ohlcv'):
+            return str(path)
+        ohlcv_path = p.with_name(p.name + '.ohlcv')
+        if ohlcv_path.exists():
+            return str(ohlcv_path)
         return str(path)
 
     def run(self, on_progress: Callable[[datetime], None] | None = None):
