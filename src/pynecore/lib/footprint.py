@@ -36,6 +36,17 @@ def delta(id: Footprint) -> float:
 
 
 # noinspection PyShadowingBuiltins
+def total_volume(id: Footprint) -> float:
+    """
+    Total volume (buy + sell) for the bar.
+
+    :param id: Footprint object
+    :return: Total volume
+    """
+    return id.total_volume()
+
+
+# noinspection PyShadowingBuiltins
 def vah(id: Footprint) -> VolumeRow:
     """
     Value Area High row.

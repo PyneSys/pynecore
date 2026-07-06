@@ -77,7 +77,7 @@ implementation status of all major Pine Script features.
 | `request.economic()`          | plugin | Macro data — external data source              |
 | `request.quandl()`            | plugin | Nasdaq Data Link — paid external API           |
 | `request.seed()`              | plugin | GitHub repository data                         |
-| `request.footprint()`         | plugin | Requires tick-level data                       |
+| `request.footprint()`         | stub   | Returns `na` — no tick order-flow data source  |
 
 ### request.security() Details
 

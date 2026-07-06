@@ -4,6 +4,7 @@ from math import nan
 from typing import TYPE_CHECKING
 
 from ..types.footprint import Footprint
+from ..types.na import NA
 
 if TYPE_CHECKING:
     from ..core.currency import CurrencyRateProvider
@@ -181,16 +182,24 @@ def seed(*args, **kwargs):
 
 
 # noinspection PyUnusedLocal
-def footprint(ticks_per_row: int, va_percent: int) -> Footprint:
+def footprint(ticks_per_row: int, va_percent: int = 70,
+              imbalance_percent: int = 300) -> Footprint | NA[Footprint]:
     """
     Request volume footprint data for the current bar.
 
+    Footprint order flow (per-tick buy/sell aggressor split, POC, VAH, VAL) is
+    sourced by TradingView from tick-level bid/ask data that PyneCore does not
+    have — only OHLCV bars are available. Rather than aborting the whole script,
+    the footprint is reported as ``na`` so that scripts guarding their footprint
+    reads with ``na()`` (the required Pine pattern, since TV itself returns na
+    when footprint data is unavailable) fall back to their price-action paths.
+
     :param ticks_per_row: Number of ticks per footprint row
     :param va_percent: Value Area percentage
-    :return: Footprint object with volume data
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :param imbalance_percent: Buy/sell imbalance threshold percentage
+    :return: ``na`` footprint (order-flow data unavailable in PyneCore)
     """
-    raise NotImplementedError("request.footprint() is not yet implemented in PyneCore")
+    return NA(Footprint)
 
 
 def _reset_request_state() -> None:

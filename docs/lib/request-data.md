@@ -179,6 +179,23 @@ new_earnings = request.earnings(syminfo.tickerid, earnings.actual)
 Full corporate event support is planned using the existing `.extra.csv` sidecar mechanism, where
 event data is provided as named columns alongside OHLCV bars.
 
+### request.footprint()
+
+`request.footprint()` returns TradingView's per-bar volume footprint (buy/sell aggressor
+split, delta, and the POC / VAH / VAL price rows). TradingView derives it from tick-level
+bid/ask order-flow data; PyneCore only has OHLCV bars, so that data source is unavailable.
+
+**Current status:** `request.footprint()` returns `na` rather than raising. Well-written
+footprint scripts already guard every read with `na()` (TradingView itself returns `na`
+when footprint data is unavailable), so they keep running and fall back to their
+price-action paths instead of aborting the whole script.
+
+```python
+# The required Pine pattern — guard the footprint, degrade gracefully:
+fp = request.footprint(50, 70)
+buy = footprint.buy_volume(fp) if not na(fp) else 0.0  # na fp -> price-action fallback
+```
+
 ## Other request.* Functions
 
 The following functions are not implemented and are intended as plugin extension points:
@@ -189,4 +206,3 @@ The following functions are not implemented and are intended as plugin extension
 | `request.economic()`  | Macro data            | Plugin extension    |
 | `request.quandl()`    | Nasdaq Data Link      | Plugin extension    |
 | `request.seed()`      | GitHub repositories   | Plugin extension    |
-| `request.footprint()` | Tick-level volume     | Plugin extension    |

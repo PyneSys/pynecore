@@ -1067,6 +1067,9 @@
     "sell_volume": {
       "type": "variable"
     },
+    "total_volume": {
+      "type": "variable"
+    },
     "vah": {
       "type": "variable"
     },
@@ -1979,6 +1982,9 @@
   },
   "lib.request": {
     "Footprint": {
+      "type": "variable"
+    },
+    "NA": {
       "type": "variable"
     },
     "TYPE_CHECKING": {
