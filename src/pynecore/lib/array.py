@@ -399,17 +399,26 @@ def lastindexof(id: list[T], value: T) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def max(id: list[Number]) -> Number | NA[float]:
+def max(id: list[Number], nth: int = 0) -> Number | NA[float]:
     """
-    Returns the maximum value in the array.
+    Returns the maximum value in the array, or the nth largest value.
+
+    na elements are ignored. ``nth`` is 0-based: 0 is the maximum, 1 the second
+    largest, and so on. Returns na if the array holds no non-na values or ``nth``
+    is out of range.
 
     :param id: Input array
-    :return: Maximum value in the array, or na if the array is empty
+    :param nth: Rank of the maximum to return (0 = maximum)
+    :return: The nth largest value in the array, or na
     """
     a = _non_na(id)
     if not a:
         return NA(float)
-    return builtins.max(a)
+    if nth == 0:
+        return builtins.max(a)
+    if nth < 0 or nth >= len(a):
+        return NA(float)
+    return sorted(a, reverse=True)[nth]
 
 
 # noinspection PyShadowingBuiltins
@@ -427,17 +436,26 @@ def median(id: list[Number]) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins
-def min(id: list[Number]) -> float | NA[float]:
+def min(id: list[Number], nth: int = 0) -> float | NA[float]:
     """
-    Returns the minimum value in the array.
+    Returns the minimum value in the array, or the nth smallest value.
+
+    na elements are ignored. ``nth`` is 0-based: 0 is the minimum, 1 the second
+    smallest, and so on. Returns na if the array holds no non-na values or ``nth``
+    is out of range.
 
     :param id: Input array
-    :return: Minimum value in the array, or na if the array is empty
+    :param nth: Rank of the minimum to return (0 = minimum)
+    :return: The nth smallest value in the array, or na
     """
     a = _non_na(id)
     if not a:
         return NA(float)
-    return builtins.min(a)
+    if nth == 0:
+        return builtins.min(a)
+    if nth < 0 or nth >= len(a):
+        return NA(float)
+    return sorted(a)[nth]
 
 
 # noinspection PyShadowingBuiltins
