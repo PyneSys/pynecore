@@ -701,7 +701,7 @@ class SimPosition(PositionBase):
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
         '_deferred_margin_call', '_fill_counter', '_partial_close_bar',
-        '_entry_open_ledger'
+        '_entry_open_ledger', '_deferred_immediate_closes'
     )
 
     def __init__(self):
@@ -788,6 +788,10 @@ class SimPosition(PositionBase):
         # close with an entry id); lets a same-bar close_all clamp to flat instead
         # of overshooting when the partial already shed part of the position.
         self._partial_close_bar: int = -1
+        # FIFO buffer of strategy.close/close_all(immediately=True) orders enqueued
+        # during the body; drained by settle_immediate_closes() right after the body
+        # so position series stay constant for the rest of the bar (TV semantics).
+        self._deferred_immediate_closes: list[Order] = []
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
@@ -2401,6 +2405,9 @@ class SimPosition(PositionBase):
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
+        # Undo any immediate close a COOF trial body run enqueued (position-side
+        # analog of the restored ``var`` state); no-op in the common case.
+        self._discard_deferred_immediate_closes()
 
         # Idle fast path: with no open position and no pending orders every phase
         # below is a provable no-op (each loop iterates an empty container, every
@@ -3248,6 +3255,57 @@ class SimPosition(PositionBase):
             # same ordering as `_finalize_bar_pnl()`.
             self.entry_equity += closed_trade.profit
 
+    def settle_immediate_closes(self):
+        """
+        Fill the strategy.close/close_all(immediately=True) orders enqueued during
+        this bar's body, at the bar close.
+
+        Runs right AFTER the body (before the bar's output/equity bookkeeping), so
+        the whole position stays coherent — fully open — for the rest of the bar and
+        every ``strategy.*`` series (``position_size``, ``position_avg_price``,
+        ``netprofit``, ``equity``, ``opentrades`` …) reads its pre-close value.
+        This matches TradingView and PyneCore's own broker mode, where an immediate
+        close does not take effect until after the script.
+
+        Per-order this mirrors the old inline path exactly (snapshot →
+        ``fill_order`` → ``_settle_close_pass_trades``); only the fill timing moved
+        from mid-body to just-after-body. The fill price is still ``self.c`` (the
+        bar close), which is unchanged between the body and this step, so exit
+        price / P&L / cumulative stats are bit-identical.
+        """
+        orders = self._deferred_immediate_closes
+        if not orders:
+            return
+        self._deferred_immediate_closes = []  # drain-once / re-entrancy guard
+        for order in orders:
+            if self.size == 0.0:
+                # An earlier buffered close already flattened. TV treats a close
+                # against a zero position as a no-op; drop the order so it cannot
+                # zombie-fill on a later bar — ``_fill_order`` early-returns on a
+                # zero-size close WITHOUT removing it from the order books.
+                self._remove_order(order)
+                continue
+            closed_before = len(self.new_closed_trades)
+            self.fill_order(order, self.c, self.h, self.l)
+            self._settle_close_pass_trades(closed_before)
+
+    def _discard_deferred_immediate_closes(self):
+        """
+        Cancel immediate closes left buffered by a throwaway COOF trial body run.
+
+        Called at the top of ``process_orders``/``process_orders_magnified``. In
+        steady state the buffer is already empty (``settle_immediate_closes``
+        drained it after the previous body); this only fires between
+        ``calc_on_order_fills`` re-executions, where a trial run's enqueued close
+        must be undone — the position-side analog of the restored ``var`` state —
+        before the next order-processing pass could wrongly fill it at the bar open.
+        """
+        if not self._deferred_immediate_closes:
+            return
+        for order in self._deferred_immediate_closes:
+            self._remove_order(order)
+        self._deferred_immediate_closes = []
+
     def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV):
         """
         Process orders using bar magnifier — check fills against each sub-bar's OHLC.
@@ -3271,6 +3329,9 @@ class SimPosition(PositionBase):
         self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
+        # Undo any immediate close a COOF trial body run enqueued (position-side
+        # analog of the restored ``var`` state); no-op in the common case.
+        self._discard_deferred_immediate_closes()
 
         # Phase 1: at-open processing (gap detection, market orders, margin at open)
         ohlc = self.h - self.o < self.o - self.l
@@ -3446,13 +3507,10 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # Same-tick fill is a backtest concept; in broker mode the order is already
     # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
     if immediately and isinstance(position, SimPosition):
-        closed_before = len(position.new_closed_trades)
-        position.fill_order(order, position.c, position.h, position.l)
-        # The bar's regular settle already ran in process_orders(); a same-tick
-        # close lands in new_closed_trades after it, and the next bar's clear()
-        # would drop it with cum_profit never booked — settle it now, the same
-        # mirror the close pass uses
-        position._settle_close_pass_trades(closed_before)
+        # Deferred immediate settle: fill after the body (settle_immediate_closes)
+        # so position series stay at their pre-close values for the rest of the
+        # bar — matching TradingView and PyneCore's broker mode.
+        position._deferred_immediate_closes.append(order)
 
 
 # noinspection PyProtectedMember,PyShadowingNames
@@ -3486,13 +3544,10 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     # Same-tick fill is a backtest concept; in broker mode the order is already
     # enqueued by ``_add_order`` and the sync engine forwards it to the exchange.
     if immediately and isinstance(position, SimPosition):
-        closed_before = len(position.new_closed_trades)
-        position.fill_order(order, position.c, position.h, position.l)
-        # The bar's regular settle already ran in process_orders(); a same-tick
-        # close lands in new_closed_trades after it, and the next bar's clear()
-        # would drop it with cum_profit never booked — settle it now, the same
-        # mirror the close pass uses
-        position._settle_close_pass_trades(closed_before)
+        # Deferred immediate settle: fill after the body (settle_immediate_closes)
+        # so position series stay at their pre-close values for the rest of the
+        # bar — matching TradingView and PyneCore's broker mode.
+        position._deferred_immediate_closes.append(order)
 
 
 # noinspection PyProtectedMember
