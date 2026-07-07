@@ -600,13 +600,13 @@ def tonumber(string: str) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def tostring(value: int | float | str | bool | NA, fmt: str | Format = '#.##########') -> str:
+def tostring(value: int | float | str | bool | NA, format: str | Format = '#.##########') -> str:
     """
     Convert value to string with optional formatting.
     Replicates Pine's str.tostring function.
 
     :param value: Value to convert (number, string, boolean or na)
-    :param fmt: Format string like '#.##' or Format instance
+    :param format: Format string like '#.##' or Format instance
     :return: String representation
     """
     if isinstance(value, NA) or value is None:
@@ -616,9 +616,9 @@ def tostring(value: int | float | str | bool | NA, fmt: str | Format = '#.######
     if isinstance(value, str):
         return value
     if isinstance(value, (int, float)):
-        if isinstance(fmt, Format):
-            return _format_number(safe_convert.safe_float(value), fmt_type=fmt)
-        return _format_number(safe_convert.safe_float(value), precision=fmt)
+        if isinstance(format, Format):
+            return _format_number(safe_convert.safe_float(value), fmt_type=format)
+        return _format_number(safe_convert.safe_float(value), precision=format)
     return str(value)  # noqa: it may be reachable if it is used with unsupported types
 
 
