@@ -191,6 +191,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
             from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+            from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
             from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
             from pynecore.transformers.security import SecurityTransformer
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
@@ -217,6 +218,10 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # so the lib.<ns>.<name> chains it emits get their imports added there
             transformed = BuiltinShadowTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
+            # Per-call evaluation of lib.*-referencing parameter defaults; must
+            # precede the series/isolation passes so the moved expressions get
+            # their series slots and call-site anchors like any body statement
+            transformed = DynamicDefaultTransformer().visit(transformed)
             # Lazy-context history hoist must run before call-site anchoring:
             # the hoisted statements are the anchorable call sites
             transformed = InlineSeriesHoistTransformer().visit(transformed)

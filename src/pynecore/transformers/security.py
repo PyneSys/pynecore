@@ -50,8 +50,9 @@ class SecurityTransformer(ast.NodeTransformer):
            __sec_wait__("sec_id")
 
     Also creates module-level __security_contexts__ dict with metadata for each context.
-    Non-constant symbol/timeframe values (e.g., function parameters) are stored as None
-    in __security_contexts__ and resolved at runtime via __sec_signal__ arguments.
+    Non-constant symbol/timeframe/lookahead values (e.g., function parameters or
+    input-derived expressions) are stored as None in __security_contexts__ and
+    resolved at runtime via __sec_signal__ arguments.
 
     Must be applied after ImportNormalizerTransformer, before PersistentSeriesTransformer.
     """
@@ -59,7 +60,9 @@ class SecurityTransformer(ast.NodeTransformer):
     def __init__(self):
         self._counter = 0
         self._all_contexts: dict[str, dict[str, ast.expr]] = {}
-        self._signal_args: dict[str, tuple[ast.expr | None, ast.expr | None]] = {}
+        self._signal_args: dict[
+            str, tuple[ast.expr | None, ast.expr | None, ast.expr | None]
+        ] = {}
         self._needs_barmerge = False
         self._needs_ltf_unzip = False
         self._ltf_sec_ids: set[str] = set()
@@ -280,7 +283,9 @@ class SecurityTransformer(ast.NodeTransformer):
         body = []
         for s in sec_ids:
             args: list[ast.expr] = [ast.Constant(value=s)]
-            sym_expr, tf_expr = self._signal_args[s]
+            # Lookahead is omitted here: a runtime-dependent lookahead forces the
+            # sid onto the inline-signal path (see _process_func classification).
+            sym_expr, tf_expr, _ = self._signal_args[s]
             args.append(copy.deepcopy(sym_expr) if sym_expr is not None
                         else ast.Constant(value=None))
             args.append(copy.deepcopy(tf_expr) if tf_expr is not None
@@ -293,13 +298,16 @@ class SecurityTransformer(ast.NodeTransformer):
         )
 
     def _inline_signal(self, sec_id: str) -> ast.If:
-        """Build a single inline signal for runtime-dependent symbol/timeframe."""
+        """Build a single inline signal for runtime-dependent
+        symbol/timeframe/lookahead."""
         args: list[ast.expr] = [ast.Constant(value=sec_id)]
-        sym_expr, tf_expr = self._signal_args[sec_id]
+        sym_expr, tf_expr, la_expr = self._signal_args[sec_id]
         args.append(copy.deepcopy(sym_expr) if sym_expr is not None
                     else ast.Constant(value=None))
         args.append(copy.deepcopy(tf_expr) if tf_expr is not None
                     else ast.Constant(value=None))
+        if la_expr is not None:
+            args.append(copy.deepcopy(la_expr))
         return ast.If(
             test=self._is_none_check(),
             body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
@@ -575,10 +583,19 @@ class SecurityTransformer(ast.NodeTransformer):
 
             call_exprs[sec_id] = expression if expression is not None else self._lib_na()
 
+            # Input-derived (Pine "simple") lookahead — e.g. the standard TV
+            # non-repaint HTF pattern ``repaint ? lookahead_off : lookahead_on``
+            # — cannot be evaluated at module level, so it is resolved at
+            # runtime through __sec_signal__ like a deferred symbol/timeframe.
+            lookahead_rt: ast.expr | None = None
+            if lookahead is not None and not self._is_module_level_expr(lookahead):
+                lookahead_rt = copy.deepcopy(lookahead)
+
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
             self._signal_args[sec_id] = (
                 copy.deepcopy(symbol) if symbol is not None else None,
                 copy.deepcopy(timeframe) if timeframe is not None else None,
+                lookahead_rt,
             )
 
             # For __security_contexts__ at module level: only use values that are
@@ -603,21 +620,13 @@ class SecurityTransformer(ast.NodeTransformer):
                 )
                 ctx['gaps'] = gaps_expr
                 if lookahead is not None:
-                    # ``lookahead`` must be a Pine constant (``barmerge.lookahead_*``)
-                    # — the value is consumed at module load to wire the live HTF
-                    # transport, well before ``main()`` runs. A local/runtime
-                    # expression here would NameError at import time, so reject
-                    # it with a clear message.
-                    if not self._is_module_level_expr(lookahead):
-                        raise SyntaxError(
-                            "'lookahead' argument of request.security() must be a "
-                            "constant (barmerge.lookahead_off, barmerge.lookahead_on, "
-                            "or barmerge.lookahead_last_closed); runtime expressions "
-                            "are not supported.",
-                            (self._module_file, getattr(lookahead, 'lineno', 0),
-                             getattr(lookahead, 'col_offset', 0) + 1, None)
-                        )
-                    ctx['lookahead'] = copy.deepcopy(lookahead)
+                    # A module-level lookahead (``barmerge.lookahead_*``) is
+                    # consumed at module load to wire the HTF transport. An
+                    # input-derived expression would NameError at import time,
+                    # so store None as a placeholder — the runtime value passed
+                    # to ``__sec_signal__`` resolves the mode on the first bar.
+                    ctx['lookahead'] = (copy.deepcopy(lookahead) if lookahead_rt is None
+                                        else ast.Constant(value=None))
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
@@ -657,14 +666,16 @@ class SecurityTransformer(ast.NodeTransformer):
         # Separate module-level (constant) signals from runtime-dependent ones.
         # Module-level signals can be emitted at function start for maximum
         # parallelism. Runtime signals must be emitted inline, after the
-        # variables they reference have been assigned.
+        # variables they reference have been assigned. A runtime-dependent
+        # lookahead forces the inline path too — its expression references
+        # locals that do not exist yet at function start.
         top_sec_ids = []
         runtime_sec_ids: set[str] = set()
         for sid in sec_ids:
-            sym_expr, tf_expr = self._signal_args[sid]
+            sym_expr, tf_expr, la_expr = self._signal_args[sid]
             sym_ok = sym_expr is None or self._is_module_level_expr(sym_expr)
             tf_ok = tf_expr is None or self._is_module_level_expr(tf_expr)
-            if sym_ok and tf_ok:
+            if sym_ok and tf_ok and la_expr is None:
                 top_sec_ids.append(sid)
             else:
                 runtime_sec_ids.add(sid)

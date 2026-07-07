@@ -836,13 +836,15 @@ def main():
     assert la_val.attr == 'lookahead_on'
 
 
-def __test_lookahead_runtime_expr_rejected__(log):
-    """Runtime `lookahead` expressions are rejected at transform time.
+def __test_lookahead_runtime_expr_deferred__(log):
+    """Runtime `lookahead` expressions are deferred to __sec_signal__.
 
-    Pine requires ``lookahead`` to be a ``barmerge.lookahead_*`` constant.
-    A local variable or IfExp would be inlined into the module-level
-    ``__security_contexts__`` literal and NameError at import time, so the
-    transformer raises a clear SyntaxError instead.
+    An input-derived (Pine "simple") lookahead — the standard TV non-repaint
+    HTF pattern — cannot be inlined into the module-level
+    ``__security_contexts__`` literal (it would NameError at import time).
+    The transformer stores None there instead and passes the actual
+    expression as the 4th ``__sec_signal__`` argument, emitted INLINE after
+    the local it references has been assigned (not at function start).
     """
     source = """
 def main():
@@ -852,5 +854,42 @@ def main():
         lookahead=mode,
     )
 """
-    with pytest.raises(SyntaxError, match="must be a constant"):
-        _transform(source)
+    tree = _transform_tree(source)
+
+    # Module-level ctx stores None as the lookahead placeholder
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    la_idx = ctx_keys.index('lookahead')
+    la_val = ctx_dict.values[la_idx]
+    assert isinstance(la_val, ast.Constant) and la_val.value is None
+
+    # The signal is inline (after the `mode` assignment), not at function
+    # start, and carries the runtime expression as its 4th argument
+    func = _find_func(tree)
+    assert isinstance(func.body[0], ast.Assign)  # mode = ...
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert len(signal_call.args) == 4
+    assert isinstance(signal_call.args[3], ast.Name)
+    assert signal_call.args[3].id == 'mode'
+
+
+def __test_lookahead_constant_signal_has_no_lookahead_arg__(log):
+    """A constant lookahead stays in ctx; __sec_signal__ keeps 3 args."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.syminfo.tickerid, "1D", lib.close,
+        lookahead=lib.barmerge.lookahead_on,
+    )
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_if = func.body[0]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert len(signal_call.args) == 3

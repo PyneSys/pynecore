@@ -243,16 +243,24 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
              if not isinstance(v1, NA) and not isinstance(v2, NA)]
     if not pairs:
         return NA(float)
-    length = len(pairs)
-    mean1 = builtins.sum(p[0] for p in pairs) / length
-    mean2 = builtins.sum(p[1] for p in pairs) / length
-    summ = 0.0
+    # Online (Welford) co-moment — matches TradingView bit-for-bit for both
+    # the biased and unbiased result, where the classic two-pass
+    # ``sum((x-mx)*(y-my)) / divisor`` lands a couple of ulps off on the
+    # unbiased path (TV-verified in test_003_array_functions_float).
+    length = 0
+    mean1 = 0.0
+    mean2 = 0.0
+    comoment = 0.0
     for v1, v2 in pairs:
-        summ += (v1 - mean1) * (v2 - mean2)
+        length += 1
+        d1 = v1 - mean1
+        mean1 += d1 / length
+        mean2 += (v2 - mean2) / length
+        comoment += d1 * (v2 - mean2)
     divisor = (length - 1) if not biased else length
     if divisor == 0:
         return 0.0
-    return summ / divisor
+    return comoment / divisor
 
 
 # noinspection PyShadowingBuiltins

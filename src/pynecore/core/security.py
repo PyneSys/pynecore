@@ -93,6 +93,16 @@ class Lookahead(Enum):
     ON = auto()
 
 
+def _lookahead_mode(value) -> Lookahead:
+    """Map a ``barmerge.lookahead_*`` singleton (or None) to a :class:`Lookahead`."""
+    from pynecore.lib import barmerge
+    if value is barmerge.lookahead_on:
+        return Lookahead.ON
+    if value is barmerge.lookahead_last_closed:
+        return Lookahead.LAST_CLOSED
+    return Lookahead.OFF
+
+
 # Liveness poll interval for security-process waits without a death watcher
 # (legacy fallback). Short enough to detect a crashed child quickly.
 _LIVENESS_POLL_SECONDS = 0.5
@@ -556,7 +566,8 @@ def create_chart_protocol(
     resolved: set[str] = set()
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
-                       timeframe: str | None = None, _scope_id=None):
+                       timeframe: str | None = None, lookahead=None,
+                       _scope_id=None):
         from pynecore import lib
         state = states[sec_id]
 
@@ -568,6 +579,21 @@ def create_chart_protocol(
         # ``lazy_spawn_fn`` itself skips sids that already have a process.
         if sec_id not in resolved:
             resolved.add(sec_id)
+            if lookahead is not None:
+                # Input-derived (Pine "simple") lookahead: the transformer stored
+                # None in __security_contexts__ and passes the actual value here.
+                # Resolve the mode BEFORE the deferred symbol/timeframe callback,
+                # which recomputes ``na_on_developing`` from ``state.lookahead``.
+                state.lookahead = _lookahead_mode(lookahead)
+                # Static symbol/timeframe with deferred lookahead: mirror the
+                # setup-time cross-symbol decision (no aggregator ⇒ cross-symbol
+                # HTF). A deferred symbol/timeframe context is recomputed by the
+                # resolver below instead.
+                state.na_on_developing = (
+                    not state.is_ltf and not state.same_timeframe
+                    and state.htf_aggregator is None
+                    and state.lookahead is Lookahead.ON
+                )
             if deferred_resolve_fn is not None and symbol is not None:
                 deferred_resolve_fn(sec_id, symbol, timeframe)
             if lazy_spawn_fn is not None:
@@ -941,7 +967,8 @@ def create_security_protocol(
     }
     own_lock = result_locks[sec_id]
 
-    def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _scope_id=None):
+    def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _lookahead=None,
+                       _scope_id=None):
         pass
 
     if is_ltf:
@@ -1473,13 +1500,10 @@ def setup_security_states(
             same_tf = (timeframe == chart_timeframe)
             resampler = None if same_tf else Resampler.get_resampler(timeframe)
 
-            lookahead_val = ctx.get('lookahead', barmerge.lookahead_off)
-            if lookahead_val is barmerge.lookahead_on:
-                lookahead_mode = Lookahead.ON
-            elif lookahead_val is barmerge.lookahead_last_closed:
-                lookahead_mode = Lookahead.LAST_CLOSED
-            else:
-                lookahead_mode = Lookahead.OFF
+            # A None value is a runtime-deferred (input-derived) lookahead; OFF
+            # serves as the placeholder until the first ``__sec_signal__``
+            # delivers the actual value.
+            lookahead_mode = _lookahead_mode(ctx.get('lookahead'))
 
             # Live HTF transport via the chart's ``HTFAggregator`` (closed-bar
             # override for all lookahead modes, plus developing-bar for

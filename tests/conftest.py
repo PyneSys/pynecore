@@ -10,6 +10,12 @@ import math
 
 from pathlib import Path
 
+# Force the plain log formatter BEFORE pynecore.lib.log is imported: with
+# rich installed, PineLogFormatter returns the bare message (rich renders
+# time/level itself), which would break ``log_comparator``'s
+# ``[timestamp] LEVEL message`` line parsing.
+os.environ["PYNE_NO_COLOR_LOG"] = "1"
+
 # Register the import hook BEFORE any pynecore imports
 # This ensures AST transformations work even when __pycache__ is deleted
 from pynecore.core import import_hook  # noqa - This must be first!
@@ -426,6 +432,9 @@ def log_comparator(capsys) -> LogComparatorProtocol:
 
     @contextmanager
     def _comparator(good_log: str, compare_dates: bool = False, float_precision: int = 12):
+        import io
+        from pynecore.lib import log as pyne_log
+
         # Remove pytest handlers temporarily
         root_logger = logging.getLogger()
         pytest_handlers = [h for h in root_logger.handlers
@@ -433,14 +442,30 @@ def log_comparator(capsys) -> LogComparatorProtocol:
         for handler in pytest_handlers:
             root_logger.removeHandler(handler)
 
+        # Capture the Pyne logger through a dedicated buffer handler. Reading
+        # capsys stderr instead is VACUOUS: the module-level StreamHandler in
+        # ``pynecore.lib.log`` binds the real stderr at import time, so under
+        # capsys nothing lands in the captured stream and every comparison
+        # silently passed on an empty log (a corrupted reference went
+        # unnoticed). The plain PineLogFormatter is reused so the parsing
+        # below sees the exact same line format.
+        log_buf = io.StringIO()
+        cap_handler = logging.StreamHandler(log_buf)
+        cap_handler.setFormatter(pyne_log.handler.formatter)
+        pyne_log.logger.addHandler(cap_handler)
+
         # noinspection PyUnreachableCode
         try:
             # Run the test
             yield
-            # Read log messages from stderr
             output = capsys.readouterr()
-            test_log = output.err
+            test_log = log_buf.getvalue()
             print(output.out, flush=True, end='')
+
+            # An expected non-empty log must produce SOME output — a silent
+            # empty capture must fail, not pass vacuously.
+            if good_log.strip():
+                assert test_log.strip(), "No log output captured, expected a non-empty log!"
 
             # Compare all lines
             line = 0
@@ -457,9 +482,13 @@ def log_comparator(capsys) -> LogComparatorProtocol:
                         test_date = datetime.fromisoformat(test_line.split(']', 1)[0].strip('['))
                         assert good_date == test_date, f"Dates are not equal! Line: {line}"
 
-                    # Round numbers in arrays and compare messages
+                    # Round numbers in arrays and compare messages. Captured
+                    # lines look like ``[timestamp] bar:      N LEVEL   msg``
+                    # (see PineLogFormatter.formatTime) — strip everything up
+                    # to and including the level column.
                     good_msg = round_numbers_in_array(good_line.split(']:', 1)[1].strip(), float_precision)
-                    test_msg = round_numbers_in_array(test_line.split(']', 1)[1][9:].strip(), float_precision)
+                    stripped = re.sub(r'^\[[^\]]*\](?:\s*bar:\s*\d+)?\s+[A-Z]+\s+', '', test_line)
+                    test_msg = round_numbers_in_array(stripped.strip(), float_precision)
                     assert good_msg == test_msg, f"Messages are not equal! Line: {line}"
 
                 except IndexError:
@@ -468,6 +497,7 @@ def log_comparator(capsys) -> LogComparatorProtocol:
                     raise ValueError(f"The log output is not in the expected format! Line: {line}")
 
         finally:
+            pyne_log.logger.removeHandler(cap_handler)
             # Restore pytest handlers
             for handler in pytest_handlers:
                 root_logger.addHandler(handler)
