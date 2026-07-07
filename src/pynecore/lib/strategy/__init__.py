@@ -2585,7 +2585,7 @@ class SimPosition(PositionBase):
         # not rejected. The first fill also shifts self.equity via its open P&L,
         # so the standalone affordability test must use the bar-start equity too.
         bar_start_size = self.size
-        bar_start_equity = self.equity
+        bar_start_equity = float(self.equity)
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -4021,21 +4021,30 @@ def exit(id: str, from_entry: str = "",
             return
 
         is_rest_leg = isinstance(qty, NA) and isinstance(qty_percent, NA)
+        # Sibling legs reserve slices of the entry first-come-first-served
+        # (consumed siblings keep their reservation until the entry fully
+        # closes). Only sticky exit legs (book_seq is None) count as siblings;
+        # a stacked strategy.close()/close_all() partial (book_seq set) is an
+        # immediate market close, not a reservation against this leg.
+        sibling = sum(o.reserved_size for o in position.exit_orders.values()
+                      if o.order_id == from_entry and o is not existing
+                      and o.book_seq is None)
+        unreserved = abs(init_size) - sibling
+        # A qty/qty_percent leg is capped at the unreserved remainder --
+        # TradingView never lets a later exit call take a slice a pre-existing
+        # leg already holds. Verified on live TV (BINANCE:BTCUSDT 30m probes):
+        # a late qty_percent=50 or qty=1 leg issued while a no-qty stop leg
+        # holds 100% never creates an order (553/553 cycles), and against a
+        # qty_percent=75 stop leg the same call is reduced to the remaining
+        # 25% instead of being dropped.
         if not isinstance(qty, NA):
-            reserved = abs(qty)
+            reserved = min(abs(qty), unreserved)
         elif not isinstance(qty_percent, NA):
-            reserved = abs(init_size) * (qty_percent * 0.01)
+            reserved = min(abs(init_size) * (qty_percent * 0.01), unreserved)
         else:
-            # No-qty "rest" leg: the entry size minus the slices reserved by
-            # sibling legs (consumed siblings keep their reservation until the
-            # entry fully closes), so it never over-closes the position.
-            # Only sticky exit legs (book_seq is None) count as siblings; a
-            # stacked strategy.close()/close_all() partial (book_seq set) is an
-            # immediate market close, not a reservation against this rest leg.
-            sibling = sum(o.reserved_size for o in position.exit_orders.values()
-                          if o.order_id == from_entry and o is not existing
-                          and o.book_seq is None)
-            reserved = abs(init_size) - sibling
+            # No-qty "rest" leg: the whole unreserved remainder, so it never
+            # over-closes the position.
+            reserved = unreserved
 
         reserved = _size_round(reserved)
         if reserved <= 0.0:
