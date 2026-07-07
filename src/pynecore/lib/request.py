@@ -165,12 +165,24 @@ def earnings(
 
 
 # noinspection PyUnusedLocal
-def financial(*args, **kwargs) -> float:
+def financial(
+        symbol=None, financial_id=None, period=None, gaps=None,
+        ignore_invalid_symbol=False, currency=None,
+) -> float:
     """
     Request financial data from FactSet.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :param symbol: Symbol ticker
+    :param financial_id: Financial metric id (e.g. "MARKET_CAP_BASIC")
+    :param period: Reporting period ("FQ", "FH", "FY", "TTM", "D")
+    :param gaps: Gap handling mode (barmerge.gaps_on/off)
+    :param ignore_invalid_symbol: If True, return na instead of raising
+    :param currency: Currency for conversion
+    :return: Financial value or na
+    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
+    if ignore_invalid_symbol:
+        return nan
     raise NotImplementedError("request.financial() is not yet implemented in PyneCore")
 
 
@@ -195,13 +207,24 @@ def quandl(*args, **kwargs) -> float:
 
 
 # noinspection PyUnusedLocal
-def seed(*args, **kwargs):
+def seed(source=None, symbol=None, expression=None,
+         ignore_invalid_symbol=False, calc_bars_count=None):
     """
     Request data from user-maintained GitHub repositories.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    Seed data lives in TradingView-hosted community repositories that PyneCore
+    has no access to — like :func:`footprint`, the data is fundamentally
+    unavailable, so the call returns ``na`` instead of aborting the script;
+    well-written scripts guard their seed series with ``na()`` checks.
+
+    :param source: Seed repository name (e.g. "seed_crypto_santiment")
+    :param symbol: Data series name within the repository
+    :param expression: Expression to evaluate in the seed context
+    :param ignore_invalid_symbol: If True, return na for invalid symbols
+    :param calc_bars_count: Number of bars to calculate (unused)
+    :return: na — seed data is not available in PyneCore
     """
-    raise NotImplementedError("request.seed() is not yet implemented in PyneCore")
+    return NA(None)
 
 
 # noinspection PyUnusedLocal
