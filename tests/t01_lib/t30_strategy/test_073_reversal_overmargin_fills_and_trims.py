@@ -46,6 +46,15 @@ def __test_reversal_new_leg_fills_then_margin_call_trims__(script_path, module_k
     opposite ``strategy.entry`` is processed, the new leg is NOT pre-fill
     rejected like a fresh entry. TradingView fills it and the bar-open margin
     call trims the over-margin excess to a viable remainder.
+
+    The trim is sized exactly like an intrabar margin call: 4x the shortfall in
+    lot units. Here the fill price is one tick above the sizing price, so the
+    1000-contract long overshoots margin by ~0.2 contracts (1999 lots); the
+    bar-open margin call liquidates ``4 * 1999`` lots = 0.7996 contracts, not a
+    whole contract. TradingView reserves the whole-contract liquidation for a
+    sub-lot shortfall (the ``cover_lots == 0`` branch); a multi-lot open
+    overshoot trims fractionally, matching TV's exported trades on
+    BINANCE:BTCUSDT 30m (RCI Strategy).
     """
     import sys
     from pathlib import Path
@@ -75,14 +84,14 @@ def __test_reversal_new_leg_fills_then_margin_call_trims__(script_path, module_k
     position = runner.script.position
 
     # The new long leg FILLS (not rejected) and survives with a trimmed remainder:
-    # full 1000-contract long minus exactly one whole contract liquidated by the
-    # bar-open margin call. A fresh entry in the same margin state would be rejected
-    # (see test_064); the same-bar close before it makes this a reversal leg.
-    assert position.size == 999.0
+    # the full 1000-contract long minus the fractional 0.7996-contract cover the
+    # bar-open margin call liquidates. A fresh entry in the same margin state would
+    # be rejected (see test_064); the same-bar close before it makes this a reversal leg.
+    assert position.size == 999.2004
 
     # Ledger: the short is reversed (closed), and the over-margin excess of the new
-    # long is removed by a single whole-contract margin call at the fill price.
+    # long is removed by a fractional-lot margin call (4x the shortfall) at the fill price.
     assert [(t.entry_id, t.exit_comment, t.size, t.exit_price) for t in closed_trades] == [
         ('S', 'Reverse', -1000.0, 100.01),
-        ('L', 'Margin call', 1.0, 100.01),
+        ('L', 'Margin call', 0.7996, 100.01),
     ]

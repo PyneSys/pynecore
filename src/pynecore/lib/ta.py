@@ -1566,6 +1566,12 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     n = length
     numerator = n * sum_xy - sum_x * sum_y
     denominator = math.sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y))
+    # Divide first, then scale by 100. TradingView computes rci in this exact
+    # (num / den) * 100 order, floating-point rounding and all, so this form
+    # reproduces its output. The mathematically "correctly rounded" alternative
+    # num * 100 / den lands 1 ULP off at near-tie bars and diverges from TV: on
+    # the wild RCI-strategy reference (BINANCE:BTCUSDT 30m) it raised the
+    # extra/missing entry divergence from 14/6 to 30/11. Verified — do not reorder.
     return (numerator / denominator) * 100
 
 
