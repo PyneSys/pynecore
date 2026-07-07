@@ -207,16 +207,16 @@ def set_style(id: Label, style: LabelStyleEnum) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def set_textcolor(id: Label, color: _color.Color) -> None:
+def set_textcolor(id: Label, textcolor: _color.Color) -> None:
     """
     Sets the label text color
 
     :param id: Label object
-    :param color: New text color
+    :param textcolor: New text color
     """
     if isinstance(id, NA):
         return
-    id.textcolor = color
+    id.textcolor = textcolor
 
 
 # noinspection PyShadowingBuiltins
