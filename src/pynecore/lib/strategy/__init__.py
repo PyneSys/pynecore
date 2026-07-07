@@ -2088,10 +2088,18 @@ class SimPosition(PositionBase):
             else:
                 cover_lots = int(raw_cover_lots)
         if cover_lots == 0 and rfactor > 1:
-            # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
-            # one whole contract, capped by the current position size.
-            mc_lots = 0
-            margin_call_size = min(1.0, quantity)
+            # Fractional-lot symbol with a sub-lot shortfall. TradingView's
+            # smallest margin-call trim is 4 lots: measured across 5367 corpus
+            # margin calls every fill is a multiple of 4 lots, and it never
+            # liquidates a whole contract on a multi-contract position. Only when
+            # the whole position is at or below one contract does TV close it
+            # entirely instead of trimming.
+            if quantity <= 1.0:
+                mc_lots = 0
+                margin_call_size = quantity
+            else:
+                mc_lots = 4
+                margin_call_size = mc_lots / rfactor
         else:
             mc_lots = max(1, cover_lots * 4)
             margin_call_size = mc_lots / rfactor
@@ -2785,16 +2793,21 @@ class SimPosition(PositionBase):
                         self.fill_order(order, fill_price, self.l, fill_price)
                     continue
 
-        # Margin call check at OPEN — TV liquidates whole contracts here even on
-        # fractional-lot symbols (verified against a TV strategy export where an
-        # entry overshooting margin filled and was immediately trimmed by exactly
-        # 1.0 contract at the fill price). The sign gates mirror the callee's own
-        # direction guards (a liquidation never reverses the position, so the
-        # second direction stays a no-op after the first fires).
+        # Margin call check at OPEN — sized exactly like the intrabar (H/L)
+        # liquidations: 4x the shortfall in lot units, and only when the
+        # shortfall truncates below one lot does it fall back to closing a
+        # single whole contract (the ``cover_lots == 0`` branch in the callee).
+        # A sub-lot open overshoot (fill price a tick above the sizing price)
+        # therefore still trims exactly 1.0 contract, while a multi-lot
+        # overshoot trims the fractional cover TV's exported trades show
+        # (BINANCE:BTCUSDT 30m RCI Strategy: a 90-lot open shortfall trims
+        # 0.0038 BTC, not a whole contract). The sign gates mirror the callee's
+        # own direction guards (a liquidation never reverses the position, so
+        # the second direction stays a no-op after the first fires).
         if self.sign < 0:
-            self._check_margin_call(self.o, for_short=True, at_open=True, whole_contracts=True)
+            self._check_margin_call(self.o, for_short=True, at_open=True)
         elif self.sign > 0:
-            self._check_margin_call(self.o, for_short=False, at_open=True, whole_contracts=True)
+            self._check_margin_call(self.o, for_short=False, at_open=True)
 
     def _process_limit_stop_orders(self, ohlc: bool):
         """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
