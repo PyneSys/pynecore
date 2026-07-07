@@ -139,12 +139,38 @@ class UnusedSeriesDetectorTransformer(ast.NodeTransformer):
         # Default to Any if we can't determine the inner type
         return ast.Name(id='Any', ctx=ast.Load())
 
+    def _resolve_series_owner(self, scope: str, var_name: str) -> str | None:
+        """Nearest enclosing scope (including ``scope`` itself) that declares
+        ``var_name`` as a Series.
+
+        Mirrors :meth:`SeriesTransformer._lookup`: a subscript resolves to the
+        closest series declaration walking outwards through the scope chain.
+        """
+        parts = scope.split('.')
+        for i in range(len(parts), 0, -1):
+            candidate = '.'.join(parts[:i])
+            if var_name in self.series_vars.get(candidate, set()):
+                return candidate
+        if var_name in self.series_vars.get("__module__", set()):
+            return "__module__"
+        return None
+
     def optimize(self, tree: ast.AST) -> ast.AST:
         """
         Main optimization pass - removes unused Series annotations
         """
         # First pass: collect all Series variables and indexed variables
         self.visit(tree)
+
+        # A parent-scope series indexed only from within a nested function is
+        # resolved through the scope chain by SeriesTransformer, so it must not
+        # be pruned. Credit the nearest enclosing scope that declares each
+        # indexed name as a Series, mirroring that resolution.
+        for scope, names in list(self.indexed_vars.items()):
+            for var_name in names:
+                owner = self._resolve_series_owner(scope, var_name)
+                if owner is not None and owner != scope:
+                    self.indexed_vars.setdefault(owner, set()).add(var_name)
 
         # Second pass: remove Series annotations from non-indexed variables
         optimizer = SeriesOptimizer(self.series_vars, self.indexed_vars)
