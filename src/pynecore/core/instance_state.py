@@ -85,10 +85,20 @@ from .series import SeriesImpl
 
 __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
-    '__attach_layout__',
+    '__attach_layout__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'explain_state',
 ]
+
+# Sentinel for dynamic parameter defaults (DynamicDefaultTransformer). A
+# default referencing per-bar runtime state (``lib.hl2`` etc.) must be
+# evaluated per CALL, not at ``def`` time: an anchored call site binds the
+# callee closure ONCE (an ``Exported`` proxy keeps a stable identity across
+# per-bar redefinitions), so a def-time default would freeze the first bar's
+# value. The transformer replaces such defaults with this sentinel and
+# evaluates the original expression in the function body when the argument
+# was omitted.
+__dyn_default__ = object()
 
 # Root state vectors by key; only roots are registered globally, every other
 # instance lives in the tree hanging off them.

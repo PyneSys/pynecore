@@ -292,7 +292,7 @@ def endswith(source: str, str_: str) -> bool:
 
 
 # noinspection PyPep8Naming,PyShadowingBuiltins
-def format(formatString: str, *args: Any) -> str:
+def format(formatString: str, *args: Any) -> str | NA[str]:
     """
     Converts the formatting string and value(s) into a formatted string.
     Supports:
@@ -304,8 +304,13 @@ def format(formatString: str, *args: Any) -> str:
 
     :param formatString: Format pattern
     :param args: Values to format
-    :return: Formatted string
+    :return: Formatted string, or na if the format pattern is na
     """
+    # na-propagation (Pine): a na format pattern yields na (e.g. the TV
+    # Technical Ratings idiom ``str.repeat("\n", 0) + "{0}"`` — the repeat
+    # returns na, the concat propagates it, and str.format passes it through).
+    if isinstance(formatString, NA) or formatString is None:
+        return NA(str)
 
     # Pre-process quotes before handling placeholders
     def process_quotes(s: str) -> str:

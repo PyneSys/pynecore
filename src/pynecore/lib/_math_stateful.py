@@ -51,6 +51,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     count: Persistent[int] = 0
     compensation: Persistent[float] = 0.0
     prev_length: Persistent[int] = 0
+    removals: Persistent[int] = 0
 
     isna = isinstance(source, NA)
     if not isna:
@@ -88,6 +89,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     changed = prev_length != 0 and length != prev_length
     prev_length = length
     if changed:
+        removals = 0
         if isna:
             # Length changed on an na bar: the old window is stale and cannot be
             # rebuilt from a missing current value; restart the warmup cleanly.
@@ -137,6 +139,38 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     else:
         if isna:
             return summ
+        # Exact resync: the incremental remove+add path below carries residual
+        # rounding error from bars long outside the window (Kahan bounds it but
+        # never clears it). That residue breaks identities TV preserves — e.g.
+        # a window of equal values must sum to exactly n*v (a run of zeros must
+        # sum to 0.0, not -3e-15), or ``sma(sma(x))`` of a flat series flips
+        # strict comparisons like the Technical Ratings
+        # ``kStochRsi < dStochRsi`` on last-bit noise. Small windows (the
+        # precision-sensitive ``sma(x, 3)`` chains) recompute from the
+        # na-compacted buffer on EVERY bar — for those lengths the fresh Kahan
+        # pass costs the same as the remove+add pair it replaces, and the
+        # result depends on the window alone. Longer windows resync once per
+        # ``length`` removals, capping any drift's lifetime at one window
+        # turnover at an amortized O(1) cost per bar.
+        removals += 1
+        if removals >= length or length <= 8:
+            removals = 0
+            recomputed = 0.0
+            comp = 0.0
+            found = 0
+            for i in range(length):
+                v = src[i]
+                if isinstance(v, NA):
+                    break
+                found += 1
+                corrected = float(v) - comp
+                new_recomputed = recomputed + corrected
+                comp = (new_recomputed - recomputed) - corrected
+                recomputed = new_recomputed
+            if found == length:
+                summ = recomputed
+                compensation = comp
+                return summ
         # Kahan summation for removing old value (float() compiles to
         # safe_convert.safe_float, returning NA instead of raising on NA)
         old_value = float(src[length])

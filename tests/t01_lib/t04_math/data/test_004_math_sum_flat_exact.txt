@@ -1,0 +1,14 @@
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: false, sum_exact: false
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: false, sum_exact: false
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: false, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: false, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
+[2025-01-01T00:00:00.000-00:00]: k_eq_d: true, sum_exact: true
