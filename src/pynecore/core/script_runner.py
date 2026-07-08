@@ -814,7 +814,6 @@ class ScriptRunner:
                             sec_result_locks,
                             _ohlcv_fields,
                             _ohlcv_tuple,
-                            sec_state.same_timeframe,
                             chart_tf,
                         ),
                         daemon=True,
