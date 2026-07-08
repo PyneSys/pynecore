@@ -42,6 +42,34 @@ def __test_numeric_date_with_time_part__():
     assert _naive(parse_datestring("03-04-2023 10:20:30")) == datetime(2023, 3, 4, 10, 20, 30)
 
 
+def __test_space_separated_numeric_is_month_first__():
+    """Space is another numeric separator: "05 12 2000" is May 12 (month-first)
+
+    Verified live on TradingView: ``timestamp("05 12 2000 ...")`` resolves to
+    May 12, ``"01 1 2000 00:00 +0000"`` to Jan 1 2000, and day-first
+    ``"31 1 2000"`` is rejected -- matching the '-', '/' and '.' behaviour.
+    """
+    assert _naive(parse_datestring("05 12 2000")) == datetime(2000, 5, 12)
+    assert _naive(parse_datestring("5 6 2000")) == datetime(2000, 5, 6)
+    assert _naive(parse_datestring("01 1 2000 00:00")) == datetime(2000, 1, 1, 0, 0)
+    assert _naive(parse_datestring("05 12 2000 10:20:30")) == datetime(2000, 5, 12, 10, 20, 30)
+
+
+def __test_iso_date_with_hh_mm_no_seconds__():
+    """ISO date + HH:MM without seconds parses (both space and T separators)"""
+    for datestring in ("2021-01-01 00:00", "2021-01-01T00:00"):
+        assert _naive(parse_datestring(datestring)) == datetime(2021, 1, 1, 0, 0), datestring
+
+
+def __test_numeric_dates_with_explicit_offset__():
+    """A "+0000" offset resolves to UTC for the corpus input.time() defaults"""
+    for datestring in ("2021-01-01 00:00 +0000", "01 1 2000 00:00 +0000"):
+        dt = parse_datestring(datestring)
+        assert dt.utcoffset().total_seconds() == 0, datestring
+    assert int(parse_datestring("2021-01-01 00:00 +0000").timestamp()) == 1609459200
+    assert int(parse_datestring("01 1 2000 00:00 +0000").timestamp()) == 946684800
+
+
 def __test_day_first_is_rejected__():
     """"13-04-2023" must raise like TV's compile error -- no day-first fallback"""
     with pytest.raises(ValueError, match="Invalid date format"):

@@ -11,14 +11,20 @@ STANDARD_FORMATS = [
     "%d %b %Y %H:%M %z",  # "01 Jan 2018 00:00 +0000"
     "%d %B %Y %H:%M:%S %z",  # "20 February 2020 15:30:00 +0200"
     "%d %B %Y %H:%M %z",  # "1 January 2018 00:00 +0000"
+    "%Y-%m-%d %H:%M:%S %z",  # "2021-01-01 00:00:00 +0000"
+    "%Y-%m-%d %H:%M %z",  # "2021-01-01 00:00 +0000"
+    "%m %d %Y %H:%M:%S %z",  # "05 12 2000 10:20:30 +0000" (month-first)
+    "%m %d %Y %H:%M %z",  # "01 1 2000 00:00 +0000" (month-first)
+    "%m %d %Y %z",  # "01 1 2000 +0000" (month-first)
 ]
 
 # Pine Script specific formats (without timezone)
 # %b = abbreviated month (Jan, Feb), %B = full month (January, February)
-# Numeric dates are MONTH-FIRST (MM-DD-YYYY) with '-', '/' or '.' separators:
-# TradingView parses "03-04-2023" as March 4 and rejects a day-first
-# "13-04-2023" outright ("timestamp(s): unrecognized datetime format"),
-# so there is intentionally no day-first fallback here.
+# Numeric dates are MONTH-FIRST (MM-DD-YYYY) with '-', '/', '.' or ' ' separators:
+# TradingView parses "03-04-2023" (and "05 12 2000") as March 4 / May 12 and
+# rejects a day-first "13-04-2023" ("31 1 2000") outright ("timestamp(s):
+# unrecognized datetime format"), so there is intentionally no day-first
+# fallback here.
 PINE_FORMATS = [
     "%b %d %Y %H:%M:%S",  # "Feb 01 2020 22:10:05"
     "%d %b %Y %H:%M:%S",  # "04 Dec 1995 00:12:00"
@@ -31,6 +37,11 @@ PINE_FORMATS = [
     "%B %d %Y",  # "February 01 2020"
     "%d %B %Y",  # "04 December 1995"
     "%Y-%m-%d",  # "2020-02-20"
+    "%Y-%m-%d %H:%M:%S",  # "2021-01-01 00:00:00"
+    "%Y-%m-%d %H:%M",  # "2021-01-01 00:00"
+    "%m %d %Y %H:%M:%S",  # "05 12 2000 10:20:30"
+    "%m %d %Y %H:%M",  # "01 1 2000 00:00"
+    "%m %d %Y",  # "05 12 2000", "3 4 2023"
     "%m-%d-%Y %H:%M:%S",  # "03-04-2023 10:20:30"
     "%m-%d-%Y %H:%M",  # "03-04-2023 10:20"
     "%m-%d-%Y",  # "03-04-2023", "3-4-2023"
@@ -212,9 +223,10 @@ def parse_datestring(datestring: str) -> datetime:
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Try parsing ISO 8601 style dates WITH TIME first (handles both T and space separator)
+    # Try parsing ISO 8601 style dates WITH TIME first (handles both T and space
+    # separator; seconds are optional -- "2021-01-01 00:00" is accepted too)
     iso_match = re.match(
-        r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?)'  # datetime part
+        r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)'  # datetime part
         r'([+-]\d{2}:\d{2})?$',  # timezone part
         datestring
     )
@@ -223,16 +235,18 @@ def parse_datestring(datestring: str) -> datetime:
         if tz_part:
             datestring = normalize_timezone(datestring)
             dt_str = datestring.replace(' ', 'T')  # Normalize to T for parsing
-            try:
-                return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S.%f%z")
-            except ValueError:
-                return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
+            for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"):
+                try:
+                    return datetime.strptime(dt_str, fmt)
+                except ValueError:
+                    continue
         else:
-            try:
-                dt = datetime.strptime(dt_part.replace(' ', 'T'), "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                dt = datetime.strptime(dt_part.replace(' ', 'T'), "%Y-%m-%dT%H:%M:%S")
-            return dt.replace(tzinfo=UTC)
+            dt_str = dt_part.replace(' ', 'T')
+            for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+                try:
+                    return datetime.strptime(dt_str, fmt).replace(tzinfo=UTC)
+                except ValueError:
+                    continue
 
     # Try parsing ISO 8601 DATE ONLY format (YYYY-MM-DD) before timezone extraction
     # This prevents the timezone regex from incorrectly matching date parts like -09 in 2025-01-09
