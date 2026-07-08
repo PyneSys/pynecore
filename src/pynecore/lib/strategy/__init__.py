@@ -2186,13 +2186,15 @@ class SimPosition(PositionBase):
     def _resolve_deferred_qty(self, order: Order, fill_price: float) -> None:
         """Finalize a default-sized entry's quantity at its actual fill price.
 
-        TradingView resolves percent_of_equity / cash default sizing when the
-        order EXECUTES: the investment target is divided by the real fill
-        price, with equity measured at that moment. The placement-time size
-        was only the margin-check estimate — a marketable limit filling at the
-        open, or a gapped market order, re-sizes here. The reversal flip
-        component stays frozen from creation (TV computes the flip quantity at
-        order creation time).
+        TradingView resolves percent_of_equity / cash default sizing of
+        price-based (limit/stop) orders when the order EXECUTES: the
+        investment target is divided by the real fill price, with equity
+        measured at that moment. For those the placement-time size was only
+        the margin-check estimate — a marketable limit filling at the open
+        re-sizes here. Market entries never defer: they keep the
+        placement-close size computed in ``entry`` (TV-probe-verified). The
+        reversal flip component stays frozen from creation (TV computes the
+        flip quantity at order creation time).
         """
         order.deferred_qty = False
         old_abs = abs(order.size)
@@ -3395,11 +3397,16 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     # lot multiple a hair below the integer (e.g. 173.432 * 1e4 ->
     # 1734319.9999999998); snap values within a few ULPs of an integer up before
     # the floor so an exact multiple is not truncated a whole lot down.
-    # Do NOT widen this tolerance to chase a single TV fill: raw lot counts
-    # 1.5e-9 contracts below an integer have filled the rounded-up size on TV
-    # (Gaussian Channel) while 4.1e-9-below ones truncated (Hybrid) — those
-    # razor ties come from TV-vs-PyneCore netprofit FP drift, not from a
-    # quantization rule, and a wider snap breaks more fills than it fixes.
+    # Do NOT widen this tolerance to chase a single TV fill: the hair-below
+    # razor ties (~2e-4 of boundary entries; the Gaussian Channel extra trade
+    # is one) are NOT reachable by any snap width. One-shot TV probes with
+    # injected equity proved the up-vs-floor outcome is a deterministic
+    # function of (equity, close) following a money-tick grid law (snap up
+    # iff floor(money_ticks/G) >= floor(cost_ticks(N0+1)/G), G scale-
+    # dependent: 0.05 ticks near 1e6 money, 0.002 near 5e5; 615/618 probe
+    # razors reproduced). The law belongs in the money-sizing path, not in
+    # this generic lot floor — implementing it here as a tolerance breaks
+    # ordinary fills.
     scaled = abs(qty) * rfactor
     nearest = round(scaled)
     lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
@@ -3735,7 +3742,7 @@ def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
 
 
 # noinspection PyProtectedMember
-def _judge_money_entry(size: float, price: float) -> float:
+def _judge_money_entry(size: float, price: float, market: bool = False) -> float:
     """Apply TV's big-money sizing and margin gate to a money-sized entry.
 
     From 1e7 account-currency units of order money upward (equivalently 1e9
@@ -3748,23 +3755,56 @@ def _judge_money_entry(size: float, price: float) -> float:
     runs at the floor size directly. See :func:`_gate_entry_lots` for the
     gate itself and the measurement provenance.
 
+    Below 1e7 money TV still snaps a MARKET entry up to the next lot when
+    the raw money tick count reaches the 0.05-tick floor-cell of that lot's
+    cost (edge = cost ticks mod 0.05; unlike the >=1e7 gate the money side
+    is NOT truncated to whole ticks). Measured by one-shot equity-injection
+    sweeps on BINANCE:BTCUSDT 30m (2026-07-08): edges two-sided at cost
+    1.0200e8 and 1.1575e8 ticks (5-level cluster), further ON points at
+    1.005e8/1.08e8, OFF at 9.9e7 and from 1.20e8 up (with an unmapped
+    interleaved ON at 1.25e8) — the snap is applied only inside the verified
+    [1e8, 1.16e8] cost band and only for market entries (the placement-close
+    sizing path); everywhere else the plain floor stands, matching the
+    pre-measurement behavior. A snapped size then faces the ordinary
+    creation-time margin check at the placement close: at 100%
+    percent_of_equity sizing the snapped cost always exceeds equity, so the
+    entry cancels at placement even when the fill open would fit (measured:
+    the Gaussian Channel razor cancel and the 2025-01-02 19:30 flat100 probe
+    cancel, where the open HAD gapped down far enough) — which is how the
+    Gaussian Channel corpus divergence resolves.
+
     :param size: Signed floor-sized quantity in contracts
     :param price: The sizing/gate price (placement close for market entries,
         fill price for price-based orders resolving at execution)
+    :param market: True when judging a market entry at placement (enables
+        the sub-1e7 snap-up; price-based fills keep the plain floor)
     :return: The granted signed quantity, or 0.0 when the entry is rejected
     """
     budget = _default_entry_budget(price)
     if budget is None:
         return size
     money, unit_cost = budget
-    if money < 1e7:
-        return size
     mintick = syminfo.mintick
     if not mintick or mintick <= 0:
         return size
     rfactor = syminfo._size_round_factor  # noqa
     lots = round(abs(size) * rfactor)
     if lots <= 0:
+        return size
+    if money < 1e7:
+        if not market:
+            return size
+        next_cost = (lots + 1) / rfactor * unit_cost / mintick
+        if not (1e8 <= next_cost <= 1.16e8):
+            return size
+        _, m1 = _ceil_to_grid(next_cost, 0.05)
+        # m1 - grid unconditionally, like the >=1e7 snap: a cost landing
+        # exactly on the grid keeps the full 0.05 window (the 2025-01-02
+        # 19:30 flat100 cancel pinned this — cost double == grid double,
+        # TV still snapped).
+        if money / mintick >= m1 - 0.05:
+            sign = 1.0 if size > 0 else -1.0
+            return sign * (lots + 1) / rfactor
         return size
     money_ticks = money / mintick
     next_cost = (lots + 1) / rfactor * unit_cost / mintick
@@ -3830,12 +3870,15 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
 
-    # A default-sized order (no explicit qty) resolves its quantity at the
-    # actual fill price (TradingView sizes percent_of_equity / cash when the
-    # order executes). The size computed here is the placement estimate used
-    # for the margin check and order bookkeeping: taken at the price the order
-    # would execute at NOW — the current price when immediately executable,
-    # the limit/stop price while it rests.
+    # A default-sized (no explicit qty) price-based order resolves its
+    # quantity at the actual fill price; for those the size computed here is
+    # only the placement estimate used for the margin check and order
+    # bookkeeping. A MARKET entry keeps this size: TV sizes it from the
+    # mark-to-market equity and close of the placement bar (probe-verified on
+    # BINANCE:BTCUSDT 30m: flat entries 13281/13281, reversal flips
+    # 26560/26561 exact). The sizing price is the price the order would
+    # execute at NOW — the current price when immediately executable, the
+    # limit/stop price while it rests.
     deferred_default = isinstance(qty, NA)
     market_sizing_price: float | None = None
     if deferred_default:
@@ -3859,9 +3902,15 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         return
 
     # Market entries keep their placement-close sizing (price-based orders
-    # re-resolve at fill), so the big-money sizing gate is judged here.
+    # re-resolve at fill), so the big-money sizing gate is judged here. A
+    # sub-1e7 snapped-up size deliberately falls through to the creation-time
+    # margin check below: TV cancels a snapped entry whose snapped cost can
+    # no longer be margined at the placement close even when the fill open
+    # would permit it (measured: the Gaussian Channel razor cancel at
+    # 100% sizing, and the 2025-01-02 19:30 flat100 probe cancel where the
+    # open HAD gapped down far enough to fit).
     if market_sizing_price is not None:
-        size = _judge_money_entry(float(size), market_sizing_price)
+        size = _judge_money_entry(float(size), market_sizing_price, market=True)
         if size == 0.0:
             if position.size == 0.0 or position.sign == direction_sign:
                 return
