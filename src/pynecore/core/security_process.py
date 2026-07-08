@@ -394,7 +394,6 @@ def security_process_main(
         result_locks: 'dict[str, LockType] | None' = None,
         ohlcv_fields: 'list[str] | None' = None,
         ohlcv_tuple: bool = False,
-        same_timeframe: bool = False,
         chart_type: 'str | None' = None,
         chart_timeframe: 'str | None' = None,
 ):
@@ -422,12 +421,6 @@ def security_process_main(
         run skips main() and writes these fields straight from the bar.
     :param ohlcv_tuple: True when ``ohlcv_fields`` came from a tuple/list
         expression (write a tuple), False for a scalar expression.
-    :param same_timeframe: True when the security TF equals the chart TF. The
-        chart then signals every chart bar (``_get_confirmed_time`` returns the
-        bar time verbatim), so gap compaction must NOT apply — a gappy
-        cross-symbol feed forward-fills (``gaps_off``) through the chart's bars
-        instead of compacting to real bars (which is only correct for a true
-        HTF series).
     :param chart_type: Synthetic chart type requested via ``ticker.heikinashi()``
         etc. (currently only ``"heikinashi"``). When set, the child applies the
         per-bar chart-type transform to every bar before the script reads it (so
@@ -588,12 +581,17 @@ def security_process_main(
     # ``ta.sma(close, 3)`` accumulate the flat fill bars (a Friday->Monday daily
     # gap would otherwise average two synthetic weekend closes). TradingView builds
     # its HTF series from real bars only. LTF keeps the fills (its intrabar windows
-    # are intentionally continuous). Same-TF cross-symbol is excluded: the chart
-    # signals every chart bar there, so compacting away the writer's fills would
-    # emit ``na`` in a gap instead of forward-filling the prior real bar (TV
-    # ``gaps_off``). ``None`` = no compaction (no gaps, LTF, or same-TF).
+    # are intentionally continuous). Same-TF cross-symbol compacts too: a
+    # session-bounded feed on a 24/7 chart (TVC:US10Y on BINANCE:BTCUSDT) would
+    # otherwise run stateful indicators (``ta.ema``) over thousands of flat
+    # weekend/overnight fills, dragging their state toward the last close while
+    # TradingView's are frozen between real bars. The chart side pairs this with
+    # the ``bar_opens`` clamp in ``_get_confirmed_time``: in a gap nothing new is
+    # confirmed, so the prior real value forward-fills (TV ``gaps_off``) instead
+    # of the child advancing into an empty window and writing ``na``.
+    # ``None`` = no compaction (no gaps, or LTF).
     real_index_map: list[int] | None = None
-    if reader is not None and not is_ltf and not same_timeframe:
+    if reader is not None and not is_ltf:
         from pynecore.lib.timeframe import in_seconds
         if in_seconds(syminfo.period) > 0:
             # Mirror ``read_from(skip_gaps=True)`` exactly: a gap is ``volume < 0``

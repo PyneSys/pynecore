@@ -346,7 +346,13 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     """
     Determine which security period the subprocess should advance to.
 
-    Same timeframe: every chart bar is itself a confirmed bar (return chart_time).
+    Same timeframe: a chart bar and its same-time security bar close at the same
+    instant, so the target is the chart bar's own open — clamped to the latest
+    real child bar open when ``bar_opens`` is loaded (gappy cross-symbol feed,
+    e.g. a session-bounded bond yield on a 24/7 crypto chart). Between real bars
+    nothing new is confirmed, so ``gaps_off`` forward-fills the last real value
+    and ``gaps_on`` emits ``na`` — TradingView never evaluates the expression on
+    the writer's synthetic gap-fill bars.
 
     Daily/weekly/monthly HTF (when ``bar_opens`` is loaded — see
     ``SecurityState.bar_opens``): confirmation rides the child's real bar opens
@@ -372,7 +378,23 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     :return: Target time in milliseconds
     """
     if state.same_timeframe:
-        return chart_time
+        if state.bar_opens is None:
+            return chart_time
+        # Gappy same-TF cross-symbol feed: clamp to the latest real child bar
+        # open. ``chart_time`` and ``bar_opens`` are both monotonic across chart
+        # bars, so the persistent ``bar_ptr`` only ever advances. ``ptr == -1``
+        # means the chart still precedes the first real security bar — return
+        # ``last_confirmed`` (0) so nothing is confirmed yet and the read stays
+        # ``na``, matching TradingView before the security series begins.
+        opens = state.bar_opens
+        n = len(opens)
+        ptr = state.bar_ptr
+        while ptr + 1 < n and opens[ptr + 1] <= chart_time:
+            ptr += 1
+        state.bar_ptr = ptr
+        if ptr >= 0:
+            return opens[ptr]
+        return state.last_confirmed
 
     resampler = state.resampler
     assert resampler is not None
@@ -1253,6 +1275,11 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
       cheaper arithmetic grid (this stays a no-op for them); LTF contexts run
       their own intrabar machinery, not HTF confirmation.
 
+    A gappy SAME-TF cross-symbol feed (a session-bounded symbol requested at the
+    chart's own TF on a 24/7 chart) rides the same intraday path: the child is
+    gap-compacted, and ``_get_confirmed_time`` clamps the chart bar time to
+    these opens so gap bars confirm nothing new.
+
     Riding the real opens (clamp for single-period / intraday, walk for
     multi-period D/W/M) makes ``new_period`` fire only on real bars: between them
     ``gaps_off`` holds the last value and ``gaps_on`` emits ``na``, both matching
@@ -1339,7 +1366,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # arithmetic next-period boundary (see ``_get_confirmed_time``). Needs the
         # session schedule; ``None`` (no schedule, or a bar outside it) keeps the
         # grid clamp.
-        if not is_dwm and sec_hours:
+        if not is_dwm and sec_hours and not state.same_timeframe:
             period_ms = tf_module.in_seconds(state.timeframe) * 1000
             if si.has_schedule_history:
                 # The trading-day roll keys off the flat (newest) session opens;
