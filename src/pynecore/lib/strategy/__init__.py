@@ -2584,6 +2584,12 @@ class SimPosition(PositionBase):
         # so the standalone affordability test must use the bar-start equity too.
         bar_start_size = self.size
         bar_start_equity = float(self.equity)
+        # Sign of the position as established by an entry filled earlier in THIS
+        # bar-open cycle. A later opposite entry that would reverse such a
+        # same-bar position is margin-gated on BOTH legs at once (see the
+        # same-bar reversal check below); a prior-bar position never set this,
+        # so it keeps the normal net-margin reversal.
+        same_bar_entry_sign = 0.0
 
         # Process Market orders
         for order in list(self.market_orders.values()):
@@ -2629,6 +2635,29 @@ class SimPosition(PositionBase):
                     if order.size == 0.0:
                         self._remove_order(order)
                         continue
+                # Same-bar opposite entry reversing a position OPENED earlier in
+                # this same bar-open cycle: TV margins BOTH legs at once (the
+                # closing leg's margin is not freed before the opening leg is
+                # gated), so the reversing entry is rejected — the first entry's
+                # position is kept — when old + new margin exceeds equity.
+                # Verified with a live TradingView probe on BINANCE:BTCUSDT: a
+                # same-bar 0.9 BTC pair (~55% equity each leg) rejects the flip,
+                # while a PRIOR-bar reversal at the same size fills (its close
+                # frees margin first — the normal net check below handles that).
+                if (same_bar_entry_sign != 0.0 and self.size != 0.0
+                        and self.sign == same_bar_entry_sign
+                        and order.sign == -same_bar_entry_sign):
+                    pv = syminfo.pointvalue
+                    ratio_old = (script.margin_short if self.sign < 0
+                                 else script.margin_long) / 100.0
+                    ratio_new = (script.margin_short if order.sign < 0
+                                 else script.margin_long) / 100.0
+                    old_margin = abs(self.size) * fill_price * pv * ratio_old
+                    new_margin = abs(self.size + order.size) * fill_price * pv * ratio_new
+                    if (old_margin + new_margin) - self.equity > abs(self.equity) * 1e-11:
+                        self._cancel_same_bar_reversal_closes(order)
+                        self._remove_order(order)
+                        continue
                 if self._entry_exceeds_margin_after_fill(order, fill_price):
                     # The reversal's new leg (opposite the bar-start position, with a
                     # same-bar close already filled) is allowed to fill and is trimmed by
@@ -2661,6 +2690,11 @@ class SimPosition(PositionBase):
             # bypass for a subsequent opposite over-margin entry on this bar.
             if order.order_type == _order_type_close and reversal_pre_sign != 0.0:
                 reversal_close_filled = True
+            # A filled market entry establishes the same-bar direction that a
+            # later opposite entry must both-legs-margin against (guard above).
+            elif (order.order_type == _order_type_entry
+                    and order.limit is None and order.stop is None):
+                same_bar_entry_sign = order.sign
 
         # Convert tick-based exit prices for entries that just filled this bar
         for order in self.exit_orders.values():
