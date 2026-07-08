@@ -2088,18 +2088,14 @@ class SimPosition(PositionBase):
             else:
                 cover_lots = int(raw_cover_lots)
         if cover_lots == 0 and rfactor > 1:
-            # Fractional-lot symbol with a sub-lot shortfall. TradingView's
-            # smallest margin-call trim is 4 lots: measured across 5367 corpus
-            # margin calls every fill is a multiple of 4 lots, and it never
-            # liquidates a whole contract on a multi-contract position. Only when
-            # the whole position is at or below one contract does TV close it
-            # entirely instead of trimming.
-            if quantity <= 1.0:
-                mc_lots = 0
-                margin_call_size = quantity
-            else:
-                mc_lots = 4
-                margin_call_size = mc_lots / rfactor
+            # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
+            # one whole contract, capped by the current position size. This holds
+            # at the open AND intrabar, regardless of position size
+            # (BINANCE:BTCUSDT 30m Gaussian Channel corpus: 43 margin calls that
+            # trim exactly 1.0 from 8+ contract positions — longs at the
+            # entry-fill open price, shorts at a high one tick above the open).
+            mc_lots = 0
+            margin_call_size = min(1.0, quantity)
         else:
             mc_lots = max(1, cover_lots * 4)
             margin_call_size = mc_lots / rfactor
@@ -3390,6 +3386,11 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     # lot multiple a hair below the integer (e.g. 173.432 * 1e4 ->
     # 1734319.9999999998); snap values within a few ULPs of an integer up before
     # the floor so an exact multiple is not truncated a whole lot down.
+    # Do NOT widen this tolerance to chase a single TV fill: raw lot counts
+    # 1.5e-9 contracts below an integer have filled the rounded-up size on TV
+    # (Gaussian Channel) while 4.1e-9-below ones truncated (Hybrid) — those
+    # razor ties come from TV-vs-PyneCore netprofit FP drift, not from a
+    # quantization rule, and a wider snap breaks more fills than it fixes.
     scaled = abs(qty) * rfactor
     nearest = round(scaled)
     lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
