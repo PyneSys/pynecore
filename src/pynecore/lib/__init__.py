@@ -520,6 +520,12 @@ def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe:
     if tv_weekday not in session_info.days:
         return False
 
+    # A session whose start equals its end spans the full 24 hours -- this is
+    # Pine's "0000-0000" all-day session (the default of ``input.session``).
+    # The day of week is already validated above, so every bar on it qualifies.
+    if session_info.start_time == session_info.end_time:
+        return True
+
     # Get bar time components
     bar_time = bar_dt_local.time()
 
