@@ -330,9 +330,28 @@ class PriceOrderBook:
     __slots__ = ('price_levels', 'orders_at_price', 'order_prices')
 
     def __init__(self):
-        self.price_levels = []  # Sorted list of prices
-        self.orders_at_price = defaultdict(list)  # price -> [Order]
-        self.order_prices = defaultdict(set)  # Order -> {prices}
+        self.price_levels: list[float] = []  # Sorted list of prices
+        # Plain dict, NOT defaultdict: a stray read must never auto-create an
+        # empty bucket. ``price_levels`` (what the intrabar walk iterates) and
+        # the keys of ``orders_at_price`` must stay in lock-step; an orphan
+        # empty key would make ``add_order`` skip registering a level, silently
+        # dropping that leg from the walk. Reads use ``.get(price, ())``.
+        self.orders_at_price: dict[float, list[Order]] = {}  # price -> [Order]
+        self.order_prices: defaultdict[Order, set[float]] = defaultdict(set)  # Order -> {prices}
+
+    def _index_price(self, order: Order, price: float, existing: set) -> None:
+        """Register ``order`` at ``price`` in both the level list and the bucket.
+
+        The level-list insertion is gated on ``price_levels`` itself (the
+        structure the walk reads), not on ``orders_at_price``, so the two can
+        never desync into a dropped level.
+        """
+        if price in existing:
+            return
+        if price not in self.price_levels:
+            insort(self.price_levels, price)
+        self.orders_at_price.setdefault(price, []).append(order)
+        existing.add(price)
 
     def add_order(self, order: Order):
         """Add order to all its relevant price levels.
@@ -345,40 +364,25 @@ class PriceOrderBook:
         otherwise survive past `_remove_order` and re-fill on the next bar.
         """
         existing = self.order_prices[order]
-
-        # Add to stop price if exists
-        if order.stop is not None and order.stop not in existing:
-            price = order.stop
-            if price not in self.orders_at_price:
-                insort(self.price_levels, price)
-            self.orders_at_price[price].append(order)
-            existing.add(price)
-
-        # Add to limit price if exists
-        if order.limit is not None and order.limit not in existing:
-            price = order.limit
-            if price not in self.orders_at_price:
-                insort(self.price_levels, price)
-            self.orders_at_price[price].append(order)
-            existing.add(price)
-
-        # Add to trail price if exists
-        if order.trail_price is not None and order.trail_price not in existing:
-            price = order.trail_price
-            if price not in self.orders_at_price:
-                insort(self.price_levels, price)
-            self.orders_at_price[price].append(order)
-            existing.add(price)
+        if order.stop is not None:
+            self._index_price(order, order.stop, existing)
+        if order.limit is not None:
+            self._index_price(order, order.limit, existing)
+        if order.trail_price is not None:
+            self._index_price(order, order.trail_price, existing)
 
     def remove_order(self, order: Order):
         """Remove order from all price levels"""
         for price in list(self.order_prices[order]):
-            self.orders_at_price[price].remove(order)
-            if not self.orders_at_price[price]:
-                idx = bisect_left(self.price_levels, price)
-                if idx < len(self.price_levels) and self.price_levels[idx] == price:
-                    del self.price_levels[idx]
-                del self.orders_at_price[price]
+            bucket = self.orders_at_price.get(price)
+            if bucket is not None:
+                if order in bucket:
+                    bucket.remove(order)
+                if not bucket:
+                    idx = bisect_left(self.price_levels, price)
+                    if idx < len(self.price_levels) and self.price_levels[idx] == price:
+                        del self.price_levels[idx]
+                    del self.orders_at_price[price]
         del self.order_prices[order]
 
     def iter_orders(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
@@ -413,7 +417,7 @@ class PriceOrderBook:
                 levels.reverse()
             for p in levels:
                 # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price[p])
+                yield from list(self.orders_at_price.get(p, ()))
 
         elif min_price is not None:
             # Ascending from min_price
@@ -421,7 +425,7 @@ class PriceOrderBook:
             # Create a copy of price levels to avoid iteration issues when levels are removed
             for p in list(self.price_levels[min_idx:]):
                 # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price[p])
+                yield from list(self.orders_at_price.get(p, ()))
 
         elif max_price is not None:
             # Descending from max_price
@@ -434,20 +438,20 @@ class PriceOrderBook:
             # Note: reversed() already creates an iterator over a copy of the slice
             for p in reversed(list(self.price_levels[:max_idx])):
                 # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price[p])
+                yield from list(self.orders_at_price.get(p, ()))
 
         elif desc:
             # All orders, descending
             # Create a copy of price levels to avoid iteration issues when levels are removed
             for p in reversed(list(self.price_levels)):
                 # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price[p])
+                yield from list(self.orders_at_price.get(p, ()))
         else:
             # All orders, ascending
             # Create a copy of price levels to avoid iteration issues when levels are removed
             for p in list(self.price_levels):
                 # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price[p])
+                yield from list(self.orders_at_price.get(p, ()))
 
     def clear(self):
         """Clear all orders"""
