@@ -24,17 +24,14 @@ def main():
 
 
 def __test_lookahead_modes_historical_equivalence__(csv_reader, runner, log):
-    """Historically off / last_closed / on agree on ``close`` (all give the last-closed bar).
+    """Off / last_closed / on agree on ``close`` for a SAME-timeframe security.
 
-    In historical/backtest mode all three lookahead modes are functionally
-    equivalent for ``close`` — they all produce the most-recently-closed
-    security bar value. ``lookahead_on`` historically falls back to
-    ``lookahead_off`` semantics (no developing exposure) because the
-    chart-derived developing OHLCV pipeline is live-mode-only.
-
-    Live mode is where ``lookahead_on`` diverges; this historical
-    equivalence guards future live-mode work from accidentally breaking the
-    backtest path.
+    The security here is requested at ``timeframe.period`` (same TF as the
+    chart), so there is no separate HTF period to step into — every lookahead
+    mode resolves to the current bar's own value. This equivalence is
+    lookahead-independent and holds in TradingView too. (For a genuine HTF,
+    ``lookahead_on`` steps into the containing period and diverges from
+    ``off`` — see ``test_018_htf_lookahead_on_containing``.)
     """
     from pynecore import lib
 

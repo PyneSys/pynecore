@@ -69,15 +69,17 @@ class Lookahead(Enum):
         bar runs with ``barstate.isconfirmed=False`` and OHLCV aggregated
         from the chart timeframe by ``HTFAggregator``; on HTF period
         boundaries the closed bar is delivered first (snapshot saved),
-        then the fresh developing bar. In historical mode there is no
-        chart-derived developing OHLCV, so ``_get_confirmed_time`` falls
-        back to ``OFF`` semantics (most recently closed bar) — historical
-        backtests therefore never expose a developing security close,
-        avoiding TV's classical historical future-leak. The TV idiom
-        ``request.security(..., lookahead_on)[1]`` remains TV-compatible
-        in both modes because ``close[1]`` is always the previously
-        closed bar regardless of whether ``close[0]`` is developing or
-        the same closed bar.
+        then the fresh developing bar. In historical/backtest mode the
+        containing period's bar is already complete in the child's data
+        file, so the child reads its final OHLCV: a bare ``close`` on the
+        developing period reproduces TV's classical historical future-leak,
+        and the inner-``[1]`` daily-pivot idiom
+        ``request.security(sym, "D", close[1], lookahead_on)`` reads the
+        just-closed prior period (yesterday) — matching TradingView. Use
+        ``LAST_CLOSED`` for the repaint-free alternative. The outer-``[1]``
+        form ``request.security(..., close, lookahead_on)[1]`` is also
+        TV-compatible because ``close[1]`` on the chart series is the
+        previously delivered value.
 
         **Cross-symbol HTF** — when the security symbol differs from the
         chart symbol there is no chart-side aggregator (the chart OHLCV
@@ -368,10 +370,13 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         ``lookahead_off`` merge rule: an HTF bar's final value is carried already
         by the chart bar whose close coincides with the HTF bar's close (the
         period's last chart bar), not by the next period's first bar.
-      * ``ON``: target is the CONTAINING period's opening time — the subprocess
-        steps into the developing HTF bar (live mode supplies developing OHLCV
-        via the SyncBlock; historical mode falls back to OFF semantics because
-        there is no chart-derived developing OHLCV to feed the subprocess).
+      * ``ON`` (same-symbol HTF, an aggregator exists): target is the CONTAINING
+        period's opening time — the subprocess steps into the developing HTF bar.
+        Live mode supplies developing OHLCV via the SyncBlock; historical/backtest
+        mode reads the containing period's already-complete bar straight from the
+        child's data file (TV's lookahead_on future-leak for a bare ``close``, the
+        just-closed prior period for an inner ``close[1]``). Cross-symbol HTF has
+        no aggregator and keeps OFF (last-closed) semantics.
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
@@ -426,13 +431,22 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
                 return opens[-1]
         return state.last_confirmed
 
-    if (state.lookahead is Lookahead.ON and state.is_live
+    if (state.lookahead is Lookahead.ON
             and state.htf_aggregator is not None):
-        # Live ``lookahead_on`` with a chart-side aggregator: step into the
-        # containing (developing) period. Cross-symbol HTF has no aggregator
-        # (chart OHLCV is the wrong instrument), so the subprocess keeps
-        # closed-bar semantics instead and the chart-side read returns ``na``
-        # while a period is open (``na_on_developing``).
+        # ``lookahead_on`` on a same-symbol HTF (an aggregator exists): step into
+        # the containing period rather than the last-closed one — TV faithful.
+        # In backtest/historical mode the containing period's bar is already
+        # complete in the child's data file, so the child reads its final OHLCV:
+        # a bare ``close`` reproduces TV's classical lookahead_on future-leak,
+        # while an ``<expr>[1]`` inside the security (the daily-pivot idiom
+        # ``security(sym, "D", close[1], lookahead_on)``) reads the just-closed
+        # prior period — the whole point of the idiom. ``lookahead_last_closed``
+        # remains the repaint-free alternative. Cross-symbol HTF has no
+        # aggregator (chart OHLCV is the wrong instrument), so it keeps
+        # closed-bar semantics and the chart-side read returns ``na`` while a
+        # period is open (``na_on_developing``). ``chart_time`` (not
+        # ``close_time``) selects the containing period so the last chart bar of
+        # a period still maps to that period, not the next.
         if state.session_starts is not None:
             # Off-grid intraday session → anchor HTF bars to the session open,
             # using the security's own exchange timezone.

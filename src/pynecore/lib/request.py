@@ -30,17 +30,18 @@ def security(*args, **kwargs):
       "last closed" in any mode. Functionally identical to
       ``lookahead_off`` in PyneCore; prefer it when "last closed" is the
       explicit intent (no reliance on the TV ``close[1]`` idiom).
-    - ``barmerge.lookahead_on``: TV-compatible. Same-symbol HTF: in live
-      mode the security context steps into the containing (developing) HTF
-      bar with ``barstate.isconfirmed=False`` and OHLCV aggregated from the
-      chart timeframe; in historical mode it falls back to closed-only
-      semantics (equivalent to ``lookahead_off``) — historical backtests
-      never expose a developing security close. Cross-symbol HTF: the
-      developing bar cannot be aggregated (wrong instrument), so the chart
-      bar inside an open HTF period reads as ``na``. ``close[1]`` at the
-      period boundary still delivers the just-closed cross-symbol HTF
-      close, so the TV ``lookahead_on + close[1]`` idiom continues to
-      work. Same behaviour in historical and live mode.
+    - ``barmerge.lookahead_on``: TV-compatible. Same-symbol HTF: the
+      security context steps into the containing HTF bar. In live mode the
+      developing bar runs with ``barstate.isconfirmed=False`` and OHLCV
+      aggregated from the chart timeframe; in historical/backtest mode the
+      containing bar is already complete in the data file, so a bare
+      ``close`` reads its final value (TV's classical future-leak) while an
+      inner ``close[1]`` reads the just-closed prior period — the daily-pivot
+      idiom ``security(sym, "D", close[1], lookahead_on)``. Cross-symbol HTF:
+      the developing bar cannot be aggregated (wrong instrument), so the
+      chart bar inside an open HTF period reads as ``na``; ``close[1]`` at
+      the period boundary still delivers the just-closed cross-symbol HTF
+      close, so the idiom continues to work.
 
     This function exists for IDE support only. In compiled scripts, the
     SecurityTransformer rewrites all calls into the signal/write/read
