@@ -163,7 +163,7 @@ def __test_security_protocol_write_read__(log):
     rb_a = ResultBlock("sec_a", create=True, version=0)
     rb_b = ResultBlock("sec_b", create=True, version=0)
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _, _ = create_security_protocol(
         "sec_a", sb, rb_a, sec_ids, _locks_for(sec_ids),
     )
 
@@ -253,7 +253,7 @@ def __test_ltf_protocol_accumulation__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_ltf", create=True, version=0)
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
         "sec_ltf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
@@ -294,7 +294,7 @@ def __test_ltf_protocol_empty_flush__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_ltf2", create=True, version=0)
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
         "sec_ltf2", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
@@ -319,7 +319,7 @@ def __test_ltf_htf_protocol_no_flush__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_htf", create=True, version=0)
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
         "sec_htf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=False,
     )
 

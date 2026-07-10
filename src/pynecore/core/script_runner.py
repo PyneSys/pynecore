@@ -1257,6 +1257,7 @@ class ScriptRunner:
                             _ohlcv_tuple,
                             sec_state.chart_type,
                             chart_tf,
+                            sec_state.plain_ltf,
                         ),
                         daemon=True,
                     )
@@ -1302,7 +1303,19 @@ class ScriptRunner:
                     sec_state.timeframe = resolved_tf
                     same_tf = (resolved_tf == current_chart_tf)
                     sec_state.same_timeframe = same_tf
-                    if same_tf:
+                    # Plain security resolving to a timeframe FINER than the
+                    # chart's: scalar LTF merge (last/first intrabar of the
+                    # chart bar) — no resampler, no HTF machinery.
+                    plain_ltf = False
+                    if not same_tf and not sec_state.is_ltf:
+                        from ..lib import timeframe as tf_module
+                        sec_seconds = tf_module.in_seconds(resolved_tf)
+                        chart_seconds = tf_module.in_seconds(current_chart_tf)
+                        plain_ltf = 0 < sec_seconds < chart_seconds
+                    sec_state.plain_ltf = plain_ltf
+                    sec_state.plain_ltf_span_ms = (
+                        sec_seconds * 1000 if plain_ltf else 0)  # noqa - bound above when plain_ltf
+                    if same_tf or plain_ltf:
                         sec_state.resampler = None
                     elif sec_state.resampler is None:
                         from .resampler import Resampler
@@ -1331,7 +1344,7 @@ class ScriptRunner:
                     # intraday session-anchor decision (the placeholder TF at
                     # setup may have been the chart TF, and the syminfo may only
                     # now be resolved).
-                    if same_tf:
+                    if same_tf or plain_ltf:
                         sec_state.session_starts = None
                         sec_state.session_tz = None
                     else:
@@ -1339,6 +1352,18 @@ class ScriptRunner:
                         si = self._sec_syminfos.get(sid) or self.syminfo
                         sec_state.session_starts, sec_state.session_tz = (
                             resolve_session_anchor(si, resolved_tf, self.tz))
+                    if plain_ltf and sec_state.chart_resampler is None:
+                        # Single-period civil D/W/M chart: the LTF target needs
+                        # the chart bar's civil period end (setup only attaches
+                        # this for static ``is_ltf`` contexts).
+                        from ..lib import timeframe as tf_module
+                        from .resampler import Resampler
+                        # noinspection PyProtectedMember
+                        chart_mod, chart_mult = tf_module._process_tf(current_chart_tf)
+                        if chart_mod in ('D', 'W', 'M') and chart_mult == 1:
+                            sec_state.chart_resampler = (
+                                Resampler.get_resampler(current_chart_tf))
+                            sec_state.chart_dwm_modifier = chart_mod
                     # Now that the real symbol/timeframe are known, decide
                     # whether the live HTF transport applies. ``setup_security_states``
                     # built the aggregator under the assumption ``sym is None``
@@ -1347,7 +1372,7 @@ class ScriptRunner:
                     # promoted from chart-TF to HTF.
                     is_same_symbol = (chart_ticker is None
                                       or str(base_symbol) == chart_ticker)
-                    needs_aggregator = (not same_tf) and is_same_symbol
+                    needs_aggregator = (not same_tf) and (not plain_ltf) and is_same_symbol
                     if needs_aggregator and sec_state.htf_aggregator is None:
                         from .htf_aggregator import HTFAggregator
                         sec_state.htf_aggregator = HTFAggregator(
@@ -1376,6 +1401,7 @@ class ScriptRunner:
                     # just-closed close.
                     sec_state.na_on_developing = (
                             (not same_tf)
+                            and (not plain_ltf)
                             and (not is_same_symbol)
                             and sec_state.lookahead is Lookahead.ON
                     )

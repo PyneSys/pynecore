@@ -396,6 +396,7 @@ def security_process_main(
         ohlcv_tuple: bool = False,
         chart_type: 'str | None' = None,
         chart_timeframe: 'str | None' = None,
+        plain_ltf: bool = False,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -429,6 +430,11 @@ def security_process_main(
         ``lib._main_timeframe`` so ``timeframe.main_period`` in this child reports
         the chart TF instead of the context's own period (the child has no
         ``lib._script`` to carry it).
+    :param plain_ltf: Scalar ``request.security()`` with a timeframe finer than
+        the chart's. The chart signals every bar with the bar's own period as
+        the target; an empty round (no intrabar in the period — a feed gap)
+        must keep the previous value (TradingView ``gaps_off`` forward-fill)
+        instead of writing ``na``.
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
@@ -453,7 +459,7 @@ def security_process_main(
 
     # Create protocol functions for security context
     (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
-     ltf_take_value, ltf_publish) = create_security_protocol(
+     ltf_take_value, ltf_publish, ltf_buffer_len) = create_security_protocol(
         sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
     )
 
@@ -1152,6 +1158,14 @@ def security_process_main(
             # not re-signal this period, so we must block briefly until the
             # bar arrives instead of falling through to ``write_na``.
             bars_run = False
+            # File-backed LTF: values written while replaying feed bars that
+            # open BEFORE the chart bar's own period (cold start mid-feed,
+            # chart session gaps) are expression-state warmup, not array
+            # content — TradingView arrays hold only the bar's own period.
+            ltf_period_start = (
+                sync_block.get_ltf_period_start(sec_id) if is_ltf else 0
+            )
+            ltf_prefix_len = 0
             grace_deadline: float | None = None
             if live_streamer is not None:
                 grace_deadline = monotonic() + live_bar_grace_seconds
@@ -1209,6 +1223,8 @@ def security_process_main(
                 # ``save()`` below captures the last bar's HA as the baseline.
                 _ha_commit()
 
+                if is_ltf and bar_time_ms < ltf_period_start:
+                    ltf_prefix_len = ltf_buffer_len()  # noqa - non-None when is_ltf
                 current_bar += 1
                 bars_run = True
 
@@ -1218,8 +1234,8 @@ def security_process_main(
                     snap.save()
 
             if is_ltf:
-                flush_fn()
-            elif not bars_run:
+                flush_fn(ltf_prefix_len)
+            elif not bars_run and not plain_ltf:
                 with result_locks[sec_id]:
                     write_na(result_block, sync_block)
 

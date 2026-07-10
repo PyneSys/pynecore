@@ -28,11 +28,24 @@ from multiprocessing.shared_memory import SharedMemory
 #   offset 72: int64   dev_time        (8 bytes) — developing HTF bar timestamp (ms);
 #                       reused as period_end_exclusive (ms) by the live LTF-window
 #                       path, which carries no pushed OHLCV (see FLAG_LTF_WINDOW)
+#   offset 80: uint32  write_seq       (4 bytes) — bumped on every result write
+#                       (value or na); cache key for the security-child
+#                       cross-context read cache (version alone only tracks
+#                       reallocation, not writes)
+#   offset 84: 4 bytes pad (alignment to 88)
+#   offset 88: int64   ltf_period_start (8 bytes) — file-backed LTF rounds: the
+#                       chart bar's period START (ms). The child runs every
+#                       feed bar up to target_time for expression state, but
+#                       only values written at/after this instant belong in
+#                       the flushed intrabar array (TradingView arrays hold
+#                       only the bar's OWN period).
 #
-# Total per slot: 80 bytes
+# Total per slot: 96 bytes
 SLOT_FORMAT = '<qIIqB'
-SLOT_SIZE = 80
+SLOT_SIZE = 96
 SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 25 bytes — original fields only
+_WRITE_SEQ_OFFSET = 80
+_LTF_PERIOD_START_OFFSET = 88
 
 # Offset of the developing-bar block within a slot.
 _DEV_OHLCV_OFFSET = 32
@@ -170,6 +183,27 @@ class SyncBlock:
         off = self._offset(sec_id)
         return struct.unpack_from('<II', self._buf, off + 8)
 
+    def set_ltf_period_start(self, sec_id: str, period_start_ms: int) -> None:
+        """Set the file-backed LTF round's chart-bar period start (ms)."""
+        off = self._offset(sec_id) + _LTF_PERIOD_START_OFFSET
+        struct.pack_into('<q', self._buf, off, period_start_ms)
+
+    def get_ltf_period_start(self, sec_id: str) -> int:
+        """Read the file-backed LTF round's chart-bar period start (ms)."""
+        off = self._offset(sec_id) + _LTF_PERIOD_START_OFFSET
+        return struct.unpack_from('<q', self._buf, off)[0]
+
+    def bump_write_seq(self, sec_id: str) -> None:
+        """Increment the slot's write sequence (wraps at 2^32)."""
+        off = self._offset(sec_id) + _WRITE_SEQ_OFFSET
+        seq = struct.unpack_from('<I', self._buf, off)[0]
+        struct.pack_into('<I', self._buf, off, (seq + 1) & 0xFFFFFFFF)
+
+    def get_write_seq(self, sec_id: str) -> int:
+        """Read the slot's write sequence."""
+        off = self._offset(sec_id) + _WRITE_SEQ_OFFSET
+        return struct.unpack_from('<I', self._buf, off)[0]
+
     def set_flags(self, sec_id: str, flags: int):
         """Set the flags byte."""
         off = self._offset(sec_id)
@@ -298,6 +332,7 @@ class ResultBlock:
             self._buf[:len(data)] = data
 
         sync_block.set_result_meta(self._sec_id, self._version, len(data))
+        sync_block.bump_write_seq(self._sec_id)
         return self._version
 
     def read(self, size: int) -> bytes:
@@ -332,6 +367,8 @@ class ResultReader:
         self._sec_id = sec_id
         self._shm: SharedMemory | None = None
         self._version: int = -1
+        self._cached_seq: int = -1
+        self._cached_value = None
 
     def read(self, sync_block: SyncBlock, default=None):
         """
@@ -359,6 +396,28 @@ class ResultReader:
         buf = shm.buf
         assert buf is not None
         return pickle.loads(buf[:result_size])
+
+    def read_cached(self, sync_block: SyncBlock, default=None):
+        """Like :meth:`read`, but unpickle only when the slot's write sequence
+        changed since the last call — repeated reads of an unchanged result
+        return the SAME cached object.
+
+        For the security-child cross-context path only: a child re-runs the
+        whole script per bar (per intrabar for LTF), so it re-reads every peer
+        context's latest value on each run. Without the cache a peer's large
+        LTF array (tens of thousands of elements after a deep first round) is
+        re-unpickled per intrabar — quadratic work that turns a 30-second run
+        into hours. The trade-off is aliasing: a script mutating the returned
+        container would poison subsequent reads, so the chart-side protocol
+        keeps the fresh-unpickle :meth:`read`.
+        """
+        seq = sync_block.get_write_seq(self._sec_id)
+        if seq == self._cached_seq:
+            return self._cached_value if self._cached_value is not None else default
+        value = self.read(sync_block, default)
+        self._cached_seq = seq
+        self._cached_value = None if value is default else value
+        return value
 
     def close(self):
         """Close the reader's shared memory handle."""
@@ -393,4 +452,5 @@ def write_na(result_block: ResultBlock, sync_block: SyncBlock) -> int:
         result_block.version,
         0  # zero size = no data = na
     )
+    sync_block.bump_write_seq(result_block.sec_id)
     return result_block.version

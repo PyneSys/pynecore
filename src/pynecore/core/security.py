@@ -214,6 +214,16 @@ class SecurityState:
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False
 
+    # Plain ``request.security()`` with a timeframe FINER than the chart's
+    # (scalar return, unlike ``is_ltf``). TradingView merge rule (verified on
+    # captured references): ``lookahead_off`` returns the expression's value on
+    # the LAST intrabar of each chart bar, ``lookahead_on`` on the FIRST. The
+    # chart side therefore targets the chart bar's own period end (OFF) or open
+    # (ON) and the child's last per-intrabar write wins. ``plain_ltf_span_ms``
+    # caches the security period in ms for the live developing-bar clamp.
+    plain_ltf: bool = False
+    plain_ltf_span_ms: int = 0
+
     # Synthetic chart type requested via ``ticker.heikinashi()`` etc. ``None`` is
     # an ordinary feed. When set (currently only ``"heikinashi"``), it is passed
     # to the security child, which applies the chart-type transform per bar
@@ -626,7 +636,8 @@ def create_chart_protocol(
                 # HTF). A deferred symbol/timeframe context is recomputed by the
                 # resolver below instead.
                 state.na_on_developing = (
-                    not state.is_ltf and not state.same_timeframe
+                    not state.is_ltf and not state.plain_ltf
+                    and not state.same_timeframe
                     and state.htf_aggregator is None
                     and state.lookahead is Lookahead.ON
                 )
@@ -644,6 +655,50 @@ def create_chart_protocol(
 
         # noinspection PyProtectedMember
         chart_time = lib._time
+
+        if state.plain_ltf:
+            # Plain (scalar) request.security with a timeframe FINER than the
+            # chart's. TradingView merge rule: ``lookahead_off`` returns the
+            # expression value on the LAST intrabar of the chart bar's own
+            # period, ``lookahead_on`` on the FIRST. The child's historical
+            # loop runs every feed bar with ``bar_open <= target`` and the
+            # last per-intrabar write wins, so the target IS the merge rule:
+            # the bar's period end for OFF, the bar's open for ON.
+            if state.lookahead is Lookahead.ON:
+                target_time = chart_time
+            elif (state.chart_dwm_modifier and state.chart_resampler is not None
+                    and state.chart_resampler.get_bar_time(chart_time, state.tz)
+                    == chart_time):
+                # Single-period civil D/W/M chart bar: no fixed arithmetic
+                # span (``chart_off`` is 0) — target the civil period end.
+                target_time = _next_civil_period_open(
+                    state.chart_dwm_modifier, chart_time, state.tz) - 1
+            else:
+                target_time = chart_time + state.chart_off
+            # A developing live chart bar's period end lies in the future —
+            # clamp to the last surely-closed intrabar so the child never
+            # blocks waiting for intrabars that have not closed yet.
+            if state.is_live and not lib.barstate.isconfirmed and state.plain_ltf_span_ms:
+                now_ms = int(datetime.now().timestamp() * 1000)
+                elapsed_close = (now_ms // state.plain_ltf_span_ms
+                                 ) * state.plain_ltf_span_ms - 1
+                if elapsed_close < target_time:
+                    target_time = elapsed_close
+            # Prefix skip: a chart bar whose whole period ends before the LTF
+            # feed's first bar cannot contain an intrabar — TradingView
+            # returns ``na`` before the LTF series begins.
+            if state.ltf_first_ms is not None and target_time < state.ltf_first_ms:
+                state.ltf_skip = True
+                state.new_period = True
+                state.needs_wait = False
+                return
+            state.ltf_skip = False
+            state.new_period = True
+            state.data_ready.clear()
+            sync_block.set_target_time(sec_id, target_time)
+            state.advance_event.set()
+            state.needs_wait = True
+            return
 
         if state.is_ltf:
             # Live streaming LTF (PluginSymbol source): the chart bar may be
@@ -720,9 +775,13 @@ def create_chart_protocol(
                 state.needs_wait = False
                 return
             state.ltf_skip = False
-            # LTF: every chart bar needs intrabar data — always signal
+            # LTF: every chart bar needs intrabar data — always signal. The
+            # period start bounds the flushed array to the bar's OWN intrabars:
+            # the child still replays any earlier feed bars for expression
+            # state, but their values are prefix, not array content.
             state.new_period = True
             state.data_ready.clear()
+            sync_block.set_ltf_period_start(sec_id, chart_time)
             sync_block.set_target_time(sec_id, ltf_target_time)
             state.advance_event.set()
             state.needs_wait = True
@@ -994,9 +1053,11 @@ def create_security_protocol(
                          readers acquire ``result_locks[<peer sid>]``.
     :param is_ltf: If True, enable LTF accumulation mode.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush,
-             ltf_take_value, ltf_publish). ``flush``/``ltf_take_value``/
-             ``ltf_publish`` are None when ``is_ltf=False``; ``flush`` serves the
-             file-backed array path, the latter two the live LTF-window path.
+             ltf_take_value, ltf_publish, buffer_len). ``flush``/
+             ``ltf_take_value``/``ltf_publish``/``buffer_len`` are None when
+             ``is_ltf=False``; ``flush``/``buffer_len`` serve the file-backed
+             array path, ``ltf_take_value``/``ltf_publish`` the live LTF-window
+             path.
     """
     readers: dict[str, ResultReader] = {
         sid: ResultReader(sid) for sid in all_sec_ids
@@ -1013,10 +1074,18 @@ def create_security_protocol(
         def __sec_write__(_sid: str, value, _scope_id=None):
             _buffer.append(value)
 
-        def flush():
+        def flush(skip: int = 0):
+            """Publish the round's intrabar array. ``skip`` drops the first N
+            buffered values — feed bars the round replayed for expression
+            state but which open BEFORE the chart bar's own period (a cold
+            start mid-feed, or intrabars in a chart session gap). TradingView
+            arrays carry only the bar's own period."""
             with own_lock:
-                write_result(result_block, sync_block, _buffer.copy())
+                write_result(result_block, sync_block, _buffer[skip:])
             _buffer.clear()
+
+        def buffer_len() -> int:
+            return len(_buffer)
 
         def ltf_take_value():
             """Return the value written by the latest intrabar run, clearing the
@@ -1041,10 +1110,15 @@ def create_security_protocol(
         flush = None
         ltf_take_value = None
         ltf_publish = None
+        buffer_len = None
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
+        # ``read_cached``: the child re-runs the script per (intra)bar, so a
+        # peer context's unchanged result must not be re-unpickled every run —
+        # a peer's deep-first-round LTF array would otherwise make the replay
+        # quadratic (hours instead of seconds). See ResultReader.read_cached.
         with result_locks[sid]:
-            return readers[sid].read(sync_block, default)
+            return readers[sid].read_cached(sync_block, default)
 
     def __sec_wait__(_sid: str, _scope_id=None):
         pass
@@ -1054,7 +1128,7 @@ def create_security_protocol(
             r.close()
 
     return (__sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup,
-            flush, ltf_take_value, ltf_publish)
+            flush, ltf_take_value, ltf_publish, buffer_len)
 
 
 # Representative dates for the off-grid session probe — one on each side of the
@@ -1312,11 +1386,14 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     modifier, multiplier = tf_module._process_tf(state.timeframe)
     is_dwm = modifier in ('D', 'W', 'M')
 
+    # LTF contexts (array windows and the scalar plain-LTF merge alike) never
+    # use HTF confirmation — their target is the chart bar's own period.
+    if state.is_ltf or state.plain_ltf:
+        return
+
     if not is_dwm:
         # Intraday HTF: only a GAPPY feed needs the real-opens clamp (see above);
-        # a dense feed keeps the arithmetic grid. LTF runs its own machinery.
-        if state.is_ltf:
-            return
+        # a dense feed keeps the arithmetic grid.
         period_sec = tf_module.in_seconds(state.timeframe)
         with OHLCVReader(data_path) as reader:
             start_ts = reader.start_timestamp
@@ -1445,12 +1522,13 @@ def load_ltf_first_ms(state: SecurityState, data_path: str) -> None:
     ``__sec_read__`` return the empty-array default without touching shared
     memory. Backtest/file-backed only: a live ``PluginSymbol`` stream has no
     static first bar, so ``ltf_first_ms`` stays ``None`` and every chart bar
-    signals as before. No-op for non-LTF contexts.
+    signals as before. No-op for non-LTF contexts (``plain_ltf`` — the scalar
+    lower-timeframe merge — uses the same prefix skip, so it loads too).
 
     :param state: LTF security context state.
     :param data_path: Path to the child's OHLCV data file.
     """
-    if not state.is_ltf:
+    if not state.is_ltf and not state.plain_ltf:
         return
     from .ohlcv_file import OHLCVReader
     with OHLCVReader(data_path) as reader:
@@ -1530,6 +1608,7 @@ def setup_security_states(
         na_on_developing = False
         anchor_starts: 'list[SymInfoSession] | None' = None
         anchor_tz: ZoneInfo | None = None
+        plain_ltf = False
         if is_ltf:
             is_gaps_on = False
             same_tf = False
@@ -1539,7 +1618,15 @@ def setup_security_states(
             gaps_val = ctx.get('gaps', barmerge.gaps_off)
             is_gaps_on = gaps_val is barmerge.gaps_on
             same_tf = (timeframe == chart_timeframe)
-            resampler = None if same_tf else Resampler.get_resampler(timeframe)
+            # Plain security with a FINER timeframe than the chart: scalar
+            # LTF merge (last/first intrabar of the chart bar), no resampler,
+            # no HTF aggregator — the chart targets its own bar period.
+            if not same_tf:
+                sec_seconds = tf_module.in_seconds(timeframe)
+                chart_seconds = tf_module.in_seconds(chart_timeframe)
+                plain_ltf = 0 < sec_seconds < chart_seconds
+            resampler = (None if same_tf or plain_ltf
+                         else Resampler.get_resampler(timeframe))
 
             # A None value is a runtime-deferred (input-derived) lookahead; OFF
             # serves as the placeholder until the first ``__sec_signal__``
@@ -1600,14 +1687,17 @@ def setup_security_states(
             resampler=resampler,
             tz=tz,
             is_ltf=is_ltf,
+            plain_ltf=plain_ltf,
+            plain_ltf_span_ms=(tf_module.in_seconds(timeframe) * 1000
+                               if plain_ltf else 0),
             lookahead=lookahead_mode,
             htf_aggregator=htf_aggregator,
             na_on_developing=na_on_developing,
             session_starts=anchor_starts,
             session_tz=anchor_tz,
             chart_off=chart_off,
-            chart_resampler=chart_ltf_resampler if is_ltf else None,
-            chart_dwm_modifier=chart_ltf_modifier if is_ltf else '',
+            chart_resampler=chart_ltf_resampler if (is_ltf or plain_ltf) else None,
+            chart_dwm_modifier=chart_ltf_modifier if (is_ltf or plain_ltf) else '',
         )
         # data_ready starts SET so reads before first signal return na (via result_size=0)
         state.data_ready.set()
