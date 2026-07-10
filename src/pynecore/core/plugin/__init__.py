@@ -54,8 +54,9 @@ class Plugin(Generic[ConfigT]):
     Minimal base class for all PyneCore plugins.
 
     Generic over the config dataclass type.  Plugin authors should inherit
-    from a concrete subclass: :class:`ProviderPlugin`, :class:`ExtensionPlugin`,
-    :class:`CLIPlugin`, or a combination via multiple inheritance.
+    from a concrete subclass: :class:`ProviderPlugin`, :class:`LiveProviderPlugin`,
+    :class:`~pynecore.core.plugin.broker.BrokerPlugin`, :class:`CLIPlugin`,
+    or a combination via multiple inheritance.
 
     Example::
 

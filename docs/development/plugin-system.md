@@ -5,7 +5,7 @@ title: "Plugin System"
 description: "How to create plugins for PyneCore"
 icon: "extension"
 date: "2026-03-30"
-lastmod: "2026-03-30"
+lastmod: "2026-07-10"
 draft: false
 toc: true
 categories: ["Development"]
@@ -29,8 +29,7 @@ Plugin (base)
 ├── ProviderPlugin           — Offline OHLCV data provider
 │   └── LiveProviderPlugin   — WebSocket/streaming data (extends ProviderPlugin)
 │       └── BrokerPlugin     — Order execution (extends LiveProviderPlugin)
-├── CLIPlugin                — CLI subcommands and parameter hooks
-└── ExtensionPlugin          — Hook-based script extension (planned)
+└── CLIPlugin                — CLI subcommands and parameter hooks
 ```
 
 `LiveProviderPlugin` inherits from `ProviderPlugin` — every live provider can also download
@@ -38,8 +37,8 @@ historical data.  See [Live Mode](../advanced/live-mode.md) for data-side detail
 
 `BrokerPlugin` inherits from `LiveProviderPlugin` — an exchange that routes orders can
 also deliver the live market data those orders trade against.  Order execution is handled
-by dedicated per-exchange broker plugins (`pynecore-bybit`, `pynecore-binance`,
-`pynecore-capitalcom`, etc.) — not by standalone data providers.
+by dedicated per-exchange broker plugins (`pynesys-pynecore-capitalcom`,
+`pynesys-pynecore-ctrader`) — not by standalone data providers.
 
 Multiple inheritance combines capabilities:
 
@@ -148,7 +147,9 @@ This creates `pyne foo bar`.
 
 #### 2. Parameter hooks via `cli_params()`
 
-Inject flags into existing commands (currently `run` is pluggable):
+Inject flags into existing commands (`run` and `data download` are currently
+pluggable; nested subcommands are addressed by their space-separated path,
+e.g. `"data download"`):
 
 ```python
 import click
@@ -199,8 +200,10 @@ checked to prevent ambiguity.
 Provides offline OHLCV data download capability.  Used by `pyne data download`.
 
 ```python
+from datetime import datetime
 from dataclasses import dataclass
 from pynecore.core.plugin import ProviderPlugin, override
+from pynecore.core.syminfo import SymInfo
 
 
 @dataclass
@@ -217,14 +220,36 @@ class FooConfig:
 class FooProvider(ProviderPlugin[FooConfig]):
     Config = FooConfig
 
+    @classmethod
     @override
-    def get_available_symbols(self) -> list[str]:
+    def to_tradingview_timeframe(cls, timeframe: str) -> str:
+        ...  # e.g. "1h" -> "60"
+
+    @classmethod
+    @override
+    def to_exchange_timeframe(cls, timeframe: str) -> str:
+        ...  # e.g. "60" -> "1h"
+
+    @override
+    def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
         ...
 
     @override
-    def download(self, days_back, on_progress=None, extra_field_names=None):
-        ...
+    def update_symbol_info(self) -> SymInfo:
+        ...  # fetch symbol metadata, including opening hours and sessions
+
+    @override
+    def download_ohlcv(self, time_from: datetime, time_to: datetime,
+                       on_progress=None, limit=None, with_extra=False):
+        ...  # fetch bars and persist them via self.save_ohlcv_data(...)
 ```
+
+Five abstract methods are required: the two timeframe converters (TradingView
+format like `"60"` / `"1D"` ↔ the exchange-native format), `get_list_of_symbols`,
+`update_symbol_info` (must return a fully populated `SymInfo`, including
+`session_starts` / `session_ends` — populate them even for 24/7 markets), and
+`download_ohlcv` (fetch the `time_from`..`time_to` window and write records
+with `save_ohlcv_data`).
 
 The `Config` dataclass is automatically turned into a self-healing TOML file
 at `workdir/config/plugins/<name>.toml` — generated with all defaults commented
@@ -248,16 +273,23 @@ full type information on `self.config` — no more `object | None` warnings.
 A single provider plugin can serve many brokers/exchanges (CCXT reaches 100+). Declare it with the `multi_broker` class attribute and the provider string's broker segment is parsed for you:
 
 ```python
+from pynecore.core.plugin import Broker
+
+
 class FooProvider(ProviderPlugin[FooConfig]):
     Config = FooConfig
     multi_broker = True
 
     @classmethod
     @override
-    def get_list_of_brokers(cls) -> list[str]:
+    def get_list_of_brokers(cls) -> list[Broker]:
         """Powers `pyne data download foo --list-brokers`."""
-        return ["broker-a", "broker-b"]
+        return [Broker("broker-a", "Broker A"), Broker("broker-b")]
 ```
+
+`Broker` is a small NamedTuple: `id` is the space-free selector used in the
+provider string and the saved filename, `name` is an optional human-readable
+display name.
 
 With `multi_broker = True`, a provider string like `foo:BROKER:SYMBOL@TF` is split so the segment after the provider name becomes the broker. The broker is then **re-folded into the symbol** before it reaches your plugin — your `__init__` receives `"BROKER:SYMBOL"` and splits it as needed, exactly how providers have always received their symbol, so existing parsing keeps working. The optional `get_list_of_brokers()` classmethod powers `--list-brokers`; leave it unimplemented (the default raises `NotImplementedError`) when the broker set can't be enumerated.
 
@@ -271,14 +303,16 @@ exchange-specific calls.  The engine handles idempotency, retry, and reconcile
 
 ```python
 from dataclasses import dataclass
-from pynecore.core.plugin import BrokerPlugin, override
+from pynecore.core.plugin import LiveProviderConfig, override
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.models import (
-    DispatchEnvelope, ExchangeCapabilities, ExchangeOrder, ExchangePosition,
+    CapabilityLevel, DispatchEnvelope, ExchangeCapabilities,
+    ExchangeOrder, ExchangePosition,
 )
 
 
 @dataclass
-class FooBrokerConfig:
+class FooBrokerConfig(LiveProviderConfig):
     """Foo exchange credentials."""
     api_key: str = ""
     api_secret: str = ""
@@ -297,21 +331,27 @@ class FooBroker(BrokerPlugin[FooBrokerConfig]):
 
     @override
     def get_capabilities(self) -> ExchangeCapabilities:
+        # Every field is a CapabilityLevel (UNSUPPORTED / SOFTWARE /
+        # PARTIAL_NATIVE / NATIVE), never a bool — see
+        # pynecore.core.broker.models for the full struct.
         return ExchangeCapabilities(
-            stop_order=True,
-            tp_sl_bracket=True,
-            reduce_only=True,
-            # ... see pynecore.core.broker.models for the full struct
+            stop_order=CapabilityLevel.NATIVE,
+            tp_sl_bracket=CapabilityLevel.NATIVE,
+            reduce_only=CapabilityLevel.NATIVE,
         )
 
     @override
-    async def execute_entry(self, envelope: DispatchEnvelope) -> ExchangeOrder:
+    async def execute_entry(self, envelope: DispatchEnvelope) -> list[ExchangeOrder]:
         ...
 
     @override
     async def get_position(self, symbol: str) -> ExchangePosition | None:
         ...
 ```
+
+A broker config subclasses `LiveProviderConfig` — that is the bound of the
+`BrokerPlugin` type parameter, and it contributes the `symbol_map` translation
+table every live plugin shares.
 
 #### Storage — `self.store_ctx`
 
@@ -423,14 +463,16 @@ class FooPlugin(ProviderPlugin[FooConfig], CLIPlugin):
     Config = FooConfig
 
     # --- ProviderPlugin: data downloading ---
+    # (timeframe converters and update_symbol_info omitted for brevity)
 
     @override
-    def get_available_symbols(self) -> list[str]:
+    def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
         # self.config is typed as FooConfig (via Generic)
         ...
 
     @override
-    def download(self, days_back, on_progress=None, extra_field_names=None):
+    def download_ohlcv(self, time_from, time_to, on_progress=None,
+                       limit=None, with_extra=False):
         ...
 
     # --- CLIPlugin: subcommands ---

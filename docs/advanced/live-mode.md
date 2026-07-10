@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-04-08"
+lastmod: "2026-07-10"
 draft: false
 toc: true
 categories: ["Advanced", "Strategy", "Live"]
@@ -18,6 +18,8 @@ tags: ["live", "streaming", "intra-bar", "varip", "paper-trading", "real-time"]
 Live mode extends PyneCore beyond backtesting: after replaying historical data the script
 seamlessly transitions to real-time streaming from a `LiveProviderPlugin`.  Indicators update
 on every tick; strategies run in paper-trading mode with tick-level order fill accuracy.
+With `--broker` (which implies `--live`), orders are routed to the real exchange through a
+`BrokerPlugin` instead of being simulated.
 
 ## Quick Start
 
@@ -180,10 +182,11 @@ pyne run script.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
 
 ## CLI Options
 
-| Flag                  | Description                                          |
-|-----------------------|------------------------------------------------------|
-| `--live`, `-l`        | Enable live streaming after historical phase         |
-| `--shutdown-timeout`  | Max seconds for graceful shutdown (default: 120)     |
+| Flag                  | Description                                                            |
+|-----------------------|------------------------------------------------------------------------|
+| `--live`, `-l`        | Enable live streaming after historical phase                           |
+| `--broker`            | Route orders to the exchange (implies `--live`; needs a `BrokerPlugin`) |
+| `--shutdown-timeout`  | Max seconds for graceful shutdown (default: 120)                       |
 
 Press `Ctrl+C` to stop live streaming.  The provider goes through a graceful shutdown sequence:
 `can_shutdown()` is polled every second, then `disconnect()` is called.
@@ -217,10 +220,10 @@ only cares whether it receives `OHLCV` or `BarUpdate` objects.
 
 ## Limitations
 
-- **Paper trading only** — no real order execution.  Live order routing is provided by
-  dedicated per-exchange broker plugins (`pynecore-bybit`, `pynecore-binance`, etc.).
-- **Single timeframe** — `request.security()` with live providers (multi-timeframe live) is not
-  yet supported.
+- **Paper trading by default** — with `--live` alone, order fills are simulated.  Real order
+  execution requires a `BrokerPlugin` data source run with `pyne run --broker` (implies
+  `--live`); shipped broker plugins are `pynesys-pynecore-capitalcom` and
+  `pynesys-pynecore-ctrader`.
 - **Provider required** — `--live` only works with provider strings, not local data files.
 - **No replay** — there is no mechanism to replay missed ticks if the connection drops mid-bar.
   The provider reconnects and resumes from the next available update.
