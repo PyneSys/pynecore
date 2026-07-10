@@ -19,6 +19,8 @@ from pynecore.core.broker.storage import (
     HEARTBEAT_INTERVAL_MS,
     OrderRow,
     PendingRecord,
+    PURGE_INTERVAL_MS,
+    RETENTION_DAYS,
     RunContext,
     STALE_THRESHOLD_MS,
 )
@@ -742,6 +744,132 @@ def __test_heartbeat_rate_limited__(tmp_path: Path) -> None:
             (ctx.run_instance_id,),
         ).fetchone()[0]
         assert hb_after_write >= hb_after_open, "the allowed call must write to the DB"
+
+
+# === Retention purge =======================================================
+
+
+def _backdated_ts() -> int:
+    """A timestamp safely past the default retention window."""
+    from pynecore.core.broker import storage as _storage
+    return _storage._now_ms() - (RETENTION_DAYS + 10) * 86_400_000
+
+
+def __test_retention_purge_removes_expired_rows__(tmp_path: Path) -> None:
+    """Old closed orders + their events are purged; live orders (and
+    their events) and recent events survive the same cutoff."""
+    old_ts = _backdated_ts()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.upsert_order(
+            "coid-old", symbol="EURUSD", side="buy", qty=1.0, state="filled",
+        )
+        ctx.close_order("coid-old")
+        ctx.upsert_order(
+            "coid-live", symbol="EURUSD", side="buy", qty=1.0, state="filled",
+        )
+        ctx.log_event("dispatch", client_order_id="coid-old")
+        ctx.log_event("dispatch", client_order_id="coid-live")
+        ctx.log_event("misc")
+
+        # Backdate everything written so far past the retention window.
+        store._conn.execute("UPDATE events SET ts_ms = ?", (old_ts,))
+        store._conn.execute(
+            "UPDATE orders SET closed_ts_ms = ? WHERE closed_ts_ms IS NOT NULL",
+            (old_ts,),
+        )
+        # Written after the backdating — recent, must survive.
+        ctx.log_event("fresh")
+
+        deleted = store.cleanup_old_data()
+        assert deleted > 0
+
+        coids = {
+            r[0] for r in store._conn.execute(
+                "SELECT client_order_id FROM orders"
+            )
+        }
+        assert coids == {"coid-live"}, "only the live order row survives"
+
+        events = {
+            (r[0], r[1]) for r in store._conn.execute(
+                "SELECT kind, client_order_id FROM events"
+            )
+        }
+        assert events == {
+            ("dispatch", "coid-live"),  # live-order guard
+            ("fresh", None),            # inside the retention window
+        }
+
+
+def __test_retention_purge_keeps_events_of_live_intents__(tmp_path: Path) -> None:
+    """An old event whose ``intent_key`` still has a live envelope is
+    protected; completing the intent makes it purgeable."""
+    old_ts = _backdated_ts()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope("Long", BAR_TS, 0)
+        ctx.log_event("defensive_close_filled", intent_key="Long")
+        store._conn.execute("UPDATE events SET ts_ms = ?", (old_ts,))
+
+        store.cleanup_old_data()
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) FROM events WHERE intent_key = 'Long'"
+        ).fetchone()[0]
+        assert remaining == 1, "live envelope must protect the event"
+
+        ctx.record_complete("Long")
+        store.cleanup_old_data()
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) FROM events WHERE intent_key = 'Long'"
+        ).fetchone()[0]
+        assert remaining == 0, "completed intent's old event is purgeable"
+
+
+def __test_retention_purge_removes_childless_ended_runs__(tmp_path: Path) -> None:
+    """An old ended run with no child rows is deleted; the live run stays."""
+    old_ts = _backdated_ts()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx_old = _open_run(store, label="old")
+        ctx_old.close()
+        ctx = _open_run(store)
+
+        store._conn.execute(
+            "UPDATE runs SET ended_ts_ms = ? WHERE ended_ts_ms IS NOT NULL",
+            (old_ts,),
+        )
+        store.cleanup_old_data()
+
+        instance_ids = {
+            r[0] for r in store._conn.execute(
+                "SELECT run_instance_id FROM runs"
+            )
+        }
+        assert instance_ids == {ctx.run_instance_id}
+
+
+def __test_heartbeat_daily_purge_gate__(tmp_path: Path) -> None:
+    """Heartbeat triggers the retention purge at most once per
+    ``PURGE_INTERVAL_MS``."""
+    from pynecore.core.broker import storage as _storage
+    old_ts = _backdated_ts()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.log_event("misc")
+        store._conn.execute("UPDATE events SET ts_ms = ?", (old_ts,))
+
+        # Gate is closed: open_run just purged.
+        ctx._last_heartbeat_write_ms = 0
+        ctx.heartbeat()
+        count = store._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        assert count == 1, "purge must not run again within the interval"
+
+        # Open the gate and heartbeat again.
+        store._last_purge_ms = _storage._now_ms() - PURGE_INTERVAL_MS - 1
+        ctx._last_heartbeat_write_ms = 0
+        ctx.heartbeat()
+        count = store._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        assert count == 0, "heartbeat past the gate must purge the old event"
 
 
 # === Close (happy path) ====================================================

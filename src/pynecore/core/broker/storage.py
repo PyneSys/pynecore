@@ -58,6 +58,8 @@ __all__ = [
     'OrderRow',
     'HEARTBEAT_INTERVAL_MS',
     'STALE_THRESHOLD_MS',
+    'RETENTION_DAYS',
+    'PURGE_INTERVAL_MS',
 ]
 
 _log = logging.getLogger(__name__)
@@ -69,6 +71,15 @@ HEARTBEAT_INTERVAL_MS: Final[int] = 60_000  # 1 minute
 # changes here, the VIEW must be replaced via a new migration
 # (see ``_MIGRATIONS``).
 STALE_THRESHOLD_MS: Final[int] = 5 * HEARTBEAT_INTERVAL_MS  # 5 minutes
+# Retention window for historical rows (events, closed orders, ended
+# runs). See :meth:`BrokerStore.cleanup_old_data` for what is protected
+# from purging regardless of age.
+RETENTION_DAYS: Final[int] = 180
+# The purge runs at ``open_run()`` and then at most once per this
+# interval, piggybacking on ``RunContext.heartbeat()`` — a bot that runs
+# for months never revisits ``open_run()``, so the heartbeat path is
+# what keeps the DB bounded while live.
+PURGE_INTERVAL_MS: Final[int] = 24 * 60 * 60 * 1000  # 1 day
 
 
 def _now_ms() -> int:
@@ -363,6 +374,9 @@ class BrokerStore:
         # BEGIN…COMMIT span must be serialized through this re-entrant
         # lock — see :meth:`transaction`.
         self._lock = threading.RLock()
+        # Gate for :meth:`maybe_cleanup_old_data` — 0 means the first
+        # caller (``open_run``) purges immediately.
+        self._last_purge_ms = 0
         # ``isolation_level=""`` = default; we open explicit transactions
         # via :meth:`transaction` (which wraps ``with conn:``). The
         # sqlite3 module's autocommit mode is not what it looks like at
@@ -532,6 +546,11 @@ class BrokerStore:
                 new_run_instance_id=run_instance_id,
                 run_id=run_id,
             )
+
+        # Retention purge piggybacks on startup; the other trigger is
+        # the daily gate in :meth:`RunContext.heartbeat`. Outside the
+        # main transaction — a purge failure must not block the run.
+        self.maybe_cleanup_old_data()
 
         return RunContext(
             run_id=run_id,
@@ -761,18 +780,105 @@ class BrokerStore:
             )
         return len(rows)
 
-    def cleanup_old_events(self, retention_days: int = 180) -> int:
-        """Purge stale event rows.
+    def cleanup_old_data(self, retention_days: int = RETENTION_DAYS) -> int:
+        """Purge historical rows past the retention window.
 
-        Not implemented yet — relevant once the DB grows past its size
-        threshold (~1 GB). The stub reserves the API slot so caller
-        code can already reference it from a ``not-implemented`` branch.
+        Four deletions in one transaction:
 
-        :raises NotImplementedError: Always; implementation lands in v2.
+        1. ``events`` older than the cutoff. Two rows are protected
+           regardless of age: events whose ``client_order_id`` matches a
+           still-live order (the audit trail of an open position stays
+           intact), and events whose ``intent_key`` still has a live
+           envelope for the same logical ``run_id`` — the engine's
+           startup replay (:meth:`RunContext.find_event_by_intent_key`,
+           :meth:`RunContext.iter_events_by_kind_for_run_id`) reads
+           those to dedup defensive-close FILLs across restarts.
+        2. ``orders`` closed before the cutoff. Live rows are never
+           touched.
+        3. Orphan ``order_refs`` — rows whose order no longer exists.
+           :meth:`RunContext.close_order` already trims refs eagerly;
+           this catches rows left behind by crashes and by step 2.
+        4. Ended ``runs`` rows older than the cutoff with no remaining
+           child rows (orders / order_refs / events).
+
+        Freed pages are reused by SQLite, so the file stops growing
+        even without VACUUM.
+
+        :param retention_days: Rows older than this many days are
+            eligible for purging.
+        :return: Total number of deleted rows.
         """
-        raise NotImplementedError(
-            "event retention cleanup — scheduled for v2"
-        )
+        cutoff = _now_ms() - retention_days * 86_400_000
+        with self.transaction():
+            deleted_events = self._conn.execute(
+                "DELETE FROM events "
+                "WHERE ts_ms < ? "
+                "  AND (client_order_id IS NULL OR NOT EXISTS ("
+                "      SELECT 1 FROM orders o "
+                "      WHERE o.client_order_id = events.client_order_id "
+                "        AND o.closed_ts_ms IS NULL)) "
+                "  AND NOT EXISTS ("
+                "      SELECT 1 FROM envelopes v "
+                "      JOIN runs r ON r.run_instance_id = events.run_instance_id "
+                "      WHERE v.run_id = r.run_id "
+                "        AND v.intent_key = events.intent_key)",
+                (cutoff,),
+            ).rowcount
+            deleted_orders = self._conn.execute(
+                "DELETE FROM orders "
+                "WHERE closed_ts_ms IS NOT NULL AND closed_ts_ms < ?",
+                (cutoff,),
+            ).rowcount
+            deleted_refs = self._conn.execute(
+                "DELETE FROM order_refs "
+                "WHERE NOT EXISTS ("
+                "    SELECT 1 FROM orders o "
+                "    WHERE o.run_instance_id = order_refs.run_instance_id "
+                "      AND o.client_order_id = order_refs.client_order_id)",
+            ).rowcount
+            deleted_runs = self._conn.execute(
+                "DELETE FROM runs "
+                "WHERE ended_ts_ms IS NOT NULL AND ended_ts_ms < ? "
+                "  AND NOT EXISTS (SELECT 1 FROM orders o "
+                "      WHERE o.run_instance_id = runs.run_instance_id) "
+                "  AND NOT EXISTS (SELECT 1 FROM order_refs f "
+                "      WHERE f.run_instance_id = runs.run_instance_id) "
+                "  AND NOT EXISTS (SELECT 1 FROM events e "
+                "      WHERE e.run_instance_id = runs.run_instance_id)",
+                (cutoff,),
+            ).rowcount
+        total = deleted_events + deleted_orders + deleted_refs + deleted_runs
+        if total:
+            _log.info(
+                "broker storage: retention purge removed %d row(s) "
+                "(events=%d, orders=%d, order_refs=%d, runs=%d, "
+                "retention=%d days)",
+                total, deleted_events, deleted_orders, deleted_refs,
+                deleted_runs, retention_days,
+            )
+        return total
+
+    def maybe_cleanup_old_data(self) -> None:
+        """Rate-limited retention purge for periodic callers.
+
+        Runs :meth:`cleanup_old_data` at most once per
+        ``PURGE_INTERVAL_MS``. The gate is stamped *before* the attempt
+        and failures are logged and swallowed — retention is
+        maintenance; it must never stop a live bot, and a persistent
+        failure retries daily instead of every heartbeat.
+        """
+        now = _now_ms()
+        if now - self._last_purge_ms < PURGE_INTERVAL_MS:
+            return
+        self._last_purge_ms = now
+        try:
+            self.cleanup_old_data()
+        except sqlite3.Error:
+            _log.warning(
+                "broker storage: retention purge failed; "
+                "next attempt in %d ms", PURGE_INTERVAL_MS,
+                exc_info=True,
+            )
 
 
 # === RunContext ============================================================
@@ -1487,9 +1593,10 @@ class RunContext:
         """Heartbeat for the current run. Rate-limited to ``HEARTBEAT_INTERVAL_MS``.
 
         The caller can call this every sync cycle — the internal gate
-        ensures at most one UPDATE per minute. Does NOT run cross-run
+        ensures at most one UPDATE per minute. Does NOT run stale-run
         cleanup (that is exclusively ``open_run()``'s responsibility —
-        clear separation of concerns).
+        clear separation of concerns); it does trigger the daily
+        retention purge (see :meth:`BrokerStore.maybe_cleanup_old_data`).
         """
         now = _now_ms()
         if now - self._last_heartbeat_write_ms < HEARTBEAT_INTERVAL_MS:
@@ -1501,6 +1608,10 @@ class RunContext:
                 (now, self.run_instance_id),
             )
         self._last_heartbeat_write_ms = now
+        # Daily retention purge rides on the heartbeat cadence — a
+        # months-running bot never revisits ``open_run()``, so this is
+        # what keeps the events/orders tables bounded while live.
+        self._store.maybe_cleanup_old_data()
 
     def close(self) -> None:
         """Happy-path run teardown: populate ``ended_ts_ms``.
