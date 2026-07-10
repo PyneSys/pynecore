@@ -3794,16 +3794,25 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
     gate itself and the measurement provenance.
 
     Below 1e7 money TV still snaps a MARKET entry up to the next lot when
-    the raw money tick count reaches the 0.05-tick floor-cell of that lot's
-    cost (edge = cost ticks mod 0.05; unlike the >=1e7 gate the money side
-    is NOT truncated to whole ticks). Measured by one-shot equity-injection
-    sweeps on BINANCE:BTCUSDT 30m (2026-07-08): edges two-sided at cost
-    1.0200e8 and 1.1575e8 ticks (5-level cluster), further ON points at
-    1.005e8/1.08e8, OFF at 9.9e7 and from 1.20e8 up (with an unmapped
-    interleaved ON at 1.25e8) — the snap is applied only inside the verified
-    [1e8, 1.16e8] cost band and only for market entries (the placement-close
-    sizing path); everywhere else the plain floor stands, matching the
-    pre-measurement behavior. A snapped size then faces the ordinary
+    the raw money tick count reaches the grid floor-cell of that lot's
+    cost (edge = cost ticks mod grid; unlike the >=1e7 gate the money side
+    is NOT truncated to whole ticks). The grid is scale-dependent and only
+    measured in bands; the snap applies only inside a verified band and
+    only for market entries (the placement-close sizing path); everywhere
+    else the plain floor stands. Measured by one-shot equity-injection
+    sweeps on BINANCE:BTCUSDT 30m:
+    - grid 0.05 at cost [1e8, 1.16e8] ticks (2026-07-08): edges two-sided
+      at cost 1.0200e8 and 1.1575e8 (5-level cluster), further ON points at
+      1.005e8/1.08e8, OFF at 9.9e7 and from 1.20e8 up (with an unmapped
+      interleaved ON at 1.25e8 — the OFF points are consistent with a
+      different, unmapped grid rather than an inactive mechanism).
+    - grid 0.005 at cost ~1.245e7 ticks (2026-07-10, the Fabio Pro Scalper
+      2025-11-05 10:30 razor cancel): edge pinned exactly at money ticks
+      12451249.295 = ceil_.005(cost) - 0.005 by 7-probe bisection (fill at
+      .294/.2949, cancel at .29501/.2955/.29711); grids 0.05/0.01/0.002
+      are each refuted by one of those points. Band held at [1.2e7, 1.3e7]
+      until more levels are mapped.
+    A snapped size then faces the ordinary
     creation-time margin check at the placement close: at 100%
     percent_of_equity sizing the snapped cost always exceeds equity, so the
     entry cancels at placement even when the fill open would fit (measured:
@@ -3833,14 +3842,18 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
         if not market:
             return size
         next_cost = (lots + 1) / rfactor * unit_cost / mintick
-        if not (1e8 <= next_cost <= 1.16e8):
+        if 1e8 <= next_cost <= 1.16e8:
+            snap_grid = 0.05
+        elif 1.2e7 <= next_cost <= 1.3e7:
+            snap_grid = 0.005
+        else:
             return size
-        _, m1 = _ceil_to_grid(next_cost, 0.05)
+        _, m1 = _ceil_to_grid(next_cost, snap_grid)
         # m1 - grid unconditionally, like the >=1e7 snap: a cost landing
         # exactly on the grid keeps the full 0.05 window (the 2025-01-02
         # 19:30 flat100 cancel pinned this — cost double == grid double,
         # TV still snapped).
-        if money / mintick >= m1 - 0.05:
+        if money / mintick >= m1 - snap_grid:
             sign = 1.0 if size > 0 else -1.0
             return sign * (lots + 1) / rfactor
         return size
