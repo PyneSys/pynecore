@@ -194,6 +194,9 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
             from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
             from pynecore.transformers.security import SecurityTransformer
+            from pynecore.transformers.security_instantiation import (
+                SecurityInstantiationTransformer,
+            )
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
             from pynecore.transformers.lib_series import LibrarySeriesTransformer
             from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
@@ -224,6 +227,9 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # Lazy-context history hoist must run before call-site anchoring:
             # the hoisted statements are the anchorable call sites
             transformed = InlineSeriesHoistTransformer().visit(transformed)
+            # Pine instantiation semantics: clone security-bearing functions
+            # per call site so each call site gets its own security contexts
+            transformed = SecurityInstantiationTransformer().visit(transformed)
             transformed = SecurityTransformer().visit(transformed)
             transformed = PersistentSeriesTransformer().visit(transformed)
             transformed = LibrarySeriesTransformer().visit(transformed)
