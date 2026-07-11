@@ -422,11 +422,31 @@ class BrokerStore:
         commit - no transaction is active``. The re-entrant lock makes
         each BEGIN…COMMIT span mutually exclusive across the two threads.
 
-        Standalone reads need no lock: SQLite's default serialized
-        threading mode guards the connection, and a read opens no
-        transaction, so it can neither corrupt nor mis-commit.
+        Standalone reads must also take the lock — see :meth:`read_lock`.
+        They open no transaction of their own, but transaction visibility
+        is connection-global: a read issued while the writer thread is
+        mid-transaction sees that writer's uncommitted rows, and a later
+        writer rollback leaves the reader having acted on phantom data.
         """
         with self._lock, self._conn:
+            yield self._conn
+
+    @contextlib.contextmanager
+    def read_lock(self) -> Iterator[sqlite3.Connection]:
+        """Serialize a standalone read against the concurrent writer.
+
+        Reads open no transaction, but they share the connection with the
+        writer thread, and SQLite's transaction visibility is
+        connection-global: a read issued mid-write sees the writer's
+        uncommitted rows, and a subsequent writer rollback leaves the
+        reader having acted on phantom data. Holding :attr:`_lock` for the
+        fetch closes that window. The lock is re-entrant, so a read nested
+        inside a :meth:`transaction` block on the same thread is safe.
+
+        Fetch eagerly inside the block (``fetchone`` / ``fetchall``) so the
+        lock is not held while the caller processes rows.
+        """
+        with self._lock:
             yield self._conn
 
     # --- Lifecycle ---------------------------------------------------------
@@ -1080,24 +1100,28 @@ class RunContext:
         envelopes: dict[str, EnvelopeRecord] = {}
         pending: dict[str, PendingRecord] = {}
 
-        for row in self._store._conn.execute(
+        with self._store.read_lock() as conn:
+            envelope_rows = conn.execute(
                 "SELECT intent_key, bar_ts_ms, retry_seq FROM envelopes "
                 "WHERE run_id = ?",
                 (self.run_id,),
-        ):
+            ).fetchall()
+            pending_rows = conn.execute(
+                "SELECT client_order_id, intent_key, resolution, "
+                "       dispatch_kind, order_ids "
+                "FROM pending_verifications "
+                "WHERE run_id = ?",
+                (self.run_id,),
+            ).fetchall()
+
+        for row in envelope_rows:
             envelopes[row['intent_key']] = EnvelopeRecord(
                 key=row['intent_key'],
                 bar_ts_ms=int(row['bar_ts_ms']),
                 retry_seq=int(row['retry_seq']),
             )
 
-        for row in self._store._conn.execute(
-                "SELECT client_order_id, intent_key, resolution, "
-                "       dispatch_kind, order_ids "
-                "FROM pending_verifications "
-                "WHERE run_id = ?",
-                (self.run_id,),
-        ):
+        for row in pending_rows:
             raw_ids = row['order_ids'] or '[]'
             pending[row['client_order_id']] = PendingRecord(
                 key=row['intent_key'],
@@ -1119,13 +1143,14 @@ class RunContext:
         non-``None`` ``resolution`` — still-parked (unresolved) rows are
         skipped.
         """
-        rows = self._store._conn.execute(
-            "SELECT client_order_id, intent_key, resolution, "
-            "       dispatch_kind, order_ids "
-            "FROM pending_verifications "
-            "WHERE run_id = ? AND resolution IS NOT NULL",
-            (self.run_id,),
-        ).fetchall()
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT client_order_id, intent_key, resolution, "
+                "       dispatch_kind, order_ids "
+                "FROM pending_verifications "
+                "WHERE run_id = ? AND resolution IS NOT NULL",
+                (self.run_id,),
+            ).fetchall()
         return [
             PendingRecord(
                 key=row['intent_key'],
@@ -1395,11 +1420,12 @@ class RunContext:
         :meth:`BrokerStore.open_run`) already migrates orphan refs
         into the live instance, so this matches the row's owner.
         """
-        rows = self._store._conn.execute(
-            "SELECT ref_type, ref_value FROM order_refs "
-            "WHERE run_instance_id = ? AND client_order_id = ?",
-            (self.run_instance_id, client_order_id),
-        )
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT ref_type, ref_value FROM order_refs "
+                "WHERE run_instance_id = ? AND client_order_id = ?",
+                (self.run_instance_id, client_order_id),
+            ).fetchall()
         for row in rows:
             yield row['ref_type'], row['ref_value']
 
@@ -1411,25 +1437,27 @@ class RunContext:
         Joins ``order_refs`` × ``orders`` on the PK. A single indexed
         SELECT that reduces this use case to one DB call.
         """
-        row = self._store._conn.execute(
-            "SELECT o.* FROM orders o "
-            "JOIN order_refs r ON "
-            "  r.run_instance_id = o.run_instance_id "
-            "  AND r.client_order_id = o.client_order_id "
-            "WHERE r.run_instance_id = ? AND r.ref_type = ? AND r.ref_value = ?",
-            (self.run_instance_id, ref_type, ref_value),
-        ).fetchone()
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT o.* FROM orders o "
+                "JOIN order_refs r ON "
+                "  r.run_instance_id = o.run_instance_id "
+                "  AND r.client_order_id = o.client_order_id "
+                "WHERE r.run_instance_id = ? AND r.ref_type = ? AND r.ref_value = ?",
+                (self.run_instance_id, ref_type, ref_value),
+            ).fetchone()
         return _row_to_order(row) if row is not None else None
 
     # --- Queries ----------------------------------------------------------
 
     def get_order(self, client_order_id: str) -> OrderRow | None:
         """Direct lookup by CO-ID."""
-        row = self._store._conn.execute(
-            "SELECT * FROM orders "
-            "WHERE run_instance_id = ? AND client_order_id = ?",
-            (self.run_instance_id, client_order_id),
-        ).fetchone()
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT * FROM orders "
+                "WHERE run_instance_id = ? AND client_order_id = ?",
+                (self.run_instance_id, client_order_id),
+            ).fetchone()
         return _row_to_order(row) if row is not None else None
 
     def iter_live_orders(
@@ -1454,7 +1482,9 @@ class RunContext:
         if from_entry is not None:
             sql += " AND from_entry = ?"
             params.append(from_entry)
-        for row in self._store._conn.execute(sql, params):
+        with self._store.read_lock() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        for row in rows:
             yield _row_to_order(row)
 
     # --- Events -----------------------------------------------------------
@@ -1503,13 +1533,14 @@ class RunContext:
         invocations; the ``runs.run_id`` lookup uses the existing
         ``idx_runs_run_id`` index.
         """
-        row = self._store._conn.execute(
-            "SELECT 1 FROM events AS e "
-            "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
-            "WHERE r.run_id = ? AND e.intent_key = ? AND e.kind = ? "
-            "LIMIT 1",
-            (self.run_id, intent_key, kind),
-        ).fetchone()
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM events AS e "
+                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND e.intent_key = ? AND e.kind = ? "
+                "LIMIT 1",
+                (self.run_id, intent_key, kind),
+            ).fetchone()
         return row is not None
 
     def iter_events_by_kind_since(
@@ -1527,12 +1558,13 @@ class RunContext:
         :param since_ts_ms: Lower bound on ``ts_ms`` (inclusive).
         :return: Iterator of payload dicts in insertion order.
         """
-        rows = self._store._conn.execute(
-            "SELECT payload FROM events "
-            "WHERE run_instance_id = ? AND kind = ? AND ts_ms >= ? "
-            "ORDER BY ts_ms",
-            (self.run_instance_id, kind, since_ts_ms),
-        )
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM events "
+                "WHERE run_instance_id = ? AND kind = ? AND ts_ms >= ? "
+                "ORDER BY ts_ms",
+                (self.run_instance_id, kind, since_ts_ms),
+            ).fetchall()
         for row in rows:
             raw = row['payload']
             if not raw:
@@ -1561,15 +1593,16 @@ class RunContext:
         payloads yield an empty dict (the column data is still
         useful).
         """
-        rows = self._store._conn.execute(
-            "SELECT e.intent_key, e.client_order_id, e.exchange_order_id, "
-            "       e.payload "
-            "FROM events AS e "
-            "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
-            "WHERE r.run_id = ? AND e.kind = ? "
-            "ORDER BY e.ts_ms",
-            (self.run_id, kind),
-        )
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT e.intent_key, e.client_order_id, e.exchange_order_id, "
+                "       e.payload "
+                "FROM events AS e "
+                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND e.kind = ? "
+                "ORDER BY e.ts_ms",
+                (self.run_id, kind),
+            ).fetchall()
         for row in rows:
             raw = row['payload']
             payload: dict = {}
