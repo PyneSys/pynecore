@@ -138,6 +138,30 @@ def __test_record_fill_fifo_closes_oldest_first__():
     assert p.netprofit == pytest.approx(20_000.0)
 
 
+def __test_record_fill_fifo_partial_close_splits_exit_fee__():
+    """A multi-trade FIFO close must split the exit fee proportionally.
+
+    Two pyramided entries closed by one exit fill that closes the first
+    trade fully and the second partially: the exit fee is shared by filled
+    quantity, so the fully-closed and partial pieces together book exactly
+    the fill fee — the partial piece must NOT be charged the whole fee on
+    top of the proportional shares.
+    """
+    p = BrokerPosition()
+    p.record_fill(_fill("buy", 1.0, 40_000.0, pine_id="E1"))
+    p.record_fill(_fill("buy", 1.0, 50_000.0, pine_id="E2"))
+    # Exit 1.5 of 2.0: closes E1 (1.0) fully + E2 (0.5) partially, fee 3.0.
+    p.record_fill(_fill("sell", 1.5, 60_000.0, pine_id="TP",
+                        leg=LegType.TAKE_PROFIT, fee=3.0))
+    assert p.size == pytest.approx(0.5)
+    assert len(p.closed_trades) == 2
+    # fee shares: 3.0*(1.0/1.5)=2.0 and 3.0*(0.5/1.5)=1.0 → total 3.0.
+    total_exit_fee = sum(t.commission for t in p.closed_trades)
+    assert total_exit_fee == pytest.approx(3.0)
+    # netprofit = (20000 - 2.0) + (5000 - 1.0)
+    assert p.netprofit == pytest.approx(24_997.0)
+
+
 def __test_record_fill_side_flip_in_single_event__():
     """Selling more than the open long flips the position to short."""
     p = BrokerPosition()

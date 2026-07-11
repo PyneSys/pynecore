@@ -480,7 +480,10 @@ class BrokerPosition(PositionBase):
                     entry_comment=trade.entry_comment,
                     entry_equity=trade.entry_equity,
                 )
-                self._close_trade(closed_piece, fill_price, event, fee_share=fee)
+                self._close_trade(
+                    closed_piece, fill_price, event,
+                    fee_share=fee * (remaining / fill_qty),
+                )
                 closed_profit += closed_piece.profit
                 # Shrink the remaining open trade
                 trade.size -= closed_piece.size
