@@ -40,6 +40,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
 )
 from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
@@ -56,6 +57,7 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
     BRACKET_OWN_STATE_RELEASED,
@@ -198,6 +200,10 @@ class OneWayEmulator:
         closes, shortfall = select_legs_for_close(intent.qty, legs, leg_side)
         if not closes:
             return CloseFanResult(legs=(), shortfall=shortfall, skipped=False)
+        await self._reject_unsupported_partial_closes(
+            closes, legs, symbol=intent.symbol,
+            intent_key=intent.intent_key, port=port,
+        )
         parent_coid = envelope.client_order_id(KIND_CLOSE)
         dispatched = await self._fan_out_closes(
             closes, symbol=intent.symbol, side=intent.side,
@@ -241,6 +247,12 @@ class OneWayEmulator:
             )
         legs = await port.fetch_raw_positions(intent.symbol)
         plan = plan_reversal(intent.side, intent.qty, legs)
+        # Pre-flight partial-leg capability BEFORE anything is persisted or
+        # sent — same atomicity rationale as the volume-bounds check below.
+        await self._reject_unsupported_partial_closes(
+            plan.closes, legs, symbol=intent.symbol,
+            intent_key=intent.intent_key, port=port,
+        )
         # Pre-flight the broker volume bounds BEFORE any close lands: an
         # out-of-range order must raise the non-halting skip while it is still
         # true, otherwise the closes reduce the book yet the whole reversal is
@@ -327,6 +339,52 @@ class OneWayEmulator:
             opened_orders=opened_orders,
         )
 
+    @staticmethod
+    async def _reject_unsupported_partial_closes(
+            closes: tuple[LegClose, ...], legs: list[PositionLeg], *,
+            symbol: str, intent_key: str, port: 'PositionPort',
+    ) -> None:
+        """Atomically skip a close plan containing a partial leg slice on a
+        port that cannot express one.
+
+        A venue without a per-leg partial reduce (Capital.com's
+        ``DELETE /positions/{dealId}`` is full-row only) declares
+        ``supports_partial_leg_close = False`` on its port; an absent
+        attribute means supported. The check runs BEFORE any close-leg row
+        is persisted or dispatched, so the skip leaves no half-reduced book
+        and nothing for restart replay to resume — raising from inside the
+        fan (the partial tail is dispatched last, FIFO) would desync the
+        engine exactly like the volume-bounds case documented in
+        :meth:`run_reversal`. Volumes are compared on the broker grid so
+        float noise in the Pine-unit plan cannot fake a partial.
+        """
+        if getattr(port, 'supports_partial_leg_close', True):
+            return
+        if not closes:
+            return
+        quantize = await port.get_volume_quantizer(symbol)
+        live_by_id = {leg.leg_id: leg for leg in legs}
+        for close in closes:
+            live = live_by_id.get(close.leg_id)
+            if live is None:
+                continue
+            if quantize(close.qty) < quantize(live.qty):
+                raise OrderSkippedByPlugin(
+                    f"Skipping {symbol} close: leg {close.leg_id} would be "
+                    f"reduced partially ({close.qty} of {live.qty}) but this "
+                    f"broker only supports whole-leg closes on a hedging "
+                    f"account. No order sent; partial closes need a one-way "
+                    f"(netting) account.",
+                    intent_key=intent_key,
+                    reason="partial_leg_close_unsupported",
+                    context={
+                        'symbol': symbol,
+                        'leg_id': close.leg_id,
+                        'close_qty': close.qty,
+                        'leg_qty': live.qty,
+                    },
+                )
+
     async def _fan_out_closes(
             self, closes: tuple[LegClose, ...], *,
             symbol: str, side: str, intent_key: str, pine_id: str,
@@ -399,6 +457,20 @@ class OneWayEmulator:
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
+        if intent.trail_price is not None and intent.trail_offset is not None:
+            # The PositionPort amend surface carries no ``trail_price`` — the
+            # deferred-activation trailing of the direct paths is not
+            # expressible per-leg, so the trailing arms IMMEDIATELY at
+            # ``trail_offset``. Trades can exit earlier/tighter than the Pine
+            # simulation; surface it instead of diverging silently.
+            _blog_warning(
+                "one-way bracket replication: trail_price activation is not "
+                "expressible per-leg — trailing on %s (exit %r) arms "
+                "immediately at offset %s instead of after the activation "
+                "level %s",
+                intent.symbol, intent.pine_id, intent.trail_offset,
+                intent.trail_price,
+            )
         legs = await port.fetch_raw_positions(intent.symbol)
         side, on_side = net_survivor_legs(legs)
         if side == 'flat' or not on_side:

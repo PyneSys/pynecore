@@ -111,7 +111,19 @@ def _coerce_oca(order: Order) -> tuple[str | None, str | None]:
 
 
 def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
-    """Translate a ``strategy.entry`` / ``strategy.order`` Pine order."""
+    """Translate a ``strategy.entry`` / ``strategy.order`` Pine order.
+
+    The intent carries the RAW script quantity — deliberately. Pine keeps
+    a consumed market entry's ``Order`` in ``entry_orders`` (it is never
+    popped), so ``build_intents`` re-emits the same intent every bar and
+    the sync engine's diff relies on it being byte-stable to recognise an
+    already-dispatched entry. The MARKET-reversal stop-and-reverse fold
+    (TV: combined = qty + |opposite position|) therefore happens at
+    DISPATCH time in :meth:`OrderSyncEngine._dispatch_new`, which runs
+    exactly once per fresh intent — folding here would make a stale
+    retained order's qty flap with the net position and re-trigger the
+    diff (measured on the Capital.com demo E2E, 2026-07-10).
+    """
     oca_name, oca_type_str = _coerce_oca(order)
     return EntryIntent(
         pine_id=order.order_id or "",

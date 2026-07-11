@@ -5995,3 +5995,59 @@ def __test_partially_filled_inflight_close_reserves_only_working_qty_for_close_a
     assert qty_by_id == {"": 5.0}  # only the close_all residual is newly dispatched
     assert b.cancel_calls == []
     assert b.modify_exit_calls == []
+
+
+# === MARKET stop-and-reverse fold at dispatch ===
+
+def __test_market_reversal_dispatch_folds_opposite_position__():
+    """A fresh MARKET entry against an opposite net position dispatches the
+    combined stop-and-reverse quantity (TV parity), while the active-intent
+    slot keeps the RAW qty so the next bar's re-emitted Pine order still
+    matches and never re-triggers the diff."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0004
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -0.0002)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    dispatched = b.entry_calls[0].intent
+    assert dispatched.side == 'sell'
+    assert dispatched.qty == 0.0006  # 0.0002 + |0.0004|, artifact-free
+    # The registered active intent stays RAW — a re-emission of the same
+    # pending order next bar must diff as unchanged.
+    assert engine.active_intents["S"].qty == 0.0002
+    # Second sync with the same pending order: no new dispatch.
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
+
+
+def __test_market_add_dispatch_keeps_raw_qty__():
+    """A same-direction MARKET add dispatches the raw script quantity."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0004
+    pos.sign = 1.0
+    pos.entry_orders["L2"] = _entry_order("L2", 0.0002)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 0.0002
+
+
+def __test_limit_reversal_dispatch_is_not_folded_again__():
+    """LIMIT/STOP entries fold at creation (``strategy.entry`` subtracts the
+    position size) — the dispatch fold must not double-count them."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 2.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -3.0, limit=50_000.0)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 3.0

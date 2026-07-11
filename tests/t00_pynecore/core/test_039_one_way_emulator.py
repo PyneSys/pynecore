@@ -209,6 +209,29 @@ def __test_run_close_shortfall_surfaced_not_halted__():
     assert res.shortfall == 2.0 and res.skipped is False
 
 
+def __test_run_close_partial_leg_unsupported_skips_atomically__():
+    """A plan with a partial slice on a no-partial port skips BEFORE any dispatch."""
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("11", "buy", 2.0, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert exc.value.reason == "partial_leg_close_unsupported"
+    assert port.closed == []
+
+
+def __test_run_close_whole_legs_pass_without_partial_support__():
+    """A whole-leg-only plan dispatches normally on a no-partial port."""
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_close(_close_env("sell", 3.0), port))
+    assert _dispatched(port) == [("10", 2), ("11", 1)]
+    assert res.skipped is False
+
+
 # === Persistence + restart replay =======================================
 
 def _identity() -> RunIdentity:
@@ -359,6 +382,30 @@ def __test_run_reversal_below_min_residual_skips_whole_reversal__():
     with pytest.raises(OrderSkippedByPlugin):
         _run(eng.run_reversal(_entry_env("buy", 3.0), port))
     assert port.closed == [] and port.placed == []
+
+
+def __test_run_reversal_partial_leg_unsupported_skips_atomically__():
+    """A reversal plan with a partial slice skips atomically on a no-partial port."""
+    # Broker holds a 3.0 sell leg while the combined order is only 2.0 —
+    # the FIFO plan would reduce the leg partially, which the port cannot
+    # express. The pre-flight raises BEFORE any close or breadcrumb.
+    port = _FakePort([_leg("20", "sell", 3.0, open_time=0.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert exc.value.reason == "partial_leg_close_unsupported"
+    assert port.closed == [] and port.placed == []
+
+
+def __test_run_reversal_whole_leg_flip_passes_without_partial_support__():
+    """A whole-leg flip works unchanged on a no-partial port."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert _dispatched(port) == [("20", 2)]
+    assert res.open_qty == 1.0
 
 
 def __test_run_reversal_persists_close_leg_rows__(tmp_path):

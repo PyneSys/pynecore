@@ -914,7 +914,6 @@ def run(
             from pynecore.core.broker.defaults import load_broker_defaults
             broker_defaults = load_broker_defaults(app_state.config_dir)
             broker_plugin.on_unexpected_cancel = broker_defaults.on_unexpected_cancel
-            broker_plugin.require_one_way_mode = broker_defaults.require_one_way_mode
 
             import asyncio as _asyncio
             broker_event_loop = _asyncio.new_event_loop()

@@ -8545,6 +8545,31 @@ class OrderSyncEngine:
         )
 
     def _dispatch_new(self, intent: Intent) -> None:
+        # MARKET stop-and-reverse fold (TV parity): TV sizes a reversing
+        # market entry at first order processing as ``qty + |opposite
+        # position|`` — the simulator mirrors that at its own bar-open
+        # execution, but the intent snapshot is taken from the PENDING
+        # order, BEFORE that fold. Fold here, at the single point a fresh
+        # entry is dispatched, into a COPY: the caller's
+        # ``_active_intents`` slot keeps the raw intent, so the next
+        # bar's diff still matches the re-emitted (raw) Pine order and
+        # the fold can never re-trigger a dispatch. LIMIT/STOP entries
+        # are already folded at creation (``strategy.entry`` subtracts
+        # the position size), and a stop-fired market re-dispatch derives
+        # from such a creation-folded leg — both excluded. Without this a
+        # live reversal merely REDUCED the opposite position instead of
+        # flipping it (measured on the Capital.com demo E2E, 2026-07-10).
+        if (isinstance(intent, EntryIntent)
+                and intent.order_type is OrderType.MARKET
+                and not intent.stop_fired_market
+                and self._position.size != 0.0
+                and ((intent.side == 'buy') == (self._position.size < 0.0))):
+            # Round to 12 decimals — finer than any real lot step, but
+            # enough to kill the float64 addition artifact.
+            intent = dataclasses.replace(
+                intent,
+                qty=round(intent.qty + abs(self._position.size), 12),
+            )
         envelope = self._build_envelope(intent)
         _blog_info("dispatching %s", intent)
         # Non-None only when the plugin opted into hedging-mode one-way

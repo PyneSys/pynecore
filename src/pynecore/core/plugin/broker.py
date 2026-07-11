@@ -62,6 +62,17 @@ class PositionPort(Protocol):
 
     The surface grows per emulation feature (close, then reversal, then bracket
     replication); only the methods a wired feature needs are required.
+
+    Optional capability attribute — read via ``getattr``, absence means
+    ``True``:
+
+    * ``supports_partial_leg_close`` — ``False`` when the venue cannot reduce
+      a single leg by a partial volume (e.g. Capital.com, whose position
+      DELETE is full-row only). The emulator then pre-flights every close /
+      reversal plan and atomically skips
+      (:class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin`) any
+      plan containing a partial leg slice, before persisting or dispatching
+      anything.
     """
 
     async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
@@ -205,24 +216,6 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     The net only catches contract violations; a plugin SHOULD still classify
     explicitly, which keeps the recoverable read path parking and the ambiguous
     write path parked-for-verification instead of halting.
-    """
-
-    require_one_way_mode: bool = True
-    """
-    When True (the default), the startup probe fails closed if the
-    account has hedging mode enabled.
-
-    The base :class:`BrokerPlugin` semantics are one-way Pine — hedging
-    mode belongs on a future ``HedgeBrokerPlugin`` subclass.  Plugins on
-    spot venues without a hedging concept leave this flag inert.
-
-    Like :attr:`on_unexpected_cancel`, the production value comes from
-    the cross-broker ``workdir/config/brokers.toml`` via
-    :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
-    ``pyne run --broker`` entry point loads it once and assigns it as an
-    instance attribute on the plugin before the script runner starts.
-    The class-level default is the strict fallback used by test paths
-    that construct plugins without the CLI.
     """
 
     defensive_close_resolution_grace_s: float | None = None

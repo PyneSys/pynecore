@@ -23,27 +23,12 @@ def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
     """Missing ``brokers.toml`` auto-creates the file and returns safe defaults.
 
     First-run smoke: no ``brokers.toml`` exists → file auto-created,
-    safe defaults returned (graceful stop, hedging-mode probe armed).
-    This is the most common production path — users get a working broker
-    without writing any TOML by hand."""
+    safe defaults returned (graceful stop). This is the most common
+    production path — users get a working broker without writing any
+    TOML by hand."""
     defaults = load_broker_defaults(tmp_path)
     assert defaults.on_unexpected_cancel == 'stop'
-    assert defaults.require_one_way_mode is True
     assert (tmp_path / 'brokers.toml').exists()
-
-
-def __test_require_one_way_mode_override__(tmp_path: Path) -> None:
-    """``require_one_way_mode = false`` round-trips through the self-healing loader.
-
-    Disabling the hedging-mode probe must round-trip through the
-    self-healing TOML loader. There is no validation list here — the
-    field is a plain bool, so any truthy/falsy TOML literal is accepted."""
-    (tmp_path / 'brokers.toml').write_text(
-        'require_one_way_mode = false\n',
-        encoding='utf-8',
-    )
-    defaults = load_broker_defaults(tmp_path)
-    assert defaults.require_one_way_mode is False
 
 
 def __test_user_override_is_loaded__(tmp_path: Path) -> None:

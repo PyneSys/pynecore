@@ -56,13 +56,6 @@ class BrokerDefaults:
     cancellations are an expected part of the operational workflow.
     """
 
-    require_one_way_mode: bool = True
-    """When True (the default), the startup probe fails closed if the
-    account has hedging mode enabled. The base :class:`BrokerPlugin`
-    semantics are one-way Pine — hedging mode belongs on a future
-    ``HedgeBrokerPlugin`` subclass. Plugins on spot venues without a
-    hedging concept (e.g. Coinbase) leave this flag inert."""
-
 
 def load_broker_defaults(config_dir: Path) -> BrokerDefaults:
     """Load :class:`BrokerDefaults` from ``<config_dir>/brokers.toml``.
