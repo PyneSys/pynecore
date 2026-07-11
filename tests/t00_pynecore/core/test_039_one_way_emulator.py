@@ -21,7 +21,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
-from pynecore.core.broker.idempotency import KIND_CLOSE
+from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_ENTRY_STOP
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -42,6 +42,7 @@ from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_STATE,
+    EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
     create_close_leg_row,
     create_residual_open_row,
     iter_active_bracket_ownerships,
@@ -332,10 +333,12 @@ def __test_restart_replay_is_idempotent__(tmp_path):
 # === run_reversal — decomposition =======================================
 
 def _entry_env(side, qty, *, symbol="EURUSD", pine_id="Long",
-               order_type=OrderType.MARKET, limit=None, stop=None) -> DispatchEnvelope:
+               order_type=OrderType.MARKET, limit=None, stop=None,
+               stop_fired=False) -> DispatchEnvelope:
     intent = EntryIntent(
         pine_id=pine_id, symbol=symbol, side=side, qty=qty,
         order_type=order_type, limit=limit, stop=stop,
+        stop_fired_market=stop_fired,
     )
     return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
 
@@ -795,6 +798,68 @@ def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
     eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.restart_replay(port))
     assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_stop_fired_reversal_breadcrumb_anchors_on_entry_stop_coid__(tmp_path):
+    """A stop-fired reversal's breadcrumb entry coid uses KIND_ENTRY_STOP, so replay finds the row."""
+    # A stop-fired market reversal dispatches its residual under KIND_ENTRY_STOP
+    # (the plugin picks the kind from stop_fired_market). The breadcrumb's
+    # entry_coid must anchor on that SAME coid: anchoring on KIND_ENTRY would
+    # make the replay's row-existence check miss the landed entry row and
+    # double-open the residual.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0, stop_fired=True)
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_place_leg=OrderDispositionUnknownError(
+            "residual timed out", client_order_id="residual-coid",
+        ),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(env, port))
+    rows = list(iter_active_residual_opens(ctx))
+    assert len(rows) == 1
+    stop_coid = env.client_order_id(KIND_ENTRY_STOP)
+    assert (rows[0].extras or {})[EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID] == stop_coid
+    # The ambiguous send actually landed: the plugin's persist-first entry row
+    # exists under the KIND_ENTRY_STOP coid. Replay must find it and discharge
+    # the breadcrumb WITHOUT re-opening the residual.
+    ctx.upsert_order(stop_coid, symbol="EURUSD", side="buy", qty=1.0,
+                     state="confirmed", pine_entry_id="Long")
+    replay_port = _FakePort([])
+    _run(eng.restart_replay(replay_port))
+    assert replay_port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_replay_restores_stop_fired_flag_on_residual_redispatch__(tmp_path):
+    """Residual replay re-dispatches a stop-fired reversal with stop_fired_market restored."""
+    # The re-dispatched place_leg must persist and dedup under the SAME
+    # KIND_ENTRY_STOP coid as the original attempt, so the rebuilt intent needs
+    # the stop_fired_market flag back — recovered from the persisted coid's
+    # kind code.
+    class _CapturingPort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.place_envelopes: list[DispatchEnvelope] = []
+
+        async def place_leg(self, envelope, qty):
+            self.place_envelopes.append(envelope)
+            return await super().place_leg(envelope, qty)
+
+    store, ctx = _make_store(tmp_path)
+    entry_coid = _entry_env("buy", 2.0).client_order_id(KIND_ENTRY_STOP)
+    _seed_residual(ctx, entry_coid=entry_coid, qty=2.0)
+    port = _CapturingPort([])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.restart_replay(port))
+    assert port.placed == [("EURUSD", 2.0)]
+    intent = port.place_envelopes[0].intent
+    assert isinstance(intent, EntryIntent) and intent.stop_fired_market is True
     assert list(iter_active_residual_opens(ctx)) == []
     store.close()
 

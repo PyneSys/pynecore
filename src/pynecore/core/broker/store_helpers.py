@@ -1773,8 +1773,9 @@ def create_residual_open_row(
     :param qty: The residual open quantity (Pine units).
     :param intent_key: The owning :class:`EntryIntent`'s diff key.
     :param pine_entry_id: The owning ``strategy.entry(id=...)`` value.
-    :param entry_coid: The residual ``place_leg``'s deterministic ``KIND_ENTRY``
-        coid — its presence on replay proves the open already persisted.
+    :param entry_coid: The residual ``place_leg``'s deterministic entry coid
+        (``KIND_ENTRY``, or ``KIND_ENTRY_STOP`` for a stop-fired reversal) —
+        its presence on replay proves the open already persisted.
     :param run_tag: Dispatch envelope run tag (to rebuild the envelope on replay).
     :param bar_ts_ms: Dispatch envelope bar timestamp.
     :param retry_seq: Dispatch envelope retry sequence.
