@@ -29,7 +29,7 @@ import itertools
 import logging
 import queue
 import time
-from collections import deque
+from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
@@ -247,6 +247,52 @@ ring is effectively unbounded for any realistic single-session fill count
 while still capping memory. In-memory only — cross-restart dedupe is owned
 by the plugins' persisted ``filled_qty`` cursors.
 """
+
+
+_SETTLED_DEFENSIVE_CLOSE_IDS_CAP = 8192
+"""Upper bound on each settled-defensive-close identity cache
+(:attr:`OrderSyncEngine._settled_defensive_close_pine_ids` /
+``_order_refs`` / ``_client_order_ids``).
+
+Purely a leak bound, not an expected eviction point: the caches gain at
+most a handful of entries per defensive close, and defensive closes are
+rare exception-path events — a session would need thousands of them to
+evict anything. Duplicate FILL deliveries arrive close behind the
+original (poll+stream race, reconnect replay), so an id thousands of
+closes old can never need deduplication in practice.
+"""
+
+
+class _BoundedIdSet:
+    """Insertion-ordered string-id cache with FIFO eviction at ``cap`` entries.
+
+    Supports the add-and-membership-test usage shared by the engine's
+    duplicate-delivery caches (:attr:`OrderSyncEngine._seen_fill_ids` and
+    the ``_settled_defensive_close_*`` trio): ids are only ever added and
+    looked up, never removed individually. Re-adding a known id is a
+    no-op (it keeps its original ring position). Once ``cap`` distinct
+    ids are held, adding a new one evicts the oldest.
+    """
+
+    __slots__ = ('_cap', '_items')
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._items: OrderedDict[str, None] = OrderedDict()
+
+    def add(self, value: str) -> None:
+        items = self._items
+        if value in items:
+            return
+        items[value] = None
+        if len(items) > self._cap:
+            items.popitem(last=False)
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 class _PartialBracketModifyDeferred(Exception):
@@ -569,9 +615,13 @@ class OrderSyncEngine:
         # matches a known settled close ref. In-memory only — a restart
         # before the second delivery falls back to the broker store's
         # ``defensive_close_filled`` audit event written by
-        # :meth:`_route_defensive_close_fill`.
-        self._settled_defensive_close_pine_ids: set[str] = set()
-        self._settled_defensive_close_order_refs: set[str] = set()
+        # :meth:`_route_defensive_close_fill`. Bounded FIFO rings
+        # (:data:`_SETTLED_DEFENSIVE_CLOSE_IDS_CAP`) so a long-lived
+        # session cannot grow them without bound.
+        self._settled_defensive_close_pine_ids = \
+            _BoundedIdSet(_SETTLED_DEFENSIVE_CLOSE_IDS_CAP)
+        self._settled_defensive_close_order_refs = \
+            _BoundedIdSet(_SETTLED_DEFENSIVE_CLOSE_IDS_CAP)
         # ``client_order_id`` cache for parked defensive closes whose FILL
         # arrives with ``pine_id=None`` and a broker-allocated ``order.id``
         # that ``_settled_defensive_close_order_refs`` never observed
@@ -582,7 +632,8 @@ class OrderSyncEngine:
         # order, so this set is the only stable duplicate-detector for the
         # polled-orders identity path used by
         # :meth:`_route_defensive_close_fill`.
-        self._settled_defensive_close_client_order_ids: set[str] = set()
+        self._settled_defensive_close_client_order_ids = \
+            _BoundedIdSet(_SETTLED_DEFENSIVE_CLOSE_IDS_CAP)
 
         # General duplicate-fill gate (superset of the defensive-close caches
         # above, which only cover synthetic ``__pyne_defensive_close__`` legs).
@@ -593,14 +644,11 @@ class OrderSyncEngine:
         # reconnect replay, a cTrader correlated dispatch-response colliding
         # with its uncorrelated push copy) cannot double-apply — over-closing,
         # double-counting P&L/``closed_trades``/risk counters, or (on an ENTRY)
-        # opening a phantom second trade. ``_seen_fill_ids`` is the O(1)
-        # membership set; ``_seen_fill_ids_order`` mirrors insertion order so
-        # the oldest id can be evicted once the set exceeds
+        # opening a phantom second trade. A bounded FIFO ring capped at
         # :data:`_SEEN_FILL_IDS_CAP`. In-memory only — cross-restart dedupe is
         # owned by the plugins' persisted ``filled_qty`` cursors (this gate is
         # defence-in-depth over the plugins' own per-fill dedup).
-        self._seen_fill_ids: set[str] = set()
-        self._seen_fill_ids_order: deque[str] = deque()
+        self._seen_fill_ids = _BoundedIdSet(_SEEN_FILL_IDS_CAP)
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -4312,7 +4360,7 @@ class OrderSyncEngine:
         path that can surface the same execution (see :class:`OrderEvent`).
 
         On a first sighting the id is recorded in the bounded FIFO ring
-        (:attr:`_seen_fill_ids` / :attr:`_seen_fill_ids_order`, capped at
+        (:attr:`_seen_fill_ids`, capped at
         :data:`_SEEN_FILL_IDS_CAP`) and ``False`` is returned so the fill is
         applied. A second sighting returns ``True`` (drop). When
         ``fill_id`` is ``None`` the gate is a no-op (``False``): the plugin
@@ -4337,9 +4385,6 @@ class OrderSyncEngine:
         # own gate so the seen-set tracks applied fills only.
         if (event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0:
             self._seen_fill_ids.add(fill_id)
-            self._seen_fill_ids_order.append(fill_id)
-            if len(self._seen_fill_ids_order) > _SEEN_FILL_IDS_CAP:
-                self._seen_fill_ids.discard(self._seen_fill_ids_order.popleft())
         return False
 
     def _mark_parent_entry_neutralised(

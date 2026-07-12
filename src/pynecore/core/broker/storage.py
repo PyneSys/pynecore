@@ -66,10 +66,10 @@ _log = logging.getLogger(__name__)
 
 # Heartbeat cadence: a denser ``RunContext.heartbeat()`` call is a no-op.
 HEARTBEAT_INTERVAL_MS: Final[int] = 60_000  # 1 minute
-# A run is considered stale after this much heartbeat silence. The same
-# value is HARD-CODED inside the ``live_runs`` VIEW's SQL — if it
-# changes here, the VIEW must be replaced via a new migration
-# (see ``_MIGRATIONS``).
+# A run is considered stale after this much heartbeat silence. The
+# ``live_runs`` VIEW bakes the value into its stored SQL (SQLite cannot
+# parameterise a VIEW); ``_heal_live_runs_view`` recreates the VIEW on
+# open whenever the stored threshold drifts from this constant.
 STALE_THRESHOLD_MS: Final[int] = 5 * HEARTBEAT_INTERVAL_MS  # 5 minutes
 # Retention window for historical rows (events, closed orders, ended
 # runs). See :meth:`BrokerStore.cleanup_old_data` for what is protected
@@ -348,6 +348,41 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         _log.info("broker storage migrated to version %d (%s)", version, description)
 
 
+_LIVE_RUNS_VIEW_SQL = f"""\
+CREATE VIEW live_runs AS
+    SELECT *
+    FROM runs
+    WHERE ended_ts_ms IS NULL
+      AND last_heartbeat_ts_ms > (
+          CAST(strftime('%s', 'now') AS INTEGER) * 1000 - {STALE_THRESHOLD_MS}
+      )"""
+
+
+def _heal_live_runs_view(conn: sqlite3.Connection) -> None:
+    """Recreate the ``live_runs`` VIEW when its stored staleness threshold
+    drifts from :data:`STALE_THRESHOLD_MS`.
+
+    The migration that created the VIEW baked the threshold in as a
+    literal (SQLite cannot parameterise a VIEW), and the migration list
+    is append-only history — so a later change to
+    :data:`STALE_THRESHOLD_MS` would silently leave existing DBs
+    filtering on the old value. Healing outside the migration chain keeps
+    every DB consistent with the running code without a schema-version
+    bump. The membership check is the no-op fast path: matching DBs are
+    not write-locked on open.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'live_runs'"
+    ).fetchone()
+    if row is not None and f"- {STALE_THRESHOLD_MS}" in row[0]:
+        return
+    with conn:
+        conn.execute("DROP VIEW IF EXISTS live_runs")
+        conn.execute(_LIVE_RUNS_VIEW_SQL)
+    _log.info("broker storage live_runs VIEW recreated with stale threshold %d ms",
+              STALE_THRESHOLD_MS)
+
+
 # === BrokerStore ===========================================================
 
 class BrokerStore:
@@ -396,6 +431,7 @@ class BrokerStore:
         self._conn.row_factory = sqlite3.Row
         self._configure_pragmas()
         _apply_migrations(self._conn)
+        _heal_live_runs_view(self._conn)
 
     def _configure_pragmas(self) -> None:
         """Configure WAL + crash-safety + FK + busy-timeout."""

@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 from abc import abstractmethod, ABCMeta
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 from pynecore.types.ohlcv import OHLCV
@@ -10,7 +9,6 @@ from pynecore.types.ohlcv import OHLCV
 from .provider import ProviderPlugin
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from ..syminfo import SymInfo
 
 

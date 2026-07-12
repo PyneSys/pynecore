@@ -26,7 +26,12 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.position import BrokerPosition
-from pynecore.core.broker.sync_engine import OrderSyncEngine, _SEEN_FILL_IDS_CAP
+from pynecore.core.broker.sync_engine import (
+    OrderSyncEngine,
+    _SEEN_FILL_IDS_CAP,
+    _SETTLED_DEFENSIVE_CLOSE_IDS_CAP,
+    _BoundedIdSet,
+)
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     BrokerEvent,
@@ -1663,6 +1668,34 @@ def __test_seen_fill_ids_ring_evicts_oldest_at_cap__():
     assert engine._is_duplicate_fill(_ev("f0")) is False
     # Bounded.
     assert len(engine._seen_fill_ids) == _SEEN_FILL_IDS_CAP
+
+
+def __test_settled_defensive_close_caches_are_bounded__():
+    """The settled-defensive-close identity caches are bounded FIFO rings.
+
+    Re-adding a known id is a no-op (keeps its ring position); exceeding
+    the cap evicts the oldest id. Guards the leak fix: a long-lived live
+    session must not grow these caches without bound.
+    """
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+
+    for cache in (engine._settled_defensive_close_pine_ids,
+                  engine._settled_defensive_close_order_refs,
+                  engine._settled_defensive_close_client_order_ids):
+        assert isinstance(cache, _BoundedIdSet)
+
+    ring = _BoundedIdSet(3)
+    ring.add("a")
+    ring.add("b")
+    ring.add("a")  # no-op re-add: "a" keeps its slot as the oldest entry
+    ring.add("c")
+    assert len(ring) == 3 and "a" in ring
+    ring.add("d")  # evicts "a" (oldest), not "b"
+    assert len(ring) == 3
+    assert "a" not in ring
+    assert "b" in ring and "c" in ring and "d" in ring
+    assert _SETTLED_DEFENSIVE_CLOSE_IDS_CAP > 0
 
 
 def __test_exit_with_prices_dispatches_execute_exit__():

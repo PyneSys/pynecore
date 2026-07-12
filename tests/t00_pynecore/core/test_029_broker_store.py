@@ -96,6 +96,54 @@ def __test_migrations_applied_on_fresh_db__(tmp_path: Path) -> None:
         conn.close()
 
 
+def __test_live_runs_view_heals_on_threshold_drift__(tmp_path: Path) -> None:
+    """A ``live_runs`` VIEW carrying a stale threshold is recreated on open.
+
+    The migration chain is append-only history, so a change to
+    ``STALE_THRESHOLD_MS`` cannot reach existing DBs through it — the
+    self-heal on open is what keeps the stored VIEW aligned with the
+    running code.
+    """
+    path = tmp_path / "broker.sqlite"
+    with BrokerStore(path, plugin_name=PLUGIN):
+        pass
+
+    def _view_sql() -> str:
+        conn = sqlite3.connect(str(path))
+        try:
+            return conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='view' AND name='live_runs'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    from pynecore.core.broker.storage import STALE_THRESHOLD_MS
+
+    # Fresh DB: the VIEW already carries the current constant.
+    assert f"- {STALE_THRESHOLD_MS}" in _view_sql()
+
+    # Simulate a DB migrated under an older constant.
+    conn = sqlite3.connect(str(path))
+    try:
+        with conn:
+            conn.execute("DROP VIEW live_runs")
+            conn.execute(
+                "CREATE VIEW live_runs AS SELECT * FROM runs "
+                "WHERE ended_ts_ms IS NULL "
+                "AND last_heartbeat_ts_ms > ("
+                "CAST(strftime('%s', 'now') AS INTEGER) * 1000 - 999)"
+            )
+    finally:
+        conn.close()
+
+    with BrokerStore(path, plugin_name=PLUGIN):
+        pass
+    healed = _view_sql()
+    assert "- 999" not in healed
+    assert f"- {STALE_THRESHOLD_MS}" in healed
+
+
 def __test_migrations_idempotent_on_reopen__(tmp_path: Path) -> None:
     """The second open does not drop or duplicate the schema."""
     path = tmp_path / "broker.sqlite"

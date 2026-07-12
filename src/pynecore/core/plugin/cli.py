@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 from . import Plugin, ConfigT
@@ -18,7 +16,7 @@ class CLIPlugin(Plugin[ConfigT]):
     """
 
     @staticmethod
-    def cli() -> typer.Typer | None:
+    def cli() -> 'typer.Typer | None':
         """
         Return a Typer app for plugin subcommands.
 
@@ -30,7 +28,7 @@ class CLIPlugin(Plugin[ConfigT]):
 
     # noinspection PyUnusedLocal
     @staticmethod
-    def cli_params(command_name: str) -> list[click.Parameter]:
+    def cli_params(command_name: str) -> 'list[click.Parameter]':
         """
         Return extra parameters for an existing command.
 
