@@ -168,6 +168,37 @@ def __test_idempotency_unsupported_rejected__():
     assert any('idempotency' in e for e in errors)
 
 
+# === Client-id budget ===
+
+
+def __test_short_budget_at_wire_floor_is_clean__():
+    """A venue budget at the wire floor (20) is a supported declaration."""
+    class _ShortBudget(_ConformingPlugin):
+        client_order_id_max_len = 20
+
+    errors, warnings = validate_plugin_contract(_ShortBudget())
+    assert errors == []
+    assert warnings == []
+
+
+def __test_budget_below_wire_floor_rejected__():
+    """A budget below the wire floor cannot stay deterministic — error."""
+    class _TinyBudget(_ConformingPlugin):
+        client_order_id_max_len = 19
+
+    errors, _ = validate_plugin_contract(_TinyBudget())
+    assert any('client_order_id_max_len' in e for e in errors)
+
+
+def __test_non_int_budget_rejected__():
+    """A non-int budget declaration (e.g. bool or str) is an error."""
+    class _BoolBudget(_ConformingPlugin):
+        client_order_id_max_len = True
+
+    errors, _ = validate_plugin_contract(_BoolBudget())
+    assert any('client_order_id_max_len' in e for e in errors)
+
+
 def __test_watch_orders_declared_but_not_overridden__():
     """A supported watch_orders declaration needs the method overridden."""
     class _NoStream(_ConformingPlugin):

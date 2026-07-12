@@ -12,6 +12,7 @@ non-empty error list, refuses to start trading.
 """
 from dataclasses import fields
 
+from pynecore.core.broker.idempotency import WIRE_CLIENT_ORDER_ID_MIN_LEN
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -159,6 +160,10 @@ def validate_plugin_contract(
       timeout retries can double-fill; live trading is refused
       (:class:`CapabilityLevel` documents this rejection, this is where it
       is enforced).
+    - **Client-id budget** — ``client_order_id_max_len`` must be an int of
+      at least :data:`~pynecore.core.broker.idempotency.WIRE_CLIENT_ORDER_ID_MIN_LEN`;
+      the wire-form client-order-id cannot stay deterministic-and-recognisable
+      below that.
     - **Lifecycle** — with ``require_account_id=True`` the plugin must have
       populated ``_account_id`` during authentication *before* the broker
       storage derives the run identity from it; a silent ``"default"``
@@ -241,6 +246,23 @@ def validate_plugin_contract(
             f"inherited defaults are cancel+recreate (an unprotected window "
             f"the declaration claims not to have). Override at least one "
             f"with the exchange's in-place amend, or declare SOFTWARE."
+        )
+
+    # --- Client-id budget ---
+    max_len = plugin.client_order_id_max_len
+    if not isinstance(max_len, int) or isinstance(max_len, bool):
+        errors.append(
+            f"{name}.client_order_id_max_len is {max_len!r} "
+            f"({type(max_len).__name__}) — must be an int (the venue's "
+            f"client-order-id length limit in characters)."
+        )
+    elif max_len < WIRE_CLIENT_ORDER_ID_MIN_LEN:
+        errors.append(
+            f"{name}.client_order_id_max_len={max_len} is below the wire "
+            f"floor ({WIRE_CLIENT_ORDER_ID_MIN_LEN}): the deterministic "
+            f"wire-form client-order-id needs 14 raw prefix characters plus "
+            f"a >=6-character hash tail to keep restart adoption sound. "
+            f"Venues with shorter client-id fields are not supportable."
         )
 
     # --- Override pairs ---

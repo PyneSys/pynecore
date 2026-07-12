@@ -47,6 +47,7 @@ SYMBOL = "EURUSD"
 
 
 class _FakeBroker:
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     def get_capabilities(self) -> ExchangeCapabilities:
         return ExchangeCapabilities(stop_order=CapabilityLevel.NATIVE)
 

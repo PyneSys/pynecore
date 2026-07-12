@@ -43,12 +43,14 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.idempotency import (
+    CLIENT_ORDER_ID_MAX_LEN,
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
     KIND_ENTRY_STOP,
     KIND_EXIT_SL,
     parse_client_order_id,
+    parse_wire_client_order_id,
 )
 from pynecore.core.broker.models import (
     CancelIntent,
@@ -966,11 +968,25 @@ class OneWayEmulator:
         # otherwise a second ambiguous round-trip would land an entry row the
         # breadcrumb's ``entry_coid`` check never finds, re-opening the
         # residual again. The flag is recovered from the persisted coid's kind
-        # code rather than a separate extras field.
-        parsed_entry = (
-            parse_client_order_id(entry_coid) if entry_coid is not None else None
+        # code rather than a separate extras field — both forms carry it raw:
+        # canonical in ``{k}{r}``, wire in the raw prefix. A wire-form coid's
+        # length IS the minting venue's budget, so replaying it at
+        # ``len(entry_coid)`` re-mints the byte-identical id; a canonical coid
+        # replays under the default (identity) budget.
+        parsed_entry = parsed_wire = None
+        coid_max_len = CLIENT_ORDER_ID_MAX_LEN
+        if entry_coid is not None:
+            parsed_entry = parse_client_order_id(entry_coid)
+            if parsed_entry is None:
+                parsed_wire = parse_wire_client_order_id(entry_coid)
+                if parsed_wire is not None:
+                    coid_max_len = len(entry_coid)
+        entry_kind = (
+            parsed_entry.kind if parsed_entry is not None
+            else parsed_wire.kind if parsed_wire is not None
+            else None
         )
-        stop_fired = parsed_entry is not None and parsed_entry.kind == KIND_ENTRY_STOP
+        stop_fired = entry_kind == KIND_ENTRY_STOP
         envelope = DispatchEnvelope(
             intent=EntryIntent(
                 pine_id=row.pine_entry_id, symbol=row.symbol, side=row.side,
@@ -978,6 +994,7 @@ class OneWayEmulator:
                 stop_fired_market=stop_fired,
             ),
             run_tag=run_tag, bar_ts_ms=bar_ts_ms, retry_seq=retry_seq,
+            coid_max_len=coid_max_len,
         )
         try:
             await port.place_leg(envelope, row.qty)

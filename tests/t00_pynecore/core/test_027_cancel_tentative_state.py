@@ -249,6 +249,7 @@ class _MockBroker:
     so the cancel-tentative entry path and the reconcile resolution path
     can be exercised in isolation.
     """
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     raise_on_cancel: list[Exception] = field(default_factory=list)
     cancel_outcomes: list[CancelDispositionOutcome] = field(default_factory=list)
     cancel_with_outcome_calls: list[DispatchEnvelope] = field(default_factory=list)

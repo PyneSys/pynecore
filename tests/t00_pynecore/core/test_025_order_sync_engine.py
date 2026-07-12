@@ -88,6 +88,7 @@ class MockBroker:
     sends so tests can inspect both the wrapped intent and the allocated
     ``client_order_id``.
     """
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     entry_calls: list[DispatchEnvelope] = field(default_factory=list)
     exit_calls: list[DispatchEnvelope] = field(default_factory=list)
     close_calls: list[DispatchEnvelope] = field(default_factory=list)
@@ -799,6 +800,95 @@ def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
         assert len(b.entry_calls) == 1
         assert b.entry_calls[0].bar_ts_ms == BAR_TS
         assert b.entry_calls[0].retry_seq == 1
+
+
+def __test_restart_adopts_wire_form_live_entry_coid__(tmp_path):
+    """A short-budget venue echoes wire ids; adoption forward-hash matches them."""
+    # Same crash window as the canonical adoption test, but the venue's
+    # client-id budget (20) forces the wire form: the echoed id carries
+    # run/bar/kind raw and hides pid/retry in the hash tail, so the scan
+    # snapshots the order whole and the builder recovers (bar, retry) by
+    # rebuilding candidate canonical ids and comparing the re-encoded wire
+    # form. The re-dispatch must be byte-identical to the live order's id.
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import (
+        build_client_order_id, encode_wire_client_order_id, KIND_ENTRY,
+    )
+
+    wire_coid = encode_wire_client_order_id(
+        build_client_order_id(
+            run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=1,
+        ),
+        20,
+    )
+    assert len(wire_coid) == 20
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.client_order_id_max_len = 20
+        b.open_orders = [_live_working_order(wire_coid)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS + 60_000)  # script re-emits "L" on a later bar
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 1
+        assert b.entry_calls[0].client_order_id(KIND_ENTRY) == wire_coid
+
+        # The adoption journaled the recovered anchor — a restart keeps it.
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        engine2 = OrderSyncEngine(
+            broker=MockBroker(),  # type: ignore[arg-type]
+            position=BrokerPosition(), symbol=SYMBOL,
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx2,
+        )
+        anchor = engine2._persisted_envelope_anchors.get("L")  # type: ignore[attr-defined]
+        assert anchor is not None
+        assert anchor.bar_ts_ms == BAR_TS
+        assert anchor.retry_seq == 1
+
+
+def __test_restart_ignores_foreign_wire_form_order__(tmp_path):
+    """A wire id from a different run_tag is ignored; the entry mints fresh."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import (
+        build_client_order_id, encode_wire_client_order_id, KIND_ENTRY,
+    )
+
+    foreign_wire = encode_wire_client_order_id(
+        build_client_order_id(
+            run_tag="zzzz", pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=3,
+        ),
+        20,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.client_order_id_max_len = 20
+        b.open_orders = [_live_working_order(foreign_wire)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].bar_ts_ms == BAR_TS
+        assert b.entry_calls[0].retry_seq == 0
 
 
 def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):

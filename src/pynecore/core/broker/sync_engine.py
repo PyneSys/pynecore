@@ -51,8 +51,10 @@ from pynecore.core.broker.idempotency import (
     KIND_EXIT_TP_PARTIAL,
     KIND_EXIT_TRAIL_PARTIAL,
     build_client_order_id,
+    encode_wire_client_order_id,
     hash_pine_id,
     parse_client_order_id,
+    parse_wire_client_order_id,
 )
 from pynecore.core.broker.intent_builder import (
     build_intents,
@@ -234,6 +236,19 @@ arrived in time and the engine halts so an operator can investigate.
 """
 
 
+_WIRE_ADOPT_RETRY_SCAN_MAX = 36
+"""Exclusive ``retry_seq`` bound for the wire-form restart adoption match.
+
+A wire client-order-id hides ``retry_seq`` inside its hash tail, so
+:meth:`OrderSyncEngine._maybe_adopt_restart_entry_anchor` recovers it by
+forward-hashing candidates. Reject bumps reset on every bar advance and the
+materialisation-time journal write covers most of them, so a live order
+whose lost anchor sits above this bound is astronomically unlikely — and
+the failure mode is merely no adoption (the order stays with reconcile),
+identical to the ambiguous-anchor skip.
+"""
+
+
 _SEEN_FILL_IDS_CAP = 8192
 """Upper bound on the engine's duplicate-fill seen-set (:attr:`OrderSyncEngine._seen_fill_ids`).
 
@@ -391,6 +406,10 @@ class OrderSyncEngine:
         self._position = position
         self._symbol = symbol
         self._run_tag = run_tag
+        # Venue client-id budget — stamped on every envelope so coid minting
+        # (and every journal/echo comparison downstream) is wire-form
+        # consistent for short-budget venues.
+        self._coid_max_len = broker.client_order_id_max_len
         self._loop = event_loop
         self._timeout = execute_timeout
         self._reconcile_every = reconcile_every_n_syncs
@@ -813,6 +832,16 @@ class OrderSyncEngine:
         # ``pid_hash`` (not ``pine_id``) because the COID hash is one-way; the
         # builder forward-hashes ``intent.pine_id`` to match.
         self._restart_live_entry_anchors: dict[str, tuple[int, int]] = {}
+        # Wire-form sibling of the snapshot above, for short-budget venues
+        # (``coid_max_len`` below the canonical width). A wire id only
+        # carries ``run_tag`` / ``bar_ts_ms`` / ``kind`` raw — the ``pid``
+        # hash and ``retry_seq`` sit inside the opaque sha256 tail — so the
+        # scan cannot key it by ``pid_hash`` up front. Each entry is the
+        # echoed ``(wire_coid, bar_ts_ms, kind)``; the builder matches lazily
+        # by rebuilding candidate canonical ids for the intent's ``pine_id``
+        # over a bounded ``retry_seq`` scan and comparing the re-encoded
+        # wire form (see :meth:`_maybe_adopt_restart_entry_anchor`).
+        self._restart_live_wire_entry_orders: list[tuple[str, int, str]] = []
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
@@ -4482,19 +4511,25 @@ class OrderSyncEngine:
             parent_anchor = self._persisted_envelope_anchors.get(from_entry)
             if parent_anchor is None:
                 return None
-            kind_entry_ref = build_client_order_id(
-                run_tag=self._run_tag,
-                pine_id=from_entry,
-                bar_ts_ms=parent_anchor.bar_ts_ms,
-                kind=KIND_ENTRY,
-                retry_seq=parent_anchor.retry_seq,
+            kind_entry_ref = encode_wire_client_order_id(
+                build_client_order_id(
+                    run_tag=self._run_tag,
+                    pine_id=from_entry,
+                    bar_ts_ms=parent_anchor.bar_ts_ms,
+                    kind=KIND_ENTRY,
+                    retry_seq=parent_anchor.retry_seq,
+                ),
+                self._coid_max_len,
             )
-            stop_ref = build_client_order_id(
-                run_tag=self._run_tag,
-                pine_id=from_entry,
-                bar_ts_ms=parent_anchor.bar_ts_ms,
-                kind=KIND_ENTRY_STOP,
-                retry_seq=parent_anchor.retry_seq,
+            stop_ref = encode_wire_client_order_id(
+                build_client_order_id(
+                    run_tag=self._run_tag,
+                    pine_id=from_entry,
+                    bar_ts_ms=parent_anchor.bar_ts_ms,
+                    kind=KIND_ENTRY_STOP,
+                    retry_seq=parent_anchor.retry_seq,
+                ),
+                self._coid_max_len,
             )
         if (self._store_ctx is not None
                 and self._store_ctx.get_order(stop_ref) is not None):
@@ -8294,6 +8329,7 @@ class OrderSyncEngine:
                 run_tag=existing.run_tag,
                 bar_ts_ms=existing.bar_ts_ms,
                 retry_seq=existing.retry_seq,
+                coid_max_len=self._coid_max_len,
             )
         anchor = self._persisted_envelope_anchors.pop(intent.intent_key, None)
         reject_anchor = self._reject_anchor_bars.get(intent.intent_key)
@@ -8321,6 +8357,7 @@ class OrderSyncEngine:
                 run_tag=self._run_tag,
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
+                coid_max_len=self._coid_max_len,
             )
             self._envelopes[intent.intent_key] = envelope
             return envelope
@@ -8332,6 +8369,7 @@ class OrderSyncEngine:
                 run_tag=self._run_tag,
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
+                coid_max_len=self._coid_max_len,
             )
             # The adoption helper already journaled the recovered anchor.
             self._envelopes[intent.intent_key] = envelope
@@ -8341,6 +8379,7 @@ class OrderSyncEngine:
             run_tag=self._run_tag,
             bar_ts_ms=self._current_bar_ts_ms,
             retry_seq=0,
+            coid_max_len=self._coid_max_len,
         )
         self._envelopes[intent.intent_key] = envelope
         if self._store_ctx is not None:
@@ -8402,7 +8441,11 @@ class OrderSyncEngine:
         this run owns — its ``client_order_id`` parses cleanly, its
         ``run_tag`` matches ours, and its kind is :data:`KIND_ENTRY` or
         :data:`KIND_ENTRY_STOP` — into :attr:`_restart_live_entry_anchors`,
-        keyed by ``pid_hash`` -> ``(bar_ts_ms, retry_seq)``. Only the entry
+        keyed by ``pid_hash`` -> ``(bar_ts_ms, retry_seq)``. An id that is
+        not canonical but parses as a wire form (short-budget venue) with a
+        matching ``run_tag`` and entry kind lands in
+        :attr:`_restart_live_wire_entry_orders` instead, deferred to the
+        adoption-time forward-hash match. Only the entry
         working order is recoverable this way: position-attached bracket legs
         never surface in ``get_open_orders`` (and are not entry kinds anyway),
         so they stay out of scope — matching the residual documented when the
@@ -8423,13 +8466,23 @@ class OrderSyncEngine:
         """
         orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
         by_pid: dict[str, set[tuple[int, int]]] = {}
+        wire_orders: list[tuple[str, int, str]] = []
         for order in orders:
             coid = order.client_order_id
             if not coid:
                 continue
             parsed = parse_client_order_id(coid)
-            if (parsed is None
-                    or parsed.run_tag != self._run_tag
+            if parsed is None:
+                # Short-budget venues echo the wire form — the pid hash and
+                # retry_seq are opaque there, so the order is snapshotted
+                # whole and matched lazily at adoption time.
+                wire = parse_wire_client_order_id(coid)
+                if (wire is not None
+                        and wire.run_tag == self._run_tag
+                        and wire.kind in (KIND_ENTRY, KIND_ENTRY_STOP)):
+                    wire_orders.append((coid, wire.bar_ts_ms, wire.kind))
+                continue
+            if (parsed.run_tag != self._run_tag
                     or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
                 continue
             by_pid.setdefault(parsed.pid_hash, set()).add(
@@ -8446,10 +8499,12 @@ class OrderSyncEngine:
                     "reconcile", pid_hash, sorted(anchors),
                 )
         self._restart_live_entry_anchors = adopted
-        if adopted:
+        self._restart_live_wire_entry_orders = wire_orders
+        if adopted or wire_orders:
             _blog_info(
                 "restart entry-anchor scan: %d live entry order(s) available "
-                "for COID adoption", len(adopted),
+                "for COID adoption (%d wire-form)",
+                len(adopted) + len(wire_orders), len(wire_orders),
             )
 
     def _maybe_adopt_restart_entry_anchor(
@@ -8464,6 +8519,16 @@ class OrderSyncEngine:
         constrained to current dispatchable :class:`EntryIntent`s — it never
         invents intent; a live order matching no current entry stays in the
         snapshot and is owned by reconcile.
+
+        Wire-form snapshot entries (short-budget venues) carry no ``pid_hash``
+        to key on, so they are matched here instead: rebuild the candidate
+        canonical id for this intent's ``pine_id`` at the echoed order's raw
+        ``bar_ts_ms`` / ``kind`` over ``retry_seq`` in
+        ``[0, _WIRE_ADOPT_RETRY_SCAN_MAX)``, re-encode at the echoed id's
+        length and compare — an equal wire string confirms the full identity
+        through its hash tail. More than one distinct surviving
+        ``(bar_ts_ms, retry_seq)`` is ambiguous and skipped, mirroring the
+        canonical scan-time ambiguity rule.
 
         ``current`` is the persisted journal anchor when one exists, else
         ``None`` (the fresh-mint path):
@@ -8485,11 +8550,15 @@ class OrderSyncEngine:
         :return: The ``(bar_ts_ms, retry_seq)`` to build with, or ``None`` to
             keep the engine's own (fresh mint or persisted anchor).
         """
-        if (not isinstance(intent, EntryIntent)
-                or not self._restart_live_entry_anchors):
+        if not isinstance(intent, EntryIntent) or not (
+                self._restart_live_entry_anchors
+                or self._restart_live_wire_entry_orders):
             return None
         pid_hash = hash_pine_id(intent.pine_id)
         adopted = self._restart_live_entry_anchors.get(pid_hash)
+        matched_wire: list[str] = []
+        if adopted is None:
+            adopted, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
         if adopted is None:
             return None
         bar_ts_ms, retry_seq = adopted
@@ -8503,6 +8572,11 @@ class OrderSyncEngine:
                 retry_seq=retry_seq,
             )
         self._restart_live_entry_anchors.pop(pid_hash, None)
+        if matched_wire:
+            self._restart_live_wire_entry_orders = [
+                entry for entry in self._restart_live_wire_entry_orders
+                if entry[0] not in matched_wire
+            ]
         _blog_info(
             "restart: adopted live entry order anchor for %s "
             "(bar_ts_ms=%d retry_seq=%d)",
@@ -8510,12 +8584,56 @@ class OrderSyncEngine:
         )
         return bar_ts_ms, retry_seq
 
+    def _match_wire_restart_anchor(
+            self, pine_id: str,
+    ) -> tuple[tuple[int, int] | None, list[str]]:
+        """Forward-hash match wire-form restart snapshot entries to ``pine_id``.
+
+        For each live wire order the scan snapshotted, rebuilds the candidate
+        canonical id at the order's raw ``bar_ts_ms`` / ``kind`` for every
+        ``retry_seq`` below :data:`_WIRE_ADOPT_RETRY_SCAN_MAX` and compares
+        the re-encoded wire form against the echoed id. The two legs of a
+        both-set entry (LIMIT + STOP kinds) share one pinned anchor, so they
+        collapse into a single ``(bar_ts_ms, retry_seq)`` — genuinely
+        ambiguous multi-anchor matches are logged and left to reconcile.
+
+        :return: ``(anchor, matched_wire_coids)`` — ``(None, [])`` when
+            nothing (or nothing unambiguous) matches.
+        """
+        anchors: set[tuple[int, int]] = set()
+        matched: list[str] = []
+        for wire_coid, bar_ts_ms, kind in self._restart_live_wire_entry_orders:
+            for retry_seq in range(_WIRE_ADOPT_RETRY_SCAN_MAX):
+                canonical = build_client_order_id(
+                    run_tag=self._run_tag,
+                    pine_id=pine_id,
+                    bar_ts_ms=bar_ts_ms,
+                    kind=kind,
+                    retry_seq=retry_seq,
+                )
+                if encode_wire_client_order_id(
+                        canonical, len(wire_coid)) == wire_coid:
+                    anchors.add((bar_ts_ms, retry_seq))
+                    matched.append(wire_coid)
+                    break
+        if not anchors:
+            return None, []
+        if len(anchors) > 1:
+            _blog_warning(
+                "restart entry-anchor adoption: ambiguous wire-form live "
+                "orders for pine_id %r (%s) — skipping adoption, leaving "
+                "them to reconcile", pine_id, sorted(anchors),
+            )
+            return None, []
+        return next(iter(anchors)), matched
+
     def _build_cancel_envelope(self, cancel: CancelIntent) -> DispatchEnvelope:
         return DispatchEnvelope(
             intent=cancel,
             run_tag=self._run_tag,
             bar_ts_ms=self._current_bar_ts_ms,
             retry_seq=0,
+            coid_max_len=self._coid_max_len,
         )
 
     def _park_pending(

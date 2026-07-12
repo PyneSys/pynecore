@@ -14,7 +14,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pynecore.core.broker.idempotency import build_client_order_id
+from pynecore.core.broker.idempotency import (
+    CLIENT_ORDER_ID_MAX_LEN,
+    build_client_order_id,
+    encode_wire_client_order_id,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.exceptions import BracketAttachAfterFillRejectedError
@@ -1158,24 +1162,37 @@ class DispatchEnvelope:
     :ivar bar_ts_ms: Bar open timestamp (ms since Unix epoch).
     :ivar retry_seq: Bumped by the recovery path only when a prior attempt is
         deliberately abandoned — defaults to ``0``.
+    :ivar coid_max_len: The venue's client-id budget (the plugin's
+        :attr:`~pynecore.core.plugin.broker.BrokerPlugin.client_order_id_max_len`).
+        When the canonical id exceeds it, :meth:`client_order_id` emits the
+        deterministic wire form instead (see
+        :mod:`pynecore.core.broker.idempotency`). The default keeps the
+        canonical id untouched.
     """
     intent: 'EntryIntent | ExitIntent | CloseIntent | CancelIntent'
     run_tag: str
     bar_ts_ms: int
     retry_seq: int = 0
+    coid_max_len: int = CLIENT_ORDER_ID_MAX_LEN
 
     def client_order_id(self, kind: str) -> str:
-        """Allocate the canonical client-order-id for a given leg kind.
+        """Allocate the client-order-id for a given leg kind.
+
+        Canonical form, shortened to the venue's wire form when
+        :attr:`coid_max_len` demands it — deterministic either way.
 
         :param kind: One of the ``KIND_*`` constants from
             :mod:`pynecore.core.broker.idempotency`.
         """
-        return build_client_order_id(
-            run_tag=self.run_tag,
-            pine_id=self.intent.pine_id,
-            bar_ts_ms=self.bar_ts_ms,
-            kind=kind,
-            retry_seq=self.retry_seq,
+        return encode_wire_client_order_id(
+            build_client_order_id(
+                run_tag=self.run_tag,
+                pine_id=self.intent.pine_id,
+                bar_ts_ms=self.bar_ts_ms,
+                kind=kind,
+                retry_seq=self.retry_seq,
+            ),
+            self.coid_max_len,
         )
 
 

@@ -58,6 +58,7 @@ def _stub_script():
 @dataclass
 class _MockBroker:
     """Duck-typed broker for integration scenarios."""
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     entry_calls: list[DispatchEnvelope] = field(default_factory=list)
     modify_entry_calls: list[tuple[DispatchEnvelope, DispatchEnvelope]] = field(
         default_factory=list,

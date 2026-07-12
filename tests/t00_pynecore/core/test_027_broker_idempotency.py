@@ -23,9 +23,13 @@ from pynecore.core.broker.idempotency import (
     ParsedClientOrderId,
     RUN_TAG_WIDTH,
     VALID_KINDS,
+    WIRE_CLIENT_ORDER_ID_MIN_LEN,
+    WIRE_RAW_PREFIX_LEN,
     build_client_order_id,
+    encode_wire_client_order_id,
     hash_pine_id,
     parse_client_order_id,
+    parse_wire_client_order_id,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 
@@ -393,3 +397,136 @@ def __test_parse_malformed_returns_none__(bad):
 def __test_parse_externally_owned_id_returns_none__():
     """A foreign exchange id that is not our canonical shape parses to None."""
     assert parse_client_order_id('DEAL-REF-FROM-CAPITAL-1234') is None
+
+
+# === Wire form (short-budget venues) =====================================
+
+
+def _canonical(**overrides) -> str:
+    kwargs = dict(
+        run_tag='ab12',
+        pine_id='Long',
+        bar_ts_ms=1_700_000_000_000,
+        kind=KIND_ENTRY,
+    )
+    kwargs.update(overrides)
+    return build_client_order_id(**kwargs)
+
+
+def __test_encode_wire_identity_when_budget_fits__():
+    """A canonical id within the budget passes through byte-identical."""
+    coid = _canonical()
+    assert encode_wire_client_order_id(coid, CLIENT_ORDER_ID_MAX_LEN) == coid
+    assert encode_wire_client_order_id(coid, len(coid)) == coid
+
+
+def __test_encode_wire_exact_budget_length_and_charset__():
+    """The wire form fills the venue budget exactly, all lowercase base36."""
+    for budget in (WIRE_CLIENT_ORDER_ID_MIN_LEN, 22, 25):
+        wire = encode_wire_client_order_id(_canonical(), budget)
+        assert len(wire) == budget
+        assert set(wire) <= set(string.digits + string.ascii_lowercase)
+        assert '-' not in wire
+
+
+def __test_encode_wire_is_deterministic__():
+    """Same canonical id + budget must always yield the same wire id."""
+    coid = _canonical()
+    first = encode_wire_client_order_id(coid, 20)
+    for _ in range(10):
+        assert encode_wire_client_order_id(coid, 20) == first
+
+
+def __test_encode_wire_raw_prefix_carries_run_bar_kind__():
+    """``{run4}{bar9}{kind}`` are verbatim in the wire prefix."""
+    bar_ts_ms = 1_700_000_000_000
+    wire = encode_wire_client_order_id(
+        _canonical(bar_ts_ms=bar_ts_ms, kind=KIND_EXIT_TP), 20,
+    )
+    assert wire[:RUN_TAG_WIDTH] == 'ab12'
+    assert int(wire[RUN_TAG_WIDTH:RUN_TAG_WIDTH + BAR_TS_WIDTH], 36) == bar_ts_ms
+    assert wire[WIRE_RAW_PREFIX_LEN - 1] == KIND_EXIT_TP
+
+
+def __test_encode_wire_distinct_for_distinct_identity__():
+    """pid / retry / kind / bar variations produce distinct wire ids."""
+    base = encode_wire_client_order_id(_canonical(), 20)
+    for variant in (
+        _canonical(pine_id='Short'),
+        _canonical(retry_seq=1),
+        _canonical(kind=KIND_EXIT_SL),
+        _canonical(bar_ts_ms=1_700_000_060_000),
+    ):
+        assert encode_wire_client_order_id(variant, 20) != base
+
+
+def __test_encode_wire_no_collision_across_random_pine_ids__():
+    """1000 random pine_ids stay collision-free in a 20-char budget."""
+    rng = random.Random(42)
+    seen = set()
+    for _ in range(1000):
+        pine_id = ''.join(
+            rng.choices(string.ascii_letters + string.digits, k=12),
+        )
+        seen.add(encode_wire_client_order_id(_canonical(pine_id=pine_id), 20))
+    assert len(seen) == 1000
+
+
+def __test_encode_wire_rejects_budget_below_floor__():
+    """A budget below the wire floor must raise, never truncate."""
+    with pytest.raises(ValueError):
+        encode_wire_client_order_id(
+            _canonical(), WIRE_CLIENT_ORDER_ID_MIN_LEN - 1,
+        )
+
+
+def __test_encode_wire_rejects_non_canonical_input__():
+    """Only a well-formed canonical id may be wire-encoded."""
+    with pytest.raises(ValueError):
+        encode_wire_client_order_id('x' * 40, 20)
+
+
+def __test_parse_wire_round_trips_raw_prefix__():
+    """Wire parse recovers run_tag / bar_ts_ms / kind from an encoded id."""
+    bar_ts_ms = 1_700_000_000_000
+    wire = encode_wire_client_order_id(
+        _canonical(bar_ts_ms=bar_ts_ms, kind=KIND_CLOSE), 20,
+    )
+    parsed = parse_wire_client_order_id(wire)
+    assert parsed is not None
+    assert parsed.run_tag == 'ab12'
+    assert parsed.bar_ts_ms == bar_ts_ms
+    assert parsed.kind == KIND_CLOSE
+
+
+def __test_parse_wire_rejects_canonical_id__():
+    """A canonical id (dashes) never parses as a wire id."""
+    assert parse_wire_client_order_id(_canonical()) is None
+
+
+@pytest.mark.parametrize('bad', [
+    '',
+    'ab12' + '0' * 9 + 'e',              # below the wire floor
+    'ab12' + '0' * 9 + 'z' + '0' * 6,    # unknown kind code
+    'AB12' + '0' * 9 + 'e' + '0' * 6,    # uppercase (not base36 lowercase)
+    'ab1!' + '0' * 9 + 'e' + '0' * 6,    # non-base36 charset
+])
+def __test_parse_wire_malformed_returns_none__(bad):
+    """Malformed / foreign ids parse to None instead of raising."""
+    assert parse_wire_client_order_id(bad) is None
+
+
+def __test_wire_forward_match_recovers_identity__():
+    """The restart adoption primitive: rebuilding a candidate canonical id
+    and re-encoding at the echoed id's length equals the echoed id exactly
+    for the true ``(pine_id, retry_seq)`` and no other candidate."""
+    echoed = encode_wire_client_order_id(_canonical(retry_seq=3), 20)
+    matches = [
+        (pine_id, retry_seq)
+        for pine_id in ('Long', 'Short', 'Scalp')
+        for retry_seq in range(36)
+        if encode_wire_client_order_id(
+            _canonical(pine_id=pine_id, retry_seq=retry_seq), len(echoed),
+        ) == echoed
+    ]
+    assert matches == [('Long', 3)]

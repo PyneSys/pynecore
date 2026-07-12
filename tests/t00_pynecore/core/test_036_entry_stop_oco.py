@@ -42,6 +42,7 @@ SYMBOL = "EURUSD"
 
 @dataclass
 class _FakeBroker:
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     capabilities: ExchangeCapabilities
     cancel_outcome: CancelDispositionOutcome = (
         CancelDispositionOutcome.CANCEL_CONFIRMED

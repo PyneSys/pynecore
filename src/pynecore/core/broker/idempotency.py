@@ -33,6 +33,41 @@ same logical order on the same bar always produce identical ids. Exchanges
 that enforce client-id uniqueness reject the duplicate outright; exchanges
 that do not (Interactive Brokers, Deribit) dedup inside the plugin via a
 ``get_open_orders`` match on the same id.
+
+Wire form for short-budget venues
+---------------------------------
+
+A venue whose client-id limit is below the canonical width (some FIX
+implementations cap ``ClOrdID`` at 20 characters) cannot carry the canonical
+id. For those, :func:`encode_wire_client_order_id` derives a fixed-length
+**wire form** that exactly fills the venue budget declared by the plugin
+(:attr:`~pynecore.core.plugin.broker.BrokerPlugin.client_order_id_max_len`)::
+
+    {run}{bar}{k}{hash}
+
+=====  ==================  ====================================================
+Field  Width               Content
+=====  ==================  ====================================================
+run    4 base36            Same session tag as the canonical form, raw.
+bar    9 base36            Same bar open timestamp (ms), raw.
+k      1                   Same single-character kind code, raw.
+hash   budget - 14 base36  sha256 of the FULL canonical id, base36-encoded.
+=====  ==================  ====================================================
+
+The three raw fields keep the restart adoption path cheap: a wire id echoed
+by the broker still reveals *whose run*, *which bar* and *which kind* it is,
+so recognising a lost anchor only has to forward-hash ``retry_seq``
+candidates for a known ``pine_id`` and compare against the opaque tail. The
+tail simultaneously carries the hashed ``pid`` / ``retry`` identity and
+confirms the full canonical match — an equal wire string is an equal logical
+order (modulo a >=31-bit hash collision; :data:`WIRE_CLIENT_ORDER_ID_MIN_LEN`
+floors the budget at 20 so the tail never drops below 6 characters).
+
+The mapping is deterministic and applied at every mint site through
+:meth:`~pynecore.core.broker.models.DispatchEnvelope.client_order_id`, so
+journal rows, broker echoes and rebuilt references all agree on the wire
+form. A canonical id that already fits the budget is passed through
+unchanged — venues accepting >= 30 characters are byte-for-byte unaffected.
 """
 from __future__ import annotations
 
@@ -42,7 +77,12 @@ from typing import Final
 
 __all__ = [
     'ParsedClientOrderId',
+    'ParsedWireClientOrderId',
     'parse_client_order_id',
+    'parse_wire_client_order_id',
+    'encode_wire_client_order_id',
+    'WIRE_CLIENT_ORDER_ID_MIN_LEN',
+    'WIRE_RAW_PREFIX_LEN',
     'KIND_ENTRY',
     'KIND_ENTRY_STOP',
     'KIND_ENTRY_STOP_WATCH',
@@ -107,6 +147,13 @@ CLIENT_ORDER_ID_MAX_LEN: Final[int] = 30
 RUN_TAG_WIDTH: Final[int] = 4
 PINE_ID_HASH_WIDTH: Final[int] = 8
 BAR_TS_WIDTH: Final[int] = 9
+
+# Wire form: {run4}{bar9}{kind1} raw prefix + base36 sha256 tail (module
+# docstring, "Wire form for short-budget venues").
+WIRE_RAW_PREFIX_LEN: Final[int] = RUN_TAG_WIDTH + BAR_TS_WIDTH + 1
+# Budget floor: 14 raw + >=6 hash chars (~31 bits). Below that the tail gets
+# too weak to confirm identity on the restart adoption path.
+WIRE_CLIENT_ORDER_ID_MIN_LEN: Final[int] = 20
 
 # === Base36 encoding =====================================================
 
@@ -215,6 +262,41 @@ def build_client_order_id(
     return result
 
 
+def encode_wire_client_order_id(coid: str, max_len: int) -> str:
+    """Encode a canonical client-order-id for a venue's client-id budget.
+
+    Identity when the canonical id fits (``len(coid) <= max_len``) — venues
+    accepting the full canonical width are unaffected. Otherwise returns the
+    fixed-length wire form ``{run4}{bar9}{kind}{hash}`` of exactly ``max_len``
+    characters (module docstring, "Wire form for short-budget venues"). Pure
+    and deterministic like :func:`build_client_order_id`, so retries,
+    restarts and journal-rebuilt references converge on the same wire id.
+
+    :param coid: A canonical id from :func:`build_client_order_id`.
+    :param max_len: The venue's client-id budget (the plugin's
+        ``client_order_id_max_len``). Must be at least
+        :data:`WIRE_CLIENT_ORDER_ID_MIN_LEN` when shortening is needed.
+    :raises ValueError: When ``coid`` is not a well-formed canonical id, or
+        the budget is below the wire floor.
+    """
+    if len(coid) <= max_len:
+        return coid
+    if max_len < WIRE_CLIENT_ORDER_ID_MIN_LEN:
+        raise ValueError(
+            f"client-id budget {max_len} is below the wire floor "
+            f"{WIRE_CLIENT_ORDER_ID_MIN_LEN}",
+        )
+    parsed = parse_client_order_id(coid)
+    if parsed is None:
+        raise ValueError(f"not a canonical client_order_id: {coid!r}")
+    hash_width = max_len - WIRE_RAW_PREFIX_LEN
+    digest = hashlib.sha256(coid.encode('utf-8')).digest()
+    tail_value = int.from_bytes(digest, 'big') % (36 ** hash_width)
+    tail = _to_base36(tail_value, width=hash_width)
+    bar = _to_base36(parsed.bar_ts_ms, width=BAR_TS_WIDTH)
+    return f"{parsed.run_tag}{bar}{parsed.kind}{tail}"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ParsedClientOrderId:
     """Structural decomposition of a canonical client-order-id.
@@ -273,4 +355,47 @@ def parse_client_order_id(coid: str) -> ParsedClientOrderId | None:
         bar_ts_ms=int(bar_b36, 36),
         kind=kind,
         retry_seq=int(retry_b36, 36),
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ParsedWireClientOrderId:
+    """Raw-prefix fields of a wire-form client-order-id.
+
+    Only the fields carried verbatim in the wire prefix are recoverable —
+    the ``pid`` hash and ``retry_seq`` live inside the opaque sha256 tail.
+    A caller that knows a candidate ``(pine_id, retry_seq)`` matches by
+    rebuilding the canonical id and re-encoding it at the echoed id's length
+    (``encode_wire_client_order_id(candidate, len(coid)) == coid``).
+    """
+    run_tag: str
+    bar_ts_ms: int
+    kind: str
+
+
+def parse_wire_client_order_id(coid: str) -> ParsedWireClientOrderId | None:
+    """Parse the raw prefix of a wire-form client-order-id.
+
+    Best-effort and total like :func:`parse_client_order_id`: anything that
+    does not match the ``{run4}{bar9}{kind}{hash>=6}`` all-base36 shape —
+    too short, containing a dash (canonical ids always do), an unknown
+    ``kind`` code — yields ``None``. Budget-independent: the wire form's
+    length always equals the minting venue's budget, so the parser only
+    enforces the :data:`WIRE_CLIENT_ORDER_ID_MIN_LEN` floor.
+
+    :param coid: The client-order-id to parse.
+    :return: The raw-prefix fields, or ``None`` when ``coid`` is not a
+        well-formed wire id.
+    """
+    if len(coid) < WIRE_CLIENT_ORDER_ID_MIN_LEN:
+        return None
+    if not (set(coid) <= set(_BASE36_DIGITS)):
+        return None
+    kind = coid[WIRE_RAW_PREFIX_LEN - 1]
+    if kind not in VALID_KINDS:
+        return None
+    return ParsedWireClientOrderId(
+        run_tag=coid[:RUN_TAG_WIDTH],
+        bar_ts_ms=int(coid[RUN_TAG_WIDTH:RUN_TAG_WIDTH + BAR_TS_WIDTH], 36),
+        kind=kind,
     )

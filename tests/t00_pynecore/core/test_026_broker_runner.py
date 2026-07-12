@@ -91,6 +91,7 @@ def _make_bars(count: int, start_price: float = 50_000.0) -> list[OHLCV]:
 class MockBrokerPlugin:
     """Duck-typed stand-in for :class:`BrokerPlugin` — matches only the
     methods :class:`ScriptRunner` and :class:`OrderSyncEngine` call."""
+    client_order_id_max_len = 30  # BrokerPlugin contract attribute
     capabilities: ExchangeCapabilities = field(default_factory=ExchangeCapabilities)
     entry_calls: list[EntryIntent] = field(default_factory=list)
     exit_calls: list[ExitIntent] = field(default_factory=list)

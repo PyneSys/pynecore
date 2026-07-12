@@ -26,6 +26,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     OrderDispositionUnknownError,
 )
+from pynecore.core.broker.idempotency import CLIENT_ORDER_ID_MAX_LEN
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
     CancelIntent,
@@ -216,6 +217,21 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     The net only catches contract violations; a plugin SHOULD still classify
     explicitly, which keeps the recoverable read path parking and the ambiguous
     write path parked-for-verification instead of halting.
+    """
+
+    client_order_id_max_len: int = CLIENT_ORDER_ID_MAX_LEN
+    """
+    The venue's client-order-id length budget, in characters.
+
+    The default (30) is the canonical
+    :mod:`~pynecore.core.broker.idempotency` width and fits every currently
+    supported exchange. A plugin for a venue with a shorter client-id field
+    (some FIX implementations cap ``ClOrdID`` at 20) overrides this with the
+    venue's actual limit; the engine then mints deterministic wire-form ids
+    of exactly this length (see the idempotency module docstring). Must be
+    at least ``WIRE_CLIENT_ORDER_ID_MIN_LEN`` (20) — the startup contract
+    probe (:func:`~pynecore.core.broker.validation.validate_plugin_contract`)
+    rejects anything lower.
     """
 
     defensive_close_resolution_grace_s: float | None = None
@@ -561,6 +577,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
             run_tag=new.run_tag,
             bar_ts_ms=new.bar_ts_ms,
             retry_seq=new.retry_seq,
+            coid_max_len=new.coid_max_len,
         )
         await self.execute_cancel(cancel_envelope)
         return await self.execute_entry(new)
@@ -585,6 +602,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
             run_tag=new.run_tag,
             bar_ts_ms=new.bar_ts_ms,
             retry_seq=new.retry_seq,
+            coid_max_len=new.coid_max_len,
         )
         await self.execute_cancel(cancel_envelope)
         return await self.execute_exit(new)
