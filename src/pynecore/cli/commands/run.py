@@ -915,6 +915,25 @@ def run(
             broker_defaults = load_broker_defaults(app_state.config_dir)
             broker_plugin.on_unexpected_cancel = broker_defaults.on_unexpected_cancel
 
+            # Probe the plugin against the BrokerPlugin authoring contract
+            # before any storage or engine state exists. Authentication has
+            # already run (``_download_provider_data`` drove it), so the
+            # account-id lifecycle is checkable here — and the broker
+            # storage below derives the run identity from it.
+            from pynecore.core.broker.validation import validate_plugin_contract
+            contract_errors, contract_warnings = validate_plugin_contract(
+                broker_plugin, require_account_id=True,
+            )
+            for warning in contract_warnings:
+                broker_warning("%s", warning)
+            if contract_errors:
+                secho(
+                    "Broker plugin contract violation(s):\n"
+                    + "\n".join(f"  - {e}" for e in contract_errors),
+                    err=True, fg=colors.RED,
+                )
+                raise Exit(1)
+
             import asyncio as _asyncio
             broker_event_loop = _asyncio.new_event_loop()
             # Drive the loop on a dedicated daemon thread. Broker plugin

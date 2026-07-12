@@ -1,13 +1,37 @@
 """
-Startup-time validation of script :class:`ScriptRequirements` against a
-plugin's :class:`ExchangeCapabilities`.
+Startup-time validation for broker mode.
 
-Pure function — the Script Runner calls this at broker-mode startup and, on a
+- :func:`validate_at_startup` — script :class:`ScriptRequirements` against a
+  plugin's :class:`ExchangeCapabilities`.
+- :func:`validate_plugin_contract` — the plugin itself against the
+  :class:`~pynecore.core.plugin.broker.BrokerPlugin` authoring contract
+  (override pairs, capability-declaration consistency, lifecycle state).
+
+Pure functions — the ``pyne run --broker`` startup path calls them and, on a
 non-empty error list, refuses to start trading.
 """
-from pynecore.core.broker.models import ExchangeCapabilities, ScriptRequirements
+from dataclasses import fields
 
-__all__ = ['validate_at_startup']
+from pynecore.core.broker.models import (
+    CapabilityLevel,
+    ExchangeCapabilities,
+    ScriptRequirements,
+)
+from pynecore.core.plugin.broker import BrokerPlugin
+
+__all__ = ['validate_at_startup', 'validate_plugin_contract']
+
+#: Methods a :class:`~pynecore.core.plugin.broker.PositionPort` implementation
+#: must provide. Mirrors the Protocol surface — kept here as data so the
+#: contract probe can enumerate it without runtime Protocol introspection.
+_POSITION_PORT_METHODS = (
+    'fetch_raw_positions',
+    'get_volume_quantizer',
+    'close_leg',
+    'reject_out_of_range',
+    'place_leg',
+    'amend_bracket',
+)
 
 
 def validate_at_startup(
@@ -103,3 +127,162 @@ def validate_at_startup(
             "opts into partial-qty bracket pyramiding support."
         )
     return errors
+
+
+def validate_plugin_contract(
+        plugin: BrokerPlugin,
+        *,
+        require_account_id: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    Probe a broker plugin against the enforceable parts of the
+    :class:`~pynecore.core.plugin.broker.BrokerPlugin` authoring contract.
+
+    The abstract ``execute_*`` surface is small, but the real contract lives
+    in docstring prose that a new plugin author can silently miss. This probe
+    turns the machine-checkable subset into fail-fast startup errors:
+
+    - **Override pairs** — a plugin that overrides
+      :meth:`~pynecore.core.plugin.broker.BrokerPlugin.get_residual_orders_after_bracket_attach_reject`
+      returns broker refs the engine hands back to
+      :meth:`~pynecore.core.plugin.broker.BrokerPlugin.cancel_broker_order_ref`,
+      whose default raises :class:`NotImplementedError` — the defensive-close
+      recovery loop would crash exactly when it is needed.
+    - **Capability declaration consistency** — every
+      :class:`ExchangeCapabilities` field must be a :class:`CapabilityLevel`
+      (a ``True``/``False`` slips through type checkers on untyped call
+      sites); a supported ``watch_orders`` needs the method actually
+      overridden; a NATIVE / PARTIAL_NATIVE ``amend_order`` claim needs at
+      least one of ``modify_entry`` / ``modify_exit`` overridden (the
+      inherited defaults are cancel+recreate, which the declaration denies).
+    - **Idempotency floor** — ``idempotency=UNSUPPORTED`` means restart /
+      timeout retries can double-fill; live trading is refused
+      (:class:`CapabilityLevel` documents this rejection, this is where it
+      is enforced).
+    - **Lifecycle** — with ``require_account_id=True`` the plugin must have
+      populated ``_account_id`` during authentication *before* the broker
+      storage derives the run identity from it; a silent ``"default"``
+      would collide every run of the account.
+    - **PositionPort surface** — a non-``None``
+      :attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port` must
+      carry the full port surface the core
+      :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` drives.
+
+    Deliberately NOT checked: ``cancel_all`` capability vs
+    ``execute_cancel_all`` override. A ``SOFTWARE`` ``cancel_all`` is
+    legitimately delivered through the sync engine's diff loop as per-intent
+    cancels with the default ``execute_cancel_all`` untouched (Capital.com
+    does exactly this).
+
+    Warnings flag legal but degraded setups the author should confirm are
+    intentional; they must not block startup.
+
+    :param plugin: The instantiated broker plugin to probe.
+    :param require_account_id: ``True`` on the production ``--broker`` path,
+        where authentication has already run and the broker storage is about
+        to derive the run identity from :attr:`BrokerPlugin.account_id`.
+        Leave ``False`` for paths that never open broker storage.
+    :return: ``(errors, warnings)`` — human-readable strings; empty lists
+        when the plugin conforms.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    cls = type(plugin)
+    name = cls.__name__
+
+    def overridden(method: str) -> bool:
+        return getattr(cls, method) is not getattr(BrokerPlugin, method)
+
+    # --- Capability declaration ---
+    caps = plugin.get_capabilities()
+    bad_fields: set[str] = set()
+    for f in fields(ExchangeCapabilities):
+        value = getattr(caps, f.name)
+        if not isinstance(value, CapabilityLevel):
+            bad_fields.add(f.name)
+            errors.append(
+                f"{name}.get_capabilities().{f.name} is {value!r} "
+                f"({type(value).__name__}) — every capability field must be "
+                f"a CapabilityLevel, never a bool or plain string."
+            )
+
+    if 'idempotency' not in bad_fields and not caps.idempotency.is_supported:
+        errors.append(
+            f"{name} declares idempotency=UNSUPPORTED — without client-id "
+            f"echo or dedup, restart/timeout retries can double-fill. Live "
+            f"trading is refused; declare SOFTWARE and dedup locally (see "
+            f"the Capital.com plugin) if the exchange offers nothing."
+        )
+
+    if 'watch_orders' not in bad_fields:
+        if caps.watch_orders.is_supported and not overridden('watch_orders'):
+            errors.append(
+                f"{name} declares watch_orders={caps.watch_orders.name} but "
+                f"does not override watch_orders() — the base method raises "
+                f"NotImplementedError, so the declared order stream cannot "
+                f"exist. Either implement the stream or declare UNSUPPORTED."
+            )
+        elif not overridden('watch_orders'):
+            warnings.append(
+                f"{name} has no watch_orders() stream: the engine falls back "
+                f"to reconcile() polling for fills, and there is NO channel "
+                f"for bot-owned-order disappearance detection (manual closes, "
+                f"broker liquidations and silent cancels stay invisible). "
+                f"Confirm this is acceptable for the venue."
+            )
+
+    if ('amend_order' not in bad_fields
+            and caps.amend_order in (CapabilityLevel.NATIVE, CapabilityLevel.PARTIAL_NATIVE)
+            and not overridden('modify_entry')
+            and not overridden('modify_exit')):
+        errors.append(
+            f"{name} declares amend_order={caps.amend_order.name} but "
+            f"overrides neither modify_entry() nor modify_exit() — the "
+            f"inherited defaults are cancel+recreate (an unprotected window "
+            f"the declaration claims not to have). Override at least one "
+            f"with the exchange's in-place amend, or declare SOFTWARE."
+        )
+
+    # --- Override pairs ---
+    if (overridden('get_residual_orders_after_bracket_attach_reject')
+            and not overridden('cancel_broker_order_ref')):
+        errors.append(
+            f"{name} overrides get_residual_orders_after_bracket_attach_reject() "
+            f"but not cancel_broker_order_ref() — the defensive-close recovery "
+            f"loop passes every returned ref to cancel_broker_order_ref(), "
+            f"whose default raises NotImplementedError. Override both."
+        )
+
+    if not overridden('execute_cancel_with_outcome'):
+        warnings.append(
+            f"{name} does not override execute_cancel_with_outcome(): every "
+            f"cancel disposition collapses to UNKNOWN, so a cancel-tentative "
+            f"order can only resolve through a broker-pushed FILL/CANCEL "
+            f"event. Override it to classify the exchange's post-cancel "
+            f"disposition when the venue makes it readable."
+        )
+
+    # --- PositionPort surface ---
+    port = plugin.position_port
+    if port is not None:
+        missing = [m for m in _POSITION_PORT_METHODS
+                   if not callable(getattr(port, m, None))]
+        if missing:
+            errors.append(
+                f"{name}.position_port opts into core one-way emulation but "
+                f"is missing PositionPort method(s): {', '.join(missing)}. "
+                f"The OneWayEmulator drives the plugin purely through this "
+                f"surface — implement all of them."
+            )
+
+    # --- Lifecycle ---
+    if require_account_id and plugin.account_id == "default":
+        errors.append(
+            f"{name}.account_id is still the \"default\" sentinel after "
+            f"authentication — connect()/session setup must populate "
+            f"self._account_id BEFORE broker storage derives the run "
+            f"identity, otherwise every run of every account of this "
+            f"plugin collides on one identity."
+        )
+
+    return errors, warnings
