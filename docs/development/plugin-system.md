@@ -5,7 +5,7 @@ title: "Plugin System"
 description: "How to create plugins for PyneCore"
 icon: "extension"
 date: "2026-03-30"
-lastmod: "2026-07-10"
+lastmod: "2026-07-12"
 draft: false
 toc: true
 categories: ["Development"]
@@ -300,6 +300,13 @@ exchange.  It receives high-level intents from the engine (`execute_entry`,
 `execute_exit`, `execute_close`, `execute_cancel`) and translates them into
 exchange-specific calls.  The engine handles idempotency, retry, and reconcile
 — the plugin focuses on the actual REST/WebSocket wiring.
+
+This section covers the scaffolding only. Before writing a real broker
+plugin, read the
+[Broker Plugin Authoring Guide](broker-plugin-authoring.md) — it is the
+checklist of contract requirements (disappearance detection, incremental
+fill reporting, client-id echo, override pairs, lifecycle order) that live
+trading depends on and the type signatures alone do not show.
 
 ```python
 from dataclasses import dataclass
