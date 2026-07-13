@@ -56,6 +56,7 @@ __all__ = [
     'EnvelopeRecord',
     'PendingRecord',
     'OrderRow',
+    'TransactionRollbackError',
     'HEARTBEAT_INTERVAL_MS',
     'STALE_THRESHOLD_MS',
     'RETENTION_DAYS',
@@ -385,6 +386,32 @@ def _heal_live_runs_view(conn: sqlite3.Connection) -> None:
 
 # === BrokerStore ===========================================================
 
+class TransactionRollbackError(Exception):
+    """Raised at the outermost :meth:`BrokerStore.transaction` boundary when
+    a nested level exited exceptionally and the exception was swallowed
+    *inside* the span.
+
+    The whole span was rolled back — none of its writes committed. A caller
+    that swallowed an inner failure and kept going therefore does NOT get a
+    silently-successful ``with`` block; this error signals the discarded
+    span so it cannot mistake it for a commit. Chained (``from``) the first
+    nested exception.
+    """
+
+
+class _TransactionAborted(Exception):
+    """Internal sentinel forcing the outermost ``transaction()`` span to
+    roll back.
+
+    A nested ``transaction()`` level that exits with an exception marks the
+    whole span rollback-only; if the exception is then swallowed *inside*
+    the outer block, the outermost ``with conn:`` would otherwise see no
+    exception and COMMIT the partial work. Raising this sentinel just before
+    the outer block would commit makes ``sqlite3`` roll back instead; the
+    outermost level converts it into a :class:`TransactionRollbackError`.
+    """
+
+
 class BrokerStore:
     """Unified SQLite broker-state store for one workdir.
 
@@ -413,6 +440,13 @@ class BrokerStore:
         # outermost level opens the real BEGIN…COMMIT span. Guarded by
         # ``_lock`` (re-entrant), so cross-thread spans stay serialized.
         self._txn_depth = 0
+        # Set when any nested :meth:`transaction` level exits with an
+        # exception; forces the outermost span to roll back even if the
+        # exception was swallowed inside the outer block. ``_txn_rollback_cause``
+        # holds the first such exception, chained into the surfaced
+        # :class:`TransactionRollbackError`.
+        self._txn_rollback_only = False
+        self._txn_rollback_cause: BaseException | None = None
         # Gate for :meth:`maybe_cleanup_old_data` — 0 means the first
         # caller (``open_run``) purges immediately.
         self._last_purge_ms = 0
@@ -474,23 +508,50 @@ class BrokerStore:
         manager is not nesting-safe, so only the outermost level runs the
         real ``with conn:``. Composite writers (e.g. the disappearance
         tracker's confirm-outcome apply) rely on this to wrap several
-        existing single-transaction helpers into one atomic span; an
-        exception anywhere inside rolls back the whole outer span.
+        existing single-transaction helpers into one atomic span.
+
+        **All-or-nothing under swallowed inner exceptions.** An exception
+        anywhere inside the span rolls back the whole outer span — even
+        when a caller catches it *inside* the outer block. A nested level
+        that exits exceptionally marks the span rollback-only; the
+        outermost level then rolls back instead of committing the partial
+        work and raises :class:`TransactionRollbackError` at its boundary
+        so the caller cannot mistake the discarded span for a commit.
+        Recovering from an inner failure and continuing to write in the
+        same span is therefore impossible by design — start a fresh
+        (non-nested) span for work that must survive.
         """
         with self._lock:
             if self._txn_depth > 0:
                 self._txn_depth += 1
                 try:
                     yield self._conn
+                except BaseException as exc:
+                    self._txn_rollback_only = True
+                    if self._txn_rollback_cause is None:
+                        self._txn_rollback_cause = exc
+                    raise
                 finally:
                     self._txn_depth -= 1
             else:
                 self._txn_depth = 1
+                self._txn_rollback_only = False
+                self._txn_rollback_cause = None
                 try:
                     with self._conn:
                         yield self._conn
+                        if self._txn_rollback_only:
+                            raise _TransactionAborted
+                except _TransactionAborted:
+                    cause = self._txn_rollback_cause
+                    raise TransactionRollbackError(
+                        "nested transaction level failed and was swallowed "
+                        "inside the span; the whole span was rolled back"
+                    ) from cause
                 finally:
                     self._txn_depth = 0
+                    self._txn_rollback_only = False
+                    self._txn_rollback_cause = None
 
     @contextlib.contextmanager
     def read_lock(self) -> Iterator[sqlite3.Connection]:

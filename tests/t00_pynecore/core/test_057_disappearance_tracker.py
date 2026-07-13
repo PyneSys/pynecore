@@ -30,7 +30,12 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.exceptions import UnexpectedCancelError
 from pynecore.core.broker.models import OrderEvent, OrderStatus
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore, OrderRow, RunContext
+from pynecore.core.broker.storage import (
+    BrokerStore,
+    OrderRow,
+    RunContext,
+    TransactionRollbackError,
+)
 from pynecore.core.broker.store_helpers import STATE_CONFIRMED
 
 PLUGIN = "TestBroker"
@@ -397,7 +402,7 @@ def __test_confirm_filled_books_slice_and_clears_stamp__(tmp_path: Path) -> None
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        registered: list[tuple[str, tuple[str, ...]]] = []
+        registered: list[tuple[str, float, tuple[str, ...]]] = []
         tracker = _make_tracker(
             ctx,
             confirm=_confirm_const(MissingConfirmation(
@@ -407,7 +412,7 @@ def __test_confirm_filled_books_slice_and_clears_stamp__(tmp_path: Path) -> None
                 extras_patch={'position_id': 'P9'}, executed_ts=T0 + 5.0,
             )),
             register_executions=lambda r, ids: registered.append(
-                (r.client_order_id, ids)),
+                (r.client_order_id, r.filled_qty, ids)),
         )
         events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
         assert len(events) == 1
@@ -425,7 +430,11 @@ def __test_confirm_filled_books_slice_and_clears_stamp__(tmp_path: Path) -> None
         assert row.closed_ts_ms is None
         assert MISSING_PENDING_EXTRA not in row.extras
         assert row.extras['position_id'] == 'P9'
-        assert registered == [("c1", ('E1',))]
+        # The dedup-seed hook sees the POST-fill row (filled_qty already 0.4).
+        assert len(registered) == 1
+        assert registered[0][0] == "c1"
+        assert registered[0][1] == pytest.approx(0.4)
+        assert registered[0][2] == ('E1',)
         recovered = _read_events(ctx, 'reconcile_missing_fill_recovered')
         assert len(recovered) == 1
         payload = recovered[0][1]
@@ -455,7 +464,7 @@ def __test_confirm_filled_monotonic_clamp__(tmp_path: Path) -> None:
                   extras={MISSING_PENDING_EXTRA: T0})
         tracker2 = _make_tracker(ctx, confirm=_confirm_const(
             MissingConfirmation(MissingResolution.FILLED,
-                                cumulative_filled_qty=5.0)))
+                                cumulative_filled_qty=5.0, fill_price=1.5)))
         events = _run(_drain(tracker2, {'working': set()}, T_EXPIRED))
         assert len(events) == 1
         assert events[0].event_type == 'filled'
@@ -520,6 +529,11 @@ def __test_partial_fill_then_cancel_preserves_slice_atomically__(
         assert [ev.event_type for ev in events] == ['partial', 'cancelled']
         assert events[0].fill_qty == pytest.approx(0.4)
         assert events[0].fill_id == 'E7'
+        # The cancelled event carries the POST-fill quantity — the engine
+        # gates the parent's native fail-safe retirement on filled_qty<=0,
+        # so a stale zero here would strand a live partial position.
+        assert events[1].event_type == 'cancelled'
+        assert events[1].order.filled_qty == pytest.approx(0.4)
         row = ctx.get_order("c1")
         assert row is not None
         assert row.filled_qty == pytest.approx(0.4)
@@ -553,6 +567,294 @@ def __test_stale_confirmation_dropped_when_row_returns_mid_confirm__(
         assert _read_events(ctx, 'unexpected_cancel') == []
 
 
+# === Review hardening: fail-closed, defensive hooks, consume-once ===========
+
+def __test_unpriced_fill_defers_and_keeps_stamp__(tmp_path: Path) -> None:
+    """A discovered fill without a usable price is never booked: the store
+    is untouched, the stamp is kept, and nothing is handed to the dedup
+    hook (which would suppress the real fill event later)."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        registered: list[tuple[str, tuple[str, ...]]] = []
+        tracker = _make_tracker(
+            ctx,
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.FILLED,
+                cumulative_filled_qty=0.4, fill_price=None,
+                execution_ids=('E1',),
+            )),
+            register_executions=lambda r, ids: registered.append(
+                (r.client_order_id, ids)),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert events == []
+        assert registered == []
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(0.0)
+        assert row.extras[MISSING_PENDING_EXTRA] == T0
+        assert row.closed_ts_ms is None
+        assert len(_read_events(ctx, 'missing_pending_fill_unpriced')) == 1
+
+
+def __test_non_finite_fill_price_defers_like_missing__(tmp_path: Path) -> None:
+    """nan / +inf / -inf prices are as unbookable as a missing price: each
+    defers, keeping the stamp and touching neither store nor dedup."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        outcome: dict[str, MissingConfirmation] = {}
+
+        async def _confirm(_row: OrderRow) -> MissingConfirmation:
+            return outcome['value']
+
+        tracker = _make_tracker(ctx, confirm=_confirm)
+        for i, bad in enumerate((float('nan'), float('inf'), float('-inf'))):
+            outcome['value'] = MissingConfirmation(
+                MissingResolution.FILLED,
+                cumulative_filled_qty=0.4, fill_price=bad)
+            events = _run(_drain(tracker, {'working': set()}, T_EXPIRED + i))
+            assert events == []
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(0.0)
+        assert row.extras[MISSING_PENDING_EXTRA] == T0
+        assert row.closed_ts_ms is None
+
+
+def __test_throwing_register_executions_does_not_strand_row__(
+        tmp_path: Path,
+) -> None:
+    """A raising dedup-seed hook is logged, not propagated: the cancelled
+    row still emits both its fill and cancelled events."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+
+        def _boom(_row: OrderRow, _ids: tuple[str, ...]) -> None:
+            raise RuntimeError("dedup channel down")
+
+        tracker = _make_tracker(
+            ctx, policy='ignore',
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.CANCELLED,
+                cumulative_filled_qty=0.4, fill_price=1.1,
+                execution_ids=('E7',),
+            )),
+            register_executions=_boom,
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['partial', 'cancelled']
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is not None
+
+
+def __test_throwing_cancel_siblings_still_arms_halt__(tmp_path: Path) -> None:
+    """A best-effort sweep that raises must not swallow the halt: it is
+    armed BEFORE the sweep, logged, and still delivered."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+
+        async def _sweep(_row: OrderRow) -> None:
+            raise RuntimeError("sweep transport down")
+
+        tracker = _make_tracker(ctx, policy='stop_and_cancel',
+                                cancel_siblings=_sweep)
+
+        async def scenario() -> None:
+            gen = tracker.observe({'working': set()}, T_EXPIRED)
+            event = await anext(gen)
+            assert event.event_type == 'cancelled'
+            with pytest.raises(UnexpectedCancelError):
+                await anext(gen)
+
+        _run(scenario())
+        assert len(_read_events(ctx, 'unexpected_cancel_sweep_failed')) == 1
+
+
+def __test_cancel_siblings_sweep_receives_post_fill_row__(tmp_path: Path) -> None:
+    """A partial-fill-then-cancel under stop_and_cancel hands the sweep the
+    POST-fill row, so it can size its cleanup on the recovered quantity."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        swept: list[float] = []
+
+        async def _sweep(r: OrderRow) -> None:
+            swept.append(r.filled_qty)
+
+        tracker = _make_tracker(
+            ctx, policy='stop_and_cancel', cancel_siblings=_sweep,
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.CANCELLED,
+                cumulative_filled_qty=0.4, fill_price=1.1,
+                execution_ids=('E7',),
+            )),
+        )
+
+        async def scenario() -> None:
+            gen = tracker.observe({'working': set()}, T_EXPIRED)
+            assert (await anext(gen)).event_type == 'partial'
+            assert (await anext(gen)).event_type == 'cancelled'
+            with pytest.raises(UnexpectedCancelError):
+                await anext(gen)
+
+        _run(scenario())
+        assert swept == [pytest.approx(0.4)]
+
+
+def __test_promotion_without_quantity_only_merges_metadata__(
+        tmp_path: Path,
+) -> None:
+    """FILLED with a position_ref but NO cumulative quantity does not flip
+    state via a fill outcome — a position reference proves association,
+    not an authoritative filled qty. Any extras patch is still merged and
+    the normal snapshot path completes the promotion."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=0.0,
+                  extras={MISSING_PENDING_EXTRA: T0})
+        tracker = _make_tracker(ctx, confirm=_confirm_const(
+            MissingConfirmation(
+                MissingResolution.FILLED, position_ref='P3',
+                extras_patch={'position_id': 'P3'},
+            )))
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert events == []
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(0.0)
+        assert row.extras['position_id'] == 'P3'
+        assert MISSING_PENDING_EXTRA not in row.extras
+        # No manufactured fill outcome for a zero-quantity promotion.
+        assert _read_events(ctx, 'reconcile_missing_fill_recovered') == []
+
+
+def __test_concurrent_breadcrumb_preserved_on_clear__(tmp_path: Path) -> None:
+    """Phase-1 clearing re-reads the live row: a breadcrumb written between
+    the snapshot and the clear survives; only the stamp key is removed."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+
+        def _tracked(r: OrderRow) -> set[tuple[str, str]]:
+            if not (r.extras or {}).get('pushed'):
+                ctx.upsert_order(
+                    "c1", extras={MISSING_PENDING_EXTRA: T0, 'pushed': 'Y'})
+            return ({('working', r.exchange_order_id)}
+                    if r.exchange_order_id else set())
+
+        tracker = DisappearanceTracker(
+            ctx, grace_s=GRACE, policy='stop', tracked_refs=_tracked,
+            confirm_missing=_confirm_const(
+                MissingConfirmation(MissingResolution.CANCELLED)),
+        )
+        # The ref is visible -> phase-1 clears the stamp.
+        _run(_drain(tracker, {'working': {'D1'}}, T0 + 1.0))
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.extras['pushed'] == 'Y'
+        assert MISSING_PENDING_EXTRA not in row.extras
+
+
+def __test_halt_delivered_exactly_once__(tmp_path: Path) -> None:
+    """The pending halt is consumed by the raise: a later pass with no new
+    disappearance does not re-raise the same halt."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        tracker = _make_tracker(ctx, policy='stop')
+
+        with pytest.raises(UnexpectedCancelError):
+            _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert tracker.pending_halt is None
+
+        # Second pass: the row is retired, no new halt, no re-raise.
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0))
+        assert events == []
+        assert tracker.pending_halt is None
+
+
+def __test_concurrent_breadcrumb_preserved_on_stamp__(tmp_path: Path) -> None:
+    """Phase-1 stamping re-reads the live row: a breadcrumb another thread
+    wrote after the snapshot but before the stamp is preserved, not
+    clobbered by the stale snapshot's extras."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={})
+
+        def _tracked(r: OrderRow) -> set[tuple[str, str]]:
+            # Simulate a concurrent push-path write landing between the
+            # phase-1 snapshot read and the stamp write.
+            if not (r.extras or {}).get('pushed'):
+                ctx.upsert_order("c1", extras={'pushed': 'Y'})
+            return ({('working', r.exchange_order_id)}
+                    if r.exchange_order_id else set())
+
+        tracker = DisappearanceTracker(
+            ctx, grace_s=GRACE, policy='stop', tracked_refs=_tracked,
+            confirm_missing=_confirm_const(
+                MissingConfirmation(MissingResolution.CANCELLED)),
+        )
+        _run(_drain(tracker, {'working': set()}, T0))
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.extras['pushed'] == 'Y'
+        assert row.extras[MISSING_PENDING_EXTRA] == T0
+
+
+def __test_deferred_throttle_is_per_reason__(tmp_path: Path) -> None:
+    """An inconclusive re-check must not mute a later unpriced-fill audit on
+    the same row: the throttle keys on (coid, reason), not coid alone."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        outcome = {'value': MissingConfirmation(MissingResolution.INCONCLUSIVE)}
+
+        async def _confirm(_row: OrderRow) -> MissingConfirmation:
+            return outcome['value']
+
+        tracker = _make_tracker(ctx, confirm=_confirm)
+        _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        # Same row, now an unpriced fill during the next grace-expired pass.
+        outcome['value'] = MissingConfirmation(
+            MissingResolution.FILLED,
+            cumulative_filled_qty=0.4, fill_price=None)
+        _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0))
+        assert len(_read_events(ctx, 'missing_pending_recheck_inconclusive')) == 1
+        assert len(_read_events(ctx, 'missing_pending_fill_unpriced')) == 1
+
+
+def __test_invalid_resolution_rejected_at_construction__() -> None:
+    """A bogus resolution raises at construction; a plain string equal to
+    an enum value is coerced (never falls through to CANCELLED)."""
+    with pytest.raises(ValueError):
+        MissingConfirmation('not_a_resolution')  # type: ignore[arg-type]
+    coerced = MissingConfirmation('cancelled')  # type: ignore[arg-type]
+    assert coerced.resolution is MissingResolution.CANCELLED
+
+
+def __test_stale_inconclusive_after_stamp_cleared_is_dropped__(
+        tmp_path: Path,
+) -> None:
+    """An INCONCLUSIVE outcome whose stamp was cleared mid-confirm is
+    dropped by the guard — no stale warning is written."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+
+        async def _confirm(confirmed_row: OrderRow) -> MissingConfirmation:
+            ctx.upsert_order(confirmed_row.client_order_id, extras={})
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+
+        tracker = _make_tracker(ctx, confirm=_confirm)
+        events = _run(_drain(tracker, {'working': None}, T_EXPIRED))
+        assert events == []
+        assert _read_events(ctx, 'missing_pending_recheck_inconclusive') == []
+
+
 # === Store-transaction nesting (the atomic-apply substrate) =================
 
 def __test_store_transaction_nesting_is_atomic__(tmp_path: Path) -> None:
@@ -584,3 +886,63 @@ def __test_store_transaction_nesting_is_atomic__(tmp_path: Path) -> None:
         assert row is not None
         assert row.filled_qty == pytest.approx(0.7)
         assert len(_read_events(ctx, 'nested_txn_probe')) == 1
+
+
+def __test_store_transaction_swallowed_inner_exception_rolls_back__(
+        tmp_path: Path,
+) -> None:
+    """A nested-level exception caught INSIDE the outer block still aborts
+    the whole span: the outer rolls back and surfaces a
+    ``TransactionRollbackError`` so the discarded span cannot be mistaken
+    for a commit."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=0.1)
+
+        class _Boom(Exception):
+            pass
+
+        with pytest.raises(TransactionRollbackError) as exc_info:
+            with ctx.transaction():
+                ctx.upsert_order("c1", filled_qty=0.2)
+                try:
+                    with ctx.transaction():
+                        ctx.upsert_order("c1", filled_qty=0.3)
+                        raise _Boom()
+                except _Boom:
+                    pass
+                # The caller swallowed the inner failure and keeps writing —
+                # the span is already rollback-only, so this is discarded too.
+                ctx.upsert_order("c1", filled_qty=0.9)
+
+        # The surfaced error chains the first nested cause.
+        assert isinstance(exc_info.value.__cause__, _Boom)
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(0.1)
+
+
+def __test_store_transaction_unswallowed_nested_propagates_original__(
+        tmp_path: Path,
+) -> None:
+    """An inner exception that is NOT swallowed propagates the exact
+    original object (not TransactionRollbackError) and still rolls back."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=0.1)
+
+        class _Boom(Exception):
+            pass
+
+        boom = _Boom()
+        with pytest.raises(_Boom) as exc_info:
+            with ctx.transaction():
+                ctx.upsert_order("c1", filled_qty=0.5)
+                with ctx.transaction():
+                    ctx.upsert_order("c1", filled_qty=0.7)
+                    raise boom
+
+        assert exc_info.value is boom
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(0.1)

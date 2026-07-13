@@ -11,7 +11,10 @@ that core:
   ``missing_pending_since`` stamp in its ``extras``; the stamp is cleared
   the moment any tracked ref reappears. Only a stamp older than the grace
   window triggers any irreversible action — a fill in flight can flicker
-  out of every snapshot for one poll.
+  out of every snapshot for one poll. Stamp and clear both re-read the
+  live row and touch *only* the ``missing_pending_since`` key, so a
+  breadcrumb written concurrently by another broker thread is never
+  clobbered.
 - **Typed ``(namespace, ref)`` keys.** A venue stores bot orders in
   several resource namespaces (working orders, open positions,
   position-attached brackets); refs are tracked per namespace so an
@@ -26,10 +29,19 @@ that core:
   NOT mutate. The tracker applies the outcome in ONE serialized store
   transaction: discovered fill slice + terminal state + sibling
   retirement together, so a partial-fill-then-cancel can never lose its
-  fill slice, and a crash cannot leave a half-applied resolution.
+  fill slice, and a crash cannot leave a half-applied resolution. Every
+  post-apply artefact (the cancelled event, the policy hook, the
+  execution registration) is built from the row re-read *after* the fill
+  slice was booked, so none of them can carry stale pre-fill quantities.
 - **Stamp-version guard.** The row can come back (or be re-stamped)
   while the async confirmation runs; the apply transaction re-checks the
   original ``missing_pending_since`` value and drops a stale outcome.
+- **Fail-closed on unpriced fills.** A discovered fill slice is only
+  booked when it carries a strictly positive price and a strictly
+  positive persisted quantity delta. An unpriced fill would be dropped by
+  the engine's ``record_fill`` yet still advance the store's
+  ``filled_qty`` and seed the plugin's dedup channel — so the tracker
+  keeps the stamp and defers instead of concluding on unpriced evidence.
 - **Dual signal.** A confirmed unexpected cancel is booked as a terminal
   close AND yielded as a synthesised ``cancelled`` :class:`OrderEvent`
   (the engine's router cleans its tracking — essential under the
@@ -38,9 +50,11 @@ that core:
   policy application run BEFORE the event is yielded, so neither depends
   on the consumer pulling another element from the generator; a pending
   halt survives an abandoned generator and re-raises on the next
-  :meth:`DisappearanceTracker.observe` call.
+  :meth:`DisappearanceTracker.observe` call. The halt is delivered
+  exactly once — each raise site consumes it.
 """
 import logging
+import math
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -134,20 +148,24 @@ class MissingConfirmation:
     order that partially filled and was then externally cancelled
     resolves as :data:`MissingResolution.CANCELLED` *with* fill data, and
     the tracker books the slice in the same transaction as the terminal
-    close.
+    close. A fill slice is only booked when ``fill_price`` is strictly
+    positive; an unpriced slice makes the tracker defer (keep the stamp)
+    rather than book exposure the engine would silently drop.
 
     :ivar resolution: The classification — see :class:`MissingResolution`.
+        A plain string equal to one of the enum values is coerced.
     :ivar cumulative_filled_qty: The order's proven cumulative filled
         quantity, when the verification discovered fill progress. The
         tracker clamps it into ``[row.filled_qty, row.qty]`` (monotonic,
         never overstating the order's own size) and books the delta.
     :ivar fill_price: Volume-weighted price of the discovered executions
-        (the price the delta is booked at).
+        (the price the delta is booked at). Must be strictly positive for
+        the slice to be booked.
     :ivar fill_fee: Summed commission of the discovered executions.
     :ivar execution_ids: Venue execution/deal ids backing the evidence.
-        Passed to the ``register_executions`` hook after a successful
-        apply so the plugin can seed its duplicate-fill channel; a lone
-        id is also stamped as the fill event's ``fill_id``.
+        Passed to the ``register_executions`` hook after a fill slice was
+        actually booked, so the plugin can seed its duplicate-fill channel;
+        a lone id is also stamped as the fill event's ``fill_id``.
     :ivar position_ref: Venue position id the fill belongs to. Selects
         the ``working_promoted_position`` audit reason and scopes the
         sibling retirement on :data:`MissingResolution.CLOSED`.
@@ -164,6 +182,15 @@ class MissingConfirmation:
     position_ref: str | None = None
     extras_patch: Mapping[str, Any] | None = None
     executed_ts: float | None = None
+
+    def __post_init__(self) -> None:
+        # Coerce a plain string (or reject an invalid value at construction
+        # time) so the apply path can rely on identity checks against the
+        # enum members and never fall through to the CANCELLED mutation.
+        if not isinstance(self.resolution, MissingResolution):
+            object.__setattr__(
+                self, 'resolution', MissingResolution(self.resolution),
+            )
 
 
 class DisappearanceTracker:
@@ -190,20 +217,25 @@ class DisappearanceTracker:
         as naturally closed). Checked on every pass, both phases.
     :param cancel_siblings: Async best-effort cancel sweep over the
         origin row's sibling orders; required by (and only used for) the
-        ``stop_and_cancel`` policy.
+        ``stop_and_cancel`` policy. Best-effort — a raising sweep is
+        logged and does not swallow the armed halt.
     :param sibling_coids: Maps a :data:`MissingResolution.CLOSED` row to
         the client-order-ids of live sibling rows sharing its position
         (a netting account merges pyramid entries onto one position id);
         they are retired in the same transaction.
     :param register_executions: Called with the confirmation's
-        ``execution_ids`` after a successful apply, so the plugin can
-        seed its duplicate-fill channel before any replayed push event.
+        ``execution_ids`` after a fill slice was actually booked, so the
+        plugin can seed its duplicate-fill channel before any replayed
+        push event. A raising hook is logged, not propagated.
     :param cancelled_event_factory: Overrides the synthesised
         ``cancelled`` event construction (venues that key the event on
-        something other than ``row.exchange_order_id``).
+        something other than ``row.exchange_order_id``). The default
+        builder is entry-shaped (``LegType.ENTRY``, ``reduce_only=False``,
+        ``OrderType.MARKET``); a non-entry row MUST supply a custom factory.
     :param fill_event_factory: Overrides the recovered-fill event
         construction. Receives ``(row, confirmation, cumulative,
-        fill_qty, now_ts)``.
+        fill_qty, now_ts)``. The default builder is entry-shaped as
+        above; a non-entry row MUST supply a custom factory.
     """
 
     def __init__(
@@ -249,16 +281,31 @@ class DisappearanceTracker:
         self._fill_event_factory = fill_event_factory
         #: Halt decided by a halting policy but not yet delivered to the
         #: consumer. Survives an abandoned generator: re-raised at the top
-        #: of the next :meth:`observe` call.
+        #: of the next :meth:`observe` call. Consumed (cleared) by whichever
+        #: raise site delivers it, so it fires exactly once.
         self._pending_halt: UnexpectedCancelError | None = None
-        #: Rows already warned about an inconclusive grace re-check, so a
-        #: sustained transport outage logs once per row, not per cadence.
-        self._warned_inconclusive: set[str] = set()
+        #: ``(coid, event_kind)`` pairs already warned about a deferred
+        #: grace re-check, so a sustained anomaly logs once per row per
+        #: reason (an inconclusive re-check must not mute a later unpriced
+        #: fill on the same row), not once per cadence.
+        self._warned_deferred: set[tuple[str, str]] = set()
 
     @property
     def pending_halt(self) -> UnexpectedCancelError | None:
-        """The undelivered halt decided by a halting policy, if any."""
+        """The undelivered halt decided by a halting policy, if any.
+
+        Observational only — delivery happens by the :class:`UnexpectedCancelError`
+        raised from :meth:`observe`, which consumes it. A plugin that both
+        consumes the generator and reads this property must not act on the
+        property independently, or it would double-handle the same halt.
+        """
         return self._pending_halt
+
+    def _take_pending_halt(self) -> UnexpectedCancelError | None:
+        """Consume the pending halt so it is delivered exactly once."""
+        halt = self._pending_halt
+        self._pending_halt = None
+        return halt
 
     async def observe(
             self,
@@ -281,13 +328,24 @@ class DisappearanceTracker:
             row whose policy is halting — or immediately, when a halt
             decided on an earlier (abandoned) pass is still undelivered.
         """
-        if self._pending_halt is not None:
-            raise self._pending_halt
+        halt = self._take_pending_halt()
+        if halt is not None:
+            raise halt
 
+        live_coids: set[str] = set()
         for row in list(self._store.iter_live_orders()):
+            live_coids.add(row.client_order_id)
             if self._is_exempt is not None and self._is_exempt(row):
                 continue
             self._observe_presence(row, present, now_ts)
+
+        # Drop throttle keys for rows that went terminal via another path
+        # (a PUSH event) and left the live set without reaching a resolve —
+        # else the in-memory set grows unbounded on a long-running instance.
+        if self._warned_deferred:
+            self._warned_deferred = {
+                k for k in self._warned_deferred if k[0] in live_coids
+            }
 
         for row in list(self._store.iter_live_orders()):
             if self._is_exempt is not None and self._is_exempt(row):
@@ -300,18 +358,31 @@ class DisappearanceTracker:
             if (now_ts - since_ts) < self._grace_s:
                 continue
             confirmation = await self._confirm_missing(row)
-            events, applied = self._apply_confirmation(
+            events, applied, register_ids, applied_row = self._apply_confirmation(
                 row, since_ts, confirmation, now_ts,
             )
-            if applied and confirmation.execution_ids and \
-                    self._register_executions is not None:
-                self._register_executions(row, confirmation.execution_ids)
+            # The post-commit hooks must see the row as it stands after the
+            # fill slice was booked — a stale pre-fill row would let a sweep
+            # miss the recovered quantity / promotion metadata.
+            hook_row = applied_row if applied_row is not None else row
+            if applied and register_ids and self._register_executions is not None:
+                # noinspection PyBroadException
+                try:
+                    self._register_executions(hook_row, register_ids)
+                except Exception:
+                    # A committed terminal row must never be stranded
+                    # without its event / halt by a dedup-seeding failure.
+                    logger.exception(
+                        "register_executions hook failed for %r",
+                        row.client_order_id,
+                    )
             if applied and confirmation.resolution is MissingResolution.CANCELLED:
-                await self._apply_policy(row)
+                await self._apply_policy(hook_row)
             for event in events:
                 yield event
-            if self._pending_halt is not None:
-                raise self._pending_halt
+            halt = self._take_pending_halt()
+            if halt is not None:
+                raise halt
 
     # --- Phase 1: stamp / clear against the present-sets --------------------
 
@@ -337,22 +408,43 @@ class DisappearanceTracker:
         extras = row.extras or {}
         if visible:
             if MISSING_PENDING_EXTRA in extras:
-                self._clear_stamp(row)
+                self._clear_stamp(row.client_order_id)
             return
         if not all_fetched:
             # Incomplete snapshot: absence is unproven — neither stamp
             # nor clear.
             return
         if MISSING_PENDING_EXTRA not in extras:
-            patched = dict(extras)
-            patched[MISSING_PENDING_EXTRA] = now_ts
-            self._store.upsert_order(row.client_order_id, extras=patched)
+            self._stamp(row.client_order_id, now_ts)
 
-    def _clear_stamp(self, row: 'OrderRow') -> None:
-        patched = {k: v for k, v in (row.extras or {}).items()
-                   if k != MISSING_PENDING_EXTRA}
-        self._store.upsert_order(row.client_order_id, extras=patched)
-        self._warned_inconclusive.discard(row.client_order_id)
+    def _stamp(self, coid: str, now_ts: float) -> None:
+        """Stamp ``missing_pending_since`` atomically, preserving extras.
+
+        Re-reads the live row and rewrites only the one key so a breadcrumb
+        another broker thread wrote between the phase-1 snapshot and here is
+        not clobbered; a stamp added concurrently is left untouched.
+        """
+        with self._store.transaction():
+            fresh = self._store.get_order(coid)
+            if fresh is None or fresh.closed_ts_ms is not None:
+                return
+            extras = dict(fresh.extras or {})
+            if MISSING_PENDING_EXTRA in extras:
+                return
+            extras[MISSING_PENDING_EXTRA] = now_ts
+            self._store.upsert_order(coid, extras=extras)
+
+    def _clear_stamp(self, coid: str) -> None:
+        """Remove ``missing_pending_since`` atomically, preserving extras."""
+        with self._store.transaction():
+            fresh = self._store.get_order(coid)
+            if fresh is not None:
+                extras = fresh.extras or {}
+                if MISSING_PENDING_EXTRA in extras:
+                    merged = {k: v for k, v in extras.items()
+                              if k != MISSING_PENDING_EXTRA}
+                    self._store.upsert_order(coid, extras=merged)
+        self._forget_deferred(coid)
 
     # --- Phase 2: grace-expiry confirmation apply ----------------------------
 
@@ -362,23 +454,26 @@ class DisappearanceTracker:
             since: float,
             confirmation: MissingConfirmation,
             now_ts: float,
-    ) -> tuple[list[OrderEvent], bool]:
+    ) -> tuple[list[OrderEvent], bool, tuple[str, ...], 'OrderRow | None']:
         """Apply one confirmation atomically under the stamp-version guard.
 
-        Returns ``(events, applied)`` — ``applied`` is ``False`` when the
-        guard dropped a stale outcome (the row came back, was re-stamped
-        or reached a terminal state while the confirmation ran).
+        Returns ``(events, applied, register_ids, applied_row)``. ``applied``
+        is ``False`` when the guard dropped a stale outcome (the row came
+        back, was re-stamped or reached a terminal state while the
+        confirmation ran) or when a fill slice was deferred for lack of a
+        price. ``register_ids`` is non-empty only when a fill slice was
+        actually booked — the plugin's dedup channel must not be seeded
+        for a slice that was never persisted. ``applied_row`` is the row
+        re-read *after* the fill slice was booked (``None`` on a dropped
+        or no-op outcome); the caller feeds it to the post-commit hooks so
+        a sweep never sees a stale pre-fill quantity.
         """
         resolution = confirmation.resolution
-        if resolution is MissingResolution.INCONCLUSIVE:
-            self._warn_inconclusive(row)
-            return [], True
-
         events: list[OrderEvent] = []
         with self._store.transaction():
             fresh = self._store.get_order(row.client_order_id)
             if fresh is None or fresh.closed_ts_ms is not None:
-                return [], False
+                return [], False, (), None
             stamp = (fresh.extras or {}).get(MISSING_PENDING_EXTRA)
             if stamp != since:
                 logger.info(
@@ -386,26 +481,73 @@ class DisappearanceTracker:
                     "changed during verification (%r -> %r)",
                     row.client_order_id, since, stamp,
                 )
-                return [], False
+                return [], False, (), None
+
+            if resolution is MissingResolution.INCONCLUSIVE:
+                self._warn_deferred(
+                    fresh, 'missing_pending_recheck_inconclusive',
+                    "grace-expired row %r left un-retired: disappearance "
+                    "re-check inconclusive — deferring rather than "
+                    "concluding a false cancel",
+                )
+                return [], True, (), None
 
             if resolution is MissingResolution.STILL_PRESENT:
-                self._clear_stamp(fresh)
-                return [], True
+                self._clear_stamp(fresh.client_order_id)
+                return [], True, (), None
 
-            fill_event = self._apply_discovered_fill(
-                fresh, confirmation, now_ts,
-            )
+            # Discovered fill slice (pure computation, no writes yet).
+            cumulative = self._clamped_cumulative(fresh, confirmation)
+            new_qty = 0.0 if cumulative is None else cumulative - fresh.filled_qty
+            has_new_fill = new_qty > _QTY_EPS
+            if has_new_fill and not (
+                    confirmation.fill_price is not None
+                    and math.isfinite(confirmation.fill_price)
+                    and confirmation.fill_price > 0.0):
+                # Fail-closed: a fill we cannot price (missing, non-finite,
+                # or non-positive) would be dropped by the engine's
+                # record_fill yet still advance the store and seed dedup.
+                # Keep the stamp and defer.
+                self._warn_deferred(
+                    fresh, 'missing_pending_fill_unpriced',
+                    "grace-expired row %r reported fill progress without a "
+                    "usable price — deferring rather than booking an "
+                    "unpriced fill",
+                )
+                return [], False, (), None
+
+            register_ids: tuple[str, ...] = ()
+            fill_event: OrderEvent | None = None
+            updated = fresh
+            if has_new_fill and cumulative is not None:
+                self._book_fill(fresh, confirmation, cumulative)
+                updated = self._store.get_order(fresh.client_order_id) or fresh
+                fill_event = self._build_fill_event(
+                    updated, confirmation, cumulative, new_qty, now_ts,
+                )
+                register_ids = confirmation.execution_ids
+            elif confirmation.position_ref is not None and cumulative is not None:
+                # Working->position promotion without fresh quantity (the
+                # fill was already booked): flip state + extras, emit and
+                # register nothing.
+                self._book_fill(fresh, confirmation, cumulative)
+                updated = self._store.get_order(fresh.client_order_id) or fresh
+            elif confirmation.extras_patch:
+                # Metadata-only patch: merge extras WITHOUT manufacturing a
+                # kind='filled' journal outcome for a zero-delta write.
+                merged = dict(fresh.extras or {})
+                merged.update(confirmation.extras_patch)
+                self._store.upsert_order(fresh.client_order_id, extras=merged)
+                updated = self._store.get_order(fresh.client_order_id) or fresh
 
             if resolution is MissingResolution.FILLED:
                 # The stamp premise is false — the ref vanished because it
                 # filled. The row stays live; the venue's normal snapshot
                 # promotion path owns it from here.
-                latest = self._store.get_order(fresh.client_order_id)
-                if latest is not None:
-                    self._clear_stamp(latest)
+                self._clear_stamp(updated.client_order_id)
                 if fill_event is not None:
                     events.append(fill_event)
-                return events, True
+                return events, True, register_ids, updated
 
             if resolution is MissingResolution.CLOSED:
                 # Filled-then-closed: the exposure no longer exists, so no
@@ -413,7 +555,7 @@ class DisappearanceTracker:
                 # reconcile owns the size side) — but any discovered fill
                 # progress was persisted above for bookkeeping.
                 DispatchJournal(self._store).apply_reconcile_outcome(
-                    fresh.client_order_id,
+                    updated.client_order_id,
                     ReconcileOutcome(
                         kind='terminal_close',
                         reason='bracket_natural_close_followup',
@@ -425,57 +567,61 @@ class DisappearanceTracker:
                             'missing_since': since,
                         },
                         exchange_order_id=(confirmation.position_ref
-                                           or fresh.exchange_order_id),
+                                           or updated.exchange_order_id),
                     ),
                 )
                 if self._sibling_coids is not None:
-                    for sibling in self._sibling_coids(fresh, confirmation):
+                    for sibling in self._sibling_coids(updated, confirmation):
                         self._store.close_order(sibling)
-                self._warned_inconclusive.discard(fresh.client_order_id)
-                return [], True
+                self._forget_deferred(updated.client_order_id)
+                return [], True, register_ids, updated
 
-            # CANCELLED — verified external cancel.
-            DispatchJournal(self._store).apply_reconcile_outcome(
-                fresh.client_order_id,
-                ReconcileOutcome(
-                    kind='terminal_close',
-                    reason='missing_pending_grace_expired',
-                    new_state='rejected',
-                    audit_event='unexpected_cancel',
-                    close_row=True,
-                    audit_payload={'missing_since': since,
-                                   'grace': self._grace_s},
-                    exchange_order_id=fresh.exchange_order_id,
-                ),
-            )
-            if fill_event is not None:
-                events.append(fill_event)
-            events.append(self._build_cancelled_event(fresh, now_ts))
-            self._warned_inconclusive.discard(fresh.client_order_id)
-            return events, True
+            if resolution is MissingResolution.CANCELLED:
+                DispatchJournal(self._store).apply_reconcile_outcome(
+                    updated.client_order_id,
+                    ReconcileOutcome(
+                        kind='terminal_close',
+                        reason='missing_pending_grace_expired',
+                        new_state='rejected',
+                        audit_event='unexpected_cancel',
+                        close_row=True,
+                        audit_payload={'missing_since': since,
+                                       'grace': self._grace_s},
+                        exchange_order_id=updated.exchange_order_id,
+                    ),
+                )
+                if fill_event is not None:
+                    events.append(fill_event)
+                events.append(self._build_cancelled_event(updated, now_ts))
+                self._forget_deferred(updated.client_order_id)
+                return events, True, register_ids, updated
 
-    def _apply_discovered_fill(
-            self,
-            fresh: 'OrderRow',
-            confirmation: MissingConfirmation,
-            now_ts: float,
-    ) -> OrderEvent | None:
-        """Persist a fill slice discovered during confirmation.
+            raise AssertionError(f"unhandled resolution {resolution!r}")
 
-        Runs inside the caller's transaction. Returns the fill event when
-        new quantity was booked, ``None`` otherwise. The cumulative is
-        clamped into ``[fresh.filled_qty, fresh.qty]`` — monotonic, never
-        overstating the order's own size.
+    @staticmethod
+    def _clamped_cumulative(
+            fresh: 'OrderRow', confirmation: MissingConfirmation,
+    ) -> float | None:
+        """Clamp the confirmed cumulative into ``[fresh.filled_qty, fresh.qty]``.
+
+        Monotonic (never regresses below what is already booked) and never
+        overstates the order's own size. ``None`` when the confirmation
+        carried no fill quantity.
         """
         if confirmation.cumulative_filled_qty is None:
             return None
-        cumulative = min(
+        return min(
             fresh.qty,
             max(fresh.filled_qty, confirmation.cumulative_filled_qty),
         )
-        new_qty = cumulative - fresh.filled_qty
-        if new_qty <= _QTY_EPS and not confirmation.extras_patch:
-            return None
+
+    def _book_fill(
+            self,
+            fresh: 'OrderRow',
+            confirmation: MissingConfirmation,
+            cumulative: float,
+    ) -> None:
+        """Persist the discovered fill slice inside the caller's transaction."""
         reason: ReconcileReason = (
             'working_promoted_position'
             if confirmation.position_ref is not None
@@ -499,31 +645,44 @@ class DisappearanceTracker:
                                    or fresh.exchange_order_id),
             ),
         )
-        if new_qty <= _QTY_EPS:
-            return None
+
+    def _build_fill_event(
+            self,
+            updated: 'OrderRow',
+            confirmation: MissingConfirmation,
+            cumulative: float,
+            fill_qty: float,
+            now_ts: float,
+    ) -> OrderEvent:
         if self._fill_event_factory is not None:
             return self._fill_event_factory(
-                fresh, confirmation, cumulative, new_qty, now_ts,
+                updated, confirmation, cumulative, fill_qty, now_ts,
             )
         return self._default_fill_event(
-            fresh, confirmation, cumulative, new_qty, now_ts,
+            updated, confirmation, cumulative, fill_qty, now_ts,
         )
 
-    def _warn_inconclusive(self, row: 'OrderRow') -> None:
+    def _warn_deferred(self, row: 'OrderRow', event_kind: str, msg: str) -> None:
+        """Log once per row per reason that a grace-expired retire deferred."""
         coid = row.client_order_id
-        if coid in self._warned_inconclusive:
+        key = (coid, event_kind)
+        if key in self._warned_deferred:
             return
-        self._warned_inconclusive.add(coid)
-        logger.warning(
-            "grace-expired row %r left un-retired: disappearance re-check "
-            "inconclusive — deferring rather than concluding a false cancel",
-            coid,
-        )
+        logger.warning(msg, coid)
         self._store.log_event(
-            'missing_pending_recheck_inconclusive',
+            event_kind,
             client_order_id=coid,
             exchange_order_id=row.exchange_order_id,
         )
+        # Arm the throttle only after the audit event is persisted, so a
+        # failed log_event does not mute a later genuine re-warning.
+        self._warned_deferred.add(key)
+
+    def _forget_deferred(self, coid: str) -> None:
+        """Drop every deferred-warning throttle for a row (it resolved)."""
+        self._warned_deferred = {
+            k for k in self._warned_deferred if k[0] != coid
+        }
 
     # --- Policy ---------------------------------------------------------------
 
@@ -532,9 +691,11 @@ class DisappearanceTracker:
 
         Runs BEFORE the cancelled event is yielded: the sweep and the
         halt decision must not depend on the consumer pulling further
-        elements. A halting policy only *arms* :attr:`pending_halt` here;
-        the raise happens after the row's events were yielded (or at the
-        top of the next pass, when the generator was abandoned).
+        elements. A halting policy *arms* :attr:`pending_halt` here BEFORE
+        the best-effort sweep, so a raising sweep can never swallow the
+        manual-intervention signal; the raise itself happens after the
+        row's events were yielded (or at the top of the next pass, when
+        the generator was abandoned).
         """
         if self._policy == 'ignore':
             self._store.log_event(
@@ -550,8 +711,7 @@ class DisappearanceTracker:
                 exchange_order_id=row.exchange_order_id,
             )
             return
-        if self._policy == 'stop_and_cancel' and self._cancel_siblings is not None:
-            await self._cancel_siblings(row)
+        # Halting policy ('stop' / 'stop_and_cancel'): arm the halt first.
         self._pending_halt = UnexpectedCancelError(
             f"Bot-owned order disappeared unexpectedly: "
             f"coid={row.client_order_id!r} "
@@ -563,6 +723,20 @@ class DisappearanceTracker:
                 'policy': self._policy,
             },
         )
+        if self._policy == 'stop_and_cancel' and self._cancel_siblings is not None:
+            # noinspection PyBroadException
+            try:
+                await self._cancel_siblings(row)
+            except Exception:
+                logger.exception(
+                    "cancel_siblings sweep failed for %r; halt stays armed",
+                    row.client_order_id,
+                )
+                self._store.log_event(
+                    'unexpected_cancel_sweep_failed',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                )
 
     # --- Default event builders ------------------------------------------------
 
