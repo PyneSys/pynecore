@@ -288,14 +288,83 @@ crash-replay logic. The optional `supports_partial_leg_close = False`
 attribute makes the emulator atomically skip plans containing partial leg
 slices on venues whose position close is full-row only (Capital.com).
 
-## Spot venues: synthesize the position
+## Spot venues: opt into the core inventory layer
 
 Spot venues expose **no position object** — no position row, no entry
 price, no unrealized P&L, no position id, no position-attached bracket.
 The position itself is not missing: the base-asset inventory relative to
-the quote asset *is* the long exposure. Everything the venue API does not
-provide, the plugin must synthesize. PyneCore ships no purpose-built spot
-helper today, so all of the following is plugin-side responsibility.
+the quote asset *is* the long exposure. The core
+`pynecore.core.broker.spot_inventory` module owns this bookkeeping; a
+spot plugin opts in by setting `self.spot_inventory_port = self` and
+implementing the `SpotInventoryPort` surface, then drives one
+`SpotInventoryManager` per run:
+
+- **`startup()`** once after authentication, before the engine's startup
+  reconcile — asset-ownership lease claim, execution catch-up from the
+  durable cursor, epoch/invariant validation, adoption watermark. Any
+  inconclusive read or unexplainable drift quarantines before a single
+  dispatch.
+- **`record_live_fill()`** for every fill observed on the live stream,
+  BEFORE emitting the corresponding `OrderEvent` — the return value is
+  the emit gate (a replayed fill id returns `False` and must not be
+  re-emitted). The ledger insert and the outbox flip commit in one
+  transaction; a crash between commit and emit loses the event, not the
+  fill (the next startup folds the row into the adopted position —
+  exactly-once, adoption path).
+- **`reconcile(now_ms)`** per poll cycle — lease heartbeat plus the
+  balance invariant with a persisted settlement-grace state machine. It
+  **returns** the ledger rows a runtime catch-up recovered this cycle (a
+  stream-gap fill), already flipped to `delivered`; emit an `OrderEvent`
+  for each. The periodic engine reconcile ignores position *increases*,
+  so a recovered fill left un-emitted would stay invisible to the
+  strategy until the next restart's adoption. The lease heartbeat is
+  fenced by the physical run instance: if a replacement instance took
+  the lease over while this process was silent, `reconcile` quarantines
+  instead of trading on a lease it no longer holds.
+- **`synthesize_position(mark)`** from `get_position()`.
+
+### The port surface
+
+`SpotInventoryPort` carries the venue facts (`product_id`, `base_asset`,
+`quote_asset`, `cursor_scope`, `base_tolerance`, `settlement_grace_s`)
+and two reads:
+
+- `fetch_executions(cursor)` — the **bot's** execution history from the
+  durable cursor, paged (`SpotExecutionBatch`). Return only fills
+  attributable to this bot: every `SpotExecution` must carry the bot's
+  own `client_order_id` (the core rejects an execution without one; a raw
+  `exchange_order_id` is not proof of bot ownership — a manual/web trade
+  carries one too). Map the fill's venue order id to the bot's
+  client_order_id via the plugin's own order records when the venue does
+  not echo it. The ledger tracks the bot's inventory, not the account's —
+  a manual or foreign trade folded in would move the balance *and* the
+  ledger together, so the invariant would never fire. A venue whose
+  account-history endpoint cannot be filtered/attributed to bot orders
+  MUST return `conclusive=False` (which fails closed) rather than dump
+  raw account trades. `cursor=None` means "no
+  history belongs to the bot yet": return an EMPTY batch anchored at the
+  venue's current watermark — the account's prior history is foreign
+  inventory and belongs to the epoch baseline, not the ledger. A
+  time-scoped API must serve an overlapping window (the ledger dedups on
+  fill id) rather than assume a strict cursor. Return `conclusive=False`
+  when the venue answered but cannot be trusted as complete.
+- `fetch_base_balance()` — the account's **TOTAL owned** base amount:
+  available PLUS locked in open sell orders PLUS pending settlement. An
+  available-only read false-fires the invariant the moment a sell order
+  rests.
+
+Executions are exact `Decimal` arithmetic end to end (the ledger stores
+canonical decimal strings — float accumulation over crypto atoms is not
+acceptable). The canonical delta equations: `base_delta` = signed
+executed base minus any BASE-currency fee; `quote_delta` =
+opposite-signed notional minus any QUOTE-currency fee; a third-currency
+fee is recorded but touches neither delta. Set `SpotExecution.venue_seq`
+to the venue's monotonic execution-sequence number when the venue
+exposes one; the fold orders by `(ts_ms, venue_seq, fill_id)`, so a
+venue whose fills can share a millisecond MUST provide it or a same-ms
+buy/sell pair may replay reversed into a false oversell. `settlement_grace_s`
+must be a finite, non-negative real number (a NaN/inf grace would let a
+confirmed conflict stay pending forever).
 
 ### `get_position()` must never return `None` while holding inventory
 
@@ -304,37 +373,43 @@ adopts it unconditionally and the periodic reconcile reads a
 held-position → `None` transition as an external flatten. A spot plugin
 that returns `None` because "the venue has no positions" silently breaks
 restart adoption — after a restart the engine believes it is flat and
-**double-opens** on the first entry signal. Synthesize an
-`ExchangePosition` instead: `size` = net base inventory from your own
-fill ledger, `entry_price` = ledger VWAP, `unrealized_pnl` =
-(mark − VWAP) × size, `leverage=1.0`, `liquidation_price=None`,
-`margin_mode="cash"`. Return `None` only when the bot's net inventory is
-genuinely flat.
+**double-opens** on the first entry signal. Return
+`synthesize_position(mark)` instead: `size` = net base inventory from
+the ledger, `entry_price` = ledger VWAP (proportional basis reduction on
+partial sells), `unrealized_pnl` = (mark − VWAP) × size, `leverage=1.0`,
+`liquidation_price=None`, `margin_mode="cash"`. It returns `None` only
+when the bot's net inventory is genuinely flat.
 
-### Persist your own fill ledger
+### The ledger is retention-exempt
 
-The core `orders` table keeps only a cumulative `filled_qty` (no per-fill
-price, fee, fee currency or execution id), and the `events` table is
-purged by the retention cleanup — neither can reconstruct a position that
-has been open longer than the retention window. A spot plugin must
-persist an **append-only execution ledger** of its own (per-fill price,
-signed base/quote deltas, fee and fee currency, venue execution id, keyed
-for dedup on the venue's fill id) that is exempt from retention: an open
-position must stay reconstructible for as long as it is open. Fees
-charged in the base currency reduce the received quantity — record the
-net delta, not the ordered quantity.
+The core `orders` table keeps only a cumulative `filled_qty` (no
+per-fill price, fee, fee currency or execution id), and the `events`
+table is purged by the retention cleanup — neither can reconstruct a
+position that has been open longer than the retention window. The
+`spot_executions` ledger is exempt from `cleanup_old_data` by design: an
+open position stays reconstructible for as long as it is open, however
+old its fills are.
 
-### The balance is pooled — reconcile fail-closed
+### The balance is pooled — the invariant fails closed
 
-The venue balance does not separate the bot's inventory from pre-existing
-holdings, manual trades or deposits. The plugin's own ledger is
-authoritative for the bot's inventory; the venue balance is a
-*reconciliation check* against a persisted baseline captured when the
-ledger starts. Any unexplainable drift in **either** direction must stop
-new dispatch until an operator intervenes — a positive drift can mask an
-external sale netted against a deposit, so warn-and-continue is not an
-option. External intervention in the bot's inventory is not supported:
-detect it and stop trading; there is no adoption path.
+The venue balance does not separate the bot's inventory from
+pre-existing holdings, manual trades or deposits. The ledger is
+authoritative for the bot's inventory; the venue balance is checked
+against `expected_total = foreign_baseline + bot_inventory(ledger)`,
+where the baseline was frozen at epoch creation. Any unexplainable drift
+in **either** direction is an attribution conflict — a positive drift
+can mask an external sale netted against a deposit, so warn-and-continue
+is not an option. The numeric tolerance (`base_tolerance`) covers ONLY
+asset quantization; settlement lag is a *temporal* state (a persisted
+pending-conflict grace re-checked with fresh executions and balance),
+never a wider tolerance. External intervention in the bot's inventory is
+not supported: the manager detects it and stops trading (quarantine, or
+process exit under the `halt` policy); there is no adoption path.
+Recovery is an operator `rebaseline()` — a new epoch generation frozen
+in one transaction, refused while unresolved dispatches remain (and
+refused when the account balance is below the ledger's bot inventory,
+which would freeze a negative baseline and launder the very withdrawal
+that triggered the conflict) — plus a restart.
 
 ### One position asset, one bot
 
@@ -343,9 +418,19 @@ it is the exclusive base of exactly one bot — no other bot may touch it
 as base *or* quote (a BTCUSDT bot and an ETHBTC bot conflict: ETHBTC
 moves BTC as its quote). As a **cash asset** it is a shared quote pool
 for any number of bots (BTCUSDT + ETHUSDT is fine); cash exhaustion is a
-normal recoverable order reject, not bookkeeping corruption. A dedicated
-(sub)account per bot per base asset is the recommended mode — it makes
-drift conflicts rare, and every conflict that still occurs is real.
+normal recoverable order reject, not bookkeeping corruption. The
+`spot_asset_owner` lease enforces this within one broker store: the
+claim rejects a base-vs-quote overlap with a live run up front (so the
+conflict is caught before either bot trades, not surfaced later as a
+spurious drift quarantine), and a concurrent second run on the same base
+starts quarantined. The lease is keyed on the physical run instance, so
+a resumed zombie sharing the reused `run_id` cannot steal its lease back
+from the replacement instance — its next heartbeat reports the loss and
+it quarantines. An instance on another workdir or machine is only
+*detected* by the balance invariant, not prevented — a dedicated
+(sub)account per bot per base asset remains the recommended mode. It
+makes drift conflicts rare, and every conflict that still occurs is
+real.
 
 ### No shorting
 
@@ -361,8 +446,11 @@ borrows).
 - **Broker-agnostic policies do not belong in plugin configs.** The
   cross-broker `workdir/config/brokers.toml` (`BrokerDefaults`) owns them;
   today that is `on_unexpected_cancel` (`stop` / `stop_and_cancel` /
-  `re_place` / `ignore` / `halt`), injected onto the plugin instance by
-  the CLI before the runner starts.
+  `re_place` / `ignore` / `halt`) and `on_inventory_conflict`
+  (`quarantine` / `halt`, spot venues only — deliberately narrower:
+  `re_place` would buy back an operator's withdrawal and `ignore` would
+  trade on corrupt books), injected onto the plugin instance by the CLI
+  before the runner starts.
 - Do not expose internal cadence/backoff constants as user config
   ("no internal tunables" policy) — keep them module constants.
 
@@ -400,6 +488,8 @@ turns the machine-checkable slice of this guide into fail-fast errors:
 | Supported `watch_orders` capability without method override             | error    |
 | `NATIVE` / `PARTIAL_NATIVE` `amend_order` without a `modify_*` override | error    |
 | Non-`None` `position_port` missing port methods                         | error    |
+| Non-`None` `spot_inventory_port` missing port members                   | error    |
+| Spot port set with an invalid `on_inventory_conflict` policy            | error    |
 | `account_id` still `"default"` after authentication                     | error    |
 | No `watch_orders()` stream (poll-only, no disappearance channel)        | warning  |
 | Inherited `execute_cancel_with_outcome` (all cancels `UNKNOWN`)         | warning  |
@@ -420,10 +510,10 @@ is hit by mainstream CFD/crypto venues:
   required work, not a plugin-side workaround.
 - **The software engines are venue-shaped:** the partial-bracket engine
   models per-deal CFD venues, the one-way emulator models grid-volume
-  hedging venues. A third venue class (e.g. spot, which exposes no
-  position object) gets no purpose-built helper and inherits the full
-  disappearance-detection burden — see the spot section above for what
-  such a plugin must synthesize and persist itself.
+  hedging venues, and the spot inventory manager models pooled-balance
+  spot venues (see the spot section above). A venue class outside these
+  three inherits the full disappearance-detection and state-synthesis
+  burden itself.
 - **Hedge-native strategies are out of scope by design:** `ExitIntent` /
   `CloseIntent` require `reduce_only=True` at the model level. Hedging
   *accounts* are supported (via `PositionPort`); hedge *semantics* in the

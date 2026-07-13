@@ -914,6 +914,7 @@ def run(
             from pynecore.core.broker.defaults import load_broker_defaults
             broker_defaults = load_broker_defaults(app_state.config_dir)
             broker_plugin.on_unexpected_cancel = broker_defaults.on_unexpected_cancel
+            broker_plugin.on_inventory_conflict = broker_defaults.on_inventory_conflict
 
             # Probe the plugin against the BrokerPlugin authoring contract
             # before any storage or engine state exists. Authentication has

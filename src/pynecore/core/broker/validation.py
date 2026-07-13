@@ -10,6 +10,7 @@ Startup-time validation for broker mode.
 Pure functions — the ``pyne run --broker`` startup path calls them and, on a
 non-empty error list, refuses to start trading.
 """
+import math
 from dataclasses import fields
 
 from pynecore.core.broker.idempotency import WIRE_CLIENT_ORDER_ID_MIN_LEN
@@ -32,6 +33,21 @@ _POSITION_PORT_METHODS = (
     'reject_out_of_range',
     'place_leg',
     'amend_bracket',
+)
+
+#: Surface a :class:`~pynecore.core.broker.spot_inventory.SpotInventoryPort`
+#: implementation must provide — same enumerate-as-data approach as above.
+_SPOT_INVENTORY_PORT_METHODS = (
+    'fetch_executions',
+    'fetch_base_balance',
+)
+_SPOT_INVENTORY_PORT_ATTRS = (
+    'product_id',
+    'base_asset',
+    'quote_asset',
+    'cursor_scope',
+    'base_tolerance',
+    'settlement_grace_s',
 )
 
 
@@ -295,6 +311,43 @@ def validate_plugin_contract(
                 f"is missing PositionPort method(s): {', '.join(missing)}. "
                 f"The OneWayEmulator drives the plugin purely through this "
                 f"surface — implement all of them."
+            )
+
+    # --- SpotInventoryPort surface ---
+    spot_port = plugin.spot_inventory_port
+    if spot_port is not None:
+        missing: list[str] = [
+            m for m in _SPOT_INVENTORY_PORT_METHODS
+            if not callable(getattr(spot_port, m, None))
+        ]
+        missing.extend(
+            a for a in _SPOT_INVENTORY_PORT_ATTRS
+            if getattr(spot_port, a, None) is None
+        )
+        if missing:
+            errors.append(
+                f"{name}.spot_inventory_port opts into core spot inventory "
+                f"but is missing SpotInventoryPort member(s): "
+                f"{', '.join(missing)}. The SpotInventoryManager drives the "
+                f"venue purely through this surface — implement all of them."
+            )
+        if plugin.on_inventory_conflict not in ('quarantine', 'halt'):
+            errors.append(
+                f"{name}.on_inventory_conflict is "
+                f"{plugin.on_inventory_conflict!r} — must be 'quarantine' "
+                f"or 'halt' (the inventory-conflict policy set is narrower "
+                f"than on_unexpected_cancel by design)."
+            )
+        grace = getattr(spot_port, 'settlement_grace_s', None)
+        if (isinstance(grace, bool)
+                or not isinstance(grace, (int, float))
+                or not math.isfinite(grace)
+                or grace < 0):
+            errors.append(
+                f"{name}.spot_inventory_port.settlement_grace_s is "
+                f"{grace!r} — must be a finite non-negative real number "
+                f"(a NaN/inf grace would let a confirmed inventory "
+                f"conflict stay pending forever while trading continues)."
             )
 
     # --- Lifecycle ---

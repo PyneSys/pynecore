@@ -23,6 +23,7 @@ __all__ = [
     'OrderDispositionUnknownError',
     'OrderSkippedByPlugin',
     'OrderSyncError',
+    'SpotInventoryConflictError',
     'UnexpectedCancelError',
 ]
 
@@ -274,6 +275,22 @@ class BrokerManualInterventionError(BrokerError):
         self.reason = reason
         self.intent_key = intent_key
         self.context = context or {}
+
+
+class SpotInventoryConflictError(BrokerManualInterventionError):
+    """The spot balance invariant broke or the bot's inventory ownership
+    could not be established.
+
+    Raised by the :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
+    when the ``halt`` inventory-conflict policy is active (or as the
+    fail-safe fallback when the quarantine hook is missing / raising):
+    an unexplainable base-balance drift in either direction, a corrupt
+    or foreign ledger row, an inconclusive execution catch-up, or a
+    lost asset-ownership lease. External intervention in the bot's
+    inventory is not supported — there is no adoption path, so the safe
+    terminal signal is manual intervention followed by an operator
+    ``rebaseline``.
+    """
 
 
 class UnexpectedCancelError(BrokerManualInterventionError):

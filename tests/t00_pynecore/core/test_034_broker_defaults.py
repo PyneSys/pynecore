@@ -6,6 +6,7 @@ import pytest
 
 from pynecore.core.broker.defaults import (
     BrokerDefaults,
+    VALID_INVENTORY_CONFLICT_POLICIES,
     VALID_UNEXPECTED_CANCEL_POLICIES,
     load_broker_defaults,
 )
@@ -28,6 +29,7 @@ def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
     TOML by hand."""
     defaults = load_broker_defaults(tmp_path)
     assert defaults.on_unexpected_cancel == 'stop'
+    assert defaults.on_inventory_conflict == 'quarantine'
     assert (tmp_path / 'brokers.toml').exists()
 
 
@@ -72,3 +74,33 @@ def __test_valid_policy_set_contents__() -> None:
     assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
         'stop', 'stop_and_cancel', 're_place', 'ignore', 'halt',
     })
+
+
+def __test_inventory_conflict_policy_loaded_and_validated__(tmp_path: Path) -> None:
+    """``on_inventory_conflict`` round-trips and fails closed on typos.
+
+    The set is deliberately narrower than ``on_unexpected_cancel`` —
+    an attribution conflict has no safe ``re_place``/``ignore`` analogue,
+    so those values must be rejected here even though the other knob
+    accepts similar spellings."""
+    assert VALID_INVENTORY_CONFLICT_POLICIES == frozenset({
+        'quarantine', 'halt',
+    })
+    (tmp_path / 'brokers.toml').write_text(
+        'on_inventory_conflict = "halt"\n',
+        encoding='utf-8',
+    )
+    defaults = load_broker_defaults(tmp_path)
+    assert defaults.on_inventory_conflict == 'halt'
+
+    if hasattr(BrokerDefaults, '_ensured'):
+        del BrokerDefaults._ensured
+    (tmp_path / 'brokers.toml').write_text(
+        'on_inventory_conflict = "ignore"\n',
+        encoding='utf-8',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_broker_defaults(tmp_path)
+    msg = str(excinfo.value)
+    assert 'on_inventory_conflict' in msg
+    assert "'ignore'" in msg

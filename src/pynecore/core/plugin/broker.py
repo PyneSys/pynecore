@@ -34,6 +34,7 @@ from pynecore.core.broker.models import (
 )
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.spot_inventory import SpotInventoryPort
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import (
         BracketAttachRejectContext,
@@ -352,6 +353,36 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     is fail-safe, never fail-open.
 
     Signature: ``sink(reason: str, context: dict | None = None)``.
+    """
+
+    on_inventory_conflict: str = "quarantine"
+    """
+    Policy for a confirmed spot balance-invariant conflict.
+
+    Only meaningful for plugins that opt into the core spot inventory
+    layer (:attr:`spot_inventory_port`). ``"quarantine"`` (default)
+    latches the engine's quarantine — trading stops, the process stays
+    alive as an observer; ``"halt"`` exits via the graceful
+    manual-intervention path. Deliberately narrower than
+    :attr:`on_unexpected_cancel`: ``re_place`` would buy back an
+    operator's withdrawal and ``ignore`` would trade on corrupt books,
+    so neither applies to an attribution conflict. In production the
+    value comes from ``workdir/config/brokers.toml`` via
+    :class:`~pynecore.core.broker.defaults.BrokerDefaults`, injected
+    like :attr:`on_unexpected_cancel`.
+    """
+
+    spot_inventory_port: 'SpotInventoryPort | None' = None
+    """Optional spot-venue inventory surface.
+
+    A spot plugin (no venue position object; pooled balances) sets this
+    (typically to ``self``) so the core
+    :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
+    can own the execution ledger, the balance-invariant reconciliation
+    and the position synthesis. Stays ``None`` for margin/CFD venues.
+    The startup contract probe
+    (:func:`~pynecore.core.broker.validation.validate_plugin_contract`)
+    verifies the full port surface when set.
     """
 
     position_port: 'PositionPort | None' = None

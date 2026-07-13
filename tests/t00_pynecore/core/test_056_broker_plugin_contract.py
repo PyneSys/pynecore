@@ -284,6 +284,48 @@ def __test_position_port_surface_checked__():
     assert errors == []
 
 
+# === SpotInventoryPort surface ===
+
+
+def __test_spot_inventory_port_surface_checked__():
+    """A partial SpotInventoryPort is rejected; missing attrs are named too."""
+    from decimal import Decimal
+
+    class _HalfSpotPort:
+        product_id = "BTC-USD"
+        base_asset = "BTC"
+
+        async def fetch_executions(self, cursor):
+            return None
+
+    plugin = _ConformingPlugin()
+    plugin.spot_inventory_port = _HalfSpotPort()
+    errors, _ = validate_plugin_contract(plugin)
+    assert any(
+        'fetch_base_balance' in e and 'quote_asset' in e
+        and 'base_tolerance' in e for e in errors
+    )
+
+    class _FullSpotPort(_HalfSpotPort):
+        quote_asset = "USD"
+        cursor_scope = "product"
+        base_tolerance = Decimal("0.00000001")
+        settlement_grace_s = 30.0
+
+        async def fetch_base_balance(self):
+            return Decimal(0)
+
+    plugin.spot_inventory_port = _FullSpotPort()
+    errors, _ = validate_plugin_contract(plugin)
+    assert errors == []
+
+    # The narrowed inventory-conflict policy set is enforced when the
+    # spot port opts in.
+    plugin.on_inventory_conflict = "re_place"
+    errors, _ = validate_plugin_contract(plugin)
+    assert any('on_inventory_conflict' in e for e in errors)
+
+
 # === Lifecycle ===
 
 

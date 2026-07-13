@@ -56,6 +56,8 @@ __all__ = [
     'EnvelopeRecord',
     'PendingRecord',
     'OrderRow',
+    'SpotExecutionRow',
+    'SpotEpochRow',
     'TransactionRollbackError',
     'HEARTBEAT_INTERVAL_MS',
     'STALE_THRESHOLD_MS',
@@ -159,6 +161,46 @@ class OrderRow:
     updated_ts_ms: int
     closed_ts_ms: int | None
     extras: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SpotExecutionRow:
+    """One row of the ``spot_executions`` ledger.
+
+    Numeric fields stay canonical decimal *strings* at this layer — the
+    :mod:`~pynecore.core.broker.spot_inventory` module owns the
+    ``decimal.Decimal`` parse/serialize round trip; the storage layer
+    never does float arithmetic on them.
+    """
+    fill_id: str
+    exchange_order_id: str | None
+    client_order_id: str | None
+    side: str  # "buy" | "sell"
+    base_delta: str
+    quote_delta: str
+    price: str
+    fee_amount: str
+    fee_currency: str
+    ts_ms: int
+    delivered: bool
+    venue_seq: int | None = None
+
+
+@dataclass(frozen=True)
+class SpotEpochRow:
+    """One row of the ``spot_inventory_epoch`` table."""
+    plugin_name: str
+    account_id: str
+    base_asset: str
+    product_id: str
+    epoch_seq: int
+    foreign_baseline: str
+    cursor_scope: str | None
+    exec_cursor: str | None
+    state: str  # "active" | "quarantined" | "closed"
+    created_ts_ms: int
+    pending_conflict_ts_ms: int | None = None
+    pending_conflict: dict | None = None
 
 
 # === Schema migrations =====================================================
@@ -316,6 +358,107 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE pending_verifications
             ADD COLUMN order_ids TEXT NOT NULL DEFAULT '[]';
     """),
+    (5, "spot inventory tables", """
+        -- Append-only per-fill execution ledger for spot venues. The
+        -- ``orders`` table keeps only a cumulative filled_qty and the
+        -- ``events`` table is retention-purged; neither can reconstruct
+        -- a spot position that has been open longer than the retention
+        -- window, so spot inventory gets its own ledger that
+        -- ``cleanup_old_data`` never touches. Numeric columns are
+        -- canonical decimal STRINGS (see
+        -- ``pynecore.core.broker.spot_inventory``) — float accumulation
+        -- over crypto atoms is not acceptable.
+        --
+        -- The PK carries the venue's fill-id uniqueness dimension
+        -- (account + product); ``run_id`` is deliberately NOT part of it
+        -- so the same venue execution can never be booked under two
+        -- logical runs. ``delivered`` is the engine-outbox marker: 0 =
+        -- recorded but not yet handed to the sync engine (startup
+        -- adoption folds such rows into the synthesized position).
+        -- ``venue_seq`` is the venue's monotonic execution-sequence key
+        -- (NULL when the venue exposes none); the fold orders by
+        -- (ts_ms, venue_seq, fill_id) so a buy and a sell sharing one
+        -- millisecond cannot replay in the wrong order and fabricate a
+        -- false oversell.
+        CREATE TABLE spot_executions (
+            run_id            TEXT NOT NULL,
+            account_id        TEXT NOT NULL,
+            product_id        TEXT NOT NULL,
+            fill_id           TEXT NOT NULL,
+            exchange_order_id TEXT,
+            client_order_id   TEXT,
+            side              TEXT NOT NULL,
+            base_delta        TEXT NOT NULL,
+            quote_delta       TEXT NOT NULL,
+            price             TEXT NOT NULL,
+            fee_amount        TEXT NOT NULL,
+            fee_currency      TEXT NOT NULL,
+            ts_ms             INTEGER NOT NULL,
+            venue_seq         INTEGER,
+            delivered         INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, product_id, fill_id)
+        );
+        CREATE INDEX idx_spot_exec_fold
+            ON spot_executions(run_id, account_id, product_id,
+                               ts_ms, venue_seq, fill_id);
+
+        -- Inventory epoch: the reconciliation baseline generation. The
+        -- balance invariant is
+        --   expected_total = foreign_baseline + bot_inventory(ledger)
+        -- where foreign_baseline was frozen at epoch creation as
+        -- (current_total - reconstructed bot inventory). ``exec_cursor``
+        -- is the plugin's durable execution-history cursor; it may only
+        -- advance in the transaction that recorded every execution
+        -- before it. ``pending_conflict_*`` persist the runtime
+        -- settlement-grace state so a crash loop cannot keep resetting
+        -- the grace window and mask a real drift.
+        CREATE TABLE spot_inventory_epoch (
+            run_id                 TEXT NOT NULL,
+            plugin_name            TEXT NOT NULL,
+            account_id             TEXT NOT NULL,
+            base_asset             TEXT NOT NULL,
+            product_id             TEXT NOT NULL,
+            epoch_seq              INTEGER NOT NULL,
+            foreign_baseline       TEXT NOT NULL,
+            cursor_scope           TEXT,
+            exec_cursor            TEXT,
+            state                  TEXT NOT NULL,
+            created_ts_ms          INTEGER NOT NULL,
+            pending_conflict_ts_ms INTEGER,
+            pending_conflict       TEXT,
+            PRIMARY KEY (run_id, product_id, epoch_seq)
+        );
+
+        -- Atomic ownership claim: one active logical run per
+        -- (plugin, account, base asset). The UNIQUE constraint turns
+        -- check-then-act races into a hard conflict; an expired
+        -- heartbeat is taken over. ``run_instance_id`` is the PHYSICAL
+        -- claimant (run_id is reused across restarts by design) — a
+        -- resumed zombie whose run_id still matches but whose instance
+        -- does not cannot steal the lease back, and its heartbeat
+        -- becomes a detected no-op. ``quote_asset`` lets the claim
+        -- reject a base-vs-quote overlap (another live run trading the
+        -- shared asset as cash) before it silently mutates this run's
+        -- balance invariant. Scope caveat: the constraint is local to
+        -- this SQLite file — a bot started from another workdir/machine
+        -- is only DETECTED by the balance invariant, not prevented here.
+        -- No FK on ``run_instance_id``: the lease outlives its run row on
+        -- purpose (retention may purge an ended run while a not-yet-taken
+        -- -over lease still points at it), and the claim path resolves a
+        -- missing prior run as "not live" (takeover permitted) rather
+        -- than relying on referential integrity.
+        CREATE TABLE spot_asset_owner (
+            plugin_name     TEXT NOT NULL,
+            account_id      TEXT NOT NULL,
+            base_asset      TEXT NOT NULL,
+            quote_asset     TEXT NOT NULL,
+            run_id          TEXT NOT NULL,
+            run_instance_id INTEGER NOT NULL,
+            claimed_ts_ms   INTEGER NOT NULL,
+            heartbeat_ts_ms INTEGER NOT NULL,
+            UNIQUE (plugin_name, account_id, base_asset)
+        );
+    """),
 ]
 
 
@@ -331,21 +474,37 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     for version, description, sql in _MIGRATIONS:
         if version <= current:
             continue
-        # ``with conn`` opens an implicit BEGIN DEFERRED and commits on
-        # exit. One version = one transaction; a half-migrated schema
-        # must not remain.
-        with conn:
-            conn.executescript(sql)
-            # The ``_migrations`` table exists only after the first
-            # migration runs — on the very first invocation the
-            # CREATE TABLE is part of the script, so the INSERT below
-            # is already safe.
-            conn.execute(
-                "INSERT INTO _migrations (version, applied_ts_ms, description) "
-                "VALUES (?, ?, ?)",
-                (version, _now_ms(), description),
-            )
-            conn.execute(f"PRAGMA user_version = {version}")
+        # ``executescript`` COMMITs any pending transaction on entry and
+        # adds NO implicit transaction control of its own — a plain
+        # ``with conn`` around it would be committed away before the DDL
+        # runs, leaving each statement in its own autocommit span. A
+        # crash between two CREATEs would then leave a half-built schema
+        # while ``user_version`` stays put, and the retry would fail
+        # permanently on the already-existing table. So the atomicity is
+        # embedded IN the script: BEGIN IMMEDIATE ... COMMIT wraps the
+        # DDL, the ``_migrations`` bookkeeping and the ``user_version``
+        # bump (all three transactional, verified — a rolled-back script
+        # leaves ``user_version`` untouched). The ``_migrations`` table
+        # is created inside migration 1's own script, so the INSERT is
+        # safe on the very first invocation too.
+        desc_literal = description.replace("'", "''")
+        script = (
+            "BEGIN IMMEDIATE;\n"
+            f"{sql}\n"
+            "INSERT INTO _migrations (version, applied_ts_ms, description) "
+            f"VALUES ({version}, {_now_ms()}, '{desc_literal}');\n"
+            f"PRAGMA user_version = {version};\n"
+            "COMMIT;"
+        )
+        try:
+            conn.executescript(script)
+        except Exception:
+            # The script aborted with its transaction still open; roll
+            # the partial schema (and the version bump) back so a retry
+            # starts from a clean, consistent state.
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         _log.info("broker storage migrated to version %d (%s)", version, description)
 
 
@@ -552,6 +711,50 @@ class BrokerStore:
                     self._txn_depth = 0
                     self._txn_rollback_only = False
                     self._txn_rollback_cause = None
+
+    @contextlib.contextmanager
+    def immediate_transaction(self) -> Iterator[sqlite3.Connection]:
+        """A write transaction that takes the DB write lock UP FRONT.
+
+        :meth:`transaction` opens a DEFERRED span (sqlite3's ``with
+        conn:``), so a check-then-insert reads under a shared snapshot and
+        two SEPARATE connections to the same file can both pass the
+        pre-write check before either writes — a real hazard for the
+        base-vs-quote exclusion in :meth:`RunContext.claim_spot_asset`,
+        which the per-store re-entrant lock cannot prevent because it only
+        serializes users of ONE connection. ``BEGIN IMMEDIATE`` acquires
+        the database write lock before the first read, so a concurrent
+        claimant on another connection blocks (up to ``busy_timeout``) and
+        then reads the first claim's committed rows.
+
+        Top-level only — it must not nest inside an open
+        :meth:`transaction` span (a raised :class:`RuntimeError` guards
+        that).
+        """
+        with self._lock:
+            if self._txn_depth > 0:
+                raise RuntimeError(
+                    "immediate_transaction() cannot nest inside an open "
+                    "transaction span"
+                )
+            # At depth 0 the store holds no span of its own, but sqlite3's
+            # legacy isolation may have a dangling implicit transaction
+            # from a bare ``execute`` (the deferred ``with conn:`` path
+            # would have committed it on exit) — settle it before the
+            # explicit BEGIN, which cannot nest.
+            if self._conn.in_transaction:
+                self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._txn_depth = 1
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
+            finally:
+                self._txn_depth = 0
 
     @contextlib.contextmanager
     def read_lock(self) -> Iterator[sqlite3.Connection]:
@@ -945,6 +1148,11 @@ class BrokerStore:
 
         Freed pages are reused by SQLite, so the file stops growing
         even without VACUUM.
+
+        The spot inventory tables (``spot_executions``,
+        ``spot_inventory_epoch``, ``spot_asset_owner``) are exempt from
+        retention by design: a spot position's reconstructibility must
+        not expire while the position is open, however old its fills are.
 
         :param retention_days: Rows older than this many days are
             eligible for purging.
@@ -1757,6 +1965,477 @@ class RunContext:
                 payload,
             )
 
+    # --- Spot inventory: execution ledger ----------------------------------
+
+    # noinspection SqlResolve
+    def record_spot_execution(
+            self, account_id: str, product_id: str, *,
+            fill_id: str,
+            side: str,
+            base_delta: str,
+            quote_delta: str,
+            price: str,
+            fee_amount: str,
+            fee_currency: str,
+            ts_ms: int,
+            venue_seq: int | None = None,
+            exchange_order_id: str | None = None,
+            client_order_id: str | None = None,
+            delivered: bool = False,
+    ) -> bool:
+        """Append one venue execution to the spot ledger.
+
+        Idempotent on the ``(account_id, product_id, fill_id)`` primary
+        key: re-recording an already-known fill (overlapping catch-up
+        window, PUSH replay, restart) is a no-op and returns ``False``.
+        The row is stamped with this context's logical ``run_id`` — the
+        PK deliberately excludes it, so the same venue execution can
+        never be booked under two logical runs; use
+        :meth:`spot_execution_owner` to inspect a conflicting row.
+
+        Numeric parameters are canonical decimal strings produced by
+        :mod:`~pynecore.core.broker.spot_inventory` — the storage layer
+        stores them verbatim.
+
+        :param account_id: The plugin's authenticated account id (fill-id
+            uniqueness dimension).
+        :param product_id: Venue product identifier the fill belongs to.
+        :param fill_id: The venue's execution id — the dedup key.
+        :param side: ``'buy'`` or ``'sell'``.
+        :param base_delta: Signed base-asset delta (canonical decimal string).
+        :param quote_delta: Signed quote-asset delta (canonical decimal string).
+        :param price: Fill price (canonical decimal string).
+        :param fee_amount: Fee amount (canonical decimal string).
+        :param fee_currency: Currency the fee was charged in.
+        :param ts_ms: Venue execution timestamp (ms).
+        :param venue_seq: The venue's monotonic execution-sequence number
+            when it exposes one, else ``None``. Used only as a tiebreak
+            in the fold ordering; a venue whose fills can share a
+            millisecond MUST provide it or same-ms buy/sell pairs may
+            replay reversed.
+        :param exchange_order_id: Broker order ref, when known.
+        :param client_order_id: Bot client-order-id, when the fill maps
+            to a bot dispatch.
+        :param delivered: ``True`` when the caller hands the fill to the
+            sync engine in the same transaction (live outbox flip);
+            ``False`` for catch-up rows that the next startup adoption
+            folds into the synthesized position.
+        :return: ``True`` if the row was inserted, ``False`` on dedup.
+        """
+        if side not in ('buy', 'sell'):
+            raise ValueError(
+                f"record_spot_execution: unknown side {side!r}; "
+                f"expected 'buy' or 'sell'"
+            )
+        with self._store.transaction():
+            cur = self._store._conn.execute(
+                "INSERT INTO spot_executions ("
+                "  run_id, account_id, product_id, fill_id,"
+                "  exchange_order_id, client_order_id, side,"
+                "  base_delta, quote_delta, price, fee_amount, fee_currency,"
+                "  ts_ms, venue_seq, delivered"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_id, product_id, fill_id) DO NOTHING",
+                (
+                    self.run_id, account_id, product_id, fill_id,
+                    exchange_order_id, client_order_id, side,
+                    base_delta, quote_delta, price, fee_amount, fee_currency,
+                    ts_ms, venue_seq, int(delivered),
+                ),
+            )
+            return cur.rowcount == 1
+
+    # noinspection SqlResolve
+    def spot_execution_owner(
+            self, account_id: str, product_id: str, fill_id: str,
+    ) -> str | None:
+        """Return the ``run_id`` that owns a ledger row, or ``None``.
+
+        Used after a dedup'd :meth:`record_spot_execution` to distinguish
+        the benign case (this run already recorded the fill) from the
+        ownership conflict (another logical run booked it first).
+        """
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT run_id FROM spot_executions "
+                "WHERE account_id = ? AND product_id = ? AND fill_id = ?",
+                (account_id, product_id, fill_id),
+            ).fetchone()
+        return None if row is None else row['run_id']
+
+    # noinspection SqlResolve
+    def iter_spot_executions(
+            self, account_id: str, product_id: str, *,
+            undelivered_only: bool = False,
+    ) -> list[SpotExecutionRow]:
+        """Fetch this logical run's ledger rows, oldest first.
+
+        Deterministic order: ``(ts_ms, venue_seq, fill_id)`` — venue
+        timestamps can tie, so the venue's own execution-sequence key
+        (``COALESCE``d to 0 when absent) is the primary tiebreak and the
+        fill-id the last resort. This keeps the inventory fold replayable
+        and prevents a same-millisecond buy/sell pair from reordering
+        into a false oversell. Returns a list (not a lazy iterator) so
+        the read lock is not held while the caller processes rows.
+        """
+        sql = (
+            "SELECT * FROM spot_executions "
+            "WHERE run_id = ? AND account_id = ? AND product_id = ?"
+        )
+        if undelivered_only:
+            sql += " AND delivered = 0"
+        sql += " ORDER BY ts_ms, COALESCE(venue_seq, 0), fill_id"
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                sql, (self.run_id, account_id, product_id),
+            ).fetchall()
+        return [_row_to_spot_execution(row) for row in rows]
+
+    # noinspection SqlResolve
+    def mark_spot_executions_delivered(
+            self, account_id: str, product_id: str,
+            fill_ids: list[str] | None = None,
+    ) -> int:
+        """Flip the ``delivered`` outbox marker on ledger rows.
+
+        :param account_id: The plugin's authenticated account id.
+        :param product_id: Venue product identifier.
+        :param fill_ids: The rows to flip; ``None`` flips every
+            undelivered row of this logical run (the startup-adoption
+            watermark: the synthesized position the engine adopts already
+            folds them, so they must never be re-delivered as events).
+        :return: Number of rows flipped.
+        """
+        base_sql = (
+            "UPDATE spot_executions SET delivered = 1 "
+            "WHERE run_id = ? AND account_id = ? AND product_id = ? "
+            "  AND delivered = 0"
+        )
+        with self._store.transaction():
+            if fill_ids is None:
+                return self._store._conn.execute(
+                    base_sql, (self.run_id, account_id, product_id),
+                ).rowcount
+            flipped = 0
+            # Chunked IN-lists — SQLite's bound-variable budget is finite.
+            for start in range(0, len(fill_ids), 500):
+                chunk = fill_ids[start:start + 500]
+                placeholders = ','.join('?' * len(chunk))
+                flipped += self._store._conn.execute(
+                    f"{base_sql} AND fill_id IN ({placeholders})",
+                    (self.run_id, account_id, product_id, *chunk),
+                ).rowcount
+            return flipped
+
+    # --- Spot inventory: epoch ---------------------------------------------
+
+    # noinspection SqlResolve
+    def get_latest_spot_epoch(self, product_id: str) -> SpotEpochRow | None:
+        """Fetch this logical run's newest epoch row for a product."""
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT * FROM spot_inventory_epoch "
+                "WHERE run_id = ? AND product_id = ? "
+                "ORDER BY epoch_seq DESC LIMIT 1",
+                (self.run_id, product_id),
+            ).fetchone()
+        return None if row is None else _row_to_spot_epoch(row)
+
+    # noinspection SqlResolve
+    def insert_spot_epoch(
+            self, *,
+            account_id: str,
+            base_asset: str,
+            product_id: str,
+            foreign_baseline: str,
+            cursor_scope: str | None,
+            exec_cursor: str | None,
+            state: str = 'active',
+    ) -> SpotEpochRow:
+        """Insert the next epoch generation for a product.
+
+        ``epoch_seq`` continues from this run's newest existing epoch
+        (1 for the first). Runs inside the caller's transaction when one
+        is open — the rebaseline path relies on this to make "write new
+        epoch + activate" a single atomic span.
+
+        :return: The freshly inserted row.
+        """
+        _validate_spot_epoch_state(state)
+        now = _now_ms()
+        with self._store.transaction():
+            row = self._store._conn.execute(
+                "SELECT COALESCE(MAX(epoch_seq), 0) AS seq "
+                "FROM spot_inventory_epoch "
+                "WHERE run_id = ? AND product_id = ?",
+                (self.run_id, product_id),
+            ).fetchone()
+            epoch_seq = int(row['seq']) + 1
+            self._store._conn.execute(
+                "INSERT INTO spot_inventory_epoch ("
+                "  run_id, plugin_name, account_id, base_asset, product_id,"
+                "  epoch_seq, foreign_baseline, cursor_scope, exec_cursor,"
+                "  state, created_ts_ms"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.run_id, self._store._plugin_name, account_id,
+                    base_asset, product_id, epoch_seq, foreign_baseline,
+                    cursor_scope, exec_cursor, state, now,
+                ),
+            )
+        return SpotEpochRow(
+            plugin_name=self._store._plugin_name,
+            account_id=account_id,
+            base_asset=base_asset,
+            product_id=product_id,
+            epoch_seq=epoch_seq,
+            foreign_baseline=foreign_baseline,
+            cursor_scope=cursor_scope,
+            exec_cursor=exec_cursor,
+            state=state,
+            created_ts_ms=now,
+        )
+
+    # noinspection SqlResolve
+    def set_spot_epoch_state(
+            self, product_id: str, epoch_seq: int, state: str,
+    ) -> None:
+        """Update one epoch row's lifecycle state."""
+        _validate_spot_epoch_state(state)
+        with self._store.transaction():
+            self._store._conn.execute(
+                "UPDATE spot_inventory_epoch SET state = ? "
+                "WHERE run_id = ? AND product_id = ? AND epoch_seq = ?",
+                (state, self.run_id, product_id, epoch_seq),
+            )
+
+    # noinspection SqlResolve
+    def set_spot_epoch_cursor(
+            self, product_id: str, epoch_seq: int, exec_cursor: str | None,
+    ) -> None:
+        """Advance the durable execution-history cursor.
+
+        MUST be called inside the same transaction that recorded every
+        execution before the new cursor position (the caller opens the
+        span; this joins it) — a cursor ahead of the recorded ledger
+        would silently skip fills on the next catch-up.
+        """
+        with self._store.transaction():
+            self._store._conn.execute(
+                "UPDATE spot_inventory_epoch SET exec_cursor = ? "
+                "WHERE run_id = ? AND product_id = ? AND epoch_seq = ?",
+                (exec_cursor, self.run_id, product_id, epoch_seq),
+            )
+
+    # noinspection SqlResolve
+    def set_spot_epoch_pending_conflict(
+            self, product_id: str, epoch_seq: int, *,
+            ts_ms: int | None,
+            payload: dict | None = None,
+    ) -> None:
+        """Persist (or clear) the runtime settlement-grace conflict state.
+
+        A balance-invariant mismatch first observed at runtime arms this
+        marker instead of quarantining immediately — settlement lag is a
+        *temporal* state, not a numeric tolerance. Persisting it keeps
+        the grace clock monotonic across crashes: a crash loop cannot
+        keep resetting the window and mask a real drift. ``ts_ms=None``
+        clears the marker (the invariant reconciled).
+        """
+        payload_json = json.dumps(payload) if payload is not None else None
+        with self._store.transaction():
+            self._store._conn.execute(
+                "UPDATE spot_inventory_epoch "
+                "SET pending_conflict_ts_ms = ?, pending_conflict = ? "
+                "WHERE run_id = ? AND product_id = ? AND epoch_seq = ?",
+                (ts_ms, payload_json, self.run_id, product_id, epoch_seq),
+            )
+
+    # --- Spot inventory: asset-ownership lease ------------------------------
+
+    # noinspection SqlResolve
+    def claim_spot_asset(
+            self, account_id: str, base_asset: str, quote_asset: str, *,
+            stale_threshold_ms: int = STALE_THRESHOLD_MS,
+    ) -> bool:
+        """Claim (or refresh) the exclusive base-asset lease for this run.
+
+        One active logical run per ``(plugin, account, base_asset)``.
+        The lease is keyed on the PHYSICAL ``run_instance_id`` (``run_id``
+        is reused across restarts by design). Own-instance re-claim
+        refreshes the heartbeat; a lease held by a DIFFERENT instance is
+        taken over only when that instance is no longer live — its
+        ``runs`` row ended cleanly (a normal restart handing off) or its
+        lease heartbeat went stale (a crash). A prior instance that is
+        still live keeps the lease, so the claimant starts quarantined.
+
+        Two guards this enforces:
+
+        - **Physical-instance fencing.** A resumed zombie carries the
+          same ``run_id`` as the replacement instance that already took
+          its lease, but a different ``run_instance_id``. Keying on the
+          instance (and checking the prior instance's ``runs`` liveness,
+          not just the lease heartbeat, so a quick clean restart is not
+          mistaken for a live conflict) means the zombie cannot reclaim,
+          and its next :meth:`heartbeat_spot_asset` reports the loss.
+        - **Base-vs-quote exclusivity.** A live foreign run that trades
+          the shared asset as its quote cash (or owns this run's quote
+          as its base) would silently move this run's balance invariant.
+          Such an overlap fails the claim up front instead of surfacing
+          later as a spurious conflict quarantine.
+
+        A cross-``run_id`` takeover writes a ``spot_lease_taken_over``
+        audit event; a same-``run_id`` restart adopts its predecessor's
+        lease silently. The exclusion is local to this SQLite file by
+        design; a second instance on another workdir/machine is detected
+        by the balance invariant, not prevented here.
+
+        :return: ``True`` when this run holds the lease on return.
+        """
+        now = _now_ms()
+        live_after = now - stale_threshold_ms
+        # IMMEDIATE: the base-vs-quote overlap check-then-insert must be
+        # atomic even across separate connections to the same store file;
+        # a DEFERRED span would let two claimants both pass the pre-write
+        # overlap read (verified) before either writes its row.
+        with self._store.immediate_transaction():
+            # Base-vs-quote overlap: any LIVE foreign lease that uses our
+            # base as its quote, or owns our quote as its base, shares an
+            # asset with us and must block the claim.
+            overlap = self._store._conn.execute(
+                "SELECT run_id FROM spot_asset_owner "
+                "WHERE plugin_name = ? AND account_id = ? "
+                "  AND run_instance_id != ? AND heartbeat_ts_ms > ? "
+                "  AND (quote_asset = ? OR base_asset = ?)",
+                (self._store._plugin_name, account_id,
+                 self.run_instance_id, live_after,
+                 base_asset, quote_asset),
+            ).fetchone()
+            if overlap is not None:
+                return False
+            row = self._store._conn.execute(
+                "SELECT run_id, run_instance_id, heartbeat_ts_ms "
+                "FROM spot_asset_owner "
+                "WHERE plugin_name = ? AND account_id = ? AND base_asset = ?",
+                (self._store._plugin_name, account_id, base_asset),
+            ).fetchone()
+            if row is None:
+                cur = self._store._conn.execute(
+                    "INSERT INTO spot_asset_owner ("
+                    "  plugin_name, account_id, base_asset, quote_asset,"
+                    "  run_id, run_instance_id, claimed_ts_ms, heartbeat_ts_ms"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(plugin_name, account_id, base_asset) "
+                    "DO NOTHING",
+                    (self._store._plugin_name, account_id, base_asset,
+                     quote_asset, self.run_id, self.run_instance_id, now, now),
+                )
+                return cur.rowcount == 1
+            prior_instance = int(row['run_instance_id'])
+            if prior_instance == self.run_instance_id:
+                self._store._conn.execute(
+                    "UPDATE spot_asset_owner SET heartbeat_ts_ms = ? "
+                    "WHERE plugin_name = ? AND account_id = ? "
+                    "  AND base_asset = ? AND run_instance_id = ?",
+                    (now, self._store._plugin_name, account_id,
+                     base_asset, self.run_instance_id),
+                )
+                return True
+            # A different physical instance holds it. Take over only if
+            # that instance is no longer live: its ``runs`` row ended
+            # cleanly (normal restart handoff), was cleaned up, or its
+            # lease heartbeat went stale (crash). A live prior instance —
+            # a genuine concurrent run, or a resumed zombie sharing our
+            # run_id — keeps the lease.
+            prior_run = self._store._conn.execute(
+                "SELECT ended_ts_ms FROM runs WHERE run_instance_id = ?",
+                (prior_instance,),
+            ).fetchone()
+            prior_ended = prior_run is None or prior_run['ended_ts_ms'] is not None
+            lease_stale = now - int(row['heartbeat_ts_ms']) > stale_threshold_ms
+            if not (prior_ended or lease_stale):
+                return False
+            # Guarded takeover: the WHERE re-checks the observed instance
+            # and heartbeat so a concurrent refresh by the (actually
+            # live) holder makes this a zero-row no-op instead of a steal.
+            cur = self._store._conn.execute(
+                "UPDATE spot_asset_owner "
+                "SET run_id = ?, run_instance_id = ?, quote_asset = ?,"
+                "    claimed_ts_ms = ?, heartbeat_ts_ms = ? "
+                "WHERE plugin_name = ? AND account_id = ? AND base_asset = ? "
+                "  AND run_instance_id = ? AND heartbeat_ts_ms = ?",
+                (self.run_id, self.run_instance_id, quote_asset, now, now,
+                 self._store._plugin_name, account_id, base_asset,
+                 prior_instance, row['heartbeat_ts_ms']),
+            )
+            if cur.rowcount != 1:
+                return False
+            # A same-run_id restart adopts its predecessor's lease
+            # silently; only a cross-run_id takeover is an audit event.
+            if row['run_id'] != self.run_id:
+                self._store._conn.execute(
+                    "INSERT INTO events ("
+                    "  run_instance_id, ts_ms, plugin_name, kind, payload"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        self.run_instance_id, now, self._store._plugin_name,
+                        'spot_lease_taken_over',
+                        json.dumps({
+                            'account_id': account_id,
+                            'base_asset': base_asset,
+                            'prior_run_id': row['run_id'],
+                            'prior_run_instance_id': prior_instance,
+                            'prior_heartbeat_ts_ms': int(row['heartbeat_ts_ms']),
+                        }),
+                    ),
+                )
+                _log.warning(
+                    "broker storage: spot asset lease taken over "
+                    "(account=%r base=%r prior_run_id=%r prior_instance=%d "
+                    "heartbeat=%d ended=%s)",
+                    account_id, base_asset, row['run_id'],
+                    prior_instance, int(row['heartbeat_ts_ms']), prior_ended,
+                )
+            return True
+
+    # noinspection SqlResolve
+    def heartbeat_spot_asset(self, account_id: str, base_asset: str) -> bool:
+        """Refresh this run's lease heartbeat.
+
+        Guarded by the physical ``run_instance_id``: a resumed zombie
+        whose lease a replacement instance already took over updates zero
+        rows and gets ``False`` back, so the caller can quarantine
+        instead of trading on a lease it no longer holds.
+
+        :return: ``True`` when this instance still holds the lease.
+        """
+        now = _now_ms()
+        with self._store.transaction():
+            cur = self._store._conn.execute(
+                "UPDATE spot_asset_owner SET heartbeat_ts_ms = ? "
+                "WHERE plugin_name = ? AND account_id = ? "
+                "  AND base_asset = ? AND run_instance_id = ?",
+                (now, self._store._plugin_name, account_id,
+                 base_asset, self.run_instance_id),
+            )
+            return cur.rowcount == 1
+
+    # noinspection SqlResolve
+    def release_spot_asset(self, account_id: str, base_asset: str) -> None:
+        """Release this run's lease on a clean shutdown.
+
+        Only this physical instance's own row is deleted; a lease another
+        instance took over in the meantime is left alone.
+        """
+        with self._store.transaction():
+            self._store._conn.execute(
+                "DELETE FROM spot_asset_owner "
+                "WHERE plugin_name = ? AND account_id = ? "
+                "  AND base_asset = ? AND run_instance_id = ?",
+                (self._store._plugin_name, account_id,
+                 base_asset, self.run_instance_id),
+            )
+
     # --- Lifecycle --------------------------------------------------------
 
     def heartbeat(self) -> None:
@@ -1807,6 +2486,65 @@ class RunContext:
 
 
 # === Private helpers =======================================================
+
+_SPOT_EPOCH_STATES = ('active', 'quarantined', 'closed')
+
+
+def _validate_spot_epoch_state(state: str) -> None:
+    if state not in _SPOT_EPOCH_STATES:
+        raise ValueError(
+            f"spot epoch state must be one of {_SPOT_EPOCH_STATES}, "
+            f"got {state!r}"
+        )
+
+
+def _row_to_spot_execution(row: sqlite3.Row) -> SpotExecutionRow:
+    return SpotExecutionRow(
+        fill_id=row['fill_id'],
+        exchange_order_id=row['exchange_order_id'],
+        client_order_id=row['client_order_id'],
+        side=row['side'],
+        base_delta=row['base_delta'],
+        quote_delta=row['quote_delta'],
+        price=row['price'],
+        fee_amount=row['fee_amount'],
+        fee_currency=row['fee_currency'],
+        ts_ms=int(row['ts_ms']),
+        delivered=bool(row['delivered']),
+        venue_seq=(
+            None if row['venue_seq'] is None else int(row['venue_seq'])
+        ),
+    )
+
+
+def _row_to_spot_epoch(row: sqlite3.Row) -> SpotEpochRow:
+    raw_conflict = row['pending_conflict']
+    conflict: dict | None = None
+    if raw_conflict:
+        try:
+            parsed = json.loads(raw_conflict)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            conflict = parsed
+    return SpotEpochRow(
+        plugin_name=row['plugin_name'],
+        account_id=row['account_id'],
+        base_asset=row['base_asset'],
+        product_id=row['product_id'],
+        epoch_seq=int(row['epoch_seq']),
+        foreign_baseline=row['foreign_baseline'],
+        cursor_scope=row['cursor_scope'],
+        exec_cursor=row['exec_cursor'],
+        state=row['state'],
+        created_ts_ms=int(row['created_ts_ms']),
+        pending_conflict_ts_ms=(
+            None if row['pending_conflict_ts_ms'] is None
+            else int(row['pending_conflict_ts_ms'])
+        ),
+        pending_conflict=conflict,
+    )
+
 
 def _row_to_order(row: sqlite3.Row) -> OrderRow:
     """Convert ``sqlite3.Row`` → :class:`OrderRow`, parsing extras JSON."""
