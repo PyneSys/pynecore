@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "The full contract a live broker plugin must uphold"
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-07-12"
+lastmod: "2026-07-13"
 draft: false
 toc: true
 categories: ["Development"]
@@ -271,6 +271,72 @@ crash-replay logic. The optional `supports_partial_leg_close = False`
 attribute makes the emulator atomically skip plans containing partial leg
 slices on venues whose position close is full-row only (Capital.com).
 
+## Spot venues: synthesize the position
+
+Spot venues expose **no position object** — no position row, no entry
+price, no unrealized P&L, no position id, no position-attached bracket.
+The position itself is not missing: the base-asset inventory relative to
+the quote asset *is* the long exposure. Everything the venue API does not
+provide, the plugin must synthesize. PyneCore ships no purpose-built spot
+helper today, so all of the following is plugin-side responsibility.
+
+### `get_position()` must never return `None` while holding inventory
+
+The engine treats `None` as an authoritative flat: the startup reconcile
+adopts it unconditionally and the periodic reconcile reads a
+held-position → `None` transition as an external flatten. A spot plugin
+that returns `None` because "the venue has no positions" silently breaks
+restart adoption — after a restart the engine believes it is flat and
+**double-opens** on the first entry signal. Synthesize an
+`ExchangePosition` instead: `size` = net base inventory from your own
+fill ledger, `entry_price` = ledger VWAP, `unrealized_pnl` =
+(mark − VWAP) × size, `leverage=1.0`, `liquidation_price=None`,
+`margin_mode="cash"`. Return `None` only when the bot's net inventory is
+genuinely flat.
+
+### Persist your own fill ledger
+
+The core `orders` table keeps only a cumulative `filled_qty` (no per-fill
+price, fee, fee currency or execution id), and the `events` table is
+purged by the retention cleanup — neither can reconstruct a position that
+has been open longer than the retention window. A spot plugin must
+persist an **append-only execution ledger** of its own (per-fill price,
+signed base/quote deltas, fee and fee currency, venue execution id, keyed
+for dedup on the venue's fill id) that is exempt from retention: an open
+position must stay reconstructible for as long as it is open. Fees
+charged in the base currency reduce the received quantity — record the
+net delta, not the ordered quantity.
+
+### The balance is pooled — reconcile fail-closed
+
+The venue balance does not separate the bot's inventory from pre-existing
+holdings, manual trades or deposits. The plugin's own ledger is
+authoritative for the bot's inventory; the venue balance is a
+*reconciliation check* against a persisted baseline captured when the
+ledger starts. Any unexplainable drift in **either** direction must stop
+new dispatch until an operator intervenes — a positive drift can mask an
+external sale netted against a deposit, so warn-and-continue is not an
+option. External intervention in the bot's inventory is not supported:
+detect it and stop trading; there is no adoption path.
+
+### One position asset, one bot
+
+Every asset serves exactly one role per account. As a **position asset**
+it is the exclusive base of exactly one bot — no other bot may touch it
+as base *or* quote (a BTCUSDT bot and an ETHBTC bot conflict: ETHBTC
+moves BTC as its quote). As a **cash asset** it is a shared quote pool
+for any number of bots (BTCUSDT + ETHUSDT is fine); cash exhaustion is a
+normal recoverable order reject, not bookkeeping corruption. A dedicated
+(sub)account per bot per base asset is the recommended mode — it makes
+drift conflicts rare, and every conflict that still occurs is real.
+
+### No shorting
+
+Spot cannot go short. A strategy whose orders would take the projected
+net inventory negative cannot run on a spot venue — refuse it rather
+than sending a sell the venue will reject (or, worse, one that silently
+borrows).
+
 ## Runtime configuration
 
 - Plugin credentials/tunables live in the plugin's own `Config` dataclass
@@ -337,9 +403,10 @@ is hit by mainstream CFD/crypto venues:
   required work, not a plugin-side workaround.
 - **The software engines are venue-shaped:** the partial-bracket engine
   models per-deal CFD venues, the one-way emulator models grid-volume
-  hedging venues. A third venue class (e.g. spot without a position
-  concept) gets no purpose-built helper and inherits the full
-  disappearance-detection burden.
+  hedging venues. A third venue class (e.g. spot, which exposes no
+  position object) gets no purpose-built helper and inherits the full
+  disappearance-detection burden — see the spot section above for what
+  such a plugin must synthesize and persist itself.
 - **Hedge-native strategies are out of scope by design:** `ExitIntent` /
   `CloseIntent` require `reduce_only=True` at the model level. Hedging
   *accounts* are supported (via `PositionPort`); hedge *semantics* in the

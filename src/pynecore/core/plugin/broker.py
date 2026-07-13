@@ -615,7 +615,23 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
 
     @abstractmethod
     async def get_position(self, symbol: str) -> 'ExchangePosition | None':
-        """Fetch current position.  Returns ``None`` for spot markets."""
+        """Fetch the current position for ``symbol``.
+
+        ``None`` means "no position exists for this symbol" and the engine
+        treats it as an **authoritative flat**: the startup ``reconcile``
+        adopts it unconditionally (a restart over ``None`` starts flat), and
+        the periodic ``reconcile`` reads a held-position → ``None``
+        transition as an external flatten. Returning ``None`` merely because
+        the venue has no native position *object* is therefore wrong — after
+        a restart the engine would forget the open exposure and double-open
+        on the first entry signal.
+
+        Spot venues MUST synthesize an :class:`ExchangePosition` from the
+        plugin's own persisted fill ledger (net base inventory as ``size``,
+        ledger VWAP as ``entry_price``, mark-to-market ``unrealized_pnl``,
+        ``leverage=1.0``) and may return ``None`` only when the bot's net
+        inventory is genuinely flat.
+        """
 
     @abstractmethod
     async def get_balance(self) -> dict[str, float]:

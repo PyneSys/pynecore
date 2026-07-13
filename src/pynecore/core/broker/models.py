@@ -297,7 +297,18 @@ class OrderEvent:
 
 @dataclass
 class ExchangePosition:
-    """Current position on the exchange (futures/margin)."""
+    """Current position on the exchange — the engine's read-side view.
+
+    Venue-agnostic. On futures/margin venues it mirrors the broker's
+    native position object. On spot venues no such object exists, so the
+    plugin synthesizes it from its own fill ledger: ``side`` long/flat,
+    ``size`` = net base inventory, ``entry_price`` = ledger VWAP,
+    ``unrealized_pnl`` = (mark − VWAP) × size, ``leverage=1.0``,
+    ``liquidation_price=None``, ``margin_mode="cash"``.
+
+    The engine's reconcile consumes ``size``, ``side``, ``entry_price``
+    and ``unrealized_pnl``; the remaining fields are informational.
+    """
     symbol: str
     side: str  # "long" | "short" | "flat"
     size: float
@@ -305,7 +316,7 @@ class ExchangePosition:
     unrealized_pnl: float
     liquidation_price: float | None
     leverage: float
-    margin_mode: str  # "cross" | "isolated"
+    margin_mode: str  # "cross" | "isolated" | "cash" (spot)
 
 
 @dataclass

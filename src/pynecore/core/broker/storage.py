@@ -409,6 +409,10 @@ class BrokerStore:
         # BEGIN…COMMIT span must be serialized through this re-entrant
         # lock — see :meth:`transaction`.
         self._lock = threading.RLock()
+        # Same-thread nesting depth of :meth:`transaction` — only the
+        # outermost level opens the real BEGIN…COMMIT span. Guarded by
+        # ``_lock`` (re-entrant), so cross-thread spans stay serialized.
+        self._txn_depth = 0
         # Gate for :meth:`maybe_cleanup_old_data` — 0 means the first
         # caller (``open_run``) purges immediately.
         self._last_purge_ms = 0
@@ -463,9 +467,30 @@ class BrokerStore:
         is connection-global: a read issued while the writer thread is
         mid-transaction sees that writer's uncommitted rows, and a later
         writer rollback leaves the reader having acted on phantom data.
+
+        **Nestable on the same thread.** A ``transaction()`` block opened
+        inside another one joins the outer span instead of opening (and
+        prematurely committing) its own — sqlite3's connection context
+        manager is not nesting-safe, so only the outermost level runs the
+        real ``with conn:``. Composite writers (e.g. the disappearance
+        tracker's confirm-outcome apply) rely on this to wrap several
+        existing single-transaction helpers into one atomic span; an
+        exception anywhere inside rolls back the whole outer span.
         """
-        with self._lock, self._conn:
-            yield self._conn
+        with self._lock:
+            if self._txn_depth > 0:
+                self._txn_depth += 1
+                try:
+                    yield self._conn
+                finally:
+                    self._txn_depth -= 1
+            else:
+                self._txn_depth = 1
+                try:
+                    with self._conn:
+                        yield self._conn
+                finally:
+                    self._txn_depth = 0
 
     @contextlib.contextmanager
     def read_lock(self) -> Iterator[sqlite3.Connection]:
@@ -957,6 +982,21 @@ class RunContext:
     run_tag: str
     _store: BrokerStore
     _last_heartbeat_write_ms: int = 0
+
+    # --- Composite writes ---------------------------------------------------
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Open (or join) the store's serialized write transaction.
+
+        Passthrough to :meth:`BrokerStore.transaction` so composite
+        writers holding only the run context can make several helper
+        calls (``upsert_order`` + journal writes + ``close_order``)
+        atomic: the helpers' own ``transaction()`` blocks nest into this
+        span, and an exception anywhere rolls back all of it.
+        """
+        with self._store.transaction() as conn:
+            yield conn
 
     # --- Core sync engine: envelope-identity ------------------------------
 
