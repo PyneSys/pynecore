@@ -356,3 +356,116 @@ def __test_validate_pyramiding_one_row_partial_bracket_ok__():
         partial_qty_bracket_exit_pyramiding=CapabilityLevel.UNSUPPORTED,
     )
     assert validate_at_startup(reqs, caps, pyramiding=1) == []
+
+
+# === may_go_short detection ===
+
+
+def __test_entry_positional_short_detects_may_go_short__():
+    """``strategy.entry(id, strategy.short)`` — positional constant short."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.entry('Short', strategy.short, qty=1)
+    """)
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'may_go_short': True,
+    }
+
+
+def __test_entry_keyword_short_detects_may_go_short__():
+    """``direction=strategy.short`` as a keyword is detected too."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.entry('Short', direction=strategy.short, qty=1)
+    """)
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'may_go_short': True,
+    }
+
+
+def __test_entry_lib_normalized_short_detects_may_go_short__():
+    """``lib.strategy.short`` — the form ImportNormalizer produces."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            lib.strategy.entry('Short', lib.strategy.short, qty=1)
+    """)
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'may_go_short': True,
+    }
+
+
+def __test_entry_direction_module_short_detects_may_go_short__():
+    """``strategy.direction.short`` / ``lib.strategy.direction.short`` spelled out."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.entry('A', strategy.direction.short, qty=1)
+            lib.strategy.entry('B', lib.strategy.direction.short, qty=1)
+    """)
+    flags = _get_requirements_keyword(tree)
+    assert flags is not None and flags['may_go_short'] is True
+
+
+def __test_order_constant_short_detects_may_go_short__():
+    """``strategy.order`` with a constant short direction is detected too."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.order('Sell', strategy.short, qty=1)
+    """)
+    assert _get_requirements_keyword(tree) == {
+        'market_orders': True, 'strategy_order': True, 'may_go_short': True,
+    }
+
+
+def __test_long_only_script_has_no_may_go_short__():
+    """Long-only entries leave the flag unset."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            strategy.entry('Long', strategy.long, qty=1)
+            strategy.order('Add', direction=strategy.long, qty=1)
+    """)
+    flags = _get_requirements_keyword(tree)
+    assert flags is not None and 'may_go_short' not in flags
+
+
+def __test_dynamic_direction_stays_advisory_false__():
+    """A non-constant direction (variable / conditional) cannot be proven at
+    compile time — the flag stays False and the sync engine's runtime
+    projected-position gate is the authoritative guard."""
+    tree = _transform("""
+        @script.strategy('S')
+        def main():
+            d = strategy.short if cond else strategy.long
+            strategy.entry('X', d, qty=1)
+            strategy.order('Y', direction=my_dir, qty=1)
+    """)
+    flags = _get_requirements_keyword(tree)
+    assert flags is not None and 'may_go_short' not in flags
+
+
+def __test_validate_rejects_may_go_short_without_short_selling__():
+    """may_go_short + short_selling UNSUPPORTED → startup reject."""
+    reqs = ScriptRequirements(market_orders=True, may_go_short=True)
+    caps = ExchangeCapabilities(watch_orders=CapabilityLevel.SOFTWARE)
+    errors = validate_at_startup(reqs, caps)
+    assert len(errors) == 1
+    assert 'short selling' in errors[0]
+
+
+def __test_validate_accepts_may_go_short_with_short_selling__():
+    """A short-capable venue passes the gate at any supported level."""
+    reqs = ScriptRequirements(market_orders=True, may_go_short=True)
+    caps = ExchangeCapabilities(short_selling=CapabilityLevel.NATIVE)
+    assert validate_at_startup(reqs, caps) == []
+
+
+def __test_validate_long_only_passes_on_spot_venue__():
+    """A long-only script starts fine against short_selling UNSUPPORTED."""
+    reqs = ScriptRequirements(market_orders=True)
+    caps = ExchangeCapabilities()
+    assert validate_at_startup(reqs, caps) == []

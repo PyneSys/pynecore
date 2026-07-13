@@ -34,6 +34,7 @@ _FLAG_TRAIL = 'trailing_stop'
 _FLAG_STRATEGY_ORDER = 'strategy_order'
 _FLAG_EXIT_ORDERS = 'exit_orders'
 _FLAG_PARTIAL_QTY_BRACKET_EXIT = 'partial_qty_bracket_exit'
+_FLAG_MAY_GO_SHORT = 'may_go_short'
 
 
 def _strategy_call_name(node: ast.Call) -> str | None:
@@ -64,6 +65,47 @@ def _strategy_call_name(node: ast.Call) -> str | None:
 def _kw_names(node: ast.Call) -> set[str]:
     """Keyword argument names syntactically present on the call."""
     return {kw.arg for kw in node.keywords if kw.arg is not None}
+
+
+def _is_strategy_direction_base(expr: ast.expr) -> bool:
+    """
+    True if ``expr`` is one of the qualifier chains a direction constant
+    hangs off: ``strategy``, ``lib.strategy``, ``direction``,
+    ``strategy.direction``, or ``lib.strategy.direction``.
+    """
+    if isinstance(expr, ast.Name):
+        return expr.id in ('strategy', 'direction')
+    if isinstance(expr, ast.Attribute):
+        if expr.attr == 'direction':
+            return _is_strategy_direction_base(expr.value)
+        if expr.attr == 'strategy':
+            return isinstance(expr.value, ast.Name) and expr.value.id == 'lib'
+    return False
+
+
+def _direction_is_constant_short(node: ast.Call) -> bool:
+    """
+    True if the ``direction`` argument of a ``strategy.entry`` /
+    ``strategy.order`` call is a syntactically constant short — the second
+    positional argument or the ``direction=`` keyword spelled as
+    ``strategy.short`` / ``lib.strategy.short`` / ``strategy.direction.short``
+    / ``lib.strategy.direction.short``.
+
+    Anything else — a variable, a conditional expression, a call — is a
+    *dynamic* direction: compile time cannot prove it, so the flag stays
+    ``False`` and the sync engine's projected-position runtime gate is the
+    authoritative guard on short-incapable venues.
+    """
+    expr: ast.expr | None = None
+    if len(node.args) >= 2:
+        expr = node.args[1]
+    for kw in node.keywords:
+        if kw.arg == 'direction':
+            expr = kw.value
+    if expr is None:
+        return False
+    return (isinstance(expr, ast.Attribute) and expr.attr == 'short'
+            and _is_strategy_direction_base(expr.value))
 
 
 def _is_script_strategy_decorator(node: ast.expr) -> bool:
@@ -108,6 +150,7 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             _FLAG_STRATEGY_ORDER: False,
             _FLAG_EXIT_ORDERS: False,
             _FLAG_PARTIAL_QTY_BRACKET_EXIT: False,
+            _FLAG_MAY_GO_SHORT: False,
         }
         self._strategy_decorator: ast.Call | None = None
 
@@ -143,8 +186,12 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
         kws = _kw_names(node)
         if name == 'entry':
             self._apply_entry_or_order(kws, is_strategy_order=False)
+            if _direction_is_constant_short(node):
+                self._reqs[_FLAG_MAY_GO_SHORT] = True
         elif name == 'order':
             self._apply_entry_or_order(kws, is_strategy_order=True)
+            if _direction_is_constant_short(node):
+                self._reqs[_FLAG_MAY_GO_SHORT] = True
         elif name == 'exit':
             self._apply_exit(kws)
             self._reqs[_FLAG_EXIT_ORDERS] = True
@@ -242,9 +289,10 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
             )
             # Insert after the module docstring (if any) to keep it valid
             insert_at = 0
-            if (module.body and isinstance(module.body[0], ast.Expr)
-                    and isinstance(module.body[0].value, ast.Constant)
-                    and isinstance(module.body[0].value.value, str)):
+            first = module.body[0] if module.body else None
+            if (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
                 insert_at = 1
             module.body.insert(insert_at, import_node)
 

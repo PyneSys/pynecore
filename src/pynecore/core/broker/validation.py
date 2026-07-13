@@ -143,6 +143,14 @@ def validate_at_startup(
             "strategy.order() on this broker, or switch to a plugin that "
             "opts into partial-qty bracket pyramiding support."
         )
+    if reqs.may_go_short and not caps.short_selling.is_supported:
+        errors.append(
+            "Script passes a constant strategy.short direction to "
+            "strategy.entry / strategy.order, but the exchange doesn't "
+            "support short selling (spot venue — a negative base position "
+            "cannot exist). Remove the short side, or trade on a "
+            "margin-capable broker."
+        )
     return errors
 
 
@@ -348,6 +356,16 @@ def validate_plugin_contract(
                 f"{grace!r} — must be a finite non-negative real number "
                 f"(a NaN/inf grace would let a confirmed inventory "
                 f"conflict stay pending forever while trading continues)."
+            )
+        if ('short_selling' not in bad_fields
+                and caps.short_selling.is_supported):
+            errors.append(
+                f"{name} declares a spot_inventory_port AND a supported "
+                f"short_selling capability — the two are mutually "
+                f"exclusive. The spot ledger models long-only exposure "
+                f"(a negative base position cannot exist on a spot "
+                f"venue); a short-capable venue must not opt into core "
+                f"spot inventory."
             )
 
     # --- Lifecycle ---

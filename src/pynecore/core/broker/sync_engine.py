@@ -455,6 +455,11 @@ class OrderSyncEngine:
         # is enforced once at startup by ``validate_at_startup``;
         # the engine itself only needs the mode value at dispatch time.
         self._partial_qty_bracket_exit_mode = caps.partial_qty_bracket_exit
+        # Short-selling runtime gate switch. When the venue cannot hold a
+        # negative base position (spot), every sell-side entry dispatch is
+        # preflighted against the projected aggregate signed position — see
+        # :meth:`_enforce_short_gate`.
+        self._short_selling_supported = caps.short_selling.is_supported
         # §2.6 broker-native fail-safe worst-SL manager (Slice A.7).
         # Like the partial-bracket state machine it is always
         # constructed — the dispatch path is the one that decides
@@ -6252,6 +6257,18 @@ class OrderSyncEngine:
         market_envelope = self._build_envelope(market_intent)
         market_coid = market_envelope.client_order_id(KIND_ENTRY_STOP)
         if watch.state == ENTRY_STOP_STATE_CANCEL_PENDING:
+            # Short-selling gate: the stop-fired MARKET POSTs execute_entry
+            # directly, bypassing ``_dispatch_new``'s gate. Inventory can
+            # shrink between the both-set entry's initial preflight and the
+            # stop firing, so re-check the projected signed position before
+            # committing. ``exclude_key=pine_id``: this market REPLACES the
+            # still-active limit intent under the same key, so its own qty must
+            # not be double-counted against itself. Gate the FIRST fire only —
+            # an already-persisted ``stop_market_pending`` POST may be live at
+            # the broker, and halting the idempotent retry would strand
+            # recovery rather than protect anything. Raises (graceful halt) on
+            # a projected-negative sell, never a silent skip.
+            self._enforce_short_gate(market_intent, exclude_key=pine_id)
             # Persist the market identity BEFORE the POST (verify-before-resend
             # on restart). No-op when already stop_market_pending (retry path).
             self._entry_stop_engine.confirm_limit_cancelled_fire_market(
@@ -8827,6 +8844,67 @@ class OrderSyncEngine:
             format_intent_key(envelope.intent.intent_key), coid, kind, error,
         )
 
+    def _enforce_short_gate(
+            self, intent: 'EntryIntent', *, exclude_key: str | None = None,
+    ) -> None:
+        """Halt before a dispatch that could take the signed position short.
+
+        Active on short-incapable venues only (``caps.short_selling``
+        UNSUPPORTED — spot). The gate is judged on the aggregate
+        POST-intent position, not on the order side: a ``strategy.order``
+        sell that only reduces an existing long is NOT a short and flows
+        through. The projection aggregates every active sell-side entry
+        intent because two individually-reducing sells can flip together.
+        Exits and closes are excluded — they are reduce-only by engine
+        contract (:meth:`_clamp_close_intents` caps closes; brackets carry
+        OCA-reduce semantics) and cannot flip the book.
+
+        Runs AFTER the MARKET stop-and-reverse fold so a reversing
+        ``strategy.entry`` is judged on its true combined quantity. On a
+        hit the engine records a graceful halt and raises — a silent skip
+        would break Pine semantics (the script would believe it is short
+        while the venue holds the old long).
+
+        :param intent: The (folded) entry intent about to dispatch.
+        :param exclude_key: Active-intent key to leave out of the
+            aggregation — the modify path passes the key being replaced so
+            the OLD quantity is not double-counted against the NEW one.
+        :raises BrokerManualInterventionError: When the projected position
+            would go negative.
+        """
+        if self._short_selling_supported or intent.side != 'sell':
+            return
+        reserved = 0.0
+        for key, active in self._active_intents.items():
+            if key == exclude_key:
+                continue
+            if isinstance(active, EntryIntent) and active.side == 'sell':
+                reserved += active.qty
+        # Same 12-decimal rounding as the reversal fold — kills float64
+        # addition artifacts without hiding any real lot-sized deficit.
+        projected = round(self._position.size - reserved - intent.qty, 12)
+        if projected >= 0.0:
+            return
+        halt = BrokerManualInterventionError(
+            f"Dispatching {intent} would take the projected position to "
+            f"{projected} (position={self._position.size}, already-reserved "
+            f"sell qty={reserved}), but the venue cannot hold a negative "
+            f"base position (short_selling unsupported). Halting instead "
+            f"of silently skipping — the script's position view would "
+            f"diverge from the venue.",
+            intent_key=intent.intent_key,
+            context={
+                'symbol': intent.symbol,
+                'pine_id': intent.pine_id,
+                'projected_position': projected,
+                'position_size': self._position.size,
+                'reserved_sell_qty': reserved,
+                'intent_qty': intent.qty,
+            },
+        )
+        self._record_halt(halt)
+        raise halt
+
     def _dispatch_new(self, intent: Intent) -> None:
         # Quarantine gate: new entries are exactly the "new or
         # exposure-increasing dispatch" the quarantine invariant blocks.
@@ -8869,9 +8947,14 @@ class OrderSyncEngine:
         # from such a creation-folded leg — both excluded. Without this a
         # live reversal merely REDUCED the opposite position instead of
         # flipping it (measured on the Capital.com demo E2E, 2026-07-10).
+        # ``strategy.order`` is excluded too: it never auto-reverses — its
+        # raw quantity simply nets against the venue position (an opposite-
+        # side order(qty=3) on a 5-long reduces to 2, it does not target a
+        # 3-short), so folding it would oversell by the position size.
         if (isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
                 and not intent.stop_fired_market
+                and not intent.is_strategy_order
                 and self._position.size != 0.0
                 and ((intent.side == 'buy') == (self._position.size < 0.0))):
             # Round to 12 decimals — finer than any real lot step, but
@@ -8880,6 +8963,10 @@ class OrderSyncEngine:
                 intent,
                 qty=round(intent.qty + abs(self._position.size), 12),
             )
+        # Short gate: judged on the folded quantity, before the envelope is
+        # built (nothing to clean up on a halt).
+        if isinstance(intent, EntryIntent):
+            self._enforce_short_gate(intent)
         envelope = self._build_envelope(intent)
         _blog_info("dispatching %s", intent)
         # Non-None only when the plugin opted into hedging-mode one-way
@@ -11658,6 +11745,13 @@ class OrderSyncEngine:
             raise _QuarantineModifyDeferred(
                 "entry modify blocked by quarantine"
             )
+        # Short gate for entry amends: a qty raise on a resting sell-side
+        # entry can flip the projected position just like a fresh dispatch.
+        # The OLD quantity is excluded from the aggregation (it is being
+        # replaced, not stacked). ``old.intent_key == new.intent_key`` by
+        # the diff's definition of a modify.
+        if isinstance(new, EntryIntent):
+            self._enforce_short_gate(new, exclude_key=new.intent_key)
         # Engine-trigger partial bracket exits never reach the broker —
         # the leg rows are engine-internal. A modify must therefore
         # cancel the prior legs through the state machine and re-emit

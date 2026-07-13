@@ -493,6 +493,21 @@ class ExchangeCapabilities:
     # unsafe; live scripts are rejected at startup.
     idempotency: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
+    # === Short selling ===
+    # NATIVE = the venue holds a signed position natively (margin / futures /
+    # CFD — selling more than the current long flips the book short).
+    # SOFTWARE = the plugin delivers short exposure through its own borrow /
+    # margin mechanism while the venue itself is spot-settled (placeholder;
+    # no current broker delivers this).
+    # UNSUPPORTED = the venue cannot hold a negative base position (spot).
+    # Scripts whose detected requirements include ``may_go_short`` are
+    # rejected at startup, and the sync engine arms its projected-position
+    # runtime gate: any dispatch that would take the aggregate signed
+    # position below zero halts the engine (graceful stop, never a silent
+    # skip). Mutually exclusive with a declared spot inventory port — the
+    # spot ledger models long-only exposure.
+    short_selling: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
 
 # === Pine Script intents ===
 
@@ -1234,6 +1249,15 @@ class ScriptRequirements:
     # a partial quantity, and silently covering the full qty would be a
     # safety violation.
     partial_qty_bracket_exit: bool = False
+    # True if any ``strategy.entry`` / ``strategy.order`` call passes a
+    # syntactically constant ``strategy.short`` direction (raw, ``lib.``-
+    # normalized, or ``strategy.direction.short`` spelled out). The validator
+    # rejects the script at startup when ``caps.short_selling`` is
+    # UNSUPPORTED. A dynamic direction (variable, conditional expression)
+    # cannot be proven at compile time and leaves the flag ``False`` — the
+    # detection is advisory only; the sync engine's projected-position gate
+    # is the authoritative runtime guard on short-incapable venues.
+    may_go_short: bool = False
 
 
 # === Interceptor (Order Sync Engine extension point) ===

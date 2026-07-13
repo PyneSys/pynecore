@@ -230,6 +230,9 @@ raw exchange support:
 - `cancel_all=SOFTWARE` does **not** require overriding
   `execute_cancel_all()` — Pine `strategy.cancel_all()` is delivered by
   the engine's diff loop as per-intent cancels.
+- `short_selling=NATIVE` on margin/CFD venues that hold signed positions;
+  leave it `UNSUPPORTED` on spot (see "No shorting" below — it arms the
+  startup reject and the engine's projected-position runtime gate).
 
 ## Idempotency: the client-order-id chain
 
@@ -434,10 +437,29 @@ real.
 
 ### No shorting
 
-Spot cannot go short. A strategy whose orders would take the projected
-net inventory negative cannot run on a spot venue — refuse it rather
-than sending a sell the venue will reject (or, worse, one that silently
-borrows).
+Spot cannot go short — leave `short_selling` at its `UNSUPPORTED`
+default (a spot inventory port combined with a supported `short_selling`
+declaration is a contract error). The core enforces the rest on two
+levels:
+
+- **Startup**: a script that passes a syntactically constant
+  `strategy.short` direction to `strategy.entry` / `strategy.order` is
+  rejected by `validate_at_startup` (`ScriptRequirements.may_go_short`,
+  detected at compile time). A dynamic direction cannot be proven and
+  passes this static gate.
+- **Runtime**: the sync engine preflights every sell-side entry dispatch
+  (and every entry amend) against the projected aggregate position —
+  current position minus every active sell-side entry intent's quantity,
+  judged after the market stop-and-reverse fold. A `strategy.order` sell
+  that only reduces an existing long flows through; a dispatch that
+  would project negative records a graceful halt
+  (`BrokerManualInterventionError`) — never a silent skip, which would
+  leave the script believing it is short. Exits and closes are
+  reduce-only by engine contract and are not gated.
+
+Margin/CFD venues that hold signed positions natively declare
+`short_selling=NATIVE` (both reference plugins do), which disables both
+gates.
 
 ## Runtime configuration
 
@@ -490,6 +512,7 @@ turns the machine-checkable slice of this guide into fail-fast errors:
 | Non-`None` `position_port` missing port methods                         | error    |
 | Non-`None` `spot_inventory_port` missing port members                   | error    |
 | Spot port set with an invalid `on_inventory_conflict` policy            | error    |
+| Spot port set with a supported `short_selling` capability               | error    |
 | `account_id` still `"default"` after authentication                     | error    |
 | No `watch_orders()` stream (poll-only, no disappearance channel)        | warning  |
 | Inherited `execute_cancel_with_outcome` (all cancels `UNKNOWN`)         | warning  |

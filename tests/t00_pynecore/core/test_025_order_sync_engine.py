@@ -60,6 +60,7 @@ from pynecore.lib.strategy import (
     Trade,
     _order_type_entry,
     _order_type_close,
+    _order_type_normal,
     oca as _oca,
 )
 
@@ -110,7 +111,15 @@ class MockBroker:
     raise_on_next_cancel: Exception | None = None
     raise_on_next_get_open_orders: Exception | None = None
     raise_on_next_get_position: Exception | None = None
-    capabilities: ExchangeCapabilities = field(default_factory=ExchangeCapabilities)
+    # The mock emulates a margin-style venue (shorts and reversals are the
+    # bread and butter of the engine tests) — declare short_selling so the
+    # projected-position gate stays out of the way; the dedicated short-gate
+    # tests override capabilities with the spot default (UNSUPPORTED).
+    capabilities: ExchangeCapabilities = field(
+        default_factory=lambda: ExchangeCapabilities(
+            short_selling=CapabilityLevel.NATIVE,
+        ),
+    )
     _next_id: int = 0
     # One-way emulation (hedging): set ``position_port = self`` + canned
     # ``raw_legs`` to drive the engine through the core OneWayEmulator.
@@ -4613,7 +4622,6 @@ def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
     """
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.run_identity import RunIdentity
-    from pynecore.core.broker.models import EntryIntent
 
     stale_bar_ts = 1_700_000_000_000  # represents an earlier-run anchor
     fresh_bar_ts = 1_700_000_060_000  # the bar the new sync is processing
@@ -6289,3 +6297,169 @@ def __test_record_quarantine_concurrent_callers_latch_once__():
     # holds — never a mix of two callers.
     winner = entered[0].reason.removeprefix("reason-")
     assert entered[0].context == {'origin': int(winner)}
+
+
+# === Short-selling runtime gate (spot venues) ===
+
+
+def _spot_broker() -> MockBroker:
+    """Mock with the spot default: ``short_selling`` UNSUPPORTED."""
+    return MockBroker(capabilities=ExchangeCapabilities())
+
+
+def _order_order(order_id, size, **kw) -> Order:
+    """A ``strategy.order`` style Pine order (normal type — never auto-reverses)."""
+    return Order(order_id, size, order_type=_order_type_normal, **kw)
+
+
+def __test_short_gate_halts_entry_short_from_flat__():
+    """A ``strategy.entry`` short on a flat book targets a negative position
+    — graceful halt, no broker call."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS)
+
+    assert engine.halted is True
+    assert b.entry_calls == []
+
+
+def __test_short_gate_halts_entry_reversal_on_spot__():
+    """A reversing MARKET ``strategy.entry`` is judged on its FOLDED
+    quantity — the combined stop-and-reverse always projects negative."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0004
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -0.0002)
+
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS)
+
+    assert engine.halted is True
+    assert b.entry_calls == []
+
+
+def __test_short_gate_strategy_order_reduce_passes__():
+    """A ``strategy.order`` sell that only reduces the long is NOT a short:
+    it dispatches with its RAW quantity (no stop-and-reverse fold)."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.entry_orders["Sell"] = _order_order("Sell", -3.0)
+
+    engine.sync(BAR_TS)
+
+    assert engine.halted is False
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 3.0
+
+
+def __test_short_gate_halts_strategy_order_flip__():
+    """A ``strategy.order`` sell larger than the position projects negative."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.entry_orders["Sell"] = _order_order("Sell", -8.0)
+
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS)
+
+    assert engine.halted is True
+    assert b.entry_calls == []
+
+
+def __test_short_gate_aggregates_active_sell_intents__():
+    """Two individually-reducing sells can flip together — the projection
+    aggregates every active sell-side entry intent."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.entry_orders["S1"] = _order_order("S1", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)  # 5 - 3 = 2: passes
+    assert engine.halted is False
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["S2"] = _order_order("S2", -3.0, limit=51_000.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 60_000)  # 5 - 3 - 3 = -1: halt
+
+    assert engine.halted is True
+    assert len(b.entry_calls) == 1
+
+
+def __test_short_gate_allows_exits_and_closes__():
+    """Exits and closes are reduce-only by engine contract — they flow
+    untouched on a spot venue."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -5.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert engine.halted is False
+    assert len(b.exit_calls) == 1
+
+
+def __test_short_gate_ignores_buy_entries__():
+    """Buy-side entries never trip the gate on a spot venue."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+
+    engine.sync(BAR_TS)
+
+    assert engine.halted is False
+    assert len(b.entry_calls) == 1
+
+
+def __test_short_gate_modify_qty_raise_halts__():
+    """An entry amend that raises a resting sell's qty past the inventory
+    projects negative — same gate, OLD qty excluded from the aggregation."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    # A raise still within the inventory modifies fine (old 3 is replaced,
+    # not stacked: 5 - 4 = 1).
+    pos.entry_orders["S"] = _order_order("S", -4.0, limit=50_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert len(b.modify_entry_calls) == 1
+
+    pos.entry_orders["S"] = _order_order("S", -6.0, limit=50_000.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 120_000)  # 5 - 6 = -1: halt
+
+    assert engine.halted is True
+    assert len(b.modify_entry_calls) == 1
+
+
+def __test_strategy_order_market_reduce_is_not_folded_on_margin__():
+    """The stop-and-reverse fold is ``strategy.entry`` semantics only:
+    ``strategy.order`` never auto-reverses, so an opposite-side market
+    order dispatches its RAW quantity on a margin venue too."""
+    b = MockBroker()  # short_selling NATIVE — gate inactive
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.entry_orders["Sell"] = _order_order("Sell", -3.0)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 3.0

@@ -326,6 +326,39 @@ def __test_spot_inventory_port_surface_checked__():
     assert any('on_inventory_conflict' in e for e in errors)
 
 
+def __test_spot_port_excludes_short_selling_capability__():
+    """A spot inventory port with a supported short_selling declaration is
+    contradictory — the spot ledger models long-only exposure."""
+    from decimal import Decimal
+
+    class _SpotPort:
+        product_id = "BTC-USD"
+        base_asset = "BTC"
+        quote_asset = "USD"
+        cursor_scope = "product"
+        base_tolerance = Decimal("0.00000001")
+        settlement_grace_s = 30.0
+
+        async def fetch_executions(self, cursor):
+            return None
+
+        async def fetch_base_balance(self):
+            return Decimal(0)
+
+    class _ShortingSpotPlugin(_ConformingPlugin):
+        capabilities = _caps(short_selling=CapabilityLevel.NATIVE)
+
+    plugin = _ShortingSpotPlugin()
+    plugin.spot_inventory_port = _SpotPort()
+    errors, _ = validate_plugin_contract(plugin)
+    assert any('short_selling' in e for e in errors)
+
+    # Without the spot port the same declaration is fine (margin venue).
+    plugin.spot_inventory_port = None
+    errors, _ = validate_plugin_contract(plugin)
+    assert errors == []
+
+
 # === Lifecycle ===
 
 
