@@ -24,6 +24,8 @@ comprehensions are not descended into (deferred or repeated evaluation).
 import ast
 from typing import cast
 
+from pynecore.transformers.locations import fix_locations
+
 __all__ = ['InlineSeriesHoistTransformer']
 
 
@@ -139,7 +141,7 @@ class InlineSeriesHoistTransformer:
         """
         tree.body = self._process_body(tree.body)
         if self._counter:
-            ast.fix_missing_locations(tree)
+            fix_locations(tree)
         return tree
 
     def _process_body(self, body: list[ast.stmt]) -> list[ast.stmt]:

@@ -210,6 +210,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
             from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+            from pynecore.transformers.locations import fix_locations
 
             # Shared slot allocator of the module (see slot_layout.py); the
             # state-contributing transformers fill it, apply_layout emits it
@@ -248,7 +249,10 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = SafeDivisionTransformer().visit(transformed)
             transformed = apply_layout(transformed, slot_layout)
 
-            ast.fix_missing_locations(transformed)
+            # Debugger-safe variant of ast.fix_missing_locations: synthetic
+            # nodes get point anchors, so no prologue bytecode maps onto the
+            # function's last line (see transformers/locations.py)
+            fix_locations(transformed)
 
             # Debug output if requested. The pretty dump and the saved copy go
             # through the display rewrite (named index constants instead of

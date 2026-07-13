@@ -486,8 +486,14 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         """Fresh, attribute-free copy of a callee expression. Other
         transformers hang ``parent`` backlinks on nodes, which would make a
         ``deepcopy`` drag the entire module tree along — rebuilding from
-        source sidesteps that."""
-        return cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
+        source sidesteps that. The reparse stamps ``lineno=1`` on every node;
+        those must be overwritten with the original callee's location, or the
+        lazy-resolve branch emits line-1 line events mid-statement (double
+        breakpoint hits and derailed step-over on the first bar)."""
+        copy = cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
+        for node in ast.walk(copy):
+            ast.copy_location(node, func)
+        return copy
 
     @staticmethod
     def _slot_ref(param: str, slot: int) -> ast.Subscript:

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import ast
 
+from pynecore.transformers.locations import fix_locations
+
 __all__ = ['ScriptRequirementsTransformer']
 
 # Flag names on ScriptRequirements — kept in sync with the dataclass in
@@ -159,7 +161,7 @@ class ScriptRequirementsTransformer(ast.NodeTransformer):
         if self._strategy_decorator is None:
             return node
         self._inject_requirements(node, self._strategy_decorator)
-        ast.fix_missing_locations(node)
+        fix_locations(node)
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
