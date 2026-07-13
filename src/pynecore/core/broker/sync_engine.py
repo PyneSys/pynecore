@@ -28,6 +28,7 @@ import dataclasses
 import itertools
 import logging
 import queue
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
@@ -92,6 +93,7 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
     PendingDefensiveClose,
+    QuarantineEnteredEvent,
     format_intent_key,
 )
 from pynecore.core.broker.native_failsafe_manager import (
@@ -325,6 +327,19 @@ class _PartialBracketModifyDeferred(Exception):
     """
 
 
+class _QuarantineModifyDeferred(Exception):
+    """Internal control-flow signal raised by :meth:`OrderSyncEngine._dispatch_modify`
+    when the quarantine latch blocks an entry amend.
+
+    The old working order is still live at the broker, so the caller must
+    keep ``_active_intents[key]`` pointing at the OLD intent — an
+    :class:`OrderSkippedByPlugin` here would pop the slot and desync the
+    engine from a resting order that was never cancelled.
+
+    Module-private — never propagates outside :mod:`sync_engine`.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class _EngineTriggerLegSpec:
     """Per-leg spec produced by :meth:`OrderSyncEngine._enumerate_engine_trigger_legs`.
@@ -477,7 +492,10 @@ class OrderSyncEngine:
         # unchanged. Constructed unconditionally (same store-only ctor as the
         # sibling engines); its persist-first ledger + ``restart_replay`` own the
         # per-leg close / bracket crash-safety.
-        self._one_way_emulator = OneWayEmulator(store_ctx=store_ctx)
+        self._one_way_emulator = OneWayEmulator(
+            store_ctx=store_ctx,
+            block_exposure_reopens=lambda: self._quarantined,
+        )
         # Set on the first ``sync`` (deferred like ``_restart_entry_scan_done``):
         # ``OneWayEmulator.restart_replay`` is async and needs live broker reads
         # via the port, so unlike the sync sibling replays it cannot run inline
@@ -775,6 +793,28 @@ class OrderSyncEngine:
         self._halted_reason: str | None = None
         self._halted_intent_key: str | None = None
         self._halted_context: dict = {}
+
+        # Quarantine latch. Unlike the halt above, quarantine stops TRADING
+        # without stopping the BOT: entry dispatch (new orders and entry
+        # amends) is blocked, while event ingestion, reconcile, protective
+        # exits, cancels and closes keep running — the process stays a live
+        # observer of its open exposure instead of dying on a live market.
+        # Latched via :meth:`record_quarantine` (idempotent, emits one
+        # :class:`QuarantineEnteredEvent`); never cleared in-process — the
+        # operator resolves the cause and restarts the strategy.
+        self._quarantined: bool = False
+        self._quarantine_reason: str | None = None
+        self._quarantine_context: dict = {}
+        # Serializes the latch transition (record_quarantine runs on the
+        # broker event-loop thread, the gates read on the main thread):
+        # check-and-set under the lock keeps the latch + its one event
+        # emission exactly-once, and reason/context are populated BEFORE
+        # the flag flips so a gate that observes ``_quarantined`` never
+        # reads half-initialized latch state.
+        self._quarantine_lock = threading.Lock()
+        # Intent keys whose blocked dispatch was already logged, so a
+        # re-emitted signal or a retried modify logs once, not every sync.
+        self._quarantine_blocked_logged: set[str] = set()
 
         # Cross-restart recovery anchors. The state store persists envelope
         # identity and parked-verification entries; replay rebuilds these
@@ -1095,6 +1135,56 @@ class OrderSyncEngine:
     def halted(self) -> bool:
         """``True`` once :meth:`_record_halt` has latched a manual-intervention halt."""
         return self._halted
+
+    @property
+    def quarantined(self) -> bool:
+        """``True`` once :meth:`record_quarantine` has latched the quarantine."""
+        return self._quarantined
+
+    def record_quarantine(
+            self,
+            reason: str,
+            context: dict | None = None,
+            *,
+            intent_key: str | None = None,
+    ) -> None:
+        """Latch the quarantine state and emit the operator event.
+
+        Idempotent — the first call latches and emits one
+        :class:`QuarantineEnteredEvent`; later calls are no-ops. After
+        this, :meth:`sync` keeps running (ingestion, reconcile, exits,
+        cancels and closes all flow) but new entry orders and entry
+        amends are blocked until the operator restarts the strategy —
+        the engine never leaves quarantine on its own.
+
+        Thread-safe: callable from the broker event-loop thread (it is
+        the target the runner wires into the plugin's ``quarantine_sink``),
+        while the dispatch gates read the latch on the main thread. The
+        check-and-set runs under a lock so concurrent callers latch (and
+        emit the event) exactly once, and reason/context are populated
+        BEFORE the flag flips. The blocking boundary is admission-time: a
+        dispatch that already passed its gate when the latch flipped is
+        allowed to complete (its exposure predates the intervention); no
+        exposure dispatch is admitted after the latch is observable.
+        """
+        with self._quarantine_lock:
+            if self._quarantined:
+                return
+            self._quarantine_reason = reason
+            self._quarantine_context = dict(context or {})
+            self._quarantined = True
+        _blog_error(
+            "sync engine quarantined: %s (intent_key=%s, context=%r) — "
+            "trading stopped, process stays alive; entry dispatch is "
+            "blocked while ingestion/cancel/close keep running. Operator "
+            "restart required to resume.",
+            reason, format_intent_key(intent_key), context,
+        )
+        self._emit_broker_event(QuarantineEnteredEvent(
+            reason=reason,
+            intent_key=intent_key,
+            context=dict(context or {}),
+        ))
 
     def raise_if_halted(self) -> None:
         """Re-raise the latched halt as :class:`BrokerManualInterventionError`.
@@ -6116,6 +6206,28 @@ class OrderSyncEngine:
         watch = self._entry_stop_engine.get_watch(pine_id)
         if watch is None:
             return
+        # Quarantine gate: the stop-fired MARKET is a new-exposure dispatch
+        # that bypasses ``_dispatch_new`` (it POSTs ``execute_entry``
+        # directly), so it needs its own gate. The preceding LIMIT cancel is
+        # risk-reducing and has already run — the OCO is committed to the
+        # stop side with no safe leg left, so the watch is terminalised and
+        # no position opens. The signal is dropped, not queued — an operator
+        # restart must not fire a market from a cross that happened during
+        # the quarantine. A fresh cross is still ``cancel_pending`` →
+        # ``mark_aborted``; a restart/retry re-entry is already
+        # ``stop_market_pending`` (the market coid persisted, a prior POST
+        # may or may not have landed) → ``mark_stop_won`` stops the retry;
+        # if that earlier POST did land, its fill still books normally.
+        if self._quarantined:
+            _blog_warning(
+                "entry-stop %r stop-fired market blocked by quarantine "
+                "(%s); no position opened",
+                pine_id, self._quarantine_reason,
+            )
+            if self._entry_stop_engine.mark_aborted(
+                    pine_id, reason='quarantine_blocked_market') is None:
+                self._entry_stop_engine.mark_stop_won(pine_id)
+            return
         active = self._active_intents.get(pine_id)
         if isinstance(active, EntryIntent):
             base = active
@@ -8293,6 +8405,14 @@ class OrderSyncEngine:
                     # ``intent`` here would make Pine == active and the retry
                     # would never run.
                     continue
+                except _QuarantineModifyDeferred:
+                    # Entry amend blocked by the quarantine latch — no broker
+                    # call was made and the old working order is still
+                    # resting. Keep the OLD intent active so the engine stays
+                    # in sync with the broker-side order; quarantine only
+                    # lifts on an operator restart, so there is nothing to
+                    # retry in-process.
+                    continue
                 except OrderDispositionUnknownError:
                     # Native-to-engine partial-bracket conversion path
                     # surfaces a timed-out strict cancel here. Leaving the
@@ -8708,6 +8828,33 @@ class OrderSyncEngine:
         )
 
     def _dispatch_new(self, intent: Intent) -> None:
+        # Quarantine gate: new entries are exactly the "new or
+        # exposure-increasing dispatch" the quarantine invariant blocks.
+        # Runs BEFORE the envelope is built, so there is nothing to clean
+        # up; the drop semantics mirror the §2.6.7 block below — the Pine
+        # signal is valid for its emit bar only, so it is dropped, never
+        # queued for replay after the operator resumes. Exits, closes and
+        # cancels flow untouched: risk reduction stays available.
+        if self._quarantined and isinstance(intent, EntryIntent):
+            if intent.intent_key not in self._quarantine_blocked_logged:
+                self._quarantine_blocked_logged.add(intent.intent_key)
+                _blog_warning(
+                    "entry dispatch %s blocked by quarantine (%s); signal "
+                    "dropped, no broker call",
+                    intent, self._quarantine_reason,
+                )
+            raise OrderSkippedByPlugin(
+                f"Entry dispatch blocked by quarantine on {intent.symbol} "
+                f"(pine_id={intent.pine_id!r}); signal dropped, no broker "
+                f"call.",
+                intent_key=intent.intent_key,
+                reason="quarantine_blocked_entry",
+                context={
+                    'symbol': intent.symbol,
+                    'pine_id': intent.pine_id,
+                    'quarantine_reason': self._quarantine_reason,
+                },
+            )
         # MARKET stop-and-reverse fold (TV parity): TV sizes a reversing
         # market entry at first order processing as ``qty + |opposite
         # position|`` — the simulator mirrors that at its own bar-open
@@ -11492,6 +11639,25 @@ class OrderSyncEngine:
             self._store_ctx.upsert_order(position_coid, extras=extras)
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
+        # Quarantine gate for entry amends: ``modify_entry`` goes straight
+        # to the broker and an amend can raise qty / move the level — an
+        # exposure-increasing dispatch the quarantine invariant blocks.
+        # The old working order stays live at the broker, so signal the
+        # caller to keep ``_active_intents`` pointing at the OLD intent
+        # (an ``OrderSkippedByPlugin`` would pop the slot and desync the
+        # engine from the still-resting order). Exit / close / cancel
+        # modifies flow untouched: risk management stays available.
+        if self._quarantined and isinstance(new, EntryIntent):
+            if new.intent_key not in self._quarantine_blocked_logged:
+                self._quarantine_blocked_logged.add(new.intent_key)
+                _blog_warning(
+                    "entry modify %s -> %s blocked by quarantine (%s); the "
+                    "resting order is left unchanged",
+                    old, new, self._quarantine_reason,
+                )
+            raise _QuarantineModifyDeferred(
+                "entry modify blocked by quarantine"
+            )
         # Engine-trigger partial bracket exits never reach the broker —
         # the leg rows are engine-internal. A modify must therefore
         # cancel the prior legs through the state machine and re-emit

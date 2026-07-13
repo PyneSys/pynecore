@@ -51,6 +51,7 @@ __all__ = [
     'LegRepairFailedEvent',
     'BracketReconstructedEvent',
     'ManualInterventionRequiredEvent',
+    'QuarantineEnteredEvent',
     'ProtectionDegradedEvent',
     'NativeFailsafeStateTransitionEvent',
     'PartialBracketBlockedDegradedFailsafeEvent',
@@ -1319,6 +1320,22 @@ class ManualInterventionRequiredEvent(BrokerEvent):
     needing to reach into plugin internals. After this event fires the
     engine is halted — all subsequent :meth:`sync` calls return early until
     the strategy is restarted.
+    """
+    reason: str
+    intent_key: str | None = None
+    context: dict | None = None
+
+
+@dataclass
+class QuarantineEnteredEvent(BrokerEvent):
+    """Emitted once when the sync engine latches its quarantine state.
+
+    Quarantine stops trading without stopping the bot: new and
+    exposure-increasing dispatches (entry orders, entry amends) are
+    blocked, while event ingestion, protective exits, cancels and closes
+    keep working — the process stays a live observer of its open
+    exposure. The operator resolves the underlying cause and restarts the
+    strategy; the engine never leaves quarantine on its own.
     """
     reason: str
     intent_key: str | None = None

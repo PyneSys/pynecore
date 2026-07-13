@@ -394,6 +394,112 @@ def __test_stop_and_cancel_requires_sweep_hook__(tmp_path: Path) -> None:
             _make_tracker(ctx, policy='bogus')
 
 
+def __test_policy_stop_with_quarantine_hook_does_not_halt__(
+        tmp_path: Path,
+) -> None:
+    """With the quarantine hook wired, ``stop`` latches quarantine and the
+    observation loop survives — the process-exiting halt is never armed."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        latched: list[tuple[str, dict]] = []
+        tracker = _make_tracker(
+            ctx, policy='stop',
+            request_quarantine=lambda r, c: latched.append((r, c)),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['cancelled']
+        assert tracker.pending_halt is None
+        assert len(latched) == 1
+        reason, context = latched[0]
+        assert "c1" in reason
+        assert context['policy'] == 'stop'
+        assert context['client_order_id'] == "c1"
+        row = ctx.get_order("c1")
+        assert row is not None and row.state == 'rejected'
+        assert len(_read_events(ctx, 'unexpected_cancel_quarantine')) == 1
+        # The stream stays usable: a later pass neither raises nor
+        # re-fires the already-latched quarantine for the retired row.
+        assert _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0)) == []
+        assert len(latched) == 1
+
+
+def __test_policy_halt_raises_process_exit_signal__(tmp_path: Path) -> None:
+    """The explicit ``halt`` policy keeps the process-exiting behavior:
+    dual signal first, then the raise."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        latched: list[tuple[str, dict]] = []
+        tracker = _make_tracker(
+            ctx, policy='halt',
+            request_quarantine=lambda reason, context: latched.append(
+                (reason, context)),
+        )
+
+        async def scenario() -> None:
+            gen = tracker.observe({'working': set()}, T_EXPIRED)
+            event = await anext(gen)
+            assert event.event_type == 'cancelled'
+            with pytest.raises(UnexpectedCancelError):
+                await anext(gen)
+
+        _run(scenario())
+        # ``halt`` never touches the quarantine hook, even when wired.
+        assert latched == []
+        assert len(_read_events(ctx, 'unexpected_cancel_quarantine')) == 0
+
+
+def __test_quarantine_hook_failure_falls_back_to_halt__(
+        tmp_path: Path,
+) -> None:
+    """A raising quarantine hook must fail-safe into the halt, never
+    fail-open into continued trading."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+
+        def _boom(_reason: str, _context: dict) -> None:
+            raise RuntimeError("latch wiring broken")
+
+        tracker = _make_tracker(ctx, policy='stop', request_quarantine=_boom)
+
+        async def scenario() -> None:
+            gen = tracker.observe({'working': set()}, T_EXPIRED)
+            event = await anext(gen)
+            assert event.event_type == 'cancelled'
+            with pytest.raises(UnexpectedCancelError):
+                await anext(gen)
+
+        _run(scenario())
+        assert len(_read_events(ctx, 'unexpected_cancel_quarantine')) == 0
+
+
+def __test_policy_stop_and_cancel_quarantines_and_sweeps__(
+        tmp_path: Path,
+) -> None:
+    """``stop_and_cancel`` with the hook wired: quarantine latched, sweep
+    still runs, no halt."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        latched: list[str] = []
+        swept: list[str] = []
+
+        async def _sweep(row: OrderRow) -> None:
+            swept.append(row.client_order_id)
+
+        tracker = _make_tracker(
+            ctx, policy='stop_and_cancel', cancel_siblings=_sweep,
+            request_quarantine=lambda reason, _context: latched.append(reason),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['cancelled']
+        assert tracker.pending_halt is None
+        assert len(latched) == 1
+        assert swept == ["c1"]
+
+
 # === Confirmation with discovered fills =====================================
 
 def __test_confirm_filled_books_slice_and_clears_stamp__(tmp_path: Path) -> None:
@@ -507,6 +613,47 @@ def __test_confirm_closed_retires_row_and_siblings_without_event__(
         assert sibling is not None and sibling.closed_ts_ms is not None
         retired = _read_events(ctx, 'reconcile_filled_then_closed_retired')
         assert len(retired) == 1
+
+
+def __test_terminal_resolution_registers_execution_ids_without_fill__(
+        tmp_path: Path,
+) -> None:
+    """CLOSED / CANCELLED register their backing execution ids even when
+    no fresh fill slice was booked: the retirement was concluded FROM
+    that evidence, so a replayed push copy must already be suppressed."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=1.0,
+                  extras={MISSING_PENDING_EXTRA: T0, 'position_id': 'P1'})
+        _seed_row(ctx, "c2", eoid="D2",
+                  extras={MISSING_PENDING_EXTRA: T0})
+        registered: list[tuple[str, tuple[str, ...]]] = []
+
+        async def _confirm(row: OrderRow) -> MissingConfirmation:
+            if row.client_order_id == "c1":
+                # Fully-filled position closed externally: the closing
+                # deals prove the closure but book no new quantity.
+                return MissingConfirmation(
+                    MissingResolution.CLOSED, position_ref='P1',
+                    execution_ids=('DEAL-CLOSE-1', 'DEAL-CLOSE-2'),
+                )
+            # Zero-fill order cancelled: evidence ids, nothing to book.
+            return MissingConfirmation(
+                MissingResolution.CANCELLED,
+                execution_ids=('DEAL-CXL-1',),
+            )
+
+        tracker = _make_tracker(
+            ctx, policy='ignore', confirm=_confirm,
+            register_executions=lambda row, ids: registered.append(
+                (row.client_order_id, ids)),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['cancelled']
+        assert sorted(registered) == [
+            ("c1", ('DEAL-CLOSE-1', 'DEAL-CLOSE-2')),
+            ("c2", ('DEAL-CXL-1',)),
+        ]
 
 
 def __test_partial_fill_then_cancel_preserves_slice_atomically__(

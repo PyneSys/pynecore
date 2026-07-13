@@ -674,6 +674,18 @@ class ScriptRunner:
                 cast('OrderSyncEngine', self._order_sync_engine).enqueue_native_bracket_observed
             )
 
+            # Quarantine latch for the disappearance tracking's ``stop`` /
+            # ``stop_and_cancel`` policies: trading stops but the process
+            # (and the plugin's event stream) stays alive. Wired
+            # unconditionally, like the observed sink above — the engine
+            # latch is idempotent and thread-safe from the broker
+            # event-loop thread; plugins without disappearance tracking
+            # simply never call it. Without this wiring the tracker falls
+            # back to the process-exiting halt.
+            broker_plugin.quarantine_sink = (
+                cast('OrderSyncEngine', self._order_sync_engine).record_quarantine
+            )
+
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run

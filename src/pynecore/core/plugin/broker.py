@@ -252,13 +252,15 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     """
     Policy for bot-owned orders that disappear without the bot cancelling them.
 
-    One of ``"stop"`` (graceful stop, default), ``"stop_and_cancel"``
-    (stop + cancel remaining bot orders), ``"re_place"`` (auto-replace
-    protective orders), or ``"ignore"`` (continue).  The class-level
-    default is the graceful-stop fallback used by test paths that
-    construct plugins without the CLI.  In production the value comes
-    from the cross-broker ``workdir/config/brokers.toml`` via
-    :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
+    One of ``"stop"`` (quarantine: trading stops, the process stays
+    alive as a live observer — default), ``"stop_and_cancel"``
+    (quarantine + cancel remaining bot orders), ``"re_place"``
+    (auto-replace protective orders), ``"ignore"`` (continue), or
+    ``"halt"`` (exit the process via the graceful manual-intervention
+    path).  The class-level default is the quarantining fallback used by
+    test paths that construct plugins without the CLI.  In production
+    the value comes from the cross-broker ``workdir/config/brokers.toml``
+    via :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
     ``pyne run --broker`` entry point loads it once and assigns it as
     an instance attribute on the plugin before the script runner
     starts.  The policy is broker-agnostic by design, so plugins do
@@ -331,6 +333,25 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
 
     Signature: ``sink(parent_entry_dispatch_ref, *, stop_level, profit_level,
     trailing_stop)`` — pass ``None`` for fields the broker is not carrying.
+    """
+
+    quarantine_sink: Callable[..., None] | None = None
+    """Optional quarantine latch into the Order Sync Engine.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` wires this to
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.record_quarantine`.
+    The plugin's disappearance tracking (typically a
+    :class:`~pynecore.core.broker.disappearance.DisappearanceTracker`
+    constructed with this as its ``request_quarantine`` hook) calls it when
+    the ``stop`` / ``stop_and_cancel`` policy fires: trading stops (the
+    engine blocks new entry dispatch and entry amends) while the process —
+    including the plugin's own event stream — keeps running, so the bot
+    stays a live observer of its open exposure instead of dying on a live
+    market. ``None`` when the runner has not wired it (state-only test
+    paths); the tracker then falls back to the process-exiting halt, which
+    is fail-safe, never fail-open.
+
+    Signature: ``sink(reason: str, context: dict | None = None)``.
     """
 
     position_port: 'PositionPort | None' = None

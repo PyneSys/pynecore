@@ -91,6 +91,8 @@ from pynecore.core.broker.store_helpers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.plugin.broker import PositionPort
 
@@ -171,8 +173,19 @@ class OneWayEmulator:
     emulating plugin exposes.
     """
 
-    def __init__(self, store_ctx: 'RunContext | None') -> None:
+    def __init__(
+            self,
+            store_ctx: 'RunContext | None',
+            *,
+            block_exposure_reopens: 'Callable[[], bool] | None' = None,
+    ) -> None:
         self._store_ctx = store_ctx
+        #: Engine-supplied gate consulted before a residual-open re-dispatch
+        #: (the reversal reopen leg). Wired to the engine's quarantine latch:
+        #: under quarantine the owed FIFO closes still run (risk-reducing)
+        #: but the reopen is withheld and its breadcrumb stays live, so the
+        #: committed reversal finishes after the operator restart.
+        self._block_exposure_reopens = block_exposure_reopens
 
     # === Close fan-out ====================================================
 
@@ -961,6 +974,18 @@ class OneWayEmulator:
                 intent_key=row.intent_key or row.pine_entry_id or '',
                 pine_id=row.pine_entry_id or '', parent_coid=parent_coid, port=port,
             )
+        # Quarantine gate: the reopen leg is a new-exposure dispatch. The
+        # owed FIFO closes above still ran (risk-reducing), but the reopen
+        # is withheld and the breadcrumb stays live — the committed
+        # reversal finishes on the replay after the operator restart.
+        if (self._block_exposure_reopens is not None
+                and self._block_exposure_reopens()):
+            _blog_warning(
+                "one-way residual reopen %r withheld by quarantine; "
+                "breadcrumb stays pending until the operator restart",
+                row.client_order_id,
+            )
+            return
         # Rebuild the intent with the ORIGINAL dispatch's coid kind: a
         # stop-fired reversal's residual went out under ``KIND_ENTRY_STOP``
         # (the plugin picks the kind from ``stop_fired_market``), so the

@@ -30,6 +30,7 @@ VALID_UNEXPECTED_CANCEL_POLICIES = frozenset({
     "stop_and_cancel",
     "re_place",
     "ignore",
+    "halt",
 })
 
 
@@ -46,14 +47,18 @@ class BrokerDefaults:
     on_unexpected_cancel: str = "stop"
     """Policy when a bot-owned order disappears without the bot cancelling it.
 
-    ``"stop"`` (default) — graceful stop; surfaced to the runner via the
-    event sink so observability can page.
-    ``"stop_and_cancel"`` — stop plus a best-effort cancel pass over the
-    remaining bot-owned orders.
+    ``"stop"`` (default) — quarantine: trading stops (no new or
+    exposure-increasing dispatch) but the process stays alive — event
+    ingestion, cancels and closes keep working and observability can
+    page. Resumed by an operator restart.
+    ``"stop_and_cancel"`` — quarantine plus a best-effort cancel pass
+    over the remaining bot-owned orders.
     ``"re_place"`` — no-op on the cancel; the sync engine re-dispatches
     the protective order on the next diff cycle.
     ``"ignore"`` — silently continue. Only safe when manual external
     cancellations are an expected part of the operational workflow.
+    ``"halt"`` — exit the process via the graceful manual-intervention
+    path, leaving any remaining orders unsupervised until restart.
     """
 
 

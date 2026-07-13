@@ -9,6 +9,7 @@ A stubbed :attr:`lib._script.initial_capital` keeps
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -51,6 +52,7 @@ from pynecore.core.broker.models import (
     LegType,
     InterceptorResult,
     PositionLeg,
+    QuarantineEnteredEvent,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.lib.strategy import (
@@ -6174,3 +6176,116 @@ def __test_limit_reversal_dispatch_is_not_folded_again__():
 
     assert len(b.entry_calls) == 1
     assert b.entry_calls[0].intent.qty == 3.0
+
+
+# === Quarantine ===
+
+
+def __test_quarantine_blocks_new_entry_but_sync_keeps_running__():
+    """Quarantine drops new entry dispatch while ``sync`` itself keeps
+    running — the process stays alive, unlike the halt latch."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    engine.record_quarantine("external cancel detected")
+    assert engine.quarantined is True
+    assert engine.halted is False
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)  # must not raise
+
+    assert b.entry_calls == []
+    assert "L" not in engine.active_intents
+    assert "L" not in engine.order_mapping
+    # The signal is dropped, not queued: a later sync of the same signal
+    # is blocked again without any broker call.
+    engine.sync(BAR_TS)
+    assert b.entry_calls == []
+
+
+def __test_quarantine_allows_exit_close_and_cancel__():
+    """Risk-reducing dispatch flows under quarantine: protective exits,
+    closes and cancels all reach the broker."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # A resting entry placed BEFORE the quarantine.
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    engine.record_quarantine("external cancel detected")
+
+    # Protective exit for an open trade dispatches.
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 1.0))
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    # Cancelling the resting entry dispatches too (risk-reducing).
+    del pos.entry_orders["L"]
+    engine.sync(BAR_TS)
+    assert len(b.cancel_calls) == 1
+
+
+def __test_quarantine_blocks_entry_modify_and_keeps_old_intent__():
+    """An entry amend under quarantine makes no broker call and keeps the
+    OLD intent active, staying in sync with the still-resting order."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    engine.record_quarantine("external cancel detected")
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
+    engine.sync(BAR_TS)
+
+    assert b.modify_entry_calls == []
+    assert engine.active_intents["L"].limit == 50_000.0
+
+
+def __test_record_quarantine_is_idempotent_and_emits_once__():
+    """The latch emits exactly one ``QuarantineEnteredEvent``."""
+    b = MockBroker()
+    events: list[BrokerEvent] = []
+    engine, _pos = _mk_engine_with_sink(b, events)
+    engine.record_quarantine("first reason", {'origin': 'test'})
+    engine.record_quarantine("second reason")
+
+    entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
+    assert len(entered) == 1
+    assert entered[0].reason == "first reason"
+    assert entered[0].context == {'origin': 'test'}
+    assert engine.quarantined is True
+
+
+def __test_record_quarantine_concurrent_callers_latch_once__():
+    """Concurrent latch attempts (the sink is called from the broker
+    event-loop thread while the main thread reads the gates) latch and emit
+    exactly once, and the winner's reason/context are internally consistent."""
+    b = MockBroker()
+    events: list[BrokerEvent] = []
+    engine, _pos = _mk_engine_with_sink(b, events)
+    n = 8
+    barrier = threading.Barrier(n)
+
+    def _caller(i: int) -> None:
+        barrier.wait()
+        engine.record_quarantine(f"reason-{i}", {'origin': i})
+
+    threads = [threading.Thread(target=_caller, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
+    assert len(entered) == 1
+    assert engine.quarantined is True
+    # The emitted event carries the SAME winner's reason/context the latch
+    # holds — never a mix of two callers.
+    winner = entered[0].reason.removeprefix("reason-")
+    assert entered[0].context == {'origin': int(winner)}

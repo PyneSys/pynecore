@@ -46,7 +46,14 @@ that core:
   close AND yielded as a synthesised ``cancelled`` :class:`OrderEvent`
   (the engine's router cleans its tracking — essential under the
   non-halting policies), while the configured ``on_unexpected_cancel``
-  policy separately decides whether the bot also halts. Persistence and
+  policy separately decides the operational reaction. ``stop`` /
+  ``stop_and_cancel`` QUARANTINE through the ``request_quarantine`` hook:
+  trading stops (the engine blocks new / exposure-increasing dispatch)
+  but the process — and this tracker's ingestion loop — stays alive;
+  raising here instead would tear down the very event stream the
+  quarantine invariant requires to keep running. Only the explicit
+  ``halt`` policy (or a quarantining policy with no hook wired — the
+  fail-safe fallback) arms the process-exiting halt. Persistence and
   policy application run BEFORE the event is yielded, so neither depends
   on the consumer pulling another element from the generator; a pending
   halt survives an abandoned generator and re-raises on the next
@@ -100,7 +107,9 @@ logger = logging.getLogger(__name__)
 MISSING_PENDING_EXTRA = 'missing_pending_since'
 
 #: Valid ``on_unexpected_cancel`` policies (see ``BrokerDefaults``).
-UNEXPECTED_CANCEL_POLICIES = ('stop', 'stop_and_cancel', 're_place', 'ignore')
+UNEXPECTED_CANCEL_POLICIES = (
+    'stop', 'stop_and_cancel', 're_place', 'ignore', 'halt',
+)
 
 #: Float comparison slack for fill quantities, matching the reconcile
 #: paths in the reference plugins.
@@ -164,8 +173,9 @@ class MissingConfirmation:
     :ivar fill_fee: Summed commission of the discovered executions.
     :ivar execution_ids: Venue execution/deal ids backing the evidence.
         Passed to the ``register_executions`` hook after a fill slice was
-        actually booked, so the plugin can seed its duplicate-fill channel;
-        a lone id is also stamped as the fill event's ``fill_id``.
+        actually booked or the row was retired on a terminal resolution,
+        so the plugin can seed its duplicate-fill channel; a lone id is
+        also stamped as the fill event's ``fill_id``.
     :ivar position_ref: Venue position id the fill belongs to. Selects
         the ``working_promoted_position`` audit reason and scopes the
         sibling retirement on :data:`MissingResolution.CLOSED`.
@@ -218,15 +228,22 @@ class DisappearanceTracker:
     :param cancel_siblings: Async best-effort cancel sweep over the
         origin row's sibling orders; required by (and only used for) the
         ``stop_and_cancel`` policy. Best-effort — a raising sweep is
-        logged and does not swallow the armed halt.
+        logged and does not swallow the armed quarantine / halt.
+    :param request_quarantine: Sink that latches the engine's quarantine
+        state (``(reason, context)``); the runner wires it to
+        ``OrderSyncEngine.record_quarantine``. Used by the ``stop`` and
+        ``stop_and_cancel`` policies. When it is missing (or raises),
+        those policies fall back to arming the process-exiting halt —
+        fail-safe, never fail-open into continued trading.
     :param sibling_coids: Maps a :data:`MissingResolution.CLOSED` row to
         the client-order-ids of live sibling rows sharing its position
         (a netting account merges pyramid entries onto one position id);
         they are retired in the same transaction.
     :param register_executions: Called with the confirmation's
-        ``execution_ids`` after a fill slice was actually booked, so the
-        plugin can seed its duplicate-fill channel before any replayed
-        push event. A raising hook is logged, not propagated.
+        ``execution_ids`` after a fill slice was actually booked or the
+        row was retired on a terminal resolution, so the plugin can seed
+        its duplicate-fill channel before any replayed push event. A
+        raising hook is logged, not propagated.
     :param cancelled_event_factory: Overrides the synthesised
         ``cancelled`` event construction (venues that key the event on
         something other than ``row.exchange_order_id``). The default
@@ -248,6 +265,7 @@ class DisappearanceTracker:
             confirm_missing: Callable[['OrderRow'], Awaitable[MissingConfirmation]],
             is_exempt: Callable[['OrderRow'], bool] | None = None,
             cancel_siblings: Callable[['OrderRow'], Awaitable[None]] | None = None,
+            request_quarantine: Callable[[str, dict[str, Any]], None] | None = None,
             sibling_coids: Callable[
                 ['OrderRow', MissingConfirmation], Iterable[str]] | None = None,
             register_executions: Callable[
@@ -275,6 +293,7 @@ class DisappearanceTracker:
         self._confirm_missing = confirm_missing
         self._is_exempt = is_exempt
         self._cancel_siblings = cancel_siblings
+        self._request_quarantine = request_quarantine
         self._sibling_coids = sibling_coids
         self._register_executions = register_executions
         self._cancelled_event_factory = cancelled_event_factory
@@ -332,20 +351,7 @@ class DisappearanceTracker:
         if halt is not None:
             raise halt
 
-        live_coids: set[str] = set()
-        for row in list(self._store.iter_live_orders()):
-            live_coids.add(row.client_order_id)
-            if self._is_exempt is not None and self._is_exempt(row):
-                continue
-            self._observe_presence(row, present, now_ts)
-
-        # Drop throttle keys for rows that went terminal via another path
-        # (a PUSH event) and left the live set without reaching a resolve —
-        # else the in-memory set grows unbounded on a long-running instance.
-        if self._warned_deferred:
-            self._warned_deferred = {
-                k for k in self._warned_deferred if k[0] in live_coids
-            }
+        self.observe_presence(present, now_ts)
 
         for row in list(self._store.iter_live_orders()):
             if self._is_exempt is not None and self._is_exempt(row):
@@ -385,6 +391,35 @@ class DisappearanceTracker:
                 raise halt
 
     # --- Phase 1: stamp / clear against the present-sets --------------------
+
+    def observe_presence(
+            self,
+            present: Mapping[str, Set[str] | None],
+            now_ts: float,
+    ) -> None:
+        """Run phase 1 only: stamp / clear every tracked live row.
+
+        For venues whose snapshot-reconcile pass owns the presence diff
+        (stamping from inside the same walk that books fills) while a
+        separate later pass drives the grace protocol via
+        :meth:`observe`. :meth:`observe` runs this itself, so calling
+        both against the same snapshot is safe — stamp and clear are
+        idempotent per pass.
+        """
+        live_coids: set[str] = set()
+        for row in list(self._store.iter_live_orders()):
+            live_coids.add(row.client_order_id)
+            if self._is_exempt is not None and self._is_exempt(row):
+                continue
+            self._observe_presence(row, present, now_ts)
+
+        # Drop throttle keys for rows that went terminal via another path
+        # (a PUSH event) and left the live set without reaching a resolve —
+        # else the in-memory set grows unbounded on a long-running instance.
+        if self._warned_deferred:
+            self._warned_deferred = {
+                k for k in self._warned_deferred if k[0] in live_coids
+            }
 
     def _observe_presence(
             self,
@@ -462,11 +497,15 @@ class DisappearanceTracker:
         back, was re-stamped or reached a terminal state while the
         confirmation ran) or when a fill slice was deferred for lack of a
         price. ``register_ids`` is non-empty only when a fill slice was
-        actually booked — the plugin's dedup channel must not be seeded
-        for a slice that was never persisted. ``applied_row`` is the row
-        re-read *after* the fill slice was booked (``None`` on a dropped
-        or no-op outcome); the caller feeds it to the post-commit hooks so
-        a sweep never sees a stale pre-fill quantity.
+        actually booked OR the row reached a terminal resolution (CLOSED /
+        CANCELLED) in the same transaction — the retirement was concluded
+        FROM that execution evidence, so a replayed push copy of it must
+        already be suppressed. A deferred or dropped outcome never seeds
+        the dedup channel: the evidence may still need to book later.
+        ``applied_row`` is the row re-read *after* the fill slice was
+        booked (``None`` on a dropped or no-op outcome); the caller feeds
+        it to the post-commit hooks so a sweep never sees a stale pre-fill
+        quantity.
         """
         resolution = confirmation.resolution
         events: list[OrderEvent] = []
@@ -553,7 +592,12 @@ class DisappearanceTracker:
                 # Filled-then-closed: the exposure no longer exists, so no
                 # fill event is emitted for it (the engine's position
                 # reconcile owns the size side) — but any discovered fill
-                # progress was persisted above for bookkeeping.
+                # progress was persisted above for bookkeeping. The
+                # retirement is concluded FROM the confirmation's execution
+                # evidence, so its ids are registered even without a fresh
+                # booked slice — a replayed push copy of an already-counted
+                # deal must not resurface as a new fill after the retire.
+                register_ids = confirmation.execution_ids
                 DispatchJournal(self._store).apply_reconcile_outcome(
                     updated.client_order_id,
                     ReconcileOutcome(
@@ -565,6 +609,7 @@ class DisappearanceTracker:
                         audit_payload={
                             'position_ref': confirmation.position_ref,
                             'missing_since': since,
+                            'execution_ids': list(confirmation.execution_ids),
                         },
                         exchange_order_id=(confirmation.position_ref
                                            or updated.exchange_order_id),
@@ -577,6 +622,10 @@ class DisappearanceTracker:
                 return [], True, register_ids, updated
 
             if resolution is MissingResolution.CANCELLED:
+                # Terminal like CLOSED above: register the backing ids so
+                # a replayed copy of the evidence cannot re-book after the
+                # retire.
+                register_ids = confirmation.execution_ids
                 DispatchJournal(self._store).apply_reconcile_outcome(
                     updated.client_order_id,
                     ReconcileOutcome(
@@ -690,12 +739,16 @@ class DisappearanceTracker:
         """Apply the ``on_unexpected_cancel`` policy for a confirmed cancel.
 
         Runs BEFORE the cancelled event is yielded: the sweep and the
-        halt decision must not depend on the consumer pulling further
-        elements. A halting policy *arms* :attr:`pending_halt` here BEFORE
-        the best-effort sweep, so a raising sweep can never swallow the
-        manual-intervention signal; the raise itself happens after the
-        row's events were yielded (or at the top of the next pass, when
-        the generator was abandoned).
+        quarantine / halt decision must not depend on the consumer pulling
+        further elements. ``stop`` and ``stop_and_cancel`` latch the
+        engine's quarantine through the ``request_quarantine`` hook — the
+        process (and this observation loop) keeps running; a missing or
+        raising hook falls back to arming the halt, never to continued
+        trading. ``halt`` always arms :attr:`pending_halt`. Either signal
+        is armed BEFORE the best-effort sweep, so a raising sweep can
+        never swallow it; a pending halt is raised after the row's events
+        were yielded (or at the top of the next pass, when the generator
+        was abandoned).
         """
         if self._policy == 'ignore':
             self._store.log_event(
@@ -711,25 +764,47 @@ class DisappearanceTracker:
                 exchange_order_id=row.exchange_order_id,
             )
             return
-        # Halting policy ('stop' / 'stop_and_cancel'): arm the halt first.
-        self._pending_halt = UnexpectedCancelError(
+        reason = (
             f"Bot-owned order disappeared unexpectedly: "
             f"coid={row.client_order_id!r} "
-            f"ref={row.exchange_order_id!r}",
-            context={
-                'client_order_id': row.client_order_id,
-                'exchange_order_id': row.exchange_order_id,
-                'symbol': row.symbol,
-                'policy': self._policy,
-            },
+            f"ref={row.exchange_order_id!r}"
         )
+        context = {
+            'client_order_id': row.client_order_id,
+            'exchange_order_id': row.exchange_order_id,
+            'symbol': row.symbol,
+            'policy': self._policy,
+        }
+        quarantined = False
+        if (self._policy in ('stop', 'stop_and_cancel')
+                and self._request_quarantine is not None):
+            # noinspection PyBroadException
+            try:
+                self._request_quarantine(reason, context)
+            except Exception:
+                logger.exception(
+                    "request_quarantine hook failed for %r; falling back "
+                    "to the process-exiting halt", row.client_order_id,
+                )
+            else:
+                quarantined = True
+                self._store.log_event(
+                    'unexpected_cancel_quarantine',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                )
+        if not quarantined:
+            # 'halt', or a quarantining policy whose hook is missing /
+            # raised: arm the process-exiting manual-intervention signal.
+            self._pending_halt = UnexpectedCancelError(reason, context=context)
         if self._policy == 'stop_and_cancel' and self._cancel_siblings is not None:
             # noinspection PyBroadException
             try:
                 await self._cancel_siblings(row)
             except Exception:
                 logger.exception(
-                    "cancel_siblings sweep failed for %r; halt stays armed",
+                    "cancel_siblings sweep failed for %r; quarantine/halt "
+                    "stays armed",
                     row.client_order_id,
                 )
                 self._store.log_event(

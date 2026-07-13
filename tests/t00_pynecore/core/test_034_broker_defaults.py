@@ -53,22 +53,22 @@ def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
     ``policy not in {…}`` checks in :mod:`reconcile`, which is harder
     to diagnose than an explicit load-time error."""
     (tmp_path / 'brokers.toml').write_text(
-        'on_unexpected_cancel = "halt"\n',
+        'on_unexpected_cancel = "abort"\n',
         encoding='utf-8',
     )
     with pytest.raises(ValueError) as excinfo:
         load_broker_defaults(tmp_path)
     msg = str(excinfo.value)
     assert 'on_unexpected_cancel' in msg
-    assert "'halt'" in msg
+    assert "'abort'" in msg
 
 
 def __test_valid_policy_set_contents__() -> None:
-    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the four expected policies.
+    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the five expected policies.
 
     Guard against accidental drift between the validator's allow-set
-    and the four branches implemented in
-    :meth:`CapitalCom._maybe_raise_unexpected_cancel`."""
+    and the policy branches implemented in
+    :meth:`DisappearanceTracker._apply_policy`."""
     assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
-        'stop', 'stop_and_cancel', 're_place', 'ignore',
+        'stop', 'stop_and_cancel', 're_place', 'ignore', 'halt',
     })

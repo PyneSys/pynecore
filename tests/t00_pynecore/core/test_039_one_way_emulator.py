@@ -786,6 +786,31 @@ def __test_restart_replay_redispatches_residual_when_entry_absent__(tmp_path):
     store.close()
 
 
+def __test_replay_withholds_residual_reopen_under_quarantine__(tmp_path):
+    """Under quarantine the residual reopen is withheld (new exposure) while
+    the owed FIFO closes still run (risk-reducing), and the breadcrumb stays
+    live so the committed reversal finishes once the operator restart lifts
+    the quarantine."""
+    store, ctx = _make_store(tmp_path)
+    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    # A still-live opposing leg: the crash hit before the FIFO closes landed.
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0)])
+    quarantined = True
+    eng = OneWayEmulator(store_ctx=ctx,
+                         block_exposure_reopens=lambda: quarantined)
+    _run(eng.restart_replay(port))
+    assert _dispatched(port) == [("20", 1)]  # owed close still ran
+    assert port.placed == []                 # reopen withheld
+    assert len(list(iter_active_residual_opens(ctx))) == 1  # breadcrumb live
+    # The quarantine lifted (operator restart): the drain finishes the reopen.
+    quarantined = False
+    port2 = _FakePort([])
+    _run(eng.drain_residual_opens("EURUSD", port2))
+    assert port2.placed == [("EURUSD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
 def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
     """Restart replay only clears the breadcrumb when the residual entry row already exists."""
     # The residual entry row already exists (place_leg's persist-first write

@@ -125,18 +125,35 @@ detection, a manual close on the broker UI, a broker-side liquidation or a
 silent cancel is **never noticed** — the bot keeps trading against a
 position that no longer exists.
 
-The pattern (see `_reconcile_snapshot` + `_emit_unexpected_cancellations`
-in the Capital.com plugin):
+The venue-agnostic core of the job — the persisted stamp/clear/grace
+state machine, the grace-expiry confirmation protocol, the dual signal
+and the `on_unexpected_cancel` policy — lives in
+`pynecore.core.broker.disappearance.DisappearanceTracker`. Build one per
+plugin instance and feed it per-namespace presence sets; your venue
+knowledge enters through its hooks (see the Capital.com and cTrader
+plugins' `reconcile.py` for the two reference wirings — the simple
+snapshot-is-authoritative venue and the deal-history-re-verification
+venue respectively):
 
 1. Per poll (or per push-gap), snapshot **all** namespaces your venue
-   stores bot orders in (positions, working orders, activity history).
-2. Compare against what the plugin believes it owns.
-3. Apply a small **grace window** before declaring a disappearance, to
-   absorb in-flight races (an order that just filled and moved namespaces).
-4. Report through `watch_orders()`: either emit a synthesised
-   `cancelled` `OrderEvent` (the engine's router cleans its tracking) or
-   raise `UnexpectedCancelError`, according to the configured
-   `on_unexpected_cancel` policy.
+   stores bot orders in (positions, working orders, activity history)
+   and feed them to the tracker (`observe` / `observe_presence`). A
+   namespace whose fetch failed is reported as `None` — an incomplete
+   snapshot must never look like a complete absence.
+2. `tracked_refs` maps each live row to its `(namespace, ref)` set;
+   the tracker stamps a row whose refs all vanished and clears the
+   stamp the moment one reappears.
+3. Only a stamp older than the **grace window** triggers anything, and
+   even then your `confirm_missing` hook re-verifies first (deal
+   history, order-status probe) — never conclude a cancel from missing
+   evidence.
+4. The tracker reports through `watch_orders()` with a dual signal: a
+   synthesised `cancelled` `OrderEvent` (the engine's router cleans its
+   tracking) plus the configured `on_unexpected_cancel` policy — the
+   default `stop` / `stop_and_cancel` latch the engine's **quarantine**
+   (trading stops, the process stays alive; wire the runner-injected
+   `quarantine_sink` into the tracker's `request_quarantine`), while
+   `halt` raises `UnexpectedCancelError` for a process exit.
 
 ### 2. `OrderEvent.fill_qty` is INCREMENTAL; `fill_id` must be stable
 
@@ -344,8 +361,8 @@ borrows).
 - **Broker-agnostic policies do not belong in plugin configs.** The
   cross-broker `workdir/config/brokers.toml` (`BrokerDefaults`) owns them;
   today that is `on_unexpected_cancel` (`stop` / `stop_and_cancel` /
-  `re_place` / `ignore`), injected onto the plugin instance by the CLI
-  before the runner starts.
+  `re_place` / `ignore` / `halt`), injected onto the plugin instance by
+  the CLI before the runner starts.
 - Do not expose internal cadence/backoff constants as user config
   ("no internal tunables" policy) — keep them module constants.
 

@@ -204,6 +204,51 @@ def __test_stop_cross_confirmed_cancel_fires_market__():
     assert eng._entry_stop_engine.get_watch("Long") is None
 
 
+def __test_stop_cross_under_quarantine_cancels_limit_never_fires_market__():
+    """Under quarantine the stop-cross still cancels the native LIMIT
+    (risk-reducing) but the stop-fired MARKET — a new-exposure dispatch that
+    bypasses ``_dispatch_new`` — is blocked and the watch settles with no
+    position opened; a later tick must not re-fire it."""
+    broker = _FakeBroker(_caps(),
+                         cancel_outcome=CancelDispositionOutcome.CANCEL_CONFIRMED)
+    eng = _engine(broker)
+    _arm(eng, _both_set_entry())
+    broker.entries.clear()
+    eng.record_quarantine("external cancel detected")
+
+    eng._drive_entry_stop_triggers(last_price=1.185)
+
+    assert len(broker.cancel_outcome_calls) == 1  # LIMIT cancel still ran
+    assert broker.entries == []                   # no market dispatched
+    assert eng._entry_stop_engine.get_watch("Long") is None  # settled
+    eng._drive_entry_stop_triggers(last_price=1.19)
+    assert broker.entries == []                   # dropped, never re-fired
+
+
+def __test_market_pending_retry_under_quarantine_settles_without_post__():
+    """A ``stop_market_pending`` re-entry (restart / retry after an unknown
+    disposition — the market coid is already persisted) is settled by the
+    quarantine gate without a second POST; a prior landed POST's fill would
+    still book, but the retry loop ends."""
+    broker = _FakeBroker(_caps())
+    eng = _engine(broker)
+    intent = _both_set_entry()
+    envelope = _arm(eng, intent)
+    broker.entries.clear()
+    # Drive the watch to stop_market_pending exactly as the fire path does
+    # after a confirmed LIMIT cancel, without POSTing the market yet.
+    eng._entry_stop_engine.begin_cancel("Long")
+    eng._entry_stop_engine.confirm_limit_cancelled_fire_market(
+        "Long", market_coid=envelope.client_order_id(KIND_ENTRY_STOP),
+    )
+    eng.record_quarantine("external cancel detected")
+
+    eng._drive_entry_stop_triggers(last_price=None)  # price-independent state
+
+    assert broker.entries == []                       # no POST under quarantine
+    assert eng._entry_stop_engine.get_watch("Long") is None  # settled
+
+
 def __test_no_cross_keeps_watch_armed_and_no_market__():
     """A price below the stop level leaves the watch ARMED and fires no market."""
     broker = _FakeBroker(_caps())
