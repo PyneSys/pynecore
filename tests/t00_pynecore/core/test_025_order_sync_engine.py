@@ -6449,6 +6449,266 @@ def __test_short_gate_modify_qty_raise_halts__():
     assert len(b.modify_entry_calls) == 1
 
 
+def __test_short_gate_modify_replace_resets_fill_ledger__():
+    """F1 regression: ``modify_entry`` defaults to cancel + re-execute, so a
+    partial fill credited to the pre-amend order is stale once the amend
+    lands a FRESH working order. The short gate must reserve the replacement
+    in full again — a stale ledger value would under-reserve and pass an
+    oversell on a spot venue."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    # 1 of the resting 3 fills; the filled slice leaves ``_position.size``
+    # and the filled entry stays active as the sticky-order sentinel.
+    engine.on_order_event(_fill_event(
+        'sell', 1.0, 50_000.0, pine_id="S", event_type='partial',
+        filled_qty=1.0, remaining_qty=2.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 4.0
+
+    # Script amends "S" to a fresh resting sell of 4 (qty + price change ->
+    # a replace-style modify). 4 - 4 = 0: the amend itself passes.
+    pos.entry_orders["S"] = _order_order("S", -4.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert len(b.modify_entry_calls) == 1
+
+    # An added sell-1 must halt: the replacement "S" now works 4 units in
+    # full (ledger reseeded to 0), so 4 - 4 - 1 = -1. A stale filled=1 leak
+    # would reserve only 3 and let 5 working units oversell the inventory.
+    pos.entry_orders["G"] = _order_order("G", -1.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 120_000)
+    assert engine.halted is True
+    assert len(b.entry_calls) == 1
+
+
+def __test_short_gate_modify_late_old_order_fill_not_credited__():
+    """F3 regression: ``modify_entry`` defaults to cancel + re-execute. A fill
+    that was in flight on the cancelled order can arrive AFTER the replacement's
+    fill ledger was reset to zero. It is keyed only by ``pine_id``, so a naive
+    ledger bump would credit it to the replacement and shrink the short-gate
+    reservation below the replacement's true still-working qty — passing an
+    oversell. ``record_fill`` still applies the fill to the position (real
+    inventory moved); only the spurious ledger credit must be suppressed."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1  # order id xchg-1
+
+    # 1 of the resting 3 fills on the ORIGINAL order (xchg-1).
+    engine.on_order_event(_fill_event(
+        'sell', 1.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='partial', filled_qty=1.0, remaining_qty=2.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 4.0
+
+    # Script amends "S" (price change) -> replace-style modify lands a fresh
+    # resting sell of 3 under a NEW order id (xchg-2); the old xchg-1 is retired.
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert len(b.modify_entry_calls) == 1
+
+    # A straggling fill from the CANCELLED old order (xchg-1) arrives after the
+    # amend. It reduces inventory (5 -> 3 total sold) but must NOT be credited
+    # to the replacement's reset ledger.
+    engine.on_order_event(_fill_event(
+        'sell', 1.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=1.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+
+    # An added sell-1 must halt: the replacement "S" still works all 3 units
+    # (ledger correctly stayed 0), so 3 - 3 - 1 = -1. A leaked filled=1 credit
+    # would reserve only 2 and pass 3 - 2 - 1 = 0 — a 4-unit oversell of 3.
+    pos.entry_orders["G"] = _order_order("G", -1.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 120_000)
+    assert engine.halted is True
+    assert len(b.entry_calls) == 1
+
+
+def __test_short_gate_filled_sell_entry_not_double_reserved__():
+    """F2 regression: a FILLED sell entry stays in ``_active_intents`` (it is
+    the diff sentinel for the sticky Pine order) while ``record_fill`` already
+    moved its qty into ``_position.size`` — the gate must reserve only the
+    working residual, otherwise a legitimate later flatten is double-counted
+    into a false halt."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    engine.on_order_event(_fill_event('sell', 3.0, 50_000.0, pine_id="S"))
+    engine.apply_async_events()
+    assert pos.size == 2.0
+    # The filled intent deliberately stays active (sticky-order sentinel).
+    assert "S" in engine.active_intents
+
+    # Flatten the remainder: 2 - (3 - 3 filled) - 2 = 0 — must dispatch.
+    pos.entry_orders["F"] = _order_order("F", -2.0)
+    engine.sync(BAR_TS + 60_000)
+
+    assert engine.halted is False
+    assert len(b.entry_calls) == 2
+
+
+def __test_short_gate_partial_fill_reserves_working_residual__():
+    """A partially filled sell entry reserves only its still-working slice;
+    the filled slice already left ``_position.size`` via ``record_fill``."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    engine.on_order_event(_fill_event(
+        'sell', 1.0, 50_000.0, pine_id="S", event_type='partial',
+        filled_qty=1.0, remaining_qty=2.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 4.0
+
+    # 4 - (3 - 1 filled) - 2 = 0: passes.
+    pos.entry_orders["F"] = _order_order("F", -2.0)
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert len(b.entry_calls) == 2
+
+    # Both working residuals aggregate: 4 - 2 - 2 - 1 = -1 halts.
+    pos.entry_orders["G"] = _order_order("G", -1.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 120_000)
+    assert engine.halted is True
+    assert len(b.entry_calls) == 2
+
+
+def __test_short_gate_reused_pine_id_reseeds_fill_ledger__():
+    """A retired entry's fill ledger must not leak onto a NEW order reusing
+    the same ``pine_id`` — the fresh dispatch reseeds to zero, so the new
+    resting qty is reserved in full again."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    engine.on_order_event(_fill_event('sell', 3.0, 50_000.0, pine_id="S"))
+    engine.apply_async_events()
+    assert pos.size == 2.0
+
+    # Script drops the settled order -> the diff retires the slot.
+    del pos.entry_orders["S"]
+    engine.sync(BAR_TS + 60_000)
+    assert "S" not in engine.active_intents
+
+    # Same pine_id re-armed with a fresh resting sell: 2 - 2 = 0 passes and
+    # the new order is reserved IN FULL (a stale filled=3 leak would zero
+    # the reservation instead).
+    pos.entry_orders["S"] = _order_order("S", -2.0, limit=51_000.0)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == 2
+
+    # 2 - 2 (fresh working "S") - 1 = -1: halts. With a leaked ledger the
+    # projection would be +1 and the oversell would dispatch.
+    pos.entry_orders["G"] = _order_order("G", -1.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 180_000)
+    assert engine.halted is True
+    assert len(b.entry_calls) == 2
+
+
+def __test_short_gate_restart_recovered_entry_seeds_fill_ledger__(tmp_path):
+    """A cross-restart recovered parked sell entry seeds the fill ledger from
+    the broker's cumulative ``filled_qty`` — the adopted position already
+    contains the filled slice, and the pre-crash fill events never replay,
+    so a full-qty reservation would double-count and falsely halt."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="S", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src",
+                             script_path="t025.py")
+        b = MockBroker(capabilities=ExchangeCapabilities())
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 5.0
+        pos.sign = 1.0
+        pos.open_trades.append(_long_trade("L", 5.0))
+        pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+        b.raise_on_next_entry = OrderDispositionUnknownError(
+            "simulated timeout", client_order_id=coid,
+        )
+        engine.sync(BAR_TS)  # parks under unknown disposition
+        assert coid in engine.pending_verification
+
+        # Crash / restart. The order landed and 2 of 3 filled while the bot
+        # was down; the broker's open-orders view carries the cumulative
+        # counter. The new engine adopts the reduced position (3.0).
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src",
+                              script_path="t025.py")
+        b2 = MockBroker(capabilities=ExchangeCapabilities())
+        b2.open_orders = [ExchangeOrder(
+            id="live-1", symbol=SYMBOL, side="sell",
+            order_type=OrderType.LIMIT, qty=3.0, filled_qty=2.0,
+            remaining_qty=1.0, price=50_000.0, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="",
+            client_order_id=coid,
+        )]
+        pos2 = BrokerPosition()
+        engine2 = OrderSyncEngine(
+            broker=b2,  # type: ignore[arg-type]
+            position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx2,
+        )
+        pos2.size = 3.0
+        pos2.sign = 1.0
+        pos2.open_trades.append(_long_trade("L", 3.0))
+        # Script re-emits the sticky sell entry plus a legit flatten of the
+        # rest: 3 - (3 - 2 filled) - 2 = 0 — must dispatch, not halt.
+        pos2.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+        pos2.entry_orders["F"] = _order_order("F", -2.0)
+
+        engine2.sync(BAR_TS + 60_000)
+
+        assert engine2.halted is False
+        # Only the flatten dispatches fresh; "S" adopts the recovered order.
+        assert len(b2.entry_calls) == 1
+        assert b2.entry_calls[0].intent.pine_id == "F"
+
+
 def __test_strategy_order_market_reduce_is_not_folded_on_margin__():
     """The stop-and-reverse fold is ``strategy.entry`` semantics only:
     ``strategy.order`` never auto-reverses, so an opposite-side market

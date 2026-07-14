@@ -207,6 +207,23 @@ def _coid_is_close(coid: str) -> bool:
     return tail[1][0] == KIND_CLOSE
 
 
+def _coid_is_entry(coid: str) -> bool:
+    """Return ``True`` when ``coid`` was minted for an entry dispatch
+    (:data:`KIND_ENTRY` or :data:`KIND_ENTRY_STOP`).
+
+    Same canonical-format kind probe as :func:`_coid_is_close`; used on the
+    cross-restart pending-anchor recovery path to seed the entry fill ledger
+    (:attr:`OrderSyncEngine._active_entry_filled_qty`) only for recovered
+    entry orders. Wire-form ids (short-budget venues) do not match — the
+    seed is skipped there and the short gate falls back to its conservative
+    full-quantity reservation.
+    """
+    tail = coid.rsplit('-', 1)
+    if len(tail) != 2 or not tail[1]:
+        return False
+    return tail[1][0] in (KIND_ENTRY, KIND_ENTRY_STOP)
+
+
 @dataclasses.dataclass
 class _CancelTentativeMeta:
     """Per-``intent_key`` shadow-map entry tracking a cancel-tentative
@@ -263,6 +280,23 @@ cause a missed dedupe in practice. Sized generously (≈8k fills) so the
 ring is effectively unbounded for any realistic single-session fill count
 while still capping memory. In-memory only — cross-restart dedupe is owned
 by the plugins' persisted ``filled_qty`` cursors.
+"""
+
+
+_RETIRED_ENTRY_ORDER_IDS_CAP = 8192
+"""Upper bound on the retired-entry-order-id ring
+(:attr:`OrderSyncEngine._retired_entry_order_ids`).
+
+Holds the broker order ids of ENTRY orders superseded by a cancel +
+re-execute :meth:`OrderSyncEngine._dispatch_modify`. A late fill from the
+retired order can still arrive after the replacement's fill ledger has been
+reset to zero; keyed only by ``pine_id``, the ENTRY-leg ledger bump in
+:meth:`OrderSyncEngine._route_event` would otherwise credit that stale fill
+to the replacement and under-reserve the short gate. The ring lets the bump
+positively identify (and skip) such stale fills without disturbing any
+legitimate current-order credit. Bounded FIFO — the window between a modify
+and the last straggling old-order fill is tiny, so evicting ids thousands of
+modifies old can never miss a real straggler. In-memory only.
 """
 
 
@@ -526,6 +560,27 @@ class OrderSyncEngine:
         # live in :meth:`_dispatch_new` and accumulated on every matching CLOSE-leg
         # FILL in :meth:`_route_event`.
         self._active_close_filled_qty: dict[str, float] = {}
+        # Cumulative fill qty already applied to each in-flight ``EntryIntent``,
+        # keyed by ``EntryIntent.intent_key`` (== ``pine_id``). A filled entry
+        # deliberately STAYS in ``_active_intents`` — the slot doubles as the
+        # diff sentinel for the sticky re-emitted Pine order — while
+        # ``record_fill`` has already moved the filled slice into
+        # ``_position.size``. Without this ledger the short-selling gate
+        # (:meth:`_enforce_short_gate`) would count that slice twice (once in
+        # the position, once as a full-qty reservation) and falsely halt a
+        # legitimate spot flatten. The gate reserves only the still-working
+        # residual (``active.qty - filled``). Seeded to ``0.0`` when the entry
+        # goes live in :meth:`_dispatch_new` (so a reused ``pine_id`` cannot
+        # inherit a stale filled value and under-reserve), accumulated on every
+        # matching ENTRY-leg FILL in :meth:`_route_event` (after the
+        # ``_seen_fill_ids`` dedup gate), max-merged from the broker's
+        # cumulative ``filled_qty`` when a CROSS-RESTART parked entry is
+        # recovered in :meth:`_verify_pending_dispatches` (same-session parks
+        # keep accumulating through the event path instead — see the NOTE
+        # there), and retired in :meth:`_drop_envelope`. A missing key
+        # conservatively reserves the full quantity — the safe direction on a
+        # short-incapable venue.
+        self._active_entry_filled_qty: dict[str, float] = {}
         self._order_mapping: dict[str, list[str]] = {}
         self._envelopes: dict[str, DispatchEnvelope] = {}
         self._pending_verification: dict[str, DispatchEnvelope] = {}
@@ -691,6 +746,15 @@ class OrderSyncEngine:
         # owned by the plugins' persisted ``filled_qty`` cursors (this gate is
         # defence-in-depth over the plugins' own per-fill dedup).
         self._seen_fill_ids = _BoundedIdSet(_SEEN_FILL_IDS_CAP)
+
+        # Broker order ids of ENTRY orders superseded by a cancel + re-execute
+        # modify (:meth:`_dispatch_modify`). A late fill from the retired order
+        # can arrive after the replacement's ``_active_entry_filled_qty`` slot
+        # has been reset to zero; the ENTRY-leg ledger bump in
+        # :meth:`_route_event` consults this ring to skip crediting such a
+        # stale fill to the replacement's short-gate reservation. Bounded FIFO
+        # (:data:`_RETIRED_ENTRY_ORDER_IDS_CAP`); in-memory only.
+        self._retired_entry_order_ids = _BoundedIdSet(_RETIRED_ENTRY_ORDER_IDS_CAP)
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -1594,6 +1658,18 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.record_unpark(coid)
             self._maybe_attach_defensive_close_ref(key, order.id)
+            # NOTE: the entry fill ledger (:attr:`_active_entry_filled_qty`)
+            # is deliberately NOT seeded from ``order.filled_qty`` here. An
+            # in-memory park is same-session: the parked intent stayed in
+            # ``_active_intents``, so its fills route through
+            # :meth:`_route_event` and bump the ledger in lockstep with the
+            # ``record_fill`` that shrinks ``_position.size``. Seeding from
+            # the broker's cumulative counter could run AHEAD of a still
+            # in-flight fill event — reservation reduced while the position
+            # is not yet — and let the short gate pass an oversell. The
+            # cross-restart sibling below is different: there the position is
+            # adopted from the broker snapshot (fills already included) and
+            # the pre-crash events never replay, so the seed is required.
             # Tag close-park recoveries so the diff-loop adoption guard
             # can adopt a re-emitted ``CloseIntent`` instead of falling
             # through to ``_dispatch_new`` and emitting a duplicate
@@ -1616,6 +1692,18 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.record_unpark(coid)
             self._maybe_attach_defensive_close_ref(anchor.key, order.id)
+            # Cross-restart sibling of the entry fill-ledger seed above: the
+            # persisted anchor carries no intent, so the entry kind comes
+            # from the COID and the broker's cumulative ``filled_qty`` is
+            # taken as-is (the gate floors the working residual at zero).
+            # Fills delivered before the crash are behind the plugin's
+            # persisted fill cursor and never replay, so without this seed
+            # the gate would reserve the full quantity of a partially filled
+            # recovered entry and could falsely halt a legitimate flatten.
+            if _coid_is_entry(coid):
+                observed = order.filled_qty
+                if observed > self._active_entry_filled_qty.get(anchor.key, 0.0):
+                    self._active_entry_filled_qty[anchor.key] = observed
             # A close-park's COID encodes :data:`KIND_CLOSE` in its
             # trailing kind+retry segment. Tag the seeded key so the
             # diff-loop adoption guard can recognise the mapping as a
@@ -3359,6 +3447,38 @@ class OrderSyncEngine:
                         if total > active_close.qty:
                             total = active_close.qty
                         self._active_close_filled_qty[event.pine_id] = total
+            # Symmetric ledger bump for ENTRY-leg fills: the entry intent
+            # stays in ``_active_intents`` after a fill (it is the diff
+            # sentinel for the sticky Pine order), but ``record_fill`` has
+            # already moved the filled slice into ``_position.size`` — track
+            # the cumulative filled qty so :meth:`_enforce_short_gate`
+            # reserves only the still-working residual instead of
+            # double-counting the slice. Same dedup posture as the close
+            # ledger above: this runs after the ``_seen_fill_ids`` gate, and
+            # the cap at the active qty keeps a duplicated / over-reported
+            # FILL from driving the reservation below zero.
+            if event.leg_type == LegType.ENTRY and event.pine_id is not None:
+                active_entry = self._active_intents.get(event.pine_id)
+                # A late fill from an order a cancel + re-execute modify already
+                # retired carries the OLD broker order id, but the ledger is
+                # keyed only by ``pine_id`` — crediting it to the replacement
+                # (whose ledger was reset to zero at modify time) would shrink
+                # the short-gate reservation below the replacement's true
+                # still-working qty and pass an oversell. ``record_fill`` above
+                # has already applied the fill to ``_position.size`` (real
+                # inventory moved); we only suppress the spurious ledger credit.
+                is_retired_fill = (
+                    event.order is not None
+                    and event.order.id in self._retired_entry_order_ids
+                )
+                if isinstance(active_entry, EntryIntent) and not is_retired_fill:
+                    fill_qty_value = event.fill_qty or 0.0
+                    if fill_qty_value > 0.0:
+                        prev = self._active_entry_filled_qty.get(event.pine_id, 0.0)
+                        total = prev + fill_qty_value
+                        if total > active_entry.qty:
+                            total = active_entry.qty
+                        self._active_entry_filled_qty[event.pine_id] = total
             # Persist defensive-close ``partial`` FIFO closures onto the
             # marker. The transient ``_last_fifo_closed_entry_ids`` list is
             # reset at the top of every :meth:`_route_event`, so a
@@ -3706,6 +3826,10 @@ class OrderSyncEngine:
         # ``_dispatch_new`` reset) keeps lifecycle ownership explicit and prevents
         # unbounded growth across many distinct close ids.
         self._active_close_filled_qty.pop(key, None)
+        # Same lifecycle for the entry-side fill ledger (short-gate residual
+        # reservation): seeded in :meth:`_dispatch_new`, read by
+        # :meth:`_enforce_short_gate`, retired here with the envelope.
+        self._active_entry_filled_qty.pop(key, None)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 
@@ -8859,6 +8983,17 @@ class OrderSyncEngine:
         contract (:meth:`_clamp_close_intents` caps closes; brackets carry
         OCA-reduce semantics) and cannot flip the book.
 
+        Each reservation is the intent's still-WORKING residual, not its
+        dispatched quantity: a filled (or partially filled) entry stays in
+        ``_active_intents`` as the diff sentinel for the sticky Pine order,
+        but ``record_fill`` has already moved the filled slice into
+        ``_position.size`` — reserving the full quantity would count that
+        slice twice and falsely halt a legitimate later sell (e.g. a spot
+        flatten). The residual comes from
+        :attr:`_active_entry_filled_qty`; a key missing from the ledger
+        conservatively reserves the full quantity (the safe direction — an
+        over-reservation can only cause a graceful halt, never a short).
+
         Runs AFTER the MARKET stop-and-reverse fold so a reversing
         ``strategy.entry`` is judged on its true combined quantity. On a
         hit the engine records a graceful halt and raises — a silent skip
@@ -8879,7 +9014,10 @@ class OrderSyncEngine:
             if key == exclude_key:
                 continue
             if isinstance(active, EntryIntent) and active.side == 'sell':
-                reserved += active.qty
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+                working = active.qty - filled
+                if working > 0.0:
+                    reserved += working
         # Same 12-decimal rounding as the reversal fold — kills float64
         # addition artifacts without hiding any real lot-sized deficit.
         projected = round(self._position.size - reserved - intent.qty, 12)
@@ -9075,6 +9213,13 @@ class OrderSyncEngine:
                 else:
                     orders = self._run_async_write(self._broker.execute_entry(envelope))
                 self._order_mapping[intent.intent_key] = [o.id for o in orders]
+                # This entry is now live on the wire — reset its cumulative
+                # fill ledger so a stale value from an earlier entry cycle on
+                # the same ``pine_id`` cannot make the short gate
+                # under-reserve the fresh order (mirrors the close-side reset
+                # below). The fills themselves arrive through
+                # :meth:`_route_event` and accumulate from zero.
+                self._active_entry_filled_qty[intent.intent_key] = 0.0
                 # Both-set Pine entry: the dispatch above placed the native
                 # LIMIT leg. Arm the software price-watch for the STOP leg so
                 # a stop cross cancels the LIMIT and fires a MARKET order. The
@@ -11979,8 +12124,35 @@ class OrderSyncEngine:
         _blog_info("modifying %s -> %s", old, new)
         try:
             if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
+                prev_order_ids = list(self._order_mapping.get(new.intent_key, []))
                 orders = self._run_async_write(self._broker.modify_entry(old_env, new_env))
-                self._order_mapping[new.intent_key] = [o.id for o in orders]
+                new_order_ids = [o.id for o in orders]
+                self._order_mapping[new.intent_key] = new_order_ids
+                # Retire the broker ids of the order this amend supersedes so a
+                # late fill from the cancelled order (default modify_entry is
+                # cancel + re-execute) is not miscredited to the replacement's
+                # reset fill ledger by the ``pine_id``-keyed ENTRY-leg bump in
+                # :meth:`_route_event`. Skip ids the plugin preserved verbatim
+                # (an atomic in-place amend re-uses the same order id — that
+                # order is NOT stale and its fills still belong to this key).
+                new_id_set = set(new_order_ids)
+                for stale_id in prev_order_ids:
+                    if stale_id not in new_id_set:
+                        self._retired_entry_order_ids.add(stale_id)
+                # ``BrokerPlugin.modify_entry`` defaults to cancel + re-execute,
+                # so the replacement is a FRESH working order with zero filled —
+                # any fill credit the order this amend replaced accrued into
+                # ``_active_entry_filled_qty`` is now stale. Reset the short-gate
+                # fill ledger to zero (mirrors the ``_dispatch_new`` reset) so a
+                # partially filled prior cycle on this ``pine_id`` cannot leave a
+                # stale filled value that makes the gate under-reserve the
+                # replacement and pass an oversell on a short-incapable venue
+                # (``old.intent_key == new.intent_key`` by the diff's modify
+                # definition, so the key is stable). Subsequent fills accumulate
+                # from zero through :meth:`_route_event`. An atomic in-place
+                # amend that preserves ``filled_qty`` only over-reserves by the
+                # pre-amend slice — the safe direction, never a short.
+                self._active_entry_filled_qty[new.intent_key] = 0.0
                 # Keep the both-set entry's software STOP leg in step with the
                 # amended native LIMIT. modify_entry preserves the LIMIT's
                 # KIND_ENTRY coid (the envelope anchor is pinned across amend
