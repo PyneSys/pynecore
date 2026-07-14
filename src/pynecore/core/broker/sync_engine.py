@@ -44,6 +44,7 @@ from pynecore.core.broker.exceptions import (
 )
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.core.broker.idempotency import (
+    KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
     KIND_ENTRY_STOP,
@@ -80,6 +81,7 @@ from pynecore.core.broker.models import (
     EntryIntent,
     ExchangePosition,
     ExitIntent,
+    INTENT_KEY_SEP,
     InterceptorResult,
     LegPartialRepairedEvent,
     LegRepairFailedEvent,
@@ -236,12 +238,23 @@ class _CancelTentativeMeta:
     persisted leg row's
     :data:`EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS` so a restart can
     rehydrate the deadline.
+
+    ``park_coid`` is the ``client_order_id`` of the durable
+    ``dispatch_kind='cancel_tentative'`` journal row that mirrors this
+    entry (see
+    :meth:`OrderSyncEngine._mark_intent_cancel_disposition_pending`) —
+    the parent-level restart persistence that covers leg-less parents,
+    where the leg-extras mirror above does not exist. ``None`` for
+    store-less runs. The ALREADY_FILLED resolution deletes the row via
+    this handle (the envelope is retained, so ``record_complete``'s
+    wholesale purge cannot be used there).
     """
     since_ts_ms: int
     reason: str
     retry_count: int = 0
     last_retry_ts_ms: int | None = None
     last_retry_outcome: CancelDispositionOutcome | None = None
+    park_coid: str | None = None
 
 
 DEFENSIVE_CLOSE_RESOLUTION_GRACE_S = 30.0
@@ -581,6 +594,33 @@ class OrderSyncEngine:
         # conservatively reserves the full quantity — the safe direction on a
         # short-incapable venue.
         self._active_entry_filled_qty: dict[str, float] = {}
+        # Intents the engine decided to cancel but whose cancel did NOT
+        # provably complete. Two feeders: the fill-time short-gate reconcile
+        # (:meth:`_reconcile_short_gate_after_fill`) parks on a dropped link
+        # (:class:`ExchangeConnectionError`), an ambiguous timeout
+        # (:class:`OrderDispositionUnknownError`) or an un-landed cancel
+        # (``execute_cancel`` returning ``False``); the general cancel path
+        # (:meth:`_dispatch_cancel` — diff drop, OCA cascade, cancel +
+        # re-execute modify) parks on the ``False`` return only (its
+        # exception handling is unchanged). Keyed by ``intent_key``; the
+        # value is the intent to re-cancel. While a key sits here the diff
+        # must NOT adopt the surviving ``_order_mapping`` entry as a healthy
+        # active order NOR re-dispatch it (either double-lives the resting
+        # order — for a short-gate forced cancel it resurrects an unbacked
+        # sell; see the guard in :meth:`_diff_and_dispatch`), and the
+        # cancel + re-execute modify path defers its replacement dispatch.
+        # Every :meth:`sync` re-attempts the cancel via
+        # :meth:`_retry_forced_cancels` (idempotent at the broker — the
+        # cancel targets the same working order — and never halting) until
+        # it provably lands, then drops the key. Persisted as
+        # ``dispatch_kind='forced_cancel'`` rows in ``pending_verifications``
+        # (:meth:`_park_forced_cancel`); a restart re-arms the map from the
+        # journal (:meth:`_absorb_journal_retry_rows`), so an un-landed
+        # cancel keeps being re-driven even when the script no longer
+        # re-emits the intent and nothing else would re-detect it. The row
+        # dies with the envelope: the landed cancel's teardown reaches
+        # ``record_complete`` through :meth:`_drop_envelope`.
+        self._forced_cancel_pending: dict[str, Intent] = {}
         self._order_mapping: dict[str, list[str]] = {}
         self._envelopes: dict[str, DispatchEnvelope] = {}
         self._pending_verification: dict[str, DispatchEnvelope] = {}
@@ -955,6 +995,7 @@ class OrderSyncEngine:
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
+            pending = self._absorb_journal_retry_rows(pending)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
             if envelopes or pending:
                 _log.info(
@@ -1030,6 +1071,7 @@ class OrderSyncEngine:
             return
         envelopes, pending = self._store_ctx.replay()
         self._persisted_envelope_anchors = dict(envelopes)
+        pending = self._absorb_journal_retry_rows(pending)
         self._persisted_pending_anchors = self._unresolved_pending(pending)
         self._prune_orphaned_pending(pending)
 
@@ -1115,6 +1157,141 @@ class OrderSyncEngine:
                     "self-healed orphaned parked dispatch %s: persisted "
                     "park row gone (recovery-confirmed or retired)", coid,
                 )
+
+    def _absorb_journal_retry_rows(
+            self, pending: dict[str, PendingRecord],
+    ) -> dict[str, PendingRecord]:
+        """Re-arm journal-only cancel-retry rows; strip them from the map.
+
+        ``pending_verifications`` rows with
+        ``dispatch_kind='forced_cancel'``, ``'cancel_tentative'`` or
+        ``'cancel_probe'`` are not parked dispatches: each records a
+        cancel obligation whose outcome is not yet provable
+        (:meth:`_park_forced_cancel` /
+        :meth:`_mark_intent_cancel_disposition_pending`). They must not
+        reach ``_persisted_pending_anchors`` —
+        :meth:`_verify_pending_dispatches` would match the cancel's
+        ``client_order_id`` against ``get_open_orders`` forever (a cancel
+        never surfaces as an open order), forcing a spurious broker
+        round-trip on every sync.
+
+        A ``forced_cancel`` row re-arms :attr:`_forced_cancel_pending` so
+        :meth:`_retry_forced_cancels` keeps re-driving the cancel across a
+        restart — the window that makes the rows worth persisting: with the
+        in-memory map lost and the script no longer re-emitting the intent,
+        nothing else would re-detect the un-landed cancel and the working
+        order would rest live at the broker indefinitely (on a
+        short-incapable venue: the exact oversell the short gate exists to
+        prevent).
+
+        A ``cancel_tentative`` row re-arms
+        :attr:`_cancel_disposition_pending` — the parent-level restart
+        persistence for the cancel-tentative state machine. For a parent
+        WITH partial-bracket legs the leg rows mirror the state and
+        :meth:`_rehydrate_cancel_tentative_from_replayed_legs` would also
+        re-arm it (its per-key guard makes the overlap idempotent; this
+        absorption runs first, in ``__init__``). For a leg-less parent the
+        row is the ONLY durable trace: without it a restart would lose the
+        unresolved cancel disposition entirely — no retry, no stale-grace
+        halt, and no diff guard, so a fresh same-key dispatch could
+        double-open next to the possibly-still-live order. The persisted
+        ``parked_ts_ms`` carries the original mark-time ``since_ts_ms``,
+        so the stale-grace deadline survives the restart without slippage
+        (leg-extras parity), and ``order_ids`` re-seeds
+        :attr:`_order_mapping` so replayed FILL / cancelled events route
+        to the tentative parent (the leg path seeds the same way from the
+        ``orders`` table).
+
+        A ``cancel_probe`` row — the speculative pre-park a SOFTWARE
+        partial-bracket parent-entry cancel writes before the broker
+        round-trip (:meth:`_dispatch_cancel`) — is re-armed through the
+        SAME cancel-tentative path. It only reaches a restart when a crash
+        stranded it before the disposition landed, so the outcome is
+        genuinely unknown: routing it to :attr:`_cancel_disposition_pending`
+        makes the startup :meth:`_drive_cancel_tentative` re-probe with
+        ``execute_cancel_with_outcome``, which distinguishes an
+        ALREADY_FILLED parent (restore + arm the live position's partial
+        protection) from a confirmed cancel (retire). The bool-only
+        ``forced_cancel`` retry cannot make that distinction and would
+        retire the protection of a parent that filled during the crash
+        window. The legs — if any — were never flipped to
+        ``cancel_tentative`` (the mark never ran), so
+        :meth:`_rehydrate_cancel_tentative_from_replayed_legs` flips them
+        for these keys after ``restart_replay`` has loaded the ledger.
+
+        Re-arming is additive and idempotent — the wholesale per-sync
+        replay re-runs this every cycle, an in-session entry keeps its
+        richer original state, and a resolved obligation already deleted
+        the row (``record_complete`` via the landed-cancel teardown, or
+        ``record_unpark`` on the ALREADY_FILLED resolution), so nothing
+        resurrects.
+        """
+        remaining: dict[str, PendingRecord] = {}
+        for coid, record in pending.items():
+            if record.dispatch_kind == 'forced_cancel':
+                if record.key not in self._forced_cancel_pending:
+                    self._forced_cancel_pending[record.key] = (
+                        self._rebuild_forced_cancel_intent(record.key)
+                    )
+                    _log.info(
+                        "re-armed forced cancel for intent %s from the "
+                        "journal (park coid=%s); retrying until it "
+                        "provably lands",
+                        format_intent_key(record.key), coid,
+                    )
+                continue
+            if record.dispatch_kind in ('cancel_tentative', 'cancel_probe'):
+                if record.key not in self._cancel_disposition_pending:
+                    self._cancel_disposition_pending[record.key] = (
+                        _CancelTentativeMeta(
+                            since_ts_ms=record.parked_ts_ms,
+                            reason=(
+                                'rehydrated_from_probe'
+                                if record.dispatch_kind == 'cancel_probe'
+                                else 'rehydrated_from_journal'
+                            ),
+                            park_coid=coid,
+                        )
+                    )
+                    if record.order_ids:
+                        current = self._order_mapping.setdefault(
+                            record.key, [],
+                        )
+                        for order_id in record.order_ids:
+                            if order_id not in current:
+                                current.append(order_id)
+                    _log.info(
+                        "re-armed cancel-tentative disposition for intent "
+                        "%s from the journal (%s, park coid=%s); the retry "
+                        "loop resolves it or the stale grace expires",
+                        format_intent_key(record.key), record.dispatch_kind,
+                        coid,
+                    )
+                continue
+            remaining[coid] = record
+        return remaining
+
+    def _rebuild_forced_cancel_intent(self, key: str) -> Intent:
+        """Synthesize a minimal intent to re-drive a journaled forced cancel.
+
+        Only identity feeds the cancel path: ``pine_id`` (plus
+        ``from_entry`` for an exit) selects the working order at the plugin,
+        and ``intent_key`` drives the engine-side teardown once the cancel
+        lands. ``side`` / ``qty`` / ``order_type`` are placeholders — no
+        consumer of :attr:`_forced_cancel_pending` reads them
+        (:meth:`_dispatch_cancel_strict` builds a bare :class:`CancelIntent`
+        from the identity fields and the diff guard tests key membership).
+        """
+        if INTENT_KEY_SEP in key:
+            pine_id, from_entry = key.split(INTENT_KEY_SEP, 1)
+            return ExitIntent(
+                pine_id=pine_id, from_entry=from_entry,
+                symbol=self._symbol, side='sell', qty=0.0,
+            )
+        return EntryIntent(
+            pine_id=key, symbol=self._symbol, side='sell', qty=0.0,
+            order_type=OrderType.MARKET,
+        )
 
     @property
     def active_intents(self) -> dict[str, Intent]:
@@ -1426,6 +1603,7 @@ class OrderSyncEngine:
         if self._store_ctx is not None:
             envelopes, pending = self._store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
+            pending = self._absorb_journal_retry_rows(pending)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
             self._prune_orphaned_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
@@ -1569,7 +1747,36 @@ class OrderSyncEngine:
                 dispatchable.append(i)
         self._deferred_exits = new_deferred
 
+        # Re-drive every parked forced cancel BEFORE the diff — short-gate
+        # and general alike, on every venue. A landed cancel clears its
+        # ``_order_mapping`` entry before the adoption branch could reclaim
+        # it, and an un-landed one keeps being re-attempted even when the
+        # script no longer emits the intent (nothing else would re-detect
+        # it). No-op when nothing is parked.
+        self._retry_forced_cancels()
+        # Fill-time short-gate safety net BEFORE the diff: re-scan the
+        # aggregate against the current position — this catches a resting
+        # sell re-adopted after a restart, when the in-memory pending set is
+        # empty and no new fill would otherwise re-trigger the drain-time
+        # reconcile. No-op on short-capable venues / when nothing is at risk.
+        self._reconcile_short_gate_after_fill()
+
         self._diff_and_dispatch(dispatchable)
+        # Fill-time short-gate safety net AFTER the diff: a cross-restart
+        # recovered resting sell lands in ``_order_mapping`` (via
+        # :meth:`_verify_pending_dispatches`) but NOT ``_active_intents`` — the
+        # script's re-emission adopts it into ``_active_intents`` only here,
+        # inside ``_diff_and_dispatch``. The pre-diff pass above therefore
+        # cannot yet see it, so a recovered sell the prior run left unbacked
+        # would rest live at the broker until the NEXT sync. Re-scan now that
+        # adoption has run so the same sync cancels it. No-op on the normal
+        # path: every sell dispatched this sync already passed the dispatch-time
+        # :meth:`_enforce_short_gate`, so the aggregate stays backed and the
+        # deficit is non-positive. No-op on short-capable venues (single bool).
+        # The parked-cancel retry deliberately does NOT re-run here — it
+        # already ran once this sync (before the pre-diff pass), and
+        # re-driving it would double the broker cancel round-trips.
+        self._reconcile_short_gate_after_fill()
         self._cleanup_unused_adoption_markers()
         # Engine-trigger partial bracket WATCH phase. Fires before
         # ``drive_native_failsafe`` so a leg that triggers in this
@@ -2923,12 +3130,25 @@ class OrderSyncEngine:
     # === Event routing ===
 
     def _drain_events(self) -> None:
+        drained_any = False
         while True:
             try:
                 event = self._event_queue.get_nowait()
             except queue.Empty:
-                return
+                break
             self._route_event(event)
+            drained_any = True
+        # Fill-time short-gate reconcile: a fill drained just now may have
+        # shrunk ``_position.size`` below the aggregate working sell qty the
+        # dispatch-time gate admitted. Re-drive any parked forced cancel
+        # first (a landed retry retires its mapping before the scan), then
+        # re-check and cancel any now-unbacked resting sell entries before
+        # they can fill into an oversell (see
+        # :meth:`_reconcile_short_gate_after_fill`). Skipped when nothing was
+        # drained — the position cannot have moved.
+        if drained_any:
+            self._retry_forced_cancels()
+            self._reconcile_short_gate_after_fill()
 
     def _route_event(self, event: OrderEvent) -> None:
         # Generic ``event %s`` arrival logging happens in
@@ -5458,6 +5678,24 @@ class OrderSyncEngine:
         the legs would survive the stale-grace window unobserved, and
         the diff-loop adoption guard would never fire to defer a fresh
         reissue.
+
+        The parent-level ``'cancel_tentative'`` journal row
+        (:meth:`_absorb_journal_retry_rows`, absorbed in ``__init__``
+        before this runs) re-arms the same key first — the per-key
+        guard below makes the overlap a no-op, so this walk is the
+        leg-side belt-and-braces. For LEG-LESS parents it never fires,
+        which is exactly why the journal row is the sole durable trace
+        there.
+
+        A final pass flips any still-``pending_entry`` legs under a
+        re-armed parent to ``cancel_tentative``. It matters for a
+        ``'cancel_probe'`` row (a crash-stranded speculative pre-park):
+        that key was re-armed from the journal, not from a
+        ``cancel_tentative`` leg row, so its legs — if any — were never
+        flipped (the mark never ran). Doing it here, after
+        ``restart_replay`` has loaded the ledger, keeps the leg trio
+        consistent with the shadow map so a later CANCEL_CONFIRMED
+        resolution does not orphan a ``pending_entry`` leg.
         """
         tentative_parents: set[str] = set()
         for leg in self._partial_bracket_engine.iter_legs():
@@ -5508,6 +5746,28 @@ class OrderSyncEngine:
                 current = self._order_mapping.setdefault(row.intent_key, [])
                 if row.exchange_order_id not in current:
                     current.append(row.exchange_order_id)
+        # A ``cancel_probe`` row (:meth:`_absorb_journal_retry_rows`) re-armed
+        # the shadow map in ``__init__`` — before ``restart_replay`` loaded
+        # the leg ledger — and its legs were never flipped to
+        # CANCEL_TENTATIVE, because the mark never ran (a crash stranded the
+        # speculative pre-park). Flip any PENDING_ENTRY leg under a re-armed
+        # parent now that the ledger is loaded, so the leg trio matches the
+        # shadow state: the disposition-resolution paths
+        # (:meth:`SoftwarePartialBracketEngine.confirm_cancel_tentative` and
+        # ``restore_legs_from_cancel_tentative``) act ONLY on CANCEL_TENTATIVE
+        # legs, so a stranded PENDING_ENTRY leg would otherwise be orphaned on
+        # a CANCEL_CONFIRMED resolution. Idempotent for keys re-armed from the
+        # leg walk above (their legs are already CANCEL_TENTATIVE, and
+        # ``mark_legs_cancel_tentative`` targets only PENDING_ENTRY) and a
+        # no-op for leg-less parents. Anchoring the leg extras at the shadow
+        # map's ``since_ts_ms`` keeps the persisted stale-grace deadline in a
+        # single epoch.
+        for parent_key, meta in self._cancel_disposition_pending.items():
+            self._partial_bracket_engine.mark_legs_cancel_tentative(
+                parent_key,
+                reason=meta.reason,
+                now_ms=meta.since_ts_ms,
+            )
 
     def _mark_intent_cancel_disposition_pending(
             self,
@@ -5515,6 +5775,7 @@ class OrderSyncEngine:
             *,
             reason: str,
             now_ms: int,
+            parked_coid: str | None = None,
     ) -> None:
         """Atomic two-level cancel-tentative entry.
 
@@ -5526,14 +5787,49 @@ class OrderSyncEngine:
         (the original ``since_ts_ms`` is preserved so the stale-grace
         deadline does not slip).
 
+        Journals a ``dispatch_kind='cancel_tentative'`` row so a restart
+        re-arms the retry loop (:meth:`_absorb_journal_retry_rows`) even
+        when the parent has NO partial-bracket legs — the leg flip below
+        is a no-op then, and without the parent-level row the unresolved
+        cancel disposition would evaporate on restart (no retry, no
+        stale-grace halt, no diff guard). ``parked_ts_ms=now_ms`` pins
+        the original stale-grace anchor across restarts, mirroring the
+        leg-extras :data:`EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS`.
+
+        :param parked_coid: The speculative forced-cancel pre-park row's
+            COID when the caller (:meth:`_dispatch_cancel`) already holds
+            one — the ``record_park`` upsert then flips that same row's
+            kind from ``'forced_cancel'`` to ``'cancel_tentative'`` in a
+            single atomic UPDATE (ownership transfer without a
+            delete+insert crash window). ``None`` mints the cancel COID
+            fresh.
+
         Emits :class:`PartialBracketCancelTentativeStartedEvent` for
         audit / observability.
         """
         if intent_key in self._cancel_disposition_pending:
             return
+        park_coid: str | None = None
+        if self._store_ctx is not None:
+            if parked_coid is not None:
+                row_coid = parked_coid
+            else:
+                cancel_envelope = self._build_cancel_envelope(CancelIntent(
+                    pine_id=intent_key, symbol=self._symbol,
+                ))
+                row_coid = cancel_envelope.client_order_id(KIND_CANCEL)
+            self._store_ctx.record_park(
+                coid=row_coid,
+                key=intent_key,
+                kind='cancel_tentative',
+                order_ids=self._order_mapping.get(intent_key, []),
+                parked_ts_ms=now_ms,
+            )
+            park_coid = row_coid
         self._cancel_disposition_pending[intent_key] = _CancelTentativeMeta(
             since_ts_ms=now_ms,
             reason=reason,
+            park_coid=park_coid,
         )
         # ``intent_key`` here is the parent ``EntryIntent.intent_key``,
         # which equals ``leg.from_entry`` on every child partial bracket
@@ -5592,6 +5888,15 @@ class OrderSyncEngine:
             return
         duration_ms = max(0, now_ms - meta.since_ts_ms)
         if outcome is CancelDispositionOutcome.ALREADY_FILLED:
+            # Retire the durable ``'cancel_tentative'`` journal row. This
+            # branch RETAINS the envelope (the parent is live and filled),
+            # so the confirm-cancel branch's ``_drop_envelope`` →
+            # ``record_complete`` wholesale purge is not available here —
+            # without this targeted delete the row would phantom-re-arm a
+            # resolved disposition on the next restart
+            # (:meth:`_absorb_journal_retry_rows`).
+            if meta.park_coid is not None and self._store_ctx is not None:
+                self._store_ctx.record_unpark(meta.park_coid)
             # Restore to ``pending_entry`` rather than ``armed``: tentative
             # legs born from a pending-parent dispatch carry only
             # ``trigger_offset`` (tick distance), never an absolute
@@ -5873,6 +6178,17 @@ class OrderSyncEngine:
         :class:`BrokerManualInterventionError`-equivalent halt — the
         partial brackets cannot be safely re-armed against a parent
         whose live/dead status the engine cannot determine.
+
+        The durable ``'cancel_tentative'`` journal row is deliberately
+        KEPT: a restart re-arms the entry
+        (:meth:`_absorb_journal_retry_rows`) with the original expired
+        anchor and immediately re-halts — the same re-halt-until-the-
+        operator-resolves loop the leg-extras rehydrate path has always
+        produced for legful parents. Deleting the row would instead let
+        a leg-less parent's unresolved disposition silently vanish
+        across the restart. No in-session re-arm can follow this pop:
+        the halt latch makes every subsequent :meth:`sync` return before
+        the journal replay runs.
         """
         self._cancel_disposition_pending.pop(intent_key, None)
         stale_grace_ms = int(self._cancel_tentative_stale_grace_s * 1000)
@@ -7876,7 +8192,7 @@ class OrderSyncEngine:
                 self._modify_old_intents.pop(key, None)
                 if needs_strict_cancel:
                     try:
-                        self._dispatch_cancel_strict(old)
+                        landed = self._dispatch_cancel_strict(old)
                     except OrderDispositionUnknownError as e:
                         _blog_warning(
                             "native-to-engine partial conversion deferred: "
@@ -7890,11 +8206,57 @@ class OrderSyncEngine:
                         for partial_key in conflicting_partial_keys:
                             new_map.pop(partial_key, None)
                         continue
+                    if not landed:
+                        # ``execute_cancel`` returned ``False`` — the native
+                        # whole-row bracket did NOT land its cancel and may
+                        # still rest live. The strict path deliberately kept
+                        # ``old``'s mapping / envelope intact, so arming the
+                        # engine-trigger partial legs now would let the live
+                        # native bracket and the new legs both close the
+                        # position (the §12 #4 coexistence violation). Mirror
+                        # the timed-out branch: restore the old native intent
+                        # and drop the new partial(s) so the next sync re-diffs
+                        # and retries the strict cancel (idempotent via the
+                        # deterministic ``client_order_id``) before any legs
+                        # are armed.
+                        _blog_warning(
+                            "native-to-engine partial conversion deferred: "
+                            "strict cancel of %s did not land (execute_cancel "
+                            "returned False); restoring old intent and dropping "
+                            "new partial bracket(s) %r so the next sync retries "
+                            "the cancel before engine-trigger legs are armed",
+                            old, conflicting_partial_keys,
+                        )
+                        self._active_intents[key] = old
+                        for partial_key in conflicting_partial_keys:
+                            new_map.pop(partial_key, None)
+                        continue
                 else:
                     self._dispatch_cancel(old)
 
         for key, intent in new_map.items():
             if key not in self._active_intents:
+                # Refuse-and-defer guard for un-landed forced cancels. The
+                # engine decided this working order must be cancelled — the
+                # short-gate fill-time reconcile (unbacked resting sell), or
+                # any cancel path whose ``execute_cancel`` returned ``False``
+                # — but the cancel has not provably landed. The surviving
+                # ``_order_mapping`` entry would otherwise be adopted below
+                # as a healthy live order, or a fresh dispatch would
+                # double-live the still-resting broker order (for a
+                # short-gate cancel: re-dispatch trips the dispatch-time
+                # gate into a halt). Skip the intent;
+                # :meth:`_retry_forced_cancels` re-attempts the cancel on
+                # every sync until it lands, then this key clears and the
+                # next diff re-evaluates the signal.
+                if key in self._forced_cancel_pending:
+                    _blog_warning(
+                        "intent %r deferred — a forced cancel on this "
+                        "working order has not completed yet; retrying "
+                        "each sync until it lands",
+                        format_intent_key(key),
+                    )
+                    continue
                 # Refuse-and-defer guard for cancel-tentative parents.
                 # The shadow map is keyed by the parent
                 # ``EntryIntent.intent_key``; an ``EntryIntent`` reissue
@@ -9000,6 +9362,12 @@ class OrderSyncEngine:
         would break Pine semantics (the script would believe it is short
         while the venue holds the old long).
 
+        This proves the invariant at DISPATCH time only. A later fill can
+        erode ``_position.size`` below the aggregate the gate admitted;
+        :meth:`_reconcile_short_gate_after_fill` runs the same aggregation
+        at fill time and cancels the now-unbacked resting sells before they
+        can leak an oversell through the async window.
+
         :param intent: The (folded) entry intent about to dispatch.
         :param exclude_key: Active-intent key to leave out of the
             aggregation — the modify path passes the key being replaced so
@@ -9018,6 +9386,11 @@ class OrderSyncEngine:
                 working = active.qty - filled
                 if working > 0.0:
                     reserved += working
+        # Forced-cancel-pending sells have left ``_active_intents`` but their
+        # working order may still rest live at the broker until the cancel
+        # lands; fold them back in so a fresh sell cannot be admitted against
+        # inventory a still-live parked sell already reserves.
+        reserved += self._parked_working_sell_qty(exclude_key=exclude_key)
         # Same 12-decimal rounding as the reversal fold — kills float64
         # addition artifacts without hiding any real lot-sized deficit.
         projected = round(self._position.size - reserved - intent.qty, 12)
@@ -9042,6 +9415,435 @@ class OrderSyncEngine:
         )
         self._record_halt(halt)
         raise halt
+
+    def _parked_working_sell_qty(self, *, exclude_key: str | None = None) -> float:
+        """Working residual of sell entries parked for an un-landed cancel.
+
+        Two parked shapes have left ``_active_intents`` while their resting
+        SELL order may STILL be live and fillable at the broker:
+
+        - :attr:`_forced_cancel_pending` — a short-gate forced cancel
+          (:meth:`_attempt_short_gate_forced_cancel`) whose cancel has not
+          provably landed (:meth:`_retry_forced_cancels` keeps re-driving it).
+        - :attr:`_cancel_disposition_pending` — a SOFTWARE partial-bracket
+          parent entry whose cancel is disposition-unknown / did-not-land,
+          moved into the cancel-tentative state machine by
+          :meth:`_mark_intent_cancel_disposition_pending` (the diff loop popped
+          it from ``_active_intents``; the cancel branch deliberately KEEPS the
+          parent envelope so the retry loop can rebuild the cancel).
+
+        Until the cancel lands the order keeps claiming inventory, so BOTH
+        short-gate aggregations — :meth:`_enforce_short_gate` at dispatch time
+        and :meth:`_reconcile_short_gate_after_fill` at fill time — must count
+        it. Omitting EITHER shape would let a DIFFERENT sell pass the dispatch
+        gate against inventory the parked order still reserves; both could then
+        fill and take a short-incapable venue negative (the exact oversell the
+        gate exists to prevent).
+
+        Working residual per key, in preference order:
+
+        1. The live in-memory intent — the real parked ``EntryIntent``
+           (``_forced_cancel_pending``) or the preserved envelope's intent
+           (``_cancel_disposition_pending``): reserve ``qty - filled`` from
+           :attr:`_active_entry_filled_qty` (the filled slice already lives in
+           ``_position.size``). A buy parent reserves nothing.
+        2. Restart-stranded keys with NO usable in-memory qty — a forced cancel
+           rehydrated with a ``qty=0.0`` placeholder
+           (:meth:`_rebuild_forced_cancel_intent`) or a cancel-tentative parent
+           whose envelope did not survive the restart — recover the
+           authoritative residual from the ``orders`` table
+           (:meth:`_recover_working_sell_qty_from_orders`).
+
+        Deduplicated against ``_active_intents`` (a parked key should never
+        also be active — parking pops the active slot — but if it somehow is,
+        the active reservation already covers it) and across the two maps (the
+        cancel-tentative branch pops ``_forced_cancel_pending`` before marking,
+        so a key lives in at most one — the ``seen`` set guards the
+        pathological overlap). Only ``EntryIntent`` sells contribute:
+        reduce-only exits / closes are never parked as sell-side entries.
+
+        :param exclude_key: Active-intent key the caller is excluding from its
+            own aggregation (the modify path passes the key being replaced);
+            skipped here too so it is not double-counted.
+        """
+        total = 0.0
+        recover_keys: list[str] = []
+        seen: set[str] = set()
+        for key, parked in self._forced_cancel_pending.items():
+            if key == exclude_key or key in self._active_intents:
+                continue
+            seen.add(key)
+            # Only sell ENTRIES reserve inventory; a rehydrated exit placeholder
+            # (:meth:`_rebuild_forced_cancel_intent` returns an ``ExitIntent``
+            # for composite keys) is reduce-only and never contributes.
+            if not isinstance(parked, EntryIntent) or parked.side != 'sell':
+                continue
+            if parked.qty > 0.0:
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+                working = parked.qty - filled
+                if working > 0.0:
+                    total += working
+            else:
+                # Restart placeholder (synthesized ``qty=0.0``): the real
+                # working residual lives in the authoritative ``orders`` table.
+                recover_keys.append(key)
+        for key in self._cancel_disposition_pending:
+            if key == exclude_key or key in self._active_intents or key in seen:
+                continue
+            envelope = self._envelopes.get(key)
+            intent = envelope.intent if envelope is not None else None
+            if isinstance(intent, EntryIntent):
+                if intent.side != 'sell':
+                    continue
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+                working = intent.qty - filled
+                if working > 0.0:
+                    total += working
+            else:
+                # Envelope lost on restart: cancel-tentative only ever holds a
+                # parent ENTRY, so recover the residual from the ``orders``
+                # table (its ``side == 'sell'`` filter excludes a buy parent).
+                recover_keys.append(key)
+        if recover_keys:
+            total += self._recover_working_sell_qty_from_orders(recover_keys)
+        return total
+
+    def _recover_working_sell_qty_from_orders(self, keys: list[str]) -> float:
+        """Authoritative still-live working SELL qty for restart-stranded keys.
+
+        A parked forced cancel rehydrated with a placeholder ``qty=0.0``
+        (:meth:`_rebuild_forced_cancel_intent`) or a cancel-tentative parent
+        whose in-memory envelope did not survive the restart carries no usable
+        in-memory working qty — yet its resting SELL order may still be live and
+        fillable at the broker, claiming inventory the short gate must reserve.
+        The ``orders`` table persists ``side`` / ``qty`` / ``filled_qty`` per
+        order, so sum ``qty - filled_qty`` over every still-live
+        (``closed_ts_ms IS NULL``) SELL row carrying one of these
+        ``intent_key``s.
+
+        Both parked shapes persist exactly ONE broker order row under their
+        ``intent_key`` — the parent entry. A short-gate parked plain resting
+        SELL entry is a plain entry; a SOFTWARE partial-bracket parent SELL has
+        engine-internal legs (mapped as ``bracket:<leg_id>``, never sent to the
+        broker), so no leg order rows exist to double-count, and the
+        ``side == 'sell'`` filter excludes the reduce-only exit legs regardless.
+
+        :param keys: Restart-stranded parked keys needing authoritative
+            recovery.
+        :return: Aggregate still-live working SELL qty across those keys.
+            ``0.0`` for a store-less run (nothing to recover from).
+        """
+        if self._store_ctx is None:
+            return 0.0
+        wanted = set(keys)
+        total = 0.0
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            if row.side == 'sell' and row.intent_key in wanted:
+                working = row.qty - row.filled_qty
+                if working > 0.0:
+                    total += working
+        return total
+
+    def _reconcile_short_gate_after_fill(self) -> None:
+        """Cancel resting sell entries a fill left unbacked (fill-time short gate).
+
+        :meth:`_enforce_short_gate` proves the aggregate invariant
+        ``position >= sum(working sell-entry residuals)`` at DISPATCH time
+        only. On a short-incapable venue (``caps.short_selling``
+        UNSUPPORTED — spot) a later fill that shrinks ``_position.size`` — a
+        close/exit reducing the long, or a late fill from an order a
+        cancel + re-execute modify already retired — can drop the position
+        below the aggregate still-working sell qty. Those sells were
+        admitted when the position still backed them and nothing re-checks
+        them, so if they fill the venue is driven short: the exact oversell
+        the gate exists to prevent, leaking through the async window between
+        the eroding fill and the next dispatch cycle.
+
+        Runs at the end of every event drain (:meth:`_drain_events`) — the
+        tightest point the engine observes a fill on the main thread
+        (``run_event_stream`` only enqueues; routing runs here) — AND twice
+        per :meth:`sync`, both BEFORE and AFTER :meth:`_diff_and_dispatch`.
+        The pre-diff pass catches a sell an in-session fill left unbacked
+        (the parked-cancel retry has just run before it, so a landed cancel
+        has already retired its mapping). The post-diff pass catches a
+        CROSS-RESTART recovered
+        resting sell: :meth:`_verify_pending_dispatches` seeds only
+        ``_order_mapping`` for it, and the script's re-emission adopts it into
+        ``_active_intents`` only inside :meth:`_diff_and_dispatch`, so the
+        pre-diff pass cannot see it — without the post-diff re-scan the
+        unbacked sell would rest live at the broker until the next sync. When
+        the aggregate overcommits, cancel resting sell entries newest-first
+        until the invariant holds again, removing the exposure at the broker
+        WITHOUT halting.
+
+        The cancel routes through :meth:`_attempt_short_gate_forced_cancel`,
+        which uses the journaled, deterministic-COID
+        :meth:`_dispatch_cancel_strict` and — crucially — makes the
+        cancellation DURABLE: a transient broker outage
+        (:class:`ExchangeConnectionError`), an ambiguous timeout
+        (:class:`OrderDispositionUnknownError`) or an un-landed cancel
+        (``execute_cancel`` returning ``False``) parks the key in
+        ``_forced_cancel_pending`` instead of leaving a half-cancelled
+        order the diff's cross-restart adoption branch would silently reclaim
+        as healthy. The parked cancels are re-attempted by
+        :meth:`_retry_forced_cancels` — invoked by every :meth:`sync` and by
+        every routing event drain, always BEFORE this scan so a landed retry
+        retires its mapping first — and persist across restarts
+        (:meth:`_park_forced_cancel`); the diff refuses to adopt or
+        re-dispatch a pending key until the cancel lands. On a clean cancel
+        the intent leaves ``_active_intents`` so the next diff re-evaluates
+        the Pine signal: a recovered position re-dispatches it safely, a
+        still-unsatisfiable short re-hits the dispatch-time gate (the
+        documented last-resort halt).
+
+        Reduce-only exits and closes are excluded (they cannot flip the
+        book), mirroring :meth:`_enforce_short_gate`. Buy-side entries never
+        contribute. No-op on short-capable venues (a single bool read on the
+        hot path).
+        """
+        if self._short_selling_supported:
+            return
+        # Working residual per live sell-side entry intent, in dispatch
+        # (insertion) order. Same residual basis as the dispatch gate: the
+        # filled slice already lives in ``_position.size``, so reserve only
+        # ``qty - filled``. A key missing from the ledger reserves the full
+        # quantity (the safe over-reservation direction). Keys already parked
+        # in ``_forced_cancel_pending`` are out of ``_active_intents``, so the
+        # candidate scan below naturally skips them (the per-sync retry owns
+        # their cancel) — but their still-live working qty is folded back into
+        # ``reserved`` (see :meth:`_parked_working_sell_qty`) so the deficit
+        # still reflects the exposure they keep at the broker.
+        live_sells: list[tuple[str, float]] = []
+        reserved = 0.0
+        for key, active in self._active_intents.items():
+            if isinstance(active, EntryIntent) and active.side == 'sell':
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+                working = active.qty - filled
+                if working > 0.0:
+                    live_sells.append((key, working))
+                    reserved += working
+        if not live_sells:
+            return
+        # Fold in still-live parked sells: they claim inventory until their
+        # cancel lands, but they are NOT cancellation candidates (owned by
+        # :meth:`_retry_forced_cancels`) — only the active sells above are.
+        reserved += self._parked_working_sell_qty()
+        # Same 12-decimal rounding as the dispatch gate / reversal fold —
+        # kills float64 addition artifacts without hiding a real lot-sized
+        # deficit.
+        deficit = round(reserved - self._position.size, 12)
+        if deficit <= 0.0:
+            return
+        # Cancel newest-first (LIFO): the earliest resting sells are the
+        # older, already-established commitments; the most recent ones
+        # tipped the aggregate past the position and are dropped first. Stop
+        # as soon as the remaining working qty is fully backed again.
+        for key, working in reversed(live_sells):
+            if deficit <= 0.0:
+                break
+            old = self._active_intents.get(key)
+            if not isinstance(old, EntryIntent):
+                continue
+            _blog_warning(
+                "short-gate fill-time reconcile: position %s no longer backs "
+                "the aggregate working sell qty %s; cancelling resting sell "
+                "entry %r (working %s) to avoid an oversell on a "
+                "short-incapable venue",
+                self._position.size, reserved, format_intent_key(key), working,
+            )
+            # Mirror the diff-loop cancel path (pop the active slot, drop any
+            # parked modify rollback snapshot, then cancel durably).
+            self._active_intents.pop(key, None)
+            self._modify_old_intents.pop(key, None)
+            # Only a CONFIRMED (landed) cancel removes the order's working qty
+            # from the exposure. A parked cancel (connection / unknown-
+            # disposition error, or ``execute_cancel`` returning ``False``)
+            # leaves the resting sell live and fillable until
+            # :meth:`_retry_forced_cancels` lands it — so it must stay counted
+            # against the deficit. Reducing it here would let the loop stop
+            # early believing the book is backed while a still-live parked sell
+            # can fill alongside the ones left untouched, driving the venue
+            # short. On a failed cancel keep the deficit intact and continue to
+            # the next candidate: over-cancelling resting sells is safe (the
+            # next diff re-evaluates the Pine signal), under-cancelling is not.
+            if self._attempt_short_gate_forced_cancel(key, old):
+                deficit = round(deficit - working, 12)
+
+    def _attempt_short_gate_forced_cancel(
+            self, key: str, old: 'EntryIntent',
+    ) -> bool:
+        """Cancel a short-gate-unbacked resting sell, durably and never halting.
+
+        Drives :meth:`_dispatch_cancel_strict` (which propagates BOTH a
+        dropped-link :class:`ExchangeConnectionError` and an ambiguous-timeout
+        :class:`OrderDispositionUnknownError`, unlike the swallowing
+        :meth:`_dispatch_cancel`, AND returns the ``execute_cancel``
+        landedness bool). On a clean, landed cancel the strict path has
+        already retired ``_order_mapping`` / the envelope and the key is
+        cleared from ``_forced_cancel_pending``. On either error — OR a
+        ``False`` return (``execute_cancel``'s documented "cancel did not
+        land, still pending" signal) — the cancel is NOT provably done and the
+        broker order may still rest unbacked, so the key is parked durably
+        via :meth:`_park_forced_cancel` for :meth:`_retry_forced_cancels` to
+        re-attempt on every :meth:`sync` (surviving restarts through the
+        journal row), and the diff refuses to adopt / re-dispatch it in the
+        meantime (:meth:`_diff_and_dispatch` guard). The strict path is used
+        deliberately: it sidesteps the SOFTWARE-partial-bracket cancel-
+        tentative machinery (which would DEGRADED_HALT on stale grace),
+        keeping this path strictly non-halting as the gate requires.
+
+        The caller has already popped ``key`` from ``_active_intents``.
+        Idempotent across retries and restarts: the cancel targets the same
+        working order at the broker.
+
+        :return: ``True`` only when the cancel provably landed (the resting
+            sell is gone at the broker); ``False`` on any parked outcome (a
+            connection / unknown-disposition error or an ``execute_cancel``
+            ``False`` return), meaning the order may still rest live. The
+            fill-time reconcile loop uses this to decide whether the order's
+            working qty may be subtracted from the still-uncovered deficit.
+        """
+        # Persist the durable forced-cancel intent BEFORE issuing the broker
+        # cancel. A crash in the round-trip window between ``execute_cancel``
+        # reaching the broker and a post-call ``record_park`` committing would
+        # otherwise lose the obligation entirely — the in-memory map is gone,
+        # no journal row exists, and the script keeps emitting the same sell
+        # (so the diff never drops it) — leaving the resting sell live and
+        # unbacked, exactly the oversell this gate exists to prevent. Parking
+        # first closes that window: the landed path below deletes the row via
+        # :meth:`_dispatch_cancel_strict`'s ``_drop_envelope`` /
+        # ``record_complete`` (which purges every ``pending_verifications`` row
+        # under this ``intent_key``), and a crash right after a successful
+        # cancel leaves only a benign row whose retry re-cancels an
+        # already-gone order (a no-op ``True``).
+        self._park_forced_cancel(key, old)
+        try:
+            landed = self._dispatch_cancel_strict(old)
+        except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "short-gate fill-time reconcile: cancel of resting sell %r "
+                "did not complete (%s); parked for per-sync retry — the diff "
+                "will not adopt or re-dispatch it until the cancel lands",
+                format_intent_key(key), e,
+            )
+            return False
+        if not landed:
+            # ``execute_cancel`` returned ``False``: the cancel did not land,
+            # the resting sell may still be live. Treating the clean return as
+            # a confirmed cancel would let the diff re-adopt / re-dispatch and
+            # resurrect the unbacked exposure. Stay parked and retry instead.
+            _blog_warning(
+                "short-gate fill-time reconcile: cancel of resting sell %r "
+                "returned False (did not land); parked for per-sync retry — "
+                "the diff will not adopt or re-dispatch it until it lands",
+                format_intent_key(key),
+            )
+            return False
+        # Provably cancelled: the strict path retired the mapping / envelope
+        # and ``record_complete`` deleted the park row; drop the in-memory
+        # entry too.
+        self._forced_cancel_pending.pop(key, None)
+        return True
+
+    def _park_forced_cancel(
+            self, key: str, old: Intent, *,
+            kind: str = 'forced_cancel',
+            parked_ts_ms: int | None = None,
+    ) -> str | None:
+        """Park an intent whose cancel did not provably land, durably.
+
+        Records the intent for :meth:`_retry_forced_cancels` and journals a
+        cancel-retry row so a restart re-arms the retry
+        (:meth:`_absorb_journal_retry_rows`) — without the row, a crash
+        while parked would leave the broker order live with nothing left to
+        cancel it: the in-memory map is gone and the script may never
+        re-emit the intent. The row's ``client_order_id`` is the cancel's
+        own deterministic COID (audit correlation; it cannot collide with a
+        parked *dispatch* row — cancels are never parked through
+        :meth:`_park_pending` and carry their own COID kind). Persisting is
+        skipped when the key is already parked: the existing row still
+        covers it, and re-writing on every retry bar would accrete one row
+        per bar under fresh cancel COIDs. ``record_complete`` inside
+        :meth:`_drop_envelope` deletes the row once the landed cancel tears
+        the envelope down.
+
+        :param kind: The journal ``dispatch_kind`` to persist.
+            ``'forced_cancel'`` (default) is the bool-only strict-retry
+            row used by the short-gate fill-time reconcile and by
+            non-SOFTWARE-partial-bracket cancels. A SOFTWARE
+            partial-bracket parent-entry cancel pre-parks as
+            ``'cancel_probe'`` instead (see :meth:`_dispatch_cancel`): if
+            a crash strands the row before the disposition lands, the
+            restart must rehydrate it through the OUTCOME-based
+            cancel-tentative machine, not the bool-only retry that cannot
+            tell an ALREADY_FILLED parent from a confirmed cancel.
+        :param parked_ts_ms: Explicit park timestamp forwarded to
+            :meth:`RunContext.record_park`; ``'cancel_probe'`` rows pass
+            the pre-park time so the restart re-arm anchors the
+            stale-grace deadline at the moment the disposition became
+            uncertain rather than granting a fresh window.
+        :return: The journaled cancel COID, or ``None`` when nothing was
+            written (no store, or the key was already parked). Callers that
+            pre-park speculatively (:meth:`_dispatch_cancel`) pass this COID
+            to :meth:`_mark_intent_cancel_disposition_pending` on the
+            cancel-tentative outcome, which atomically converts the row's
+            kind to ``'cancel_tentative'`` instead of deleting it.
+        """
+        already_parked = key in self._forced_cancel_pending
+        self._forced_cancel_pending[key] = old
+        if self._store_ctx is None or already_parked:
+            return None
+        from_entry = old.from_entry if isinstance(old, ExitIntent) else None
+        cancel_envelope = self._build_cancel_envelope(CancelIntent(
+            pine_id=old.pine_id, symbol=self._symbol, from_entry=from_entry,
+        ))
+        coid = cancel_envelope.client_order_id(KIND_CANCEL)
+        self._store_ctx.record_park(
+            coid=coid,
+            key=key,
+            kind=kind,
+            order_ids=self._order_mapping.get(key, []),
+            parked_ts_ms=parked_ts_ms,
+        )
+        return coid
+
+    def _retry_forced_cancels(self) -> None:
+        """Re-attempt every parked forced cancel; drop the landed ones.
+
+        Runs once per :meth:`sync` (before the pre-diff short-gate pass) and
+        after every event drain that routed something — on every venue, for
+        short-gate and general parks alike. A cancel that now lands cleanly
+        retires its mapping / envelope / journal row and leaves
+        ``_forced_cancel_pending``; one that still errors or returns
+        ``False`` stays parked for the next attempt. Never halts (the same
+        non-halting strict path as the initial attempt). No-op when nothing
+        is parked.
+        """
+        if not self._forced_cancel_pending:
+            return
+        for key, old in list(self._forced_cancel_pending.items()):
+            try:
+                landed = self._dispatch_cancel_strict(old)
+            except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+                _blog_warning(
+                    "forced cancel retry for %r still pending (%s); will "
+                    "retry next sync", format_intent_key(key), e,
+                )
+                continue
+            if not landed:
+                # ``execute_cancel`` still returns ``False``: the working
+                # order has not been cancelled. Keep the key parked for the
+                # next retry rather than releasing an un-landed cancel.
+                _blog_warning(
+                    "forced cancel retry for %r returned False (still "
+                    "pending); will retry next sync", format_intent_key(key),
+                )
+                continue
+            self._forced_cancel_pending.pop(key, None)
+            _blog_info(
+                "parked forced cancel for %r landed; released",
+                format_intent_key(key),
+            )
 
     def _dispatch_new(self, intent: Intent) -> None:
         # Quarantine gate: new entries are exactly the "new or
@@ -12107,7 +12909,7 @@ class OrderSyncEngine:
             # strict cancel (idempotent at the exchange via the
             # deterministic ``client_order_id``).
             try:
-                self._dispatch_cancel_strict(old)
+                landed = self._dispatch_cancel_strict(old)
             except OrderDispositionUnknownError as e:
                 _blog_warning(
                     "native-to-engine conversion deferred: cancel of %s "
@@ -12117,6 +12919,25 @@ class OrderSyncEngine:
                     old, e,
                 )
                 raise
+            if not landed:
+                # ``execute_cancel`` returned ``False`` — the native whole-row
+                # bracket did NOT land its cancel and may still rest live. The
+                # strict path kept ``old``'s mapping / envelope intact, so
+                # arming the engine-trigger partial legs now would let the live
+                # native bracket and the new legs both close size on the
+                # position (the §12 #4 coexistence violation). Signal a deferred
+                # conversion so :meth:`_diff_and_dispatch` keeps ``_active_intents``
+                # pointing at the OLD native intent; the next sync re-diffs and
+                # retries the strict cancel (idempotent via the deterministic
+                # ``client_order_id``) before any legs are armed.
+                _blog_warning(
+                    "native-to-engine conversion deferred: cancel of %s did "
+                    "not land (execute_cancel returned False); engine legs "
+                    "will not be armed until the next sync retries the cancel "
+                    "and observes the native bracket cleared",
+                    old,
+                )
+                raise _PartialBracketModifyDeferred(old.intent_key)
             self._dispatch_new(new)
             return
         old_env = self._build_envelope(old)
@@ -12216,7 +13037,23 @@ class OrderSyncEngine:
                     self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
                 # CloseIntent or mismatched kinds — cancel + re-execute.
-                self._dispatch_cancel(old)
+                if old.intent_key in self._forced_cancel_pending:
+                    # A prior cancel on this key is still un-landed; the
+                    # per-sync :meth:`_retry_forced_cancels` owns it.
+                    # Re-cancelling here would only double the broker
+                    # round-trip, and dispatching the replacement would
+                    # double-live the still-resting order. Defer the whole
+                    # modify until the parked cancel lands.
+                    _blog_warning(
+                        "modify %s -> %s deferred — a prior forced cancel "
+                        "on this key has not landed yet; retrying each sync",
+                        old, new,
+                    )
+                    raise _PartialBracketModifyDeferred(
+                        "cancel+re-execute modify deferred — forced cancel "
+                        "pending"
+                    )
+                landed = self._dispatch_cancel(old)
                 # If the cancel landed in cancel-tentative (default cancel
                 # path swallowed an ``OrderDispositionUnknownError`` and
                 # :meth:`_mark_intent_cancel_disposition_pending` was set),
@@ -12237,6 +13074,23 @@ class OrderSyncEngine:
                     raise _PartialBracketModifyDeferred(
                         "cancel+re-execute modify deferred — cancel "
                         "disposition pending"
+                    )
+                if not landed:
+                    # ``execute_cancel`` returned ``False``: the old working
+                    # order is still live (``_dispatch_cancel`` just parked
+                    # it). Dispatching the replacement now would double-live
+                    # the key — defer until the parked cancel lands, exactly
+                    # like the cancel-tentative case above.
+                    _blog_warning(
+                        "modify %s -> %s deferred — cancel of %s did not "
+                        "land (execute_cancel returned False); the "
+                        "replacement will be dispatched after the parked "
+                        "cancel lands",
+                        old, new, format_intent_key(old.intent_key),
+                    )
+                    raise _PartialBracketModifyDeferred(
+                        "cancel+re-execute modify deferred — cancel did "
+                        "not land"
                     )
                 self._dispatch_new(new)
         except OrderDispositionUnknownError as e:
@@ -12260,7 +13114,7 @@ class OrderSyncEngine:
             )
             raise
 
-    def _dispatch_cancel(self, old: Intent) -> None:
+    def _dispatch_cancel(self, old: Intent) -> bool:
         # Default cancel path: ``OrderDispositionUnknownError`` is logged
         # and swallowed — the next ``reconcile()`` pass observes whether
         # the exchange-side order is still live, and a subsequent cancel
@@ -12268,8 +13122,71 @@ class OrderSyncEngine:
         # exchange). Callers that must NOT proceed when the cancel
         # disposition is unknown should invoke
         # :meth:`_dispatch_cancel_strict` instead.
+        #
+        # Returns ``True`` when the caller may treat the cancel as settled
+        # (landed, benign no-op, or the unknown-disposition handling below
+        # — cancel-tentative / eager-retire — now owns the ambiguity, same
+        # as it always did). Returns ``False`` ONLY when ``execute_cancel``
+        # returned ``False``: the working order is still live at the
+        # broker, the intent has been parked in ``_forced_cancel_pending``
+        # for the per-sync retry, and the caller MUST NOT arm replacement
+        # state for the key (the cancel + re-execute modify path defers on
+        # this).
+        #
+        # Persist the cancel obligation BEFORE the broker round-trip (same
+        # ordering as :meth:`_attempt_short_gate_forced_cancel`). If the
+        # process dies in the window before the disposition lands, the
+        # working order rests live at the broker with NO journal row to
+        # re-drive its cancel — the in-memory map is gone, the script may
+        # never re-emit the intent, and nothing re-detects it
+        # (``reconcile()`` never cancels open orders and ``_active_intents``
+        # is empty after a restart). Parking first closes that window.
+        #
+        # The pre-park KIND depends on the intent. A SOFTWARE partial-bracket
+        # parent-entry cancel pre-parks as a ``'cancel_probe'``, NOT a
+        # ``'forced_cancel'``: the disposition is still unknown here, and a
+        # crash-stranded row must rehydrate through the OUTCOME-based
+        # cancel-tentative machine (``execute_cancel_with_outcome``
+        # distinguishes an ALREADY_FILLED parent from a confirmed cancel),
+        # never the bool-only ``_retry_forced_cancels`` — the latter reads a
+        # benign no-op ``True`` from a parent that filled during the window
+        # as a confirmed cancel and retires the live position's partial
+        # protection. The probe timestamp doubles as the stale-grace
+        # ``since_ts_ms`` so a crash-then-restart does not grant a fresh
+        # window. Any other cancel keeps the ``'forced_cancel'`` kind (the
+        # bool-only strict retry is correct for whole-row native exits and
+        # for non-SOFTWARE entries, and is the non-halting driver the short
+        # gate depends on).
+        #
+        # Every live outcome below reshapes the row to its final kind before
+        # returning: a landed / eager-retire cancel deletes it via
+        # ``_drop_envelope``'s ``record_complete``; BOTH an unknown-disposition
+        # timeout AND an ``execute_cancel`` ``False`` on a SOFTWARE parent
+        # entry convert the probe to a ``'cancel_tentative'`` row (the mark's
+        # atomic upsert via ``parked_coid``) so every subsequent retry runs
+        # through the OUTCOME-based machine. A ``False`` proves the parent
+        # live only at THIS instant — a resting parent can fill before a later
+        # retry, and the bool-only ``execute_cancel`` cannot tell a confirmed
+        # cancel from the benign no-op ``True`` a since-filled parent returns,
+        # so a bool-only retry would retire the now-live position's partial
+        # protection. An ``execute_cancel`` ``False`` on any OTHER cancel keeps
+        # the ``'forced_cancel'`` row (whole-row native exits and non-SOFTWARE
+        # entries never fill into unbacked partial protection, so the bool-only
+        # retry is the correct, non-halting driver the short gate depends on).
+        is_software_parent_entry = (
+            isinstance(old, EntryIntent)
+            and self._partial_qty_bracket_exit_mode is CapabilityLevel.SOFTWARE
+        )
+        parked_coid = self._park_forced_cancel(
+            old.intent_key, old,
+            kind='cancel_probe' if is_software_parent_entry else 'forced_cancel',
+            parked_ts_ms=(
+                self._cancel_tentative_now_ms()
+                if is_software_parent_entry else None
+            ),
+        )
         try:
-            self._dispatch_cancel_strict(old)
+            landed = self._dispatch_cancel_strict(old)
         except OrderDispositionUnknownError as e:
             _blog_warning(
                 "cancel dispatch for %s timed out (coid=%s); "
@@ -12305,26 +13222,99 @@ class OrderSyncEngine:
                 # on the fly each iteration (see
                 # :meth:`_drive_cancel_tentative`), so no persistent swap
                 # is needed to satisfy the plugin contract.
+                #
+                # Hand the speculative pre-park over to cancel-tentative:
+                # it owns the ambiguity through its own retry loop and keeps
+                # the envelope, so the forced-cancel retry must not
+                # double-drive the cancel — drop the in-memory entry — while
+                # the journal row is atomically CONVERTED (kind flip inside
+                # the mark's ``record_park`` upsert) rather than deleted, so
+                # the obligation stays restart-durable with no window in
+                # which neither row exists. Leg-less parents depend on this:
+                # the leg flip inside the mark is a no-op for them, leaving
+                # the converted row as the only durable trace.
+                self._forced_cancel_pending.pop(old.intent_key, None)
                 self._mark_intent_cancel_disposition_pending(
                     old.intent_key,
                     reason='parent_cancel_disposition_unknown',
                     now_ms=self._cancel_tentative_now_ms(),
+                    parked_coid=parked_coid,
                 )
-                return
+                return True
             # Non-partial-bracket cancel (CloseIntent never reaches here;
             # whole-row ExitIntent native cancel, or any EntryIntent in
             # modes other than SOFTWARE partial bracket): keep the
             # original eager-retire semantics. The strict path raised
             # before reaching its post-cancel cleanup, so mirror the
             # mapping / envelope drop and the pending-partials cleanup
-            # here — same as before this workstream.
+            # here — same as before this workstream. ``_drop_envelope``'s
+            # ``record_complete`` purges the speculative pre-park row; drop
+            # its in-memory retry entry too so the eager retire does not
+            # leave a durable forced cancel behind (unchanged net behaviour).
+            self._forced_cancel_pending.pop(old.intent_key, None)
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
             self._retire_pending_partials_for_cancelled_entry(
                 old, reason='parent_cancelled_by_strategy_unknown',
             )
+            return True
+        if not landed:
+            if is_software_parent_entry:
+                # A SOFTWARE partial-bracket parent entry whose cancel did NOT
+                # land must resolve through the OUTCOME-based cancel-tentative
+                # machine, exactly like the unknown-disposition timeout above —
+                # NOT the bool-only forced-cancel retry. ``execute_cancel``
+                # returning ``False`` proves the parent live only at THIS
+                # instant; a resting parent can fill before a later retry, and
+                # the bool-only ``execute_cancel`` cannot distinguish a
+                # confirmed cancel from the benign no-op ``True`` a filled
+                # parent returns — the strict retry would then retire the
+                # now-live position's partial protection. Hand the speculative
+                # pre-park to cancel-tentative (atomic ``'cancel_probe'`` ->
+                # ``'cancel_tentative'`` kind flip via ``parked_coid``, no
+                # delete+insert window); its retry loop drives
+                # ``execute_cancel_with_outcome``, which restores protection on
+                # ALREADY_FILLED and retires only on an unambiguous cancel.
+                # Drop the in-memory forced-cancel entry so the two retry loops
+                # do not double-drive the cancel — cancel-tentative now owns it.
+                _blog_warning(
+                    "cancel of %s did not land (execute_cancel returned "
+                    "False); entering cancel-tentative — the outcome-based "
+                    "retry loop resolves it (partial protection is restored if "
+                    "the parent filled) or the stale grace expires",
+                    format_intent_key(old.intent_key),
+                )
+                self._forced_cancel_pending.pop(old.intent_key, None)
+                self._mark_intent_cancel_disposition_pending(
+                    old.intent_key,
+                    reason='parent_cancel_did_not_land',
+                    now_ms=self._cancel_tentative_now_ms(),
+                    parked_coid=parked_coid,
+                )
+                return True
+            # ``execute_cancel``'s documented "cancel did not land, still
+            # pending" signal (e.g. a cTrader cancel/modify race, where the
+            # working order stays live and may still fill). The strict path
+            # kept the mapping / envelope / partial-bracket legs intact —
+            # exactly what the plugin asked for by returning ``False`` — so
+            # the pre-park (already a ``'forced_cancel'`` row for any
+            # non-SOFTWARE cancel) stays armed to re-drive the cancel every
+            # sync; the diff guard refuses to adopt or re-dispatch the key, and
+            # a later fill of the still-live order keeps routing normally.
+            _blog_warning(
+                "cancel of %s did not land (execute_cancel returned False); "
+                "parked for per-sync retry — the diff will not adopt or "
+                "re-dispatch the key until the cancel lands",
+                format_intent_key(old.intent_key),
+            )
+            return False
+        # Landed: the strict path's ``_drop_envelope`` -> ``record_complete``
+        # already purged the speculative pre-park row; drop its in-memory
+        # retry entry too.
+        self._forced_cancel_pending.pop(old.intent_key, None)
+        return True
 
-    def _dispatch_cancel_strict(self, old: Intent) -> None:
+    def _dispatch_cancel_strict(self, old: Intent) -> bool:
         """Cancel a dispatched intent and propagate unknown-disposition errors.
 
         Identical to :meth:`_dispatch_cancel` except a timed-out broker
@@ -12334,6 +13324,25 @@ class OrderSyncEngine:
         engine partial-bracket conversion, where leaving the native
         bracket possibly live while engine legs are armed would violate
         the §12 #4 coexistence invariant.
+
+        :return: The landedness of the cancel. ``True`` when the order is
+            provably gone (the plugin's :meth:`BrokerPlugin.execute_cancel`
+            returned truthy — a confirmed cancel or a benign no-op where no
+            live row matched) or the cancel was resolved engine-internally
+            (engine-trigger partial-bracket leg cascade, a ``CloseIntent``
+            with nothing to cancel, or the one-way bracket-clear). ``False``
+            ONLY when ``execute_cancel`` returned ``False`` — its documented
+            "cancel did not land, still pending" signal, meaning the broker
+            order may still rest. On ``False`` the engine-side tracking
+            state (``_order_mapping``, envelope, partial-bracket legs) is
+            deliberately KEPT — the order is live, its fills must keep
+            routing — and the teardown is deferred to the retry that
+            finally lands. Callers must not treat a ``False`` return as a
+            confirmed cancel: the short-gate forced cancel and the
+            swallowing :meth:`_dispatch_cancel` park the intent in
+            ``_forced_cancel_pending`` for the per-sync retry; the
+            remaining strict callers cancel whole-row native exits, whose
+            plugin paths never return ``False``.
         """
         # Engine-trigger partial bracket exits are engine-internal: the
         # leg rows were never sent to the broker, so a plugin
@@ -12352,7 +13361,7 @@ class OrderSyncEngine:
             )
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
-            return
+            return True
         if isinstance(old, EntryIntent):
             # A both-set entry's STOP leg is a software watch; the strategy
             # cancel below cancels the native LIMIT working order, so retire
@@ -12371,10 +13380,11 @@ class OrderSyncEngine:
             # CloseIntent is immediate market — nothing to cancel.
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
-            return
+            return True
         cancel_envelope = self._build_cancel_envelope(cancel)
         _blog_info("cancelling %s", cancel)
         port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        cancelled = True
         try:
             if port is not None and isinstance(old, ExitIntent):
                 # Hedging-mode emulation: a whole-row exit's bracket lives
@@ -12389,15 +13399,33 @@ class OrderSyncEngine:
                     ),
                 )
             else:
-                self._run_async_write(self._broker.execute_cancel(cancel_envelope))
+                # ``execute_cancel`` returns a bool: ``True`` = confirmed
+                # cancel or benign no-op (order already gone), ``False`` =
+                # "cancel did not land, still pending". Capture it so the
+                # short-gate forced-cancel path can keep an un-landed cancel
+                # parked instead of treating a clean return as proof the
+                # resting sell is gone.
+                cancelled = bool(
+                    self._run_async_write(
+                        self._broker.execute_cancel(cancel_envelope),
+                    ),
+                )
         except BrokerManualInterventionError as e:
             self._record_halt(e)
             raise
-        self._order_mapping.pop(old.intent_key, None)
-        self._drop_envelope(old.intent_key)
-        self._retire_pending_partials_for_cancelled_entry(
-            old, reason='parent_cancelled_by_strategy',
-        )
+        if cancelled:
+            self._order_mapping.pop(old.intent_key, None)
+            self._drop_envelope(old.intent_key)
+            self._retire_pending_partials_for_cancelled_entry(
+                old, reason='parent_cancelled_by_strategy',
+            )
+        # ``False``: the working order is still live at the broker — keep
+        # the mapping / envelope / partial-bracket legs intact (the plugin
+        # returned ``False`` precisely so the engine keeps tracking the
+        # order: a later fill must still route and promote its protection).
+        # The caller parks the intent for the per-sync retry; the teardown
+        # above runs when a retry finally lands.
+        return cancelled
 
     def _retire_pending_partials_for_cancelled_entry(
             self, old: Intent, *, reason: str,

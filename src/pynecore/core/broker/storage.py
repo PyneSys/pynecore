@@ -127,12 +127,19 @@ class PendingRecord:
     :meth:`OrderSyncEngine._diff_and_dispatch` re-emits a modify rather
     than a fresh order). Defaults to ``'new'`` for pre-v3 rows and any
     code path that did not specify the kind explicitly.
+
+    ``parked_ts_ms`` is the row's park timestamp (epoch ms). For
+    ``dispatch_kind='cancel_tentative'`` rows it carries the original
+    cancel-tentative ``since_ts_ms`` anchor so a restart re-arms the
+    stale-grace deadline without slippage (see
+    :meth:`OrderSyncEngine._absorb_journal_retry_rows`).
     """
     key: str
     coid: str
     resolution: str | None = None
     dispatch_kind: str = 'new'
     order_ids: list[str] = field(default_factory=list)
+    parked_ts_ms: int = 0
 
 
 @dataclass
@@ -1296,6 +1303,7 @@ class RunContext:
     def record_park(
             self, coid: str, key: str, *, kind: str = 'new',
             order_ids: list[str] | None = None,
+            parked_ts_ms: int | None = None,
     ) -> None:
         """Persist a parked dispatch (unknown-disposition response).
 
@@ -1314,26 +1322,64 @@ class RunContext:
         :param key: The ``intent_key`` this parked dispatch belongs to.
         :param kind: ``'new'`` (default) when the parked dispatch was an
             ``execute_*`` call (new order), ``'modify'`` when it was a
-            ``modify_entry`` / ``modify_exit``. The value is overwritten
-            on re-park — a modify-park can be replaced by a later
-            new-park and vice versa. The engine uses this when
-            processing a ``'rejected'`` resolution to decide whether to
-            clear the ``_active_intents`` / ``_order_mapping`` slot
-            (kind='new') or to keep the original mapping and only drop
-            the envelope (kind='modify' — the original exchange order is
-            still live).
+            ``modify_entry`` / ``modify_exit``, ``'forced_cancel'`` when
+            the row records an intent the engine decided to cancel whose
+            cancel did not provably land (see
+            ``OrderSyncEngine._park_forced_cancel`` — these rows re-arm
+            the forced-cancel retry after a restart and never enter the
+            ``get_open_orders`` matching path), ``'cancel_tentative'``
+            when the row records a parent whose cancel disposition is
+            unresolved (see
+            ``OrderSyncEngine._mark_intent_cancel_disposition_pending``
+            — these rows re-arm the cancel-tentative retry loop after a
+            restart independently of partial-bracket leg rows, and never
+            enter the ``get_open_orders`` matching path either), or
+            ``'cancel_probe'`` for the speculative pre-park a SOFTWARE
+            partial-bracket parent-entry cancel writes BEFORE the broker
+            round-trip (see ``OrderSyncEngine._dispatch_cancel``). A
+            ``'cancel_probe'`` row exists only inside the crash window
+            between the pre-park and the disposition landing: on a live
+            path it is immediately reshaped to its final kind
+            (``'cancel_tentative'`` on an unknown-disposition timeout,
+            ``'forced_cancel'`` on an ``execute_cancel`` ``False``, or
+            deleted on a landed cancel). If a crash strands one, the
+            restart rehydrates it through the OUTCOME-based
+            cancel-tentative machine (``execute_cancel_with_outcome``,
+            which distinguishes ALREADY_FILLED from CANCEL_CONFIRMED)
+            instead of the bool-only forced-cancel retry — the latter
+            would mistake a parent that filled during the window for a
+            confirmed cancel and retire the live position's protection.
+            The value is overwritten on re-park — a modify-park can be
+            replaced by a later new-park and vice versa; the engine's
+            cancel-probe-to-cancel-tentative / cancel-probe-to-forced-cancel
+            ownership transfer relies on this UPDATE being atomic (a
+            single row flips kind, no delete+insert window). The engine
+            uses this when processing
+            a ``'rejected'`` resolution to decide whether to clear the
+            ``_active_intents`` / ``_order_mapping`` slot (kind='new')
+            or to keep the original mapping and only drop the envelope
+            (kind='modify' — the original exchange order is still live).
         :param order_ids: The ``_order_mapping[key]`` snapshot captured at
             park time (the exchange order IDs), persisted as a JSON array
             so a post-restart modify-rejected resolution can recover them
             and avoid a duplicate ``execute_*`` dispatch. Defaults to an
             empty list.
+        :param parked_ts_ms: Explicit park timestamp (epoch ms); defaults
+            to now. ``'cancel_tentative'`` and ``'cancel_probe'`` rows pass
+            the mark / pre-park time so the restart re-arm restores the
+            original stale-grace deadline instead of granting a fresh
+            window.
         """
-        if kind not in ('new', 'modify'):
+        if kind not in (
+                'new', 'modify', 'forced_cancel',
+                'cancel_tentative', 'cancel_probe',
+        ):
             raise ValueError(
                 f"record_park: unknown kind {kind!r}; "
-                f"expected 'new' or 'modify'"
+                f"expected 'new', 'modify', 'forced_cancel', "
+                f"'cancel_tentative' or 'cancel_probe'"
             )
-        now = _now_ms()
+        now = _now_ms() if parked_ts_ms is None else parked_ts_ms
         ids_json = json.dumps(order_ids) if order_ids else '[]'
         with self._store.transaction():
             self._store._conn.execute(
@@ -1453,7 +1499,7 @@ class RunContext:
             ).fetchall()
             pending_rows = conn.execute(
                 "SELECT client_order_id, intent_key, resolution, "
-                "       dispatch_kind, order_ids "
+                "       dispatch_kind, order_ids, parked_ts_ms "
                 "FROM pending_verifications "
                 "WHERE run_id = ?",
                 (self.run_id,),
@@ -1474,6 +1520,7 @@ class RunContext:
                 resolution=row['resolution'],
                 dispatch_kind=row['dispatch_kind'] or 'new',
                 order_ids=json.loads(raw_ids),
+                parked_ts_ms=int(row['parked_ts_ms']),
             )
 
         return envelopes, pending
@@ -1491,7 +1538,7 @@ class RunContext:
         with self._store.read_lock() as conn:
             rows = conn.execute(
                 "SELECT client_order_id, intent_key, resolution, "
-                "       dispatch_kind, order_ids "
+                "       dispatch_kind, order_ids, parked_ts_ms "
                 "FROM pending_verifications "
                 "WHERE run_id = ? AND resolution IS NOT NULL",
                 (self.run_id,),
@@ -1503,6 +1550,7 @@ class RunContext:
                 resolution=row['resolution'],
                 dispatch_kind=row['dispatch_kind'] or 'new',
                 order_ids=json.loads(row['order_ids'] or '[]'),
+                parked_ts_ms=int(row['parked_ts_ms']),
             )
             for row in rows
         ]

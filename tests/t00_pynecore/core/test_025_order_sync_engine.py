@@ -109,6 +109,7 @@ class MockBroker:
     raise_on_next_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
     raise_on_next_cancel: Exception | None = None
+    false_on_next_cancel: bool = False
     raise_on_next_get_open_orders: Exception | None = None
     raise_on_next_get_position: Exception | None = None
     # The mock emulates a margin-style venue (shorts and reversals are the
@@ -187,6 +188,9 @@ class MockBroker:
             err = self.raise_on_next_cancel
             self.raise_on_next_cancel = None
             raise err
+        if self.false_on_next_cancel:
+            self.false_on_next_cancel = False
+            return False
         return True
 
     async def modify_entry(self, old, new):
@@ -6542,6 +6546,348 @@ def __test_short_gate_modify_late_old_order_fill_not_credited__():
     assert len(b.entry_calls) == 1
 
 
+def __test_short_gate_fill_time_reconcile_cancels_unbacked_sell__():
+    """F3-deep regression: the dispatch gate proves ``position >= working
+    sells`` only at DISPATCH time. A late fill from a retired (cancel +
+    re-execute) order erodes the position below the replacement sell's
+    still-working qty AFTER dispatch. Nothing re-checks the resting sell, so
+    it could fill into an oversell through the async window. The fill-time
+    reconcile must cancel the now-unbacked resting sell — without halting."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1  # order id xchg-1, 5 - 5 = 0 backs it exactly
+
+    # Amend "S" (price change) -> replace-style modify: xchg-1 is retired, a
+    # fresh resting sell of 5 lands under xchg-2, the fill ledger resets to 0.
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert len(b.modify_entry_calls) == 1
+
+    # A straggling fill of 2 from the CANCELLED old order (xchg-1) arrives.
+    # ``record_fill`` sells 2 against the long (5 -> 3 real inventory), the
+    # retired-order guard keeps it OUT of the replacement's ledger. Now the
+    # replacement works all 5 units against a position of only 3: 3 - 5 = -2.
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+
+    # The fill-time reconcile cancelled the unbacked resting sell "S" at the
+    # broker (xchg-2) so it can never fill into the oversell — and kept the
+    # bot running (no halt). Without the fix "S" stays live and cancel_calls
+    # is empty.
+    assert engine.halted is False
+    assert len(b.cancel_calls) == 1
+    assert b.cancel_calls[0].intent.pine_id == "S"
+    assert "S" not in engine.active_intents
+
+
+def __test_short_gate_fill_time_reconcile_noop_when_still_backed__():
+    """The reconcile must NOT over-cancel: a fill that leaves the position
+    still covering the aggregate working sell qty leaves the resting sell
+    untouched (mirrors the F3 fill-not-credited scenario, which stays flat)."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1  # 5 - 3 = 2 backs it
+
+    pos.entry_orders["S"] = _order_order("S", -3.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.modify_entry_calls) == 1
+
+    # A late fill of 1 from the retired old order: 5 -> 4, ledger stays 0.
+    # 4 - 3 = 1 >= 0, so the resting sell is still fully backed: no cancel.
+    engine.on_order_event(_fill_event(
+        'sell', 1.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=1.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 4.0
+
+    assert engine.halted is False
+    assert b.cancel_calls == []
+    assert "S" in engine.active_intents
+
+
+def __test_short_gate_fill_time_reconcile_noop_on_short_capable_venue__():
+    """The fill-time reconcile is a spot-only guard. On a short-capable
+    (margin) venue the position may legitimately go negative, so an eroding
+    fill must never cancel a resting sell."""
+    b = MockBroker()  # default capabilities: short_selling NATIVE
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.modify_entry_calls) == 1
+
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+
+    # Short selling is supported: no reconcile, the resting sell stays live.
+    assert engine.halted is False
+    assert b.cancel_calls == []
+    assert "S" in engine.active_intents
+
+
+def _reconcile_deficit_setup() -> tuple[MockBroker, OrderSyncEngine, BrokerPosition]:
+    """Spot engine with a replacement sell "S" (xchg-2, works 5) and a
+    long of 5, ready for a late retired-order fill of 2 to erode the position
+    to 3 and leave the resting sell unbacked (deficit 2)."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 5.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 5.0))
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+    engine.sync(BAR_TS)  # xchg-1
+    pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)  # replace -> xchg-2, fill ledger reset to 0
+    assert len(b.modify_entry_calls) == 1
+    return b, engine, pos
+
+
+def __test_short_gate_reconcile_failed_cancel_parks_and_retries__():
+    """F1 regression: the corrective cancel can fail with a dropped link
+    (``ExchangeConnectionError``). The engine must NOT leave the half-cancelled
+    order for the cross-restart adoption branch to silently reclaim as healthy
+    — that resurrects the unbacked sell. The cancel is parked and re-attempted
+    every sync (never halting); the diff refuses to adopt / re-dispatch the key
+    until it lands."""
+    b, engine, pos = _reconcile_deficit_setup()
+
+    # The broker link drops exactly during the corrective cancel.
+    b.raise_on_next_cancel = ExchangeConnectionError("cancel link dropped")
+    # Late fill of 2 from the retired old order (xchg-1): 5 -> 3, working sell
+    # stays 5, so 3 - 5 = -2 deficit. The reconcile tries to cancel "S".
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+
+    # Cancel attempted once and failed -> parked, bot still running, and the
+    # order is NOT silently kept active.
+    assert engine.halted is False
+    assert "S" in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 1
+
+    # Next sync, "S" still emitted by Pine, link STILL down: the adoption
+    # branch must NOT reclaim the surviving mapping as a healthy order (the
+    # pre-fix bug), and the still-unresolved cancel must not re-dispatch into a
+    # halt. It defers; the retry re-attempts the cancel.
+    b.raise_on_next_cancel = ExchangeConnectionError("still down")
+    engine.sync(BAR_TS + 120_000)
+    assert engine.halted is False
+    assert "S" not in engine.active_intents          # adoption guard held
+    assert "S" in engine._forced_cancel_pending
+    assert len(b.cancel_calls) == 2                   # retry attempted
+
+    # Link recovers and the strategy drops "S": the parked cancel lands and the
+    # key is released — no halt, no lingering unbacked order.
+    pos.entry_orders.pop("S")
+    engine.sync(BAR_TS + 180_000)
+    assert engine.halted is False
+    assert "S" not in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 3                   # cancel landed
+
+
+def __test_short_gate_reconcile_unknown_disposition_parks_no_premature_halt__():
+    """F1 regression: an ambiguous cancel timeout
+    (``OrderDispositionUnknownError``) means the resting sell MAY still be live.
+    Pre-fix, ``_dispatch_cancel`` swallowed it and dropped the mapping, so the
+    next sync re-dispatched into a dispatch-time halt while the order might
+    still rest. The durable path parks it and keeps retrying without halting
+    until the disposition provably resolves."""
+    b, engine, pos = _reconcile_deficit_setup()
+
+    b.raise_on_next_cancel = OrderDispositionUnknownError(
+        "cancel timed out", client_order_id="xchg-2",
+    )
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+    assert engine.halted is False
+    assert "S" in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 1
+
+    # Disposition STILL ambiguous on retry, "S" still emitted: the engine must
+    # keep deferring, NOT halt (the pre-fix code would already have halted on
+    # the re-dispatch of the first post-swallow sync).
+    b.raise_on_next_cancel = OrderDispositionUnknownError(
+        "cancel still ambiguous", client_order_id="xchg-2",
+    )
+    engine.sync(BAR_TS + 120_000)
+    assert engine.halted is False
+    assert "S" in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 2
+
+    # The cancel is finally confirmed and the strategy drops "S": released.
+    pos.entry_orders.pop("S")
+    engine.sync(BAR_TS + 180_000)
+    assert engine.halted is False
+    assert "S" not in engine._forced_cancel_pending
+    assert len(b.cancel_calls) == 3
+
+
+def __test_short_gate_reconcile_false_cancel_parks_and_retries__():
+    """The corrective cancel can return ``False`` WITHOUT raising —
+    ``execute_cancel``'s documented "cancel did not land, still pending"
+    signal. Treating a clean return as proof the resting sell is gone would let
+    the diff re-adopt / re-dispatch and resurrect the unbacked exposure. The
+    engine must park the key (never halting) and keep retrying until a truthy
+    return proves the cancel landed."""
+    b, engine, pos = _reconcile_deficit_setup()
+
+    # The corrective cancel returns False (still pending), no exception.
+    b.false_on_next_cancel = True
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+
+    # Cancel attempted once, returned False -> parked, bot still running, the
+    # order is NOT treated as cancelled.
+    assert engine.halted is False
+    assert "S" in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 1
+
+    # Next sync, "S" still emitted by Pine, cancel STILL returns False: the
+    # adoption branch must NOT reclaim the surviving mapping as a healthy order,
+    # and the still-unlanded cancel must not re-dispatch into a halt. It defers;
+    # the retry re-attempts the cancel (once per sync).
+    b.false_on_next_cancel = True
+    engine.sync(BAR_TS + 120_000)
+    assert engine.halted is False
+    assert "S" not in engine.active_intents          # adoption guard held
+    assert "S" in engine._forced_cancel_pending
+    assert len(b.cancel_calls) == 2                   # single retry this sync
+
+    # The cancel finally lands (truthy) and the strategy drops "S": released —
+    # no halt, no lingering unbacked order.
+    pos.entry_orders.pop("S")
+    engine.sync(BAR_TS + 180_000)
+    assert engine.halted is False
+    assert "S" not in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert len(b.cancel_calls) == 3                   # cancel landed
+
+
+def __test_short_gate_reconcile_failed_first_cancel_continues_to_next__():
+    """A failed cancel must NOT count towards the deficit. With TWO resting
+    sells, if the newest cancel does not land (``execute_cancel`` returns
+    ``False`` — still parked, still fillable), the loop must keep the deficit
+    intact and cancel the next candidate so the CONFIRMED-remaining exposure is
+    backed. Subtracting the parked order's working qty would stop the loop
+    early, leaving a second sell live and adopted as healthy — both could then
+    fill and drive the venue short."""
+    b = _spot_broker()
+    engine, pos = _mk_engine(b)
+    pos.size = 9.0
+    pos.sign = 1.0
+    pos.open_trades.append(_long_trade("L", 9.0))
+    # Two resting sells of 4 each: 4 + 4 = 8 <= 9 backs both at dispatch.
+    pos.entry_orders["S1"] = _order_order("S1", -4.0, limit=50_000.0)
+    pos.entry_orders["S2"] = _order_order("S2", -4.0, limit=52_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+
+    # Replace-style modify of the NEWEST sell "S2" (price change): its old
+    # order is retired, a fresh resting sell of 4 lands, the ledger resets.
+    pos.entry_orders["S2"] = _order_order("S2", -4.0, limit=53_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.modify_entry_calls) == 1
+
+    # A straggling fill of 4 from the CANCELLED old "S2" order (xchg-2) erodes
+    # the long 9 -> 5; the retired-order guard keeps it out of "S2"'s ledger,
+    # so both sells still work 4 each: reserved 8 vs position 5 => deficit 3.
+    # The newest-first cancel of "S2" returns False (parked, still live).
+    b.false_on_next_cancel = True
+    engine.on_order_event(_fill_event(
+        'sell', 4.0, 50_000.0, pine_id="S2", xchg_id="xchg-2",
+        event_type='filled', filled_qty=4.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 5.0
+
+    # The failed "S2" cancel did NOT satisfy the deficit, so the loop went on
+    # to cancel "S1" too (which landed). Confirmed-remaining exposure is the
+    # parked "S2" (4) alone against a position of 5 — backed. Both orders were
+    # cancelled at the broker; neither is left adopted as a healthy sell.
+    assert engine.halted is False
+    assert [c.intent.pine_id for c in b.cancel_calls] == ["S2", "S1"]
+    assert "S2" in engine._forced_cancel_pending      # parked, retried
+    assert "S1" not in engine.active_intents          # cancel landed
+    assert "S2" not in engine.active_intents          # popped + parked
+
+
+def __test_short_gate_dispatch_counts_parked_forced_cancel_sell__():
+    """A forced-cancel-pending sell has left ``_active_intents`` but its working
+    order may still rest live at the broker until the cancel lands. The dispatch
+    gate must fold it into the reservation, otherwise a DIFFERENT sell can be
+    admitted against inventory the parked order still reserves — both then fill
+    and take a short-incapable venue negative."""
+    b, engine, pos = _reconcile_deficit_setup()
+
+    # Park "S" (works 5, still live) via a corrective cancel that returns False.
+    b.false_on_next_cancel = True
+    engine.on_order_event(_fill_event(
+        'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+        event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+    ))
+    engine.apply_async_events()
+    assert pos.size == 3.0
+    assert "S" in engine._forced_cancel_pending
+    assert "S" not in engine.active_intents
+    assert engine._parked_working_sell_qty() == 5.0
+
+    # A DIFFERENT sell "S2" of 3 is emitted while "S" stays parked-but-live.
+    # A bare active-only aggregation would see reserved=0 and pass (3 - 3 = 0);
+    # counting the still-live parked "S" (works 5) projects 3 - 5 - 3 = -5, so
+    # the gate halts and never dispatches "S2" — preventing the S + S2 oversell.
+    # Keep "S"'s retry from landing this sync so it stays counted.
+    b.false_on_next_cancel = True
+    pos.entry_orders["S2"] = _order_order("S2", -3.0, limit=52_000.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS + 120_000)
+
+    assert engine.halted is True
+    assert "S2" not in engine.active_intents  # blocked before the broker call
+    assert len(b.entry_calls) == 1            # only the original "S" dispatch
+
+
 def __test_short_gate_filled_sell_entry_not_double_reserved__():
     """F2 regression: a FILLED sell entry stays in ``_active_intents`` (it is
     the diff sentinel for the sticky Pine order) while ``record_fill`` already
@@ -6707,6 +7053,322 @@ def __test_short_gate_restart_recovered_entry_seeds_fill_ledger__(tmp_path):
         # Only the flatten dispatches fresh; "S" adopts the recovered order.
         assert len(b2.entry_calls) == 1
         assert b2.entry_calls[0].intent.pine_id == "F"
+
+
+def __test_short_gate_restart_recovered_unbacked_sell_cancelled_same_sync__(tmp_path):
+    """A cross-restart recovered resting sell the prior run left UNBACKED must
+    be cancelled on the FIRST post-restart sync, not the next one.
+
+    :meth:`_verify_pending_dispatches` seeds only ``_order_mapping`` for the
+    recovered order; the script's re-emission adopts it into ``_active_intents``
+    inside :meth:`_diff_and_dispatch`, so the pre-diff short-gate pass cannot
+    see it yet. Without a post-diff re-scan the unbacked sell would rest live at
+    the broker for a full extra bar (oversell window). The post-diff pass
+    catches the freshly-adopted sell and cancels it in the same sync."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="S", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src",
+                             script_path="t025.py")
+        b = MockBroker(capabilities=ExchangeCapabilities())
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 5.0
+        pos.sign = 1.0
+        pos.open_trades.append(_long_trade("L", 5.0))
+        pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+        b.raise_on_next_entry = OrderDispositionUnknownError(
+            "simulated timeout", client_order_id=coid,
+        )
+        engine.sync(BAR_TS)  # parks the sell under unknown disposition
+        assert coid in engine.pending_verification
+
+        # Crash / restart. The sell landed live (0 filled) but the long was
+        # reduced to 3 while the bot was down (an exit the prior run's forced
+        # cancel of "S" never completed against). The recovered book therefore
+        # holds a resting sell of 5 against a long of only 3 — unbacked by 2.
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src",
+                              script_path="t025.py")
+        b2 = MockBroker(capabilities=ExchangeCapabilities())
+        b2.open_orders = [ExchangeOrder(
+            id="live-1", symbol=SYMBOL, side="sell",
+            order_type=OrderType.LIMIT, qty=5.0, filled_qty=0.0,
+            remaining_qty=5.0, price=50_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="",
+            client_order_id=coid,
+        )]
+        pos2 = BrokerPosition()
+        engine2 = OrderSyncEngine(
+            broker=b2,  # type: ignore[arg-type]
+            position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx2,
+        )
+        pos2.size = 3.0
+        pos2.sign = 1.0
+        pos2.open_trades.append(_long_trade("L", 3.0))
+        # Script re-emits the sticky sell entry: 3 - 5 = -2 unbacked.
+        pos2.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+
+        engine2.sync(BAR_TS + 60_000)
+
+        # The recovered unbacked sell is cancelled in THIS sync (post-diff
+        # pass), never halting, and not left as a healthy adopted order.
+        assert engine2.halted is False
+        assert len(b2.cancel_calls) == 1
+        assert b2.cancel_calls[0].intent.pine_id == "S"
+        assert "S" not in engine2.active_intents
+        assert "S" not in engine2._forced_cancel_pending
+
+
+def __test_forced_cancel_survives_restart_reissued_from_journal__(tmp_path):
+    """A parked forced cancel is journaled, so a crash while parked cannot
+    orphan the still-live unbacked sell. Pre-fix the pending map was
+    memory-only: if the script no longer re-emitted the intent after the
+    restart, NOTHING re-detected the un-landed cancel and the resting sell
+    stayed live at the broker indefinitely (the oversell the short gate
+    exists to prevent). The ``dispatch_kind='forced_cancel'`` journal row
+    re-arms the retry on the first post-restart sync — with no script
+    re-emission and no order-recovery needed — and the landed cancel deletes
+    the row along with the envelope."""
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src",
+                             script_path="t025.py")
+        b = _spot_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 5.0
+        pos.sign = 1.0
+        pos.open_trades.append(_long_trade("L", 5.0))
+        pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+        engine.sync(BAR_TS)  # xchg-1
+        pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
+        engine.sync(BAR_TS + 60_000)  # replace -> xchg-2, fill ledger reset
+        assert len(b.modify_entry_calls) == 1
+
+        # A late fill from the retired xchg-1 erodes the long to 3: the
+        # fill-time reconcile force-cancels the resting sell, but the cancel
+        # does not land — parked AND journaled.
+        b.false_on_next_cancel = True
+        engine.on_order_event(_fill_event(
+            'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+            event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+        ))
+        engine.apply_async_events()
+        assert "S" in engine._forced_cancel_pending
+        assert len(b.cancel_calls) == 1
+
+        # Crash while parked. The fresh run's script does NOT re-emit "S"
+        # (the signal is gone), so nothing but the journal row knows the
+        # resting sell still needs cancelling.
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src",
+                              script_path="t025.py")
+        b2 = _spot_broker()
+        pos2 = BrokerPosition()
+        engine2 = OrderSyncEngine(
+            broker=b2,  # type: ignore[arg-type]
+            position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx2,
+        )
+        pos2.size = 3.0
+        pos2.sign = 1.0
+        pos2.open_trades.append(_long_trade("L", 3.0))
+
+        # The journal re-armed the forced cancel at construction already.
+        assert "S" in engine2._forced_cancel_pending
+
+        engine2.sync(BAR_TS + 120_000)
+
+        # The first post-restart sync re-drives and lands the cancel —
+        # never halting — and the journal row dies with the envelope.
+        assert engine2.halted is False
+        assert len(b2.cancel_calls) == 1
+        assert b2.cancel_calls[0].intent.pine_id == "S"
+        assert "S" not in engine2._forced_cancel_pending
+        envelopes, pending = ctx2.replay()
+        assert "S" not in envelopes
+        assert not pending
+
+
+def __test_forced_cancel_restart_recovers_working_sell_qty_from_orders__(tmp_path):
+    """F2 regression: a forced cancel rehydrated from the journal synthesizes a
+    ``qty=0.0`` placeholder intent (only identity drives the cancel). If the
+    cancel stays un-landed after the restart the still-live resting SELL order
+    keeps claiming inventory, yet ``_parked_working_sell_qty`` read 0.0 from the
+    placeholder — so a DIFFERENT sell passed the short gate and both could fill,
+    an oversell on a short-incapable venue. The working residual is now
+    recovered from the authoritative ``orders`` table (side + qty + filled_qty),
+    so the parked exposure is reserved and the second sell halts."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.models import EntryIntent
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src",
+                             script_path="t025.py")
+        b = _spot_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 5.0
+        pos.sign = 1.0
+        pos.open_trades.append(_long_trade("L", 5.0))
+        pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
+        engine.sync(BAR_TS)  # xchg-1
+        pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
+        engine.sync(BAR_TS + 60_000)  # replace -> xchg-2, fill ledger reset
+
+        # The real plugin persists the resting sell order row; MockBroker does
+        # not, so mirror that persistence — the authoritative residual the
+        # recovery reads after the restart lives in the ``orders`` table.
+        ctx.upsert_order(
+            "sell-S", symbol=SYMBOL, side="sell", qty=5.0, state="confirmed",
+            intent_key="S", filled_qty=0.0,
+        )
+
+        # A late fill from the retired xchg-1 erodes the long to 3; the
+        # fill-time reconcile force-cancels the resting sell but the cancel does
+        # not land -> parked AND journaled.
+        b.false_on_next_cancel = True
+        engine.on_order_event(_fill_event(
+            'sell', 2.0, 50_000.0, pine_id="S", xchg_id="xchg-1",
+            event_type='filled', filled_qty=2.0, remaining_qty=0.0,
+        ))
+        engine.apply_async_events()
+        assert "S" in engine._forced_cancel_pending
+        ctx.close()
+
+        # Crash while parked. The fresh run does NOT re-emit "S".
+        ctx2 = store.open_run(_restart_identity(), script_source="src",
+                              script_path="t025.py")
+        b2 = _spot_broker()
+        pos2 = BrokerPosition()
+        engine2 = OrderSyncEngine(
+            broker=b2,  # type: ignore[arg-type]
+            position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx2,
+        )
+        pos2.size = 3.0
+        pos2.sign = 1.0
+        pos2.open_trades.append(_long_trade("L", 3.0))
+
+        # The journal re-armed "S" with a synthesized qty=0.0 placeholder.
+        assert "S" in engine2._forced_cancel_pending
+        assert engine2._forced_cancel_pending["S"].qty == 0.0
+        # Pre-fix the placeholder reserved 0.0; the orders-table recovery now
+        # supplies the still-live working residual of 5.0.
+        assert engine2._parked_working_sell_qty() == 5.0
+
+        # A DIFFERENT sell "S2" of 3 against the eroded long of 3 would pass a
+        # bare active-only gate (3 - 3 = 0) and oversell alongside the parked
+        # "S"; counting the recovered parked 5 projects 3 - 5 - 3 = -5, so the
+        # dispatch gate halts before the broker call.
+        s2 = EntryIntent(
+            pine_id="S2", symbol=SYMBOL, side='sell', qty=3.0,
+            order_type=OrderType.MARKET,
+        )
+        with pytest.raises(BrokerManualInterventionError):
+            engine2._enforce_short_gate(s2)
+        assert engine2.halted is True
+
+
+def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
+    """General-path (non-short-gate) regression for the un-landed cancel: a
+    working entry the script dropped is cancelled through the default diff
+    path, but ``execute_cancel`` returns ``False`` — the order is still live.
+    Pre-fix the bool was discarded and the strict path tore the mapping /
+    envelope down anyway, so a same-key re-emit dispatched a SECOND working
+    order next to the still-resting one (2x exposure), and the retired
+    partial-bracket state would have left an eventual fill unprotected. Now
+    the tracking state survives, the key parks, the diff defers the re-emit,
+    and the retry re-drives the cancel until it lands. Runs on a
+    short-capable venue to prove the mechanism is venue-independent."""
+    b = MockBroker()  # short_selling NATIVE — short gate inactive
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["E"] = _order_order("E", 3.0, limit=100.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    assert "E" in engine.order_mapping
+
+    # Script drops the entry; the broker reports the cancel did not land.
+    pos.entry_orders.pop("E")
+    b.false_on_next_cancel = True
+    engine.sync(BAR_TS + 60_000)
+    assert engine.halted is False
+    assert "E" in engine._forced_cancel_pending
+    assert len(b.cancel_calls) == 1
+    # The strict path kept the tracking state — the order is still live and
+    # its fills must keep routing.
+    assert "E" in engine.order_mapping
+
+    # Script re-emits the same entry while the cancel is still un-landed:
+    # the diff must defer (no second working order next to the resting one)
+    # and the per-sync retry re-drives the cancel exactly once.
+    pos.entry_orders["E"] = _order_order("E", 3.0, limit=100.0)
+    b.false_on_next_cancel = True
+    engine.sync(BAR_TS + 120_000)
+    assert engine.halted is False
+    assert len(b.cancel_calls) == 2                   # retry, still False
+    assert len(b.entry_calls) == 1                    # NO double-open
+    assert "E" in engine._forced_cancel_pending
+    assert "E" not in engine.active_intents           # deferred, not adopted
+
+    # The cancel finally lands: the key is released, the teardown runs, and
+    # the still-wanted entry re-dispatches fresh on the same sync's diff.
+    engine.sync(BAR_TS + 180_000)
+    assert engine.halted is False
+    assert "E" not in engine._forced_cancel_pending
+    assert len(b.cancel_calls) == 3                   # landed
+    assert len(b.entry_calls) == 2                    # re-dispatched after
+
+
+def __test_modify_cancel_reexecute_deferred_while_cancel_unlanded__():
+    """Mismatched-kind modify (cancel + re-execute): when the cancel of the
+    old working order does not land (``execute_cancel`` returns ``False``),
+    the replacement must NOT be dispatched in the same sync — the old order
+    is still live and a fresh dispatch would double-live the key. The modify
+    defers (old intent stays active for the next re-diff) until the parked
+    cancel lands; a repeat attempt while parked defers WITHOUT another
+    broker cancel round-trip (the per-sync retry owns the cancel)."""
+    from pynecore.core.broker.sync_engine import _PartialBracketModifyDeferred
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["E"] = _order_order("E", 3.0, limit=100.0)
+    engine.sync(BAR_TS)
+    old = engine.active_intents["E"]
+    new = CloseIntent(pine_id="E", symbol=SYMBOL, side='sell', qty=3.0)
+
+    b.false_on_next_cancel = True
+    with pytest.raises(_PartialBracketModifyDeferred):
+        engine._dispatch_modify(old, new)
+    assert "E" in engine._forced_cancel_pending
+    assert b.close_calls == []            # replacement NOT dispatched
+    assert len(b.cancel_calls) == 1
+
+    with pytest.raises(_PartialBracketModifyDeferred):
+        engine._dispatch_modify(old, new)
+    assert len(b.cancel_calls) == 1       # no duplicate cancel round-trip
+    assert b.close_calls == []
 
 
 def __test_strategy_order_market_reduce_is_not_folded_on_margin__():

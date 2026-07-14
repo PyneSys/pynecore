@@ -333,9 +333,12 @@ def __test_replay_round_trip_envelope_and_pending__(tmp_path: Path) -> None:
         "Long": EnvelopeRecord(key="Long", bar_ts_ms=BAR_TS, retry_seq=0),
         "TP\0Long": EnvelopeRecord(key="TP\0Long", bar_ts_ms=BAR_TS, retry_seq=1),
     }
-    assert pending == {
-        "coid-1": PendingRecord(key="Long", coid="coid-1"),
-    }
+    park_row = pending.pop("coid-1")
+    assert pending == {}
+    assert park_row.parked_ts_ms > 0  # stamped at park time, replayed verbatim
+    assert park_row == PendingRecord(
+        key="Long", coid="coid-1", parked_ts_ms=park_row.parked_ts_ms,
+    )
 
 
 def __test_record_complete_drops_envelope_and_pending__(tmp_path: Path) -> None:
