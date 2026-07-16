@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
+    ClientOrderIdSpentError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
@@ -5179,7 +5180,22 @@ class OrderSyncEngine:
 
         old_qty = bracket_intent.qty
         new_intent = dataclasses.replace(bracket_intent, qty=target_qty)
-        self._dispatch_modify(bracket_intent, new_intent)
+        try:
+            self._dispatch_modify(bracket_intent, new_intent)
+        except OrderSkippedByPlugin as e:
+            # The qty amend escalated into the bracket-attach-reject
+            # recovery inside ``_dispatch_modify`` (defensive close armed,
+            # residuals cancelled) or the plugin declined the replacement
+            # after the cancel+recreate fallback already retired the old
+            # legs. Either way nothing is live for this key at the broker
+            # any more — drop the slot like the diff-loop modify caller
+            # does and let the defensive-close settlement / next bar
+            # re-evaluate. Re-raising here would propagate through
+            # ``_route_event`` and crash the event drain on a condition
+            # the recovery already handled.
+            _blog_warning("%s", e)
+            self._active_intents.pop(bracket_key, None)
+            return
         self._active_intents[bracket_key] = new_intent
         self._sync_pine_exit_qty(new_intent, target_qty)
 
@@ -9845,7 +9861,14 @@ class OrderSyncEngine:
                 format_intent_key(key),
             )
 
-    def _dispatch_new(self, intent: Intent) -> None:
+    def _dispatch_new(self, intent: Intent, *, _coid_spent_retry: int = 0) -> None:
+        # ``_coid_spent_retry`` counts the internal re-dispatches of the
+        # :class:`ClientOrderIdSpentError` recovery below (never passed by
+        # external callers): each pass re-anchors the envelope on a bumped
+        # ``retry_seq`` and retries, so the counter both bounds the loop
+        # and suppresses the one-shot intent transforms (the MARKET
+        # reversal fold must not be applied twice to the same intent).
+        #
         # Quarantine gate: new entries are exactly the "new or
         # exposure-increasing dispatch" the quarantine invariant blocks.
         # Runs BEFORE the envelope is built, so there is nothing to clean
@@ -9891,7 +9914,8 @@ class OrderSyncEngine:
         # raw quantity simply nets against the venue position (an opposite-
         # side order(qty=3) on a 5-long reduces to 2, it does not target a
         # 3-short), so folding it would oversell by the position size.
-        if (isinstance(intent, EntryIntent)
+        if (_coid_spent_retry == 0
+                and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
                 and not intent.stop_fired_market
                 and not intent.is_strategy_order
@@ -10276,6 +10300,31 @@ class OrderSyncEngine:
             # responsible for the warning + active-intents bookkeeping —
             # don't mislabel this as a dispatch failure.
             raise
+        except ClientOrderIdSpentError as e:
+            # The venue never allows client-id reuse and the deterministic
+            # id was consumed by a now-dead order (typically the cancelled
+            # half of an earlier cancel+recreate modify on the same pinned
+            # envelope). The plugin verified nothing is live under the id
+            # before raising, so re-anchor on a bumped ``retry_seq`` and
+            # re-dispatch immediately — the replacement lands under a
+            # fresh id within the same sync instead of the dead order
+            # being adopted as live. Bounded: each pass bumps the anchor,
+            # so repeated collisions (several ids spent by earlier runs)
+            # converge; anything beyond the cap is a venue anomaly that
+            # must surface.
+            if _coid_spent_retry >= 3:
+                _blog_error(
+                    "dispatch failed for %s: client order id still spent "
+                    "after %d re-anchors: %s",
+                    intent, _coid_spent_retry, e,
+                )
+                raise
+            _blog_warning(
+                "client order id spent for %s (%s); re-anchoring and "
+                "re-dispatching under a fresh id", intent, e,
+            )
+            self._reanchor_envelope_after_reject(intent.intent_key)
+            self._dispatch_new(intent, _coid_spent_retry=_coid_spent_retry + 1)
         except ExchangeOrderRejectedError as e:
             # The exchange rejected the order outright — no parent fill (the
             # ``BracketAttachAfterFillRejectedError`` branch above owns the
@@ -10733,7 +10782,60 @@ class OrderSyncEngine:
         :class:`BrokerManualInterventionError` — at that point the
         position is open AND we couldn't auto-close it, an operator
         must intervene.
+
+        A reject carrying ``qty <= 0`` is a *proven-flat* signal: the
+        plugin measured that a racing sibling fill already consumed the
+        entire bracket quantity, so there is no residual position to
+        defend. Dispatching a zero-quantity close would be skipped by
+        the plugin (it quantizes below every venue grid) and the skip
+        branch would escalate an already-flat position into a
+        manual-intervention halt. Instead the close and its pending
+        marker are skipped entirely (no close FILL will ever arrive to
+        settle one) while the rest of the cascade — ``natural_close_at``
+        stamp, OCA cancel, residual cleanup, re-dispatch guard,
+        :class:`OrderSkippedByPlugin` surfacing — runs unchanged.
         """
+        context = BracketAttachRejectContext.from_exception(e, intent)
+        entry_id = context.from_entry
+
+        if e.qty <= 0:
+            _blog_error(
+                "bracket attach rejected after parent fill for %s, but "
+                "the sibling fill already flattened the position "
+                "(deal_id=%s, side=%s) — no defensive close required: %s",
+                intent, e.position_deal_id, e.position_side, e,
+            )
+            # ``natural_close_at`` opts the parent row out of the
+            # missing-pending accounting: the position vanishes from
+            # the broker snapshot through the sibling's fill, an order
+            # this engine never registered as a dispatch of its own.
+            if self._store_ctx is not None:
+                row = self._store_ctx.get_order(e.position_coid)
+                if row is not None:
+                    extras = dict(row.extras or {})
+                    extras['natural_close_at'] = time.time()
+                    self._store_ctx.upsert_order(
+                        e.position_coid, extras=extras,
+                    )
+            if entry_id:
+                self._cascade_oca_cancel_for_key(entry_id)
+                self._cancel_bracket_reject_residuals(context)
+                self._defensively_closed_entries_this_sync.add(entry_id)
+            raise OrderSkippedByPlugin(
+                f"Bracket attach rejected after entry fill — sibling "
+                f"fill already flattened the parent position "
+                f"(deal_id={e.position_deal_id}), no defensive close "
+                f"required; intent re-evaluation deferred to next bar",
+                intent_key=intent.intent_key,
+                reason="bracket_reject_defensive_close",
+                context={
+                    'position_deal_id': e.position_deal_id,
+                    'position_coid': e.position_coid,
+                    'symbol': e.symbol,
+                    'qty': e.qty,
+                },
+            ) from e
+
         _blog_error(
             "bracket attach rejected after parent fill for %s; "
             "issuing defensive market close "
@@ -10751,8 +10853,6 @@ class OrderSyncEngine:
             comment=f"defensive close after bracket attach reject: {e}",
         )
 
-        context = BracketAttachRejectContext.from_exception(e, intent)
-        entry_id = context.from_entry
         marker_armed = False
         if entry_id:
             # Pre-build the close envelope so we can stamp the canonical
@@ -13098,6 +13198,31 @@ class OrderSyncEngine:
                 "modify parked (unknown disposition) for %s: %s", new, e,
             )
             self._park_pending(new_env, e, kind='modify', old_intent=old)
+        except BracketAttachAfterFillRejectedError as e:
+            # The plugin's modify path reached ``execute_exit`` (the
+            # cancel+recreate fallback runs on a bracket shape change, a
+            # missing inverse anchor, or a leg that vanished mid-amend)
+            # and the recreate was rejected AFTER the parent fill — the
+            # position is open and unprotected (or proven flat on
+            # ``qty <= 0``), exactly the condition the ``_dispatch_new``
+            # recovery branch owns. Without this handler the exception
+            # would fall through to the generic re-raise below and
+            # propagate out of ``sync()``, halting the run on a
+            # recoverable condition while the defensive close / residual
+            # cleanup never ran. The old working legs are already gone at
+            # the broker (the fallback cancelled them before the
+            # recreate), so retire the stale per-key state first: the
+            # predecessor's broker ids must not miscredit a racing late
+            # fill (entry amends only — mirrors the spent-coid branch
+            # below) and the dead mapping must not shadow the key. The
+            # handler surfaces the intent as
+            # :class:`OrderSkippedByPlugin`, which the callers answer by
+            # dropping the active slot.
+            if isinstance(new, EntryIntent):
+                for stale_id in self._order_mapping.get(new.intent_key, []):
+                    self._retired_entry_order_ids.add(stale_id)
+            self._order_mapping.pop(new.intent_key, None)
+            self._handle_bracket_attach_after_fill_reject(new, e)
         except BrokerManualInterventionError as e:
             _blog_error(
                 "modify halted (manual intervention) for %s: %s", new, e,
@@ -13108,6 +13233,31 @@ class OrderSyncEngine:
             # Inner _dispatch_new (the cancel+re-execute fallback) declined.
             # _diff_and_dispatch handles the active-intents pop + warning.
             raise
+        except ClientOrderIdSpentError as e:
+            # The plugin's cancel+recreate fallback ran on a venue that
+            # never allows client-id reuse: the old order is already
+            # cancelled and the recreate was refused with nothing left
+            # live under the pinned id (the plugin verified before
+            # raising). Re-anchor on a bumped ``retry_seq`` and dispatch
+            # the replacement as a fresh order in the same sync — the key
+            # must not be left silently without its working order or
+            # protection, and the raw raise below would halt the engine
+            # on a recoverable condition.
+            _blog_warning(
+                "modify %s -> %s hit a spent client order id (%s); "
+                "re-anchoring and dispatching the replacement fresh",
+                old, new, e,
+            )
+            # Retire the cancelled predecessor's broker ids BEFORE the
+            # re-anchor drops the mapping: a fill that raced the cancel
+            # must not be miscredited to the fresh replacement's reset
+            # fill ledger by the ``pine_id``-keyed ENTRY-leg bump (same
+            # rationale as the success path above).
+            if isinstance(new, EntryIntent):
+                for stale_id in self._order_mapping.get(new.intent_key, []):
+                    self._retired_entry_order_ids.add(stale_id)
+            self._reanchor_envelope_after_reject(new.intent_key)
+            self._dispatch_new(new)
         except Exception as e:
             _blog_error(
                 "modify failed for %s: %s: %s", new, type(e).__name__, e,

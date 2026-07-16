@@ -20,6 +20,7 @@ from pynecore import lib
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
+    ClientOrderIdSpentError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     InsufficientMarginError,
@@ -108,6 +109,8 @@ class MockBroker:
     watch_orders_impl: str = "generator"  # "generator" | "not_implemented"
     raise_on_next_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
+    raise_on_next_modify_entry: Exception | None = None
+    raise_on_next_modify_exit: Exception | None = None
     raise_on_next_cancel: Exception | None = None
     false_on_next_cancel: bool = False
     raise_on_next_get_open_orders: Exception | None = None
@@ -195,10 +198,18 @@ class MockBroker:
 
     async def modify_entry(self, old, new):
         self.modify_entry_calls.append((old, new))
+        if self.raise_on_next_modify_entry is not None:
+            err = self.raise_on_next_modify_entry
+            self.raise_on_next_modify_entry = None
+            raise err
         return [self._mk_order(new, 'e')]
 
     async def modify_exit(self, old, new):
         self.modify_exit_calls.append((old, new))
+        if self.raise_on_next_modify_exit is not None:
+            err = self.raise_on_next_modify_exit
+            self.raise_on_next_modify_exit = None
+            raise err
         return [self._mk_order(new, 't')]
 
     # Defensive-close residual contract — defaults mirror BrokerPlugin
@@ -1233,6 +1244,83 @@ def __test_modified_entry_dispatches_modify_entry__():
     # that is what makes the exchange treat the amend as idempotent.
     assert old.bar_ts_ms == new.bar_ts_ms == BAR_TS
     assert old.run_tag == new.run_tag == RUN_TAG
+
+
+def __test_entry_spent_coid_redispatches_same_sync__():
+    """A spent client order id re-anchors and re-dispatches within the same sync."""
+    # A venue that never allows client-id reuse refuses a create whose
+    # deterministic id was consumed by a now-dead order. Unlike a plain
+    # reject (signal dropped, next bar re-evaluates), nothing is wrong with
+    # the intent itself — the engine bumps ``retry_seq`` and re-sends
+    # immediately so the entry lands in the SAME sync.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = ClientOrderIdSpentError("orderLinkId spent")
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 2
+    spent, redispatched = b.entry_calls
+    assert spent.bar_ts_ms == redispatched.bar_ts_ms == BAR_TS
+    assert spent.retry_seq == 0
+    assert redispatched.retry_seq == 1
+    assert engine.active_intents.keys() == {"L"}
+    assert engine.order_mapping["L"] == ["xchg-1"]
+
+
+def __test_entry_modify_spent_coid_dispatches_replacement_fresh__():
+    """A spent id from the modify fallback re-anchors and dispatches the NEW intent fresh."""
+    # The default cancel+recreate modify re-sends the pinned id the cancel
+    # just spent; a no-reuse venue refuses it with nothing left live. The
+    # engine must not halt and must not leave the key without a working
+    # order: it re-anchors and dispatches the replacement as a fresh entry.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
+    b.raise_on_next_modify_entry = ClientOrderIdSpentError("orderLinkId spent")
+    engine.sync(BAR_TS)
+
+    assert len(b.modify_entry_calls) == 1
+    assert len(b.entry_calls) == 2
+    redispatched = b.entry_calls[1]
+    assert redispatched.intent.limit == 49_500.0
+    # Same-bar re-anchor: identical bar_ts_ms, bumped retry_seq -> fresh id.
+    assert redispatched.bar_ts_ms == BAR_TS
+    assert redispatched.retry_seq == 1
+    assert engine.active_intents["L"].limit == 49_500.0
+    assert engine.order_mapping["L"] == ["xchg-2"]
+
+
+def __test_exit_modify_spent_coid_dispatches_replacement_fresh__():
+    """A spent id from an exit-bracket modify re-dispatches the bracket fresh."""
+    # Same recovery on the bracket path: the position must not be left
+    # silently without its TP/SL protection when the recreate collides
+    # with the ids the cancel just spent.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=61_000.0, stop=45_000.0,
+    )
+    b.raise_on_next_modify_exit = ClientOrderIdSpentError("orderLinkId spent")
+    engine.sync(BAR_TS)
+
+    assert len(b.modify_exit_calls) == 1
+    assert len(b.exit_calls) == 2
+    redispatched = b.exit_calls[1]
+    assert redispatched.bar_ts_ms == BAR_TS
+    assert redispatched.retry_seq == 1
 
 
 def __test_removed_entry_dispatches_cancel__():
@@ -3573,6 +3661,131 @@ def __test_bracket_reject_short_position_close_side_is_buy__():
     assert len(b.close_calls) == 1
     assert b.close_calls[0].intent.side == 'buy'
     assert b.close_calls[0].intent.qty == 2.5
+
+
+def __test_bracket_reject_zero_residual_skips_close_and_does_not_halt__():
+    """A proven-flat (qty=0) bracket reject dispatches NO defensive close and does not halt.
+
+    When the plugin measured that a racing sibling fill consumed the
+    ENTIRE bracket quantity, the reject arrives with ``qty=0`` — the
+    position is already flat. The engine must not synthesize a
+    zero-quantity :class:`CloseIntent`: a real plugin would skip it
+    below the venue grid and the skip branch would escalate to a
+    manual-intervention halt for a position that needs no intervention.
+    The exit intent is surfaced as skipped, the re-dispatch guard is
+    armed, and the run continues.
+    """
+    b = MockBroker()
+    err = BracketAttachAfterFillRejectedError(
+        "bracket attach reject",
+        position_deal_id='deal-L',
+        position_coid='coid-entry',
+        symbol=SYMBOL,
+        position_side='buy',
+        qty=0.0,
+        from_entry='Long',
+    )
+    b.raise_on_next_exit = err
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        engine._dispatch_new(intent)
+
+    assert exc.value.reason == "bracket_reject_defensive_close"
+    assert exc.value.intent_key == intent.intent_key
+    # No close dispatched at all — the position is proven flat.
+    assert b.close_calls == []
+    # The sync-loop guard against re-dispatching brackets for this
+    # entry is still armed, same as on the dispatched-close path.
+    assert 'Long' in engine._defensively_closed_entries_this_sync
+    assert engine.halted is False
+
+
+def __test_bracket_reject_from_exit_modify_dispatches_defensive_close__():
+    """A bracket reject raised by ``modify_exit`` runs the recovery instead of crashing the sync.
+
+    The plugin's ``modify_exit`` can fall back to cancel+recreate (bracket
+    shape change, missing inverse anchor, vanished amended leg), whose
+    ``execute_exit`` recreate can reject AFTER the parent fill.
+    ``_dispatch_modify`` must route the exception into
+    :meth:`_handle_bracket_attach_after_fill_reject` exactly like
+    ``_dispatch_new`` does — the defensive close dispatches, the exit slot
+    is dropped, and ``sync()`` returns instead of propagating.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
+        "L", -1.0, "Bracket", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
+        "L", -1.0, "Bracket", limit=61_000.0, stop=45_000.0,
+    )
+    b.raise_on_next_modify_exit = BracketAttachAfterFillRejectedError(
+        "bracket recreate rejected after parent fill",
+        position_deal_id='deal-L',
+        position_coid='coid-entry',
+        symbol=SYMBOL,
+        position_side='buy',
+        qty=1.0,
+        from_entry='L',
+    )
+    engine.sync(BAR_TS)  # must not raise
+
+    assert len(b.modify_exit_calls) == 1
+    # Defensive close dispatched: opposite side, same qty/symbol.
+    assert len(b.close_calls) == 1
+    close_env = b.close_calls[0]
+    assert isinstance(close_env.intent, CloseIntent)
+    assert close_env.intent.side == 'sell'
+    assert close_env.intent.qty == 1.0
+    assert close_env.intent.immediately is True
+    # The exit slot was dropped so the next bar re-evaluates from scratch.
+    assert "Bracket\0L" not in engine.active_intents
+    assert engine.halted is False
+
+
+def __test_bracket_reject_zero_residual_from_exit_modify_does_not_halt__():
+    """A proven-flat (qty=0) bracket reject from ``modify_exit`` skips the close and keeps running.
+
+    Same routing as the previous test with the proven-flat contract: the
+    sibling fill already flattened the position, so no defensive close
+    dispatches, the re-dispatch guard is armed, and the run continues.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
+        "L", -1.0, "Bracket", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
+        "L", -1.0, "Bracket", limit=61_000.0, stop=45_000.0,
+    )
+    b.raise_on_next_modify_exit = BracketAttachAfterFillRejectedError(
+        "bracket recreate rejected, sibling fill flattened the position",
+        position_deal_id='deal-L',
+        position_coid='coid-entry',
+        symbol=SYMBOL,
+        position_side='buy',
+        qty=0.0,
+        from_entry='L',
+    )
+    engine.sync(BAR_TS)  # must not raise
+
+    assert len(b.modify_exit_calls) == 1
+    assert b.close_calls == []
+    # Proven flat: no pending defensive-close marker was armed (no close
+    # FILL will ever arrive to settle one).
+    assert 'L' not in engine._pending_defensive_close
+    assert "Bracket\0L" not in engine.active_intents
+    assert engine.halted is False
 
 
 def __test_bracket_reject_defensive_close_timeout_does_not_halt__():

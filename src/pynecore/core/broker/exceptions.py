@@ -15,6 +15,7 @@ __all__ = [
     'BracketAttachAfterFillRejectedError',
     'BrokerError',
     'BrokerManualInterventionError',
+    'ClientOrderIdSpentError',
     'ExchangeCapabilityError',
     'ExchangeConnectionError',
     'ExchangeOrderRejectedError',
@@ -89,6 +90,25 @@ class InsufficientMarginError(ExchangeOrderRejectedError):
     """
 
 
+class ClientOrderIdSpentError(ExchangeOrderRejectedError):
+    """A create was refused because the deterministic client order id is
+    already consumed by a now-terminal order, on a venue that never allows
+    client-id reuse (Bybit rejects re-creation under a cancelled order's
+    ``orderLinkId``: spot retCode 170141, derivatives 110072 — measured
+    live). The default cancel+recreate modify path re-sends the same
+    pinned id, so on such venues the recreate collides with the id the
+    cancel just spent.
+
+    Contract for plugins: raise ONLY after verifying that nothing is live
+    under the id (the duplicate lookup returned a terminal, dead order —
+    not a fill) and after cleaning up any sibling orders the same dispatch
+    attempt already placed. The engine responds by re-anchoring the
+    intent's envelope on a bumped ``retry_seq`` and re-dispatching
+    immediately, so the replacement lands under a fresh id instead of the
+    dead order being silently adopted as live.
+    """
+
+
 class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
     """A protective TP/SL bracket attach was rejected AFTER the parent
     ENTRY/EXIT fill committed on the exchange.
@@ -120,7 +140,11 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
     :ivar position_side: Side of the OPEN position (``"buy"`` for long,
         ``"sell"`` for short). The defensive close picks the opposite.
     :ivar qty: Quantity of the unprotected position (units the close
-        intent must flatten).
+        intent must flatten). ``0`` is a *proven-flat* signal — the
+        plugin measured that a racing sibling fill already consumed the
+        entire bracket quantity; the engine then skips the defensive
+        close (nothing remains to flatten) while still running the
+        OCA-cancel / residual-cleanup cascade.
     :ivar symbol: Trading symbol of the unprotected position.
     :ivar position_deal_id: Exchange-side identifier of the unprotected
         open position, when the plugin can supply one. Broker-specific
