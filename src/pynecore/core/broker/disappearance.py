@@ -97,6 +97,7 @@ __all__ = [
     'DisappearanceTracker',
     'MissingConfirmation',
     'MissingResolution',
+    'resolve_unexpected_cancel_policy',
 ]
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,73 @@ UNEXPECTED_CANCEL_POLICIES = (
 #: Float comparison slack for fill quantities, matching the reconcile
 #: paths in the reference plugins.
 _QTY_EPS = 1e-9
+
+
+def resolve_unexpected_cancel_policy(
+        policy: str,
+        *,
+        reason: str,
+        context: dict[str, Any],
+        request_quarantine: Callable[[str, dict[str, Any]], None] | None,
+        log_event: Callable[..., None] | None,
+        client_order_id: str | None,
+        exchange_order_id: str | None,
+) -> UnexpectedCancelError | None:
+    """Resolve the ``on_unexpected_cancel`` policy for a confirmed
+    unexpected cancel — the mapping shared by the grace-window tracker path
+    (:meth:`DisappearanceTracker._apply_policy`) and the sync engine's
+    WS-push handler
+    (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._apply_unexpected_cancel_policy`).
+
+    Applies the ``ignore`` / ``re_place`` audit-only logging and the
+    ``stop`` / ``stop_and_cancel`` quarantine latch, and RETURNS the halt
+    the caller must arm its own way (the tracker parks it on
+    :attr:`pending_halt`; the engine records + raises it) — or ``None``
+    when the outcome needed no halt (ignored, re-placed, or quarantined).
+    The fail-closed rule lives here: a ``stop`` / ``stop_and_cancel``
+    whose ``request_quarantine`` sink is missing or raises falls back to
+    the halt, never to continued trading. The caller owns the
+    ``stop_and_cancel`` sibling sweep — it is async and shaped differently
+    per path.
+
+    :param request_quarantine: Quarantine latch sink; ``None`` (an unwired
+        sink under a quarantining policy) triggers the fail-closed halt.
+    :param log_event: Audit sink (``RunContext.log_event``); ``None`` skips
+        audit persistence (a store-less engine on the push path).
+    """
+    def _log(kind: str) -> None:
+        if log_event is not None:
+            log_event(
+                kind,
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+            )
+
+    if policy == 'ignore':
+        _log('unexpected_cancel_ignored')
+        return None
+    if policy == 're_place':
+        _log('unexpected_cancel_re_place')
+        return None
+    quarantined = False
+    if (policy in ('stop', 'stop_and_cancel')
+            and request_quarantine is not None):
+        # noinspection PyBroadException
+        try:
+            request_quarantine(reason, context)
+        except Exception:
+            logger.exception(
+                "request_quarantine hook failed for %r; falling back "
+                "to the process-exiting halt", client_order_id,
+            )
+        else:
+            quarantined = True
+            _log('unexpected_cancel_quarantine')
+    if not quarantined:
+        # 'halt', or a quarantining policy whose hook is missing / raised:
+        # arm the process-exiting manual-intervention signal.
+        return UnexpectedCancelError(reason, context=context)
+    return None
 
 
 class MissingResolution(StrEnum):
@@ -750,20 +818,6 @@ class DisappearanceTracker:
         were yielded (or at the top of the next pass, when the generator
         was abandoned).
         """
-        if self._policy == 'ignore':
-            self._store.log_event(
-                'unexpected_cancel_ignored',
-                client_order_id=row.client_order_id,
-                exchange_order_id=row.exchange_order_id,
-            )
-            return
-        if self._policy == 're_place':
-            self._store.log_event(
-                'unexpected_cancel_re_place',
-                client_order_id=row.client_order_id,
-                exchange_order_id=row.exchange_order_id,
-            )
-            return
         reason = (
             f"Bot-owned order disappeared unexpectedly: "
             f"coid={row.client_order_id!r} "
@@ -775,28 +829,17 @@ class DisappearanceTracker:
             'symbol': row.symbol,
             'policy': self._policy,
         }
-        quarantined = False
-        if (self._policy in ('stop', 'stop_and_cancel')
-                and self._request_quarantine is not None):
-            # noinspection PyBroadException
-            try:
-                self._request_quarantine(reason, context)
-            except Exception:
-                logger.exception(
-                    "request_quarantine hook failed for %r; falling back "
-                    "to the process-exiting halt", row.client_order_id,
-                )
-            else:
-                quarantined = True
-                self._store.log_event(
-                    'unexpected_cancel_quarantine',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
-        if not quarantined:
-            # 'halt', or a quarantining policy whose hook is missing /
-            # raised: arm the process-exiting manual-intervention signal.
-            self._pending_halt = UnexpectedCancelError(reason, context=context)
+        halt = resolve_unexpected_cancel_policy(
+            self._policy,
+            reason=reason,
+            context=context,
+            request_quarantine=self._request_quarantine,
+            log_event=self._store.log_event,
+            client_order_id=row.client_order_id,
+            exchange_order_id=row.exchange_order_id,
+        )
+        if halt is not None:
+            self._pending_halt = halt
         if self._policy == 'stop_and_cancel' and self._cancel_siblings is not None:
             # noinspection PyBroadException
             try:
@@ -819,23 +862,30 @@ class DisappearanceTracker:
             self, row: 'OrderRow', now_ts: float,
     ) -> OrderEvent:
         if self._cancelled_event_factory is not None:
-            return self._cancelled_event_factory(row, now_ts)
-        return OrderEvent(
-            order=ExchangeOrder(
-                id=row.exchange_order_id or '', symbol=row.symbol,
-                side=row.side, order_type=OrderType.MARKET,
-                qty=row.qty, filled_qty=row.filled_qty,
-                remaining_qty=max(0.0, row.qty - row.filled_qty),
-                price=None, stop_price=None, average_fill_price=None,
-                status=OrderStatus.CANCELLED, timestamp=now_ts, fee=0.0,
-                fee_currency='', reduce_only=False,
-                client_order_id=row.client_order_id,
-            ),
-            event_type='cancelled',
-            fill_price=None, fill_qty=None, timestamp=now_ts,
-            pine_id=row.pine_entry_id, from_entry=row.from_entry,
-            leg_type=LegType.ENTRY,
-        )
+            event = self._cancelled_event_factory(row, now_ts)
+        else:
+            event = OrderEvent(
+                order=ExchangeOrder(
+                    id=row.exchange_order_id or '', symbol=row.symbol,
+                    side=row.side, order_type=OrderType.MARKET,
+                    qty=row.qty, filled_qty=row.filled_qty,
+                    remaining_qty=max(0.0, row.qty - row.filled_qty),
+                    price=None, stop_price=None, average_fill_price=None,
+                    status=OrderStatus.CANCELLED, timestamp=now_ts, fee=0.0,
+                    fee_currency='', reduce_only=False,
+                    client_order_id=row.client_order_id,
+                ),
+                event_type='cancelled',
+                fill_price=None, fill_qty=None, timestamp=now_ts,
+                pine_id=row.pine_entry_id, from_entry=row.from_entry,
+                leg_type=LegType.ENTRY,
+            )
+        # Stamp the tracker-origin marker on both the default and the
+        # plugin-supplied event: the policy already ran in
+        # :meth:`_apply_policy` before this event is emitted, so the sync
+        # engine's WS-push handler must NOT re-apply it.
+        event.from_disappearance_tracker = True
+        return event
 
     @staticmethod
     def _default_fill_event(

@@ -26,6 +26,7 @@ from pynecore.core.broker.exceptions import (
     InsufficientMarginError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    UnexpectedCancelError,
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
@@ -93,6 +94,7 @@ class MockBroker:
     ``client_order_id``.
     """
     client_order_id_max_len = 30  # BrokerPlugin contract attribute
+    on_unexpected_cancel = "stop"  # BrokerPlugin contract attribute
     entry_calls: list[DispatchEnvelope] = field(default_factory=list)
     exit_calls: list[DispatchEnvelope] = field(default_factory=list)
     close_calls: list[DispatchEnvelope] = field(default_factory=list)
@@ -6514,6 +6516,349 @@ def __test_record_quarantine_concurrent_callers_latch_once__():
     # holds — never a mix of two callers.
     winner = entered[0].reason.removeprefix("reason-")
     assert entered[0].context == {'origin': int(winner)}
+
+
+# === Push-detected unexpected cancel policy ===
+
+
+def _cancelled_event(
+        deal_id: str, *, pine_id: str | None = "L",
+        from_entry: str | None = None, filled_qty: float = 0.0,
+        from_disappearance_tracker: bool = False,
+) -> OrderEvent:
+    """A venue ``cancelled`` status event for a mapped bot order.
+
+    ``from_disappearance_tracker`` mimics the marker the core
+    :class:`DisappearanceTracker` stamps on its own synthesised events.
+    """
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=deal_id, symbol=SYMBOL, side='buy',
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=filled_qty,
+            remaining_qty=max(0.0, 1.0 - filled_qty), price=None,
+            stop_price=None, average_fill_price=None,
+            status=OrderStatus.CANCELLED, timestamp=0.0, fee=0.0,
+            fee_currency="", client_order_id="coid-L",
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id=pine_id, from_entry=from_entry,
+        from_disappearance_tracker=from_disappearance_tracker,
+    )
+
+
+def __test_push_external_cancel_stop_quarantines_and_blocks_replace__():
+    """A venue-pushed cancel of a still-mapped bot order latches the
+    quarantine under 'stop' and suppresses the strategy's next-bar
+    re-dispatch — the fix for the operator-vs-bot re-place duel."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    deal_id = engine.order_mapping["L"][0]
+
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    assert engine.halted is False
+    assert "L" not in engine.order_mapping
+    assert "L" not in engine.active_intents
+
+    # The Pine book still carries L, but the next sync must NOT re-place it:
+    # the quarantine gate blocks the re-dispatch, so no duel.
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
+
+
+def __test_push_external_cancel_halt_raises_gracefully__():
+    """Under 'halt' a push-detected external cancel records the halt and
+    raises :class:`UnexpectedCancelError` out of the event-application
+    path so the engine performs its graceful stop."""
+    b = MockBroker()
+    b.on_unexpected_cancel = "halt"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    with pytest.raises(UnexpectedCancelError):
+        engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.halted is True
+    assert engine.quarantined is False
+    assert "L" not in engine.order_mapping
+
+
+def __test_engine_initiated_cancel_does_not_trigger_policy__():
+    """A cancel the engine itself dispatched (the strategy dropped the
+    order) pops the mapping first, so the venue's later cancelled push
+    lands in the 'external cancel observed' branch and never triggers the
+    policy."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    # Strategy drops L -> the engine dispatches its OWN cancel, popping the
+    # mapping before any stream event for it arrives.
+    del pos.entry_orders["L"]
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.cancel_calls) == 1
+    assert "L" not in engine.order_mapping
+
+    # The venue now confirms that engine-initiated cancel on the stream.
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is False
+    assert engine.halted is False
+
+
+def __test_tracker_synthesized_cancel_does_not_reapply_policy__():
+    """A cancelled event carrying ``from_disappearance_tracker`` tears down
+    the mapping but does NOT re-run the policy — the tracker already
+    applied it before emitting the event (no double quarantine / halt)."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    engine._route_event(
+        _cancelled_event(deal_id, from_disappearance_tracker=True),
+    )
+
+    # Teardown still ran (the tracker never touches ``_order_mapping``)...
+    assert "L" not in engine.order_mapping
+    # ...but the engine did NOT re-apply the policy.
+    assert engine.quarantined is False
+    assert engine.halted is False
+
+
+def __test_push_external_cancel_stop_and_cancel_sweeps_siblings__():
+    """Under 'stop_and_cancel' a push-detected external cancel latches the
+    quarantine AND best-effort cancels the remaining bot-owned working
+    orders — the engine-side analogue of the tracker's sibling sweep, which
+    never runs on a reliable-push venue."""
+    b = MockBroker()
+    b.on_unexpected_cancel = "stop_and_cancel"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.entry_orders["M"] = _entry_order("M", 1.0, limit=49_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+    deal_id = engine.order_mapping["L"][0]
+
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    assert engine.halted is False
+    assert "L" not in engine.order_mapping
+    # The sibling's working order received a best-effort broker cancel...
+    assert len(b.cancel_calls) == 1
+    assert b.cancel_calls[0].intent.pine_id == "M"
+    # ...and its slot stays active (tracker-path parity), so the unchanged
+    # Pine book diffs to no-op instead of re-placing the swept order.
+    assert "M" in engine.active_intents
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 2
+
+
+def __test_push_external_cancel_stop_and_cancel_spares_filled_entry__():
+    """The stop_and_cancel sweep leaves an entry with filled exposure for
+    the operator — cancelling its residual working order would strand real
+    broker exposure without tracking."""
+    b = MockBroker()
+    b.on_unexpected_cancel = "stop_and_cancel"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.entry_orders["M"] = _entry_order("M", 2.0, limit=49_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+    sibling_id = engine.order_mapping["M"][0]
+    # M partially fills — real exposure with a residual still working.
+    engine._route_event(_fill_event(
+        "buy", 1.0, 49_000.0, pine_id="M", xchg_id=sibling_id,
+        event_type='partial', filled_qty=1.0, remaining_qty=1.0,
+    ))
+
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    # The partially filled sibling was spared by the sweep.
+    assert len(b.cancel_calls) == 0
+    assert "M" in engine.order_mapping
+
+
+def __test_parked_modify_predecessor_cancel_is_not_unexpected__():
+    """The default plugin modify is cancel + re-execute. When the
+    REPLACEMENT submission parks (unknown disposition), the predecessor's
+    ids stay in the mapping — its venue CANCELLED push confirms the
+    engine's OWN cancel and must NOT fire the unexpected-cancel policy or
+    tear down the parked verification state."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    # The strategy moves the level; the plugin's cancel+re-execute modify
+    # cancels the predecessor, then the replacement submission times out
+    # ambiguously — the dispatch parks for verification.
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "replacement submit timed out", client_order_id="coid-L-replacement",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(engine.pending_verification) == 1
+
+    # The venue now pushes the CANCELLED for the predecessor the plugin
+    # cancelled inside modify_entry — an engine-initiated cancel.
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is False
+    assert engine.halted is False
+    # The stale predecessor id was trimmed from the mapping, while the
+    # parked verification state survives to resolve the replacement.
+    assert "L" not in engine.order_mapping
+    assert "L" in engine.active_intents
+    assert len(engine.pending_verification) == 1
+
+
+def __test_parked_modify_promoted_live_id_cancel_fires_policy__():
+    """An atomic in-place amend that parks registers its OWN live order id
+    as a possibly engine-cancelled predecessor (the engine cannot tell the
+    modify shapes apart at park time). Once verification promotes that
+    order LIVE from ``get_open_orders`` the marker must be dropped — a
+    later operator cancel of the amended order is a GENUINE external
+    cancel and must fire the unexpected-cancel policy, not be consumed
+    silently as the predecessor confirmation."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    # The in-place amend times out ambiguously — the dispatch parks and
+    # the still-live order id lands in the parked-cancel ring.
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "amend timed out", client_order_id="coid-L-amend",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(engine.pending_verification) == 1
+
+    # The venue's open-orders view proves the amended order LIVE under
+    # the parked COID — verification promotes it and retires the marker.
+    b.open_orders = [_live_working_order("coid-L-amend", order_id=deal_id)]
+    engine.sync(BAR_TS + 120_000)
+    assert len(engine.pending_verification) == 0
+    assert deal_id in engine.order_mapping["L"]
+
+    # An operator now cancels the amended order out from under the bot.
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    assert "L" not in engine.order_mapping
+
+
+def __test_parked_modify_declared_atomic_amend_cancel_fires_policy__():
+    """A plugin that declares the parked modify an atomic in-place amend
+    (``predecessor_cancel_ids=()``) registers NOTHING in the parked-cancel
+    ring — the engine issued no predecessor cancel, so a venue CANCELLED
+    push during the still-unresolved park is a GENUINE external cancel and
+    must fire the unexpected-cancel policy immediately, in-window."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    # The in-place amend times out ambiguously — the plugin declares the
+    # shape: no predecessor cancel was issued.
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "amend timed out", client_order_id="coid-L-amend",
+        predecessor_cancel_ids=(),
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(engine.pending_verification) == 1
+
+    # An operator cancels the order while the park is still unresolved.
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    assert engine.halted is False
+    assert "L" not in engine.order_mapping
+    assert "L" not in engine.active_intents
+
+
+def __test_parked_modify_declared_predecessor_ids_consumed__():
+    """A plugin that declares the exact predecessor ids it cancel-issued
+    before the ambiguous replacement submission gets exactly those pushes
+    consumed as engine-initiated — no policy, parked verification state
+    survives (the declared-shape mirror of the undeclared default)."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "replacement submit timed out", client_order_id="coid-L-replacement",
+        predecessor_cancel_ids=(deal_id,),
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(engine.pending_verification) == 1
+
+    # The venue confirms the declared engine-initiated predecessor cancel.
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is False
+    assert engine.halted is False
+    assert "L" not in engine.order_mapping
+    assert "L" in engine.active_intents
+    assert len(engine.pending_verification) == 1
+
+
+def __test_parked_modify_teardown_retires_park_against_stale_snapshot__():
+    """The external-cancel teardown retires the parked verification state
+    IN-MEMORY too, in lockstep with the persisted rows — an eventually
+    consistent ``get_open_orders`` snapshot that still lists the cancelled
+    order under the parked COID must NOT re-promote the torn-down mapping
+    on the next sync, and the modify rollback snapshot must not outlive
+    the park either."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    # Declared atomic amend parks with an empty ring — an external cancel
+    # during the park fires the policy and tears the key down.
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "amend timed out", client_order_id="coid-L-amend",
+        predecessor_cancel_ids=(),
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(engine.pending_verification) == 1
+
+    engine._route_event(_cancelled_event(deal_id))
+
+    assert engine.quarantined is True
+    # The in-memory park died with the key at teardown time...
+    assert len(engine.pending_verification) == 0
+    # ...and the rollback snapshot did not outlive it.
+    assert engine._modify_old_intents == {}
+
+    # A stale open-orders snapshot still lists the cancelled order under
+    # the parked COID — nothing is left to match it, so the cancelled
+    # mapping must not resurrect.
+    b.open_orders = [_live_working_order("coid-L-amend", order_id=deal_id)]
+    engine.sync(BAR_TS + 120_000)
+    assert "L" not in engine.order_mapping
 
 
 # === Short-selling runtime gate (spot venues) ===

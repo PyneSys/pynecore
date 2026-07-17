@@ -276,6 +276,14 @@ class OrderEvent:
     # across every path that can surface the same execution; the sync engine's
     # duplicate-fill gate keys on it. ``None`` => no-op for the gate.
     fill_id: str | None = None
+    # Set only on ``cancelled`` events synthesised by the
+    # :class:`~pynecore.core.broker.disappearance.DisappearanceTracker` after
+    # it has already applied the ``on_unexpected_cancel`` policy for the
+    # disappearance. The sync engine's WS-push handler applies the SAME policy
+    # for venue-pushed external cancels (``False`` here), so this flag gates
+    # the handler OFF for the tracker's own events — re-applying would double
+    # the audit / sibling sweep and raise the ``halt`` from the wrong place.
+    from_disappearance_tracker: bool = False
 
     def __str__(self) -> str:
         parts = [

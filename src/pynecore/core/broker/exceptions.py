@@ -216,6 +216,19 @@ class OrderDispositionUnknownError(BrokerError):
         sync engine uses it to match the open-orders query back to the
         originating dispatch.
     :ivar cause: The underlying raw exception, if any, preserved for logging.
+    :ivar predecessor_cancel_ids: For an ambiguous MODIFY dispatch, the
+        modify shape the plugin executed before the disposition turned
+        unknown. ``None`` (default) — shape undeclared: the sync engine
+        assumes the plugin's default cancel + re-execute modify and treats a
+        venue CANCELLED push for any currently mapped order id during the
+        park as the engine-initiated predecessor confirmation. An empty
+        tuple — atomic in-place amend, NO predecessor cancel was issued: a
+        CANCELLED push during the park is a genuine external cancel and
+        fires the ``on_unexpected_cancel`` policy. A non-empty tuple — the
+        exchange order ids the plugin cancel-issued before the ambiguous
+        replacement submission; exactly those pushes are consumed as
+        engine-initiated. Meaningful only when raised from
+        ``modify_entry`` / ``modify_exit``-shaped plugin calls.
     """
 
     def __init__(
@@ -223,10 +236,12 @@ class OrderDispositionUnknownError(BrokerError):
             message: str,
             client_order_id: str,
             cause: Exception | None = None,
+            predecessor_cancel_ids: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(message)
         self.client_order_id = client_order_id
         self.cause = cause
+        self.predecessor_cancel_ids = predecessor_cancel_ids
 
 
 class OrderSkippedByPlugin(BrokerError):

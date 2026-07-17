@@ -34,6 +34,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
+from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
@@ -328,15 +329,45 @@ closes old can never need deduplication in practice.
 """
 
 
+_MODIFY_PARKED_CANCEL_IDS_CAP = 1024
+"""Upper bound on the parked-modify predecessor-cancel-id ring
+(:attr:`OrderSyncEngine._modify_parked_cancel_ids`).
+
+Holds the broker order ids a cancel + re-execute
+:meth:`OrderSyncEngine._dispatch_modify` was about to supersede when the
+REPLACEMENT submission raised :class:`OrderDispositionUnknownError` and the
+dispatch was parked. The predecessor's cancel is engine-initiated, but the
+park keeps ``_order_mapping`` pointing at the predecessor, so its venue
+CANCELLED push would otherwise be misread as an UNEXPECTED external cancel
+by the ``cancelled`` branch of :meth:`OrderSyncEngine._route_event` — firing
+the ``on_unexpected_cancel`` policy on an ordinary recoverable modify
+timeout. A plugin that declares the modify shape on the exception
+(``predecessor_cancel_ids``) registers exactly the declared ids — an atomic
+in-place amend declares ``()`` and registers nothing, so an external cancel
+during the park still fires the policy; only an undeclared shape falls back
+to registering every mapped id. Entries are one-shot: the ``cancelled``
+branch discards an id when it consumes the matching push, and
+:meth:`_verify_pending_dispatches` discards an id whose order is promoted
+LIVE from ``get_open_orders`` (an undeclared atomic in-place amend registers
+its own live order id — once proven live, a later CANCELLED for it is a
+genuine external cancel, not the predecessor confirmation). The cap is
+purely a leak bound for pushes that never arrive:
+parked modifies are rare exception-path events. In-memory only — after a
+restart the replayed pending-verification rows resolve the parked dispatch
+before events are re-routed.
+"""
+
+
 class _BoundedIdSet:
     """Insertion-ordered string-id cache with FIFO eviction at ``cap`` entries.
 
     Supports the add-and-membership-test usage shared by the engine's
     duplicate-delivery caches (:attr:`OrderSyncEngine._seen_fill_ids` and
-    the ``_settled_defensive_close_*`` trio): ids are only ever added and
-    looked up, never removed individually. Re-adding a known id is a
+    the ``_settled_defensive_close_*`` trio). Re-adding a known id is a
     no-op (it keeps its original ring position). Once ``cap`` distinct
-    ids are held, adding a new one evicts the oldest.
+    ids are held, adding a new one evicts the oldest. :meth:`discard`
+    supports the one-shot consumers
+    (:attr:`OrderSyncEngine._modify_parked_cancel_ids`).
     """
 
     __slots__ = ('_cap', '_items')
@@ -352,6 +383,9 @@ class _BoundedIdSet:
         items[value] = None
         if len(items) > self._cap:
             items.popitem(last=False)
+
+    def discard(self, value: str) -> None:
+        self._items.pop(value, None)
 
     def __contains__(self, value: object) -> bool:
         return value in self._items
@@ -796,6 +830,23 @@ class OrderSyncEngine:
         # stale fill to the replacement's short-gate reservation. Bounded FIFO
         # (:data:`_RETIRED_ENTRY_ORDER_IDS_CAP`); in-memory only.
         self._retired_entry_order_ids = _BoundedIdSet(_RETIRED_ENTRY_ORDER_IDS_CAP)
+
+        # Broker order ids whose engine-initiated cancel was issued INSIDE a
+        # cancel + re-execute plugin modify that then PARKED (the replacement
+        # submission raised ``OrderDispositionUnknownError``, so the
+        # success-path ``_order_mapping`` remap never ran). The venue's
+        # CANCELLED push for such a predecessor still matches a live mapping
+        # in :meth:`_route_event` and would be misread as an UNEXPECTED
+        # external cancel — tearing down the parked verification state and
+        # firing the ``on_unexpected_cancel`` policy on an ordinary
+        # recoverable modify timeout. Registered in the
+        # ``OrderDispositionUnknownError`` handler of
+        # :meth:`_dispatch_modify`, consumed by the ``cancelled`` branch of
+        # :meth:`_route_event`. Bounded FIFO
+        # (:data:`_MODIFY_PARKED_CANCEL_IDS_CAP`); in-memory only.
+        self._modify_parked_cancel_ids = _BoundedIdSet(
+            _MODIFY_PARKED_CANCEL_IDS_CAP,
+        )
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -1866,6 +1917,18 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.record_unpark(coid)
             self._maybe_attach_defensive_close_ref(key, order.id)
+            # The promoted order is proven LIVE at the venue. If its id sits
+            # in the parked-modify cancel ring, the park was an atomic
+            # in-place amend that registered its OWN live order id (the
+            # engine cannot tell the modify shapes apart at park time) —
+            # a future CANCELLED push for this id can no longer be the
+            # engine-initiated predecessor confirmation, so drop it or a
+            # genuine operator cancel of the amended order would be
+            # consumed silently and skip the ``on_unexpected_cancel``
+            # policy. A cancel+re-execute park is unaffected: its
+            # registered predecessor ids differ from the fresh
+            # replacement's id promoted here.
+            self._modify_parked_cancel_ids.discard(order.id)
             # NOTE: the entry fill ledger (:attr:`_active_entry_filled_qty`)
             # is deliberately NOT seeded from ``order.filled_qty`` here. An
             # in-memory park is same-session: the parked intent stayed in
@@ -3845,6 +3908,45 @@ class OrderSyncEngine:
                     now_ms=self._cancel_tentative_now_ms(),
                 )
                 return
+            if (key is not None
+                    and event.order.id in self._modify_parked_cancel_ids):
+                # Engine-initiated predecessor cancel of a PARKED cancel +
+                # re-execute modify: the replacement submission raised
+                # ``OrderDispositionUnknownError`` in
+                # :meth:`_dispatch_modify`, so the success-path remap never
+                # replaced the mapping and this push still matches ``key``.
+                # It confirms the engine's OWN cancel — not an external one:
+                # skip the unexpected-cancel teardown (which would drop the
+                # envelope and DELETE the persisted pending-verification row
+                # the parked replacement needs for recovery) and the
+                # ``on_unexpected_cancel`` policy. Retire the predecessor id
+                # (a late fill must not be miscredited to the replacement's
+                # reset fill ledger — mirrors the modify success path) and
+                # trim it from the mapping; the pending-verification
+                # machinery resolves the replacement's own disposition.
+                # Consumption is ONE-SHOT: the predecessor-cancel push
+                # arrives at most once, so drop the id from the ring — a
+                # LATER cancelled push under the same order id (an atomic
+                # amend whose live id was registered too) is a genuine
+                # external cancel and must hit the policy path below.
+                self._modify_parked_cancel_ids.discard(event.order.id)
+                if isinstance(self._active_intents.get(key), EntryIntent):
+                    self._retired_entry_order_ids.add(event.order.id)
+                remaining = [
+                    order_id
+                    for order_id in self._order_mapping.get(key, [])
+                    if order_id != event.order.id
+                ]
+                if remaining:
+                    self._order_mapping[key] = remaining
+                else:
+                    self._order_mapping.pop(key, None)
+                _blog_info(
+                    "engine-initiated modify-cancel confirmed for intent %s "
+                    "(%s) — parked replacement verification continues",
+                    format_intent_key(key), event,
+                )
+                return
             if key is not None:
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
@@ -3885,6 +3987,16 @@ class OrderSyncEngine:
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
+                # A bot-owned order the engine still maps was cancelled out
+                # from under us — the same unexpected-cancel the grace-window
+                # tracker guards, but observed first on the private stream.
+                # Apply the ``on_unexpected_cancel`` policy here or the push
+                # would silently let the strategy re-dispatch the entry next
+                # bar (a re-place duel with an operator's manual cancel).
+                # Runs AFTER the teardown so a ``halt`` raise leaves no live
+                # mapping behind, mirroring
+                # :meth:`_halt_if_defensive_close_terminal`.
+                self._apply_unexpected_cancel_policy(event, key)
             else:
                 _blog_info(
                     "external cancel observed (%s)", event,
@@ -3935,6 +4047,177 @@ class OrderSyncEngine:
             else:
                 _blog_warning(
                     "order rejected (%s)", event,
+                )
+
+    def _apply_unexpected_cancel_policy(
+            self, event: OrderEvent, key: str,
+    ) -> None:
+        """Apply ``on_unexpected_cancel`` for a push-detected external cancel.
+
+        The WS-push analogue of
+        :meth:`~pynecore.core.broker.disappearance.DisappearanceTracker._apply_policy`:
+        on a reliable-push venue (Bybit, cTrader) the private-stream
+        ``cancelled`` event beats the tracker's grace window every time, so
+        without this the configured policy would be dead for push-detected
+        external cancels. Routes through the shared
+        :func:`~pynecore.core.broker.disappearance.resolve_unexpected_cancel_policy`
+        decision so the mapping stays identical to the tracker path.
+
+        - ``stop`` / ``stop_and_cancel`` latch :meth:`record_quarantine`
+          (idempotent) — the process keeps running but new entry dispatch is
+          blocked, so the strategy's next-bar re-dispatch of the cancelled
+          entry is suppressed and the re-place duel stops.
+        - ``halt`` records and RAISES :class:`UnexpectedCancelError` out of
+          the event-application path (mirroring
+          :meth:`_halt_if_defensive_close_terminal`) so the engine performs
+          its graceful stop.
+        - ``ignore`` / ``re_place`` only audit-log.
+
+        ``stop_and_cancel`` additionally runs the engine-side best-effort
+        sibling sweep (:meth:`_sweep_siblings_after_unexpected_cancel`) —
+        the push-path analogue of the tracker's ``cancel_siblings`` hook.
+        On a reliable-push venue the tracker never detects a push-observed
+        cancel (the plugin retires the row on the terminal push), so
+        without the engine-side sweep the policy's cancel half would
+        silently never run and the remaining bot-owned orders would rest
+        live after the operator-selected safety response fired. Ordering
+        mirrors :meth:`DisappearanceTracker._apply_policy`: the quarantine
+        / halt signal is armed BEFORE the sweep, and the sweep swallows
+        per-intent failures, so a failing cancel can never soften the
+        safety outcome.
+
+        Tracker-synthesised ``cancelled`` events
+        (:attr:`OrderEvent.from_disappearance_tracker`) are skipped: the
+        tracker already applied the policy before emitting them, so
+        re-applying would double the audit / sibling sweep and — for
+        ``halt`` — raise from the wrong place. Their teardown above still
+        runs (the tracker never touches ``_order_mapping``); only the policy
+        is gated off here.
+
+        :param event: The venue-pushed ``cancelled`` event.
+        :param key: The matched intent key whose mapping was just torn down.
+        """
+        if event.from_disappearance_tracker:
+            return
+        policy = self._broker.on_unexpected_cancel
+        order = event.order
+        coid = order.client_order_id if order is not None else None
+        exchange_order_id = order.id if order is not None else None
+        reason = (
+            f"Bot-owned order cancelled unexpectedly on the venue: "
+            f"coid={coid!r} ref={exchange_order_id!r} intent={key!r}"
+        )
+        context = {
+            'client_order_id': coid,
+            'exchange_order_id': exchange_order_id,
+            'symbol': order.symbol if order is not None else self._symbol,
+            'intent_key': key,
+            'policy': policy,
+        }
+        halt = resolve_unexpected_cancel_policy(
+            policy,
+            reason=reason,
+            context=context,
+            request_quarantine=self.record_quarantine,
+            log_event=(
+                self._store_ctx.log_event
+                if self._store_ctx is not None else None
+            ),
+            client_order_id=coid,
+            exchange_order_id=exchange_order_id,
+        )
+        if halt is not None:
+            # Record BEFORE the sweep (mirrors the tracker's "signal armed
+            # before the best-effort sweep" ordering) so a raising sweep can
+            # never swallow the halt; the raise itself runs after the sweep
+            # so the remaining orders are still cancelled best-effort.
+            self._record_halt(halt)
+        if policy == 'stop_and_cancel':
+            self._sweep_siblings_after_unexpected_cancel(
+                key, origin_coid=coid,
+            )
+        if halt is not None:
+            raise halt
+
+    def _sweep_siblings_after_unexpected_cancel(
+            self, origin_key: str, *, origin_coid: str | None,
+    ) -> None:
+        """Best-effort sibling cancel sweep for push-detected ``stop_and_cancel``.
+
+        The engine-side analogue of the reference plugins'
+        ``cancel_siblings`` tracker hook: cancels every OTHER bot-owned
+        working order the engine still tracks, so the quarantine / halt
+        does not strand resting entries or exits that could execute after
+        the safety response fired. Semantics mirror the plugin sweeps
+        (e.g. Bybit's ``_cancel_sibling_working_orders``):
+
+        - An entry that already carries filled exposure is left for the
+          operator — cancelling its residual working order would strand
+          real broker exposure without tracking.
+        - Cancels go through :meth:`_dispatch_cancel`, so an ambiguous
+          disposition lands in the cancel-tentative / forced-cancel retry
+          machinery instead of being treated as settled, and each mapping
+          is kept until its cancel outcome is known.
+        - Per-intent failures are swallowed and audited
+          (``unexpected_cancel_sweep_failed``) — the sweep runs while the
+          quarantine / halt is already armed, so a failing cancel never
+          softens the safety outcome. A settled cancel is audited as
+          ``unexpected_cancel_cascade``.
+
+        The active intent slots are deliberately KEPT (matching the
+        tracker path, which never touches engine state for swept
+        siblings): the quarantine blocks new entry dispatch, an unchanged
+        Pine book diffs to no-op, and ``reconcile()`` observes the final
+        broker-side state.
+
+        :param origin_key: The intent key of the unexpectedly cancelled
+            order — already torn down by the caller; skipped defensively.
+        :param origin_coid: The origin order's client order id, recorded on
+            the audit rows.
+        """
+        for key, intent in list(self._active_intents.items()):
+            if key == origin_key:
+                continue
+            has_mapping = bool(self._order_mapping.get(key))
+            has_engine_legs = (
+                isinstance(intent, ExitIntent)
+                and self._partial_bracket_engine.has_active_legs_for_intent(
+                    key,
+                )
+            )
+            if not has_mapping and not has_engine_legs:
+                # Nothing working at the broker (or engine-side) for this
+                # slot — no order to strand.
+                continue
+            if (isinstance(intent, EntryIntent)
+                    and self._active_entry_filled_qty.get(key, 0.0) > 0.0):
+                # Real broker exposure — never cancel-and-retire it.
+                continue
+            # noinspection PyBroadException
+            try:
+                self._dispatch_cancel(intent)
+            except Exception:
+                _log.exception(
+                    "stop_and_cancel sibling sweep: cancel of %s failed; "
+                    "quarantine/halt stays armed",
+                    format_intent_key(key),
+                )
+                if self._store_ctx is not None:
+                    self._store_ctx.log_event(
+                        'unexpected_cancel_sweep_failed',
+                        client_order_id=origin_coid,
+                        intent_key=key,
+                    )
+                continue
+            _blog_info(
+                "stop_and_cancel sibling sweep: cancelled %s",
+                format_intent_key(key),
+            )
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'unexpected_cancel_cascade',
+                    client_order_id=origin_coid,
+                    intent_key=key,
                 )
 
     def _abort_pending_partial_legs_for_dead_entry(
@@ -4025,6 +4308,29 @@ class OrderSyncEngine:
             if record.key == key
         ]:
             self._persisted_pending_anchors.pop(coid, None)
+        # Retire same-key IN-MEMORY parks in lockstep with the persisted
+        # rows ``record_complete`` DELETEs below. Store-backed runs would
+        # self-heal the residue only at the TOP of the next :meth:`sync`
+        # (:meth:`_prune_orphaned_pending` reconciles against the replay),
+        # but :meth:`_verify_pending_dispatches` runs LATER in the SAME
+        # sync than the event drain — an external cancel drained in
+        # between tears the key down here, yet the stale park would still
+        # be matched against an eventually-consistent ``get_open_orders``
+        # snapshot and re-promote the cancelled order into
+        # ``_order_mapping``. A storeless run never prunes at all: the
+        # dead park would force the spurious broker round-trip forever
+        # and stay promotable indefinitely.
+        for coid in [
+            coid for coid, envelope in self._pending_verification.items()
+            if envelope.intent.intent_key == key
+        ]:
+            self._pending_verification.pop(coid, None)
+        # The modify rollback snapshot dies with the park: once the key is
+        # retired no ``'rejected'`` resolution can arrive for it (the
+        # persisted rows are deleted below), and ``_park_pending``'s
+        # first-park-wins ``setdefault`` would otherwise resurrect the
+        # STALE snapshot into a later, unrelated park reusing this key.
+        self._modify_old_intents.pop(key, None)
         # Drop the recovered-close-anchor tag in lockstep with the
         # envelope. The tag was seeded by
         # :meth:`_verify_pending_dispatches` (or its persisted-anchor
@@ -13197,6 +13503,37 @@ class OrderSyncEngine:
             _blog_warning(
                 "modify parked (unknown disposition) for %s: %s", new, e,
             )
+            # The default plugin modify is cancel + re-execute
+            # (:meth:`BrokerPlugin.modify_entry` / ``modify_exit``): by the
+            # time the REPLACEMENT submission turned ambiguous, the
+            # predecessor's cancel has typically already landed at the venue.
+            # The park below keeps ``_order_mapping`` pointing at the
+            # predecessor ids (the success-path remap never ran), so the
+            # venue's normal CANCELLED push for that engine-initiated cancel
+            # would match a live mapping in :meth:`_route_event` and be
+            # misread as an UNEXPECTED external cancel — tearing down the
+            # parked verification state and firing the
+            # ``on_unexpected_cancel`` policy on an ordinary recoverable
+            # modify timeout. Register the predecessor ids so the
+            # ``cancelled`` branch consumes the push as engine-initiated
+            # instead. When the plugin declares the modify shape
+            # (``predecessor_cancel_ids``), register EXACTLY the declared
+            # ids: an atomic in-place amend declares ``()``, nothing is
+            # registered, and a CANCELLED push during the park is a genuine
+            # external cancel that fires the policy (whose teardown also
+            # clears the otherwise-unresolvable park via
+            # :meth:`_drop_envelope` + the next-sync self-heal). Only an
+            # UNDECLARED shape falls back to registering every mapped id —
+            # there an atomic amend registers its own live order id too and
+            # a genuinely external cancel during the park window is consumed
+            # once: the documented cost of not firing the policy on an
+            # ordinary modify timeout.
+            if e.predecessor_cancel_ids is None:
+                for prev_id in self._order_mapping.get(new.intent_key, []):
+                    self._modify_parked_cancel_ids.add(prev_id)
+            else:
+                for prev_id in e.predecessor_cancel_ids:
+                    self._modify_parked_cancel_ids.add(prev_id)
             self._park_pending(new_env, e, kind='modify', old_intent=old)
         except BracketAttachAfterFillRejectedError as e:
             # The plugin's modify path reached ``execute_exit`` (the
