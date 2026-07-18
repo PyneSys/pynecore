@@ -44,6 +44,10 @@ from ...types.ohlcv import OHLCV
 if TYPE_CHECKING:
     from .closedtrades import closedtrades
     from .opentrades import opentrades
+    # Static-only public aliases: at runtime the submodule import above already
+    # sets these attributes on the package; the underscore aliases keep them out
+    # of the module-property registry.
+    from . import commission as commission, oca as oca
 
 
 #
@@ -2467,7 +2471,8 @@ class SimPosition(PositionBase):
         :return: True when the ``max_cons_loss_days`` halt fired — the caller
             must stop processing the bar's orders.
         """
-        current_trading_day = int(lib.time_tradingday())
+        # Statically a value (module_property), at runtime still the function
+        current_trading_day = int(lib.time_tradingday())  # pyright: ignore[reportCallIssue]
         if current_trading_day == self.risk_last_trading_day:
             return False
         current_equity = float(self.equity)

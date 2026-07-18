@@ -8,7 +8,7 @@ from ..types.line import Line
 from ..types.linefill import LineFill
 
 
-def cast_color(x: Color | NA) -> Color | NA[Color]:
+def cast_color(x: Color | NA) -> Color:
     """
     Casts `na` to Color
     :param x: The value to convert
@@ -17,7 +17,7 @@ def cast_color(x: Color | NA) -> Color | NA[Color]:
     return NA(Color) if isinstance(x, NA) else x
 
 
-def cast_label(x: Label | NA) -> Label | NA[Label]:
+def cast_label(x: Label | NA) -> Label:
     """
     Casts `na` to Label
 
@@ -27,7 +27,7 @@ def cast_label(x: Label | NA) -> Label | NA[Label]:
     return NA(Label) if isinstance(x, NA) else x
 
 
-def cast_table(x: Table | NA) -> Table | NA[Table]:
+def cast_table(x: Table | NA) -> Table:
     """
     Casts `na` to Table
 
@@ -49,7 +49,7 @@ def cast_bool(x: bool | int | float | NA) -> bool:
     return not not x
 
 
-def cast_box(x: Box | NA) -> Box | NA[Box]:
+def cast_box(x: Box | NA) -> Box:
     """
     Casts `na` to Box
 
@@ -59,7 +59,7 @@ def cast_box(x: Box | NA) -> Box | NA[Box]:
     return NA(Box) if isinstance(x, NA) else x
 
 
-def cast_int(x: int | float | NA) -> int | NA[int]:
+def cast_int(x: int | float | NA) -> int:
     """
     Casts na or truncates float value to int
 
@@ -71,7 +71,7 @@ def cast_int(x: int | float | NA) -> int | NA[int]:
     return int(x)
 
 
-def cast_line(x: Line | NA) -> Line | NA[Line]:
+def cast_line(x: Line | NA) -> Line:
     """
     Casts `na` to Line
 
@@ -81,7 +81,7 @@ def cast_line(x: Line | NA) -> Line | NA[Line]:
     return NA(Line) if isinstance(x, NA) else x
 
 
-def cast_float(x: float | int | NA) -> float | NA[float]:
+def cast_float(x: float | int | NA) -> float:
     """
     Casts `na` to float
 
@@ -93,7 +93,7 @@ def cast_float(x: float | int | NA) -> float | NA[float]:
     return float(x)
 
 
-def cast_string(x: str | NA) -> str | NA[str]:
+def cast_string(x: str | NA) -> str:
     """
     Casts `na` to string
 
@@ -103,7 +103,7 @@ def cast_string(x: str | NA) -> str | NA[str]:
     return NA(str) if isinstance(x, NA) else x
 
 
-def cast_linefill(x: LineFill | NA) -> LineFill | NA[LineFill]:
+def cast_linefill(x: LineFill | NA) -> LineFill:
     """
     Casts `na` to LineFill
 

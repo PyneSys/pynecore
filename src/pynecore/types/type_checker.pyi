@@ -4,8 +4,8 @@ Pine Script type checker compatibility layer.
 In Pine Script (and PyneCore), every variable is implicitly a Series — meaning even a plain
 ``float`` supports historical indexing like ``close[1]`` (the previous bar's value). At runtime
 the AST transformer handles this, but IDEs (PyCharm, etc.) only see the static types. Since
-``Series[float]`` is a union of ``float | _SeriesType[float] | NA[float]``, strict type checkers
-complain that the ``float`` member has no ``__getitem__``.
+``Series[float]`` is a transparent alias for ``float`` (see series.pyi), strict type checkers
+complain that ``float`` has no ``__getitem__``.
 
 This module solves it by re-exporting ``float``, ``int``, and ``bool`` as enhanced subclasses
 **only under TYPE_CHECKING** (i.e., only visible to the IDE, zero runtime cost). The enhanced

@@ -1,5 +1,5 @@
 from ..types.datetime import DayOfWeek
-from ..core.module_property import module_property
+from ..core.module_property import module_property, module_function_property
 
 
 #
@@ -20,7 +20,7 @@ saturday = DayOfWeek()
 #
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
     """
     Day of the week

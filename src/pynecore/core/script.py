@@ -1,4 +1,4 @@
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, overload
 import os
 import sys
 
@@ -44,7 +44,7 @@ class InputData:
     maxval: int | float | None = None
     step: int | float | None = None
     tooltip: str | None = None
-    inline: bool | None = False
+    inline: str | None = None
     group: str | None = None
     confirm: bool | None = False
     options: tuple[int | float | str, ...] | None = None
@@ -526,18 +526,20 @@ class _Input:
     Input functions
     """
 
-    def __call__(self, defval: Any, title: str | None = None, *,
-                 tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
-                 display: _display.Display | None = None, _id: str = "", **__) -> Any:
+    def __call__(self, defval: Any, title: str | None = None,
+                 tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+                 display: _display.Display | None = None, active: bool | None = None,
+                 *, _id: str = "", **__) -> Any:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
 
         :param defval: The default value of the input
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
@@ -556,52 +558,95 @@ class _Input:
         )
         return defval if _id not in _old_input_values else _old_input_values[_id]
 
+    # Pine's numeric inputs have TWO positional overloads after ``title``: the
+    # minval/maxval/step form and the options form. A single Python parameter
+    # list cannot bind both, so the implementations take ``*args`` and bind the
+    # tail by inspecting the third argument (a tuple/list selects the options
+    # form) — mirroring what the v6 reference publishes.
+    _NUMERIC_RANGE_TAIL = ('minval', 'maxval', 'step', 'tooltip', 'inline', 'group',
+                           'confirm', 'display', 'active')
+    _NUMERIC_OPTIONS_TAIL = ('options', 'tooltip', 'inline', 'group',
+                             'confirm', 'display', 'active')
+
     @classmethod
-    def _int(cls, defval: int, title: str | None = None, *,
+    def _bind_numeric_tail(cls, args: tuple, kwargs: dict) -> None:
+        """
+        Bind positional arguments after ``title`` into ``kwargs`` following
+        Pine's two numeric input overloads.
+
+        :param args: Positional arguments after ``defval`` and ``title``
+        :param kwargs: Keyword arguments; bound names are added in place
+        :raises TypeError: On too many positionals or a positional/keyword clash
+        """
+        if not args:
+            return
+        names = (cls._NUMERIC_OPTIONS_TAIL if isinstance(args[0], (tuple, list))
+                 else cls._NUMERIC_RANGE_TAIL)
+        if len(args) > len(names):
+            raise TypeError("too many positional arguments for input")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"input got multiple values for argument '{name}'")
+            kwargs[name] = value
+
+    # noinspection PyMethodOverriding
+    @overload
+    @classmethod
+    def _int(cls, defval: int, title: str | None = None,
              minval: int | None = None, maxval: int | None = None, step: int | None = None,
-             tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
-             confirm: bool | None = False, options: tuple[int] | None = None,
-             display: _display.Display | None = None, _id: str = "", **__) -> PyneInt:
+             tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+             confirm: bool | None = False, display: _display.Display | None = None,
+             active: bool | None = None) -> PyneInt: ...
+
+    # noinspection PyMethodOverriding
+    @overload
+    @classmethod
+    def _int(cls, defval: int, title: str | None = None,
+             options: tuple[int, ...] | None = None,
+             tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+             confirm: bool | None = False, display: _display.Display | None = None,
+             active: bool | None = None) -> PyneInt: ...
+
+    @classmethod
+    def _int(cls, defval: int, title: str | None = None, *args,
+             _id: str = "", **kwargs) -> PyneInt:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for an integer input to the script's inputs.
 
+        Positional arguments after ``title`` follow Pine v6's two overloads
+        (``minval, maxval, step, ...`` or ``options, ...``); ``active`` is
+        UI-only in Pine and is accepted but ignored.
+
         :param defval: The default value of the input
         :param title: The title of the input
-        :param minval: The minimum value of the input
-        :param maxval: The maximum value of the input
-        :param step: The step value of the input
-        :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
-        :param group: The group of the input
-        :param confirm: If True, the user will be asked to confirm the input
-        :param options: A tuple of integers that the user can select from
-        :param display: Controls where the script will display the input's information
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
+        cls._bind_numeric_tail(args, kwargs)
         inputs[_id] = InputData(
             id=_id,
             input_type='int',
             defval=defval,
             title=title,
-            minval=minval,
-            maxval=maxval,
-            step=step,
-            tooltip=tooltip,
-            inline=inline,
-            group=group,
-            confirm=confirm,
-            options=options,
-            display=display,
+            minval=kwargs.get('minval'),
+            maxval=kwargs.get('maxval'),
+            step=kwargs.get('step'),
+            tooltip=kwargs.get('tooltip'),
+            inline=kwargs.get('inline'),
+            group=kwargs.get('group'),
+            confirm=kwargs.get('confirm', False),
+            options=kwargs.get('options'),
+            display=kwargs.get('display'),
         )
         return defval if _id not in _old_input_values else safe_convert.safe_int(_old_input_values[_id])
 
     @classmethod
-    def _bool(cls, defval: bool, title: str | None = None, *,
-              tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
+    def _bool(cls, defval: bool, title: str | None = None,
+              tooltip: str | None = None, inline: str | None = None, group: str | None = None,
               confirm: bool | None = False, display: _display.Display | None = None,
-              _id: str = "", **__) -> bool:
+              active: bool | None = None,
+              *, _id: str = "", **__) -> bool:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a boolean input to the script's inputs.
@@ -609,10 +654,11 @@ class _Input:
         :param defval: The default value of the input
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
         :param confirm: If True, the user will be asked to confirm the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
@@ -629,54 +675,66 @@ class _Input:
         )
         return defval if _id not in _old_input_values else bool(_old_input_values[_id])
 
+    # noinspection PyMethodOverriding
+    @overload
     @classmethod
-    def _float(cls, defval: float, title: str | None = None, *,
-               tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
-               confirm: bool | None = False, options: tuple[int] | None = None,
-               minval: float | None = None, maxval: float | None = None, step: float | None = None,
-               display: _display.Display | None = None, _id: str = "", **__) -> PyneFloat:
+    def _float(cls, defval: float, title: str | None = None,
+               minval: float | None = None, maxval: float | None = None,
+               step: float | None = None,
+               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+               confirm: bool | None = False, display: _display.Display | None = None,
+               active: bool | None = None) -> PyneFloat: ...
+
+    # noinspection PyMethodOverriding
+    @overload
+    @classmethod
+    def _float(cls, defval: float, title: str | None = None,
+               options: tuple[int | float, ...] | None = None,
+               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+               confirm: bool | None = False, display: _display.Display | None = None,
+               active: bool | None = None) -> PyneFloat: ...
+
+    @classmethod
+    def _float(cls, defval: float, title: str | None = None, *args,
+               _id: str = "", **kwargs) -> PyneFloat:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a float input to the script's inputs.
 
+        Positional arguments after ``title`` follow Pine v6's two overloads
+        (``minval, maxval, step, ...`` or ``options, ...``); ``active`` is
+        UI-only in Pine and is accepted but ignored.
+
         :param defval: The default value of the input
         :param title: The title of the input
-        :param minval: The minimum value of the input
-        :param maxval: The maximum value of the input
-        :param step: The step value of the input
-        :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
-        :param group: The group of the input
-        :param confirm: If True, the user will be asked to confirm the input
-        :param options: A tuple of integers that the user can select from
-        :param display: Controls where the script will display the input's information
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
+        cls._bind_numeric_tail(args, kwargs)
         inputs[_id] = InputData(
             id=_id,
             input_type='float',
             defval=defval,
             title=title,
-            minval=minval,
-            maxval=maxval,
-            step=step,
-            tooltip=tooltip,
-            inline=inline,
-            group=group,
-            confirm=confirm,
-            options=options,
-            display=display,
+            minval=kwargs.get('minval'),
+            maxval=kwargs.get('maxval'),
+            step=kwargs.get('step'),
+            tooltip=kwargs.get('tooltip'),
+            inline=kwargs.get('inline'),
+            group=kwargs.get('group'),
+            confirm=kwargs.get('confirm', False),
+            options=kwargs.get('options'),
+            display=kwargs.get('display'),
         )
         return defval if _id not in _old_input_values else safe_convert.safe_float(_old_input_values[_id])
 
     @classmethod
-    def string(cls, defval: str, title: str | None = None, *,
-               tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
+    def string(cls, defval: str, title: str | None = None,
+               options: tuple[str, ...] | None = None,
+               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
                confirm: bool | None = False,
-               options: tuple[str] | None = None,
-               display: _display.Display | None = None,
-               _id: str = "", **__) -> str:
+               display: _display.Display | None = None, active: bool | None = None,
+               *, _id: str = "", **__) -> str:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a string input to the script's inputs.
@@ -684,10 +742,11 @@ class _Input:
         :param defval: The default value of the input
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
         :param confirm: If True, the user will be asked to confirm the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
         :param options: A tuple of strings that the user can select from
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
@@ -707,10 +766,11 @@ class _Input:
         return defval if _id not in _old_input_values else str(_old_input_values[_id])
 
     @classmethod
-    def color(cls, defval: Color, title: str | None = None, *,
-              tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
+    def color(cls, defval: Color, title: str | None = None,
+              tooltip: str | None = None, inline: str | None = None, group: str | None = None,
               confirm: bool | None = False, display: _display.Display | None = None,
-              _id: str = "", **__) -> Color:
+              active: bool | None = None,
+              *, _id: str = "", **__) -> Color:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a color input to the script's inputs.
@@ -718,10 +778,11 @@ class _Input:
         :param defval: The default value of the input
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
         :param confirm: If True, the user will be asked to confirm the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
@@ -739,22 +800,27 @@ class _Input:
         return defval if _id not in _old_input_values else Color(_old_input_values[_id])
 
     @classmethod
-    def source(cls, defval: str | Source, title: str | None = None, *,
-               tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
-               confirm: bool | None = False, display: _display.Display | None = None,
-               _id: str = "", **__) -> PyneFloat:
+    def source(cls, defval: str | Source | float, title: str | None = None,
+               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+               display: _display.Display | None = None, active: bool | None = None,
+               confirm: bool | None = False,
+               *, _id: str = "", **__) -> PyneFloat:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a source input to the script's inputs.
+
+        Pine v6 positional order — uniquely among inputs, ``confirm`` comes LAST,
+        after ``display`` and ``active``.
 
         :param defval: The name of the "source" registered in lib module,
                        like "open", "high", "low", "close", "hl2", "hlc3", "ohlc4"
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
-        :param confirm: If True, the user will be asked to confirm the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
+        :param confirm: If True, the user will be asked to confirm the input
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
@@ -774,12 +840,12 @@ class _Input:
         return defval if _id not in _old_input_values else _old_input_values[_id]  # type: ignore[return-value]
 
     @classmethod
-    def enum(cls, defval: TEnum, title: str | None = None, *,
-             tooltip: str | None = None, inline: bool | None = False, group: str | None = None,
+    def enum(cls, defval: TEnum, title: str | None = None,
+             options: tuple[str, ...] | None = None,
+             tooltip: str | None = None, inline: str | None = None, group: str | None = None,
              confirm: bool | None = False,
-             options: tuple[str] | None = None,
-             display: _display.Display | None = None,
-             _id: str = "", **__) -> TEnum:
+             display: _display.Display | None = None, active: bool | None = None,
+             *, _id: str = "", **__) -> TEnum:
         """
         Adds an input to your script's settings, which allows you to provide configuration options
         to script users. This function adds a field for a enum input to the script's inputs.
@@ -787,10 +853,11 @@ class _Input:
         :param defval: The default value of the input
         :param title: The title of the input
         :param tooltip: The tooltip of the input
-        :param inline: If True, the input will be displayed inline
+        :param inline: Inputs with the same inline string are displayed on one line
         :param group: The group of the input
         :param confirm: If True, the user will be asked to confirm the input
         :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
         :param options: A tuple of strings that the user can select from
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
@@ -819,21 +886,116 @@ class _Input:
                     return defval
             return defval
 
+    # We don't have interactive inputs, so price is stored as a float input; its
+    # Pine positional order has no minval/maxval/step, so it cannot alias _float
+    @classmethod
+    def price(cls, defval: float, title: str | None = None,
+              tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+              confirm: bool | None = False, display: _display.Display | None = None,
+              active: bool | None = None,
+              *, _id: str = "", **__) -> PyneFloat:
+        """
+        Adds an input to your script's settings, which allows you to provide configuration options
+        to script users. This function adds a field for a price input to the script's inputs.
+
+        :param defval: The default value of the input
+        :param title: The title of the input
+        :param tooltip: The tooltip of the input
+        :param inline: Inputs with the same inline string are displayed on one line
+        :param group: The group of the input
+        :param confirm: If True, the user will be asked to confirm the input
+        :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
+        :param _id: The unique identifier of the input, it is filled by the InputTransformer
+        :return: The input value from toml file or the default
+        """
+        return cls._float(defval, title, tooltip=tooltip, inline=inline, group=group,
+                          confirm=confirm, display=display, _id=_id)
+
+    # Pine's input.symbol has NO options: its third positional is tooltip, so it
+    # cannot alias string (whose third positional is options)
+    @classmethod
+    def symbol(cls, defval: str, title: str | None = None,
+               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+               confirm: bool | None = False, display: _display.Display | None = None,
+               active: bool | None = None,
+               *, _id: str = "", **__) -> str:
+        """
+        Adds an input to your script's settings, which allows you to provide configuration options
+        to script users. This function adds a field for a symbol input to the script's inputs.
+
+        :param defval: The default value of the input
+        :param title: The title of the input
+        :param tooltip: The tooltip of the input
+        :param inline: Inputs with the same inline string are displayed on one line
+        :param group: The group of the input
+        :param confirm: If True, the user will be asked to confirm the input
+        :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
+        :param _id: The unique identifier of the input, it is filled by the InputTransformer
+        :return: The input value from toml file or the default
+        """
+        return cls.string(defval, title, tooltip=tooltip, inline=inline, group=group,
+                          confirm=confirm, display=display, _id=_id)
+
+    # Pine's input.text_area has neither options nor inline: its positional
+    # order is defval, title, tooltip, group, confirm, display, active
+    @classmethod
+    def text_area(cls, defval: str, title: str | None = None,
+                  tooltip: str | None = None, group: str | None = None,
+                  confirm: bool | None = False, display: _display.Display | None = None,
+                  active: bool | None = None,
+                  *, _id: str = "", **__) -> str:
+        """
+        Adds an input to your script's settings, which allows you to provide configuration options
+        to script users. This function adds a field for a text area input to the script's inputs.
+
+        :param defval: The default value of the input
+        :param title: The title of the input
+        :param tooltip: The tooltip of the input
+        :param group: The group of the input
+        :param confirm: If True, the user will be asked to confirm the input
+        :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
+        :param _id: The unique identifier of the input, it is filled by the InputTransformer
+        :return: The input value from toml file or the default
+        """
+        return cls.string(defval, title, tooltip=tooltip, group=group,
+                          confirm=confirm, display=display, _id=_id)
+
+    # time() returns UNIX timestamp in milliseconds (int); its Pine positional
+    # order has no minval/maxval/step, so it cannot alias _int
+    @classmethod
+    def time(cls, defval: int, title: str | None = None,
+             tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+             confirm: bool | None = False, display: _display.Display | None = None,
+             active: bool | None = None,
+             *, _id: str = "", **__) -> PyneInt:
+        """
+        Adds an input to your script's settings, which allows you to provide configuration options
+        to script users. This function adds a field for a time input to the script's inputs.
+
+        :param defval: The default value of the input (UNIX timestamp in milliseconds)
+        :param title: The title of the input
+        :param tooltip: The tooltip of the input
+        :param inline: Inputs with the same inline string are displayed on one line
+        :param group: The group of the input
+        :param confirm: If True, the user will be asked to confirm the input
+        :param display: Controls where the script will display the input's information
+        :param active: UI-only in Pine (greys out the field); accepted for parity, ignored
+        :param _id: The unique identifier of the input, it is filled by the InputTransformer
+        :return: The input value from toml file or the default
+        """
+        return cls._int(defval, title, tooltip=tooltip, inline=inline, group=group,
+                        confirm=confirm, display=display, _id=_id)
+
     int = _int
     bool = _bool
     float = _float
 
-    # We don't have interactive inputs, so it is the same as float
-    price = _float
-
     # These are incomplete, but good workaround
     session = string
-    symbol = string
     timeframe = string
-    text_area = string
-
-    # time() returns UNIX timestamp in milliseconds (int)
-    time = _int
 
 
 # noinspection PyShadowingBuiltins

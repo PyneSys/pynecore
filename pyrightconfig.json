@@ -10,7 +10,6 @@
    ],
    "reportIndexIssue": "none",
    "typeCheckingMode": "basic",
-   "reportUnknownMemberType": "none",
    "reportAssignmentType": "none",
    "reportRedeclaration": "none",
    "reportArgumentType": "none",

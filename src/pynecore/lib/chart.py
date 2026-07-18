@@ -113,7 +113,7 @@ class _ChartPoint:
         return ChartPoint(index=NA(int), time=time, price=price)
 
     @staticmethod
-    def copy(id: ChartPoint) -> ChartPoint | NA[ChartPoint]:
+    def copy(id: ChartPoint) -> ChartPoint:
         """
         Returns a copy of the ``chart.point`` object.
 

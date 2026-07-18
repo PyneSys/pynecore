@@ -27,3 +27,26 @@ def __test_module_properties_json_is_current__():
 
     assert generated == committed, \
         "module_properties.json is stale — rerun scripts/module_property_collector.py"
+
+
+def __test_registry_excludes_typing_machinery__():
+    """
+    Implementation-only names must NOT be accepted public lib names: a registry
+    entry suppresses the transformer's unknown-name error, so typing machinery
+    leaking in makes e.g. ``ta.cast`` silently valid in user scripts.
+    """
+    json_path = _REPO_ROOT / 'src' / 'pynecore' / 'transformers' / 'module_properties.json'
+    committed = json.loads(json_path.read_text())
+
+    banned = {
+        'cast', 'overload', 'TypeVar', 'TypeAlias', 'TYPE_CHECKING', 'Literal',
+        'Any', 'Callable', 'module_property', 'module_function_property',
+        # TypeVar instances used across lib modules
+        'T', 'TFI', 'TFIB', 'TKey', 'TValue', 'Number',
+    }
+    offenders = sorted(
+        f'{module}.{name}'
+        for module, names in committed.items()
+        for name in names if name in banned
+    )
+    assert not offenders, f"typing machinery leaked into the registry: {offenders}"

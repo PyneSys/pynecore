@@ -1,4 +1,4 @@
-from typing import TypeVar, Any
+from typing import TypeVar, Any, cast
 
 import builtins
 
@@ -105,7 +105,7 @@ def abs(id: list[int | float]) -> list[int | float]:
 
 
 # noinspection PyShadowingBuiltins
-def avg(id: list[Number]) -> float | NA[float]:
+def avg(id: list[Number]) -> float:
     """
     Returns the average value of the elements in the array.
 
@@ -229,7 +229,7 @@ def copy(id: list[T]) -> list[T]:
 
 
 # noinspection PyShadowingBuiltins
-def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> float | NA[float]:
+def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> float:
     """
     Returns the covariance between the elements in the two arrays.
 
@@ -407,7 +407,7 @@ def lastindexof(id: list[T], value: T) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def max(id: list[Number], nth: int = 0) -> Number | NA[float]:
+def max(id: list[Number], nth: int = 0) -> Number:
     """
     Returns the maximum value in the array, or the nth largest value.
 
@@ -421,16 +421,16 @@ def max(id: list[Number], nth: int = 0) -> Number | NA[float]:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return cast(Number, id[0] if id else NA(None))
     if nth == 0:
         return builtins.max(a)
     if nth < 0 or nth >= len(a):
-        return NA(float)
+        return cast(Number, NA(builtins.type(a[0])))
     return sorted(a, reverse=True)[nth]
 
 
 # noinspection PyShadowingBuiltins
-def median(id: list[Number]) -> float | NA[float]:
+def median(id: list[Number]) -> float:
     """
     Returns the median value of the elements in the array.
 
@@ -444,7 +444,7 @@ def median(id: list[Number]) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins
-def min(id: list[Number], nth: int = 0) -> float | NA[float]:
+def min(id: list[Number], nth: int = 0) -> Number:
     """
     Returns the minimum value in the array, or the nth smallest value.
 
@@ -458,16 +458,16 @@ def min(id: list[Number], nth: int = 0) -> float | NA[float]:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return cast(Number, id[0] if id else NA(None))
     if nth == 0:
         return builtins.min(a)
     if nth < 0 or nth >= len(a):
-        return NA(float)
+        return cast(Number, NA(builtins.type(a[0])))
     return sorted(a)[nth]
 
 
 # noinspection PyShadowingBuiltins
-def mode(id: list[T]) -> T | NA[float]:
+def mode(id: list[T]) -> T:
     """
     Returns the most frequently occurring element in the array.
 
@@ -476,7 +476,9 @@ def mode(id: list[T]) -> T | NA[float]:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        # An all-na array still knows its element type through its na elements;
+        # a truly empty one does not, so it gets a typeless na
+        return cast(T, id[0] if id else NA(None))
     return statistics.mode(a)
 
 
@@ -499,7 +501,7 @@ def _na_size(size: int | NA) -> int:
 
 
 # noinspection PyShadowingNames
-def new_box(size: int | NA = 0, initial_value: Box | NA = NA(Box)) -> list[Box | NA[Box]]:
+def new_box(size: int | NA = 0, initial_value: Box = NA(Box)) -> list[Box]:
     """
     Creates a new array of box objects of the specified size, with each element initialized
     to the specified value.
@@ -514,7 +516,7 @@ def new_box(size: int | NA = 0, initial_value: Box | NA = NA(Box)) -> list[Box |
 
 
 # noinspection PyShadowingNames
-def new_line(size: int | NA = 0, initial_value: Line | NA = NA(Line)) -> list[Line | NA[Line]]:
+def new_line(size: int | NA = 0, initial_value: Line = NA(Line)) -> list[Line]:
     """
     Creates a new array of line objects of the specified size, with each element initialized
     to the specified value.
@@ -529,7 +531,7 @@ def new_line(size: int | NA = 0, initial_value: Line | NA = NA(Line)) -> list[Li
 
 
 # noinspection PyShadowingNames
-def new_label(size: int | NA = 0, initial_value: Label | NA = NA(Label)) -> list[Label | NA[Label]]:
+def new_label(size: int | NA = 0, initial_value: Label = NA(Label)) -> list[Label]:
     """
     Creates a new array of label objects of the specified size, with each element initialized
     to the specified value.
@@ -545,7 +547,7 @@ def new_label(size: int | NA = 0, initial_value: Label | NA = NA(Label)) -> list
 
 # noinspection PyShadowingNames
 def new_linefill(size: int | NA = 0,
-                 initial_value: LineFill | NA = NA(LineFill)) -> list[LineFill | NA[LineFill]]:
+                 initial_value: LineFill = NA(LineFill)) -> list[LineFill]:
     """
     Creates a new array of linefill objects of the specified size, with each element initialized
     to the specified value.
@@ -560,7 +562,7 @@ def new_linefill(size: int | NA = 0,
 
 
 # noinspection PyShadowingNames
-def new(size: int | NA = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]:
+def new(size: int | NA = 0, initial_value: T = NA(T)) -> list[T]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -573,7 +575,7 @@ def new(size: int | NA = 0, initial_value: T | NA[T] = NA(T)) -> list[T | NA[T]]
 
 
 # noinspection PyShadowingNames
-def new_bool(size: int | NA = 0, initial_value: bool | NA = NA(bool)) -> list[PyneBool]:
+def new_bool(size: int | NA = 0, initial_value: bool = NA(bool)) -> list[bool]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -587,7 +589,7 @@ def new_bool(size: int | NA = 0, initial_value: bool | NA = NA(bool)) -> list[Py
 
 
 # noinspection PyShadowingNames
-def new_color(size: int | NA = 0, initial_value: Color | NA = NA(Color)) -> list[Color | NA[Color]]:
+def new_color(size: int | NA = 0, initial_value: Color = NA(Color)) -> list[Color]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -601,7 +603,7 @@ def new_color(size: int | NA = 0, initial_value: Color | NA = NA(Color)) -> list
 
 
 # noinspection PyShadowingNames
-def new_float(size: int | NA = 0, initial_value: float | int | NA = NA(float)) -> list[PyneFloat]:
+def new_float(size: int | NA = 0, initial_value: float | int = NA(float)) -> list[float]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -617,7 +619,7 @@ def new_float(size: int | NA = 0, initial_value: float | int | NA = NA(float)) -
 
 
 # noinspection PyShadowingNames
-def new_int(size: int | NA = 0, initial_value: int | NA = NA(int)) -> list[PyneInt]:
+def new_int(size: int | NA = 0, initial_value: int = NA(int)) -> list[int]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -631,7 +633,7 @@ def new_int(size: int | NA = 0, initial_value: int | NA = NA(int)) -> list[PyneI
 
 
 # noinspection PyShadowingNames
-def new_string(size: int | NA = 0, initial_value: str | NA = NA(str)) -> list[PyneStr]:
+def new_string(size: int | NA = 0, initial_value: str = NA(str)) -> list[str]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -645,7 +647,7 @@ def new_string(size: int | NA = 0, initial_value: str | NA = NA(str)) -> list[Py
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_linear_interpolation(id: list[float], percentage: float) -> float | NA[float]:
+def percentile_linear_interpolation(id: list[float], percentage: float) -> float:
     """
     Calculate the percentile value using linear interpolation, following TradingView's logic.
 
@@ -698,7 +700,7 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_nearest_rank(id: list[float], percentage: float) -> float | NA[float]:
+def percentile_nearest_rank(id: list[float], percentage: float) -> float:
     """
     Calculate the nearest rank percentile without interpolation.
 
@@ -732,7 +734,7 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float | NA[fl
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentrank(id: list[Number], index: int) -> float | NA[float]:
+def percentrank(id: list[Number], index: int) -> float:
     """
     Returns the percentile rank of the element at the specified index.
     The percentile rank is the percentage of values less than or equal to the value at index.
@@ -787,7 +789,7 @@ def push(id: list[T], value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def range(id: list[Number]) -> Number | NA[float]:
+def range(id: list[Number]) -> Number:
     """
     Returns the range of the elements in the array.
 
@@ -796,7 +798,7 @@ def range(id: list[Number]) -> Number | NA[float]:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return cast(Number, id[0] if id else NA(None))
     return builtins.max(a) - builtins.min(a)
 
 
@@ -954,7 +956,7 @@ def standardize(id: list[float | int]) -> list[float | int]:
 
 
 # noinspection PyShadowingBuiltins
-def stdev(id: list[Number], biased: bool = True) -> float | NA[float]:
+def stdev(id: list[Number], biased: bool = True) -> float:
     """
     Returns the standard deviation of the elements in the array.
 
@@ -975,7 +977,7 @@ def stdev(id: list[Number], biased: bool = True) -> float | NA[float]:
 
 
 # noinspection PyShadowingBuiltins
-def sum(id: list[float | int]) -> float | int | NA[float]:
+def sum(id: list[float | int]) -> float | int:
     """
     Returns the sum of the elements in the array.
 
@@ -1000,7 +1002,7 @@ def unshift(id: list[T], value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def variance(id: list[Number], biased: bool = True) -> float | NA[float]:
+def variance(id: list[Number], biased: bool = True) -> float:
     """
     Returns the variance of the elements in the array.
 

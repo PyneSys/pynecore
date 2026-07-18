@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, time as dt_time, date, UTC
 
 from pynecore.types.source import Source
 
-from ..core.module_property import module_property
+from ..core.module_property import module_property, module_function_property
 from ..core.script import script, input
 
 from ..types.na import NA
@@ -320,15 +320,19 @@ def is_na(source: Any = None) -> bool | NA:
         return NA(None)
     # If the source is a type or GenericAlias (like list[float]), return NA of that type
     if isinstance(source, (type, GenericAlias)) and source is not NA:
-        return NA(source)
+        # na.pyi deliberately types NA(x) as x itself (so na sentinels flow as
+        # values in user scripts), which contradicts the honest annotation here
+        return NA(source)  # pyright: ignore[reportReturnType]
     if isinstance(source, float):
         if _math.isnan(source) or _math.isinf(source):
             return True
     return isinstance(source, NA) or source is NA
 
 
-# In Pine Script, na is both a property and a function
-na: Callable[[Any], bool | NA] | Any = is_na
+# In Pine Script, na is both a property and a function; any narrower type than
+# Any produces false positives on one of its three faces (bare value, na(x)
+# predicate, na(type) constructor)
+na: Any = is_na
 
 
 def nz(source: Any, replacement: Any = 0) -> Any:
@@ -351,7 +355,7 @@ def nz(source: Any, replacement: Any = 0) -> Any:
 ### Date / Time ###
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def dayofmonth(time: int | None = None, timezone: str | None = None) -> int:
     """
     Day of the month
@@ -364,7 +368,7 @@ def dayofmonth(time: int | None = None, timezone: str | None = None) -> int:
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def hour(time: int | None = None, timezone: str | None = None) -> int:
     """
     Hour of the day
@@ -377,7 +381,7 @@ def hour(time: int | None = None, timezone: str | None = None) -> int:
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def minute(time: int | None = None, timezone: str | None = None) -> int:
     """
     Minute of the hour
@@ -390,7 +394,7 @@ def minute(time: int | None = None, timezone: str | None = None) -> int:
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def month(time: int | None = None, timezone: str | None = None) -> int:
     """
     Month of the year
@@ -403,7 +407,7 @@ def month(time: int | None = None, timezone: str | None = None) -> int:
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def second(time: int | None = None, timezone: str | None = None) -> int:
     """
     Second of the minute
@@ -881,7 +885,7 @@ def _d_bar_time(current_time_ms: int) -> int:
     return _trading_day_open_sec(td, _dbt_tz, _dbt_starts, _dbt_on) * 1000
 
 
-@module_property
+@module_function_property
 def time(timeframe: str | None = None, session: str | int | None = None,
          timezone: str | None = None, bars_back: int = 0) -> PyneInt:
     """
@@ -1163,7 +1167,7 @@ def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
     return min(bar_close_ms, day_end_ms)
 
 
-@module_property
+@module_function_property
 def time_close(timeframe: str | None = None, session: str | int | None = None,
                timezone: str | None = None, bars_back: int = 0) -> PyneInt:
     """
@@ -1290,7 +1294,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def weekofyear(time: int | None = None, timezone: str | None = None) -> int:
     """
     Week of the year
@@ -1303,7 +1307,7 @@ def weekofyear(time: int | None = None, timezone: str | None = None) -> int:
 
 
 # noinspection PyShadowingNames
-@module_property
+@module_function_property
 def year(time: int | None = None, timezone: str | None = None) -> int:
     """
     Year

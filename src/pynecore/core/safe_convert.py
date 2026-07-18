@@ -31,7 +31,7 @@ def safe_div(a: PyneFloat, b: PyneFloat):
         return NA(float)
 
 
-def safe_float(value: PyneFloat) -> float | NA[float]:
+def safe_float(value: PyneFloat) -> float:
     """
     Safe float conversion that returns NA for NA inputs.
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.
@@ -46,7 +46,7 @@ def safe_float(value: PyneFloat) -> float | NA[float]:
         return NA(float)
 
 
-def safe_int(value: PyneInt) -> int | NA[int]:
+def safe_int(value: PyneInt) -> int:
     """
     Safe int conversion that returns NA for NA inputs.
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.

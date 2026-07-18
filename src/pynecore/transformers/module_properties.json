@@ -1,11 +1,5 @@
 {
   "lib": {
-    "Any": {
-      "type": "variable"
-    },
-    "Callable": {
-      "type": "variable"
-    },
     "DateStr": {
       "type": "variable"
     },
@@ -27,16 +21,10 @@
     "Source": {
       "type": "variable"
     },
-    "TYPE_CHECKING": {
-      "type": "variable"
-    },
     "TimezoneNotFoundError": {
       "type": "variable"
     },
     "TimezoneStr": {
-      "type": "variable"
-    },
-    "TypeAlias": {
       "type": "variable"
     },
     "UTC": {
@@ -123,9 +111,6 @@
     "minute": {
       "type": "property"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "month": {
       "type": "property"
     },
@@ -139,9 +124,6 @@
       "type": "variable"
     },
     "open": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "plotarrow": {
@@ -231,9 +213,6 @@
     }
   },
   "lib.array": {
-    "Any": {
-      "type": "variable"
-    },
     "Box": {
       "type": "variable"
     },
@@ -252,9 +231,6 @@
     "NA": {
       "type": "variable"
     },
-    "Number": {
-      "type": "variable"
-    },
     "PyneBool": {
       "type": "variable"
     },
@@ -268,12 +244,6 @@
       "type": "variable"
     },
     "SequenceView": {
-      "type": "variable"
-    },
-    "T": {
-      "type": "variable"
-    },
-    "TypeVar": {
       "type": "variable"
     },
     "abs": {
@@ -525,9 +495,6 @@
     "lib": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "na_float": {
       "type": "variable"
     },
@@ -535,9 +502,6 @@
       "type": "variable"
     },
     "new": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "set_bgcolor": {
@@ -651,9 +615,6 @@
       "type": "property"
     },
     "lib": {
-      "type": "variable"
-    },
-    "module_property": {
       "type": "variable"
     },
     "point": {
@@ -926,9 +887,6 @@
     "friday": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "monday": {
       "type": "variable"
     },
@@ -1154,9 +1112,6 @@
     "lib": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "na_float": {
       "type": "variable"
     },
@@ -1164,9 +1119,6 @@
       "type": "variable"
     },
     "new": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "set_color": {
@@ -1306,9 +1258,6 @@
     "lib": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "na_float": {
       "type": "variable"
     },
@@ -1316,9 +1265,6 @@
       "type": "variable"
     },
     "new": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "set_color": {
@@ -1426,9 +1372,6 @@
     }
   },
   "lib.log": {
-    "Any": {
-      "type": "variable"
-    },
     "Path": {
       "type": "variable"
     },
@@ -1497,19 +1440,7 @@
     }
   },
   "lib.map": {
-    "Any": {
-      "type": "variable"
-    },
     "NA": {
-      "type": "variable"
-    },
-    "TKey": {
-      "type": "variable"
-    },
-    "TValue": {
-      "type": "variable"
-    },
-    "TypeVar": {
       "type": "variable"
     },
     "clear": {
@@ -1547,6 +1478,9 @@
     }
   },
   "lib.math": {
+    "Decimal": {
+      "type": "variable"
+    },
     "NA": {
       "type": "variable"
     },
@@ -1556,10 +1490,7 @@
     "PyneInt": {
       "type": "variable"
     },
-    "TFI": {
-      "type": "variable"
-    },
-    "TypeVar": {
+    "ROUND_HALF_UP": {
       "type": "variable"
     },
     "abs": {
@@ -1580,9 +1511,6 @@
     "builtins": {
       "type": "variable"
     },
-    "cast": {
-      "type": "variable"
-    },
     "ceil": {
       "type": "variable"
     },
@@ -1598,6 +1526,9 @@
     "floor": {
       "type": "variable"
     },
+    "localcontext": {
+      "type": "variable"
+    },
     "log": {
       "type": "variable"
     },
@@ -1611,9 +1542,6 @@
       "type": "variable"
     },
     "min": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "phi": {
@@ -1663,9 +1591,6 @@
     }
   },
   "lib.matrix": {
-    "Any": {
-      "type": "variable"
-    },
     "Matrix": {
       "type": "variable"
     },
@@ -1771,9 +1696,6 @@
     "mode": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "mult": {
       "type": "variable"
     },
@@ -1867,9 +1789,6 @@
     }
   },
   "lib.plot": {
-    "Any": {
-      "type": "variable"
-    },
     "Plot": {
       "type": "variable"
     },
@@ -1947,9 +1866,6 @@
     "lib": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "new": {
       "type": "variable"
     },
@@ -2009,9 +1925,6 @@
       "type": "variable"
     },
     "NA": {
-      "type": "variable"
-    },
-    "TYPE_CHECKING": {
       "type": "variable"
     },
     "annotations": {
@@ -2107,9 +2020,6 @@
     "lib": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "regular": {
       "type": "variable"
     },
@@ -2187,14 +2097,22 @@
       "type": "variable"
     }
   },
+  "lib.splits": {
+    "Splits": {
+      "type": "variable"
+    },
+    "denominator": {
+      "type": "variable"
+    },
+    "numerator": {
+      "type": "variable"
+    }
+  },
   "lib.strategy": {
     "ABC": {
       "type": "variable"
     },
     "IntEnum": {
-      "type": "variable"
-    },
-    "Literal": {
       "type": "variable"
     },
     "NA": {
@@ -2225,9 +2143,6 @@
       "type": "variable"
     },
     "SimPosition": {
-      "type": "variable"
-    },
-    "TYPE_CHECKING": {
       "type": "variable"
     },
     "Trade": {
@@ -2329,9 +2244,6 @@
     "max_runup": {
       "type": "property"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "na_float": {
       "type": "variable"
     },
@@ -2354,9 +2266,6 @@
       "type": "property"
     },
     "order": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "percent_of_equity": {
@@ -2443,9 +2352,6 @@
       "type": "variable"
     },
     "max_runup_percent": {
-      "type": "variable"
-    },
-    "module_property": {
       "type": "variable"
     },
     "profit": {
@@ -2546,9 +2452,6 @@
     "max_runup_percent": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "opentrades": {
       "type": "property"
     },
@@ -2595,9 +2498,6 @@
     }
   },
   "lib.string": {
-    "Any": {
-      "type": "variable"
-    },
     "Decimal": {
       "type": "variable"
     },
@@ -2684,9 +2584,6 @@
     }
   },
   "lib.syminfo": {
-    "Literal": {
-      "type": "variable"
-    },
     "NA": {
       "type": "variable"
     },
@@ -2866,18 +2763,6 @@
     "Series": {
       "type": "variable"
     },
-    "TFI": {
-      "type": "variable"
-    },
-    "TFIB": {
-      "type": "variable"
-    },
-    "TYPE_CHECKING": {
-      "type": "variable"
-    },
-    "TypeVar": {
-      "type": "variable"
-    },
     "accdist": {
       "type": "property"
     },
@@ -2903,9 +2788,6 @@
       "type": "variable"
     },
     "builtins": {
-      "type": "variable"
-    },
-    "cast": {
       "type": "variable"
     },
     "cci": {
@@ -3022,9 +2904,6 @@
     "mode": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "mom": {
       "type": "variable"
     },
@@ -3035,9 +2914,6 @@
       "type": "property"
     },
     "open": {
-      "type": "variable"
-    },
-    "overload": {
       "type": "variable"
     },
     "percentile_linear_interpolation": {
@@ -3195,9 +3071,6 @@
     "merge_cells": {
       "type": "variable"
     },
-    "module_property": {
-      "type": "variable"
-    },
     "new": {
       "type": "variable"
     },
@@ -3294,9 +3167,6 @@
     }
   },
   "lib.timeframe": {
-    "TYPE_CHECKING": {
-      "type": "variable"
-    },
     "change": {
       "type": "variable"
     },
@@ -3341,9 +3211,6 @@
     },
     "main_period": {
       "type": "property"
-    },
-    "module_property": {
-      "type": "variable"
     },
     "multiplier": {
       "type": "property"

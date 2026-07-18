@@ -13,7 +13,7 @@ import heapq
 from collections import deque
 
 from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool
-from ..core.module_property import module_property
+from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
 from ..core import safe_convert
@@ -273,7 +273,7 @@ def cci(source: float, length: int) -> PyneFloat:
     return (source - mean) / (0.015 * mdev)
 
 
-def change(source: Series[TFIB], length: int = 1) -> TFIB | NA[TFIB]:
+def change(source: Series[TFIB], length: int = 1) -> TFIB:
     """
     Calculate a simple change with respect to the given bar offset.
 
@@ -292,7 +292,10 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB | NA[TFIB]:
         source = round(source, 14)
     prev_val = source[length]  # noqa
 
-    if isinstance(source, NA) or isinstance(prev_val, NA):
+    if isinstance(source, NA):
+        # type(source) would be the NA class itself — keep the source sentinel's type
+        return cast(TFIB, source)
+    if isinstance(prev_val, NA):
         return NA(cast(type[TFIB], type(source)))
     if isinstance(source, float):
         return cast(TFIB, round(source - prev_val, 14))  # noqa
@@ -948,7 +951,7 @@ def max(source: Series[float]) -> PyneFloat:
     return max_val
 
 
-def median(source: Series[TFI], length: int) -> TFI | NA[TFI] | Series[TFI]:
+def median(source: Series[TFI], length: int) -> TFI:
     """
     Calculate the median of the source series over a given period.
 
@@ -962,7 +965,8 @@ def median(source: Series[TFI], length: int) -> TFI | NA[TFI] | Series[TFI]:
     length = int(length)
 
     if isinstance(source, NA):
-        return NA(cast(type[TFI], type(source)))
+        # type(source) would be the NA class itself — keep the source sentinel's type
+        return cast(TFI, source)
 
     # Store heaps and window
     heap_low: Persistent[list[TFI]] = []  # Max heap (negative values)
@@ -1047,7 +1051,7 @@ def min(source: Series[float]) -> PyneFloat:
     return min_val
 
 
-def mode(source: Series[TFI], length: int) -> TFI | NA:
+def mode(source: Series[TFI], length: int) -> TFI:
     """
     Returns the mode of the series. If there are several values with the same frequency,
     it returns the smallest value.
@@ -1058,14 +1062,16 @@ def mode(source: Series[TFI], length: int) -> TFI | NA:
              the smallest value instead. Returns na during warm-up period.
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA) or bar_index < length - 1:
-        return NA(float)
+    if isinstance(source, NA):
+        return cast(TFI, source)
+    if bar_index < length - 1:
+        return cast(TFI, NA(builtins.type(source)))
     length = int(length)
 
     # Store values for quick access
-    values = [source[i] for i in builtins.range(length) if source[i] is not NA(float)]
+    values = [source[i] for i in builtins.range(length) if not isinstance(source[i], NA)]
     if not values:
-        return NA(float)
+        return cast(TFI, NA(builtins.type(source)))
 
     # Find mode - sort values to handle equal frequencies
     values.sort()  # Ensure we pick the smallest value when frequencies are equal
@@ -1907,7 +1913,7 @@ def swma(source: Series[float]) -> PyneFloat:
 
 
 # noinspection PyUnusedLocal
-@module_property
+@module_function_property
 def tr(handle_na: bool = False) -> PyneFloat:
     """
     Calculate True Range (TR)
@@ -2074,7 +2080,7 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
 
 
 # noinspection PyUnusedLocal
-@module_property
+@module_function_property
 def vwap(source: Series[float] | None = None, anchor: bool | None = None,
          stdev_mult: float | None = None) -> PyneFloat | tuple[PyneFloat, PyneFloat, PyneFloat]:
     """

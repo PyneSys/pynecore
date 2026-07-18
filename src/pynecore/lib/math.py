@@ -1,6 +1,7 @@
 from typing import TypeVar, cast, overload
 import builtins
 import math
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 from ..types.na import NA
 from ..types import PyneFloat, PyneInt
@@ -87,7 +88,7 @@ def avg(*numbers: TFI | NA[TFI]) -> PyneFloat:
     return builtins.sum(n for n in numbers) / len(numbers)
 
 
-def ceil(number: TFI | NA[TFI]) -> PyneFloat:
+def ceil(number: TFI | NA[TFI]) -> PyneInt:
     """
     Returns the smallest integer greater than or equal to a number.
 
@@ -95,7 +96,7 @@ def ceil(number: TFI | NA[TFI]) -> PyneFloat:
     :return: The smallest integer greater than or equal to the number.
     """
     if isinstance(number, NA):
-        return NA(float)
+        return NA(int)
     return math.ceil(number)
 
 
@@ -123,7 +124,7 @@ def exp(number: TFI | NA[TFI]) -> PyneFloat:
     return math.exp(number)
 
 
-def floor(number: TFI | NA[TFI]) -> PyneFloat:
+def floor(number: TFI | NA[TFI]) -> PyneInt:
     """
     Returns the largest integer less than or equal to a number.
 
@@ -131,8 +132,9 @@ def floor(number: TFI | NA[TFI]) -> PyneFloat:
     :return: The largest integer less than or equal to the number.
     """
     if isinstance(number, NA):
-        return NA(float)
-    return int(number)
+        return NA(int)
+    # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2)
+    return math.floor(number)
 
 
 def log(number: TFI | NA[TFI]) -> PyneFloat:
@@ -159,6 +161,35 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
     return math.log10(number)
 
 
+def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
+    """
+    Return the na matching the operands' numeric contract: NA(float) when any
+    type-carrying operand is float-like, NA(int) when the type-carrying operands
+    are all int-like, the typeless na when no operand carries a type at all.
+    Typeless na operands are neutral — they must not push an int contract to float.
+    """
+    saw_typed = False
+    for n in numbers:
+        if isinstance(n, NA):
+            if n.type is None:
+                continue
+            saw_typed = True
+            if n.type is not int:
+                return NA(float)
+        else:
+            saw_typed = True
+            if not isinstance(n, int):
+                return NA(float)
+    return NA(int) if saw_typed else NA(None)
+
+
+# noinspection PyShadowingBuiltins
+@overload
+def max(*numbers: int) -> PyneInt: ...
+@overload
+def max(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
 def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
@@ -170,9 +201,16 @@ def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
     assert numbers, "At least one number is necessary!"
 
     if any(isinstance(n, NA) for n in numbers):
-        return NA(float)
+        return _na_of_operands(numbers)
 
     return builtins.max(cast(list[TFI], numbers))
+
+
+# noinspection PyShadowingBuiltins
+@overload
+def min(*numbers: int) -> PyneInt: ...
+@overload
+def min(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -186,7 +224,7 @@ def min(*numbers: TFI | NA[TFI]) -> PyneFloat:
     assert numbers, "At least one number is necessary!"
 
     if any(isinstance(n, NA) for n in numbers):
-        return NA(float)
+        return _na_of_operands(numbers)
 
     return builtins.min(cast(list[TFI], numbers))
 
@@ -207,6 +245,13 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
 
 
 # noinspection PyShadowingBuiltins
+@overload
+def round(number: TFI | NA[TFI]) -> PyneInt: ...
+@overload
+def round(number: TFI | NA[TFI], precision: PyneInt) -> PyneFloat: ...
+
+
+# noinspection PyShadowingBuiltins
 def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     """
     Returns a number rounded to a specified number of decimal places.
@@ -216,10 +261,26 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     :return: The rounded number.
     """
     if isinstance(number, NA):
-        return NA(float)
+        # No precision means the int contract (first overload), so an int-typed na
+        return NA(float) if isinstance(precision, int) else NA(int)
+    # TV-measured: ties round away from zero on the decimal (shortest-repr) value,
+    # not half-even on the binary double (round(2.5) == 3, round(-2.5) == -3,
+    # round(2.675, 2) == 2.68 — builtins.round gives 2, -2 and 2.67 there)
+    if not math.isfinite(number):
+        # Pine has no non-finite values (1/0 is na); the precision overload keeps
+        # builtins.round() behavior (returns the float unchanged), but the
+        # one-argument overload must honor its int contract, so it yields an int na
+        return number if isinstance(precision, int) else NA(int)
+    decimal_number = Decimal(repr(number))
     if not isinstance(precision, int):
-        return builtins.round(number)
-    return builtins.round(number, precision)
+        return int(decimal_number.to_integral_value(rounding=ROUND_HALF_UP))
+    # quantize() fails when the result needs more digits than the context precision
+    # (default 28), so size a local context from the magnitude and the requested
+    # precision (e.g. round(1e30, 2), round(x, 100))
+    with localcontext() as ctx:
+        ctx.prec = builtins.max(1, decimal_number.adjusted() + precision + 2)
+        return float(decimal_number.quantize(Decimal(1).scaleb(-precision),
+                                             rounding=ROUND_HALF_UP))
 
 
 @overload

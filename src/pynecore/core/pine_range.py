@@ -1,4 +1,15 @@
+from typing import Generator, overload
+
 from pynecore.types.pine_types import PyneFloat, PyneInt
+
+
+@overload
+def pine_range(from_num: int, to_num: int, step_num: int | None = None) -> range: ...
+
+
+@overload
+def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
+               step_num: PyneInt | PyneFloat | None = None) -> Generator[float, None, None]: ...
 
 
 def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None):

@@ -292,7 +292,7 @@ def endswith(source: str, str_: str) -> bool:
 
 
 # noinspection PyPep8Naming,PyShadowingBuiltins
-def format(formatString: str, *args: Any) -> str | NA[str]:
+def format(formatString: str, *args: Any) -> str:
     """
     Converts the formatting string and value(s) into a formatted string.
     Supports:
@@ -385,7 +385,7 @@ def format(formatString: str, *args: Any) -> str | NA[str]:
 
 # noinspection PyProtectedMember
 def format_time(time: int | NA[int], fmt: str | None = None,
-                tz: str | None = None) -> str | NA[str]:
+                tz: str | None = None) -> str:
     """
     Format timestamp according to format string and timezone
 

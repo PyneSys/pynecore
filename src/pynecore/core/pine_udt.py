@@ -1,11 +1,12 @@
 from dataclasses import dataclass, replace as udt_copy
-from typing import TypeVar, Type, Any
+from typing import TypeVar, Type, Any, dataclass_transform
 
 __all__ = ['udt', 'udt_copy']
 
 T = TypeVar('T')
 
 
+@dataclass_transform()
 def udt(cls: Type[T]) -> Type[T]:
     """
     Custom dataclass decorator that adds a `copy` method to the class.

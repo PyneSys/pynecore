@@ -6,7 +6,10 @@ T = TypeVar('T')
 class NA(Generic[T]):
     type: Type[T] | T | None
 
-    def __new__(cls, type: Type[T] | T | None = int) -> NA[T]: ...
+    # The "plain T" lie at its root: a constructed NA value types as T, so
+    # lib functions can return NA(X) under a plain -> X annotation and na
+    # sentinels flow anywhere an X is expected (in Pine any value can be na).
+    def __new__(cls, type: Type[T] | T | None = int) -> T: ...  # type: ignore[misc]
     def __init__(self, type: Type[T] | T | None = int) -> None: ...
 
     def __repr__(self) -> str: ...
@@ -66,7 +69,13 @@ class NA(Generic[T]):
     def __call__(self, *_: Any, **__: Any) -> Any: ...
 
 
-na_float: NA[float]
-na_int: NA[int]
-na_str: NA[str]
-na_bool: NA[bool]
+# The singleton constants wear the same "plain T" face as __new__ above:
+# na_float must be assignable wherever a float is, or every hot-path use of the
+# interned constants (instead of an NA(float) call) would false-positive.
+na_float: float
+na_int: int
+na_str: str
+na_bool: bool
+na_inf: float
+na_neg_inf: float
+na_nan: float

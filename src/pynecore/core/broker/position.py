@@ -626,7 +626,8 @@ class BrokerPosition(PositionBase):
         if self.risk_halt_trading:
             return
         try:
-            current_trading_day = int(lib.time_tradingday())
+            # Statically a value (module_property), at runtime still the function
+            current_trading_day = int(lib.time_tradingday())  # pyright: ignore[reportCallIssue]
         except (AttributeError, TypeError, ValueError):
             return
         if current_trading_day == self.risk_last_trading_day:

@@ -114,12 +114,27 @@ def _is_type_checking(test: ast.expr) -> bool:
             or (isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'))
 
 
+# Typing machinery must not become accepted public lib names: imports from these
+# modules (and TypeVar assignments) are implementation detail, not Pine API.
+_SKIP_IMPORT_MODULES = {'typing', 'typing_extensions'}
+_SKIP_IMPORT_MODULE_SUFFIXES = ('core.module_property', 'core.overload')
+
+
+def _is_typevar_call(value: ast.expr) -> bool:
+    """Whether an assignment value is a ``TypeVar(...)`` call."""
+    return (isinstance(value, ast.Call)
+            and ((isinstance(value.func, ast.Name) and value.func.id == 'TypeVar')
+                 or (isinstance(value.func, ast.Attribute) and value.func.attr == 'TypeVar')))
+
+
 def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
     """Collect every public module-level name of a parsed lib module.
 
     ``@module_property`` functions are recorded as ``property``; plain functions,
     classes, assignments (including conditional ones) and imported names as
-    ``variable``. ``_``-prefixed names and ``TYPE_CHECKING`` blocks are skipped.
+    ``variable``. ``_``-prefixed names, ``TYPE_CHECKING`` blocks and typing
+    machinery (``typing`` imports, ``TypeVar`` assignments, the decorator helper
+    modules) are skipped.
 
     :param tree: Parsed module AST.
     :return: name -> {"type": "property"|"variable"} mapping.
@@ -145,13 +160,15 @@ def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 is_property = any(
-                    isinstance(d, ast.Name) and d.id == 'module_property'
+                    isinstance(d, ast.Name) and d.id in ('module_property', 'module_function_property')
                     for d in node.decorator_list
                 )
                 record(node.name, 'property' if is_property else 'variable')
             elif isinstance(node, ast.ClassDef):
                 record(node.name, 'variable')
             elif isinstance(node, ast.Assign):
+                if _is_typevar_call(node.value):
+                    continue
                 for target in node.targets:
                     record_target(target)
             elif isinstance(node, ast.AnnAssign):
@@ -164,6 +181,10 @@ def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
                 for alias in node.names:
                     record(alias.asname or alias.name.split('.')[0], 'variable')
             elif isinstance(node, ast.ImportFrom):
+                module = node.module or ''
+                if (module in _SKIP_IMPORT_MODULES
+                        or module.endswith(_SKIP_IMPORT_MODULE_SUFFIXES)):
+                    continue
                 for alias in node.names:
                     if alias.name == '*':
                         continue

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from math import nan
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from ..types.footprint import Footprint
 from ..types.na import NA
@@ -11,9 +11,11 @@ if TYPE_CHECKING:
 
 _currency_provider: CurrencyRateProvider | None = None
 
+T = TypeVar('T')
+
 
 # noinspection PyUnusedLocal
-def security(*args, **kwargs):
+def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
     """
     Request data from another symbol/timeframe.
 
@@ -54,15 +56,34 @@ def security(*args, **kwargs):
 
 
 # noinspection PyUnusedLocal
+@overload
+def security_lower_tf(
+        symbol, timeframe, expression: tuple,
+        ignore_invalid_symbol=False, currency=None,
+        ignore_invalid_timeframe=False, calc_bars_count=None,
+) -> tuple[list, ...]: ...
+
+
+# noinspection PyUnusedLocal
+@overload
+def security_lower_tf(
+        symbol, timeframe, expression: T,
+        ignore_invalid_symbol=False, currency=None,
+        ignore_invalid_timeframe=False, calc_bars_count=None,
+) -> list[T]: ...
+
+
+# noinspection PyUnusedLocal
 def security_lower_tf(
         symbol, timeframe, expression,
         ignore_invalid_symbol=False, currency=None,
         ignore_invalid_timeframe=False, calc_bars_count=None,
-):
+) -> Any:
     """
     Request intrabar data from a lower timeframe.
 
-    Returns an array of values, one per intrabar within each chart bar.
+    Returns an array of values, one per intrabar within each chart bar; a tuple
+    expression yields a tuple of such arrays, one per tuple element.
     This function exists for IDE support only. In compiled scripts, the
     SecurityTransformer rewrites all calls into the LTF signal/write/read
     protocol at AST level — this function is never called at runtime.
