@@ -54,6 +54,21 @@ and exits when RSI crosses below the overbought level.
 This marker tells the import hook to apply AST transformations (Series, Persistent, function
 isolation, etc.) before executing the module. Without it, the file is treated as regular Python.
 
+### The `edge` Variant
+
+You may also encounter scripts whose docstring starts with `@pyne edge`:
+
+```python
+"""@pyne edge"""
+```
+
+The extra token marks code that stays within a strict, Pine-equivalent subset of Python. The
+PyneComp compiler emits it automatically, since compiled Pine Script always falls within this
+subset. PyneCore runs `@pyne edge` scripts exactly like any other Pyne code — the token changes
+nothing at runtime. It exists to enable future tooling that relies on the subset guarantee (for
+example, a possible Pyne-to-Pine conversion). If you edit such a script and want the full power
+of Python, simply remove the `edge` word from the docstring.
+
 ## 2. Imports
 
 Import type annotations from `pynecore` and library functions from `pynecore.lib`:

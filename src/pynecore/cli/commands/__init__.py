@@ -69,6 +69,15 @@ def setup(
         # Create workdir
         Path(workdir).mkdir(parents=True, exist_ok=False)
 
+    # Create the .pyne marker file so the directory is recognized as a workdir by content
+    marker_file = Path(workdir) / '.pyne'
+    if not marker_file.exists():
+        marker_file.write_text(
+            "# PyneCore workdir marker. The version refers to the workdir structure, "
+            "not your project.\n"
+            'workdir_version = "1.0"\n'
+        )
+
     # Create scripts directory
     scripts_dir = Path(workdir) / 'scripts' / 'lib'
     scripts_dir.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
 import os
 import sys
+import tomllib
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -33,9 +34,28 @@ class AppState:
 
     # noinspection DuplicatedCode
     @staticmethod
+    def _is_workdir(path: Path) -> bool:
+        """
+        Check if the directory itself is a workdir, marked by a `.pyne` file with a
+        supported workdir structure version.
+        """
+        marker = path / ".pyne"
+        if not marker.is_file():
+            return False
+        try:
+            with marker.open("rb") as f:
+                data = tomllib.load(f)
+            major = int(str(data.get("workdir_version", "")).split(".")[0])
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            return False
+        return major >= 1
+
+    # noinspection DuplicatedCode
+    @staticmethod
     def _find_workdir() -> Path:
         """
         Recursively searches for the workdir folder in the current and parent directories.
+        A directory containing a valid `.pyne` marker file is itself a workdir.
         If not found, uses the current directory.
         """
         current_dir = Path().resolve()
@@ -44,6 +64,9 @@ class AppState:
 
         # Start with the current directory and move upwards
         for _ in range(max_depth):
+            if AppState._is_workdir(current_dir):
+                return current_dir
+
             workdir_candidate = current_dir / "workdir"
             if workdir_candidate.exists() and workdir_candidate.is_dir():
                 return workdir_candidate
