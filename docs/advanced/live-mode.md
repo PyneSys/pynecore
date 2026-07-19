@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-07-10"
+lastmod: "2026-07-19"
 draft: false
 toc: true
 categories: ["Advanced", "Strategy", "Live"]
@@ -222,8 +222,8 @@ only cares whether it receives `OHLCV` or `BarUpdate` objects.
 
 - **Paper trading by default** — with `--live` alone, order fills are simulated.  Real order
   execution requires a `BrokerPlugin` data source run with `pyne run --broker` (implies
-  `--live`); shipped broker plugins are `pynesys-pynecore-capitalcom` and
-  `pynesys-pynecore-ctrader`.
+  `--live`); shipped broker plugins are `pynesys-pynecore-bybit`,
+  `pynesys-pynecore-capitalcom` and `pynesys-pynecore-ctrader`.
 - **Provider required** — `--live` only works with provider strings, not local data files.
 - **No replay** — there is no mechanism to replay missed ticks if the connection drops mid-bar.
   The provider reconnects and resumes from the next available update.

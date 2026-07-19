@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "The full contract a live broker plugin must uphold"
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-07-13"
+lastmod: "2026-07-19"
 draft: false
 toc: true
 categories: ["Development"]
@@ -23,7 +23,7 @@ entry points, config TOML generation, the `ProviderPlugin` basics and the
 `BrokerStore` persistence surface. This document assumes all of that and
 covers what a new broker author cannot see from the type signatures alone.
 
-Two reference implementations exist, deliberately covering the two common
+Three reference implementations exist, deliberately covering the common
 venue shapes:
 
 - **`pynecore-capitalcom`** — REST/poll CFD venue: per-deal positions,
@@ -31,13 +31,17 @@ venue shapes:
   stream fused from snapshot polls.
 - **`pynecore-ctrader`** — push venue: protobuf WebSocket wire, native
   execution events, centi-unit volume grid, hedging-mode accounts.
+- **`pynecore-bybit`** — push crypto exchange: JSON REST + WebSocket
+  order/execution/position streams, client-id echo, native in-place
+  amends, and category-based model selection (spot inventory / linear
+  position / inverse contract mapping) inside one plugin.
 
-Both follow the same file layout (`plugin.py` / `config.py` / `provider.py`
-/ `execution.py` / `reconcile.py` / `recovery.py` / `models.py` /
-`exceptions.py` + a `_base.py` tying the mix-ins together) — copy that
-structure rather than inventing a new one. When in doubt about how to
-implement something, find the corresponding code in whichever of the two is
-closer to your venue's shape.
+All three follow the same file layout (`plugin.py` / `config.py` /
+`provider.py` / `execution.py` / `reconcile.py` / `recovery.py` /
+`models.py` / `exceptions.py` + a `_base.py` tying the mix-ins together) —
+copy that structure rather than inventing a new one. When in doubt about
+how to implement something, find the corresponding code in whichever
+reference is closest to your venue's shape.
 
 ## The plugin stack and the division of labour
 
@@ -300,7 +304,8 @@ the quote asset *is* the long exposure. The core
 `pynecore.core.broker.spot_inventory` module owns this bookkeeping; a
 spot plugin opts in by setting `self.spot_inventory_port = self` and
 implementing the `SpotInventoryPort` surface, then drives one
-`SpotInventoryManager` per run:
+`SpotInventoryManager` per run (the Bybit plugin's spot category is the
+reference wiring):
 
 - **`startup()`** once after authentication, before the engine's startup
   reconcile — asset-ownership lease claim, execution catch-up from the

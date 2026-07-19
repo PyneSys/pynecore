@@ -5,7 +5,7 @@ title: "Plugin System"
 description: "How to create plugins for PyneCore"
 icon: "extension"
 date: "2026-03-30"
-lastmod: "2026-07-12"
+lastmod: "2026-07-19"
 draft: false
 toc: true
 categories: ["Development"]
@@ -37,8 +37,9 @@ historical data.  See [Live Mode](../advanced/live-mode.md) for data-side detail
 
 `BrokerPlugin` inherits from `LiveProviderPlugin` — an exchange that routes orders can
 also deliver the live market data those orders trade against.  Order execution is handled
-by dedicated per-exchange broker plugins (`pynesys-pynecore-capitalcom`,
-`pynesys-pynecore-ctrader`) — not by standalone data providers.
+by dedicated per-exchange broker plugins (`pynesys-pynecore-bybit`,
+`pynesys-pynecore-capitalcom`, `pynesys-pynecore-ctrader`) — not by standalone data
+providers.
 
 Multiple inheritance combines capabilities:
 
@@ -292,6 +293,86 @@ provider string and the saved filename, `name` is an optional human-readable
 display name.
 
 With `multi_broker = True`, a provider string like `foo:BROKER:SYMBOL@TF` is split so the segment after the provider name becomes the broker. The broker is then **re-folded into the symbol** before it reaches your plugin — your `__init__` receives `"BROKER:SYMBOL"` and splits it as needed, exactly how providers have always received their symbol, so existing parsing keeps working. The optional `get_list_of_brokers()` classmethod powers `--list-brokers`; leave it unimplemented (the default raises `NotImplementedError`) when the broker set can't be enumerated.
+
+### LiveProviderPlugin — Streaming Data
+
+A `LiveProviderPlugin` is a `ProviderPlugin` that can also **stream bars in
+real time** — this is what `pyne run --live` needs.  On top of the five
+`ProviderPlugin` abstract methods it adds a connection lifecycle and a
+blocking bar-watch call:
+
+```python
+from dataclasses import dataclass
+from pynecore.core.plugin import LiveProviderPlugin, LiveProviderConfig, override
+from pynecore.types.ohlcv import OHLCV
+
+
+@dataclass
+class FooLiveConfig(LiveProviderConfig):
+    """Foo live provider"""
+
+    api_key: str = ""
+    """API key for authentication"""
+
+
+class FooLiveProvider(LiveProviderPlugin[FooLiveConfig]):
+    Config = FooLiveConfig
+
+    # ... the five ProviderPlugin abstract methods (see above) ...
+
+    @override
+    async def connect(self) -> None:
+        ...  # authenticate, open the WebSocket, subscribe
+
+    @override
+    async def disconnect(self) -> None:
+        ...  # close the connection cleanly
+
+    @property
+    @override
+    def is_connected(self) -> bool:
+        ...
+
+    @override
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        ...  # await the next update from the stream
+```
+
+The contract behind those four members:
+
+- **Config base class.**  A live plugin's config subclasses
+  `LiveProviderConfig`, which contributes the shared `symbol_map`
+  translation table (TradingView-style symbol → exchange-native
+  identifier).  Symbols not in the map fall back to `normalize_symbol()` —
+  do not invent a plugin-specific translation knob.
+- **`watch_ohlcv()` blocks until the next update** and returns an `OHLCV`
+  with `is_closed=True` for a final bar, `False` for an intra-bar update.
+  The framework calls it in a loop.
+- **`connect()` is called again on every reconnect**, not just once.  The
+  framework drives a full `disconnect()` → `connect()` cycle after a
+  connection error or a stale feed, so `connect()` must re-initialize
+  every piece of connection-scoped state (auth, server-side subscriptions,
+  partially accumulated quote state).
+- **Reconnection is retried indefinitely** with exponential backoff — the
+  `reconnect_delay` class attribute doubles per failure up to
+  `max_reconnect_delay`.  Do not add your own retry limit; a live bot must
+  survive arbitrarily long outages.
+- **Feed-liveness watchdog.**  When the transport looks alive but
+  `watch_ohlcv` stays silent for `feed_timeout_bars` timeframe periods
+  during an open session, the framework assumes a half-open socket / lost
+  subscription and forces a reconnect cycle.  Only set the attribute to
+  `None` when the venue's own liveness machinery genuinely covers the
+  dead-feed case.
+- **Optional hooks**: `on_disconnect()` / `on_reconnect()` for custom
+  reconnect behavior, and `can_shutdown()` — polled every second during
+  graceful shutdown; return `False` to delay exit while cleanup (closing
+  positions, draining orders) is still in progress.
+
+The async methods run in a background thread; the framework bridges them to
+the synchronous `ScriptRunner` via a queue — the plugin never deals with
+that plumbing.  For the user-facing behavior (historical → live transition,
+intra-bar updates, `barstate`, CLI flags) see
+[Live Mode](../advanced/live-mode.md).
 
 ### BrokerPlugin — Order Execution
 
