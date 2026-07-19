@@ -5,8 +5,10 @@ The module is both a function (``hline(...)``) and a namespace (``hline.style_so
 call sites are routed to :func:`hline` by the module property AST transformer.
 """
 from ..types.hline import HLineEnum, HLine
+from ..types.plot_meta import PlotMeta
 
 from . import color as _color, display as _display
+from .. import lib
 
 
 #
@@ -43,12 +45,23 @@ def hline(
     :param display: Controls where the hline is displayed. Possible values are: display.none, display.all. Default is display.all
     :return: An hline object, that can be used in fill
     """
+    n = lib._viz_seq.get('hline', 0)
+    lib._viz_seq['hline'] = n + 1
+    hid = f'hline#{n}'
+    t = title or None
+    if hid not in lib._plot_meta:
+        meta = PlotMeta(id=hid, kind='hline', title=t, price=price, color=color,
+                        linestyle=linestyle, linewidth=linewidth, editable=editable,
+                        display=display)
+        lib._plot_meta[hid] = meta
+        lib._plot_meta_new.append(meta)
     return HLine(
         price=price,
-        title=title or None,
+        title=t,
         color=color,
         linestyle=linestyle,
         linewidth=linewidth,
         editable=editable,
-        display=display
+        display=display,
+        id=hid
     )

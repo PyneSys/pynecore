@@ -22,7 +22,12 @@ class PlotModule:
     linestyle_dashed: PlotEnum
     linestyle_dotted: PlotEnum
 
-    def __call__(self, series: Any, title: str | None = None, *args, **kwargs) -> Plot: ...
+    def __call__(self, series: Any, title: str | None = None, color: Any = None,
+                 linewidth: int = 1, style: PlotEnum | None = None, trackprice: bool = False,
+                 histbase: float = 0.0, offset: int = 0, join: bool = False, editable: bool = True,
+                 show_last: int | None = None, display: Any = None, format: str | None = None,
+                 precision: int | None = None, force_overlay: bool = False,
+                 *args, **kwargs) -> Plot: ...
 
 
 plot: PlotModule

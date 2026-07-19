@@ -1,4 +1,5 @@
 from ..core.module_property import module_property
+from ..types.base import next_vid
 from ..types.chart import ChartPoint
 from ..types.polyline import Polyline
 from ..types.na import NA
@@ -56,6 +57,7 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
         line_width=line_width,
         force_overlay=force_overlay
     )
+    polyline_obj.vid = next_vid()
     _registry[polyline_obj] = None
     # Enforce Pine's max_polylines_count cap: drop the oldest polyline (FIFO) past the limit.
     # A security child never sets ``lib._script``; fall back to TV's hard maximum

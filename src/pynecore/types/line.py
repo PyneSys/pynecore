@@ -27,3 +27,5 @@ class Line:
     width: int = 1
 
     force_overlay: bool = False
+
+    vid: int = -1

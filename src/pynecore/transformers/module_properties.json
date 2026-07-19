@@ -6,7 +6,13 @@
     "GenericAlias": {
       "type": "variable"
     },
+    "HLine": {
+      "type": "variable"
+    },
     "NA": {
+      "type": "variable"
+    },
+    "PlotMeta": {
       "type": "variable"
     },
     "PyneInt": {
@@ -490,6 +496,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "next_vid": {
       "type": "variable"
     },
     "set_bgcolor": {
@@ -1053,7 +1062,13 @@
     "HLineEnum": {
       "type": "variable"
     },
+    "PlotMeta": {
+      "type": "variable"
+    },
     "hline": {
+      "type": "variable"
+    },
+    "lib": {
       "type": "variable"
     },
     "style_dashed": {
@@ -1107,6 +1122,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "next_vid": {
       "type": "variable"
     },
     "set_color": {
@@ -1255,6 +1273,9 @@
     "new": {
       "type": "variable"
     },
+    "next_vid": {
+      "type": "variable"
+    },
     "set_color": {
       "type": "variable"
     },
@@ -1333,6 +1354,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "next_vid": {
       "type": "variable"
     },
     "set_color": {
@@ -1783,6 +1807,9 @@
     "PlotEnum": {
       "type": "variable"
     },
+    "PlotMeta": {
+      "type": "variable"
+    },
     "linestyle_dashed": {
       "type": "variable"
     },
@@ -1855,6 +1882,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "next_vid": {
       "type": "variable"
     },
     "style_arrow_both": {
@@ -3060,6 +3090,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "next_vid": {
       "type": "variable"
     },
     "set_bgcolor": {

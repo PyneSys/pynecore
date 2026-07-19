@@ -32,3 +32,5 @@ class Box:
     text_formatting: Optional[_text.FormatEnum] = None
 
     force_overlay: bool = False
+
+    vid: int = -1

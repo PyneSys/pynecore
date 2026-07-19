@@ -65,6 +65,8 @@ ScriptRunner(
     plot_path: Path | None = None,
     strat_path: Path | None = None,
     trade_path: Path | None = None,
+    viz_path: Path | None = None,
+    viz_journal: bool = False,
     update_syminfo_every_run: bool = False,
     last_bar_index: int = 0,
     inputs: dict[str, Any] | None = None,
@@ -83,6 +85,8 @@ ScriptRunner(
 | `plot_path`                | `Path \| None`    | Save indicator plot data to CSV                                |
 | `strat_path`               | `Path \| None`    | Save strategy statistics to CSV                                |
 | `trade_path`               | `Path \| None`    | Save trade-by-trade data to CSV                                |
+| `viz_path`                 | `Path \| None`    | Write plot-style + drawing visual data as NDJSON (see below)   |
+| `viz_journal`              | `bool`            | Emit per-bar drawing create/update/delete events              |
 | `update_syminfo_every_run` | `bool`            | Re-apply syminfo before each bar (for parallel runners)        |
 | `last_bar_index`           | `int`             | Override last bar index (for multi-script setups)              |
 | `inputs`                   | `dict \| None`    | Override script `input()` defaults at runtime                  |
@@ -249,6 +253,34 @@ runner = ScriptRunner(
 for candle, plot_data, new_trades in runner.run_iter():
     pass  # files are written as bars are processed
 ```
+
+## Visual Output (Plot Styles & Drawings)
+
+The `plot_path` CSV holds only numeric plot values. To also capture plot **styles** (colors, widths,
+shapes) and **drawing objects** (lines, labels, boxes, tables, polylines, linefills), enable the viz
+output with `viz_path` (and optionally `viz_journal`):
+
+```python
+runner = ScriptRunner(
+    script_path=Path("my_indicator.py"),
+    ohlcv_iter=candles,
+    syminfo=syminfo,
+    viz_path=Path("output/viz.ndjson"),  # opt-in NDJSON stream
+    viz_journal=True,                     # per-bar drawing events
+)
+```
+
+The runner also exposes the same state programmatically:
+
+| Accessor            | Description                                                          |
+|---------------------|----------------------------------------------------------------------|
+| `runner.plot_meta`  | `{id: PlotMeta}` — registered plot-family metadata (kept after the run) |
+| `runner.drawings()` | Full snapshot of the live drawing objects                            |
+| `runner.viz_events` | Optional callback receiving each bar's journal events                |
+
+The plots CSV is unchanged and viz output is entirely opt-in. See
+[Visual Output (Viz)](./visual-output.md) for the NDJSON format, the only-on-change color encoding,
+ordinal-id semantics, journal mode, and the live `lib._plot_meta` / `lib._viz_dyn` read patterns.
 
 ## Complete Example: Strategy with Trade Analysis
 

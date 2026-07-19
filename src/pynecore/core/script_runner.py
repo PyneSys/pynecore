@@ -16,6 +16,8 @@ from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
+from pynecore.core import viz
+from pynecore.core.viz import VizWriter
 
 from pynecore.types import script_type
 from pynecore.core.plugin.live_provider import PluginSymbol
@@ -425,6 +427,7 @@ class ScriptRunner:
     __slots__ = ('script_module', 'script', 'ohlcv_iter', 'syminfo', 'update_syminfo_every_run',
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'last_bar_time',
+                 'viz_writer', 'viz_journal', '_viz_shadow', 'viz_events',
                  'equity_curve', 'first_price', 'last_price',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
@@ -439,6 +442,7 @@ class ScriptRunner:
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
+                 viz_path: Path | None = None, viz_journal: bool = False,
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  last_bar_time: int | None = None,
                  inputs: dict[str, Any] | None = None,
@@ -462,6 +466,11 @@ class ScriptRunner:
         :param plot_path: Path to save the plot data
         :param strat_path: Path to save the strategy results
         :param trade_path: Path to save the trade data of the strategy
+        :param viz_path: Path to write the plot/drawing visual data (NDJSON). ``None`` disables
+                         file output; a ``viz_events`` callback still receives journal events
+                         when ``viz_journal`` is set.
+        :param viz_journal: If true, diff the live drawings every bar and emit
+                            create/update/delete events (to the file and/or ``viz_events``)
         :param update_syminfo_every_run: If it is needed to update the syminfo lib in every run,
                                          needed for parallel script executions
         :param last_bar_index: Last bar index, the index of the last bar of the historical data
@@ -727,6 +736,13 @@ class ScriptRunner:
         self.plot_writer = CSVWriter(
             plot_path, float_fmt=f".8g"
         ) if plot_path else None
+        # Visual data (plot styles + drawings) NDJSON writer. Journaling can also
+        # run without a file: ``_viz_shadow`` drives the per-bar diff whose events
+        # are handed to the ``viz_events`` callback (set by the caller).
+        self.viz_writer = VizWriter(viz_path) if viz_path else None
+        self.viz_journal = viz_journal
+        self._viz_shadow: dict | None = {} if viz_journal else None
+        self.viz_events: Callable[[list[dict]], None] | None = None
         self.strat_writer = CSVWriter(strat_path, headers=(
             "Metric",
             f"All {syminfo.currency}", "All %",
@@ -846,6 +862,28 @@ class ScriptRunner:
         else:
             position.process_orders()
 
+    # noinspection PyProtectedMember
+    def _write_viz_bar(self, candle) -> None:
+        """Emit the current bar's visual data (values + colors + journal events).
+
+        Reads the just-populated ``lib._plot_data`` / ``lib._viz_dyn`` and the
+        current-bar time (``lib._time``, already in milliseconds). Must be called
+        after the script body ran and before the per-bar viz-state is cleared.
+
+        :param candle: The current OHLCV bar (kept for signature parity; time is
+                       taken from ``lib._time`` which the runner already set).
+        """
+        if self.viz_writer is None and self._viz_shadow is None:
+            return
+        if self.viz_writer is not None:
+            self.viz_writer.write_bar(self.bar_index, lib._time, lib._plot_data, lib._viz_dyn)
+        if self._viz_shadow is not None:
+            events = viz.journal_diff(self._viz_shadow, self.bar_index)
+            if self.viz_writer is not None:
+                self.viz_writer.write_events(events)
+            if self.viz_events is not None:
+                self.viz_events(events)
+
     def _process_orders_magnified(self, position, sub_bars, candle) -> None:
         """Backtest sub-bar order processing; in broker mode, the exchange
         is the source of truth — magnification is irrelevant and the engine
@@ -894,6 +932,20 @@ class ScriptRunner:
     @property
     def _broker_mode(self) -> bool:
         return self._order_sync_engine is not None
+
+    @property
+    def plot_meta(self) -> dict:
+        """The registered plot-family metadata for the current/last run.
+
+        Kept live after the run (drawing/meta state is reset only at run-start),
+        so callers can introspect ``{id -> PlotMeta}`` programmatically.
+        """
+        return lib._plot_meta
+
+    @staticmethod
+    def drawings() -> dict:
+        """Full snapshot of the live drawing objects (lines/labels/boxes/...)."""
+        return viz.drawings_snapshot()
 
     @property
     def broker_position_snapshot(self) -> 'Any | None':
@@ -983,6 +1035,11 @@ class ScriptRunner:
         if self.plot_writer:
             self.plot_writer.open()
 
+        # Open the viz writer and emit the header (syminfo/script are set up above)
+        if self.viz_writer is not None:
+            self.viz_writer.open()
+            self.viz_writer.write_header(self.script, lib.syminfo, self.viz_journal)
+
         # If the script is a strategy, we open strategy output files too
         if is_strat:
             # Open trade writer if we have one
@@ -991,6 +1048,10 @@ class ScriptRunner:
 
         # Clear plot data
         lib._plot_data.clear()
+        # Reset plot-family metadata, dynamic channels and drawing registries for
+        # this run. Deliberately NOT in ``_reset_lib_vars`` so post-run programmatic
+        # access to ``plot_meta`` / ``drawings()`` keeps working.
+        viz.reset_state()
 
         # Trade counter
         trade_num = 0
@@ -1582,6 +1643,8 @@ class ScriptRunner:
                     ef.update(lib._plot_data)
                     self.plot_writer.write_ohlcv(bar_candle._replace(extra_fields=ef))
 
+                self._write_viz_bar(bar_candle)
+
                 if is_strat and self.trades_writer and position:
                     for t in position.new_closed_trades:
                         trade_num += 1
@@ -1753,6 +1816,8 @@ class ScriptRunner:
                     yield candle, lib._plot_data, position.new_closed_trades
 
                 lib._plot_data.clear()
+                lib._viz_dyn.clear()
+                lib._viz_seq.clear()
 
                 if is_strat and position:
                     current_equity = float(position.equity) if position.equity \
@@ -1970,6 +2035,8 @@ class ScriptRunner:
                                 # noinspection PyProtectedMember
                                 bpos._handle_bar_open_risk()
                             lib._plot_data.clear()
+                            lib._viz_dyn.clear()
+                            lib._viz_seq.clear()
                             # Restart settle: this branch runs the script BEFORE
                             # sync (so a bar-close order dispatches same-bar), but
                             # on the first bar after a restart the Pine order book
@@ -2015,6 +2082,8 @@ class ScriptRunner:
                                 self._log_sim_fills(position)
 
                             lib._plot_data.clear()
+                            lib._viz_dyn.clear()
+                            lib._viz_seq.clear()
                             _run_libs_and_main()
 
                             # Fill immediate closes enqueued during the body, at
@@ -2038,6 +2107,8 @@ class ScriptRunner:
                             yield candle, lib._plot_data, position.new_closed_trades
 
                         lib._plot_data.clear()
+                        lib._viz_dyn.clear()
+                        lib._viz_seq.clear()
 
                         if is_strat and position:
                             current_equity = float(position.equity) if position.equity \
@@ -2178,6 +2249,17 @@ class ScriptRunner:
                 self._engine_event_stream_future.cancel()
                 self._engine_event_stream_future = None
 
+            # Finalize the viz writer: a full drawings snapshot, then the end
+            # record. Drawing registries are still populated here (they are only
+            # reset at run-start), so the snapshot reflects the final state.
+            # Guard against an exception before the writer was ever opened.
+            if self.viz_writer is not None and self.viz_writer.is_open:
+                try:
+                    self.viz_writer.write_drawings_snapshot()
+                    self.viz_writer.write_end(self.viz_writer.bars)
+                finally:
+                    self.viz_writer.close()
+
             # Reset library variables
             _reset_lib_vars()
             # Drop function instances and this run's root vectors
@@ -2288,6 +2370,9 @@ class ScriptRunner:
                 updated_candle = window.aggregated._replace(extra_fields=extra_fields)
                 self.plot_writer.write_ohlcv(updated_candle)
 
+            # Write visual data (plot styles + drawings) for this aggregated bar
+            self._write_viz_bar(window.aggregated)
+
             # Yield results
             if not is_strat:
                 yield window.aggregated, lib._plot_data
@@ -2335,6 +2420,8 @@ class ScriptRunner:
 
             # Clear plot data
             lib._plot_data.clear()
+            lib._viz_dyn.clear()
+            lib._viz_seq.clear()
 
             # Track equity curve for strategies
             if is_strat and position:

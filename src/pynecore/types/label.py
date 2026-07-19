@@ -30,3 +30,5 @@ class Label:
     text_font_family: Optional[_font.FontFamilyEnum] = None
     force_overlay: bool = False
     text_formatting: Optional[_text.FormatEnum] = None
+
+    vid: int = -1

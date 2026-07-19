@@ -1,3 +1,4 @@
+from ..types.base import next_vid
 from ..types.linefill import LineFill
 from ..types.line import Line
 from ..types.na import NA
@@ -20,11 +21,20 @@ def new(line1: Line, line2: Line, color: _color.Color) -> LineFill | NA[LineFill
     if isinstance(line1, NA) or isinstance(line2, NA):
         return NA(LineFill)
 
+    # Pine allows only one linefill per pair of lines: a successive ``linefill.new()``
+    # call for the same pair replaces the previous fill.
+    for existing in _registry:
+        if ((existing.line1 is line1 and existing.line2 is line2)
+                or (existing.line1 is line2 and existing.line2 is line1)):
+            _registry.remove(existing)
+            break
+
     linefill_obj = LineFill(
         line1=line1,
         line2=line2,
         color=color
     )
+    linefill_obj.vid = next_vid()
     _registry.append(linefill_obj)
     return linefill_obj
 

@@ -21,3 +21,4 @@ class HLine:
     linewidth: int = 1  # Width of the rendered line
     editable: bool = True  # If true then hline style will be editable in Format dialog
     display: Optional[_display.Display] = None  # Controls where the hline is displayed
+    id: Optional[str] = None  # Registration id assigned by ``hline()``

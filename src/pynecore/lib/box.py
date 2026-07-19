@@ -1,8 +1,9 @@
 from copy import copy as _copy
-from typing import overload
+from typing import Any, overload
 
 from ..core.module_property import module_property
 
+from ..types.base import next_vid
 from ..types.box import Box
 from ..types.na import NA, na_int, na_float
 from ..types.chart import ChartPoint
@@ -35,17 +36,17 @@ def new(left: int | float, top: float, right: int | float, bottom: float,
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Box: ...
 
 
+# Positional parameter orders of the two Pine call shapes; ``new()`` maps ``*args``
+# onto one of these depending on whether the first positional is a ``chart.point``.
+_COMMON_PARAMS = ('border_color', 'border_width', 'border_style', 'extend', 'xloc', 'bgcolor',
+                  'text', 'text_size', 'text_color', 'text_halign', 'text_valign', 'text_wrap',
+                  'text_font_family', 'force_overlay', 'text_formatting')
+_POINT_PARAMS = ('top_left', 'bottom_right') + _COMMON_PARAMS
+_COORD_PARAMS = ('left', 'top', 'right', 'bottom') + _COMMON_PARAMS
+
+
 # noinspection PyProtectedMember
-def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | None = None,
-        right: int | float | None = None, bottom: float | None = None,
-        border_color: _color.Color = _color.blue, border_width: int = 1,
-        border_style: _line.LineEnum = _line.style_solid, extend: _extend.Extend = _extend.none,
-        xloc: _xloc.XLoc = _xloc.bar_index, bgcolor: _color.Color = _color.blue, text: str = "",
-        text_size: _size.Size = _size.auto, text_color: _color.Color = _color.black,
-        text_halign: _text.AlignEnum = _text.align_center, text_valign: _text.AlignEnum = _text.align_center,
-        text_wrap: _text.WrapEnum = _text.wrap_none, text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none,
-        top_left: ChartPoint | None = None, bottom_right: ChartPoint | None = None) -> Box:
+def new(*args: Any, **kwargs: Any) -> Box:
     """
     Creates a new box object.
 
@@ -57,10 +58,8 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
       and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated
       to int to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
 
-    :param left: Bar index / bar time of the left border (coordinate form), or the top-left corner
-                 ``chart.point`` (point form, when passed as the first positional argument)
-    :param top: Price of the top border (coordinate form), or the bottom-right corner
-                ``chart.point`` when the first positional argument is a ``chart.point``
+    :param left: Bar index / bar time of the left border (coordinate form)
+    :param top: Price of the top border (coordinate form)
     :param right: Bar index / bar time of the right border (coordinate form only)
     :param bottom: Price of the bottom border (coordinate form only)
     :param border_color: Color of the four borders
@@ -82,19 +81,44 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
     :param bottom_right: Bottom-right corner ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A box object
     """
-    if top_left is not None:
-        left = top_left
-    if bottom_right is not None:
-        top = bottom_right
-    if isinstance(left, ChartPoint):
-        bottom_right_point = top if isinstance(top, ChartPoint) else left
+    if args:
+        names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
+        if len(args) > len(names):
+            raise TypeError(f"box.new() takes at most {len(names)} positional arguments")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"box.new() got multiple values for argument '{name}'")
+            kwargs[name] = value
+    top_left = kwargs.get('top_left')
+    bottom_right = kwargs.get('bottom_right')
+    border_color = kwargs.get('border_color', _color.blue)
+    border_width = kwargs.get('border_width', 1)
+    border_style = kwargs.get('border_style', _line.style_solid)
+    extend = kwargs.get('extend', _extend.none)
+    xloc = kwargs.get('xloc', _xloc.bar_index)
+    bgcolor = kwargs.get('bgcolor', _color.blue)
+    text = kwargs.get('text', "")
+    text_size = kwargs.get('text_size', _size.auto)
+    text_color = kwargs.get('text_color', _color.black)
+    text_halign = kwargs.get('text_halign', _text.align_center)
+    text_valign = kwargs.get('text_valign', _text.align_center)
+    text_wrap = kwargs.get('text_wrap', _text.wrap_none)
+    text_font_family = kwargs.get('text_font_family', _font.family_default)
+    force_overlay = kwargs.get('force_overlay', False)
+    text_formatting = kwargs.get('text_formatting', _text.format_none)
+    if isinstance(top_left, ChartPoint):
+        bottom_right_point = bottom_right if isinstance(bottom_right, ChartPoint) else top_left
         if xloc == _xloc.bar_time:
-            left_val, top_val = left.time, left.price
+            left_val, top_val = top_left.time, top_left.price
             right_val, bottom_val = bottom_right_point.time, bottom_right_point.price
         else:
-            left_val, top_val = left.index, left.price
+            left_val, top_val = top_left.index, top_left.price
             right_val, bottom_val = bottom_right_point.index, bottom_right_point.price
     else:
+        left = kwargs.get('left')
+        top = kwargs.get('top')
+        right = kwargs.get('right')
+        bottom = kwargs.get('bottom')
         left_val = int(left) if isinstance(left, (int, float)) else na_int
         top_val = top if isinstance(top, (int, float)) else na_float
         right_val = int(right) if isinstance(right, (int, float)) else na_int
@@ -121,6 +145,7 @@ def new(left: ChartPoint | int | float | None = None, top: ChartPoint | float | 
         text_formatting=text_formatting,
         force_overlay=force_overlay,
     )
+    box.vid = next_vid()
     _registry[box] = None
     # Enforce Pine's max_boxes_count cap: drop the oldest box (FIFO) past the limit.
     # A security child never sets ``lib._script``; fall back to TV's hard maximum
@@ -145,11 +170,16 @@ def delete(id):
     _registry.pop(id, None)
 
 
-# noinspection PyShadowingBuiltins
+# noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
     if isinstance(id, NA):
         return NA(Box)
-    return _copy(id)
+    clone = _copy(id)
+    clone.vid = next_vid()
+    _registry[clone] = None
+    if len(_registry) > (lib._script.max_boxes_count if lib._script is not None else 500):
+        del _registry[next(iter(_registry))]
+    return clone
 
 
 # Setter methods

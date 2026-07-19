@@ -1,14 +1,24 @@
 from copy import copy as _copy
-from typing import overload
+from typing import Any, overload
 
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
+from ..types.base import next_vid
 from ..types.line import LineEnum, Line
 from ..types.na import NA, na_int, na_float
 from ..lib import xloc as _xloc, extend as _extend, color as _color
+from ..lib import linefill as _linefill
 from .. import lib
 
 _registry: dict[Line, None] = {}
+
+
+def _remove(line_obj: Line) -> None:
+    """Remove a line and every linefill referencing it (Pine deletes a linefill
+    when either of its lines is deleted, including count-limit eviction)."""
+    _registry.pop(line_obj, None)
+    _linefill._registry[:] = [lf for lf in _linefill._registry
+                              if lf.line1 is not line_obj and lf.line2 is not line_obj]
 
 style_arrow_both = LineEnum('ab')
 style_arrow_left = LineEnum('al')
@@ -31,13 +41,16 @@ def new(x1: int | float, y1: float, x2: int | float, y2: float,
         width: int = 1, force_overlay: bool = False) -> Line: ...
 
 
+# Positional parameter orders of the two Pine call shapes; ``new()`` maps ``*args``
+# onto one of these depending on whether the first positional is a ``chart.point``.
+_POINT_PARAMS = ('first_point', 'second_point', 'xloc', 'extend', 'color', 'style',
+                 'width', 'force_overlay')
+_COORD_PARAMS = ('x1', 'y1', 'x2', 'y2', 'xloc', 'extend', 'color', 'style',
+                 'width', 'force_overlay')
+
+
 # noinspection PyProtectedMember
-def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | None = None,
-        x2: int | float | None = None, y2: float | None = None,
-        xloc: _xloc.XLoc = _xloc.bar_index, extend: _extend.Extend = _extend.none,
-        color: _color.Color = _color.blue, style: LineEnum = style_solid,
-        width: int = 1, force_overlay: bool = False,
-        first_point: ChartPoint | None = None, second_point: ChartPoint | None = None) -> Line:
+def new(*args: Any, **kwargs: Any) -> Line:
     """
     Creates a new line object.
 
@@ -48,10 +61,8 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
       and ``y1`` / ``y2`` are prices. Float ``x1`` / ``x2`` are truncated to int
       to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
 
-    :param x1: Bar index / bar time of the first point (coordinate form), or the first
-               ``chart.point`` (point form, when passed as the first positional argument)
-    :param y1: Price of the first point (coordinate form), or the second ``chart.point`` when
-               the first positional argument is a ``chart.point``
+    :param x1: Bar index / bar time of the first point (coordinate form)
+    :param y1: Price of the first point (coordinate form)
     :param x2: Bar index / bar time of the second point (coordinate form only)
     :param y2: Price of the second point (coordinate form only)
     :param xloc: Possible values: ``xloc.bar_index`` and ``xloc.bar_time``
@@ -66,19 +77,35 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
     :param second_point: Second ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A line object
     """
-    if first_point is not None:
-        x1 = first_point
-    if second_point is not None:
-        y1 = second_point
-    if isinstance(x1, ChartPoint):
-        second = y1 if isinstance(y1, ChartPoint) else x1
+    if args:
+        names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
+        if len(args) > len(names):
+            raise TypeError(f"line.new() takes at most {len(names)} positional arguments")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"line.new() got multiple values for argument '{name}'")
+            kwargs[name] = value
+    first_point = kwargs.get('first_point')
+    second_point = kwargs.get('second_point')
+    xloc = kwargs.get('xloc', _xloc.bar_index)
+    extend = kwargs.get('extend', _extend.none)
+    color = kwargs.get('color', _color.blue)
+    style = kwargs.get('style', style_solid)
+    width = kwargs.get('width', 1)
+    force_overlay = kwargs.get('force_overlay', False)
+    if isinstance(first_point, ChartPoint):
+        second = second_point if isinstance(second_point, ChartPoint) else first_point
         if xloc == _xloc.bar_time:
-            x1_val, y1_val = x1.time, x1.price
+            x1_val, y1_val = first_point.time, first_point.price
             x2_val, y2_val = second.time, second.price
         else:
-            x1_val, y1_val = x1.index, x1.price
+            x1_val, y1_val = first_point.index, first_point.price
             x2_val, y2_val = second.index, second.price
     else:
+        x1 = kwargs.get('x1')
+        y1 = kwargs.get('y1')
+        x2 = kwargs.get('x2')
+        y2 = kwargs.get('y2')
         x1_val = int(x1) if isinstance(x1, (int, float)) else na_int
         y1_val = y1 if isinstance(y1, (int, float)) else na_float
         x2_val = int(x2) if isinstance(x2, (int, float)) else na_int
@@ -96,13 +123,14 @@ def new(x1: ChartPoint | int | float | None = None, y1: ChartPoint | float | Non
         width=width,
         force_overlay=force_overlay
     )
+    line_obj.vid = next_vid()
     _registry[line_obj] = None
     # Enforce Pine's max_lines_count cap: drop the oldest line (FIFO) past the limit.
     # A security child never sets ``lib._script``; fall back to TV's hard maximum
     # (500) there, otherwise the registry grows without bound (the child re-runs
     # main() for every bar of its own series, accumulating every drawing ever made).
     if len(_registry) > (lib._script.max_lines_count if lib._script is not None else 500):
-        del _registry[next(iter(_registry))]
+        _remove(next(iter(_registry)))
     return line_obj
 
 
@@ -118,15 +146,20 @@ def delete(id):
     """Delete line object"""
     if isinstance(id, NA):
         return
-    _registry.pop(id, None)
+    _remove(id)
 
 
-# noinspection PyShadowingBuiltins
+# noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
     """Copy line object"""
     if isinstance(id, NA):
         return NA(Line)
-    return _copy(id)
+    clone = _copy(id)
+    clone.vid = next_vid()
+    _registry[clone] = None
+    if len(_registry) > (lib._script.max_lines_count if lib._script is not None else 500):
+        _remove(next(iter(_registry)))
+    return clone
 
 
 # noinspection PyShadowingBuiltins

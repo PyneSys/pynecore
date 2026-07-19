@@ -45,6 +45,8 @@ class Table:
     # Cell data storage - using (column, row) as key
     cells: Dict[Tuple[int, int], TableCell] = field(default_factory=dict)
 
+    vid: int = -1
+
     def get_cell(self, column: int, row: int) -> TableCell:
         """Get or create a cell at the specified position."""
         if (column, row) not in self.cells:

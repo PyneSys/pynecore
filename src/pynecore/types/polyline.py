@@ -36,3 +36,5 @@ class Polyline:
     
     # If true, the drawing will display on the main chart pane
     force_overlay: bool = False
+
+    vid: int = -1

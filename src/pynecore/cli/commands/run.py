@@ -575,6 +575,16 @@ def run(
         trade_path: Path | None = Option(None, "--trade", "-tp",
                                          help="Path to save the trade data",
                                          rich_help_panel="Out Path Options"),
+        viz: bool = Option(False, "--viz", "-vz",
+                           help="Write plot/drawing visual data (NDJSON)",
+                           rich_help_panel="Out Path Options"),
+        viz_path: Path | None = Option(None, "--viz-path",
+                                       help="Viz NDJSON path (implies --viz)",
+                                       rich_help_panel="Out Path Options"),
+        viz_journal: bool = Option(False, "--viz-journal",
+                                   help="Record per-bar drawing create/update/delete events "
+                                        "(implies --viz)",
+                                   rich_help_panel="Out Path Options"),
         api_key: str | None = Option(None, "--api-key", "-a",
                                      help="PyneSys API key for compilation (overrides configuration file)",
                                      envvar="PYNESYS_API_KEY",
@@ -800,6 +810,12 @@ def run(
         trade_path = trade_path.with_suffix(".csv")
     if not trade_path:
         trade_path = app_state.output_dir / f"{script.stem}_trade.csv"
+
+    # --viz-path / --viz-journal both imply --viz
+    if viz_path or viz_journal:
+        viz = True
+    if viz and not viz_path:
+        viz_path = app_state.output_dir / f"{script.stem}_viz.ndjson"
 
     # Validate and process --timeframe option
     magnifier_mode = False
@@ -1112,6 +1128,7 @@ def run(
                     runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                           last_bar_time=last_bar_time,
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
+                                          viz_path=viz_path if viz else None, viz_journal=viz_journal,
                                           security_data=security_data,
                                           magnifier_iter=magnifier_iter,
                                           magnifier_source_tf=magnifier_source_tf,

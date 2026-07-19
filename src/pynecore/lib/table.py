@@ -1,4 +1,5 @@
 from ..core.module_property import module_property
+from ..types.base import next_vid
 from ..types.table import Table
 from ..types.na import NA
 from ..lib import (color as _color, position as _position, size as _size, text as _text, font as _font)
@@ -38,6 +39,7 @@ def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.C
         border_width=border_width,
         force_overlay=force_overlay
     )
+    table.vid = next_vid()
     _registry.append(table)
     return table
 

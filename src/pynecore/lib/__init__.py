@@ -20,9 +20,11 @@ from ..core.script import script, input
 
 from ..types.na import NA
 from ..types import Series, PyneInt
+from ..types.plot_meta import PlotMeta
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
 from .plot import plot as _plot
+from ..types.hline import HLine
 from . import timeframe as timeframe_module
 from . import session as session_module
 from ._fixnan import fixnan
@@ -114,6 +116,12 @@ _main_timeframe: str | None = None
 
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
+
+# Plot-family registration state
+_plot_meta: dict[str, PlotMeta] = {}   # id -> meta, insertion order = registration order
+_plot_meta_new: list[PlotMeta] = []    # pending metas, drained only by the viz writer
+_viz_dyn: dict[str, Any] = {}          # per-bar dynamic channels, cleared with _plot_data
+_viz_seq: dict[str, int] = {}          # per-bar ordinal counters for bgcolor/barcolor/fill/hline
 
 # Extra fields from CSV data (beyond OHLCV), populated each bar by ScriptRunner
 extra_fields: dict[str, Any] = {}
@@ -257,38 +265,450 @@ def timestamp(year: int | float, month: int | float, day: int | float, hour: int
 
 ### Plotting ###
 
-# TODO: implement creating plot metadata to be able to plot in a different module
-
-def barcolor(*_, **__):
-    ...
-
-
-def bgcolor(*_, **__):
-    ...
-
-
-def fill(*_, **__):
-    ...
+def _uniq_title(title: str) -> str:
+    """Return a title unique against the current bar's ``_plot_data`` keys."""
+    c = 0
+    t = title
+    while t in _plot_data:
+        t = title + ' ' + str(c)
+        c += 1
+    return t
 
 
-def plotarrow(*_, **__):
-    ...
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plotshape(series: Any, title: str | None = None, style: Any = None, location: Any = None,
+              color: Any = None, offset: int = 0, text: str | None = None, textcolor: Any = None,
+              editable: bool = True, size: Any = None, show_last: int | None = None,
+              display: Any = None, format: str | None = None, precision: int | None = None,
+              force_overlay: bool = False) -> None:
+    """
+    Plot a shape marker on bars where ``series`` is true.
+
+    :param series: Marker is drawn on bars where this value is true (na propagates)
+    :param title: Plot title
+    :param style: Shape style (``shape.*``); default ``shape.xcross``
+    :param location: Marker location (``location.*``); default ``location.abovebar``
+    :param color: Marker color
+    :param offset: Horizontal shift in bars
+    :param text: Text displayed with the marker
+    :param textcolor: Color of the marker text
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param size: Marker size (``size.*``); default ``size.auto``
+    :param show_last: If set, only the last ``show_last`` markers are drawn
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the displayed values
+    :param precision: Number of decimal places for the displayed values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The plotshape function can only be called from the main function!")
+    t = _uniq_title('Shape' if title is None else title)
+    _plot_data[t] = series if is_na(series) else int(bool(series))
+    meta = _plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='shape', title=t, style=style, location=location, color=color,
+                        offset=offset, text=text, textcolor=textcolor, editable=editable,
+                        size=size, show_last=show_last, display=display, format=format,
+                        precision=precision, force_overlay=force_overlay)
+        _plot_meta[t] = meta
+        _plot_meta_new.append(meta)
+    if not meta.dynamic:
+        if (color is not None and color is not meta.color) or \
+                (textcolor is not None and textcolor is not meta.textcolor):
+            meta.dynamic = True
+            # The static meta record is already out — re-queue an updated one.
+            _plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so reverts to the static colors are emitted
+        _viz_dyn[t] = (color, textcolor)
 
 
-def plotbar(*_, **__):
-    ...
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plotchar(series: Any, title: str | None = None, char: str | None = None, location: Any = None,
+             color: Any = None, offset: int = 0, text: str | None = None, textcolor: Any = None,
+             editable: bool = True, size: Any = None, show_last: int | None = None,
+             display: Any = None, format: str | None = None, precision: int | None = None,
+             force_overlay: bool = False) -> None:
+    """
+    Plot a character marker on bars where ``series`` is true.
+
+    :param series: The value plotted (stored raw)
+    :param title: Plot title
+    :param char: The character to draw; default '◆'
+    :param location: Marker location (``location.*``); default ``location.abovebar``
+    :param color: Marker color
+    :param offset: Horizontal shift in bars
+    :param text: Text displayed with the marker
+    :param textcolor: Color of the marker text
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param size: Marker size (``size.*``); default ``size.auto``
+    :param show_last: If set, only the last ``show_last`` markers are drawn
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the displayed values
+    :param precision: Number of decimal places for the displayed values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The plotchar function can only be called from the main function!")
+    t = _uniq_title('Char' if title is None else title)
+    _plot_data[t] = series
+    meta = _plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='char', title=t, char=char, location=location, color=color,
+                        offset=offset, text=text, textcolor=textcolor, editable=editable,
+                        size=size, show_last=show_last, display=display, format=format,
+                        precision=precision, force_overlay=force_overlay)
+        _plot_meta[t] = meta
+        _plot_meta_new.append(meta)
+    if not meta.dynamic:
+        if (color is not None and color is not meta.color) or \
+                (textcolor is not None and textcolor is not meta.textcolor):
+            meta.dynamic = True
+            # The static meta record is already out — re-queue an updated one.
+            _plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so reverts to the static colors are emitted
+        _viz_dyn[t] = (color, textcolor)
 
 
-def plotcandle(*_, **__):
-    ...
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plotarrow(series: Any, title: str | None = None, colorup: Any = None, colordown: Any = None,
+              offset: int = 0, minheight: int = 5, maxheight: int = 100, editable: bool = True,
+              show_last: int | None = None, display: Any = None, format: str | None = None,
+              precision: int | None = None, force_overlay: bool = False) -> None:
+    """
+    Plot up/down arrows sized by the magnitude of ``series``.
+
+    :param series: Arrow direction/length; positive draws up, negative draws down
+    :param title: Plot title
+    :param colorup: Color of up arrows
+    :param colordown: Color of down arrows
+    :param offset: Horizontal shift in bars
+    :param minheight: Minimum arrow height in pixels
+    :param maxheight: Maximum arrow height in pixels
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` arrows are drawn
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the displayed values
+    :param precision: Number of decimal places for the displayed values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The plotarrow function can only be called from the main function!")
+    t = _uniq_title('Arrows' if title is None else title)
+    _plot_data[t] = series
+    meta = _plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='arrow', title=t, colorup=colorup, colordown=colordown,
+                        offset=offset, minheight=minheight, maxheight=maxheight, editable=editable,
+                        show_last=show_last, display=display, format=format, precision=precision,
+                        force_overlay=force_overlay)
+        _plot_meta[t] = meta
+        _plot_meta_new.append(meta)
+    if not meta.dynamic:
+        if (colorup is not None and colorup is not meta.colorup) or \
+                (colordown is not None and colordown is not meta.colordown):
+            meta.dynamic = True
+            # The static meta record is already out — re-queue an updated one.
+            _plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so reverts to the static colors are emitted
+        _viz_dyn[t] = (colorup, colordown)
 
 
-def plotchar(series: Any, title: str | None = None, *_, **__):
-    _plot(series, title)
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plotcandle(open: Any, high: Any, low: Any, close: Any, title: str | None = None,
+               color: Any = None, wickcolor: Any = None, editable: bool = True,
+               show_last: int | None = None, bordercolor: Any = None, display: Any = None,
+               format: str | None = None, precision: int | None = None,
+               force_overlay: bool = False) -> None:
+    """
+    Plot OHLC candles from the four supplied series.
+
+    :param open: Open value of the candle
+    :param high: High value of the candle
+    :param low: Low value of the candle
+    :param close: Close value of the candle
+    :param title: Plot title
+    :param color: Body color
+    :param wickcolor: Wick color
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` candles are drawn
+    :param bordercolor: Border color
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the displayed values
+    :param precision: Number of decimal places for the displayed values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The plotcandle function can only be called from the main function!")
+    base = 'Candles' if title is None else title
+    c = 0
+    t = base
+    while f"{t} (open)" in _plot_data:
+        t = base + ' ' + str(c)
+        c += 1
+    _plot_data[f"{t} (open)"] = open
+    _plot_data[f"{t} (high)"] = high
+    _plot_data[f"{t} (low)"] = low
+    _plot_data[f"{t} (close)"] = close
+    meta = _plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='candle', title=t, color=color, wickcolor=wickcolor,
+                        bordercolor=bordercolor, editable=editable, show_last=show_last,
+                        display=display, format=format, precision=precision,
+                        force_overlay=force_overlay)
+        _plot_meta[t] = meta
+        _plot_meta_new.append(meta)
+    if not meta.dynamic:
+        if (color is not None and color is not meta.color) or \
+                (wickcolor is not None and wickcolor is not meta.wickcolor) or \
+                (bordercolor is not None and bordercolor is not meta.bordercolor):
+            meta.dynamic = True
+            # The static meta record is already out — re-queue an updated one.
+            _plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so reverts to the static colors are emitted
+        _viz_dyn[t] = (color, wickcolor, bordercolor)
 
 
-def plotshape(*_, **__):
-    ...
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plotbar(open: Any, high: Any, low: Any, close: Any, title: str | None = None, color: Any = None,
+            editable: bool = True, show_last: int | None = None, display: Any = None,
+            format: str | None = None, precision: int | None = None,
+            force_overlay: bool = False) -> None:
+    """
+    Plot OHLC bars from the four supplied series.
+
+    :param open: Open value of the bar
+    :param high: High value of the bar
+    :param low: Low value of the bar
+    :param close: Close value of the bar
+    :param title: Plot title
+    :param color: Bar color
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` bars are drawn
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the displayed values
+    :param precision: Number of decimal places for the displayed values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The plotbar function can only be called from the main function!")
+    base = 'Bars' if title is None else title
+    c = 0
+    t = base
+    while f"{t} (open)" in _plot_data:
+        t = base + ' ' + str(c)
+        c += 1
+    _plot_data[f"{t} (open)"] = open
+    _plot_data[f"{t} (high)"] = high
+    _plot_data[f"{t} (low)"] = low
+    _plot_data[f"{t} (close)"] = close
+    meta = _plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='bar', title=t, color=color, editable=editable,
+                        show_last=show_last, display=display, format=format, precision=precision,
+                        force_overlay=force_overlay)
+        _plot_meta[t] = meta
+        _plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so a return to the static color is emitted
+        _viz_dyn[t] = color
+    elif color is not None and color is not meta.color:
+        _viz_dyn[t] = color
+        meta.dynamic = True
+        # The static meta record is already out — re-queue an updated one.
+        _plot_meta_new.append(meta)
+
+
+# noinspection PyProtectedMember
+def bgcolor(color: Any = None, offset: int = 0, editable: bool = True, show_last: int | None = None,
+            title: str | None = None, display: Any = None, force_overlay: bool = False) -> None:
+    """
+    Fill the background of bars with ``color``.
+
+    :param color: Background color for the current bar (na leaves the bar unpainted)
+    :param offset: Horizontal shift in bars
+    :param editable: If true, the fill is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` bars are painted
+    :param title: Plot title
+    :param display: Controls where the fill is displayed
+    :param force_overlay: If true, the fill displays on the main chart pane
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The bgcolor function can only be called from the main function!")
+    n = _viz_seq.get('bgcolor', 0)
+    _viz_seq['bgcolor'] = n + 1
+    key = f'bgcolor#{n}'
+    meta = _plot_meta.get(key)
+    if meta is None:
+        meta = PlotMeta(id=key, kind='bgcolor', title=title, offset=offset, editable=editable,
+                        show_last=show_last, display=display, force_overlay=force_overlay,
+                        dynamic=True)
+        _plot_meta[key] = meta
+        _plot_meta_new.append(meta)
+    # Record every bar (na/None -> null "off") so paint/unpaint transitions are emitted
+    _viz_dyn[key] = color
+
+
+# noinspection PyProtectedMember
+def barcolor(color: Any = None, offset: int = 0, editable: bool = True, show_last: int | None = None,
+             title: str | None = None, display: Any = None) -> None:
+    """
+    Color the price bars with ``color``.
+
+    :param color: Bar color for the current bar (na leaves the bar unchanged)
+    :param offset: Horizontal shift in bars
+    :param editable: If true, the coloring is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` bars are colored
+    :param title: Plot title
+    :param display: Controls where the coloring is displayed
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The barcolor function can only be called from the main function!")
+    n = _viz_seq.get('barcolor', 0)
+    _viz_seq['barcolor'] = n + 1
+    key = f'barcolor#{n}'
+    meta = _plot_meta.get(key)
+    if meta is None:
+        meta = PlotMeta(id=key, kind='barcolor', title=title, offset=offset, editable=editable,
+                        show_last=show_last, display=display, dynamic=True)
+        _plot_meta[key] = meta
+        _plot_meta_new.append(meta)
+    # Record every bar (na/None -> null "off") so color/unpaint transitions are emitted
+    _viz_dyn[key] = color
+
+
+# Positional parameter orders of Pine's three ``fill`` overloads; ``fill()`` maps
+# ``*args`` onto one of these depending on the runtime shape of the call.
+_FILL_PLOT_PARAMS = ('plot1', 'plot2', 'color', 'title', 'editable', 'show_last',
+                     'fillgaps', 'display')
+_FILL_HLINE_PARAMS = ('hline1', 'hline2', 'color', 'title', 'editable', 'fillgaps', 'display')
+_FILL_GRADIENT_PARAMS = ('plot1', 'plot2', 'top_value', 'bottom_value', 'top_color',
+                         'bottom_color', 'title', 'display', 'fillgaps', 'editable')
+
+
+# noinspection PyProtectedMember
+def fill(*args: Any, **kwargs: Any) -> None:
+    """
+    Fill the area between two plots or two hlines.
+
+    Three call shapes are accepted (Pine-compatible):
+
+    - ``fill(plot1, plot2, color, title, editable, show_last, fillgaps, display)``
+    - ``fill(hline1, hline2, color, title, editable, fillgaps, display)``
+    - ``fill(plot1, plot2, top_value, bottom_value, top_color, bottom_color, title,
+      display, fillgaps, editable)`` — vertical gradient
+
+    Positional arguments are bound to the hline shape when the first argument is an
+    ``hline``, to the gradient shape when the third argument is a numeric ``top_value``
+    rather than a color, and to the plot shape otherwise.
+
+    :param plot1: First plot object (``hline1`` for the hline shape)
+    :param plot2: Second plot object (``hline2`` for the hline shape)
+    :param color: Solid fill color
+    :param title: Plot title
+    :param editable: If true, the fill is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` bars are filled (plot shape only)
+    :param fillgaps: If true, the fill continues across gaps (na values)
+    :param display: Controls where the fill is displayed
+    :param top_value: Value mapped to ``top_color`` in gradient mode
+    :param bottom_value: Value mapped to ``bottom_color`` in gradient mode
+    :param top_color: Color at ``top_value`` in gradient mode
+    :param bottom_color: Color at ``bottom_value`` in gradient mode
+    """
+    if _lib_semaphore:
+        return
+    if bar_index == 0:
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
+            raise RuntimeError("The fill function can only be called from the main function!")
+    if args:
+        if isinstance(args[0], HLine):
+            names = _FILL_HLINE_PARAMS
+        else:
+            a2 = args[2] if len(args) > 2 else None
+            # Gradient shape: the third positional is ``top_value`` — a number (or an na
+            # value followed by a gradient color where the plot shape would have a bool).
+            if (isinstance(a2, (int, float)) and not isinstance(a2, bool)) or \
+                    (isinstance(a2, NA) and len(args) > 4 and not isinstance(args[4], bool)):
+                names = _FILL_GRADIENT_PARAMS
+            else:
+                names = _FILL_PLOT_PARAMS
+        if len(args) > len(names):
+            raise TypeError(f"fill() takes at most {len(names)} positional arguments")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"fill() got multiple values for argument '{name}'")
+            kwargs[name] = value
+    plot1 = kwargs.get('plot1') if 'plot1' in kwargs else kwargs.get('hline1')
+    plot2 = kwargs.get('plot2') if 'plot2' in kwargs else kwargs.get('hline2')
+    color = kwargs.get('color')
+    title = kwargs.get('title')
+    editable = kwargs.get('editable', True)
+    show_last = kwargs.get('show_last')
+    fillgaps = kwargs.get('fillgaps', False)
+    display = kwargs.get('display')
+    top_value = kwargs.get('top_value')
+    bottom_value = kwargs.get('bottom_value')
+    top_color = kwargs.get('top_color')
+    bottom_color = kwargs.get('bottom_color')
+    n = _viz_seq.get('fill', 0)
+    _viz_seq['fill'] = n + 1
+    key = f'fill#{n}'
+    meta = _plot_meta.get(key)
+    created = meta is None
+    if meta is None:
+        if isinstance(plot1, HLine):
+            meta = PlotMeta(id=key, kind='fill', title=title, color=color, editable=editable,
+                            show_last=show_last, fillgaps=fillgaps, display=display,
+                            hline1=plot1.id if plot1 is not None else None,
+                            hline2=plot2.id if plot2 is not None else None)
+        else:
+            meta = PlotMeta(id=key, kind='fill', title=title, color=color, editable=editable,
+                            show_last=show_last, fillgaps=fillgaps, display=display,
+                            plot1=plot1.id if plot1 is not None else None,
+                            plot2=plot2.id if plot2 is not None else None)
+        _plot_meta[key] = meta
+        _plot_meta_new.append(meta)
+    if top_color is not None or bottom_color is not None \
+            or top_value is not None or bottom_value is not None:
+        _viz_dyn[key] = (top_value, bottom_value, top_color, bottom_color)
+        if not meta.dynamic:
+            meta.dynamic = True
+            if not created:
+                # Already emitted as static — re-queue so an updated meta record
+                # (dynamic: true) precedes this bar's color delta.
+                _plot_meta_new.append(meta)
+    elif meta.dynamic:
+        # Once dynamic, record every bar so a return to the static color is emitted
+        _viz_dyn[key] = color
+    elif color is not None and color is not meta.color:
+        _viz_dyn[key] = color
+        meta.dynamic = True
+        # The static meta record is already out — re-queue an updated one.
+        _plot_meta_new.append(meta)
 
 
 ### Alert ###

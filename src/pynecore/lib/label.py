@@ -1,8 +1,9 @@
 from copy import copy as _copy
-from typing import overload
+from typing import Any, overload
 
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
+from ..types.base import next_vid
 from ..types.label import LabelStyleEnum, Label
 from ..types.na import NA, na_int, na_float
 from ..lib import xloc as _xloc, yloc as _yloc, color as _color, size as _size, text as _text, font as _font
@@ -52,15 +53,16 @@ def new(x: int | float, y: int | float, text: str = "", xloc: _xloc.XLoc = _xloc
         force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none) -> Label: ...
 
 
+# Positional parameter orders of the two Pine call shapes; ``new()`` maps ``*args``
+# onto one of these depending on whether the first positional is a ``chart.point``.
+_COMMON_PARAMS = ('xloc', 'yloc', 'color', 'style', 'textcolor', 'size', 'textalign',
+                  'tooltip', 'text_font_family', 'force_overlay', 'text_formatting')
+_POINT_PARAMS = ('point', 'text') + _COMMON_PARAMS
+_COORD_PARAMS = ('x', 'y', 'text') + _COMMON_PARAMS
+
+
 # noinspection PyProtectedMember
-def new(x: ChartPoint | int | float | None = None, y: int | float | str | None = None,
-        text: str = "", xloc: _xloc.XLoc = _xloc.bar_index,
-        yloc: _yloc.YLoc = _yloc.price, color: _color.Color = _color.blue,
-        style: LabelStyleEnum = style_label_down, textcolor: _color.Color = _color.white,
-        size: _size.Size = _size.normal, textalign: _text.AlignEnum = _text.align_center,
-        tooltip: str = "", text_font_family: _font.FontFamilyEnum = _font.family_default,
-        force_overlay: bool = False, text_formatting: _text.FormatEnum = _text.format_none,
-        point: ChartPoint | None = None) -> Label:
+def new(*args: Any, **kwargs: Any) -> Label:
     """
     Creates a new label object.
 
@@ -72,10 +74,8 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
       A float ``x`` is truncated to int to mirror Pine's implicit float-to-int
       conversion on ``series int`` parameters.
 
-    :param x: Bar index / bar time of the label position (coordinate form), or a ``chart.point``
-              object (point form, when passed as the first positional argument)
-    :param y: Price of the label position (coordinate form), or the label ``text`` when the
-              first positional argument is a ``chart.point``
+    :param x: Bar index / bar time of the label position (coordinate form)
+    :param y: Price of the label position (coordinate form)
     :param text: Label text
     :param xloc: Possible values: ``xloc.bar_index`` and ``xloc.bar_time``
     :param yloc: Possible values are ``yloc.price``, ``yloc.abovebar``, ``yloc.belowbar``
@@ -91,17 +91,35 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
     :param point: ``chart.point`` object (point form, keyword equivalent of the first positional)
     :return: A label object
     """
-    if point is not None:
-        x = point
-    if isinstance(x, ChartPoint):
-        # Positional chart.point form: the second positional (y) is the label text
-        if text == "" and isinstance(y, str):
-            text = y
+    if args:
+        names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
+        if len(args) > len(names):
+            raise TypeError(f"label.new() takes at most {len(names)} positional arguments")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"label.new() got multiple values for argument '{name}'")
+            kwargs[name] = value
+    point = kwargs.get('point')
+    text = kwargs.get('text', "")
+    xloc = kwargs.get('xloc', _xloc.bar_index)
+    yloc = kwargs.get('yloc', _yloc.price)
+    color = kwargs.get('color', _color.blue)
+    style = kwargs.get('style', style_label_down)
+    textcolor = kwargs.get('textcolor', _color.white)
+    size = kwargs.get('size', _size.normal)
+    textalign = kwargs.get('textalign', _text.align_center)
+    tooltip = kwargs.get('tooltip', "")
+    text_font_family = kwargs.get('text_font_family', _font.family_default)
+    force_overlay = kwargs.get('force_overlay', False)
+    text_formatting = kwargs.get('text_formatting', _text.format_none)
+    if isinstance(point, ChartPoint):
         if xloc == _xloc.bar_time:
-            x_val, y_val = x.time, x.price
+            x_val, y_val = point.time, point.price
         else:
-            x_val, y_val = x.index, x.price
+            x_val, y_val = point.index, point.price
     else:
+        x = kwargs.get('x')
+        y = kwargs.get('y')
         x_val = int(x) if isinstance(x, (int, float)) else na_int
         y_val = y if isinstance(y, (int, float)) else na_float
 
@@ -121,6 +139,7 @@ def new(x: ChartPoint | int | float | None = None, y: int | float | str | None =
         force_overlay=force_overlay,
         text_formatting=text_formatting or _text.format_none
     )
+    label_obj.vid = next_vid()
     _registry[label_obj] = None
     # Enforce Pine's max_labels_count cap: drop the oldest label (FIFO) past the limit.
     # A security child never sets ``lib._script``; fall back to TV's hard maximum
@@ -146,12 +165,17 @@ def delete(id):
     _registry.pop(id, None)
 
 
-# noinspection PyShadowingBuiltins
+# noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
     """Copy label object"""
     if isinstance(id, NA):
         return NA(Label)
-    return _copy(id)
+    clone = _copy(id)
+    clone.vid = next_vid()
+    _registry[clone] = None
+    if len(_registry) > (lib._script.max_labels_count if lib._script is not None else 500):
+        del _registry[next(iter(_registry))]
+    return clone
 
 
 # noinspection PyShadowingBuiltins

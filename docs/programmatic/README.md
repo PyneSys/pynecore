@@ -25,6 +25,7 @@ custom backtesting frameworks, data pipelines, and more.
 
 - [ScriptRunner API](./script-runner.md) - Running scripts from Python, accessing indicator and
   strategy results
+- [Visual Output (Viz)](./visual-output.md) - Plot styles and drawing data as an opt-in NDJSON stream
 - [Data & SymInfo](./data-and-syminfo.md) - Loading and creating OHLCV data and symbol information
 - [Integration Patterns](./integration-patterns.md) - Real-world integration examples (FreqTrade,
   live trading, custom systems)

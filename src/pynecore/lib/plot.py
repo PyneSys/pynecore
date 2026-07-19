@@ -2,6 +2,7 @@ from typing import Any
 import sys
 
 from ..types.plot import PlotEnum, Plot
+from ..types.plot_meta import PlotMeta
 
 
 #
@@ -29,23 +30,39 @@ linestyle_dotted = PlotEnum()
 # Module function
 #
 
-# noinspection PyProtectedMember
-def plot(series: Any, title: str | None = None, *_, **__):
+# noinspection PyProtectedMember,PyShadowingBuiltins
+def plot(series: Any, title: str | None = None, color: Any = None, linewidth: int = 1,
+         style: Any = None, trackprice: bool = False, histbase: float = 0.0, offset: int = 0,
+         join: bool = False, editable: bool = True, show_last: int | None = None,
+         display: Any = None, format: str | None = None, precision: int | None = None,
+         force_overlay: bool = False, *_, **__):
     """
-    Plot series, by default a CSV is generated, but this can be extended
+    Plot a series on the chart.
 
-    :param series: The value to plot in every bar
-    :param title: The title of the plot, if multiple plots are created with the same title, a
-                  number will be appended
-    :return: The a Plot object, can be used to reference the plot in other functions
+    :param series: The value to plot on every bar
+    :param title: The title of the plot; if several plots share a title a number is appended
+    :param color: Plot color; when it varies per bar it is recorded as a dynamic channel
+    :param linewidth: Width of the plotted line in pixels
+    :param style: Plot style (``plot.style_*``); ``None`` means Pine's ``style_line``
+    :param trackprice: If true, a horizontal price line is shown at the last value
+    :param histbase: Reference value for ``style_histogram``, ``style_columns`` and ``style_area``
+    :param offset: Horizontal shift of the plot, in bars
+    :param join: If true, ``style_circles`` / ``style_cross`` points are joined with lines
+    :param editable: If true, the plot style is editable in the Format dialog
+    :param show_last: If set, only the last ``show_last`` bars are plotted
+    :param display: Controls where the plot is displayed
+    :param format: Formatting of the plotted values (``format.price``, ``format.volume`` etc.)
+    :param precision: Number of decimal places for the plotted values
+    :param force_overlay: If true, the plot displays on the main chart pane
+    :return: A Plot object, used to reference the plot in other functions
     """
     from .. import lib
     if lib._lib_semaphore:
-        return Plot()
+        return Plot('')
 
     if lib.bar_index == 0:  # Only check if it is the first bar for performance reasons
         # Check if it is called from the main function
-        if sys._getframe(1).f_code.co_name not in ('main', 'plotchar'):  # noqa
+        if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plot function can only be called from the main function!")
 
     # Ensure unique title
@@ -56,9 +73,23 @@ def plot(series: Any, title: str | None = None, *_, **__):
     while t in lib._plot_data:
         t = title + ' ' + str(c)
         c += 1
-    title = t
 
-    # Store plot data
-    lib._plot_data[title] = series
+    lib._plot_data[t] = series
+    meta = lib._plot_meta.get(t)
+    if meta is None:
+        meta = PlotMeta(id=t, kind='plot', title=t, color=color, linewidth=linewidth, style=style,
+                        trackprice=trackprice, histbase=histbase, offset=offset, join=join,
+                        editable=editable, show_last=show_last, display=display, format=format,
+                        precision=precision, force_overlay=force_overlay)
+        lib._plot_meta[t] = meta
+        lib._plot_meta_new.append(meta)
+    if meta.dynamic:
+        # Once dynamic, record every bar so a return to the static color is emitted
+        lib._viz_dyn[t] = color
+    elif color is not None and color is not meta.color:
+        lib._viz_dyn[t] = color
+        meta.dynamic = True
+        # The static meta record is already out — re-queue an updated one.
+        lib._plot_meta_new.append(meta)
 
-    return Plot()
+    return Plot(t)
