@@ -1,7 +1,7 @@
 """
 Builtin library of Pyne
 """
-from typing import TYPE_CHECKING, TypeAlias, Any, Callable
+from typing import TYPE_CHECKING, TypeAlias, Any
 from types import GenericAlias
 
 if TYPE_CHECKING:
@@ -1021,7 +1021,7 @@ _EPOCH_ORDINAL = 719163  # date(1970, 1, 1).toordinal()
 
 
 # noinspection PyProtectedMember
-@module_property
+@module_function_property
 def time_tradingday() -> PyneInt:
     """
     The beginning time of the trading day the current bar belongs to, as a UNIX

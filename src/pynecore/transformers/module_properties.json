@@ -231,18 +231,6 @@
     "NA": {
       "type": "variable"
     },
-    "PyneBool": {
-      "type": "variable"
-    },
-    "PyneFloat": {
-      "type": "variable"
-    },
-    "PyneInt": {
-      "type": "variable"
-    },
-    "PyneStr": {
-      "type": "variable"
-    },
     "SequenceView": {
       "type": "variable"
     },

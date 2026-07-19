@@ -186,6 +186,7 @@ def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
 # noinspection PyShadowingBuiltins
 @overload
 def max(*numbers: int) -> PyneInt: ...
+# noinspection PyShadowingBuiltins
 @overload
 def max(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
 
@@ -209,6 +210,7 @@ def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
 # noinspection PyShadowingBuiltins
 @overload
 def min(*numbers: int) -> PyneInt: ...
+# noinspection PyShadowingBuiltins
 @overload
 def min(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
 
@@ -247,6 +249,7 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
 # noinspection PyShadowingBuiltins
 @overload
 def round(number: TFI | NA[TFI]) -> PyneInt: ...
+# noinspection PyShadowingBuiltins
 @overload
 def round(number: TFI | NA[TFI], precision: PyneInt) -> PyneFloat: ...
 

@@ -9,7 +9,6 @@ from pathlib import Path
 import pynecore.lib.format as _format
 import pynecore.lib.scale as _scale
 import pynecore.lib.strategy as _strategy
-import pynecore.lib.strategy.commission
 import pynecore.lib.currency as _currency
 import pynecore.lib.display as _display
 
@@ -434,6 +433,7 @@ class Script:
         :param max_polylines_count: The number of last polyline drawings displayed
         :param dynamic_requests: Specifies whether the script can dynamically call functions from
         :param behind_chart: Controls whether the script's plots and drawings in the main chart pane
+        :param _broker_requirements: Broker capability requirements of the script, internal use only
         """
         script = cls()
         script.script_type = _script_type.strategy
@@ -596,7 +596,7 @@ class _Input:
              minval: int | None = None, maxval: int | None = None, step: int | None = None,
              tooltip: str | None = None, inline: str | None = None, group: str | None = None,
              confirm: bool | None = False, display: _display.Display | None = None,
-             active: bool | None = None) -> PyneInt: ...
+             active: bool | None = None, *, _id: str = "") -> PyneInt: ...
 
     # noinspection PyMethodOverriding
     @overload
@@ -605,7 +605,7 @@ class _Input:
              options: tuple[int, ...] | None = None,
              tooltip: str | None = None, inline: str | None = None, group: str | None = None,
              confirm: bool | None = False, display: _display.Display | None = None,
-             active: bool | None = None) -> PyneInt: ...
+             active: bool | None = None, *, _id: str = "") -> PyneInt: ...
 
     @classmethod
     def _int(cls, defval: int, title: str | None = None, *args,
@@ -641,6 +641,7 @@ class _Input:
         )
         return defval if _id not in _old_input_values else safe_convert.safe_int(_old_input_values[_id])
 
+    # noinspection PyUnusedLocal
     @classmethod
     def _bool(cls, defval: bool, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -683,7 +684,7 @@ class _Input:
                step: float | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
                confirm: bool | None = False, display: _display.Display | None = None,
-               active: bool | None = None) -> PyneFloat: ...
+               active: bool | None = None, *, _id: str = "") -> PyneFloat: ...
 
     # noinspection PyMethodOverriding
     @overload
@@ -692,7 +693,7 @@ class _Input:
                options: tuple[int | float, ...] | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
                confirm: bool | None = False, display: _display.Display | None = None,
-               active: bool | None = None) -> PyneFloat: ...
+               active: bool | None = None, *, _id: str = "") -> PyneFloat: ...
 
     @classmethod
     def _float(cls, defval: float, title: str | None = None, *args,
@@ -728,6 +729,7 @@ class _Input:
         )
         return defval if _id not in _old_input_values else safe_convert.safe_float(_old_input_values[_id])
 
+    # noinspection PyUnusedLocal
     @classmethod
     def string(cls, defval: str, title: str | None = None,
                options: tuple[str, ...] | None = None,
@@ -765,6 +767,7 @@ class _Input:
         )
         return defval if _id not in _old_input_values else str(_old_input_values[_id])
 
+    # noinspection PyUnusedLocal
     @classmethod
     def color(cls, defval: Color, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -799,6 +802,7 @@ class _Input:
         )
         return defval if _id not in _old_input_values else Color(_old_input_values[_id])
 
+    # noinspection PyUnusedLocal
     @classmethod
     def source(cls, defval: str | Source | float, title: str | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -839,6 +843,7 @@ class _Input:
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
         return defval if _id not in _old_input_values else _old_input_values[_id]  # type: ignore[return-value]
 
+    # noinspection PyUnusedLocal
     @classmethod
     def enum(cls, defval: TEnum, title: str | None = None,
              options: tuple[str, ...] | None = None,
@@ -888,6 +893,7 @@ class _Input:
 
     # We don't have interactive inputs, so price is stored as a float input; its
     # Pine positional order has no minval/maxval/step, so it cannot alias _float
+    # noinspection PyUnusedLocal
     @classmethod
     def price(cls, defval: float, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -914,6 +920,7 @@ class _Input:
 
     # Pine's input.symbol has NO options: its third positional is tooltip, so it
     # cannot alias string (whose third positional is options)
+    # noinspection PyUnusedLocal
     @classmethod
     def symbol(cls, defval: str, title: str | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -940,6 +947,7 @@ class _Input:
 
     # Pine's input.text_area has neither options nor inline: its positional
     # order is defval, title, tooltip, group, confirm, display, active
+    # noinspection PyUnusedLocal
     @classmethod
     def text_area(cls, defval: str, title: str | None = None,
                   tooltip: str | None = None, group: str | None = None,
@@ -965,6 +973,7 @@ class _Input:
 
     # time() returns UNIX timestamp in milliseconds (int); its Pine positional
     # order has no minval/maxval/step, so it cannot alias _int
+    # noinspection PyUnusedLocal
     @classmethod
     def time(cls, defval: int, title: str | None = None,
              tooltip: str | None = None, inline: str | None = None, group: str | None = None,

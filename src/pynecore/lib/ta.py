@@ -175,9 +175,6 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     weights: Persistent[list[float]] = []
     norm: Persistent[float] = 0.0
 
-    if TYPE_CHECKING:
-        weights: list[float] = cast(list[float], weights)
-
     # Calculate weights only once
     if not weights:
         m = offset * (length - 1) if not floor else math.floor(offset * (length - 1))
@@ -296,7 +293,7 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
         # type(source) would be the NA class itself — keep the source sentinel's type
         return cast(TFIB, source)
     if isinstance(prev_val, NA):
-        return NA(cast(type[TFIB], type(source)))
+        return NA(type(source))
     if isinstance(source, float):
         return cast(TFIB, round(source - prev_val, 14))  # noqa
     if isinstance(source, int):
@@ -314,7 +311,7 @@ def cmo(source: float, length: int) -> PyneFloat:
     """
     momentum = change(source)
     if isinstance(momentum, NA):
-        return momentum
+        return NA(float)
     sum1 = lib_math.sum(momentum if momentum >= 0.0 else 0.0, length)
     sum2 = lib_math.sum(0.0 if momentum >= 0.0 else -momentum, length)
     return 100 * (sum1 - sum2) / (sum1 + sum2)
@@ -334,22 +331,23 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     weighted_summ: Persistent[float] = 0.0
     val: Persistent[float] = NA(float)
 
-    isna = isinstance(source, NA)
-    if not isna:
-        # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
-        # indexes past NA gaps to the true oldest value still inside the window.
-        # Reading the parameter directly would step back ``length`` *bars* and land
-        # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
-        src: Series[float] = source
-        # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
-        # beyond the per-series default max_bars_back (500); otherwise the window-drop
-        # read returns na and poisons ``summ`` permanently.
-        max_bars_back(src, int(length))
+    if isinstance(source, NA):
+        # An NA bar leaves the window unchanged; hold the last full value
+        # (still NA while warming up)
+        return NA(float) if count < length else val
+
+    # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
+    # indexes past NA gaps to the true oldest value still inside the window.
+    # Reading the parameter directly would step back ``length`` *bars* and land
+    # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
+    src: Series[float] = source
+    # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
+    # beyond the per-series default max_bars_back (500); otherwise the window-drop
+    # read returns na and poisons ``summ`` permanently.
+    max_bars_back(src, int(length))
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
-        if isna:
-            return NA(float)
         count += 1
         summ += source
         weighted_summ += source * (length - count)
@@ -358,9 +356,6 @@ def cog(source: Series[float], length: int) -> PyneFloat:
 
     # Normal calculation phase
     else:
-        if isna:
-            # An NA bar leaves the window unchanged; hold the last full value
-            return val
         new_summ = summ + source - src[length]
         weighted_summ = weighted_summ + summ - length * src[length]
         summ = new_summ
@@ -798,30 +793,29 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     sum_y: Persistent[float] = 0.0  # Sum of source values in the window
     sum_xy: Persistent[float] = 0.0  # Weighted sum: sum((window_size - 1 - i) * source[i])
 
-    isna = isinstance(source, NA)
-    if not isna:
+    if isinstance(source, NA):
+        if bar_count < window_size:
+            return NA(float)
+        # An NA bar leaves the window unchanged; fall through to report the held value
+    else:
         # NA values are NOT stored in the buffer, only skipped, so ``src[window_size]``
         # indexes past NA gaps to the true oldest value still inside the window.
         # Reading the parameter directly would step back ``window_size`` *bars* and
         # land inside an NA gap, subtracting an NA that poisons ``sum_y`` forever.
         src: Series[float] = source
 
-    # Warm-up phase: accumulate values until the window is full
-    if bar_count < window_size:
-        if isna:
-            return NA(float)
-        prev_sum_y = sum_y
-        sum_y = prev_sum_y + source
-        sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y
-        bar_count += 1
-
-        # Return NA until we have enough data
+        # Warm-up phase: accumulate values until the window is full
         if bar_count < window_size:
-            return NA(float)
-    else:
-        # Rolling update: remove the oldest value when the window is full. An NA bar
-        # leaves the window unchanged; fall through to report the held value.
-        if not isna:
+            prev_sum_y = sum_y
+            sum_y = prev_sum_y + source
+            sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y
+            bar_count += 1
+
+            # Return NA until we have enough data
+            if bar_count < window_size:
+                return NA(float)
+        else:
+            # Rolling update: remove the oldest value when the window is full
             dropped_value = src[window_size]
             prev_sum_y = sum_y
             sum_y = prev_sum_y + source - dropped_value
@@ -972,12 +966,6 @@ def median(source: Series[TFI], length: int) -> TFI:
     heap_low: Persistent[list[TFI]] = []  # Max heap (negative values)
     heap_high: Persistent[list[TFI]] = []  # Min heap
     window: Persistent[list[TFI]] = []  # Recent values for removal
-
-    if TYPE_CHECKING:
-        heap_low: list[TFI] = cast(list[TFI], heap_low)
-        heap_high: list[TFI] = cast(list[TFI], heap_high)
-        window: list[TFI] = cast(list[TFI], window)
-        source: TFI = cast(TFI, source)
 
     # Add new value and balance heaps
     value = source
@@ -1254,9 +1242,6 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
 
     levels: Persistent[list[PyneFloat]] = [NA(float)] * 11
     had_anchor: Persistent[bool] = False
-
-    if TYPE_CHECKING:
-        levels: list[PyneFloat] = cast(list[PyneFloat], levels)
 
     # Normalize type to lowercase for case-insensitive comparison
     type_lower = type.lower() if isinstance(type, str) else ""
@@ -2068,8 +2053,6 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
         return NA(float)
 
     values: Persistent[deque[float]] = deque(maxlen=occurrence + 1)
-    if TYPE_CHECKING:
-        values: deque[float] = cast(deque[float], values)
 
     if condition:
         values.append(source)
@@ -2177,22 +2160,23 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
 
-    isna = isinstance(source, NA)
-    if not isna:
-        # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
-        # indexes past NA gaps to the true oldest value still inside the window.
-        # Reading the parameter directly would step back ``length`` *bars* and land
-        # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
-        src: Series[float] = source
-        # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
-        # beyond the per-series default max_bars_back (500); otherwise the window-drop
-        # read returns na and poisons ``summ`` permanently.
-        max_bars_back(src, int(length))
+    if isinstance(source, NA):
+        # An NA bar leaves the window unchanged; hold the last full value
+        # (still NA while warming up)
+        return NA(float) if count < length else weighted_summ / denom
+
+    # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
+    # indexes past NA gaps to the true oldest value still inside the window.
+    # Reading the parameter directly would step back ``length`` *bars* and land
+    # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
+    src: Series[float] = source
+    # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
+    # beyond the per-series default max_bars_back (500); otherwise the window-drop
+    # read returns na and poisons ``summ`` permanently.
+    max_bars_back(src, int(length))
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
-        if isna:
-            return NA(float)
         count += 1
         summ += source
         weighted_summ += source * count
@@ -2201,9 +2185,6 @@ def wma(source: Series[float], length: int) -> PyneFloat:
 
     # Normal calculation phase
     else:
-        if isna:
-            # An NA bar leaves the window unchanged; hold the last full value
-            return weighted_summ / denom
         old_summ = summ
         # Substract the oldest value and add the newest value
         summ -= src[length] - source

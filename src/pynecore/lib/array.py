@@ -8,7 +8,6 @@ import statistics
 from ..utils.sequence_view import SequenceView
 
 from ..types.na import NA
-from ..types import PyneFloat, PyneInt, PyneStr, PyneBool
 from ..types.color import Color
 from ..types.box import Box
 from ..types.line import Line
@@ -421,7 +420,7 @@ def max(id: list[Number], nth: int = 0) -> Number:
     """
     a = _non_na(id)
     if not a:
-        return cast(Number, id[0] if id else NA(None))
+        return id[0] if id else NA(None)
     if nth == 0:
         return builtins.max(a)
     if nth < 0 or nth >= len(a):
@@ -458,7 +457,7 @@ def min(id: list[Number], nth: int = 0) -> Number:
     """
     a = _non_na(id)
     if not a:
-        return cast(Number, id[0] if id else NA(None))
+        return id[0] if id else NA(None)
     if nth == 0:
         return builtins.min(a)
     if nth < 0 or nth >= len(a):
@@ -478,7 +477,7 @@ def mode(id: list[T]) -> T:
     if not a:
         # An all-na array still knows its element type through its na elements;
         # a truly empty one does not, so it gets a typeless na
-        return cast(T, id[0] if id else NA(None))
+        return id[0] if id else NA(None)
     return statistics.mode(a)
 
 
@@ -674,7 +673,9 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
         raise ValueError("Percentage must be between 0 and 100")
 
     has_na = any(isinstance(v, NA) for v in id)
-    non_na = sorted(v for v in id if not isinstance(v, NA))
+    # filter() instead of a comprehension: PyCharm mis-narrows `not isinstance`
+    # inside comprehension conditions (elements would type as NA, not float)
+    non_na = sorted(filter(lambda v: not isinstance(v, NA), id))
     sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
     n = len(id)
 
@@ -719,7 +720,8 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
     if not (0 <= percentage <= 100):
         raise ValueError("Percentage must be between 0 and 100")
 
-    non_na = sorted(v for v in id if not isinstance(v, NA))
+    # filter() instead of a comprehension: see percentile_linear_interpolation
+    non_na = sorted(filter(lambda v: not isinstance(v, NA), id))
     sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
     n = len(id)
     if percentage == 0:
@@ -798,7 +800,7 @@ def range(id: list[Number]) -> Number:
     """
     a = _non_na(id)
     if not a:
-        return cast(Number, id[0] if id else NA(None))
+        return id[0] if id else NA(None)
     return builtins.max(a) - builtins.min(a)
 
 

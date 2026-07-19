@@ -9,8 +9,9 @@ class NA(Generic[T]):
     # The "plain T" lie at its root: a constructed NA value types as T, so
     # lib functions can return NA(X) under a plain -> X annotation and na
     # sentinels flow anywhere an X is expected (in Pine any value can be na).
+    # No __init__ here: if the stub declares one, PyCharm ignores __new__'s
+    # return type and NA(float) degrades to NA[float] again.
     def __new__(cls, type: Type[T] | T | None = int) -> T: ...  # type: ignore[misc]
-    def __init__(self, type: Type[T] | T | None = int) -> None: ...
 
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...

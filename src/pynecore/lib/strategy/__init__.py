@@ -103,11 +103,11 @@ if True:
 #
 
 @overload
-def _na_to_none(value: PyneFloat) -> float | None: ...
+def _na_to_none(value: PyneFloat | NA[float]) -> float | None: ...
 
 
 @overload
-def _na_to_none(value: PyneStr) -> str | None: ...
+def _na_to_none(value: PyneStr | NA[str]) -> str | None: ...
 
 
 def _na_to_none(value):  # type: ignore[misc]
@@ -289,7 +289,7 @@ class Trade:
         self.exit_comment: PyneStr = ''
         self.exit_equity: PyneFloat = na_float
 
-        self.commission = commission
+        self.commission: PyneFloat = commission
 
         self.max_drawdown: PyneFloat = 0.0
         self.max_drawdown_percent: PyneFloat = 0.0
@@ -2472,7 +2472,7 @@ class SimPosition(PositionBase):
             must stop processing the bar's orders.
         """
         # Statically a value (module_property), at runtime still the function
-        current_trading_day = int(lib.time_tradingday())  # pyright: ignore[reportCallIssue]
+        current_trading_day = int(lib.time_tradingday())
         if current_trading_day == self.risk_last_trading_day:
             return False
         current_equity = float(self.equity)
