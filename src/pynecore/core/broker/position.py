@@ -453,6 +453,13 @@ class BrokerPosition(PositionBase):
             )
             self.open_trades.append(trade)
             self.open_commission += fee
+            # The entry Order stays in ``entry_orders`` for intent stability, but
+            # its filled slice now lives in ``open_trades``. Record how much of it
+            # has filled so ``strategy.exit``'s bound-size reservation does not
+            # count the same quantity twice (issue BYBIT-001).
+            entry_order = self.entry_orders.get(event.pine_id)
+            if entry_order is not None:
+                entry_order.filled_qty += fill_qty
             return False
 
         # Reducing or flipping — FIFO close of existing trades

@@ -1,5 +1,6 @@
 import os
 import queue
+import signal
 import threading
 import time
 import sys
@@ -38,6 +39,61 @@ from ...cli.utils.api_error_handler import APIErrorHandler
 __all__ = []
 
 console = Console()
+
+#: Default seconds between live-run heartbeat lines when the interactive
+#: spinner is suppressed (durable log / non-TTY). Overridable via
+#: ``PYNE_HEARTBEAT_INTERVAL``; ``0`` disables the heartbeat entirely.
+DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _resolve_heartbeat_interval(raw: str | None) -> float:
+    """Parse the ``PYNE_HEARTBEAT_INTERVAL`` override.
+
+    :param raw: The raw environment value, if any.
+    :return: A positive interval in seconds, or ``0.0`` to disable.
+    """
+    if raw is None or raw == "":
+        return DEFAULT_HEARTBEAT_INTERVAL_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_HEARTBEAT_INTERVAL_S
+    return value if value > 0.0 else 0.0
+
+
+class _LiveHeartbeat:
+    """Emit a periodic "still running" line while the live loop is quiet.
+
+    When the interactive spinner is suppressed (durable log / non-TTY), a
+    long silent phase — waiting for the next bar or a resting order to move —
+    leaves the transcript with no output for tens of seconds, so an operator
+    cannot tell a healthy wait from a hang. This ticker logs a heartbeat on a
+    fixed cadence using an :class:`threading.Event` wait (event-driven, no
+    busy-poll), so ``stop()`` returns promptly instead of after a full sleep.
+    """
+
+    def __init__(self, interval_s: float, emit: 'Any') -> None:
+        self._interval = interval_s
+        self._emit = emit
+        self._stop = threading.Event()
+        self._started_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run, name="live-heartbeat", daemon=True,
+        )
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            elapsed = time.monotonic() - self._started_at
+            self._emit(elapsed)
+
+    def start(self) -> None:
+        if self._interval > 0.0:
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class CustomTimeElapsedColumn(ProgressColumn):
@@ -191,6 +247,56 @@ def _broker_metrics_text(
     if position_text:
         parts.append(position_text)
         parts.append(f"UPnL [{pnl_style}]{_format_broker_value(unrealized, signed=True)}[/]")
+    return " ".join(parts)
+
+
+def _format_run_completion_summary(
+        reason: str,
+        position: Any,
+        exchange_position: Any,
+        balance: dict[str, float] | None,
+        preferred_currency: str | None,
+) -> str:
+    """Build the one-line broker-run completion summary.
+
+    Emitted when a ``--broker`` run stops (graceful shutdown, ``Ctrl-C`` /
+    ``SIGTERM`` interrupt, or manual-intervention halt) so the operator gets
+    an explicit closing line stating the final position and account equity,
+    rather than a transcript that simply ends.
+
+    :param reason: Short why-it-stopped label (``completed``, ``interrupted``…).
+    :param position: The Pine ``position`` object (paper/fallback size source).
+    :param exchange_position: The broker position snapshot, when available.
+    :param balance: The account equity mapping (currency -> equity).
+    :param preferred_currency: ``syminfo.currency`` used to pick the equity row.
+    :return: A single log line summarizing the final state.
+    """
+    parts = [f"run stopped ({reason})"]
+
+    size: float | None = None
+    if exchange_position is not None:
+        raw = _coerce_finite_float(getattr(exchange_position, 'size', None))
+        if raw is not None:
+            side = str(getattr(exchange_position, 'side', '') or '').lower()
+            if side == 'short':
+                raw = -abs(raw)
+            elif side == 'long':
+                raw = abs(raw)
+            size = raw
+    elif position is not None:
+        size = _coerce_finite_float(getattr(position, 'size', None))
+
+    if size is not None:
+        if abs(size) < 1e-12:
+            parts.append("position=flat")
+        else:
+            parts.append(f"position={size:g}")
+
+    selected = _select_broker_balance(balance, preferred_currency)
+    if selected is not None:
+        currency, equity = selected
+        parts.append(f"equity={_format_broker_value(equity)} {currency}")
+
     return " ".join(parts)
 
 
@@ -900,6 +1006,11 @@ def run(
         broker_event_loop_thread = None
         broker_store = None
         broker_store_ctx = None
+        # Whether the live loop reached its explicit completion summary. When
+        # it did not (an early raise, a crash mid-run) the outer ``finally``
+        # narrates the cleanup outcome + next step so a failed run never ends
+        # without a visible cleanup status.
+        broker_run_reached_summary = False
         # Live OHLCV consumer generator — captured here so the outer
         # ``finally`` can close it explicitly *before* the broker event
         # loop is torn down. Without that, the consumer's own ``finally``
@@ -1313,6 +1424,44 @@ def run(
                         )
                         progress.update(task, description=_spinner_text())
 
+                    stop_reason = "completed"
+                    # Translate SIGTERM (the signal a supervisor / lab harness
+                    # sends to stop the process) into the same graceful
+                    # ``KeyboardInterrupt`` path as Ctrl-C, so a stopped run
+                    # still tears down cleanly and prints its completion +
+                    # cleanup summary instead of dying at return_code=-15 with
+                    # no visible cleanup outcome.
+                    _prev_sigterm = None
+                    _sigterm_installed = False
+                    if broker_plugin is not None:
+                        def _on_sigterm(_signum, _frame):
+                            raise KeyboardInterrupt
+                        try:
+                            _prev_sigterm = signal.getsignal(signal.SIGTERM)
+                            signal.signal(signal.SIGTERM, _on_sigterm)
+                            _sigterm_installed = True
+                        except (ValueError, OSError):
+                            # signal.signal only works on the main thread; a
+                            # non-main-thread run keeps the default disposition.
+                            _sigterm_installed = False
+                    # When the spinner is suppressed (durable log / non-TTY)
+                    # a quiet phase would otherwise print nothing for tens of
+                    # seconds; a periodic heartbeat keeps the transcript alive
+                    # so a healthy wait is distinguishable from a hang.
+                    heartbeat = None
+                    if _spinner_disabled:
+                        _hb_interval = _resolve_heartbeat_interval(
+                            os.environ.get("PYNE_HEARTBEAT_INTERVAL"),
+                        )
+                        if _hb_interval > 0.0:
+                            heartbeat = _LiveHeartbeat(
+                                _hb_interval,
+                                lambda elapsed: broker_info(
+                                    "still running — %.0fs elapsed, waiting "
+                                    "for market data / next event", elapsed,
+                                ),
+                            )
+                            heartbeat.start()
                     try:
                         runner.run(on_progress=cb_progress_live,
                                    on_tick=cb_tick_live)
@@ -1323,6 +1472,7 @@ def run(
                         # every log line, otherwise leaving an orphan
                         # ``⠧ Live — …`` row in the transcript.
                         progress.stop()
+                        stop_reason = "interrupted"
                         broker_warning("live streaming stopped (interrupted)")
                     except BrokerManualInterventionError:
                         # The ``[BROKER] ERROR sync engine halted by …`` line
@@ -1331,11 +1481,33 @@ def run(
                         # follow-up hint in the same Pine log format so the
                         # operator knows the strategy is no longer running.
                         progress.stop()
+                        stop_reason = "manual intervention required"
                         broker_warning(
                             "live streaming stopped — manual intervention "
                             "required, resolve the broker-side state and "
                             "restart"
                         )
+                    finally:
+                        if heartbeat is not None:
+                            heartbeat.stop()
+                        if _sigterm_installed:
+                            try:
+                                signal.signal(signal.SIGTERM, _prev_sigterm)
+                            except (ValueError, OSError):
+                                pass
+
+                # Explicit end-of-run summary so a successful broker command
+                # confirms it stopped and reports its final position/equity
+                # instead of an unadorned end of transcript.
+                if broker_plugin is not None:
+                    broker_info("%s", _format_run_completion_summary(
+                        stop_reason,
+                        getattr(runner.script, 'position', None),
+                        runner.broker_position_snapshot,
+                        runner.broker_balance,
+                        getattr(syminfo, 'currency', None),
+                    ))
+                    broker_run_reached_summary = True
 
             else:
                 # Batch mode: progress bar with time range
@@ -1407,6 +1579,16 @@ def run(
                         worker.join(timeout=0.1)
                         progress.refresh()
         finally:
+            # A broker run that never reached its completion summary ended
+            # abnormally (early raise / crash mid-run). Narrate that the
+            # teardown below still runs and what to do next, so a failed run
+            # does not end without a visible cleanup outcome.
+            if broker_plugin is not None and not broker_run_reached_summary:
+                broker_warning(
+                    "run ended before a clean stop — closing broker storage "
+                    "and stopping the event loop; review the last [BROKER] "
+                    "entries and re-run to reconcile before trading again"
+                )
             # Close the live OHLCV consumer first so its ``finally`` can
             # signal ``stop_event`` and join the producer thread WHILE the
             # broker event loop is still alive — otherwise the producer's

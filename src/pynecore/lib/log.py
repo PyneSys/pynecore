@@ -1,8 +1,16 @@
 from typing import Any
 import os
+import sys
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
+
+#: Fallback virtual-console width (columns) for a redirected/durable log sink.
+#: Rich falls back to 80 columns when stdout is not a real terminal, which
+#: hard-wraps long broker and exchange order identifiers (UUIDs) across
+#: physical lines so they can no longer be grepped or copied as one token.
+#: A wide virtual console keeps identifier-bearing lines on a single line.
+DURABLE_LOG_WIDTH = 200
 
 from .string import format as _format
 from .. import lib
@@ -25,6 +33,33 @@ _security_logger: logging.Logger | None = None
 
 if os.environ.get("PYNE_NO_COLOR_LOG", "") == "1":
     rich = None
+
+
+def _resolve_log_console_width(is_tty: bool, columns_env: str | None) -> int | None:
+    """Pick the Rich console width for the log handler.
+
+    On an interactive terminal (``is_tty``) return ``None`` so Rich keeps
+    auto-detecting the real terminal width. When stdout is redirected to a
+    durable sink (file, pipe, systemd journal, Docker log) Rich would fall
+    back to 80 columns and fold long broker/order identifiers across lines;
+    return an explicit wide width so they stay searchable. An explicit
+    ``COLUMNS`` override always wins so a caller can widen or narrow the
+    transcript deliberately.
+
+    :param is_tty: Whether stdout is an interactive terminal.
+    :param columns_env: The raw ``COLUMNS`` environment value, if any.
+    :return: An explicit column count, or ``None`` to let Rich auto-detect.
+    """
+    if columns_env:
+        try:
+            width = int(columns_env)
+        except ValueError:
+            width = 0
+        if width > 0:
+            return width
+    if is_tty:
+        return None
+    return DURABLE_LOG_WIDTH
 
 
 # noinspection PyProtectedMember
@@ -147,7 +182,18 @@ if logger.hasHandlers():
 
 logger.setLevel(logging.INFO)
 if rich:
+    from rich.console import Console as _RichConsole
+
+    _stdout_is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    _log_console_width = _resolve_log_console_width(
+        _stdout_is_tty, os.environ.get("COLUMNS"),
+    )
+    _log_console = (
+        None if _log_console_width is None
+        else _RichConsole(width=_log_console_width)
+    )
     handler = PineRichHandler(  # noqa
+        console=_log_console,
         show_time=True,
         show_level=True,
         omit_repeated_times=False,

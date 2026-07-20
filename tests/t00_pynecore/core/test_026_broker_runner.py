@@ -633,3 +633,149 @@ def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
     assert "authentication failed at startup" in str(excinfo.value).lower()
     # No orders should have been dispatched.
     assert plugin.entry_calls == []
+
+
+# === Trade CSV export (WS: closed-trade rows) ===
+
+
+def _read_trade_rows(trade_path: Path) -> list[list[str]]:
+    """Return the trades CSV data rows (header stripped)."""
+    import csv
+    if not trade_path.exists():
+        return []
+    with trade_path.open(newline="") as f:
+        rows = list(csv.reader(f))
+    return rows[1:] if rows else []
+
+
+_ENTRY_THEN_CLOSE_SCRIPT = '''\
+"""
+@pyne
+"""
+from pynecore.lib import script, strategy, bar_index
+
+@script.strategy("EntryThenClose")
+def main():
+    if bar_index == 0:
+        strategy.entry("L", strategy.long, qty=1.0)
+    if bar_index == 2:
+        strategy.close("L")
+'''
+
+
+def _drive_entry_and_close(runner, plugin):
+    """Enter on bar 0, fill it, close on bar 2, fill the close, then let the
+    run continue. Returns after the close fill has been recorded."""
+    it = iter(runner.run_iter())
+    next(it)  # bar 0 — entry created
+    next(it)  # bar 1 — sync dispatches execute_entry
+
+    exch_id = runner._order_sync_engine._order_mapping["L"][0]
+    runner._order_sync_engine.on_order_event(OrderEvent(
+        order=ExchangeOrder(
+            id=exch_id, symbol="BTCUSDT", side="buy",
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
+            remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='filled', fill_price=50_000.0, fill_qty=1.0,
+        timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
+    ))
+    plugin.startup_position = ExchangePosition(
+        symbol="BTCUSDT", side="long", size=1.0, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+
+    next(it)  # bar 2 — drain entry fill, script issues close
+    next(it)  # bar 3 — sync dispatches execute_close
+
+    assert len(plugin.close_calls) == 1
+    # Fill the close on the exchange and flatten the mirrored position.
+    runner._order_sync_engine.on_order_event(OrderEvent(
+        order=ExchangeOrder(
+            id="xchg-close", symbol="BTCUSDT", side="sell",
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
+            remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=50_400.0, status=OrderStatus.FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='filled', fill_price=50_400.0, fill_qty=1.0,
+        timestamp=0.0, pine_id="L", leg_type=LegType.CLOSE,
+    ))
+    plugin.startup_position = None
+    return it
+
+
+def __test_broker_closed_trade_written_once_no_duplication__(tmp_path):
+    """A trade closed on a bar produces exactly one entry+exit CSV pair.
+
+    ``BrokerPosition.new_closed_trades`` is append-only (session-wide log), so
+    the per-bar trades writer must emit only the newly-appended tail. Otherwise
+    every bar after the close re-writes the already-exported trade."""
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
+    )
+    script_path = _write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
+    trade_path = tmp_path / "trades.csv"
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(8),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+        trade_path=trade_path,
+    )
+
+    it = _drive_entry_and_close(runner, plugin)
+    # Drain the remaining bars (bar 4 records the close, bars 5..7 must NOT
+    # re-write the already-exported trade).
+    for _ in it:
+        pass
+
+    pos = runner.script.position
+    assert len(pos.closed_trades) == 1
+
+    rows = _read_trade_rows(trade_path)
+    types = [r[2] for r in rows]
+    assert types == ["Entry long", "Exit long"], \
+        f"expected exactly one entry+exit pair, got {types}"
+
+
+def __test_broker_intrabar_close_flushed_on_shutdown__(tmp_path):
+    """A trade that closes on an intra-bar tick still lands in the trades CSV.
+
+    The per-bar writer runs only on closed bars. When a live trade closes on an
+    intra-bar update and the run stops before the next bar close, the shutdown
+    path must flush the closed trade — otherwise ``closed_trades == 1`` while the
+    CSV has zero rows (the BYBIT-006 symptom)."""
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
+    )
+    script_path = _write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
+    trade_path = tmp_path / "trades.csv"
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(8),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+        trade_path=trade_path,
+    )
+
+    it = _drive_entry_and_close(runner, plugin)
+    # Record the close fill NOW (as an intra-bar drain would), before any
+    # further closed-bar write, then stop the run immediately — mirroring a
+    # graceful shutdown right after an intra-bar close.
+    runner._order_sync_engine.apply_async_events()
+    pos = runner.script.position
+    assert len(pos.closed_trades) == 1
+    # Terminate the generator (GeneratorExit -> finally export path). No further
+    # closed bar is processed, so only the shutdown flush can emit the rows.
+    it.close()
+
+    rows = _read_trade_rows(trade_path)
+    types = [r[2] for r in rows]
+    assert types == ["Entry long", "Exit long"], \
+        f"intra-bar-closed trade must be flushed on shutdown, got {types}"

@@ -5469,6 +5469,50 @@ def __test_unexpected_cancel_without_pine_id_retires_native_failsafe_state__():
     assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
 
 
+def __test_strategy_cancel_echo_logged_as_own_cancel__(caplog):
+    """A venue CANCELLED echo of a strategy-requested cancel is not external.
+
+    ``_dispatch_cancel`` tears down ``_order_mapping`` synchronously on a
+    confirmed cancel, so the venue's follow-up ``CANCELLED`` push no longer
+    matches an intent. The engine must recognise it as its OWN cancel via the
+    expected-id ring and log ``strategy cancel confirmed``, not the misleading
+    ``external cancel observed`` fallback.
+    """
+    import logging
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine._order_mapping["L"][0]
+
+    # Strategy drops the entry -> synchronous confirmed cancel.
+    del pos.entry_orders["L"]
+    engine.sync(BAR_TS)
+    assert "L" not in engine._order_mapping
+    assert deal_id in engine._strategy_cancel_expected_ids
+
+    cancelled = OrderEvent(
+        order=ExchangeOrder(
+            id=deal_id, symbol=SYMBOL, side='buy',
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=50_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id=None, from_entry=None,
+    )
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        engine._route_event(cancelled)
+    messages = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "strategy cancel confirmed" in messages
+    assert "external cancel observed" not in messages
+    # One-shot: the id is consumed so a genuinely external later cancel of a
+    # reused id would still be flagged.
+    assert deal_id not in engine._strategy_cancel_expected_ids
+
+
 def __test_unexpected_reject_without_pine_id_retires_native_failsafe_state__():
     """A pine_id-less reject matched by order id still retires the entry's fail-safe state."""
     # Mirror of the cancel case for the 'rejected' branch: a broker-synthesized
@@ -5498,6 +5542,92 @@ def __test_unexpected_reject_without_pine_id_retires_native_failsafe_state__():
     )
     engine._route_event(rejected)
     assert mgr.get_state(coid).health is FailsafeHealth.RETIRED
+
+
+def _mk_bracket_with_inflight_close(b: MockBroker):
+    """Entry L filled, whole-row bracket TP\\0L live, CloseIntent for L in flight.
+
+    Returns ``(engine, pos, tp_id)`` where ``tp_id`` is the mapped venue id of
+    the bracket exit leg. Mirrors the live-lab
+    ``bybit_linear_entry_bracket_close`` sequence at the moment the venue
+    reduce-only-cancels the TP leg during the explicit close.
+    """
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine.on_order_event(_fill_event(
+        "buy", 1.0, 50_000.0, pine_id="L", leg=LegType.ENTRY,
+    ))
+    tp_id = engine._order_mapping["TP\0L"][0]
+    # ``strategy.close(id="L")`` dispatched, its fill not yet drained — the
+    # CloseIntent shares the entry's ``pine_id`` key.
+    engine._active_intents["L"] = CloseIntent(
+        pine_id="L", symbol=SYMBOL, side="sell", qty=1.0,
+    )
+    return engine, pos, tp_id
+
+
+def _reduce_only_cancel_event(order_id: str) -> OrderEvent:
+    """A venue ``cancelled`` push for a reduce-only bracket TP leg."""
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=order_id, symbol=SYMBOL, side='sell',
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=60_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="", reduce_only=True,
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id="TP", from_entry="L",
+        leg_type=LegType.TAKE_PROFIT,
+    )
+
+
+def __test_reduce_only_bracket_cancel_during_bot_close_is_expected__():
+    """A reduce-only bracket leg the venue auto-cancels during a bot close
+    must not quarantine, and its live SL sibling must be swept.
+
+    When ``strategy.close`` flattens the position, Bybit auto-cancels the
+    reduce-only TP limit (``cancelType=CancelByReduceOnly``) but leaves the
+    conditional SL stop resting. The cancel is our own close's deterministic
+    fallout, not an external operator cancel — the engine must recognise it,
+    keep trading (no quarantine) and cancel the remaining bracket legs.
+    """
+    b = MockBroker()
+    engine, pos, tp_id = _mk_bracket_with_inflight_close(b)
+
+    engine._route_event(_reduce_only_cancel_event(tp_id))
+
+    assert not engine._quarantined
+    # The bracket intent's still-live SL leg is swept via a real cancel.
+    swept = {(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls}
+    assert ("TP", "L") in swept
+    # Tracking for the retired bracket is dropped so the next sync does not
+    # re-diff it; the in-flight CloseIntent is left to settle.
+    assert "TP\0L" not in engine.active_intents
+    assert isinstance(engine.active_intents.get("L"), CloseIntent)
+    assert ("TP", "L") not in pos.exit_orders
+
+
+def __test_reduce_only_exit_cancel_without_bot_close_still_quarantines__():
+    """Without a bot close in flight, a reduce-only exit cancel is external.
+
+    The discriminator for the expected-cancel suppression is an active
+    bot-initiated close for the same parent. An operator cancelling a
+    reduce-only exit while no close is in flight is a genuine unexpected
+    cancel and must still trip the ``on_unexpected_cancel`` quarantine.
+    """
+    b = MockBroker()
+    engine, pos, tp_id = _mk_bracket_with_inflight_close(b)
+    # Drop the in-flight close: no bot close is flattening the parent.
+    engine._active_intents.pop("L", None)
+
+    engine._route_event(_reduce_only_cancel_event(tp_id))
+
+    assert engine._quarantined
 
 
 # === One-way emulation routing (hedging, position_port set) ===============
@@ -6568,6 +6698,63 @@ def __test_push_external_cancel_stop_quarantines_and_blocks_replace__():
     # the quarantine gate blocks the re-dispatch, so no duel.
     engine.sync(BAR_TS + 60_000)
     assert len(b.entry_calls) == 1
+
+
+def __test_native_cancel_all_expected_no_quarantine__():
+    """A plugin native bulk cancel (``execute_cancel_all``) arms the engine's
+    expected-cancel set via ``enqueue_native_cancel_all_expected`` BEFORE the
+    venue call, so the follow-up ``CANCELLED`` pushes retire the mapped orders
+    cleanly instead of tripping the ``on_unexpected_cancel`` quarantine."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0, limit=49_000.0)
+    engine.sync(BAR_TS)
+    deal_l = engine.order_mapping["L"][0]
+    deal_l2 = engine.order_mapping["L2"][0]
+
+    # The plugin arms the expected-cancel set (marker rides the event queue),
+    # then the venue pushes CANCELLED for both bulk-cancelled orders.
+    engine.enqueue_native_cancel_all_expected(SYMBOL)
+    engine._event_queue.put(_cancelled_event(deal_l, pine_id="L"))
+    engine._event_queue.put(_cancelled_event(deal_l2, pine_id="L2"))
+    engine._drain_events()
+
+    assert engine.quarantined is False
+    assert engine.halted is False
+    assert "L" not in engine.order_mapping
+    assert "L2" not in engine.order_mapping
+    assert "L" not in engine.active_intents
+    assert "L2" not in engine.active_intents
+
+
+def __test_native_cancel_all_expected_is_precise_one_shot__():
+    """The expected-cancel arm snapshots only the orders mapped at marker time.
+    A DIFFERENT order cancelled out from under the bot right after the bulk
+    cancel is a genuine external cancel and must still quarantine — the arm is
+    a precise per-id, one-shot latch, not a blanket symbol-wide suppression."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_l = engine.order_mapping["L"][0]
+
+    # Bulk cancel arms + confirms L cleanly.
+    engine.enqueue_native_cancel_all_expected(SYMBOL)
+    engine._event_queue.put(_cancelled_event(deal_l, pine_id="L"))
+    engine._drain_events()
+    assert engine.quarantined is False
+    assert "L" not in engine.order_mapping
+
+    # A NEW resting entry placed after the bulk cancel is not in the arm set;
+    # an external cancel of it must still fire the quarantine.
+    pos.entry_orders["L3"] = _entry_order("L3", 1.0, limit=48_000.0)
+    engine.sync(BAR_TS + 60_000)
+    deal_l3 = engine.order_mapping["L3"][0]
+    engine._route_event(_cancelled_event(deal_l3, pine_id="L3"))
+
+    assert engine.quarantined is True
+    assert "L3" not in engine.order_mapping
 
 
 def __test_push_external_cancel_halt_raises_gracefully__():

@@ -8,6 +8,7 @@ from pynecore.cli.commands.run import (
     ExchangeClockColumn,
     _broker_metrics_text,
     _exchange_display_time,
+    _format_run_completion_summary,
 )
 
 
@@ -147,3 +148,46 @@ def __test_broker_metrics_text_signs_short_exchange_position__():
         "Eq [cyan]1,000.00 EUR[/] Pos [cyan]-25[/] "
         "Entry [cyan]1.20000[/] UPnL [green]+3.21[/]"
     )
+
+
+def __test_completion_summary_reports_flat_position_and_equity__():
+    """A graceful stop with no open exchange position summarizes as ``position=flat``."""
+    position = SimpleNamespace(size=0.0)
+
+    summary = _format_run_completion_summary(
+        "completed",
+        position=position,
+        exchange_position=None,
+        balance={"USDT": 49998.5},
+        preferred_currency="USDT",
+    )
+
+    assert summary == "run stopped (completed) position=flat equity=49,998.50 USDT"
+
+
+def __test_completion_summary_signs_short_exchange_position__():
+    """The completion summary negates a short exchange position's size."""
+    exchange_position = SimpleNamespace(side="short", size=25.0)
+
+    summary = _format_run_completion_summary(
+        "interrupted",
+        position=None,
+        exchange_position=exchange_position,
+        balance={"EUR": 1000.0},
+        preferred_currency="EUR",
+    )
+
+    assert summary == "run stopped (interrupted) position=-25 equity=1,000.00 EUR"
+
+
+def __test_completion_summary_survives_missing_state__():
+    """With no position or balance the summary is just the reason line — never crashes."""
+    summary = _format_run_completion_summary(
+        "manual intervention required",
+        position=None,
+        exchange_position=None,
+        balance=None,
+        preferred_currency=None,
+    )
+
+    assert summary == "run stopped (manual intervention required)"

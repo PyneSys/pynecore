@@ -17,6 +17,14 @@ app = typer.Typer(
     invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"]},
     rich_markup_mode="rich",
+    # Never render frame locals in the crash traceback. A provider/broker
+    # error boundary can carry credential-bearing configuration objects
+    # (session tokens, API secrets) in its local variables; Typer's default
+    # ``pretty_exceptions_show_locals=True`` would dump those verbatim into
+    # the durable CLI transcript. Keeping the traceback (still useful for
+    # diagnosing where the failure surfaced) but stripping the locals is the
+    # CLI-level fix — no exception should ever leak secrets to the console.
+    pretty_exceptions_show_locals=False,
 )
 
 

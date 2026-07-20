@@ -355,6 +355,25 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     Signature: ``sink(reason: str, context: dict | None = None)``.
     """
 
+    native_cancel_all_expected_sink: Callable[..., None] | None = None
+    """Optional expected-cancel registration for a native bulk cancel.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` wires this to
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.enqueue_native_cancel_all_expected`.
+    A plugin that implements :meth:`execute_cancel_all` with a single native
+    bulk-cancel endpoint (e.g. Bybit ``POST /v5/order/cancel-all``) bypasses
+    the engine's per-order :class:`~pynecore.core.broker.models.CancelIntent`
+    dispatch, so the subsequent broker-pushed ``CANCELLED`` events for the
+    orders it removed would otherwise be misread as EXTERNAL cancels and trip
+    the :attr:`on_unexpected_cancel` quarantine. The plugin MUST call this
+    sink BEFORE issuing the venue bulk-cancel so the engine registers every
+    currently-mapped order id as expected-to-cancel; the marker is FIFO-ordered
+    ahead of the ``CANCELLED`` pushes it precedes. ``None`` when the runner has
+    not wired it (state-only test paths); the plugin must guard accordingly.
+
+    Signature: ``sink(symbol: str | None = None)``.
+    """
+
     on_inventory_conflict: str = "quarantine"
     """
     Policy for a confirmed spot balance-invariant conflict.

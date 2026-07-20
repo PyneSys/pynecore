@@ -157,6 +157,7 @@ class Order:
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
+        "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
@@ -232,6 +233,12 @@ class Order:
 
         self.cancelled = False
         self.deferred_qty = False
+        # Live-only fill accounting: how much of this retained entry order has
+        # already been recorded as an open trade. The simulator removes a
+        # market entry order on fill, so it stays 0.0 there; the live broker
+        # keeps the entry Order in ``entry_orders`` for intent stability, so the
+        # bound-size reservation must not double-count the filled slice.
+        self.filled_qty = 0.0
         self.flip_extra = 0.0
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
@@ -4290,7 +4297,16 @@ def exit(id: str, from_entry: str = "",
         pending = position.entry_orders.get(entry_id)
         if pending is not None:
             sign = pending.sign
-            total += abs(pending.size)
+            # Only the not-yet-filled remainder of the entry order counts. The
+            # backtest simulator removes a market entry order on fill, so
+            # ``filled_qty`` stays 0.0 and this is simply ``abs(pending.size)``.
+            # The live broker keeps the entry Order in ``entry_orders`` for
+            # intent stability while ``record_fill`` moves the filled slice into
+            # ``open_trades``; counting the full order size there would
+            # double-count the fill and over-reserve the exit (issue BYBIT-001).
+            unfilled = abs(pending.size) - pending.filled_qty
+            if unfilled > 0.0:
+                total += unfilled
         for open_trade in position.open_trades:
             if open_trade.entry_id == entry_id:
                 sign = open_trade.sign

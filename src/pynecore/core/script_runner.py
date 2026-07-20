@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, UTC
 
 from pynecore import lib
-from pynecore.lib.log import broker_info, broker_warning, ohlcv_info, sim_info
+from pynecore.lib.log import broker_debug, broker_info, broker_warning, ohlcv_info, sim_info
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float
@@ -695,6 +695,20 @@ class ScriptRunner:
                 cast('OrderSyncEngine', self._order_sync_engine).record_quarantine
             )
 
+            # Native bulk-cancel expected-cancel arm. A plugin whose
+            # ``execute_cancel_all`` calls a single native endpoint (e.g. Bybit
+            # ``POST /v5/order/cancel-all``) bypasses the engine's per-order
+            # ``_dispatch_cancel``; without this hook the venue's follow-up
+            # ``CANCELLED`` pushes would be misread as external cancels and trip
+            # the ``on_unexpected_cancel`` quarantine on the engine's OWN bulk
+            # cancel. The plugin calls this before the venue round-trip; the
+            # marker rides the thread-safe event queue and is applied on the main
+            # thread ahead of those pushes. Installed unconditionally — plugins
+            # without a native bulk cancel never call it.
+            broker_plugin.native_cancel_all_expected_sink = (
+                cast('OrderSyncEngine', self._order_sync_engine).enqueue_native_cancel_all_expected
+            )
+
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
@@ -1018,12 +1032,17 @@ class ScriptRunner:
                     reason=exc.reason,
                 ) from exc
 
+            # Confirm demo/live authentication and account identity at INFO
+            # without dumping every asset balance into the durable transcript.
+            # A multi-asset account prints its complete equity mapping here,
+            # which is noise for the operator and needlessly exposes the full
+            # balance sheet; the detailed snapshot stays available at DEBUG.
             broker_info(
-                "authenticated: plugin=%s account=%s equity=%s",
+                "authenticated: plugin=%s account=%s",
                 type(self._broker_plugin).__name__,
                 self._broker_plugin.account_id,
-                balance,
             )
+            broker_debug("account equity snapshot: %s", balance)
             self.broker_balance = balance
 
         # Update syminfo lib properties if needed
@@ -1055,6 +1074,15 @@ class ScriptRunner:
 
         # Trade counter
         trade_num = 0
+
+        # Broker mode watermark: how many entries of the append-only
+        # ``BrokerPosition.new_closed_trades`` have already been flushed to the
+        # trades CSV. Unlike ``SimPosition`` (which rebuilds ``new_closed_trades``
+        # per bar), the broker position never clears the list, so the per-bar
+        # writer must only emit the freshly-appended tail — and the shutdown path
+        # must flush any trades closed after the last bar-close write (e.g. an
+        # intra-bar close right before a graceful shutdown).
+        broker_trades_closed_written = 0
 
         # Position shortcut — ``SimPosition`` in backtest, ``BrokerPosition``
         # in broker mode, ``None`` for indicators
@@ -1637,7 +1665,7 @@ class ScriptRunner:
 
             # noinspection PyProtectedMember
             def _write_bar_output(bar_candle):
-                nonlocal trade_num
+                nonlocal trade_num, broker_trades_closed_written
                 if self.plot_writer and lib._plot_data:
                     ef = {} if bar_candle.extra_fields is None else dict(bar_candle.extra_fields)
                     ef.update(lib._plot_data)
@@ -1646,7 +1674,17 @@ class ScriptRunner:
                 self._write_viz_bar(bar_candle)
 
                 if is_strat and self.trades_writer and position:
-                    for t in position.new_closed_trades:
+                    # ``SimPosition`` rebuilds ``new_closed_trades`` every bar, so
+                    # the whole list is this bar's closes. ``BrokerPosition`` never
+                    # clears it (it is the session-wide closed-trade log), so slice
+                    # off only the tail appended since the last write to avoid
+                    # re-emitting every prior trade on each subsequent bar.
+                    if self._broker_mode:
+                        new_trades = position.new_closed_trades[broker_trades_closed_written:]
+                        broker_trades_closed_written = len(position.new_closed_trades)
+                    else:
+                        new_trades = position.new_closed_trades
+                    for t in new_trades:
                         trade_num += 1
                         self.trades_writer.write(
                             trade_num, t.entry_bar_index,
@@ -2133,6 +2171,39 @@ class ScriptRunner:
 
         finally:  # Python reference counter will close this even if the iterator is not exhausted
             if is_strat and position:
+                # Broker mode: flush trades that closed after the last bar-close
+                # write (e.g. an intra-bar close settled right before a graceful
+                # shutdown). ``_write_bar_output`` runs only on closed bars, so
+                # without this the closing rows of such a trade would be lost even
+                # though the strategy statistics already count it as closed.
+                if self.trades_writer and self._broker_mode:
+                    pending_closed = position.new_closed_trades[broker_trades_closed_written:]
+                    broker_trades_closed_written = len(position.new_closed_trades)
+                    for t in pending_closed:
+                        trade_num += 1
+                        self.trades_writer.write(
+                            trade_num, t.entry_bar_index,
+                            "Entry long" if t.size > 0 else "Entry short",
+                            t.entry_comment if t.entry_comment else t.entry_id,
+                            string.format_time(t.entry_time),  # type: ignore
+                            t.entry_price, abs(t.size), t.profit,
+                            f"{t.profit_percent:.2f}", t.cum_profit,
+                            f"{t.cum_profit_percent:.2f}", t.max_runup,
+                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
+                            f"{t.max_drawdown_percent:.2f}",
+                        )
+                        self.trades_writer.write(
+                            trade_num, t.exit_bar_index,
+                            "Exit long" if t.size > 0 else "Exit short",
+                            t.exit_comment if t.exit_comment else t.exit_id,
+                            string.format_time(t.exit_time),  # type: ignore
+                            t.exit_price, abs(t.size), t.profit,
+                            f"{t.profit_percent:.2f}", t.cum_profit,
+                            f"{t.cum_profit_percent:.2f}", t.max_runup,
+                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
+                            f"{t.max_drawdown_percent:.2f}",
+                        )
+
                 # Export remaining open trades before closing
                 if self.trades_writer and position.open_trades:
                     for trade in position.open_trades:

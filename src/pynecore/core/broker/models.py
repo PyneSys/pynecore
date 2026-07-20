@@ -262,7 +262,7 @@ class OrderEvent:
     so it must never be used for a path that a duplicate could also reach.
     """
     order: ExchangeOrder
-    event_type: str  # "created" | "filled" | "partial" | "cancelled" | "rejected"
+    event_type: str  # "created" | "amended" | "filled" | "partial" | "cancelled" | "rejected"
     fill_price: float | None
     fill_qty: float | None  # INCREMENTAL qty of THIS event (see class docstring)
     timestamp: float

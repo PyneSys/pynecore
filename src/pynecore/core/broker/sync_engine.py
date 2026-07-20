@@ -440,6 +440,24 @@ class _EngineTriggerLegSpec:
     trail_activation_offset: float | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _NativeCancelAllExpected:
+    """Queue marker: a plugin issued a native bulk cancel.
+
+    Enqueued onto :attr:`OrderSyncEngine._event_queue` by
+    :meth:`OrderSyncEngine.enqueue_native_cancel_all_expected` (called from the
+    plugin's ``execute_cancel_all`` via the runner-installed
+    ``native_cancel_all_expected_sink``) BEFORE the venue bulk-cancel is issued.
+    It rides the SAME FIFO queue as the broker-pushed ``CANCELLED`` events, so
+    when :meth:`OrderSyncEngine._drain_events` reaches it — on the MAIN thread,
+    ahead of the ``CANCELLED`` pushes the bulk cancel will generate — the engine
+    snapshots every currently-mapped order id as expected-to-cancel, and the
+    later ``CANCELLED`` events are routed as the engine's own cancels instead of
+    tripping the ``on_unexpected_cancel`` quarantine.
+    """
+    symbol: str | None
+
+
 class OrderSyncEngine:
     """Translate Pine orders to broker calls and route fills back.
 
@@ -663,7 +681,7 @@ class OrderSyncEngine:
         # so pyramiding entries with multiple tick-deferred exits per
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
-        self._event_queue: queue.Queue[OrderEvent] = queue.Queue()
+        self._event_queue: queue.Queue[OrderEvent | _NativeCancelAllExpected] = queue.Queue()
         # §2.6.7 broker-native fail-safe recovery feed. The plugin's reconcile
         # pass runs on the broker event-loop thread and enqueues observed
         # bracket triples here; they are applied to the manager on the MAIN
@@ -845,6 +863,39 @@ class OrderSyncEngine:
         # :meth:`_route_event`. Bounded FIFO
         # (:data:`_MODIFY_PARKED_CANCEL_IDS_CAP`); in-memory only.
         self._modify_parked_cancel_ids = _BoundedIdSet(
+            _MODIFY_PARKED_CANCEL_IDS_CAP,
+        )
+
+        # Broker order ids the engine expects to be CANCELLED because a plugin
+        # issued a NATIVE bulk cancel (``execute_cancel_all`` — e.g. Bybit
+        # ``POST /v5/order/cancel-all``). That single endpoint bypasses the
+        # engine's per-order :meth:`_dispatch_cancel`, so the venue's follow-up
+        # ``CANCELLED`` push for each removed order still matches a live mapping
+        # in :meth:`_route_event` and would be misread as an UNEXPECTED external
+        # cancel — firing the ``on_unexpected_cancel`` quarantine on the engine's
+        # OWN bulk cancel. Seeded on the MAIN thread by
+        # :meth:`_register_native_cancel_all_expected` when the FIFO-ordered
+        # :class:`_NativeCancelAllExpected` marker is drained (ahead of the
+        # ``CANCELLED`` pushes), consumed one-shot by the ``cancelled`` branch of
+        # :meth:`_route_event`. Bounded FIFO
+        # (:data:`_MODIFY_PARKED_CANCEL_IDS_CAP`); in-memory only.
+        self._native_cancel_all_expected_ids = _BoundedIdSet(
+            _MODIFY_PARKED_CANCEL_IDS_CAP,
+        )
+
+        # Broker order ids the engine expects to be CANCELLED because the
+        # STRATEGY asked to cancel them (``_dispatch_cancel`` synchronously
+        # tore down the ``_order_mapping`` / envelope on a confirmed cancel).
+        # The venue then echoes a ``CANCELLED`` push for the same id, which no
+        # longer matches a live mapping — :meth:`_find_key_for_order_id`
+        # returns ``None`` — and the ``cancelled`` branch of
+        # :meth:`_route_event` would otherwise log it as an EXTERNAL cancel,
+        # even though it confirms the engine's OWN strategy-driven cancel.
+        # Seeded on the MAIN thread by :meth:`_dispatch_cancel` before the
+        # mapping is popped, consumed one-shot by the ``cancelled`` branch of
+        # :meth:`_route_event`. Bounded FIFO
+        # (:data:`_MODIFY_PARKED_CANCEL_IDS_CAP`); in-memory only.
+        self._strategy_cancel_expected_ids = _BoundedIdSet(
             _MODIFY_PARKED_CANCEL_IDS_CAP,
         )
 
@@ -3200,6 +3251,14 @@ class OrderSyncEngine:
                 event = self._event_queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(event, _NativeCancelAllExpected):
+                # Native bulk-cancel marker (see :class:`_NativeCancelAllExpected`).
+                # FIFO-ordered ahead of the ``CANCELLED`` pushes the bulk cancel
+                # generates, so snapshotting the mapping here — on the main
+                # thread — arms the expected-cancel set before those events route.
+                self._register_native_cancel_all_expected(event.symbol)
+                drained_any = True
+                continue
             self._route_event(event)
             drained_any = True
         # Fill-time short-gate reconcile: a fill drained just now may have
@@ -3888,6 +3947,15 @@ class OrderSyncEngine:
             ):
                 return
             key = self._find_key_for_order_id(event.order.id)
+            if event.order.id in self._native_cancel_all_expected_ids:
+                # A native bulk cancel (``execute_cancel_all``) removed this
+                # order; the marker armed its id in
+                # :meth:`_register_native_cancel_all_expected` ahead of this
+                # push. It confirms the engine's OWN cancel — not an external
+                # one: retire it cleanly and skip the ``on_unexpected_cancel``
+                # quarantine path below.
+                self._handle_expected_native_cancel_all(event, key)
+                return
             if (key is not None
                     and key in self._cancel_disposition_pending):
                 # Event-driven cancel-tentative confirm: the broker pushed
@@ -3947,6 +4015,16 @@ class OrderSyncEngine:
                     format_intent_key(key), event,
                 )
                 return
+            if (key is not None
+                    and self._is_expected_bracket_close_cancel(event, key)):
+                # A reduce-only bracket leg the venue auto-cancelled because a
+                # bot-initiated close/reduce flattened its parent position.
+                # This is a deterministic side effect of our own close, NOT an
+                # external cancel — suppress the quarantine and sweep the OCA
+                # siblings (Bybit only auto-cancels the reduce-only TP limit;
+                # the conditional SL stop rests live until swept).
+                self._handle_expected_bracket_close_cancel(event, key)
+                return
             if key is not None:
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
@@ -3997,6 +4075,15 @@ class OrderSyncEngine:
                 # mapping behind, mirroring
                 # :meth:`_halt_if_defensive_close_terminal`.
                 self._apply_unexpected_cancel_policy(event, key)
+            elif event.order.id in self._strategy_cancel_expected_ids:
+                # The strategy asked to cancel this order; ``_dispatch_cancel``
+                # already tore down the mapping on the confirmed cancel, so the
+                # lookup above missed. This push merely echoes our OWN cancel —
+                # log it as such (one-shot) instead of the external fallback.
+                self._strategy_cancel_expected_ids.discard(event.order.id)
+                _blog_info(
+                    "strategy cancel confirmed (%s)", event,
+                )
             else:
                 _blog_info(
                     "external cancel observed (%s)", event,
@@ -4220,6 +4307,108 @@ class OrderSyncEngine:
                     intent_key=key,
                 )
 
+    def _bot_close_in_flight_for(self, from_entry: str) -> bool:
+        """True when a bot-initiated close/reduce for ``from_entry`` is live.
+
+        A script ``strategy.close(id)`` maps to a :class:`CloseIntent` keyed by
+        the entry id (``pine_id == from_entry``); ``strategy.close_all()`` maps
+        to one with an empty ``pine_id`` that flattens every parent. Either
+        covers the bracket whose ``from_entry`` matches, so the reduce-only
+        legs the venue auto-cancels while the close is in flight are our own
+        close's expected fallout rather than an external cancel.
+        """
+        for intent in self._active_intents.values():
+            if isinstance(intent, CloseIntent) and intent.pine_id in ("", from_entry):
+                return True
+        return False
+
+    def _is_expected_bracket_close_cancel(
+            self, event: OrderEvent, key: str,
+    ) -> bool:
+        """True when a cancelled bracket leg is expected fallout of a bot close.
+
+        The matched intent must be a reduce-only :class:`ExitIntent` whose
+        parent position is being flattened by a bot-initiated close/reduce
+        (:meth:`_bot_close_in_flight_for`). An operator cancel of a reduce-only
+        exit while no close is in flight fails this test and still routes
+        through the ``on_unexpected_cancel`` quarantine path.
+        """
+        intent = self._active_intents.get(key)
+        if not isinstance(intent, ExitIntent):
+            return False
+        order = event.order
+        if order is None or not order.reduce_only:
+            return False
+        return self._bot_close_in_flight_for(intent.from_entry)
+
+    def _cancel_and_retire_exit_leg(self, key: str, intent: ExitIntent) -> None:
+        """Cancel any still-live venue legs of an exit intent, then retire it.
+
+        A whole-row ``strategy.exit`` bracket is ONE :class:`ExitIntent` mapped
+        to two venue legs (TP limit + conditional SL stop). When the venue
+        auto-cancels only the reduce-only TP, the SL rests live under this same
+        intent — dispatching a cancel for the intent sweeps it (the plugin
+        cancels every working leg of the ``(exit_id, from_entry)`` pair and
+        treats the already-dead TP as a benign no-op). Tracking is then dropped
+        so the next sync does not re-diff the retired bracket. A leg with no
+        live broker mapping is retired without a venue round-trip.
+        """
+        if self._order_mapping.get(key):
+            # noinspection PyBroadException
+            try:
+                self._dispatch_cancel(intent)
+            except Exception:
+                _log.exception(
+                    "expected bracket close sweep: cancel of %s failed; "
+                    "reconcile will re-drive",
+                    format_intent_key(key),
+                )
+        self._order_mapping.pop(key, None)
+        self._active_intents.pop(key, None)
+        self._drop_envelope(key)
+        self._remove_pine_order_for_intent(intent)
+
+    def _handle_expected_bracket_close_cancel(
+            self, event: OrderEvent, key: str,
+    ) -> None:
+        """Retire a venue-cancelled bracket leg and sweep its live siblings.
+
+        The parent position is being flattened by a bot close, so the
+        reduce-only leg that just terminated is dead on the venue and every
+        OTHER live leg of the same parent must be cancelled too — Bybit only
+        auto-cancels the reduce-only TP limit; the conditional SL stop rests
+        live until swept. No quarantine: this is our own close's deterministic
+        side effect. The parent's :class:`CloseIntent` / :class:`EntryIntent`
+        are left untouched so the pending close FILL settles and runs the
+        normal :meth:`_cleanup_closed_position` teardown.
+        """
+        intent = self._active_intents.get(key)
+        if not isinstance(intent, ExitIntent):
+            return
+        from_entry = intent.from_entry
+        _blog_info(
+            "reduce-only bracket leg %s cancelled by venue after bot close of "
+            "%r — expected, sweeping siblings",
+            format_intent_key(key), from_entry,
+        )
+        # Matched intent: cancels its still-live SL leg (single whole-row
+        # bracket) then retires tracking.
+        self._cancel_and_retire_exit_leg(key, intent)
+        # Any OTHER exit intents protecting the same parent (separate
+        # ``strategy.exit`` ids) get the same treatment.
+        for sib_key, sib in list(self._active_intents.items()):
+            if isinstance(sib, ExitIntent) and sib.from_entry == from_entry:
+                self._cancel_and_retire_exit_leg(sib_key, sib)
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'expected_bracket_close_cancel',
+                client_order_id=(
+                    event.order.client_order_id
+                    if event.order is not None else None
+                ),
+                intent_key=key,
+            )
+
     def _abort_pending_partial_legs_for_dead_entry(
             self, intent_key: str, *, reason: str,
     ) -> None:
@@ -4433,6 +4622,110 @@ class OrderSyncEngine:
             if order_id in ids:
                 return key
         return None
+
+    def enqueue_native_cancel_all_expected(self, symbol: str | None = None) -> None:
+        """Thread-safe expected-cancel arm for a plugin native bulk cancel.
+
+        The runner installs this as the plugin's
+        :attr:`~pynecore.core.plugin.broker.BrokerPlugin.native_cancel_all_expected_sink`.
+        A plugin whose ``execute_cancel_all`` calls a single native bulk-cancel
+        endpoint invokes this on the broker event-loop thread BEFORE issuing the
+        venue call, so the marker is FIFO-ordered ahead of the ``CANCELLED``
+        pushes the bulk cancel produces. Enqueuing onto the shared
+        :attr:`_event_queue` (rather than snapshotting the mapping here) keeps
+        the mapping read on the main thread in
+        :meth:`_register_native_cancel_all_expected`, drained in
+        :meth:`_drain_events` — the same marshaling ``run_event_stream`` uses for
+        async fills. Without this the venue's follow-up ``CANCELLED`` events are
+        misread as external cancels and trip the ``on_unexpected_cancel``
+        quarantine on the engine's OWN bulk cancel.
+
+        :param symbol: The venue symbol the bulk cancel targeted, for audit /
+            future multi-symbol engines; single-symbol engines register every
+            currently-mapped order id regardless.
+        """
+        self._event_queue.put(_NativeCancelAllExpected(symbol))
+
+    def _register_native_cancel_all_expected(self, symbol: str | None) -> None:
+        """Snapshot currently-mapped order ids as expected-to-cancel (main thread).
+
+        Called from :meth:`_drain_events` when the FIFO
+        :class:`_NativeCancelAllExpected` marker is drained — ahead of the
+        venue's ``CANCELLED`` pushes for the bulk-cancelled orders. Every broker
+        order id the engine still maps is recorded in
+        :attr:`_native_cancel_all_expected_ids`; the ``cancelled`` branch of
+        :meth:`_route_event` consumes each one-shot, tearing the order down as
+        the engine's own cancel instead of an external one.
+        """
+        count = 0
+        for ids in self._order_mapping.values():
+            for order_id in ids:
+                self._native_cancel_all_expected_ids.add(order_id)
+                count += 1
+        _blog_info(
+            "native cancel-all: armed %d expected-cancel order id(s) (symbol=%r)",
+            count, symbol,
+        )
+
+    def _handle_expected_native_cancel_all(
+            self, event: OrderEvent, key: str | None,
+    ) -> None:
+        """Retire an order the engine's own native bulk cancel removed.
+
+        Consumes the one-shot ``event.order.id`` entry in
+        :attr:`_native_cancel_all_expected_ids` and tears the mapped order down
+        WITHOUT firing the ``on_unexpected_cancel`` policy — this ``CANCELLED``
+        is the deterministic result of the engine's own
+        :meth:`enqueue_native_cancel_all_expected` bulk cancel, not an external
+        cancel. Trims only the cancelled leg from the intent's mapping; when the
+        last mapped leg drops, the intent is retired exactly like the
+        unexpected-cancel branch (native fail-safe retired for an unfilled
+        entry, pending partial legs / entry-stop watch aborted, envelope and
+        active-intent slot dropped).
+        """
+        order_id = event.order.id
+        self._native_cancel_all_expected_ids.discard(order_id)
+        if key is None:
+            _blog_info(
+                "native cancel-all: expected cancel for untracked order (%s)",
+                event,
+            )
+            return
+        # Retire the predecessor entry order id so a late fill on the just
+        # cancelled leg is not miscredited to a re-dispatched replacement
+        # (mirrors the modify-cancel branch).
+        if isinstance(self._active_intents.get(key), EntryIntent):
+            self._retired_entry_order_ids.add(order_id)
+        remaining = [
+            oid for oid in self._order_mapping.get(key, []) if oid != order_id
+        ]
+        if remaining:
+            self._order_mapping[key] = remaining
+            _blog_info(
+                "native cancel-all: expected cancel for intent %s leg (%s); "
+                "%d leg(s) still mapped",
+                format_intent_key(key), event, len(remaining),
+            )
+            return
+        # Last mapped leg gone — retire the whole intent. Retire the native
+        # fail-safe state BEFORE the teardown evicts the legs / envelope, and
+        # only for an unfilled parent entry (see the unexpected-cancel branch).
+        if (isinstance(self._active_intents.get(key), EntryIntent)
+                and event.order.filled_qty <= 0.0):
+            self._retire_native_failsafe_for_entry(key)
+        self._abort_pending_partial_legs_for_dead_entry(
+            key, reason='native_cancel_all',
+        )
+        self._entry_stop_engine.mark_aborted(
+            key, reason='native_cancel_all',
+        )
+        self._order_mapping.pop(key, None)
+        self._active_intents.pop(key, None)
+        self._drop_envelope(key)
+        _blog_info(
+            "native cancel-all: expected cancel retired intent %s (%s)",
+            format_intent_key(key), event,
+        )
 
     def _resolve_deferred_for_entry(self, entry_id: str) -> None:
         """An entry fill unblocks every exit that references it via ticks.
@@ -13901,6 +14194,14 @@ class OrderSyncEngine:
             self._record_halt(e)
             raise
         if cancelled:
+            # Remember the broker order ids we just cancelled: the venue's
+            # follow-up ``CANCELLED`` push arrives after this teardown has
+            # already dropped the mapping, so :meth:`_route_event` can no
+            # longer match it to an intent — mark the ids expected so it is
+            # logged as an engine-owned cancel, not an external one.
+            for order_id in self._order_mapping.get(old.intent_key, ()):
+                if order_id:
+                    self._strategy_cancel_expected_ids.add(order_id)
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
             self._retire_pending_partials_for_cancelled_entry(
