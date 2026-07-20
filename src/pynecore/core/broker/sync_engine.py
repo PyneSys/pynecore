@@ -14910,6 +14910,26 @@ class OrderSyncEngine:
             for order_id in self._order_mapping.get(old.intent_key, ()):
                 if order_id:
                     self._strategy_cancel_expected_ids.add(order_id)
+            # §2.6.7 eager retire: that suppressed follow-up push is exactly
+            # the event whose key-matched 'cancelled' branch would have
+            # retired the parent's parked ``NativeStopState`` — with the
+            # mapping gone it only hits the log-only expected-id branch, so
+            # the retire must happen HERE or a restart-rehydrated DEGRADING
+            # state strands forever after a strategy cancel of an adopted
+            # entry (``block_new_entry`` keeps blocking a flat symbol and the
+            # stale-window timer never stops). Run it BEFORE ``_drop_envelope``
+            # evicts the envelope / anchors ``_resolve_parent_opening_ref``
+            # resolves the COID from, and gate on a never-filled entry
+            # (mirroring the event branch's ``filled_qty <= 0`` guard) — the
+            # residual cancel of a partially filled entry must keep the live
+            # position's fail-safe armed. Idempotent no-op when no state is
+            # parked under the entry.
+            if (isinstance(old, EntryIntent)
+                    and not any(
+                        trade.entry_id == old.intent_key
+                        for trade in self._position.open_trades
+                    )):
+                self._retire_native_failsafe_for_entry(old.intent_key)
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)
             self._retire_pending_partials_for_cancelled_entry(

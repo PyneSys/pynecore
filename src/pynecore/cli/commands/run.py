@@ -7,6 +7,7 @@ import time
 import sys
 import tomllib
 
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC, tzinfo
@@ -595,6 +596,48 @@ def _format_missing_report(bar_count: int, real_bars: int, oldest_ts: int | None
     return '\n'.join(lines)
 
 
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX (Windows) fallback
+    _fcntl = None  # type: ignore[assignment]
+
+
+@contextmanager
+def _ohlcv_download_lock(ohlcv_path: Path | None):
+    """Serialize the shared-OHLCV download/rewrite across concurrent processes.
+
+    Two runs on the same ``(provider, symbol, timeframe)`` share one
+    ``.ohlcv`` file. The warmup download ``seek(0)``-truncates and rewrites it;
+    a second process reading (or truncating) that file at the same instant sees
+    a half-written or empty file. An OS advisory lock on a sidecar ``.lock``
+    next to the ``.ohlcv`` makes the second process block in the kernel until
+    the first finishes, then read a complete file.
+
+    The wait is an ``fcntl.flock`` kernel wait — event-driven, not a poll loop
+    or a sleep. When ``fcntl`` is unavailable (non-POSIX) or the path is unknown
+    the lock degrades to a no-op: correctness on the single-run path is
+    unaffected and the bot must never halt on a missing OS primitive.
+
+    :param ohlcv_path: The target ``.ohlcv`` path, or ``None`` (live/in-memory
+        feeds with no shared file — nothing to serialize).
+    """
+    if ohlcv_path is None or _fcntl is None:
+        yield
+        return
+
+    lock_path = ohlcv_path.with_suffix(ohlcv_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
 def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
     """
     Download historical data from a provider and return the result.
@@ -694,104 +737,111 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         # history horizon is reached and extending again is pointless — we
         # stop and surface that precise reason instead of burning retries.
         prev_oldest_ts: int | None = None
-        for attempt in range(max_retries + 1):
-            with provider_instance as ohlcv_writer:
-                ohlcv_writer.seek(0)
-                ohlcv_writer.truncate()
+        # Serialize the truncate-and-rewrite (and the verification reads) against
+        # any concurrent run sharing this ``.ohlcv`` file: a second process waits
+        # on the kernel flock and then reads a complete file, never a
+        # half-truncated one. The lock spans the whole retry loop and the
+        # bar-count pin below so no other process can rewrite the file between
+        # our download and our reads.
+        exact_from_ts: int | None = None
+        with _ohlcv_download_lock(provider_instance.ohlcv_path):
+            for attempt in range(max_retries + 1):
+                with provider_instance as ohlcv_writer:
+                    ohlcv_writer.seek(0)
+                    ohlcv_writer.truncate()
 
-                time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
-                time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
+                    time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
+                    time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
 
-                total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+                    total_seconds = int((time_to_dl - time_from_dl).total_seconds())
 
-                progress.update(
-                    task, total=total_seconds, completed=0,
-                    start_time=time_from_dl,
+                    progress.update(
+                        task, total=total_seconds, completed=0,
+                        start_time=time_from_dl,
+                    )
+
+                    def cb_progress(current_time: datetime):
+                        elapsed_seconds = int((current_time - time_from_dl).total_seconds())
+                        progress.update(task, completed=elapsed_seconds)
+
+                    provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+
+                if bar_count is None:
+                    break
+
+                # Collect real (``volume >= 0``) bar timestamps in the requested
+                # range — gap-fill rows (``volume == -1``) emitted by the OHLCV
+                # writer don't count against the target.
+                window_from_ts = int(time_from_dt.timestamp())
+                window_to_ts = int(time_to_dt.timestamp())
+                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
+                    real_ts = [b.timestamp for b in r.read_from(
+                        window_from_ts, window_to_ts, skip_gaps=True,
+                    )]
+                real_bars = len(real_ts)
+                oldest_ts = min(real_ts) if real_ts else None
+
+                if real_bars >= bar_count:
+                    break
+
+                # History-horizon check: if extending ``from`` earlier did not
+                # surface any older bar than the previous attempt, the venue has
+                # no more history — retrying cannot help, so report precisely now.
+                horizon_reached = (
+                    prev_oldest_ts is not None and oldest_ts is not None
+                    and oldest_ts >= prev_oldest_ts
                 )
 
-                def cb_progress(current_time: datetime):
-                    elapsed_seconds = int((current_time - time_from_dl).total_seconds())
-                    progress.update(task, completed=elapsed_seconds)
+                if horizon_reached or attempt == max_retries:
+                    missing_slots = _missing_slots(
+                        real_ts, window_from_ts, window_to_ts, int(tf_seconds),
+                    )
+                    in_session, closed = _classify_missing_slots(
+                        missing_slots, syminfo, int(tf_seconds),
+                    )
+                    secho(
+                        _format_missing_report(
+                            bar_count, real_bars, oldest_ts,
+                            in_session, closed, int(tf_seconds), horizon_reached,
+                        ),
+                        fg=colors.YELLOW,
+                    )
+                    break
 
-                provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+                prev_oldest_ts = oldest_ts
 
-            if bar_count is None:
-                break
-
-            # Collect real (``volume >= 0``) bar timestamps in the requested
-            # range — gap-fill rows (``volume == -1``) emitted by the OHLCV
-            # writer don't count against the target.
-            window_from_ts = int(time_from_dt.timestamp())
-            window_to_ts = int(time_to_dt.timestamp())
-            with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                real_ts = [b.timestamp for b in r.read_from(
-                    window_from_ts, window_to_ts, skip_gaps=True,
-                )]
-            real_bars = len(real_ts)
-            oldest_ts = min(real_ts) if real_ts else None
-
-            if real_bars >= bar_count:
-                break
-
-            # History-horizon check: if extending ``from`` earlier did not
-            # surface any older bar than the previous attempt, the venue has
-            # no more history — retrying cannot help, so report precisely now.
-            horizon_reached = (
-                prev_oldest_ts is not None and oldest_ts is not None
-                and oldest_ts >= prev_oldest_ts
-            )
-
-            if horizon_reached or attempt == max_retries:
-                missing_slots = _missing_slots(
-                    real_ts, window_from_ts, window_to_ts, int(tf_seconds),
+                # Extend the range, anchoring on the oldest bar actually served so
+                # the next pass reaches strictly-older history: request the missing
+                # count of slots before it, plus a multi-day buffer that clears any
+                # single weekend / session gap in one jump. Without the buffer a
+                # weekend between ``from`` and the oldest bar would stall the
+                # oldest cursor and be misread as the venue history horizon. The
+                # over-fetch is harmless — the range is pinned to exactly N real
+                # bars below.
+                anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
+                missing = bar_count - real_bars
+                candidate = (
+                    datetime.fromtimestamp(anchor_ts, UTC).replace(tzinfo=None)
+                    - timedelta(seconds=tf_seconds * (missing + 10))
+                    - timedelta(days=3)
                 )
-                in_session, closed = _classify_missing_slots(
-                    missing_slots, syminfo, int(tf_seconds),
-                )
-                secho(
-                    _format_missing_report(
-                        bar_count, real_bars, oldest_ts,
-                        in_session, closed, int(tf_seconds), horizon_reached,
-                    ),
-                    fg=colors.YELLOW,
-                )
-                break
+                if time_from_dt.tzinfo is not None:
+                    candidate = candidate.replace(tzinfo=UTC)
+                # Only ever move the window start earlier.
+                time_from_dt = min(time_from_dt, candidate)
 
-            prev_oldest_ts = oldest_ts
+            assert provider_instance.ohlcv_path is not None
 
-            # Extend the range, anchoring on the oldest bar actually served so
-            # the next pass reaches strictly-older history: request the missing
-            # count of slots before it, plus a multi-day buffer that clears any
-            # single weekend / session gap in one jump. Without the buffer a
-            # weekend between ``from`` and the oldest bar would stall the
-            # oldest cursor and be misread as the venue history horizon. The
-            # over-fetch is harmless — the range is pinned to exactly N real
-            # bars below.
-            anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
-            missing = bar_count - real_bars
-            candidate = (
-                datetime.fromtimestamp(anchor_ts, UTC).replace(tzinfo=None)
-                - timedelta(seconds=tf_seconds * (missing + 10))
-                - timedelta(days=3)
-            )
-            if time_from_dt.tzinfo is not None:
-                candidate = candidate.replace(tzinfo=UTC)
-            # Only ever move the window start earlier.
-            time_from_dt = min(time_from_dt, candidate)
-
-    assert provider_instance.ohlcv_path is not None
-
-    # For bar-count mode, pin the start timestamp to the N-th last real
-    # bar so the reader serves *exactly* N bars, not the over-fetched
-    # surplus we used to guarantee coverage through gaps.
-    exact_from_ts: int | None = None
-    if bar_count is not None:
-        with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-            real_ts = [b.timestamp for b in r.read_from(
-                0, int(time_to_dt.timestamp()), skip_gaps=True,
-            )]
-        if len(real_ts) >= bar_count:
-            exact_from_ts = real_ts[-bar_count]
+            # For bar-count mode, pin the start timestamp to the N-th last real
+            # bar so the reader serves *exactly* N bars, not the over-fetched
+            # surplus we used to guarantee coverage through gaps.
+            if bar_count is not None:
+                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
+                    real_ts = [b.timestamp for b in r.read_from(
+                        0, int(time_to_dt.timestamp()), skip_gaps=True,
+                    )]
+                if len(real_ts) >= bar_count:
+                    exact_from_ts = real_ts[-bar_count]
 
     return _ProviderData(
         ohlcv_path=provider_instance.ohlcv_path,
@@ -1382,6 +1432,13 @@ def run(
                 secho(str(e), err=True, fg=colors.RED)
                 broker_store.close()
                 raise Exit(1)
+            except BaseException:
+                # open_run wraps its INSERT in a transaction: any failure before
+                # it returns rolls the row back (no orphaned LIVE row) but leaves
+                # the SQLite connection open. Close it so a startup crash here
+                # cannot leak the store, then re-raise the real error.
+                broker_store.close()
+                raise
 
         # The broker run is now open; every subsequent startup step
         # (security parsing, live iterator chaining, ScriptRunner import)

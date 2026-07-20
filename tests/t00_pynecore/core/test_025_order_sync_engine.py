@@ -836,6 +836,121 @@ def __test_clean_restart_equal_journal_anchor_adopts_not_duplicates__(tmp_path):
         assert "L" not in engine2._active_intents  # type: ignore[attr-defined]
 
 
+def __test_adopted_entry_cancel_retires_native_failsafe_and_late_push_is_noop__(tmp_path):
+    """A strategy cancel of an adopted entry retires its parked fail-safe state.
+
+    The cTrader adopted-entry cancel stall: the plugin's ``execute_cancel``
+    consumes the ``ORDER_CANCELLED`` ack synchronously and retires its own
+    store row, so the engine's teardown drops the mapping FIRST and the
+    venue's follow-up CANCELLED push only hits the log-only expected-id
+    branch of ``_route_event`` — the key-matched branch that retires the
+    parent's ``NativeStopState`` never runs. A restart-rehydrated DEGRADING
+    state then strands forever: ``block_new_entry`` keeps blocking the flat
+    symbol and the stale-window timer never stops. The eager retire in
+    ``_dispatch_cancel_strict`` must clean it up regardless of whether the
+    push arrives before or after the teardown.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [_live_working_order(live_coid, order_id="wo-1")]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        # First post-restart sync adopts the live order.
+        engine.sync(BAR_TS + 60_000)
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+
+        # Restart-rehydrated §2.6.7 state parked under the adopted entry's
+        # opening dispatch ref — DEGRADING until confirmed, blocking entries.
+        mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+        ref = engine._resolve_parent_opening_ref("L")  # type: ignore[attr-defined]
+        assert ref is not None
+        mgr.register_parent(
+            parent_entry_dispatch_ref=ref, symbol=SYMBOL, parent_side='long',
+            mintick=1.0, pending_confirmation=True, now_ms=float(BAR_TS),
+        )
+        assert mgr.get_state(ref).health is FailsafeHealth.DEGRADING
+        assert mgr.block_new_entry(symbol=SYMBOL, pine_id="X", bar_ts_ms=BAR_TS)
+
+        # strategy.cancel(): the plugin confirms synchronously (MockBroker
+        # returns True, exactly like cTrader consuming the ack in-dispatch).
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS + 120_000)
+
+        assert len(b.cancel_calls) == 1
+        assert "L" not in engine._order_mapping  # type: ignore[attr-defined]
+        assert "L" not in engine._active_intents  # type: ignore[attr-defined]
+        # The parked state is retired eagerly — the symbol-level block unwinds
+        # without needing the (suppressed) venue push.
+        assert mgr.get_state(ref).health is FailsafeHealth.RETIRED
+        assert not mgr.block_new_entry(symbol=SYMBOL, pine_id="X", bar_ts_ms=BAR_TS)
+
+        # The venue's late CANCELLED push for the same order is a no-op: it is
+        # recognised as the engine's own cancel (expected-id branch), applies
+        # no unexpected-cancel policy, and leaves the retired state retired.
+        late_push = OrderEvent(
+            order=ExchangeOrder(
+                id="wo-1", symbol=SYMBOL, side='buy',
+                order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+                remaining_qty=1.0, price=50_000.0, stop_price=None,
+                average_fill_price=None, status=OrderStatus.CANCELLED,
+                timestamp=0.0, fee=0.0, fee_currency="",
+            ),
+            event_type='cancelled', fill_price=None, fill_qty=None,
+            timestamp=0.0, pine_id="L", from_entry=None,
+        )
+        engine._route_event(late_push)  # type: ignore[attr-defined]
+        assert not engine.quarantined
+        assert mgr.get_state(ref).health is FailsafeHealth.RETIRED
+        assert not mgr.block_new_entry(symbol=SYMBOL, pine_id="X", bar_ts_ms=BAR_TS)
+
+
+def __test_partially_filled_entry_cancel_keeps_native_failsafe_armed__():
+    """The residual cancel of a partially filled entry must NOT retire its fail-safe."""
+    from pynecore.core.broker.idempotency import KIND_ENTRY
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 2.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    coid = b.entry_calls[0].client_order_id(KIND_ENTRY)
+
+    # Half the entry fills — an open trade now exists under "L".
+    engine.on_order_event(_fill_event(
+        'buy', 2.0, 50_000.0, pine_id="L", event_type='partial',
+        filled_qty=1.0, remaining_qty=1.0,
+    ))
+    engine._drain_events()  # type: ignore[attr-defined]
+    assert any(t.entry_id == "L" for t in pos.open_trades)
+
+    mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+    mgr.register_parent(
+        parent_entry_dispatch_ref=coid, symbol=SYMBOL, parent_side='long',
+        mintick=1.0,
+    )
+
+    # strategy.cancel() of the residual: the live position's fail-safe must
+    # stay armed — only the never-filled path retires eagerly.
+    del pos.entry_orders["L"]
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.cancel_calls) == 1
+    assert mgr.get_state(coid).health is not FailsafeHealth.RETIRED
+
+
 def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
     """The restart scan ignores a foreign run_tag order and mints fresh for a brand-new entry."""
     # A live order from a DIFFERENT run_tag must be ignored, and a brand-new
