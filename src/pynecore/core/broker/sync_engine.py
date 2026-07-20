@@ -63,6 +63,7 @@ from pynecore.core.broker.idempotency import (
     parse_wire_client_order_id,
 )
 from pynecore.core.broker.intent_builder import (
+    build_entry_intent,
     build_intents,
     CLOSE_ALL_EXIT_ID,
     CLOSE_EXIT_ID_PREFIX,
@@ -83,6 +84,7 @@ from pynecore.core.broker.models import (
     DispatchEnvelope,
     EntryDeferredCancelDispositionPendingEvent,
     EntryIntent,
+    ExchangeOrder,
     ExchangePosition,
     ExitIntent,
     INTENT_KEY_SEP,
@@ -1154,6 +1156,22 @@ class OrderSyncEngine:
         # :attr:`_restart_live_entry_order_ids`, resolved after the forward-hash
         # match binds the wire order to its ``pine_id``.
         self._restart_live_wire_order_id_by_coid: dict[str, str] = {}
+        # Full live :class:`ExchangeOrder` for each entry working order the
+        # restart scan discovered, keyed by ``ExchangeOrder.id``. The anchor /
+        # order-id snapshots above carry only the identity needed to rebuild the
+        # COID; :meth:`_reconstruct_pine_entry_orders` needs the venue's actual
+        # side / price / order-type to rebuild the Pine ``Order`` so a
+        # persisted-logic ``strategy.cancel`` on the first post-restart bar has a
+        # target. Populated by :meth:`_scan_live_entry_anchors_for_restart`.
+        self._restart_live_entry_orders_by_id: dict[str, ExchangeOrder] = {}
+        # Pine entry intents rebuilt by :meth:`_reconstruct_pine_entry_orders`
+        # from a live broker working order the script has NOT re-declared this
+        # run (keyed by ``pine_id``). The entry-orphan sweep in
+        # :meth:`_diff_and_dispatch` cancels any that the first post-restart
+        # script dropped from the order book (``strategy.cancel``) before the
+        # diff could adopt them; keys the script kept (re-emitted or left
+        # standing) are dropped from the set as the adoption branch pins them.
+        self._restart_reconstructed_entry_keys: dict[str, EntryIntent] = {}
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
@@ -4446,16 +4464,47 @@ class OrderSyncEngine:
                 return True
         return False
 
+    def _bot_close_in_flight_for_symbol(self, symbol: str) -> bool:
+        """True when ANY bot-initiated close/reduce is live for ``symbol``.
+
+        On a netting / one-way venue every entry of a symbol shares ONE net
+        position, so the exchange's reduce-only accounting is position-level,
+        not per-entry. A bot close of one entry shrinks that shared position
+        and the venue can auto-cancel a reduce-only leg attached to a
+        DIFFERENT, still-open entry (its summed reduce-only quantity now
+        exceeds the reduced position). Unlike :meth:`_bot_close_in_flight_for`
+        this does not require the close to name the leg's own ``from_entry``.
+
+        A true per-position hedge venue never auto-cancels a sibling entry's
+        bracket on a close (each entry is an independent broker position), so
+        the cancel event this classifies simply never arrives there.
+        """
+        for intent in self._active_intents.values():
+            if isinstance(intent, CloseIntent) and intent.symbol == symbol:
+                return True
+        return False
+
     def _is_expected_bracket_close_cancel(
             self, event: OrderEvent, key: str,
     ) -> bool:
         """True when a cancelled bracket leg is expected fallout of a bot close.
 
         The matched intent must be a reduce-only :class:`ExitIntent` whose
-        parent position is being flattened by a bot-initiated close/reduce
-        (:meth:`_bot_close_in_flight_for`). An operator cancel of a reduce-only
-        exit while no close is in flight fails this test and still routes
-        through the ``on_unexpected_cancel`` quarantine path.
+        parent position is being flattened by a bot-initiated close/reduce.
+        Two shapes qualify:
+
+        - The close names the leg's own ``from_entry``
+          (:meth:`_bot_close_in_flight_for`) — the bracket's parent is going
+          away and the whole bracket is swept.
+        - A close of ANOTHER entry on the SAME symbol is in flight
+          (:meth:`_bot_close_in_flight_for_symbol`) — on a netting venue the
+          shared position shrank and the venue reduce-only-cancelled a leg of
+          a still-open sibling entry. That leg is collateral fallout, not an
+          external cancel; the sibling's parent stays open and protected.
+
+        An operator cancel of a reduce-only exit while no close is in flight
+        fails both tests and still routes through the ``on_unexpected_cancel``
+        quarantine path.
         """
         intent = self._active_intents.get(key)
         if not isinstance(intent, ExitIntent):
@@ -4463,7 +4512,9 @@ class OrderSyncEngine:
         order = event.order
         if order is None or not order.reduce_only:
             return False
-        return self._bot_close_in_flight_for(intent.from_entry)
+        if self._bot_close_in_flight_for(intent.from_entry):
+            return True
+        return self._bot_close_in_flight_for_symbol(intent.symbol)
 
     def _cancel_and_retire_exit_leg(self, key: str, intent: ExitIntent) -> None:
         """Cancel any still-live venue legs of an exit intent, then retire it.
@@ -4492,6 +4543,30 @@ class OrderSyncEngine:
         self._drop_envelope(key)
         self._remove_pine_order_for_intent(intent)
 
+    def _trim_cancelled_bracket_leg(self, event: OrderEvent, key: str) -> None:
+        """Drop one venue-cancelled leg from an exit intent, keep the rest.
+
+        A whole-row ``strategy.exit`` bracket maps to two venue legs (TP limit
+        + conditional SL stop). When the venue reduce-only-cancels ONE of them
+        as collateral of another entry's close (see
+        :meth:`_handle_expected_bracket_close_cancel`), the sibling entry stays
+        open, so its intent and any still-live leg must survive. Trim only the
+        dead order id from the mapping. If it was the intent's LAST mapped leg
+        the bracket has no venue presence left — retire the intent so the next
+        sync re-diffs it fresh (mirrors the last-leg branch of
+        :meth:`_handle_expected_native_cancel_all`).
+        """
+        order_id = event.order.id if event.order is not None else None
+        remaining = [
+            oid for oid in self._order_mapping.get(key, []) if oid != order_id
+        ]
+        if remaining:
+            self._order_mapping[key] = remaining
+            return
+        self._order_mapping.pop(key, None)
+        self._active_intents.pop(key, None)
+        self._drop_envelope(key)
+
     def _handle_expected_bracket_close_cancel(
             self, event: OrderEvent, key: str,
     ) -> None:
@@ -4510,6 +4585,32 @@ class OrderSyncEngine:
         if not isinstance(intent, ExitIntent):
             return
         from_entry = intent.from_entry
+        if not self._bot_close_in_flight_for(from_entry):
+            # Cross-entry collateral cancel: the leg belongs to a still-open
+            # entry that is NOT being closed. The venue dropped it only
+            # because a bot close of ANOTHER entry shrank the shared net
+            # position below the summed reduce-only quantity (netting-venue
+            # position-level accounting). The sibling's parent stays open and
+            # must keep its protection, so do NOT sweep the bracket — trim
+            # only the dead leg from the intent's mapping and leave the intent
+            # (with its still-live sibling leg) intact.
+            _blog_info(
+                "reduce-only bracket leg %s reduce-only-cancelled by venue "
+                "while flattening another entry on %r — expected collateral, "
+                "trimming the dead leg and keeping the sibling bracket",
+                format_intent_key(key), intent.symbol,
+            )
+            self._trim_cancelled_bracket_leg(event, key)
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'expected_bracket_close_cancel',
+                    client_order_id=(
+                        event.order.client_order_id
+                        if event.order is not None else None
+                    ),
+                    intent_key=key,
+                )
+            return
         _blog_info(
             "reduce-only bracket leg %s cancelled by venue after bot close of "
             "%r — expected, sweeping siblings",
@@ -8327,6 +8428,93 @@ class OrderSyncEngine:
             return
         self._reconstruct_one_way_bracket_exits()
         self._reconstruct_partial_bracket_exits()
+        self._reconstruct_pine_entry_orders()
+
+    def _reconstruct_pine_entry_orders(self) -> None:
+        """Re-install persistent ``strategy.entry`` working orders after a restart.
+
+        A pending Pine LIMIT / STOP entry is persistent — once placed it lives in
+        ``position.entry_orders`` across bars (the script need not re-emit it) —
+        but a fresh process starts with empty order dicts. A first-bar
+        ``strategy.cancel`` after a restart would then operate on an empty book
+        (a silent no-op) and the surviving live broker working order would be
+        stranded: :meth:`_hydrate_restart_entry_adoptions` only binds an entry
+        the script RE-DECLARES this run, so a script whose persisted logic goes
+        straight to ``strategy.cancel`` leaves the order neither adopted nor
+        cancelled (the reported cTrader restart-adoption stall).
+
+        Rebuild every live entry working order this run owns — matched from the
+        :meth:`_scan_live_entry_anchors_for_restart` snapshot (proof it is still
+        live at the venue) to its Pine id via the durable journal
+        (``iter_live_orders``' ``pine_entry_id``, the same lookup the plugin's
+        ``execute_cancel`` uses) — into ``position.entry_orders`` and seed
+        ``_order_mapping`` from the live order id, exactly as the bracket
+        reconstruction does. The first post-restart script then sees the order it
+        placed: ``strategy.cancel`` removes it and the entry-orphan sweep in
+        :meth:`_diff_and_dispatch` retires the live order; leaving it standing (or
+        re-emitting it) routes through the cross-restart adoption branch, which
+        pins it without a duplicate dispatch.
+
+        Pure-local: reads the persisted journal and the in-memory scan snapshot,
+        mutates only ``position.entry_orders`` / ``_order_mapping`` /
+        ``_restart_reconstructed_entry_keys``. Runs once (guarded by the same
+        ``_pine_bracket_reconstruct_done`` latch as the bracket reconstruction).
+        """
+        if self._store_ctx is None or not self._restart_live_entry_orders_by_id:
+            return
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            pine_id = row.pine_entry_id
+            order_id = row.exchange_order_id
+            if pine_id is None or not order_id:
+                continue
+            # Exit / bracket rows carry a parent ``from_entry``; only a bare
+            # working entry order is reconstructable here.
+            if row.from_entry is not None:
+                continue
+            # The order must STILL be live at the venue (present in the scan
+            # snapshot, which only records this run's entry-kind working orders).
+            # A journal row whose order the venue no longer lists — externally
+            # filled / cancelled — is left to reconcile.
+            ex_order = self._restart_live_entry_orders_by_id.get(order_id)
+            if ex_order is None:
+                continue
+            # Already tracked: an in-session dispatch, a prior reconstruction, or
+            # (on the direct-``sync`` path) the script re-declared it before this
+            # ran. Leave it to the diff's adoption branch.
+            if (pine_id in self._active_intents
+                    or pine_id in self._order_mapping
+                    or pine_id in self._position.entry_orders):
+                continue
+            if ex_order.order_type is OrderType.STOP:
+                limit_price = None
+                stop_price = (
+                    ex_order.stop_price if ex_order.stop_price is not None
+                    else ex_order.price
+                )
+            elif ex_order.order_type is OrderType.LIMIT:
+                limit_price = ex_order.price
+                stop_price = None
+            else:
+                # A working entry order should be LIMIT or STOP; preserve
+                # whatever prices the venue reported rather than guess a type.
+                limit_price = ex_order.price
+                stop_price = ex_order.stop_price
+            self._position.reconstruct_entry_order(
+                pine_id=pine_id,
+                side=ex_order.side,
+                qty=abs(ex_order.qty),
+                limit=limit_price,
+                stop=stop_price,
+            )
+            self._order_mapping[pine_id] = [order_id]
+            self._restart_reconstructed_entry_keys[pine_id] = build_entry_intent(
+                self._position.entry_orders[pine_id], self._symbol,
+            )
+            _blog_info(
+                "restart: reconstructed live entry working order %s -> %s "
+                "(bound for strategy cancel / adoption)",
+                order_id, format_intent_key(pine_id),
+            )
 
     def _reconstruct_one_way_bracket_exits(self) -> None:
         """Re-install one-way (hedging-emulated) native brackets after a restart.
@@ -8647,6 +8835,33 @@ class OrderSyncEngine:
         # cross-restart adoption branch adopts them instead of re-dispatching a
         # duplicate (see :meth:`_hydrate_restart_entry_adoptions`).
         self._hydrate_restart_entry_adoptions(new_map)
+
+        # Entry-orphan sweep. :meth:`_reconstruct_pine_entry_orders` rebuilt a
+        # live broker working order into ``position.entry_orders`` BEFORE the
+        # first post-restart script ran (via :meth:`settle_restart_state`). If
+        # that script removed it (``strategy.cancel``) the key is now in NEITHER
+        # ``new_map`` (``build_intents`` dropped it) NOR ``_active_intents`` (no
+        # diff has adopted it yet), so the cancellation loop below — which
+        # iterates ``_active_intents`` — would never see it and the live order
+        # would be stranded (the reported cTrader restart-adoption stall). Retire
+        # it here. A key the script KEPT (re-emitted, or left standing under
+        # persistent Pine semantics) appears in ``new_map`` and is adopted by the
+        # diff's cross-restart branch below — drop it from tracking, do not
+        # cancel. Runs once per restart: each key is consumed on the first diff.
+        if self._restart_reconstructed_entry_keys:
+            for key in list(self._restart_reconstructed_entry_keys):
+                if key in new_map or key in self._active_intents:
+                    self._restart_reconstructed_entry_keys.pop(key, None)
+                    continue
+                old = self._restart_reconstructed_entry_keys.pop(key)
+                if key not in self._order_mapping:
+                    continue
+                _blog_info(
+                    "restart: reconstructed entry %s was cancelled by the "
+                    "first post-restart script — retiring the stranded live "
+                    "broker order", format_intent_key(key),
+                )
+                self._dispatch_cancel(old)
 
         # Pine semantic: when an entry intent fails to dispatch in this same
         # sync (e.g. plugin reports qty below venue minimum), a bracket exit
@@ -10021,6 +10236,7 @@ class OrderSyncEngine:
         order_ids_by_pid: dict[str, list[str]] = {}
         wire_orders: list[tuple[str, int, str]] = []
         wire_order_id_by_coid: dict[str, str] = {}
+        orders_by_id: dict[str, ExchangeOrder] = {}
         for order in orders:
             coid = order.client_order_id
             if not coid:
@@ -10037,6 +10253,7 @@ class OrderSyncEngine:
                     wire_orders.append((coid, wire.bar_ts_ms, wire.kind))
                     if order.id:
                         wire_order_id_by_coid[coid] = order.id
+                        orders_by_id[order.id] = order
                 continue
             if (parsed.run_tag != self._run_tag
                     or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
@@ -10046,6 +10263,7 @@ class OrderSyncEngine:
             )
             if order.id:
                 order_ids_by_pid.setdefault(parsed.pid_hash, []).append(order.id)
+                orders_by_id[order.id] = order
         adopted: dict[str, tuple[int, int]] = {}
         adopted_order_ids: dict[str, list[str]] = {}
         for pid_hash, anchors in by_pid.items():
@@ -10064,6 +10282,7 @@ class OrderSyncEngine:
         self._restart_live_entry_order_ids = adopted_order_ids
         self._restart_live_wire_entry_orders = wire_orders
         self._restart_live_wire_order_id_by_coid = wire_order_id_by_coid
+        self._restart_live_entry_orders_by_id = orders_by_id
         if adopted or wire_orders:
             _blog_info(
                 "restart entry-anchor scan: %d live entry order(s) available "

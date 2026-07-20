@@ -6491,6 +6491,203 @@ def __test_reduce_only_exit_cancel_without_bot_close_still_quarantines__():
     assert engine._quarantined
 
 
+def _mk_multi_bracket_with_cross_entry_close(b: MockBroker):
+    """Two entries L1/L2, each its own whole-row bracket; close(L1) in flight.
+
+    Mirrors the live-lab ``bybit_linear_multi_entry_brackets`` sequence at the
+    instant the venue reduce-only-cancels a leg of L2's bracket while the bot
+    is flattening L1. On a netting venue both entries share one net position,
+    so ``strategy.close(L1)`` shrinks it and Bybit drops an excess reduce-only
+    leg — here L2's TP — even though L2 stays open.
+
+    Returns ``(engine, pos, tp2_id, sl2_id)``. L2's bracket is mapped to TWO
+    venue legs (the single-leg mock exit is augmented with a seeded SL id) so
+    the leg-trim keeps a live sibling.
+    """
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    pos.exit_orders[("TP1", "L1")] = _exit_order(
+        "L1", -1.0, "TP1", limit=60_000.0, stop=45_000.0,
+    )
+    pos.exit_orders[("TP2", "L2")] = _exit_order(
+        "L2", -1.0, "TP2", limit=61_000.0, stop=46_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine.on_order_event(_fill_event(
+        "buy", 1.0, 50_000.0, pine_id="L1", leg=LegType.ENTRY,
+        xchg_id=engine._order_mapping["L1"][0],
+    ))
+    engine.on_order_event(_fill_event(
+        "buy", 1.0, 50_000.0, pine_id="L2", leg=LegType.ENTRY,
+        xchg_id=engine._order_mapping["L2"][0],
+    ))
+    tp2_id = engine._order_mapping["TP2\0L2"][0]
+    # Model the second (conditional SL) leg the real plugin maps alongside the
+    # TP: the single-leg mock exit only produced the TP id.
+    sl2_id = "TP2-sl-xchg"
+    engine._order_mapping["TP2\0L2"].append(sl2_id)
+    # ``strategy.close(id="L1")`` dispatched, its fill not yet drained.
+    engine._active_intents["L1"] = CloseIntent(
+        pine_id="L1", symbol=SYMBOL, side="sell", qty=1.0,
+    )
+    return engine, pos, tp2_id, sl2_id
+
+
+def _cross_entry_reduce_only_cancel_event(order_id: str) -> OrderEvent:
+    """A venue ``cancelled`` push for L2's reduce-only TP leg."""
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=order_id, symbol=SYMBOL, side='sell',
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=61_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="", reduce_only=True,
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id="TP2", from_entry="L2",
+        leg_type=LegType.TAKE_PROFIT,
+    )
+
+
+def __test_cross_entry_reduce_only_cancel_during_bot_close_is_expected__():
+    """Closing one entry that reduce-only-cancels ANOTHER entry's leg must not
+    quarantine, and must preserve the still-open sibling's bracket.
+
+    On a netting / one-way venue the two entries share one net position, so
+    ``strategy.close(L1)`` shrinks it and the venue drops an excess reduce-only
+    leg belonging to L2 — a still-open entry NOT being closed. This is
+    deterministic collateral of the bot's own close, not an external operator
+    cancel: the engine must keep trading (no quarantine), trim only the dead
+    leg, and leave L2's intent + its live SL leg intact (no defensive sweep).
+    """
+    b = MockBroker()
+    engine, pos, tp2_id, sl2_id = _mk_multi_bracket_with_cross_entry_close(b)
+
+    engine._route_event(_cross_entry_reduce_only_cancel_event(tp2_id))
+
+    assert not engine._quarantined
+    # L2's bracket intent survives with only its live SL leg mapped.
+    assert "TP2\0L2" in engine.active_intents
+    assert engine.order_mapping["TP2\0L2"] == [sl2_id]
+    # The still-open sibling is NOT force-swept — no cancel dispatched for it.
+    swept = {(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls}
+    assert ("TP2", "L2") not in swept
+    # L2's Pine exit stays desired; the in-flight close of L1 is left to settle.
+    assert ("TP2", "L2") in pos.exit_orders
+    assert isinstance(engine.active_intents.get("L1"), CloseIntent)
+
+
+def _cross_entry_reduce_only_sl_cancel_event(order_id: str) -> OrderEvent:
+    """A venue ``cancelled`` push for L2's reduce-only conditional SL leg."""
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=order_id, symbol=SYMBOL, side='sell',
+            order_type=OrderType.STOP, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=None, stop_price=46_000.0,
+            average_fill_price=None, status=OrderStatus.CANCELLED,
+            timestamp=0.0, fee=0.0, fee_currency="", reduce_only=True,
+        ),
+        event_type='cancelled', fill_price=None, fill_qty=None,
+        timestamp=0.0, pine_id="TP2", from_entry="L2",
+        leg_type=LegType.STOP_LOSS,
+    )
+
+
+def _settle_keyed_close_of_l1(engine, pos) -> None:
+    """Model close(L1) settling: intent retired, L1's Pine orders leave the book.
+
+    Mirrors the engine's keyed-close retirement ("close state retired") plus the
+    next bar's Pine book after the trade closed — the script no longer holds
+    L1's entry or its ``strategy.exit`` row, while L2 (still open, persistent
+    Pine semantics) keeps both.
+    """
+    engine._active_intents.pop("L1", None)
+    engine._order_mapping.pop("L1", None)
+    del pos.entry_orders["L1"]
+    del pos.exit_orders[("TP1", "L1")]
+
+
+def __test_multi_entry_bracket_close_lifecycle_no_quarantine_no_halt__():
+    """Full live-lab ``bybit_linear_multi_entry_brackets`` sequence: close(L1)
+    with collateral cancel of L2's TP leg, then close(L2) sweeping its own
+    bracket — no quarantine, no defensive close, clean convergence.
+
+    Chains the two halves of the original failure (quarantine on the collateral
+    cancel; halt via defensive close after the moot bracket re-emission) into
+    the whole lifecycle from the evidence log. With the classification fix the
+    surviving bracket intent is never swept, so the diff never re-emits the
+    exit against a flat position and the 110017 → defensive-close → halt tail
+    cannot start.
+    """
+    b = MockBroker()
+    engine, pos, tp2_id, sl2_id = _mk_multi_bracket_with_cross_entry_close(b)
+    exits_dispatched = len(b.exit_calls)
+
+    # Venue reduce-only-cancels L2's TP as collateral of close(L1).
+    engine._route_event(_cross_entry_reduce_only_cancel_event(tp2_id))
+    assert not engine._quarantined
+    assert engine.order_mapping["TP2\0L2"] == [sl2_id]
+
+    # close(L1) fills and settles; next bar's book no longer holds L1.
+    _settle_keyed_close_of_l1(engine, pos)
+    engine.sync(BAR_TS)
+    assert not engine._quarantined
+    # L1's now-parentless bracket is retired via a real venue cancel; L2's
+    # surviving bracket intent is adopted as-is — NOT re-dispatched.
+    cancelled = {(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls}
+    assert ("TP1", "L1") in cancelled
+    assert len(b.exit_calls) == exits_dispatched
+    assert "TP2\0L2" in engine.active_intents
+
+    # close(L2): the venue reduce-only-cancels L2's remaining SL leg — this
+    # names the leg's OWN from_entry, so the whole bracket sweep applies.
+    engine._active_intents["L2"] = CloseIntent(
+        pine_id="L2", symbol=SYMBOL, side="sell", qty=1.0,
+    )
+    engine._route_event(_cross_entry_reduce_only_sl_cancel_event(sl2_id))
+    assert not engine._quarantined
+    assert "TP2\0L2" not in engine.active_intents
+    assert ("TP2", "L2") not in pos.exit_orders
+
+    # No defensive close was ever synthesised anywhere in the lifecycle.
+    assert b.close_calls == []
+
+
+def __test_cross_entry_cancel_of_last_leg_retires_and_redispatches_fresh__():
+    """Both legs of the sibling's bracket collaterally cancelled: the intent is
+    retired, the Pine exit stays desired, and the next sync re-dispatches it.
+
+    When the venue drops BOTH the TP and the SL of a still-open sibling entry
+    while another entry's close is in flight, the bracket has no venue presence
+    left — the trim retires the intent but must NOT remove the Pine exit order,
+    so the still-open entry regains protection through a fresh dispatch on the
+    next sync instead of resting unprotected.
+    """
+    b = MockBroker()
+    engine, pos, tp2_id, sl2_id = _mk_multi_bracket_with_cross_entry_close(b)
+    exits_dispatched = len(b.exit_calls)
+
+    engine._route_event(_cross_entry_reduce_only_cancel_event(tp2_id))
+    engine._route_event(_cross_entry_reduce_only_sl_cancel_event(sl2_id))
+
+    assert not engine._quarantined
+    # Last mapped leg gone -> intent retired, but the Pine exit stays desired.
+    assert "TP2\0L2" not in engine.active_intents
+    assert "TP2\0L2" not in engine.order_mapping
+    assert ("TP2", "L2") in pos.exit_orders
+
+    # close(L1) settles; the next sync re-establishes L2's protection fresh.
+    _settle_keyed_close_of_l1(engine, pos)
+    engine.sync(BAR_TS)
+    assert not engine._quarantined
+    fresh = [c for c in b.exit_calls[exits_dispatched:]
+             if c.intent.pine_id == "TP2"]
+    assert len(fresh) == 1
+    assert "TP2\0L2" in engine.active_intents
+    assert b.close_calls == []
+
+
 # === One-way emulation routing (hedging, position_port set) ===============
 #
 # When ``broker.position_port`` is set the dispatch hub routes reducing /
@@ -6810,6 +7007,128 @@ def __test_first_bar_cancel_survives_restart_settle__(tmp_path):
         assert ("X", "L") not in pos.exit_orders  # cancel NOT overwritten
         assert ("1", None, None) in b.amend_calls  # live bracket cleared
         assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+
+
+def _seed_live_entry_order_row(ctx, *, coid: str, order_id: str, pine_id: str,
+                               side: str = "buy", qty: float = 1.0) -> None:
+    """Journal a live entry working-order row the way a plugin's ``_persist_entry``
+    would — keyed by ``pine_entry_id`` with the broker order id, no ``from_entry``
+    (a bare entry, not a bracket leg). The restart entry reconstruction reads this
+    to reverse-map the live order back to its Pine id."""
+    ctx.upsert_order(
+        coid, symbol=SYMBOL, side=side, qty=qty, state='confirmed',
+        intent_key=pine_id, pine_entry_id=pine_id,
+        exchange_order_id=order_id, extras={'order_id': order_id},
+    )
+
+
+def _live_stop_entry_order(coid: str, *, order_id: str, stop: float,
+                           side: str = "buy") -> ExchangeOrder:
+    """A broker-side OPEN STOP entry working order carrying ``coid`` — the shape
+    ``get_open_orders`` surfaces for a resting ``strategy.entry(..., stop=X)``."""
+    return ExchangeOrder(
+        id=order_id, symbol=SYMBOL, side=side,
+        order_type=OrderType.STOP, qty=1.0, filled_qty=0.0,
+        remaining_qty=1.0, price=None, stop_price=stop,
+        average_fill_price=None, status=OrderStatus.OPEN,
+        timestamp=0.0, fee=0.0, fee_currency="",
+        client_order_id=coid,
+    )
+
+
+def __test_cancel_only_restart_retires_reconstructed_entry__(tmp_path):
+    """A restart whose script goes straight to ``strategy.cancel`` (no re-declare)
+    retires the live entry working order instead of stranding it.
+
+    The reported cTrader stall: phase A placed a distant STOP entry and stopped
+    cleanly; phase B (same run identity) reloads its persisted phase and issues
+    ``strategy.cancel`` WITHOUT re-declaring the entry. Because a fresh process
+    starts with an empty Pine order book, the cancel used to no-op and the live
+    order was neither adopted nor cancelled — :meth:`_hydrate_restart_entry_adoptions`
+    only binds an entry the script RE-declares. Reconstructing the working order
+    pre-script (in :meth:`settle_restart_state`) gives the cancel a target: the
+    diff's entry-orphan sweep retires the live broker order.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        _seed_live_entry_order_row(ctx, coid=live_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(live_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        # Fresh process: the Pine order book is empty until reconstruction.
+        assert "L" not in pos.entry_orders
+        # settle runs BEFORE the first-bar script -> rebuilds the entry so the
+        # script's cancel can act on a populated book.
+        engine.settle_restart_state(BAR_TS)
+        assert "L" in pos.entry_orders  # reconstructed pre-script
+        assert pos.entry_orders["L"].stop == 1.30000  # STOP level restored
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+
+        # The first-bar script issues strategy.cancel -> the entry is removed
+        # and NOT re-declared.
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS)
+
+        # The reconstructed entry's live order is cancelled at the venue; no
+        # duplicate entry was ever dispatched.
+        assert len(b.entry_calls) == 0
+        assert len(b.cancel_calls) == 1
+        assert "L" not in engine._order_mapping  # type: ignore[attr-defined]
+        assert engine._restart_reconstructed_entry_keys == {}  # type: ignore[attr-defined]
+
+
+def __test_cancel_only_restart_kept_entry_is_adopted_not_cancelled__(tmp_path):
+    """A restart that reconstructs a working order the script LEAVES STANDING adopts
+    it — no duplicate dispatch, no spurious cancel.
+
+    The counterpart to the cancel-only case: a persistent Pine entry the script
+    does not re-emit (nor cancel) must survive the restart. Reconstruction seeds
+    the order book and mapping; the first post-restart diff routes it through the
+    cross-restart adoption branch, which pins the live order as the active intent
+    and dispatches nothing. The entry-orphan sweep must NOT fire.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        _seed_live_entry_order_row(ctx, coid=live_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(live_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        engine.settle_restart_state(BAR_TS)
+        assert "L" in pos.entry_orders  # reconstructed pre-script
+
+        # The first-bar script leaves the entry standing (persistent Pine order).
+        engine.sync(BAR_TS)
+
+        # The live order is adopted, not re-dispatched, and not cancelled.
+        assert len(b.entry_calls) == 0
+        assert len(b.cancel_calls) == 0
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+        assert "L" in engine._active_intents  # type: ignore[attr-defined]
+        assert engine._restart_reconstructed_entry_keys == {}  # type: ignore[attr-defined]
 
 
 def __test_settle_restart_state_skips_when_already_reconstructed__(tmp_path):

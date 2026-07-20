@@ -347,6 +347,54 @@ class BrokerPosition(PositionBase):
         )
         self.exit_orders[(pine_id, from_entry)] = order
 
+    def reconstruct_entry_order(
+            self,
+            *,
+            pine_id: str,
+            side: str,
+            qty: float,
+            limit: float | None,
+            stop: float | None,
+    ) -> None:
+        """Re-install a persistent ``strategy.entry`` working order after a restart.
+
+        Pine ``strategy.entry`` / ``strategy.order`` working orders are
+        persistent: once placed a pending LIMIT / STOP entry lives in
+        :attr:`entry_orders` across bars (the script need not re-emit it) until
+        it fills or is cancelled. A fresh process starts with empty order dicts,
+        so a first-bar ``strategy.cancel`` after a restart would operate on an
+        empty book (a silent no-op) and the live broker working order would be
+        stranded — neither adopted nor cancelled. The
+        :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine` rebuilds the
+        entry here, once, from the live broker snapshot so the first post-restart
+        script sees the same order it placed: a ``strategy.cancel`` removes it and
+        the diff retires the live order, while leaving it standing (or re-emitting
+        it) adopts the live order without a duplicate dispatch.
+
+        ``side`` is the entry side (``"buy"``/``"sell"``); the stored
+        :class:`~pynecore.lib.strategy.Order` carries the matching signed size so
+        :func:`~pynecore.core.broker.intent_builder.build_intents` re-derives the
+        same intent. Tick fields are left ``None`` — the venue reports resolved
+        absolute prices, never the original tick distances.
+
+        :param pine_id: The ``strategy.entry(id=...)`` value (the entry id).
+        :param side: The entry side, ``"buy"`` or ``"sell"``.
+        :param qty: Entry quantity magnitude.
+        :param limit: Absolute limit price, or ``None`` (STOP entry).
+        :param stop: Absolute stop trigger price, or ``None`` (LIMIT entry).
+        """
+        # noinspection PyProtectedMember
+        from pynecore.lib.strategy import Order, _order_type_entry
+        signed_size = qty if side == "buy" else -qty
+        order = Order(
+            pine_id,
+            signed_size,
+            order_type=_order_type_entry,
+            limit=limit,
+            stop=stop,
+        )
+        self.entry_orders[pine_id] = order
+
     def reconstruct_parent_trade(
             self,
             *,
