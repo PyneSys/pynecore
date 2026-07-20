@@ -8,7 +8,7 @@ from typer import Typer, Option, Argument, Exit, Context, secho, colors, confirm
 
 from rich import print as rprint
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
-                           TimeElapsedColumn, TimeRemainingColumn)
+                           TimeElapsedColumn, TimeRemainingColumn, TaskID)
 
 from ..app import app, app_state
 from ..pluggable import PluggableCommand
@@ -17,6 +17,8 @@ from ...core.plugin import ProviderPlugin, ProviderError
 from ...core.provider_string import is_provider_string, parse_provider_string
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
+from ...core.download_runner import (download_to_file, ConflictAction, DownloadConflict,
+                                     DownloadPlan, DownloadProgress, DownloadError)
 from ...core.ohlcv_file import OHLCVReader
 from ...core.aggregator import validate_aggregation, aggregate_ohlcv
 from ...core.syminfo import SymInfo
@@ -210,7 +212,7 @@ def download(
     """
     try:
         from ...core.config import ensure_config
-        from ...core.download_info import read_download_provider, write_download_provider
+        from ...core.download_info import read_download_provider
 
         # A .ohlcv/.toml path re-downloads with the provider string persisted
         # in the [download] section of its syminfo TOML.
@@ -430,108 +432,73 @@ def download(
         # own keys (see CLIPlugin.cli_params / PluggableCommand).
         provider_instance.plugin_params = getattr(ctx, "plugin_params", {})
 
-        # Open the OHLCV file and start downloading
-        with provider_instance as ohlcv_writer:
-            # Truncate file if overwrite is True
-            if truncate:
-                ohlcv_writer.seek(0)
-                ohlcv_writer.truncate()
+        # Progress display is created only once the download range is resolved
+        # (the bar's date column and total both need it).
+        dl_progress: Progress | None = None
+        dl_task: TaskID | None = None
 
-            # If the start date is "continue" (default), we resume from the last download
-            resolved_from: datetime = time_from
-            fetch_all = False
-            if time_from == "continue":
-                end_ts = ohlcv_writer.end_timestamp
-                interval = ohlcv_writer.interval
-                if end_ts and interval:  # Resume from last download
-                    resolved_from = datetime.fromtimestamp(end_ts, UTC)
-                    # We need to add one interval to the start date to avoid downloading the same data
-                    resolved_from += timedelta(seconds=interval)
-                elif getattr(provider_class, 'fetch_all_by_default', False):
-                    resolved_from = datetime.fromtimestamp(0, UTC)
-                    fetch_all = True
-                else:  # No data, download one year as default
-                    resolved_from = datetime.now(UTC) - timedelta(days=365)
-
-            # We need to remove timezone info
-            resolved_from = resolved_from.replace(tzinfo=None)
-            time_to = time_to.replace(tzinfo=None)
-
-            # We cannot download data from the future otherwise it would take very long
-            if time_to > datetime.now(UTC).replace(tzinfo=None):
-                time_to = datetime.now(UTC).replace(tzinfo=None)
-
-            # Check time range (skip for fetch_all providers)
-            if not fetch_all and time_to < resolved_from:
-                secho("Error: End date (to) must be greater than start date (from)!", err=True, fg=colors.RED)
-                raise Exit(1)
-
-            # If the start date is before the start of the existing file, we truncate the file
-            if ohlcv_writer.start_timestamp and not fetch_all:
-                if resolved_from < ohlcv_writer.start_datetime.replace(tzinfo=None):
-                    secho(f"The start date (from: {resolved_from}) is before the start of the "
-                          f"existing file ({ohlcv_writer.start_datetime.replace(tzinfo=None)}).\n"
-                          f"If you continue, the file will be truncated.",
-                          fg=colors.YELLOW)
-                    confirm("Do you want to continue?", abort=True)
-                    # Truncate file
-                    ohlcv_writer.seek(0)
-                    ohlcv_writer.truncate()
-
-            # fetch_all provider: use spinner-only progress (no time-based progress bar)
-            if fetch_all:
-                with Progress(
-                        SpinnerColumn(finished_text="[green]✓"),
-                        TextColumn("{task.description}"),
-                        TimeElapsedColumn(),
-                ) as progress:
-                    progress.add_task(
-                        description="Downloading all available OHLCV data...",
-                        total=None,
-                    )
-                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=None,
-                                                     limit=chunk_size, with_extra=extra_data)
+        def on_start(plan: DownloadPlan) -> None:
+            """ Open the progress display matching the resolved range """
+            nonlocal dl_progress, dl_task
+            if plan.fetch_all:
+                # fetch_all provider: use spinner-only progress (no time-based progress bar)
+                display = Progress(
+                    SpinnerColumn(finished_text="[green]✓"),
+                    TextColumn("{task.description}"),
+                    TimeElapsedColumn(),
+                )
+                display.start()
+                dl_task = display.add_task(
+                    description="Downloading all available OHLCV data...",
+                    total=None,
+                )
             else:
-                total_seconds = int((time_to - resolved_from).total_seconds())
+                display = Progress(
+                    SpinnerColumn(finished_text="[green]✓"),
+                    TextColumn("{task.description}"),
+                    DateColumn(plan.time_from),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    "/",
+                    TimeRemainingColumn(),
+                )
+                display.start()
+                dl_task = display.add_task(
+                    description="Downloading OHLCV data...",
+                    total=plan.total_seconds,
+                )
+            dl_progress = display
 
-                # Get OHLCV data
-                with Progress(
-                        SpinnerColumn(finished_text="[green]✓"),
-                        TextColumn("{task.description}"),
-                        DateColumn(resolved_from),
-                        BarColumn(),
-                        TimeElapsedColumn(),
-                        "/",
-                        TimeRemainingColumn(),
-                ) as progress:
-                    task = progress.add_task(
-                        description="Downloading OHLCV data...",
-                        total=total_seconds,
-                    )
+        def on_progress(progress_info: DownloadProgress) -> None:
+            """ Callback to update progress """
+            assert dl_progress is not None and dl_task is not None
+            dl_progress.update(dl_task, completed=progress_info.elapsed_seconds)
 
-                    def cb_progress(current_time: datetime):
-                        """ Callback to update progress """
-                        elapsed_seconds = int((current_time - resolved_from).total_seconds())
-                        progress.update(task, completed=elapsed_seconds)
+        def on_conflict(conflict: DownloadConflict) -> ConflictAction:
+            """ Ask the user before an existing file gets truncated """
+            secho(f"The start date (from: {conflict.time_from}) is before the start of the "
+                  f"existing file ({conflict.existing_start}).\n"
+                  f"If you continue, the file will be truncated.",
+                  fg=colors.YELLOW)
+            confirm("Do you want to continue?", abort=True)
+            return 'truncate'
 
-                    # Start downloading
-                    provider_instance.download_ohlcv(resolved_from, time_to, on_progress=cb_progress,
-                                                     limit=chunk_size, with_extra=extra_data)
-
-            # Refine the heuristic mincontract from the downloaded volume data
-            # (only when the provider had no exchange value for it)
-            if provider_instance.mincontract_estimated:
-                qty_step = ohlcv_writer.analyzed_qty_step
-                if qty_step is not None and qty_step != sym_info.mincontract:
-                    sym_info.mincontract = qty_step
-                    assert provider_instance.ohlcv_path is not None
-                    sym_info.save_toml(provider_instance.ohlcv_path.with_suffix('.toml'))
-
-        # Record the canonical provider string so the file can be re-downloaded
-        # by path (see the .ohlcv/.toml branch above).
-        assert provider_instance.ohlcv_path is not None
-        write_download_provider(provider_instance.ohlcv_path.with_suffix('.toml'),
-                                f"{provider_name}:{symbol}@{timeframe}")
+        try:
+            assert provider_instance is not None
+            download_to_file(
+                provider_instance,
+                time_from=time_from, time_to=time_to,
+                truncate=truncate, chunk_size=chunk_size, extra_data=extra_data,
+                syminfo=sym_info,
+                on_start=on_start, on_progress=on_progress, on_conflict=on_conflict,
+                provider_string=f"{provider_name}:{symbol}@{timeframe}",
+            )
+        except DownloadError as e:
+            secho(f"Error: {e}", err=True, fg=colors.RED)
+            raise Exit(1)
+        finally:
+            if dl_progress is not None:
+                dl_progress.stop()
 
     except ProviderError as e:
         secho(f"Error: {e}", err=True, fg=colors.RED)

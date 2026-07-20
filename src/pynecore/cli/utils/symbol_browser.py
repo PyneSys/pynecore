@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,8 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 from rich.text import Text
 
-from ...core.ohlcv_file import OHLCVWriter
+from ...core.download_runner import (download_to_file, DownloadConflictError,
+                                     DownloadPlan, DownloadProgress)
 from ...core.plugin import ProviderPlugin
 from ...core.syminfo import SymInfo
 from ..commands.data import parse_date_or_days, validate_timeframe
@@ -202,6 +203,7 @@ class SymbolBrowser:
         self.dl_total_seconds: int = 1
         self.dl_elapsed_seconds: int = 0
         self.dl_started_monotonic: float = 0.0
+        self.dl_indeterminate: bool = False  # fetch_all download: no known total
         self.dl_label: str = ""
         self.dl_status: str | None = None  # last download result message
         self.dl_status_ok: bool = True
@@ -644,6 +646,7 @@ class SymbolBrowser:
         self.dl_label = f"{symbol} {tf}"
         self.dl_elapsed_seconds = 0
         self.dl_total_seconds = 1
+        self.dl_indeterminate = False
         self.dl_started_monotonic = time.monotonic()
         self.dl_status = None
         self.dl_future = self.dl_executor.submit(
@@ -656,109 +659,47 @@ class SymbolBrowser:
                       from_value: datetime | str, to_value: datetime,
                       truncate: bool) -> None:
         try:
-            # Mutate the provider in the same way the regular CLI flow
-            # would have done at construction: symbol + timeframe +
-            # xchg_timeframe + ohlcv_path + ohlcv_file all need to be in
-            # sync before entering the provider context manager (which
-            # opens the OHLCVWriter).
-            provider = self.provider
-            provider.symbol = symbol
-            provider.timeframe = tf
-            provider.xchg_timeframe = provider.to_exchange_timeframe(tf)
-            ohlcv_path = provider.get_ohlcv_path(
-                symbol, tf, self.ohlcv_dir,
-            )
-            provider.ohlcv_path = ohlcv_path
-            provider.ohlcv_file = OHLCVWriter(ohlcv_path)
-
-            with provider as ohlcv_writer:
-                if truncate:
-                    ohlcv_writer.seek(0)
-                    ohlcv_writer.truncate()
-                resolved_from = self._resolve_from(from_value, ohlcv_writer)
-                # Strip tz to match the existing CLI download semantics.
-                resolved_from = resolved_from.replace(tzinfo=None)
-                resolved_to = to_value.replace(tzinfo=None)
-                now_naive = datetime.now(UTC).replace(tzinfo=None)
-                if resolved_to > now_naive:
-                    resolved_to = now_naive
-
-                fetch_all = (
-                    from_value == "continue"
-                    and ohlcv_writer.end_timestamp == 0
-                    and getattr(type(provider), 'fetch_all_by_default', False)
-                )
-                if not fetch_all and resolved_to < resolved_from:
-                    raise ValueError(
-                        "End date (to) must be greater than start date (from)"
-                    )
-
-                total = max(1, int((resolved_to - resolved_from).total_seconds()))
+            def on_start(plan: DownloadPlan) -> None:
                 with self.dl_lock:
-                    self.dl_total_seconds = total
+                    self.dl_total_seconds = max(1, plan.total_seconds)
                     self.dl_elapsed_seconds = 0
+                    # A fetch_all download has no known end, so no progress
+                    # ticks arrive: show a pulsing bar instead of a stuck 0%
+                    self.dl_indeterminate = plan.fetch_all
 
-                def on_progress(ts: datetime) -> None:
-                    elapsed = int((ts - resolved_from).total_seconds())
-                    if elapsed < 0:
-                        elapsed = 0
-                    if elapsed > total:
-                        elapsed = total
-                    with self.dl_lock:
-                        self.dl_elapsed_seconds = elapsed
+            def on_progress(progress_info: DownloadProgress) -> None:
+                with self.dl_lock:
+                    self.dl_elapsed_seconds = progress_info.elapsed_seconds
 
-                provider.download_ohlcv(
-                    resolved_from, resolved_to,
-                    on_progress=None if fetch_all else on_progress,
-                    limit=self.default_chunk_size,
-                    with_extra=self.default_extra_data,
-                )
-
-                # Write a fresh SymInfo TOML alongside the OHLCV — matches
-                # what the CLI download path does on first run.
-                if not provider.is_symbol_info_exists():
-                    # noinspection PyBroadException
-                    try:
-                        sym_info = provider.update_symbol_info()
-                        assert provider.ohlcv_path is not None
-                        sym_info.save_toml(
-                            provider.ohlcv_path.with_suffix('.toml')
-                        )
-                    except Exception:
-                        pass  # SymInfo write is best-effort
-
-            if self.provider_string_prefix:
-                from ...core.download_info import write_download_provider
-                write_download_provider(
-                    ohlcv_path.with_suffix('.toml'),
-                    f"{self.provider_string_prefix}:{symbol}@{tf}",
-                )
+            provider_string = (f"{self.provider_string_prefix}:{symbol}@{tf}"
+                               if self.provider_string_prefix else None)
+            download_to_file(
+                self.provider,
+                symbol=symbol, timeframe=tf, ohlcv_dir=self.ohlcv_dir,
+                time_from=from_value, time_to=to_value,
+                truncate=truncate,
+                chunk_size=self.default_chunk_size,
+                extra_data=self.default_extra_data,
+                on_start=on_start, on_progress=on_progress,
+                # No place to ask here: rather than silently dropping the
+                # user's data, report the conflict and let them re-run with
+                # the wizard's Truncate field set to Yes.
+                on_conflict='abort',
+                provider_string=provider_string,
+            )
 
             with self.dl_lock:
                 self.dl_status = f"[OK] downloaded {self.dl_label}"
                 self.dl_status_ok = True
+        except DownloadConflictError as exc:
+            with self.dl_lock:
+                self.dl_status = f"[ERR] {exc} Set Truncate to Yes to overwrite it."
+                self.dl_status_ok = False
         except BaseException as exc:
             msg = str(exc) or repr(exc)
             with self.dl_lock:
                 self.dl_status = f"[ERR] {type(exc).__name__}: {msg}"
                 self.dl_status_ok = False
-
-    @staticmethod
-    def _resolve_from(from_value: datetime | str,
-                      ohlcv_writer: OHLCVWriter) -> datetime:
-        """Mirror the CLI's ``time_from`` resolution for ``"continue"``."""
-        if isinstance(from_value, datetime):
-            return from_value
-        if from_value != "continue":
-            raise ValueError(f"Unexpected from value: {from_value!r}")
-        end_ts = ohlcv_writer.end_timestamp
-        interval = ohlcv_writer.interval
-        if end_ts and interval:
-            from datetime import timedelta
-            return (datetime.fromtimestamp(end_ts, UTC)
-                    + timedelta(seconds=interval))
-        from datetime import timedelta
-        return datetime.now(UTC) - timedelta(days=365)
 
     def _maybe_collect_download(self) -> None:
         if self.dl_future is None or not self.dl_future.done():
@@ -993,12 +934,27 @@ class SymbolBrowser:
             elapsed = self.dl_elapsed_seconds
             total = self.dl_total_seconds
             started = self.dl_started_monotonic
+            indeterminate = self.dl_indeterminate
         # The Progress widget is rebuilt on every render, so Rich's built-in
         # TimeElapsedColumn / TimeRemainingColumn always saw a freshly-created
         # task and reported 0:00:00 / -:--:--. Compute real wall-clock elapsed
         # and ETA from the dl_started_monotonic anchor and the progress ratio,
         # then feed them in as plain text fields.
         elapsed_real = max(0.0, time.monotonic() - started) if started else 0.0
+        if indeterminate:
+            progress = Progress(
+                TextColumn("{task.fields[label]}", style="bold"),
+                BarColumn(),
+                TextColumn("{task.fields[elapsed_str]}", style="progress.elapsed"),
+                expand=True,
+            )
+            progress.add_task(
+                "download", total=None,
+                label=self.dl_label,
+                elapsed_str=self._format_hms(elapsed_real),
+            )
+            return Panel(progress, title=f"Downloading {self.dl_label}",
+                         title_align="left", height=_STRIP_HEIGHT_PROGRESS)
         if 0 < elapsed < total:
             eta = elapsed_real * (total - elapsed) / elapsed
             eta_str = self._format_hms(eta)
