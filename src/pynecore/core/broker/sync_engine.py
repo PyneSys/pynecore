@@ -149,6 +149,7 @@ from pynecore.core.broker.store_helpers import (
     iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
+from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
@@ -162,18 +163,6 @@ _T = TypeVar('_T')
 
 Intent = EntryIntent | ExitIntent | CloseIntent
 
-ADOPTED_STARTUP_ENTRY_ID = "__adopted_startup__"
-"""Synthetic FIFO parent-trade id seeded by startup adoption.
-
-When a fresh process restarts over an existing broker position and the real
-Pine parent entry id cannot be recovered (no bracket, or a pyramided
-multi-parent position), :meth:`OrderSyncEngine.reconcile` seeds the adopted
-size under this synthetic id (see :meth:`_recover_adopted_parent_entry_id`).
-The id deliberately does NOT match any real ``strategy.entry`` id, so the
-close-quantity clamp must treat an open FIFO that carries it as untracked
-exposure: a keyed ``strategy.close(id)`` that misses every faithful id must
-still be allowed to flatten the adopted position rather than be dropped.
-"""
 
 CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
 

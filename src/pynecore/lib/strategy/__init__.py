@@ -13,7 +13,7 @@ from ...core.module_property import module_property
 from ... import lib
 from .. import syminfo
 
-from ...types.strategy import QtyType
+from ...types.strategy import QtyType, ADOPTED_STARTUP_ENTRY_ID
 from ...types.base import IntEnum
 from ...types.na import NA, na_float, na_str
 from ...types import PyneFloat, PyneInt, PyneStr
@@ -3556,9 +3556,21 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
         bound_size = position.sign * position._entry_open_ledger.get(id, 0.0)
     else:
         bound_size = 0.0
+        adopted_size = 0.0
         for trade in position.open_trades:
             if trade.entry_id == id:
                 bound_size += trade.size
+            elif trade.entry_id is None or trade.entry_id == ADOPTED_STARTUP_ENTRY_ID:
+                adopted_size += trade.size
+        if bound_size == 0.0:
+            # Startup adoption seeds the open position under a synthetic (or
+            # ``None``) parent id because the real ``strategy.entry`` ids from the
+            # prior process are unknown, so a keyed ``close(id)`` matches no open
+            # trade. Bind it to the adopted exposure instead of dropping the close
+            # (early ``size == 0.0`` return) — otherwise the script could never
+            # flatten an adopted position by entry id. ``_clamp_close_intents``
+            # caps this to the residual position size before dispatch.
+            bound_size = adopted_size
 
     if isinstance(qty, NA):
         if not isinstance(qty_percent, NA):
