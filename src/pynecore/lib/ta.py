@@ -1,5 +1,5 @@
 """
-@pyne
+@pyne lib
 """
 from typing import TypeVar, cast, TYPE_CHECKING
 
@@ -286,7 +286,11 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
 
     # We need to round to prevent problems caused by floating point precision
     if isinstance(source, (float, int)):
-        source = round(source, 14)
+        # The cast is for pyright: it types round(float) as float, which is not
+        # assignable back to the TFIB-typed parameter; PyCharm resolves it to
+        # TFIB already.
+        # noinspection PyUnnecessaryCast
+        source = cast(TFIB, round(source, 14))
     prev_val = source[length]  # noqa
 
     if isinstance(source, NA):

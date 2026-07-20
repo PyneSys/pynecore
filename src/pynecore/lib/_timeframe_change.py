@@ -1,5 +1,5 @@
 """
-@pyne
+@pyne lib
 
 Stateful implementation of ``lib.timeframe.change``. It lives in its own
 small module because the ``@pyne`` marker is module-level and the host
@@ -25,6 +25,10 @@ from pynecore.types import Persistent
 __all__ = ['change']
 
 
+# The engine-private ``lib._*`` members are the intended interface here, and the
+# ``Persistent`` markers are rewritten by the AST transformer, so the IDE sees neither
+# the next-bar reads of the state variables nor their lazy-init narrowing.
+# noinspection PyProtectedMember,PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def change(timeframe: str) -> bool:
     """
     Detects changes in the specified timeframe.
@@ -43,7 +47,6 @@ def change(timeframe: str) -> bool:
     if tf_sec < xchg_tf_sec:
         return False
 
-    # noinspection PyProtectedMember
     _modifier, _multiplier = _timeframe._process_tf(timeframe)
     assert _modifier != 'T', "Ticks are not (yet) supported!"
 
@@ -55,18 +58,15 @@ def change(timeframe: str) -> bool:
         if last_dt is None:
             last_dt = dt - timedelta(seconds=xchg_tf_sec)
             last_signal = last_dt
-        assert isinstance(last_dt, datetime)
 
         while last_dt < dt:
             prev_dt = last_dt
             last_dt = last_dt + timedelta(seconds=xchg_tf_sec)
 
             # The anchor point is the session start
-            # noinspection PyProtectedMember
             if _timeframe._is_new_session(last_dt, prev_dt, xchg_tf_sec):
                 # We need to round the session start to the nearest hour
                 last_signal = last_dt.replace(minute=0, second=0, microsecond=0)
-            assert isinstance(last_signal, datetime)
             seconds_since_last_session = (last_dt - last_signal).total_seconds()
 
             if seconds_since_last_session % tf_sec == 0:
@@ -78,9 +78,7 @@ def change(timeframe: str) -> bool:
     # Daily/Weekly/Monthly: true on the first chart bar of a new period of
     # the scheduled grid — the period identity changing is exactly
     # ``ta.change(time(timeframe))`` on the verified grid
-    # noinspection PyProtectedMember
     if _multiplier > 1:
-        # noinspection PyProtectedMember
         if (_modifier, _multiplier) == _timeframe._process_tf(str(_syminfo.period)):
             # The chart's own bars are the requested grid: every bar starts one
             key = lib._time

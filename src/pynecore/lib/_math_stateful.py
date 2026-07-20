@@ -1,5 +1,5 @@
 """
-@pyne
+@pyne lib
 
 Stateful implementations of ``lib.math.random`` and ``lib.math.sum``. They
 live in their own small module because the ``@pyne`` marker is module-level
@@ -21,7 +21,9 @@ TFI = TypeVar('TFI', float, int)
 __all__ = ['random', 'sum']
 
 
-# noinspection PyShadowingBuiltins,PyShadowingNames
+# The lazy-init narrowing of ``prng`` is invisible to the IDE: ``Persistent`` is a
+# marker the AST transformer rewrites, so flow analysis keeps the ``| None`` arm.
+# noinspection PyShadowingBuiltins,PyShadowingNames,PyUnresolvedReferences
 def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(int)) -> PyneFloat:
     """
     Returns a random number between two numbers.
@@ -38,7 +40,12 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
     return res
 
 
-# noinspection PyShadowingBuiltins
+# Three groups of IDE findings here are artifacts of the ``@pyne`` transform, not real
+# defects: ``Persistent`` assignments look dead because their value is read on the NEXT
+# bar, ``src`` looks possibly-unbound because it is a series whose storage outlives the
+# ``if`` that feeds it, and ``src[i]`` looks like subscripting a float because
+# ``Series[T]`` erases to ``T`` for the IDE.
+# noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences
 def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     """
     Returns the sum of a series over a specified length using Kahan summation.
@@ -53,8 +60,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     prev_length: Persistent[int] = 0
     removals: Persistent[int] = 0
 
-    isna = isinstance(source, NA)
-    if not isna:
+    if not isinstance(source, NA):
         # Record every non-na bar's value into the sliding buffer BEFORE any
         # early return (shortcut / warmup), so the positional recompute below
         # sees a complete history with no holes. NA values are intentionally
@@ -90,7 +96,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     prev_length = length
     if changed:
         removals = 0
-        if isna:
+        if isinstance(source, NA):
             # Length changed on an na bar: the old window is stale and cannot be
             # rebuilt from a missing current value; restart the warmup cleanly.
             summ = 0.0
@@ -124,7 +130,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
             return recomputed
 
     if count < length - 1:
-        if not isna:
+        if not isinstance(source, NA):
             count += 1
             # Kahan summation for adding new value
             corrected_value = float(source) - compensation
@@ -133,11 +139,11 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
             summ = new_sum
         return NA(float)
     elif count == length - 1:
-        if isna:
+        if isinstance(source, NA):
             return NA(float)
         count += 1
     else:
-        if isna:
+        if isinstance(source, NA):
             return summ
         # Exact resync: the incremental remove+add path below carries residual
         # rounding error from bars long outside the window (Kahan bounds it but

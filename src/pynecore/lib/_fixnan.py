@@ -1,5 +1,5 @@
 """
-@pyne
+@pyne lib
 
 Stateful implementation of ``lib.fixnan``. It lives in its own small module
 because the ``@pyne`` marker is module-level and the host module
