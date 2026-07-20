@@ -2014,3 +2014,46 @@ def __test_startup_adopts_own_open_position_across_restart__(
         assert len(pos.open_trades) == 1
         assert pos.open_trades[0].size == 0.01
         ctx.close()
+
+
+def __test_owned_size_ignores_provider_vs_venue_symbol_domain__(
+        tmp_path: Path,
+) -> None:
+    """Ownership reconstruction must not filter the journal by symbol.
+
+    The engine's ``symbol`` is the provider ticker (``BTCUSDT.P`` for a
+    perp), while plugins journal order rows under the venue wire symbol
+    (``BTCUSDT``). A symbol-filtered journal query would match zero rows
+    and wrongly report the restarting run as owning nothing.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order(
+            "own-entry", symbol=SYMBOL, side="buy", qty=0.01,
+            state="confirmed", pine_entry_id="L", filled_qty=0.01,
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=0.01, entry_price=1_900.0,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="isolated",
+            ),
+        )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=broker,  # type: ignore[arg-type]
+            position=pos,
+            symbol=SYMBOL + ".P",
+            run_tag=ctx.run_tag,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 0.01, (
+            "the provider '.P' ticker must not hide the run's own "
+            "venue-symbol journal rows from ownership reconstruction"
+        )
+        ctx.close()

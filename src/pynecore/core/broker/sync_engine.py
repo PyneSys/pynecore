@@ -2806,16 +2806,22 @@ class OrderSyncEngine:
         this runs), so the run-owned net is the signed sum of those
         cursors: a filled buy adds, a filled sell subtracts, resting
         (unfilled) working orders contribute zero. A brand-new run with no
-        rows for the symbol owns nothing and returns ``0.0``; a genuine
-        restart over its own open position finds its entry row's cursor and
-        returns the full size it left behind.
+        rows owns nothing and returns ``0.0``; a genuine restart over its
+        own open position finds its entry row's cursor and returns the
+        full size it left behind.
+
+        The journal query is scoped by ``run_instance_id`` only, with no
+        symbol filter: a run trades a single symbol, and plugins journal
+        rows under the venue wire symbol (e.g. ``ETHUSDT``) while
+        ``self._symbol`` holds the provider ticker (e.g. ``ETHUSDT.P``) —
+        filtering on the provider ticker would match zero rows.
 
         Pure-local: read-only over the persisted journal.
         """
         if self._store_ctx is None:
             return 0.0
         owned = 0.0
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             filled = row.filled_qty
             if filled == 0.0:
                 continue
