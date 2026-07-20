@@ -316,8 +316,19 @@ class SymInfo:
         Organizes data under [symbol] section.
         None values are commented out with '#key ='
 
+        An existing [download] section (written by `pyne data download`, see
+        core.download_info) is preserved verbatim across the rewrite.
+
         :param path: Path to save the file
         """
+        from .download_info import extract_download_section
+
+        preserved_download = None
+        if path.exists():
+            try:
+                preserved_download = extract_download_section(path.read_text(encoding='utf-8'))
+            except OSError:
+                pass
 
         def time_to_str(t):
             """Convert time object to string"""
@@ -413,6 +424,10 @@ class SymInfo:
                 lines.append("")
         else:
             lines.append(_SESSION_SCHEDULE_EXAMPLE_COMMENT)
+            lines.append("")
+
+        if preserved_download:
+            lines.append(preserved_download)
             lines.append("")
 
         # Write to file

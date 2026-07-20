@@ -148,6 +148,7 @@ class SymbolBrowser:
     def __init__(self, provider: ProviderPlugin, symbols: list[str],
                  *,
                  ohlcv_dir: Path,
+                 provider_string_prefix: str | None = None,
                  default_timeframe: str = "1D",
                  default_from: str = "continue",
                  default_to: str = "now",
@@ -158,6 +159,10 @@ class SymbolBrowser:
         self.provider = provider
         self.symbols: list[str] = list(symbols)
         self.ohlcv_dir = ohlcv_dir
+        self.provider_string_prefix = provider_string_prefix
+        """Provider (+broker selector) prefix, e.g. ``"ccxt:BYBIT"`` — the
+        browsed symbols carry no such prefix. Used to persist the canonical
+        provider string next to a finished download; None disables that."""
         self.default_chunk_size = default_chunk_size
         self.default_extra_data = default_extra_data
         self.max_cache = max_cache
@@ -721,6 +726,13 @@ class SymbolBrowser:
                         )
                     except Exception:
                         pass  # SymInfo write is best-effort
+
+            if self.provider_string_prefix:
+                from ...core.download_info import write_download_provider
+                write_download_provider(
+                    ohlcv_path.with_suffix('.toml'),
+                    f"{self.provider_string_prefix}:{symbol}@{tf}",
+                )
 
             with self.dl_lock:
                 self.dl_status = f"[OK] downloaded {self.dl_label}"

@@ -161,8 +161,10 @@ def _format_date_default(value, fallback: str) -> str:
 def download(
         ctx: Context,
         provider: str = Argument(..., show_default=False,
-                                 help="Provider name (e.g. 'ccxt') or a full provider string "
-                                      "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D')"),
+                                 help="Provider name (e.g. 'ccxt'), a full provider string "
+                                      "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D'), or the path of an "
+                                      "already downloaded .ohlcv/.toml file to re-download it "
+                                      "with its saved provider string (typically with -f continue)"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
                                     help="Symbol (e.g. BYBIT:BTC/USDT:USDT). Ignored when the "
                                          "provider string already contains a symbol"),
@@ -208,6 +210,23 @@ def download(
     """
     try:
         from ...core.config import ensure_config
+        from ...core.download_info import read_download_provider, write_download_provider
+
+        # A .ohlcv/.toml path re-downloads with the provider string persisted
+        # in the [download] section of its syminfo TOML.
+        if provider.endswith(('.ohlcv', '.toml')):
+            given = Path(provider)
+            path = next((p for p in (given, app_state.data_dir / given.name) if p.exists()), None)
+            if path is None:
+                secho(f"Error: File not found: {provider}", err=True, fg=colors.RED)
+                raise Exit(1)
+            saved = read_download_provider(path.with_suffix('.toml'))
+            if saved is None:
+                secho(f"Error: {path.with_suffix('.toml').name} has no [download] provider "
+                      f"section. Download it once with a provider string to record it.",
+                      err=True, fg=colors.RED)
+                raise Exit(1)
+            provider = saved
 
         # Resolve the provider plugin from either the bare name or the leading
         # segment of a provider string.
@@ -279,18 +298,24 @@ def download(
             return inst, slist, tdir
 
         def _browse_symbols(inst: "ProviderPlugin", slist: list[str], tdir: Path,
-                            *, can_go_back: bool) -> bool:
+                            *, selector: str | None, can_go_back: bool) -> bool:
             """Launch the symbol browser TUI for ``inst``.
 
+            :param selector: Broker/exchange selector the provider was opened
+                with (the browsed symbols carry no such prefix), or None for
+                single-broker providers. Used to build the canonical provider
+                string persisted next to the download.
             :param can_go_back: When True, ESC returns to the broker picker
                 instead of quitting the command.
             :return: True if the user asked to go back to the broker list.
             """
             from ..utils.symbol_browser import SymbolBrowser
+            prefix = f"{provider_name}:{selector}" if selector else provider_name
             browser = SymbolBrowser(
                 inst,
                 slist,
                 ohlcv_dir=tdir,
+                provider_string_prefix=prefix,
                 default_timeframe=timeframe,
                 default_from=_format_date_default(time_from, "continue"),
                 default_to=_format_date_default(time_to, "now"),
@@ -337,7 +362,7 @@ def download(
                 picker.error = None
                 assert tui_ohlcv_dir is not None
                 if _browse_symbols(provider_instance, symbols_list, tui_ohlcv_dir,
-                                   can_go_back=True):
+                                   selector=chosen, can_go_back=True):
                     continue
                 return
 
@@ -380,7 +405,7 @@ def download(
                 raise Exit(1)
             assert tui_ohlcv_dir is not None
             _browse_symbols(provider_instance, symbols_list, tui_ohlcv_dir,
-                            can_go_back=False)
+                            selector=symbol, can_go_back=False)
             return
 
         # Download symbol info if not exists
@@ -501,6 +526,12 @@ def download(
                     sym_info.mincontract = qty_step
                     assert provider_instance.ohlcv_path is not None
                     sym_info.save_toml(provider_instance.ohlcv_path.with_suffix('.toml'))
+
+        # Record the canonical provider string so the file can be re-downloaded
+        # by path (see the .ohlcv/.toml branch above).
+        assert provider_instance.ohlcv_path is not None
+        write_download_provider(provider_instance.ohlcv_path.with_suffix('.toml'),
+                                f"{provider_name}:{symbol}@{timeframe}")
 
     except ProviderError as e:
         secho(f"Error: {e}", err=True, fg=colors.RED)
