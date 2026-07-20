@@ -230,6 +230,61 @@ def __test_create_entry_order_row_writes_canonical_extras__(tmp_path: Path) -> N
             ctx.close()
 
 
+def __test_create_entry_order_row_reopens_closed_same_coid__(tmp_path: Path) -> None:
+    """Re-creating an entry under a COID whose prior row was closed must
+    revive the row (``closed_ts_ms`` cleared) so it is live again.
+
+    Regression: a Pine strategy that cancels a working order and then
+    re-creates it under the same id within the same bar produces an
+    identical COID. Without the reopen guard the second
+    ``create_entry_order_row`` hits ``upsert_order``'s UPDATE path, which
+    leaves ``closed_ts_ms`` set — the re-created order stays invisible to
+    ``iter_live_orders`` and a subsequent ``strategy.cancel`` degrades to
+    a no-op while the order is still live on the exchange.
+    """
+    path = tmp_path / "broker.sqlite"
+    with BrokerStore(path, plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long")
+            # First lifecycle: create, confirm, then close (cancelled).
+            create_entry_order_row(
+                ctx, coid=coid, symbol="EURUSD", side="buy", qty=1.0,
+                intent_key="Long", pine_entry_id="Long",
+                kind=ENTRY_KIND_WORKING, order_type='limit',
+            )
+            mark_confirmed_with_fill(
+                ctx, coid=coid, exchange_id='deal-f792',
+                is_filled=False, filled_qty=0.0, fill_price=None,
+            )
+            ctx.close_order(coid)
+            closed = ctx.get_order(coid)
+            assert closed is not None
+            assert closed.closed_ts_ms is not None
+            # The closed row is not live.
+            assert all(r.client_order_id != coid for r in ctx.iter_live_orders())
+
+            # Second lifecycle: same COID, re-created within the same bar.
+            create_entry_order_row(
+                ctx, coid=coid, symbol="EURUSD", side="buy", qty=1.0,
+                intent_key="Long", pine_entry_id="Long",
+                kind=ENTRY_KIND_WORKING, order_type='limit',
+            )
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_SUBMITTED
+            # Revived into the live range.
+            assert row.closed_ts_ms is None
+            live_ids = [r.client_order_id for r in ctx.iter_live_orders()]
+            assert coid in live_ids
+            # Per-lifecycle fields reset: the stale cancelled deal id and any
+            # fill must not carry into the fresh submission.
+            assert row.exchange_order_id is None
+            assert row.filled_qty == 0.0
+        finally:
+            ctx.close()
+
+
 def __test_create_entry_order_row_rejects_bogus_kind__(tmp_path: Path) -> None:
     """An invalid kind raises before any DB write."""
     path = tmp_path / "broker.sqlite"

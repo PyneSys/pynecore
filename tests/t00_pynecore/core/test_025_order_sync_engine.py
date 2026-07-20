@@ -2293,6 +2293,53 @@ def __test_completed_partial_close_retires_state_final_close_dispatches__():
     assert b.cancel_calls == []
 
 
+def __test_same_bar_residual_close_mints_fresh_client_order_id__():
+    """A same-bar close after a filled partial close must NOT reuse its COID.
+
+    ``strategy.close("L", qty=6)`` fills fully; the retirement re-dispatch of
+    ``strategy.close("L")`` for the 4-unit residual can land on the SAME bar
+    (live ``calc_on_every_tick`` syncing). The COID formula is
+    ``run-pid-bar-kind+retry``, so a bare envelope drop would rebuild the
+    identical ``retry_seq=0`` id the filled close already spent — an
+    idempotency-caching venue (Bybit ``orderLinkId``) then returns the
+    already-filled order instead of creating the fresh close, stranding the
+    residual. Retirement must bump ``retry_seq`` for the same-bar window.
+    """
+    from pynecore.core.broker.idempotency import KIND_CLOSE
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    first_coid = b.close_calls[0].client_order_id(KIND_CLOSE)
+
+    # The 6-unit keyed close fills FULLY; 4 units of "L" stay open.
+    fill = replace(
+        _fill_event('sell', 6.0, 50_000.0, pine_id="", leg=LegType.CLOSE),
+        pine_id=None, from_entry="L",
+    )
+    engine._route_event(fill)
+    assert pos.size == 4.0
+
+    # The script closes the residual on the SAME bar.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -4.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS)
+
+    assert len(b.close_calls) == 2
+    assert b.close_calls[1].intent.qty == 4.0
+    second_coid = b.close_calls[1].client_order_id(KIND_CLOSE)
+    assert second_coid != first_coid, \
+        "same-bar residual close reused the spent client_order_id"
+
+
 def __test_partial_close_does_not_redispatch_retained_entry__():
     """A filled partial close must never let the retained market entry re-open exposure.
 
@@ -6366,6 +6413,45 @@ def __test_emulated_exit_flat_skips_non_halting__():
     with pytest.raises(OrderSkippedByPlugin):
         engine._dispatch_new(ex)
     assert b.amend_calls == []  # nothing amended on a flat skip
+
+
+def __test_emulated_filled_entry_side_flip_dispatches_reversal_not_modify__():
+    """A same-Pine-ID opposite-side re-entry after the market entry FILLED is a
+    fresh entry cycle, never a broker amend of the consumed order.
+
+    ``strategy.entry("pos", long)`` fills; the consumed market entry stays in
+    ``_active_intents`` as the sticky diff sentinel. ``strategy.entry("pos",
+    short)`` then collides on the same ``intent_key`` with a different side —
+    before the fix the diff routed it through ``_dispatch_modify`` →
+    ``modify_entry``, amending an already-FILLED market order (cTrader rejects
+    that with ORDER_NOT_FOUND). The dispatch must instead flow through
+    ``_dispatch_new`` — the one-way reversal planner on a hedging plugin —
+    FIFO-closing the long leg and opening the residual short.
+    """
+    from pynecore.core.broker.models import EntryIntent
+    b = MockBroker()
+    b.position_port = b
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["pos"] = _entry_order("pos", 1000.0)
+
+    engine.sync(BAR_TS)
+    assert b.place_leg_calls == [1000.0]  # pure add: long opened via the port
+    engine._route_event(_fill_event('buy', 1000.0, 1.0, pine_id="pos"))
+    assert pos.size == 1000.0
+
+    # Pine reversal: same ID, opposite side; the broker now holds the long leg.
+    pos.entry_orders["pos"] = _entry_order("pos", -1000.0)
+    b.raw_legs = [_pleg("7", "buy", 1000.0, open_time=1.0)]
+    engine.sync(BAR_TS + 60_000)
+
+    assert b.modify_entry_calls == []  # a filled market order is not amendable
+    assert b.close_leg_calls == [("7", 1000)]  # long leg FIFO-closed
+    # Stop-and-reverse fold: 1000 raw + 1000 long = 2000 combined; the
+    # reversal closes 1000 and opens the residual 1000 short.
+    assert b.place_leg_calls == [1000.0, 1000.0]
+    active = engine.active_intents["pos"]
+    assert isinstance(active, EntryIntent)
+    assert active.side == 'sell'
 
 
 def __test_first_sync_drives_one_way_replay_when_emulating__():

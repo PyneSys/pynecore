@@ -4652,7 +4652,10 @@ class OrderSyncEngine:
         reached the broker (the §2.6.7 block-new-entry / native-failsafe
         drops), so the next attempt may safely reuse ``retry_seq=0`` — an
         *exchange reject* means the COID was already spent: the broker saw
-        and refused it. A bare drop would reset the next
+        and refused it. The same holds for a fully FILLED keyed close
+        retired while the position stays open
+        (:meth:`_retire_completed_keyed_close`), which also retires through
+        this path. A bare drop would reset the next
         :meth:`_build_envelope` to ``retry_seq=0`` with the SAME
         ``bar_ts_ms``, rebuilding the identical ``client_order_id`` (the id
         is ``run_tag-pine-bar-kind+retry_seq``). A same-bar retry — which
@@ -8182,7 +8185,16 @@ class OrderSyncEngine:
                 exit_orders.pop(ex_key, None)
         self._active_intents.pop(key, None)
         entry_filled = self._active_entry_filled_qty.get(key)
-        self._drop_envelope(key)
+        # The filled close's COID is SPENT at the exchange — a bare
+        # ``_drop_envelope`` would let a same-bar residual close rebuild the
+        # identical ``retry_seq=0`` id, which idempotency-caching venues
+        # (Bybit ``orderLinkId``) dedupe into the already-filled order
+        # instead of creating the fresh close. Retire through the
+        # reject-path re-anchor so the next same-bar build mints
+        # ``retry_seq + 1``; a later-bar close still gets a clean
+        # current-bar ``retry_seq=0`` COID via the bar-scope discard in
+        # :meth:`_build_envelope`.
+        self._reanchor_envelope_after_reject(key)
         if entry_filled is not None:
             self._active_entry_filled_qty[key] = entry_filled
         _blog_info(
@@ -9729,6 +9741,42 @@ class OrderSyncEngine:
                             "re-dispatching",
                             format_intent_key(key), filled_entry, intent.qty,
                         )
+                        self._active_intents[key] = intent
+                        continue
+                if (isinstance(intent, EntryIntent)
+                        and isinstance(active_intent, EntryIntent)):
+                    # A consumed market entry stays in ``_active_intents`` as
+                    # the sticky diff sentinel, but its broker order is FILLED
+                    # — there is nothing left to amend. A re-emitted same-key
+                    # entry with different parameters (the canonical case:
+                    # ``strategy.entry`` with the SAME Pine id and the
+                    # OPPOSITE side, i.e. a stop-and-reverse) is a fresh
+                    # entry cycle, not a modify. ``_dispatch_modify`` would
+                    # call ``modify_entry`` against the filled order id —
+                    # hedging venues reject that outright (cTrader:
+                    # ORDER_NOT_FOUND on an amend of a filled market order)
+                    # and the default cancel + re-execute path would skip the
+                    # MARKET stop-and-reverse fold and the one-way reversal
+                    # planner. Route through ``_dispatch_new`` instead: the
+                    # netting fold sizes the combined reversal qty and a
+                    # ``position_port`` plugin plans close-then-open legs via
+                    # ``run_reversal``. Only a FULLY consumed prior entry
+                    # qualifies — a partially filled resting order still has
+                    # a live working remainder that the modify path owns.
+                    filled_prev = self._active_entry_filled_qty.get(key, 0.0)
+                    if filled_prev >= active_intent.qty - 1e-9:
+                        _blog_info(
+                            "re-emitted entry %s supersedes a fully filled "
+                            "prior entry (filled=%s) — dispatching a fresh "
+                            "entry cycle instead of modifying the consumed "
+                            "order", format_intent_key(key), filled_prev,
+                        )
+                        try:
+                            self._dispatch_new(intent)
+                        except OrderSkippedByPlugin as e:
+                            _blog_warning("%s", e)
+                            skipped_entry_ids_this_sync.add(intent.pine_id)
+                            continue
                         self._active_intents[key] = intent
                         continue
                 try:

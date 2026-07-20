@@ -650,6 +650,23 @@ def create_entry_order_row(
             f"create_entry_order_row: kind must be one of "
             f"{{ENTRY_KIND_POSITION, ENTRY_KIND_WORKING}}, got {kind!r}"
         )
+    # Reopen a previously-closed row sharing this COID before writing the
+    # fresh submitted fields. ``DispatchEnvelope.client_order_id`` is a pure
+    # function of (run_tag, pine_id, bar_ts_ms, kind, retry_seq), so a Pine
+    # strategy that cancels an order and re-creates it under the same id
+    # within the same bar produces an *identical* COID. The first lifecycle
+    # closed the row (``closed_ts_ms`` set); ``upsert_order`` then takes its
+    # UPDATE path, which does not touch ``closed_ts_ms`` — leaving the
+    # re-created order invisible to ``iter_live_orders`` and therefore to the
+    # cancel sweep, reconcile, and fill-fallback. A later ``strategy.cancel``
+    # finds no live target and degrades to a no-op while the order is still
+    # live on the exchange. Clearing ``closed_ts_ms`` and resetting the
+    # per-lifecycle fields (exchange id, fill) restores true insert semantics
+    # for the fresh submission. Mirrors the plugin-side TP/SL reopen guard.
+    existing = store.get_order(coid)
+    if existing is not None and existing.closed_ts_ms is not None:
+        store.reopen_order(coid)
+        store.upsert_order(coid, exchange_order_id=None, filled_qty=0.0)
     store.upsert_order(
         coid,
         symbol=symbol,
