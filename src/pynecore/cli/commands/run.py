@@ -11,6 +11,7 @@ from pathlib import Path
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from typer import Option, Argument, secho, Exit, colors
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -467,6 +468,133 @@ class _ProviderData:
         self.time_from_ts = time_from_ts
 
 
+def _missing_slots(real_ts: list[int], start_ts: int, end_ts: int,
+                   tf_seconds: int) -> list[int]:
+    """Return the aligned slot start-timestamps in ``[start_ts, end_ts)`` that
+    have no real bar.
+
+    The expected grid is inferred from the real bars themselves — anchored on
+    the newest real bar and stepped back by ``tf_seconds`` — so the reported
+    slots share the feed's phase and only genuinely-absent slots surface. With
+    no real bars the grid phase is unknown and an empty list is returned.
+
+    :param real_ts: Real (non-gap-fill) bar timestamps; need not be sorted.
+    :param start_ts: Inclusive window start (epoch seconds).
+    :param end_ts: Exclusive window end (epoch seconds).
+    :param tf_seconds: Timeframe length in seconds.
+    :return: Sorted list of missing slot start-timestamps.
+    """
+    if tf_seconds <= 0 or not real_ts:
+        return []
+    present = set(real_ts)
+    anchor = max(real_ts)
+    missing: list[int] = []
+    slot = anchor
+    # Walk the grid back from the newest real bar to ``start_ts``.
+    while slot >= start_ts:
+        if start_ts <= slot < end_ts and slot not in present:
+            missing.append(slot)
+        slot -= tf_seconds
+    missing.reverse()
+    return missing
+
+
+def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
+                            tf_seconds: int) -> tuple[list[int], list[int]]:
+    """Split missing slots into in-session anomalies vs closed-session gaps.
+
+    A slot that falls inside a trading session but has no bar is an *anomaly*
+    (incomplete pagination or a venue-omitted tick), while a slot in a
+    known-closed window (weekend, out-of-hours) is an *expected* venue gap.
+    When the symbol carries no ``opening_hours`` (24/7 instrument) every slot
+    is treated as in-session, so any hole is reported as an anomaly.
+
+    :param missing: Missing slot start-timestamps (epoch seconds).
+    :param syminfo: Symbol calendar (``opening_hours``, ``timezone``).
+    :param tf_seconds: Timeframe length in seconds.
+    :return: ``(in_session, closed)`` timestamp lists.
+    """
+    opening_hours = getattr(syminfo, 'opening_hours', None)
+    if not opening_hours:
+        return list(missing), []
+    from pynecore.lib.session import _is_in_session
+    try:
+        tz = ZoneInfo(syminfo.timezone)
+    except Exception:  # noqa: BLE001
+        return list(missing), []
+    in_session: list[int] = []
+    closed: list[int] = []
+    for ts in missing:
+        local_dt = datetime.fromtimestamp(ts, tz)
+        if _is_in_session(opening_hours, local_dt, tf_seconds):
+            in_session.append(ts)
+        else:
+            closed.append(ts)
+    return in_session, closed
+
+
+def _merge_intervals(slots: list[int], tf_seconds: int) -> list[tuple[int, int]]:
+    """Coalesce consecutive grid slots into ``[start, end)`` epoch intervals.
+
+    :param slots: Sorted slot start-timestamps (epoch seconds).
+    :param tf_seconds: Timeframe length in seconds.
+    :return: List of ``(start_ts, end_ts)`` half-open intervals.
+    """
+    if not slots:
+        return []
+    intervals: list[tuple[int, int]] = []
+    run_start = slots[0]
+    prev = slots[0]
+    for ts in slots[1:]:
+        if ts == prev + tf_seconds:
+            prev = ts
+            continue
+        intervals.append((run_start, prev + tf_seconds))
+        run_start = ts
+        prev = ts
+    intervals.append((run_start, prev + tf_seconds))
+    return intervals
+
+
+def _format_missing_report(bar_count: int, real_bars: int, oldest_ts: int | None,
+                           in_session: list[int], closed: list[int],
+                           tf_seconds: int, horizon_reached: bool) -> str:
+    """Build a precise, actionable coverage-shortfall message.
+
+    Distinguishes a venue history-horizon limit (extending ``from`` yields no
+    older bars) from in-session holes (incomplete pagination / omitted ticks),
+    and lists the exact missing intervals for each class instead of a vague
+    sparse-coverage count.
+    """
+    def fmt(ts: int) -> str:
+        return datetime.fromtimestamp(ts, UTC).strftime('%Y-%m-%d %H:%M')
+
+    def fmt_intervals(slots: list[int]) -> str:
+        parts = [f"{fmt(a)}..{fmt(b)}Z" for a, b in _merge_intervals(slots, tf_seconds)]
+        return ', '.join(parts)
+
+    lines = [f"Warning: requested {bar_count} bars, got {real_bars} real bars."]
+    if horizon_reached and oldest_ts is not None:
+        lines.append(
+            f"  Venue history horizon reached: oldest bar the feed serves is "
+            f"{fmt(oldest_ts)}Z. The remaining {bar_count - real_bars} bar(s) "
+            f"predate the venue's available history (not a pagination gap)."
+        )
+    if in_session:
+        lines.append(
+            f"  {len(in_session)} in-session slot(s) missing (incomplete "
+            f"pagination or venue-omitted ticks): {fmt_intervals(in_session)}"
+        )
+    if closed:
+        lines.append(
+            f"  {len(closed)} slot(s) fall in known-closed sessions "
+            f"(expected venue gap): {fmt_intervals(closed)}"
+        )
+    if not horizon_reached and not in_session and not closed:
+        lines.append("  Cause could not be localized from the downloaded range.")
+    return '\n'.join(lines)
+
+
 def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
     """
     Download historical data from a provider and return the result.
@@ -561,6 +689,11 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         task = progress.add_task(
             "Downloading OHLCV data...", total=1, start_time=time_from_dt,
         )
+        # Oldest real bar the venue served on the previous attempt. When a
+        # further-extended ``from`` fails to pull any older bar, the feed's
+        # history horizon is reached and extending again is pointless — we
+        # stop and surface that precise reason instead of burning retries.
+        prev_oldest_ts: int | None = None
         for attempt in range(max_retries + 1):
             with provider_instance as ohlcv_writer:
                 ohlcv_writer.seek(0)
@@ -585,33 +718,66 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
             if bar_count is None:
                 break
 
-            # Count real bars (``volume >= 0``) in the requested range —
-            # gap-fill rows (``volume == -1``) emitted by the OHLCV writer
-            # don't count against the target.
+            # Collect real (``volume >= 0``) bar timestamps in the requested
+            # range — gap-fill rows (``volume == -1``) emitted by the OHLCV
+            # writer don't count against the target.
+            window_from_ts = int(time_from_dt.timestamp())
+            window_to_ts = int(time_to_dt.timestamp())
             with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                real_bars = sum(1 for _ in r.read_from(
-                    int(time_from_dt.timestamp()),
-                    int(time_to_dt.timestamp()),
-                    skip_gaps=True,
-                ))
+                real_ts = [b.timestamp for b in r.read_from(
+                    window_from_ts, window_to_ts, skip_gaps=True,
+                )]
+            real_bars = len(real_ts)
+            oldest_ts = min(real_ts) if real_ts else None
 
             if real_bars >= bar_count:
                 break
-            if attempt == max_retries:
+
+            # History-horizon check: if extending ``from`` earlier did not
+            # surface any older bar than the previous attempt, the venue has
+            # no more history — retrying cannot help, so report precisely now.
+            horizon_reached = (
+                prev_oldest_ts is not None and oldest_ts is not None
+                and oldest_ts >= prev_oldest_ts
+            )
+
+            if horizon_reached or attempt == max_retries:
+                missing_slots = _missing_slots(
+                    real_ts, window_from_ts, window_to_ts, int(tf_seconds),
+                )
+                in_session, closed = _classify_missing_slots(
+                    missing_slots, syminfo, int(tf_seconds),
+                )
                 secho(
-                    f"Warning: requested {bar_count} bars, only got {real_bars} "
-                    f"real bars after {max_retries + 1} attempts (feed has "
-                    f"sparse coverage).",
+                    _format_missing_report(
+                        bar_count, real_bars, oldest_ts,
+                        in_session, closed, int(tf_seconds), horizon_reached,
+                    ),
                     fg=colors.YELLOW,
                 )
                 break
 
-            # Extend the range by the shortfall plus a proportional buffer so
-            # we likely finish in one extra pass instead of retrying again.
+            prev_oldest_ts = oldest_ts
+
+            # Extend the range, anchoring on the oldest bar actually served so
+            # the next pass reaches strictly-older history: request the missing
+            # count of slots before it, plus a multi-day buffer that clears any
+            # single weekend / session gap in one jump. Without the buffer a
+            # weekend between ``from`` and the oldest bar would stall the
+            # oldest cursor and be misread as the venue history horizon. The
+            # over-fetch is harmless — the range is pinned to exactly N real
+            # bars below.
+            anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
             missing = bar_count - real_bars
-            gap_ratio = missing / real_bars if real_bars else 1.0
-            extra_bars = int(missing * (1.0 + gap_ratio)) + 10
-            time_from_dt -= timedelta(seconds=tf_seconds * extra_bars)
+            candidate = (
+                datetime.fromtimestamp(anchor_ts, UTC).replace(tzinfo=None)
+                - timedelta(seconds=tf_seconds * (missing + 10))
+                - timedelta(days=3)
+            )
+            if time_from_dt.tzinfo is not None:
+                candidate = candidate.replace(tzinfo=UTC)
+            # Only ever move the window start earlier.
+            time_from_dt = min(time_from_dt, candidate)
 
     assert provider_instance.ohlcv_path is not None
 

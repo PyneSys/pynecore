@@ -34,6 +34,7 @@ from pynecore.core.broker.models import (
     DispatchEnvelope,
     ExchangeCapabilities,
     ExchangeOrder,
+    ExchangePosition,
     OrderStatus,
     OrderType,
 )
@@ -1931,3 +1932,85 @@ def __test_modify_rejected_after_restart_recovers_ids_from_modify_row__(
             "_order_mapping['L']; an empty attached row must not mask it"
         )
         ctx_b.close()
+
+
+# === Run-ownership isolation on a one-way (netting) venue ==================
+
+
+@dataclass
+class _PositionMockBroker(_MockBroker):
+    """``_MockBroker`` variant that serves a venue net position snapshot."""
+    position: ExchangePosition | None = None
+
+    async def get_position(self, symbol):
+        return self.position
+
+
+def __test_startup_does_not_adopt_a_concurrent_runs_venue_net__(
+        tmp_path: Path,
+) -> None:
+    """A fresh run must not adopt another run's account+symbol exposure.
+
+    Two independent runs share one account+symbol on a one-way venue: run A
+    holds a 0.01 long, then run B starts. B's durable order journal has no
+    rows for the symbol, so B owns nothing of the shared venue net — startup
+    adoption must leave B flat rather than copying A's 0.01 into
+    ``_position.size`` (which later mis-reports A's close as B's external
+    close).
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx_b = _open_ctx(store)
+        broker_b = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=0.01, entry_price=1_900.0,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="isolated",
+            ),
+        )
+        engine_b, pos_b = _mk_engine(broker_b, ctx_b)
+
+        engine_b.reconcile()  # startup adoption
+
+        assert pos_b.size == 0.0, (
+            "run B owns none of the shared venue net — it must stay flat"
+        )
+        assert pos_b.sign == 0.0
+        assert pos_b.open_trades == []
+        ctx_b.close()
+
+
+def __test_startup_adopts_own_open_position_across_restart__(
+        tmp_path: Path,
+) -> None:
+    """A genuine single-run restart still adopts its own venue net in full.
+
+    The run left a 0.01 long open in a prior process; its durable entry row
+    survives with a ``filled_qty`` cursor covering the position. On restart
+    the run owns the whole venue net, so the ownership clamp is a no-op and
+    adoption proceeds exactly as before.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        # Durable evidence of this run's own open long: a filled entry row.
+        ctx.upsert_order(
+            "own-entry", symbol=SYMBOL, side="buy", qty=0.01,
+            state="confirmed", pine_entry_id="L", filled_qty=0.01,
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=0.01, entry_price=1_900.0,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="isolated",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 0.01, "the run owns its whole venue net — adopt it"
+        assert pos.sign == 1.0
+        assert len(pos.open_trades) == 1
+        assert pos.open_trades[0].size == 0.01
+        ctx.close()

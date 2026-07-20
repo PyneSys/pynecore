@@ -2789,6 +2789,63 @@ class OrderSyncEngine:
                 )
         self._attached_adoption_keys.clear()
 
+    def _durable_owned_signed_size(self) -> float:
+        """Net signed size this run owns, from its durable order ledger.
+
+        On a one-way (netting) venue the exchange reports a SINGLE account
+        net position for the symbol — it carries no per-run handle, so two
+        independent runs trading the same account+symbol see each other's
+        exposure folded into that one number. Startup adoption must not
+        copy the whole net into ``_position.size``: a run may only claim
+        the slice its OWN orders produced.
+
+        Reconstruct that slice from the run's persisted order journal — the
+        only per-run-attributable source. Every live order row carries a
+        durable ``filled_qty`` cursor (seeded from the venue's per-order
+        execution history by the plugin's startup adoption baseline before
+        this runs), so the run-owned net is the signed sum of those
+        cursors: a filled buy adds, a filled sell subtracts, resting
+        (unfilled) working orders contribute zero. A brand-new run with no
+        rows for the symbol owns nothing and returns ``0.0``; a genuine
+        restart over its own open position finds its entry row's cursor and
+        returns the full size it left behind.
+
+        Pure-local: read-only over the persisted journal.
+        """
+        if self._store_ctx is None:
+            return 0.0
+        owned = 0.0
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            filled = row.filled_qty
+            if filled == 0.0:
+                continue
+            owned += filled if row.side == 'buy' else -filled
+        return owned
+
+    @staticmethod
+    def _clamp_adoption_to_owned(
+            broker_signed: float, owned_signed: float,
+    ) -> float:
+        """Clamp the adoptable venue net to the run-owned slice.
+
+        A run may adopt only the portion of the venue net that its own
+        orders produced, and never more than actually rests on the venue in
+        that direction:
+
+        - Nothing owned, or a flat venue → adopt nothing.
+        - Owned and venue agree in direction → adopt the smaller magnitude
+          (the run cannot own more than the venue currently shows, and must
+          not absorb another run's slice beyond its own).
+        - Opposite directions (the run's owned history disagrees with the
+          venue's net sign) → adopt nothing rather than guess.
+        """
+        if owned_signed == 0.0 or broker_signed == 0.0:
+            return 0.0
+        if (owned_signed > 0.0) != (broker_signed > 0.0):
+            return 0.0
+        magnitude = min(abs(broker_signed), abs(owned_signed))
+        return magnitude if broker_signed > 0.0 else -magnitude
+
     def reconcile(self) -> None:
         """Read-side position reconciliation with the exchange.
 
@@ -2994,6 +3051,33 @@ class OrderSyncEngine:
                         "unrecognised side label %r",
                         new_size, self._position.size, exch_pos.side,
                     )
+            # Run-ownership isolation: on a one-way (netting) venue the
+            # exchange net folds every run's exposure on this
+            # account+symbol into one number. Adopt only the slice THIS run
+            # can attribute to its own durable order history — otherwise a
+            # fresh run started while another run holds a position would
+            # copy the other run's exposure into ``_position.size`` (and
+            # later mis-report the other run's close as its own external
+            # close). A genuine single-run restart owns the whole net, so
+            # the clamp is a no-op there. Only applies when the durable
+            # journal is available; the store-less unit path keeps the raw
+            # unconditional adoption.
+            if adopt_known and self._store_ctx is not None:
+                owned_signed = self._durable_owned_signed_size()
+                clamped = self._clamp_adoption_to_owned(
+                    broker_signed, owned_signed,
+                )
+                if clamped != broker_signed:
+                    _blog_warning(
+                        "startup adoption limited to run-owned exposure "
+                        "(exchange=%s, owned=%s, internal=%s) — the "
+                        "remaining venue net belongs to another run on "
+                        "this account+symbol",
+                        broker_signed, owned_signed, self._position.size,
+                    )
+                    broker_signed = clamped
+                    if broker_signed == 0.0:
+                        broker_entry_price = 0.0
             if adopt_known and broker_signed != self._position.size:
                 _blog_warning(
                     "position size mismatch (exchange=%s, internal=%s) — "
