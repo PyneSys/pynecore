@@ -12,7 +12,7 @@ import asyncio
 import time
 import threading
 from concurrent import futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -2240,6 +2240,154 @@ def __test_fully_filled_inflight_keyed_close_drops_stale_order_no_redispatch__()
     assert b.modify_exit_calls == []
     assert ("Close entry(s) order L1", "L1") not in pos.exit_orders
     assert "L1" not in engine.active_intents
+
+
+def __test_completed_partial_close_retires_state_final_close_dispatches__():
+    """A later ``strategy.close(id)`` for the residual dispatches after a filled partial close.
+
+    ``strategy.close("L", qty=6)`` against a 10-unit long fills fully, leaving
+    a 4-unit residual under the SAME id. The filled ``CloseIntent`` used to
+    stay in ``_active_intents`` until the whole-position flat teardown, so the
+    later ``strategy.close("L")`` for the residual was blocked (unchanged-skip
+    against the identical slot / in-flight guard / working==0 clamp) and never
+    reached the broker. The working==0 retirement at the fill site must pop
+    the per-id close state (and drop the stale backing order) so the second
+    close dispatches as a fresh intent. The CLOSE fill carries the entry id in
+    ``from_entry`` (the Bybit / cTrader convention) to cover the
+    ``from_entry or pine_id`` key derivation.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 6.0
+
+    # The 6-unit keyed close fills FULLY; 4 units of "L" stay open.
+    fill = replace(
+        _fill_event('sell', 6.0, 50_000.0, pine_id="", leg=LegType.CLOSE),
+        pine_id=None, from_entry="L",
+    )
+    engine._route_event(fill)
+    assert pos.size == 4.0
+
+    # Retirement: slot + stale backing order gone, so the id is closable again.
+    assert "L" not in engine.active_intents
+    assert ("Close entry(s) order L", "L") not in pos.exit_orders
+
+    # The script closes the residual — a genuinely new close on the same id.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -4.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.close_calls) == 2
+    assert b.close_calls[1].intent.pine_id == "L"
+    assert b.close_calls[1].intent.qty == 4.0
+    assert b.cancel_calls == []
+
+
+def __test_partial_close_does_not_redispatch_retained_entry__():
+    """A filled partial close must never let the retained market entry re-open exposure.
+
+    ``strategy.entry("L", 200)`` fills; the consumed market ``Order`` stays in
+    ``entry_orders`` as the sticky diff sentinel. ``strategy.close("L",
+    qty=100)`` collides on the shared ``intent_key``, promotes the slot to the
+    ``CloseIntent`` and fills. On the next sync only the retained
+    ``EntryIntent`` is re-derived — before the fix the diff routed an
+    active-CLOSE-vs-new-ENTRY modify through cancel + re-execute, re-dispatching
+    the ORIGINAL 200-unit market entry (exposure 100 -> 300). The retirement
+    plus the consumed-entry re-anchor guard must keep the entry off the wire,
+    then let the final ``strategy.close("L")`` flatten the residual.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 200.0)
+
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    engine._route_event(_fill_event('buy', 200.0, 1.0, pine_id="L"))
+    assert pos.size == 200.0
+
+    # Partial close: shares the intent key with the retained entry.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -100.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 100.0
+    assert isinstance(engine.active_intents["L"], CloseIntent)
+
+    # The partial close fills fully; 100 units remain open.
+    fill = replace(
+        _fill_event('sell', 100.0, 1.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-close-1"),
+        pine_id="L", from_entry=None,
+    )
+    engine._route_event(fill)
+    assert pos.size == 100.0
+
+    # Next sync re-derives ONLY the retained 200-unit entry. It must re-anchor
+    # as the diff sentinel — never re-dispatch (the historic 200-unit re-entry).
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == 1
+    assert len(b.close_calls) == 1
+    from pynecore.core.broker.models import EntryIntent
+    assert isinstance(engine.active_intents["L"], EntryIntent)
+
+    # The final close for the residual dispatches fresh and flattens.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -100.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.entry_calls) == 1
+    assert len(b.close_calls) == 2
+    assert b.close_calls[1].intent.qty == 100.0
+    final_fill = replace(
+        _fill_event('sell', 100.0, 1.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-close-2"),
+        pine_id="L", from_entry=None,
+    )
+    engine._route_event(final_fill)
+    assert pos.size == 0.0
+
+
+def __test_consumed_entry_reanchors_over_stale_close_slot_without_dispatch__():
+    """The consumed-entry guard alone re-anchors over a stale CloseIntent slot.
+
+    Covers the path the fill-site retirement cannot reach: the active slot
+    still holds a ``CloseIntent`` (e.g. one adopted without a captured backing
+    order) while the only re-derived intent is the retained, fully-consumed
+    market entry. The modify branch must re-anchor the sentinel without any
+    broker round-trip — ``_dispatch_modify``'s mismatched-kinds branch would
+    cancel + re-execute the entry and re-open closed exposure.
+    """
+    from pynecore.core.broker.models import EntryIntent
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 100.0)]
+    retained = _entry_order("L", 200.0)
+    retained.filled_qty = 200.0
+    pos.entry_orders["L"] = retained
+    engine._active_intents["L"] = CloseIntent(
+        pine_id="L", symbol=SYMBOL, side="sell", qty=100.0,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert b.entry_calls == []
+    assert b.close_calls == []
+    assert b.cancel_calls == []
+    assert isinstance(engine.active_intents["L"], EntryIntent)
 
 
 # === Duplicate-fill idempotency gate ===

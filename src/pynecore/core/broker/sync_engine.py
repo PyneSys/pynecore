@@ -660,6 +660,17 @@ class OrderSyncEngine:
         # live in :meth:`_dispatch_new` and accumulated on every matching CLOSE-leg
         # FILL in :meth:`_route_event`.
         self._active_close_filled_qty: dict[str, float] = {}
+        # The Pine-side close ``Order`` instance each dispatched ``CloseIntent``
+        # was built from, keyed by ``CloseIntent.intent_key``. Captured in
+        # :meth:`_dispatch_new` and consumed by
+        # :meth:`_retire_completed_keyed_close`: when a keyed close fully fills
+        # while the position stays non-flat, the retirement must drop exactly
+        # the STALE backing order (so the next sync cannot re-derive and
+        # re-dispatch the already-satisfied close against the residual) while
+        # leaving a FRESH same-key close ``Order`` the script issued in the
+        # meantime untouched — the ``(exit_id, order_id)`` book key cannot
+        # distinguish the two generations, but object identity can.
+        self._close_backing_orders: dict[str, Any] = {}
         # Cumulative fill qty already applied to each in-flight ``EntryIntent``,
         # keyed by ``EntryIntent.intent_key`` (== ``pine_id``). A filled entry
         # deliberately STAYS in ``_active_intents`` — the slot doubles as the
@@ -3838,16 +3849,39 @@ class OrderSyncEngine:
             # ``record_fill``'s own gate (``fill_qty > 0``) and cap at the active
             # qty so a duplicated / over-reported FILL cannot drive working below
             # zero.
-            if event.leg_type == LegType.CLOSE and event.pine_id is not None:
-                active_close = self._active_intents.get(event.pine_id)
+            # The closed entry id rides ``event.from_entry`` on plugins that
+            # report a close as the entry's exit (Bybit, cTrader) and
+            # ``event.pine_id`` on plugins where the closing activity
+            # references the entry's own exchange id (Capital.com) — the same
+            # fallback pair :meth:`_cleanup_closed_position` resolves on. The
+            # keyed ``CloseIntent`` slot is keyed by that entry id.
+            close_key = event.from_entry or event.pine_id
+            if event.leg_type == LegType.CLOSE and close_key is not None:
+                active_close = self._active_intents.get(close_key)
                 if isinstance(active_close, CloseIntent):
                     fill_qty_value = event.fill_qty or 0.0
                     if fill_qty_value > 0.0:
-                        prev = self._active_close_filled_qty.get(event.pine_id, 0.0)
+                        prev = self._active_close_filled_qty.get(close_key, 0.0)
                         total = prev + fill_qty_value
                         if total > active_close.qty:
                             total = active_close.qty
-                        self._active_close_filled_qty[event.pine_id] = total
+                        self._active_close_filled_qty[close_key] = total
+                        # The keyed close is now FULLY satisfied while the
+                        # position stays open (another entry's exposure, or
+                        # this id's own residual after a partial close). The
+                        # slot / ledger / envelope would otherwise be retired
+                        # only by the whole-position flat teardown, so a
+                        # legitimately NEW ``strategy.close(id)`` for the
+                        # residual would be indistinguishable from the
+                        # already-satisfied close and silently blocked (the
+                        # in-flight CloseIntent guard / working==0 clamp).
+                        # Retire the per-id close state now so the next keyed
+                        # close on this id dispatches as a fresh intent.
+                        if (total >= active_close.qty - 1e-9
+                                and self._position.size != 0.0):
+                            self._retire_completed_keyed_close(
+                                close_key, active_close,
+                            )
             # Symmetric ledger bump for ENTRY-leg fills: the entry intent
             # stays in ``_active_intents`` after a fill (it is the diff
             # sentinel for the sticky Pine order), but ``record_fill`` has
@@ -4600,6 +4634,10 @@ class OrderSyncEngine:
         # ``_dispatch_new`` reset) keeps lifecycle ownership explicit and prevents
         # unbounded growth across many distinct close ids.
         self._active_close_filled_qty.pop(key, None)
+        # The captured backing-order pin dies with the close's envelope — a
+        # later close cycle on the same key re-captures its own instance in
+        # :meth:`_dispatch_new`.
+        self._close_backing_orders.pop(key, None)
         # Same lifecycle for the entry-side fill ledger (short-gate residual
         # reservation): seeded in :meth:`_dispatch_new`, read by
         # :meth:`_enforce_short_gate`, retired here with the envelope.
@@ -8068,16 +8106,91 @@ class OrderSyncEngine:
         """
         exit_orders = self._position.exit_orders
         for ex_key in list(exit_orders.keys()):
-            order = exit_orders[ex_key]
-            exit_id = order.exit_id
-            if exit_id == CLOSE_ALL_EXIT_ID:
-                order_pine_id = ""
-            elif exit_id and exit_id.startswith(CLOSE_EXIT_ID_PREFIX):
-                order_pine_id = order.order_id or ""
-            else:
-                continue
+            order_pine_id = self._close_order_pine_id(exit_orders[ex_key])
             if order_pine_id == intent.pine_id:
                 exit_orders.pop(ex_key, None)
+
+    @staticmethod
+    def _close_order_pine_id(order: Any) -> str | None:
+        """Invert a close ``Order`` to the ``CloseIntent.pine_id`` it derives.
+
+        ``build_intents`` maps a ``strategy.close_all`` order
+        (``exit_id == CLOSE_ALL_EXIT_ID``) to ``pine_id == ""`` and a
+        ``strategy.close(id)`` order (``exit_id`` prefixed with
+        ``CLOSE_EXIT_ID_PREFIX``) to ``pine_id == order.order_id``. Returns
+        ``None`` for anything else (persistent ``strategy.exit`` brackets
+        never produce a ``CloseIntent``).
+        """
+        exit_id = order.exit_id
+        if exit_id == CLOSE_ALL_EXIT_ID:
+            return ""
+        if exit_id and exit_id.startswith(CLOSE_EXIT_ID_PREFIX):
+            return order.order_id or ""
+        return None
+
+    def _capture_close_backing_order(self, intent: CloseIntent) -> None:
+        """Remember which Pine close ``Order`` backs a just-dispatched close.
+
+        Called from :meth:`_dispatch_new` when a ``CloseIntent`` reaches the
+        broker. :meth:`_retire_completed_keyed_close` later needs the exact
+        instance: the ``(exit_id, order_id)`` book key is shared by every
+        close generation on the same id, so only object identity can tell
+        the dispatched close's stale order from a fresh one the script
+        issued after the fill.
+        """
+        for order in self._position.exit_orders.values():
+            if self._close_order_pine_id(order) == intent.pine_id:
+                self._close_backing_orders[intent.intent_key] = order
+                return
+
+    def _retire_completed_keyed_close(
+            self, key: str, active_close: CloseIntent,
+    ) -> None:
+        """Retire a fully-filled keyed close while the position is non-flat.
+
+        A keyed ``strategy.close(id)`` whose working qty reached zero is
+        terminal, but the whole-position flat teardown never runs while the
+        book stays open (the id's own residual after a partial close, or
+        other entries). Left in place, the filled ``CloseIntent`` slot makes
+        a subsequent ``strategy.close(id)`` for the residual
+        indistinguishable from the satisfied close: the rebuilt intent either
+        compares equal to the slot (unchanged-skip), hits the in-flight
+        CloseIntent guard, or is zero-clamped by the working==0 reservation —
+        and the key collision with the retained parent ``EntryIntent`` can
+        even route a ``CLOSE -> ENTRY`` modify that re-opens exposure.
+
+        Retirement drops the slot, the envelope/anchors/fill ledger
+        (:meth:`_drop_envelope`) and the STALE backing Pine order — matched
+        by object identity so a fresh same-key close the script already
+        issued survives. ``_order_mapping`` is deliberately KEPT: the
+        retained parent ``EntryIntent`` re-emitted next sync then re-anchors
+        through the diff's adoption branch instead of re-dispatching the
+        consumed market entry. The parent's entry-fill ledger is preserved
+        across the key-generic :meth:`_drop_envelope` for the same reason
+        (short-gate reservation, consumed-entry detection).
+
+        Only closes this engine dispatched are retired — without a captured
+        backing order (e.g. a recovered close anchor adopted after restart)
+        the tombstone semantics are left untouched.
+        """
+        backing = self._close_backing_orders.get(key)
+        if backing is None:
+            return
+        exit_orders = self._position.exit_orders
+        for ex_key in list(exit_orders.keys()):
+            if exit_orders[ex_key] is backing:
+                exit_orders.pop(ex_key, None)
+        self._active_intents.pop(key, None)
+        entry_filled = self._active_entry_filled_qty.get(key)
+        self._drop_envelope(key)
+        if entry_filled is not None:
+            self._active_entry_filled_qty[key] = entry_filled
+        _blog_info(
+            "keyed close %s fully filled (qty=%s) with the position still "
+            "open — close state retired; a later close on this id "
+            "dispatches fresh",
+            format_intent_key(key), active_close.qty,
+        )
 
     # === Restart-time Pine-side bracket reconstruction ===
 
@@ -9588,6 +9701,36 @@ class OrderSyncEngine:
                             active_intent.symbol, intent.side, intent.symbol,
                         )
                     continue
+                if (isinstance(intent, EntryIntent)
+                        and isinstance(active_intent, CloseIntent)):
+                    # A consumed market entry stays in ``entry_orders`` as the
+                    # sticky diff sentinel, but ``CloseIntent`` shares
+                    # ``intent_key == pine_id`` with it — a keyed close on the
+                    # same id promotes the slot to the CloseIntent, and once
+                    # that close's backing order vanishes, the re-emitted
+                    # retained entry collides here as an
+                    # active-CLOSE-vs-new-ENTRY modify. ``_dispatch_modify``'s
+                    # mismatched-kinds branch is cancel + re-execute, which
+                    # would re-dispatch the ORIGINAL market entry and re-open
+                    # already-closed exposure. When the entry has already
+                    # fully filled (its slice lives in ``_position``), the
+                    # only correct action is to re-anchor the slot as the
+                    # sentinel without any broker round-trip.
+                    entry_order = self._position.entry_orders.get(intent.pine_id)
+                    filled_entry = self._active_entry_filled_qty.get(key, 0.0)
+                    if (entry_order is not None
+                            and entry_order.filled_qty > filled_entry):
+                        filled_entry = entry_order.filled_qty
+                    if filled_entry >= intent.qty - 1e-9:
+                        _blog_info(
+                            "re-emitted entry %s already consumed "
+                            "(filled=%s qty=%s) — re-anchoring the diff "
+                            "sentinel over the retired close without "
+                            "re-dispatching",
+                            format_intent_key(key), filled_entry, intent.qty,
+                        )
+                        self._active_intents[key] = intent
+                        continue
                 try:
                     self._dispatch_modify(self._active_intents[key], intent)
                 except OrderSkippedByPlugin as e:
@@ -10956,6 +11099,10 @@ class OrderSyncEngine:
                 # ledger so a stale value from an earlier close cycle on the same
                 # ``pine_id`` cannot make the clamp under-reserve the fresh close.
                 self._active_close_filled_qty[intent.intent_key] = 0.0
+                # Pin the backing Pine order instance so the working==0
+                # retirement can drop exactly this generation's order (see
+                # :meth:`_retire_completed_keyed_close`).
+                self._capture_close_backing_order(intent)
             # The dispatch reached the broker. If this envelope carries a
             # reject bump (retry_seq > 0) it was NOT journaled at build time —
             # persist it now so the live order's bumped COID survives a restart.
