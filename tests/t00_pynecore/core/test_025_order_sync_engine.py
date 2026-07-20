@@ -682,10 +682,12 @@ def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
     # broker, then the process crashes BEFORE the bump is journaled. On
     # restart the journal holds NO anchor for "L", but the working order is
     # live under the retry_seq=1 COID. Without adoption the engine would mint
-    # a fresh retry_seq=0 id (a different COID the plugin dedup cannot match)
-    # and double-open. The startup scan + build-time adoption must instead
-    # rebuild the exact live COID — even when the script re-emits the entry on
-    # a LATER bar than the one the order was placed on.
+    # a fresh retry_seq=0 id and double-open. The startup scan must instead
+    # BIND the live working order to the re-declared entry intent so the diff
+    # adopts it and dispatches NO fresh order — even when the script re-emits
+    # the entry on a LATER bar than the one the order was placed on — while the
+    # recovered anchor is still journaled so a modify/cancel rebuilds the exact
+    # live COID.
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
 
@@ -708,10 +710,9 @@ def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
 
         engine.sync(later_bar)  # script re-emits "L" on a later bar
 
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].bar_ts_ms == BAR_TS
-        assert b.entry_calls[0].retry_seq == 1
-        assert b.entry_calls[0].client_order_id(KIND_ENTRY) == bumped_coid
+        # The live order is adopted, not re-dispatched: no duplicate is sent.
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
         # The adoption journaled the recovered anchor — a second restart keeps it.
         ctx.close()
@@ -725,6 +726,114 @@ def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
         assert anchor is not None
         assert anchor.bar_ts_ms == BAR_TS
         assert anchor.retry_seq == 1
+
+
+def __test_restart_adopted_entry_is_cancelled_not_duplicated__(tmp_path):
+    """Restart binds the live entry order and a later cancel retires it.
+
+    Reproduces the Capital.com / cTrader restart-adoption incident: phase A
+    leaves a live entry working order; phase B re-declares the SAME entry. The
+    first post-restart diff must ADOPT the live order (no second dispatch — the
+    duplicate the venues created because they do not dedup working orders by
+    client id), and when the script later drops the entry (``strategy.cancel``)
+    the adopted order is retired instead of stranded.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        b.open_orders = [_live_working_order(live_coid, order_id="wo-1")]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        # First post-restart sync: adopt the live order, dispatch NOTHING.
+        engine.sync(BAR_TS + 60_000)
+
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+        assert "L" in engine._active_intents  # type: ignore[attr-defined]
+
+        # strategy.cancel(): the script stops declaring the entry.
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS + 120_000)
+
+        # The adopted order is cancelled at the venue; still no duplicate entry.
+        assert len(b.entry_calls) == 0
+        assert len(b.cancel_calls) == 1
+        assert "L" not in engine._order_mapping  # type: ignore[attr-defined]
+        assert "L" not in engine._active_intents  # type: ignore[attr-defined]
+
+
+def __test_clean_restart_equal_journal_anchor_adopts_not_duplicates__(tmp_path):
+    """A CLEAN restart with journal and live order in agreement adopts, never duplicates.
+
+    The exact reported incident shape (capitalcom.md / ctrader.md): phase A
+    dispatches the entry THROUGH the engine, so the journal holds the
+    retry_seq=0 envelope anchor; the process stops cleanly; phase B restarts
+    with the working order still live under that same COID and the journal
+    intact. Journal anchor == live anchor (same bar, retry 0 vs 0) — the two
+    stores agree it is the SAME dispatch, so the first post-restart diff must
+    bind the live order to the re-declared intent and dispatch NOTHING, and a
+    later ``strategy.cancel`` must retire the adopted order.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import KIND_ENTRY
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        # --- Phase A: normal run dispatches the entry, journaling its envelope.
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        assert len(b.entry_calls) == 1
+        live_coid = b.entry_calls[0].client_order_id(KIND_ENTRY)
+        ctx.close()  # clean stop
+
+        # --- Phase B: restart — journal intact, working order live at the venue.
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        b2 = MockBroker()
+        b2.open_orders = [_live_working_order(live_coid, order_id="wo-1")]
+        pos2 = BrokerPosition()
+        engine2 = OrderSyncEngine(
+            broker=b2,  # type: ignore[arg-type]
+            position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx2,
+        )
+        pos2.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        engine2.sync(BAR_TS + 60_000)
+
+        # No duplicate entry is dispatched; the live order is bound as the
+        # active intent.
+        assert len(b2.entry_calls) == 0
+        assert engine2._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+        assert "L" in engine2._active_intents  # type: ignore[attr-defined]
+
+        # strategy.cancel(): the adopted order is retired, still no duplicate.
+        del pos2.entry_orders["L"]
+        engine2.sync(BAR_TS + 120_000)
+
+        assert len(b2.entry_calls) == 0
+        assert len(b2.cancel_calls) == 1
+        assert "L" not in engine2._order_mapping  # type: ignore[attr-defined]
+        assert "L" not in engine2._active_intents  # type: ignore[attr-defined]
 
 
 def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
@@ -833,9 +942,9 @@ def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
 
         engine.sync(BAR_TS + 60_000)
 
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].bar_ts_ms == BAR_TS
-        assert b.entry_calls[0].retry_seq == 1
+        # Both live legs are bound to the entry intent; nothing is re-dispatched.
+        assert len(b.entry_calls) == 0
+        assert sorted(engine._order_mapping["L"]) == ["live-b", "live-e"]  # type: ignore[attr-defined]
 
 
 def __test_restart_adopts_wire_form_live_entry_coid__(tmp_path):
@@ -874,10 +983,10 @@ def __test_restart_adopts_wire_form_live_entry_coid__(tmp_path):
 
         engine.sync(BAR_TS + 60_000)  # script re-emits "L" on a later bar
 
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].bar_ts_ms == BAR_TS
-        assert b.entry_calls[0].retry_seq == 1
-        assert b.entry_calls[0].client_order_id(KIND_ENTRY) == wire_coid
+        # The wire-form live order is bound to the intent and adopted, not
+        # re-dispatched; the recovered anchor is still journaled below.
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
         # The adoption journaled the recovered anchor — a restart keeps it.
         ctx.close()
@@ -961,8 +1070,9 @@ def __test_restart_scan_connection_error_skips_sync_and_retries__(tmp_path):
         engine.sync(BAR_TS)  # broker recovered -> scan + adoption
 
         assert engine._restart_entry_scan_done is True  # type: ignore[attr-defined]
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].retry_seq == 1
+        # Once the live order is visible it is adopted, not re-dispatched.
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
 
 # === Read-path backstop: untranslated transient faults park, never crash ===
@@ -1542,8 +1652,9 @@ def __test_restart_scan_raw_retryable_provider_error_parks_and_retries__(tmp_pat
         engine.sync(BAR_TS)  # broker recovered -> scan + adoption
 
         assert engine._restart_entry_scan_done is True  # type: ignore[attr-defined]
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].retry_seq == 1
+        # Once the live order is visible it is adopted, not re-dispatched.
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
 
 # === Write-path backstop: untranslated dispatch transients halt, never dup ===
@@ -1651,9 +1762,9 @@ def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
 
         engine.sync(BAR_TS)
 
-        assert len(b.entry_calls) == 1
-        assert b.entry_calls[0].bar_ts_ms == BAR_TS
-        assert b.entry_calls[0].retry_seq == 2
+        # The higher same-bar live order is bound and adopted, not re-dispatched.
+        assert len(b.entry_calls) == 0
+        assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
 
 def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
@@ -2290,6 +2401,58 @@ def __test_completed_partial_close_retires_state_final_close_dispatches__():
     assert len(b.close_calls) == 2
     assert b.close_calls[1].intent.pine_id == "L"
     assert b.close_calls[1].intent.qty == 4.0
+    assert b.cancel_calls == []
+
+
+def __test_inverse_undershoot_partial_close_retires_on_filled_event__():
+    """An inverse partial close retires on the order's ``filled`` flag, not exact base sum.
+
+    On an inverse contract the plugin converts each CLOSE fill from whole
+    contracts back to base at the dispatch anchor, so the summed base
+    typically UNDERSHOOTS the requested ``CloseIntent.qty`` by up to one
+    contract's worth (~1e-5 BTC on BTCUSD) — orders of magnitude beyond the
+    ``1e-9`` base tolerance the accumulation gate used. Retirement therefore
+    never fired for inverse, the filled ``CloseIntent`` slot lingered, and the
+    later keyed ``strategy.close(id)`` for the residual was suppressed (the
+    live-inverse bug). The venue-authoritative ``event_type == "filled"`` flag
+    must drive retirement regardless of the base-conversion residue, so the
+    residual's fresh close still dispatches.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 10.0)]
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 6.0
+
+    # The keyed close fills FULLY at the venue, but the contracts->base
+    # conversion lands the accumulated base 6e-5 SHORT of the 6.0 request —
+    # far beyond ``1e-9``. Only the ``filled`` flag proves terminality.
+    fill = replace(
+        _fill_event('sell', 5.99994, 50_000.0, pine_id="", leg=LegType.CLOSE),
+        pine_id=None, from_entry="L", event_type='filled',
+    )
+    engine._route_event(fill)
+    assert pos.size == pytest.approx(4.00006)
+
+    # Retirement fired despite the base undershoot: slot + backing order gone.
+    assert "L" not in engine.active_intents
+    assert ("Close entry(s) order L", "L") not in pos.exit_orders
+
+    # The residual's fresh keyed close now dispatches instead of being blocked.
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -pos.size, order_type=_order_type_close, exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.close_calls) == 2
+    assert b.close_calls[1].intent.pine_id == "L"
     assert b.cancel_calls == []
 
 

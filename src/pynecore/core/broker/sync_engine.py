@@ -1129,6 +1129,16 @@ class OrderSyncEngine:
         # ``pid_hash`` (not ``pine_id``) because the COID hash is one-way; the
         # builder forward-hashes ``intent.pine_id`` to match.
         self._restart_live_entry_anchors: dict[str, tuple[int, int]] = {}
+        # Live exchange order ids for the same snapshot, keyed by ``pid_hash``.
+        # The COID-anchor snapshot above only rebuilds a byte-identical
+        # ``client_order_id``; it does NOT stop the first post-restart diff from
+        # re-dispatching the re-declared entry. Any venue that does not treat the
+        # client id as a working-order idempotency key (Capital.com, cTrader,
+        # ...) then double-opens. :meth:`_hydrate_restart_entry_adoptions` seeds
+        # ``_order_mapping`` from these ids so the cross-restart adoption branch
+        # in :meth:`_diff_and_dispatch` binds the live order as the active
+        # intent instead of sending a duplicate.
+        self._restart_live_entry_order_ids: dict[str, list[str]] = {}
         # Wire-form sibling of the snapshot above, for short-budget venues
         # (``coid_max_len`` below the canonical width). A wire id only
         # carries ``run_tag`` / ``bar_ts_ms`` / ``kind`` raw — the ``pid``
@@ -1139,6 +1149,11 @@ class OrderSyncEngine:
         # over a bounded ``retry_seq`` scan and comparing the re-encoded
         # wire form (see :meth:`_maybe_adopt_restart_entry_anchor`).
         self._restart_live_wire_entry_orders: list[tuple[str, int, str]] = []
+        # Live exchange order id for each wire snapshot entry, keyed by the
+        # echoed wire ``client_order_id`` — the wire counterpart of
+        # :attr:`_restart_live_entry_order_ids`, resolved after the forward-hash
+        # match binds the wire order to its ``pine_id``.
+        self._restart_live_wire_order_id_by_coid: dict[str, str] = {}
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
@@ -3877,8 +3892,25 @@ class OrderSyncEngine:
                         # in-flight CloseIntent guard / working==0 clamp).
                         # Retire the per-id close state now so the next keyed
                         # close on this id dispatches as a fresh intent.
-                        if (total >= active_close.qty - 1e-9
-                                and self._position.size != 0.0):
+                        #
+                        # Terminal is signalled by the venue reporting the
+                        # close order fully filled (``event_type == "filled"``),
+                        # NOT only by the accumulated base reaching
+                        # ``active_close.qty``: on an inverse contract the
+                        # plugin converts each fill from contracts back to base
+                        # at the dispatch anchor, so the summed base can
+                        # undershoot the requested qty by up to one contract's
+                        # worth (e.g. ~1e-5 BTC on BTCUSD) — far beyond the
+                        # ``1e-9`` base tolerance. Keying off the order's own
+                        # completion flag makes retirement grid-agnostic; the
+                        # base threshold stays as the fallback for plugins /
+                        # paths that report incremental fills without a
+                        # terminal ``filled`` event.
+                        close_complete = (
+                            event.event_type == "filled"
+                            or total >= active_close.qty - 1e-9
+                        )
+                        if close_complete and self._position.size != 0.0:
                             self._retire_completed_keyed_close(
                                 close_key, active_close,
                             )
@@ -8610,6 +8642,12 @@ class OrderSyncEngine:
         intents = self._restore_adopted_partial_bracket_classification(intents)
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 
+        # Bind any live broker entry orders the restart scan discovered to the
+        # re-declared Pine entry intents BEFORE the dispatch loop, so the
+        # cross-restart adoption branch adopts them instead of re-dispatching a
+        # duplicate (see :meth:`_hydrate_restart_entry_adoptions`).
+        self._hydrate_restart_entry_adoptions(new_map)
+
         # Pine semantic: when an entry intent fails to dispatch in this same
         # sync (e.g. plugin reports qty below venue minimum), a bracket exit
         # that references it via ``from_entry`` is a silent no-op — same as
@@ -9980,7 +10018,9 @@ class OrderSyncEngine:
         """
         orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
         by_pid: dict[str, set[tuple[int, int]]] = {}
+        order_ids_by_pid: dict[str, list[str]] = {}
         wire_orders: list[tuple[str, int, str]] = []
+        wire_order_id_by_coid: dict[str, str] = {}
         for order in orders:
             coid = order.client_order_id
             if not coid:
@@ -9995,6 +10035,8 @@ class OrderSyncEngine:
                         and wire.run_tag == self._run_tag
                         and wire.kind in (KIND_ENTRY, KIND_ENTRY_STOP)):
                     wire_orders.append((coid, wire.bar_ts_ms, wire.kind))
+                    if order.id:
+                        wire_order_id_by_coid[coid] = order.id
                 continue
             if (parsed.run_tag != self._run_tag
                     or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
@@ -10002,10 +10044,16 @@ class OrderSyncEngine:
             by_pid.setdefault(parsed.pid_hash, set()).add(
                 (parsed.bar_ts_ms, parsed.retry_seq),
             )
+            if order.id:
+                order_ids_by_pid.setdefault(parsed.pid_hash, []).append(order.id)
         adopted: dict[str, tuple[int, int]] = {}
+        adopted_order_ids: dict[str, list[str]] = {}
         for pid_hash, anchors in by_pid.items():
             if len(anchors) == 1:
                 adopted[pid_hash] = next(iter(anchors))
+                ids = order_ids_by_pid.get(pid_hash)
+                if ids:
+                    adopted_order_ids[pid_hash] = ids
             else:
                 _blog_warning(
                     "restart entry-anchor scan: ambiguous live orders for "
@@ -10013,12 +10061,94 @@ class OrderSyncEngine:
                     "reconcile", pid_hash, sorted(anchors),
                 )
         self._restart_live_entry_anchors = adopted
+        self._restart_live_entry_order_ids = adopted_order_ids
         self._restart_live_wire_entry_orders = wire_orders
+        self._restart_live_wire_order_id_by_coid = wire_order_id_by_coid
         if adopted or wire_orders:
             _blog_info(
                 "restart entry-anchor scan: %d live entry order(s) available "
                 "for COID adoption (%d wire-form)",
                 len(adopted) + len(wire_orders), len(wire_orders),
+            )
+
+    def _hydrate_restart_entry_adoptions(self, new_map: dict[str, Intent]) -> None:
+        """Bind live broker entry orders to their re-declared Pine intents.
+
+        :meth:`_scan_live_entry_anchors_for_restart` snapshots every live entry
+        working order this run already owns. The COID-anchor adoption in
+        :meth:`_maybe_adopt_restart_entry_anchor` only rebuilds a byte-identical
+        ``client_order_id`` — it does NOT stop the first post-restart diff from
+        dispatching the re-declared entry again. Venues that do not treat the
+        client id as a working-order idempotency key (Capital.com, cTrader)
+        then double-open, raising live exposure. Seed :attr:`_order_mapping`
+        from the live exchange order id here, before the dispatch loop, so the
+        cross-restart adoption branch in :meth:`_diff_and_dispatch` pins the
+        entry as the active intent and sends no fresh order. A later
+        ``strategy.cancel`` retires the adopted order through the normal
+        cancellation diff.
+
+        Binds when the live order IS this intent's dispatch: fresh-mint
+        outright (no journal anchor survived), a same-bar EQUAL anchor (the
+        clean-restart shape — journal and venue agree on the exact dispatch,
+        the reported Capital.com / cTrader duplicate incident), or a same-bar
+        HIGHER live retry (an ACKed reject bump that crashed before
+        journaling, adopted by :meth:`_maybe_adopt_restart_entry_anchor` at
+        build time). A cross-bar or lower-retry live order is an orphan the
+        journal anchor overrides — it is left for reconcile, and the entry
+        re-dispatches under the journal anchor as before.
+
+        Runs once per restart: each snapshot entry is consumed on match, and a
+        seeded ``_order_mapping`` slot blocks a second bind on the next sync.
+        """
+        if not (self._restart_live_entry_anchors
+                or self._restart_live_wire_entry_orders):
+            return
+        for key, intent in new_map.items():
+            if not isinstance(intent, EntryIntent):
+                continue
+            if key in self._active_intents or key in self._order_mapping:
+                continue
+            pid_hash = hash_pine_id(intent.pine_id)
+            anchor = self._restart_live_entry_anchors.get(pid_hash)
+            order_ids = self._restart_live_entry_order_ids.get(pid_hash)
+            matched_wire: list[str] = []
+            if anchor is None:
+                anchor, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
+                if anchor is None:
+                    continue
+                order_ids = [
+                    self._restart_live_wire_order_id_by_coid[coid]
+                    for coid in matched_wire
+                    if coid in self._restart_live_wire_order_id_by_coid
+                ]
+            if not order_ids:
+                continue
+            bar_ts_ms, retry_seq = anchor
+            current = self._persisted_envelope_anchors.get(key)
+            if current is not None and not (
+                    bar_ts_ms == current.bar_ts_ms
+                    and retry_seq >= current.retry_seq):
+                # The journal anchor stays authoritative — the live order is a
+                # cross-bar / lower-retry orphan. Leave it for reconcile; the
+                # entry re-dispatches under the journal anchor.
+                continue
+            self._restart_live_entry_order_ids.pop(pid_hash, None)
+            if current is not None and retry_seq == current.retry_seq:
+                # Clean restart: journal and venue hold the SAME anchor, so
+                # there is nothing for :meth:`_maybe_adopt_restart_entry_anchor`
+                # to re-journal — consume the snapshot entry here so the
+                # build-time scan does not keep matching it.
+                self._restart_live_entry_anchors.pop(pid_hash, None)
+                if matched_wire:
+                    self._restart_live_wire_entry_orders = [
+                        entry for entry in self._restart_live_wire_entry_orders
+                        if entry[0] not in matched_wire
+                    ]
+            self._order_mapping[key] = list(dict.fromkeys(order_ids))
+            _blog_info(
+                "restart: binding %d live entry order(s) to intent %s "
+                "(adopting instead of re-dispatching)",
+                len(self._order_mapping[key]), format_intent_key(key),
             )
 
     def _maybe_adopt_restart_entry_anchor(
