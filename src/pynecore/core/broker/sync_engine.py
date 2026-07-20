@@ -32,6 +32,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
+from concurrent import futures
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
@@ -41,6 +42,7 @@ from pynecore.core.broker.exceptions import (
     ClientOrderIdSpentError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -172,6 +174,19 @@ still be allowed to flatten the adopted position rather than be dropped.
 """
 
 CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
+
+#: Seconds a broker read may stay unresolved past its bridge timeout before the
+#: engine stops dispatching. A read that outran ``execute_timeout`` is retained
+#: (see :meth:`OrderSyncEngine._submit_read`) and every later read parks behind
+#: it, which silently disables reconciliation — while ``sync`` would otherwise
+#: keep dispatching, because the periodic reconcile runs *after*
+#: ``_diff_and_dispatch`` and swallows its connection error. Trading on a
+#: position view that can no longer be refreshed is exactly the ambiguity
+#: :class:`BrokerManualInterventionError` exists for, so past this grace the
+#: engine fails closed instead of ordering blind. The ``BrokerPlugin`` contract
+#: does not oblige a read implementation to enforce its own finite timeout, so
+#: Core cannot assume the request eventually expires on its own.
+READ_STUCK_GRACE_S = 60.0
 """Default stale-grace window (seconds) for cancel-tentative resolution.
 
 A pending-entry partial bracket leg may enter ``cancel_tentative`` when
@@ -527,6 +542,25 @@ class OrderSyncEngine:
         self._coid_max_len = broker.client_order_id_max_len
         self._loop = event_loop
         self._timeout = execute_timeout
+        #: Concurrent future of a read that outran ``_timeout`` and is therefore
+        #: still running on the loop. ``result(timeout=...)`` only abandons the
+        #: *wait*, never the coroutine, so the bridge keeps ownership and parks
+        #: the next read instead of stacking a second one on the same
+        #: connection. Released on the first cycle that finds it resolved.
+        self._inflight_read: futures.Future[Any] | None = None
+        #: ``False`` while the broker view could not be refreshed: every read
+        #: since the last success has failed, been parked by a gate, or outran
+        #: the bridge wait. :meth:`_guard_stuck_reads` refuses to open new
+        #: exposure until a real read restores confirmation.
+        self._read_view_confirmed = True
+        #: Monotonic timestamp at which confirmation was lost. Drives the
+        #: :data:`READ_STUCK_GRACE_S` fail-closed check in :meth:`sync`.
+        #: ``0.0`` while the view is confirmed.
+        self._reads_unconfirmed_since = 0.0
+        #: Monotonic deadline until which broker reads are parked after a venue
+        #: rate limit, honouring the ``retry_after`` the venue asked for.
+        #: ``0.0`` means "not throttled".
+        self._read_backoff_until = 0.0
         self._reconcile_every = reconcile_every_n_syncs
         self._mintick = mintick
         # Tick-grid factors for the native fail-safe rounding (mintick ==
@@ -1770,6 +1804,18 @@ class OrderSyncEngine:
         # also called from contexts that don't pre-drain (e.g. tests, the
         # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
+        # Fail closed if the broker view can no longer be refreshed: never open
+        # new exposure against a position state the engine could not re-read.
+        # Runs BEFORE the restart scans and ``_verify_pending_dispatches``
+        # below, because each of those reads through the same bridge and bails
+        # out of ``sync`` with an ``ExchangeConnectionError`` of its own — a
+        # guard placed after them would never be reached on exactly the wedged
+        # runs it exists to catch, so the grace halt could never latch. The
+        # verdict is kept for the rest of the cycle: ``_diff_and_dispatch``
+        # (which gates only its exposure-opening ``EntryIntent`` branches) and
+        # ``_drive_entry_stop_triggers`` can both open new exposure and must
+        # obey it too.
+        may_open_exposure = self._guard_stuck_reads()
         # One-time restart scan of live broker entry orders, so a bumped COID
         # the crash window dropped before journaling can be adopted at build
         # time (see :meth:`_scan_live_entry_anchors_for_restart` and
@@ -1864,7 +1910,13 @@ class OrderSyncEngine:
         # reconcile. No-op on short-capable venues / when nothing is at risk.
         self._reconcile_short_gate_after_fill()
 
-        self._diff_and_dispatch(dispatchable)
+        # The diff itself always runs, even on an unconfirmed view: it is also
+        # what cancels orders the script dropped and what dispatches
+        # ``strategy.close`` / protective exits. Skipping it wholesale would
+        # leave an obsolete resting entry live and block a requested flatten
+        # for the whole grace window. Only the exposure-opening branches inside
+        # it obey ``may_open_exposure``.
+        self._diff_and_dispatch(dispatchable, may_open_exposure=may_open_exposure)
         # Fill-time short-gate safety net AFTER the diff: a cross-restart
         # recovered resting sell lands in ``_order_mapping`` (via
         # :meth:`_verify_pending_dispatches`) but NOT ``_active_intents`` — the
@@ -1892,7 +1944,13 @@ class OrderSyncEngine:
         # native LIMIT and (only once that cancel is confirmed) fires a
         # MARKET order. Latched cancel_pending / stop_market_pending watches
         # are re-driven here too (restart / retry), independent of price.
-        self._drive_entry_stop_triggers(last_price=last_price)
+        # Gated on the read guard: this path ends in ``execute_entry``, so a
+        # cycle that must not open exposure has to skip it as well. The state
+        # machine is latched and idempotent, so deferring it one cycle is safe.
+        # The partial-bracket and native-failsafe drivers above deliberately
+        # stay ungated — they protect or reduce existing exposure.
+        if may_open_exposure:
+            self._drive_entry_stop_triggers(last_price=last_price)
         # Drain native failsafe dispatches into the plugin dispatcher
         # (§2.6 worst-SL drive loop). The manager accumulates snapshots
         # via the leg state-change listener / ``recompute_worst_sl``;
@@ -8410,7 +8468,20 @@ class OrderSyncEngine:
             corrected.append(intent)
         return corrected
 
-    def _diff_and_dispatch(self, intents: list[Intent]) -> None:
+    def _diff_and_dispatch(
+            self, intents: list[Intent], *, may_open_exposure: bool = True,
+    ) -> None:
+        """Diff the freshly built intents against the live state and dispatch.
+
+        :param intents: The dispatchable intents built for this sync.
+        :param may_open_exposure: ``False`` when :meth:`_guard_stuck_reads`
+            could not confirm the broker position view this cycle. Cancels,
+            adoption, orphan sweeps and every exposure-reducing dispatch
+            (``ExitIntent`` / ``CloseIntent``) still run — only new and
+            modified ``EntryIntent`` dispatches are deferred, because those
+            are the ones that could open exposure against a position state
+            the engine could not re-read.
+        """
         intents = self._restore_adopted_partial_bracket_classification(intents)
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 
@@ -8850,6 +8921,20 @@ class OrderSyncEngine:
                     self._dispatch_cancel(old)
 
         for key, intent in new_map.items():
+            if not may_open_exposure and isinstance(intent, EntryIntent):
+                # Unconfirmed broker view (see :meth:`_guard_stuck_reads`):
+                # an entry is the only intent kind that can open exposure, so
+                # it is the only one deferred here. Both the fresh-dispatch and
+                # the modify branch are covered — an amend can raise qty or
+                # move the level closer, which opens exposure just as much.
+                # The key stays in ``new_map``, so the cancellation loop above
+                # does not mistake the deferral for a strategy-side cancel.
+                _blog_warning(
+                    "entry intent %r deferred — broker position view "
+                    "unconfirmed this cycle; retrying next sync",
+                    format_intent_key(key),
+                )
+                continue
             if key not in self._active_intents:
                 # Refuse-and-defer guard for un-landed forced cancels. The
                 # engine decided this working order must be cancelled — the
@@ -14273,6 +14358,237 @@ class OrderSyncEngine:
             timeout=self._timeout,
         )
 
+    def _mark_reads_confirmed(self) -> None:
+        """Record that a read round trip completed, refreshing the broker view."""
+        self._read_view_confirmed = True
+        self._reads_unconfirmed_since = 0.0
+
+    def _mark_reads_unconfirmed(self) -> None:
+        """Record that the broker view could not be refreshed.
+
+        Idempotent: the loss timestamp is stamped once, so the grace measures
+        the whole unconfirmed stretch rather than restarting on every retry.
+        """
+        if self._read_view_confirmed:
+            self._read_view_confirmed = False
+            self._reads_unconfirmed_since = time.monotonic()
+
+    def _collect_retained_read(self) -> tuple[Any, Exception | None] | None:
+        """Release a resolved retained read, handing back its outcome verbatim.
+
+        No-op while nothing is retained or the retained read is still running.
+        The outcome is never dropped: a late fault must keep its identity (an
+        :class:`ExchangeRateLimitError` still carries the ``retry_after`` the
+        venue asked for), and a late value is the caller's to use.
+
+        :return: ``None`` when there was nothing to collect; otherwise
+            ``(value, None)`` on success or ``(None, fault)`` on failure.
+        """
+        inflight = self._inflight_read
+        if inflight is None or not inflight.done():
+            return None
+        self._inflight_read = None
+        try:
+            return inflight.result(), None
+        except Exception as exc:
+            return None, exc
+
+    def _guard_stuck_reads(self) -> bool:
+        """Halt before dispatching if broker reads have been wedged too long.
+
+        A read that outran ``execute_timeout`` is retained by
+        :meth:`_submit_read` and parks every later read behind it. That alone is
+        survivable — reads are idempotent and the engine retries — but the
+        periodic reconcile runs *after* ``_diff_and_dispatch`` and swallows its
+        ``ExchangeConnectionError`` with a warning, so nothing else stops the
+        engine from continuing to place and modify orders against a position
+        view it can no longer refresh. Past :data:`READ_STUCK_GRACE_S` that is
+        no longer a transient blip, so the engine latches a manual-intervention
+        halt instead of trading blind.
+
+        A retained read that has *already* resolved is collected here rather
+        than left for the periodic reconcile at the end of ``sync``: that runs
+        after ``_diff_and_dispatch``, so a late fault would only surface once an
+        order had gone out. A late terminal fault (a permanent misconfiguration)
+        propagates before any order can land.
+
+        The verdict tracks :attr:`_read_view_confirmed`, not merely "is a read
+        stuck". Every state in which the view could not be refreshed gates
+        dispatch the same way — a wedged read, a fault, an unexpired venue
+        rate-limit backoff (which parks reads outright, so nothing is retained
+        to inspect), and a late value that arrived too long after its cycle to
+        be applied. Confirmation is not assumed back: the engine issues a real
+        :meth:`reconcile` here, *before* dispatch rather than after it, so the
+        position it is about to trade against has actually been re-read. Only
+        when that fails for longer than :data:`READ_STUCK_GRACE_S` does the
+        engine latch a manual-intervention halt instead of trading blind.
+
+        No-op while reads are healthy.
+
+        :return: ``True`` when dispatch may proceed this cycle.
+        :raises BrokerManualInterventionError: When the view has been
+            unconfirmable for longer than :data:`READ_STUCK_GRACE_S`.
+        """
+        collected = self._collect_retained_read()
+        if collected is not None:
+            # Whatever it produced, that read belonged to an earlier cycle: its
+            # fault is stale news and its value is a snapshot nothing applied.
+            # Either way the current view is unconfirmed until the re-read below
+            # lands.
+            self._mark_reads_unconfirmed()
+            _, late = collected
+            if late is not None:
+                translated = self._translate_read_fault(late)
+                if not isinstance(translated, ExchangeConnectionError):
+                    raise translated from late
+                _blog_warning(
+                    "broker read failed after the bridge stopped waiting: %s",
+                    translated,
+                )
+        if self._read_view_confirmed:
+            return True
+
+        # The view is known stale. Re-read it now instead of dispatching on it:
+        # a success restores confirmation (``_submit_read`` flips the flag) and
+        # applies the broker's own position state, which is the whole point of
+        # gating here rather than trusting the reconcile that runs after the
+        # diff. A connection error keeps the run alive — reads are idempotent,
+        # so the next cycle simply tries again.
+        try:
+            self.reconcile()
+        except ExchangeConnectionError as e:
+            _blog_warning(
+                "broker view could not be re-read before dispatch: %s", e,
+            )
+        if self._read_view_confirmed:
+            return True
+
+        unconfirmed_for = time.monotonic() - self._reads_unconfirmed_since
+        if unconfirmed_for <= READ_STUCK_GRACE_S:
+            _blog_warning(
+                "dispatch skipped: broker position view unconfirmed for "
+                "%.0fs — deferring new exposure to the next cycle",
+                unconfirmed_for,
+            )
+            return False
+        halt = BrokerManualInterventionError(
+            f"Broker reads have been unusable for {unconfirmed_for:.0f}s "
+            f"(grace {READ_STUCK_GRACE_S:.0f}s): position state can no longer "
+            f"be refreshed, so further dispatch would trade blind — manual "
+            f"intervention required",
+            context={
+                'symbol': self._symbol,
+                'unconfirmed_for_s': round(unconfirmed_for, 1),
+                'grace_s': READ_STUCK_GRACE_S,
+                'execute_timeout_s': self._timeout,
+            },
+        )
+        self._record_halt(halt)
+        raise halt
+
+    def _submit_read(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """Run a read on the broker loop, owning its in-flight future.
+
+        Differs from :meth:`_run_async` in that the submitted future is retained
+        rather than dropped. ``result(timeout=...)`` abandons only the *wait* —
+        the coroutine keeps running on the loop — so a bridge that forgets it
+        lets the next cycle stack a second concurrent read on the same
+        connection (three consecutive timeouts leave three live reads). Plugins
+        whose read wraps a blocking request in ``asyncio.to_thread`` with a
+        request timeout longer than ``execute_timeout`` hit this on every slow
+        venue response, filling the shared executor and delaying order writes
+        behind stale reads.
+
+        Two pre-flight gates park the read instead of issuing it: an unexpired
+        venue rate-limit backoff, and an unresolved previous read. Both close the
+        unsubmitted coroutine (so it cannot warn "was never awaited") and raise
+        :class:`ExchangeConnectionError`, which the engine's existing park-and-
+        retry sites already handle. Reads are idempotent, so skipping a cycle is
+        always safe.
+
+        The rate-limit gate is checked before the loop-less fallback: pacing the
+        venue is a property of the venue, not of how the coroutine happens to be
+        driven. In-flight tracking is loop-only by nature — the fallback runs the
+        coroutine to completion inline, so nothing can be left pending.
+
+        :param coro: A read-only broker coroutine.
+        :return: The coroutine's result.
+        :raises ExchangeConnectionError: When the read is parked by a gate.
+        """
+        remaining = self._read_backoff_until - time.monotonic()
+        if remaining > 0.0:
+            coro.close()
+            self._mark_reads_unconfirmed()
+            raise ExchangeConnectionError(
+                f"broker reads rate-limited for another {remaining:.1f}s",
+            )
+        self._read_backoff_until = 0.0
+
+        if self._loop is None:
+            try:
+                value = asyncio.run(coro)
+            except BaseException:
+                self._mark_reads_unconfirmed()
+                raise
+            self._mark_reads_confirmed()
+            return value
+
+        inflight = self._inflight_read
+        if inflight is not None:
+            if not inflight.done():
+                coro.close()
+                self._mark_reads_unconfirmed()
+                raise ExchangeConnectionError(
+                    "previous broker read is still in flight",
+                )
+            collected = self._collect_retained_read()
+            if collected is not None and collected[1] is not None:
+                # The abandoned read terminated with a fault after the bridge
+                # had stopped waiting. Surface it now, dropping the fresh
+                # coroutine unsent, so the caller's translation still runs —
+                # a late ``ExchangeRateLimitError`` would otherwise have its
+                # ``retry_after`` silently discarded and the venue hammered on
+                # the very next cycle. A late *successful* value is dropped
+                # here: it predates this cycle, so a fresh read is issued
+                # instead, and the view stays unconfirmed until that lands.
+                coro.close()
+                self._mark_reads_unconfirmed()
+                raise collected[1]
+
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        self._inflight_read = future
+        self._mark_reads_unconfirmed()
+        try:
+            value = future.result(timeout=self._timeout)
+        except TimeoutError:
+            # The wait was abandoned, but the coroutine can complete inside the
+            # race window between the timeout firing and this handler. Consume
+            # whatever it produced rather than dropping it on the floor: a late
+            # ``retry_after`` must still pace the venue, and a terminal fault
+            # must not be reduced to a transient bridge timeout.
+            raced = self._collect_retained_read()
+            if raced is None:
+                # Genuinely still running: keep ownership so the next cycle
+                # parks until this read resolves — at the latest when the
+                # plugin's own request timeout expires. Deliberately NOT
+                # cancelled: cancelling the bridge future flips it to ``done``
+                # immediately while the loop task is still unwinding, which
+                # would reopen the gate and let a second read stack on top of
+                # the one still in flight.
+                raise
+            raced_value, raced_fault = raced
+            if raced_fault is not None:
+                raise raced_fault
+            self._mark_reads_confirmed()
+            return raced_value
+        except BaseException:
+            # Resolved with a fault: ownership ends here, the caller translates.
+            self._inflight_read = None
+            raise
+        self._inflight_read = None
+        self._mark_reads_confirmed()
+        return value
+
     def _run_async_read(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Run a read-only broker query, parking an untranslated transient fault.
 
@@ -14284,13 +14600,19 @@ class OrderSyncEngine:
         next bar instead of crashing the live run. Reads are idempotent, so a
         blind retry next bar is always safe.
 
-        Three transient shapes are caught:
+        Four transient shapes are caught:
 
         - a retryable :class:`~pynecore.core.plugin.ProviderError` (the sanctioned
           convention — a plugin whose wire faults subclass it, e.g. cTrader);
         - stdlib :class:`ConnectionError` and :class:`TimeoutError` (a plugin that
           lets a raw socket / timeout fault propagate, or a wedged dispatch-bridge
-          ``result(timeout=...)`` — safe to park on a read since nothing mutated).
+          ``result(timeout=...)`` — safe to park on a read since nothing mutated);
+        - :class:`~pynecore.core.broker.exceptions.ExchangeRateLimitError` (a venue
+          ``429`` / "too many requests" hit during routine polling — a purely
+          transient throttle that must never terminate a live run). The venue's
+          ``retry_after`` is recorded as a read backoff deadline and enforced by
+          :meth:`_submit_read`, so the following cycles park locally instead of
+          hammering the venue for the interval it asked to be left alone.
 
         A non-retryable ``ProviderError`` (a permanent misconfiguration — unknown
         symbol, bad account mode) is re-raised unchanged: it must fail loud, not
@@ -14306,13 +14628,39 @@ class OrderSyncEngine:
             fault.
         """
         try:
-            return self._run_async(coro)
-        except ProviderError as exc:
+            return self._submit_read(coro)
+        except Exception as exc:
+            translated = self._translate_read_fault(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
+
+    def _translate_read_fault(self, exc: Exception) -> Exception:
+        """Map a read-side fault onto the engine's recoverable taxonomy.
+
+        Shared by :meth:`_run_async_read` and :meth:`_guard_stuck_reads` so a
+        fault reaches the same verdict whether it surfaces on the read call or
+        is collected later from a retained future (see :meth:`_submit_read`).
+
+        :param exc: The raw fault raised by the broker coroutine.
+        :return: The exception to raise — ``exc`` itself when it must propagate
+            unchanged (a permanent misconfiguration, or anything outside the
+            transient shapes).
+        """
+        if isinstance(exc, ExchangeRateLimitError):
+            # Honour the interval the venue asked for. Without it the next sync
+            # reads again immediately (``calc_on_every_tick`` syncs on every
+            # market update), which prolongs the throttle, burns quota and can
+            # escalate a transient 429 into a venue ban.
+            self._read_backoff_until = time.monotonic() + max(0.0, exc.retry_after)
+            return ExchangeConnectionError(str(exc) or "exchange rate limit hit")
+        if isinstance(exc, ProviderError):
             if is_retryable_provider_error(exc):
-                raise ExchangeConnectionError(str(exc) or "connection lost") from exc
-            raise
-        except (ConnectionError, TimeoutError) as exc:
-            raise ExchangeConnectionError(str(exc) or "connection lost") from exc
+                return ExchangeConnectionError(str(exc) or "connection lost")
+            return exc
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return ExchangeConnectionError(str(exc) or "connection lost")
+        return exc
 
     def _run_async_write(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Run a disposition-ambiguous order dispatch, halting on an untranslated fault.

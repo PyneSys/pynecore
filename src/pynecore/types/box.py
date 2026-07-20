@@ -4,16 +4,17 @@ from dataclasses import dataclass
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
 from .na import NA
+from .pine_types import PyneFloat, PyneInt
 
 
 @dataclass(slots=True, eq=False)
 class Box:
     # Required parameters - coordinates (``na`` when set from a chart.point that lacks the
     # corresponding coordinate for the active xloc)
-    left: int | NA  # Bar index or UNIX time
-    top: float | NA  # Price of the top border
-    right: int | NA  # Bar index or UNIX time
-    bottom: float | NA  # Price of the bottom border
+    left: PyneInt  # Bar index or UNIX time
+    top: PyneFloat  # Price of the top border
+    right: PyneInt  # Bar index or UNIX time
+    bottom: PyneFloat  # Price of the bottom border
 
     # Optional parameters with defaults
     border_color: Optional[_color.Color] = None

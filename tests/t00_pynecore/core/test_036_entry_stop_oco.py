@@ -15,6 +15,7 @@ configurable cancel disposition, verifying:
 """
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 
 from pynecore.core.broker.models import (
@@ -28,6 +29,7 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.exceptions import ExchangeRateLimitError
 from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_STOP
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.store_helpers import (
@@ -35,6 +37,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_STOP_STATE_CANCEL_PENDING,
 )
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.lib.strategy import Order, _order_type_entry
 
 
 SYMBOL = "EURUSD"
@@ -223,6 +226,51 @@ def __test_stop_cross_under_quarantine_cancels_limit_never_fires_market__():
     assert eng._entry_stop_engine.get_watch("Long") is None  # settled
     eng._drive_entry_stop_triggers(last_price=1.19)
     assert broker.entries == []                   # dropped, never re-fired
+
+
+def __test_stale_read_defers_stop_fired_market_then_fires_when_reads_recover__():
+    """A cycle whose broker read failed must not fire the stop MARKET.
+
+    The stop-fired MARKET bypasses ``_dispatch_new`` and POSTs ``execute_entry``
+    directly, so gating ``_diff_and_dispatch`` alone would let it open new
+    exposure on a position view the engine could not refresh. Unlike the
+    quarantine gate this only *defers*: the watch stays live and the latched,
+    idempotent state machine fires on the next healthy sync."""
+    broker = _FakeBroker(_caps(),
+                         cancel_outcome=CancelDispositionOutcome.CANCEL_CONFIRMED)
+    pos = BrokerPosition()
+    eng = OrderSyncEngine(
+        broker, pos, SYMBOL, run_tag="tts0", mintick=0.0001,
+    )
+    _arm(eng, _both_set_entry())
+    broker.entries.clear()
+    # Keep the entry live in the Pine order book, otherwise the diff would
+    # legitimately cancel it and retire the watch before the stop can fire.
+    pos.entry_orders["Long"] = Order(
+        "Long", 1.0, order_type=_order_type_entry, limit=1.16, stop=1.18,
+    )
+
+    # A retained read that has already failed with a venue 429 — collected by
+    # the pre-dispatch guard, which then disallows exposure for this cycle.
+    stale = Future()
+    stale.set_exception(ExchangeRateLimitError("error.too-many.requests",
+                                              retry_after=30.0))
+    eng._inflight_read = stale
+
+    eng.sync(1_700_000_000_000, last_price=1.185)
+
+    assert broker.entries == [], "stop MARKET fired on a stale position view"
+    watch = eng._entry_stop_engine.get_watch("Long")
+    assert watch is not None, "the watch must be deferred, not settled"
+
+    # Reads healthy again -> the deferred cross fires on the next sync.
+    eng._read_backoff_until = 0.0
+    eng.sync(1_700_000_060_000, last_price=1.185)
+
+    assert len(broker.entries) == 1
+    market_intent, _ = broker.entries[0]
+    assert market_intent.order_type == OrderType.MARKET
+    assert market_intent.stop_fired_market is True
 
 
 def __test_market_pending_retry_under_quarantine_settles_without_post__():

@@ -8,7 +8,7 @@ _registry: list[LineFill] = []
 
 
 # noinspection PyShadowingBuiltins
-def new(line1: Line, line2: Line, color: _color.Color) -> LineFill | NA[LineFill]:
+def new(line1: Line, line2: Line, color: _color.Color) -> LineFill:
     """
     Creates a new linefill object and displays it on the chart, filling the space between line1 and
     line2 with the color specified in color.
@@ -55,7 +55,7 @@ def delete(id: LineFill) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def get_line1(id: LineFill) -> Line | NA:
+def get_line1(id: LineFill) -> Line:
     """
     Returns the ID of the first line used in the id linefill.
 
@@ -68,7 +68,7 @@ def get_line1(id: LineFill) -> Line | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_line2(id: LineFill) -> Line | NA:
+def get_line2(id: LineFill) -> Line:
     """
     Returns the ID of the second line used in the id linefill.
 

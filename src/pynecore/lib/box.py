@@ -6,6 +6,7 @@ from ..core.module_property import module_property
 from ..types.base import next_vid
 from ..types.box import Box
 from ..types.na import NA, na_int, na_float
+from ..types.pine_types import PyneFloat, PyneInt
 from ..types.chart import ChartPoint
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
@@ -377,7 +378,7 @@ def set_xloc(id: Box, left: int, right: int, xloc: _xloc.XLoc) -> None:
 # Getter methods
 
 # noinspection PyShadowingBuiltins
-def get_bottom(id: Box) -> float | NA:
+def get_bottom(id: Box) -> PyneFloat:
     """Returns the price value of the bottom border of the box."""
     if isinstance(id, NA):
         return NA(float)
@@ -385,7 +386,7 @@ def get_bottom(id: Box) -> float | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_left(id: Box) -> int | NA:
+def get_left(id: Box) -> PyneInt:
     """
     Returns the bar index or the UNIX time (depending on the last value used for 'xloc') of the
     left border of the box.
@@ -396,7 +397,7 @@ def get_left(id: Box) -> int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_right(id: Box) -> int | NA:
+def get_right(id: Box) -> PyneInt:
     """
     Returns the bar index or the UNIX time (depending on the last value used for 'xloc') of the
     right border of the box.
@@ -407,7 +408,7 @@ def get_right(id: Box) -> int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_top(id: Box) -> float | NA:
+def get_top(id: Box) -> PyneFloat:
     """Returns the price value of the top border of the box."""
     if isinstance(id, NA):
         return NA(float)

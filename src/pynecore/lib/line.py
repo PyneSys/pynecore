@@ -6,6 +6,7 @@ from ..types.chart import ChartPoint
 from ..types.base import next_vid
 from ..types.line import LineEnum, Line
 from ..types.na import NA, na_int, na_float
+from ..types.pine_types import PyneFloat, PyneInt
 from ..lib import xloc as _xloc, extend as _extend, color as _color
 from ..lib import linefill as _linefill
 from .. import lib
@@ -163,7 +164,7 @@ def copy(id):
 
 
 # noinspection PyShadowingBuiltins
-def get_x1(id: Line) -> int | NA:
+def get_x1(id: Line) -> PyneInt:
     """
     Returns UNIX time or bar index (depending on the last xloc value set) of the first point of the line.
 
@@ -176,7 +177,7 @@ def get_x1(id: Line) -> int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_y1(id: Line) -> float | NA:
+def get_y1(id: Line) -> PyneFloat:
     """
     Returns price of the first point of the line.
 
@@ -189,7 +190,7 @@ def get_y1(id: Line) -> float | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_x2(id: Line) -> int | NA:
+def get_x2(id: Line) -> PyneInt:
     """
     Returns UNIX time or bar index (depending on the last xloc value set) of the second point of the line.
 
@@ -202,7 +203,7 @@ def get_x2(id: Line) -> int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_y2(id: Line) -> float | NA:
+def get_y2(id: Line) -> PyneFloat:
     """
     Returns price of the second point of the line.
 
@@ -398,7 +399,7 @@ def set_y2(id: Line, y: float) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def get_price(id: Line, x: int) -> float | NA:
+def get_price(id: Line, x: int) -> PyneFloat:
     """
     Returns the price level of a line at a given bar index.
 

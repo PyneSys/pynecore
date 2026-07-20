@@ -4,6 +4,7 @@ from typing import Optional
 from ..lib import color as _color, xloc as _xloc, yloc as _yloc, size as _size, text as _text, font as _font
 from .base import StrLiteral
 from .na import NA
+from .pine_types import PyneFloat, PyneInt
 
 
 class LabelStyleEnum(StrLiteral):
@@ -14,8 +15,8 @@ class LabelStyleEnum(StrLiteral):
 class Label:
     # Required parameters (``na`` when set from a chart.point that lacks the corresponding
     # coordinate for the active xloc)
-    x: int | NA  # Bar index or UNIX time
-    y: int | float | NA  # Price of the label position
+    x: PyneInt  # Bar index or UNIX time
+    y: PyneInt | PyneFloat  # Price of the label position
     text: str = ""  # Label text
     
     # Optional parameters with defaults

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import queue
 import signal
@@ -37,6 +38,118 @@ from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
+
+
+#: Task name given to :func:`_drain_loop_tasks`, used to keep a drain from
+#: cancelling a sibling drain (only possible when the teardown is invoked twice
+#: on a loop whose first drain outran its wait — the drain must never abort
+#: another drain).
+_DRAIN_NAME = "_drain_loop_tasks"
+
+
+async def _drain_loop_tasks() -> None:
+    """Cancel and await every task on the running loop except this one.
+
+    Runs on the broker event loop itself (scheduled by :func:`_drain_then_stop`).
+    Mirrors the standard ``asyncio.runners._cancel_all_tasks`` shutdown: request
+    cancellation on all sibling tasks, then await them so each finishes
+    unwinding — closing its WebSocket transport and cancelling its own child
+    tasks — before the loop is stopped and closed. ``return_exceptions=True``
+    keeps a task that re-raises something other than ``CancelledError`` from
+    aborting the drain.
+    """
+    current = asyncio.current_task()
+    pending = [
+        task for task in asyncio.all_tasks()
+        if task is not current and task.get_name() != _DRAIN_NAME
+    ]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _drain_then_stop(loop: "Any") -> None:
+    """Start the task drain on the loop, then stop the loop once it completes.
+
+    Runs *on* the loop thread (scheduled with ``call_soon_threadsafe``), which
+    is what makes the teardown self-contained: the coroutine is created only at
+    the moment a task can be built from it, and ``loop.stop`` fires from the
+    drain's completion callback rather than from the caller. A caller that
+    stops waiting therefore leaves the teardown running to completion instead
+    of stranding a half-scheduled drain — the loop still stops, just later.
+
+    :param loop: The broker event loop being torn down.
+    """
+    task = loop.create_task(_drain_loop_tasks(), name=_DRAIN_NAME)
+
+    def _on_drained(drain: "Any") -> None:
+        if not drain.cancelled():
+            # Retrieve any exception so it is not reported as never-retrieved.
+            _ = drain.exception()
+        loop.stop()
+
+    task.add_done_callback(_on_drained)
+
+
+def _shutdown_broker_event_loop(
+    loop: "Any",
+    thread: "threading.Thread | None",
+    timeout: float,
+) -> bool:
+    """
+    Tear down the broker event-loop pump thread, then close the loop.
+
+    The loop runs ``run_forever`` on ``thread``; ``loop.stop()`` must be
+    scheduled onto the loop thread with ``call_soon_threadsafe`` because the
+    caller lives on a different (Pine script) thread. ``loop.close()`` is only
+    safe once ``run_forever`` has actually returned — closing a still-running
+    loop raises ``RuntimeError: Cannot close a running event loop``. This joins
+    the thread first and only closes when the loop has genuinely stopped, so a
+    slow-to-drain pump can never crash the CLI exit.
+
+    :param loop: The broker event loop to stop and close.
+    :param thread: The thread running ``loop.run_forever`` (``None`` if the
+        pump never started).
+    :param timeout: Maximum seconds to wait for the loop thread to exit.
+        Non-positive means wait forever, matching the ``--shutdown-timeout``
+        contract honoured by :mod:`pynecore.core.live_runner`.
+    :return: ``True`` if the loop was closed; ``False`` if it was still running
+        after ``timeout`` (left open, not closed, to avoid the
+        close-while-running crash).
+    """
+    # Cancel and await every task still living on the loop BEFORE stopping it.
+    # The broker's private order-event stream (``run_event_stream`` →
+    # ``watch_orders``) and its WebSocket receive/ping loops are long-lived
+    # tasks that the graceful public-data disconnect does not reach. Closing the
+    # loop while they are pending destroys them mid-await, producing
+    # ``Task was destroyed but it is pending`` warnings and
+    # ``RuntimeError: Event loop is closed`` at process exit — the exact failure
+    # a strategy exception (which skips the normal completion summary) surfaces.
+    # Draining here, while ``run_forever`` is still turning the loop, lets each
+    # task observe its cancellation and unwind cleanly (closing its socket)
+    # instead of being abandoned. The drain and the subsequent ``loop.stop`` are
+    # chained together *on the loop thread* so that giving up on the wait below
+    # never strands a partially scheduled teardown.
+    join_timeout = timeout if timeout > 0 else None
+    try:
+        if thread is not None and thread.is_alive() and loop.is_running():
+            loop.call_soon_threadsafe(_drain_then_stop, loop)
+        else:
+            loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        # Loop already stopped or closed — nothing to signal.
+        pass
+    if thread is not None:
+        thread.join(timeout=join_timeout)
+    # Gate close() on the loop having actually stopped rather than assuming the
+    # join succeeded within ``timeout``. A join timeout leaves the thread alive
+    # and the loop running; closing it then raises RuntimeError.
+    if loop.is_running():
+        return False
+    loop.close()
+    return True
 
 console = Console()
 
@@ -1062,8 +1175,7 @@ def run(
                 )
                 raise Exit(1)
 
-            import asyncio as _asyncio
-            broker_event_loop = _asyncio.new_event_loop()
+            broker_event_loop = asyncio.new_event_loop()
             # Drive the loop on a dedicated daemon thread. Broker plugin
             # coroutines are submitted from the (synchronous) Pine script
             # thread via ``run_coroutine_threadsafe``, which requires the
@@ -1609,14 +1721,16 @@ def run(
                 broker_store_ctx.close()
             if broker_store is not None:
                 broker_store.close()
-            # Stop the broker event-loop pump thread before process exit.
-            # ``call_soon_threadsafe`` is required because the loop runs on
-            # a different thread than the one issuing the stop.
+            # Stop the broker event-loop pump thread before process exit, then
+            # close the loop only once its thread has actually exited
+            # ``run_forever``. Closing a still-running loop raises
+            # ``RuntimeError: Cannot close a running event loop``.
             if broker_event_loop is not None:
-                try:
-                    broker_event_loop.call_soon_threadsafe(broker_event_loop.stop)  # type: ignore[call-arg]
-                except RuntimeError:
-                    pass
-                if broker_event_loop_thread is not None:
-                    broker_event_loop_thread.join(timeout=5.0)
-                broker_event_loop.close()
+                if not _shutdown_broker_event_loop(
+                    broker_event_loop, broker_event_loop_thread, shutdown_timeout,
+                ):
+                    broker_warning(
+                        "Broker event loop did not stop within %.0fs; "
+                        "leaving it open to avoid a close-while-running crash.",
+                        shutdown_timeout,
+                    )

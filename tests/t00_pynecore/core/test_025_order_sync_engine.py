@@ -9,7 +9,9 @@ A stubbed :attr:`lib._script.initial_capital` keeps
 from __future__ import annotations
 
 import asyncio
+import time
 import threading
+from concurrent import futures
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +25,7 @@ from pynecore.core.broker.exceptions import (
     ClientOrderIdSpentError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
     InsufficientMarginError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -31,6 +34,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
     OrderSyncEngine,
+    READ_STUCK_GRACE_S,
     _SEEN_FILL_IDS_CAP,
     _SETTLED_DEFENSIVE_CLOSE_IDS_CAP,
     _BoundedIdSet,
@@ -117,6 +121,9 @@ class MockBroker:
     false_on_next_cancel: bool = False
     raise_on_next_get_open_orders: Exception | None = None
     raise_on_next_get_position: Exception | None = None
+    #: Number of ``get_position`` reads that actually reached the broker. Used to
+    #: prove a rate-limit backoff parks the read locally instead of issuing it.
+    get_position_calls: int = 0
     # The mock emulates a margin-style venue (shorts and reversals are the
     # bread and butter of the engine tests) — declare short_selling so the
     # projected-position gate stays out of the way; the dedicated short-gate
@@ -239,6 +246,7 @@ class MockBroker:
         return list(self.open_orders)
 
     async def get_position(self, symbol):
+        self.get_position_calls += 1
         if self.raise_on_next_get_position is not None:
             err = self.raise_on_next_get_position
             self.raise_on_next_get_position = None
@@ -989,6 +997,501 @@ def __test_reconcile_read_stdlib_connection_and_timeout_map_to_exchange_connecti
         engine, _ = _mk_engine(b)
         with pytest.raises(ExchangeConnectionError):
             engine.reconcile()
+
+
+def __test_reconcile_read_rate_limit_maps_to_exchange_connection__():
+    """A venue rate limit (``error.too-many.requests`` -> ``ExchangeRateLimitError``)
+    on the reconcile ``get_position`` read is a transient throttle: it maps to
+    ``ExchangeConnectionError`` so the engine parks + retries instead of the run
+    dying. Mirrors the real Capital.com ``GET /positions`` 429 crash."""
+    b = MockBroker()
+    b.raise_on_next_get_position = ExchangeRateLimitError(
+        "API error occured: error.too-many.requests", retry_after=1.0,
+    )
+    engine, _ = _mk_engine(b)
+    with pytest.raises(ExchangeConnectionError):
+        engine.reconcile()
+
+
+def __test_sync_skips_periodic_reconcile_rate_limit_then_recovers__():
+    """End-to-end: a venue rate limit during periodic ``get_position`` polling
+    parks the reconcile and keeps the live run going, then recovers on the next
+    poll once the throttle clears. Sibling of the connection-error test — proves a
+    recoverable 429 never terminates the run.
+
+    Also pins the pacing contract: while the venue's ``retry_after`` interval is
+    unexpired the engine must park the read *locally* — a further sync issues no
+    broker request at all. Without that, ``calc_on_every_tick`` would keep
+    hammering a venue that just asked to be left alone."""
+    from pynecore.lib.strategy import Trade
+
+    b = MockBroker()
+    b.raise_on_next_get_position = ExchangeRateLimitError(
+        "API error occured: error.too-many.requests", retry_after=1.0,
+    )
+    engine, pos = _mk_engine(b)
+    engine._reconcile_every = 1
+    pos.size = 100.0
+    pos.sign = 1.0
+    pos.avg_price = 1.17
+    pos.open_trades.append(Trade(
+        size=100.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=1.17, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    engine.sync(BAR_TS)  # rate limit -> reconcile parked, run survives
+
+    assert pos.size == 100.0
+    assert pos.open_trades
+    reads_after_throttle = b.get_position_calls
+    assert engine._read_backoff_until > 0.0, "retry_after was not recorded"
+
+    # Throttle still unexpired: the next sync must not touch the venue.
+    b.position = None  # broker recovered, but we are not allowed to ask yet
+    engine.sync(BAR_TS + 60_000)
+
+    assert b.get_position_calls == reads_after_throttle, "read issued while throttled"
+    assert pos.size == 100.0
+
+    # Throttle expires -> the very next poll reconciles against the flat broker.
+    engine._read_backoff_until = 0.0
+    engine.sync(BAR_TS + 120_000)
+
+    assert b.get_position_calls > reads_after_throttle
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+
+
+def __test_timed_out_read_is_not_resubmitted_while_in_flight__():
+    """
+    ``result(timeout=...)`` abandons only the *wait* — the coroutine keeps
+    running on the broker loop. The read bridge must therefore keep ownership of
+    the timed-out future and park the next read, instead of stacking a second
+    concurrent request on the same connection (three consecutive timeouts would
+    otherwise leave three live reads piling into the plugin's shared executor).
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+    entered = threading.Event()
+    concurrent_reads = 0
+
+    class _SlowReadBroker(MockBroker):
+        async def get_position(self, symbol):
+            nonlocal concurrent_reads
+            concurrent_reads += 1
+            entered.set()
+            # Blocks past ``execute_timeout``, exactly like a venue read whose
+            # own request timeout is longer than the engine's bridge timeout.
+            await release.wait()
+            return self.position
+
+    b = _SlowReadBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.2,
+    )
+
+    try:
+        # First read: wedged on the loop, the bridge gives up waiting.
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+        assert entered.wait(timeout=5.0), "read never reached the broker"
+        assert concurrent_reads == 1
+
+        # Second read while the first is still unresolved: parked locally, and
+        # crucially NOT handed to the broker.
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+        assert concurrent_reads == 1, "a second read was stacked on the first"
+
+        # Once the wedged read genuinely resolves, ownership is released and
+        # reads resume. Ownership is dropped by the first cycle that observes
+        # the future finished, so wait on the retained future itself.
+        wedged = engine._inflight_read
+        assert wedged is not None, "timed-out read was not retained"
+        loop.call_soon_threadsafe(release.set)
+        wedged.result(timeout=5.0)
+
+        assert engine._run_async_read(b.get_position(SYMBOL)) is b.position
+        assert concurrent_reads > 1
+        assert engine._inflight_read is None
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_late_rate_limit_from_timed_out_read_still_paces__():
+    """
+    A read that outruns ``execute_timeout`` and only *then* fails with a venue
+    429 must still pace the venue. The bridge stopped waiting, so the fault
+    surfaces on the next cycle when the retained future is collected — dropping
+    it there would discard ``retry_after`` and let the next tick hammer a venue
+    that just asked to be left alone.
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+
+    class _LateRateLimitBroker(MockBroker):
+        async def get_position(self, symbol):
+            await release.wait()
+            raise ExchangeRateLimitError(
+                "API error occured: error.too-many.requests", retry_after=30.0,
+            )
+
+    b = _LateRateLimitBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.2,
+    )
+
+    try:
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+
+        wedged = engine._inflight_read
+        assert wedged is not None, "timed-out read was not retained"
+        loop.call_soon_threadsafe(release.set)
+        with pytest.raises(ExchangeRateLimitError):
+            wedged.result(timeout=5.0)
+
+        assert engine._read_backoff_until == 0.0, "backoff armed too early"
+
+        # Collecting the late failure must translate it and arm the backoff.
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+        assert engine._read_backoff_until > time.monotonic(), \
+            "late retry_after was discarded"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_permanently_wedged_read_halts_before_dispatching_blind__():
+    """
+    A read that never resolves parks every later read, which silently disables
+    reconciliation — and the periodic reconcile runs AFTER ``_diff_and_dispatch``
+    and swallows its connection error, so nothing else would stop the engine
+    from ordering against a position view it can no longer refresh. Past
+    ``READ_STUCK_GRACE_S`` the engine must fail closed instead.
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+
+    class _WedgedReadBroker(MockBroker):
+        async def get_position(self, symbol):
+            await release.wait()
+            return self.position
+
+    b = _WedgedReadBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.2,
+    )
+
+    try:
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+        assert engine._inflight_read is not None
+
+        # Still inside the grace: dispatch is allowed to continue.
+        engine.sync(BAR_TS)
+        assert not engine.halted
+
+        # Age the wedged read past the grace.
+        engine._reads_unconfirmed_since = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
+
+        with pytest.raises(BrokerManualInterventionError):
+            engine.sync(BAR_TS + 60_000)
+        assert engine.halted
+    finally:
+        # Let the wedged read finish before stopping the loop — scheduling
+        # ``release.set`` and ``loop.stop`` in the same iteration would stop
+        # ``run_forever`` before the woken coroutine gets its turn, and
+        # ``loop.close()`` would then destroy it pending.
+        wedged = engine._inflight_read
+        loop.call_soon_threadsafe(release.set)
+        if wedged is not None:
+            wedged.result(timeout=5.0)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_late_read_failure_blocks_dispatch_in_the_same_sync__():
+    """
+    A retained read that has already completed with a fault must be collected
+    BEFORE ``_diff_and_dispatch``. The periodic reconcile that would otherwise
+    collect it runs at the end of ``sync``, so an order would go out first —
+    dispatched against a position view that demonstrably could not be refreshed.
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+
+    class _LateFailingReadBroker(MockBroker):
+        reads_healthy = False
+
+        async def get_position(self, symbol):
+            if self.reads_healthy:
+                return await MockBroker.get_position(self, symbol)
+            await release.wait()
+            raise ExchangeRateLimitError(
+                "API error occured: error.too-many.requests", retry_after=30.0,
+            )
+
+    b = _LateFailingReadBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.2,
+    )
+
+    try:
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+
+        wedged = engine._inflight_read
+        assert wedged is not None
+        loop.call_soon_threadsafe(release.set)
+        with pytest.raises(ExchangeRateLimitError):
+            wedged.result(timeout=5.0)
+
+        # The read has now failed, but nothing has collected it yet.
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+
+        assert b.entry_calls == [], "order dispatched before the late read failure was collected"
+        assert engine._read_backoff_until > time.monotonic(), "late retry_after was discarded"
+        assert not engine.halted, "a recoverable late fault must not kill the run"
+
+        # Next cycle, with reads healthy again, dispatch resumes — but only
+        # because the guard's re-read actually lands: clearing the backoff is
+        # not enough on its own, the broker view has to be confirmed afresh.
+        engine._read_backoff_until = 0.0
+        engine.sync(BAR_TS + 60_000)
+        assert b.entry_calls == [], "dispatch resumed without a confirmed position re-read"
+
+        # That re-read hit the throttle again and re-armed the backoff.
+        assert engine._read_backoff_until > time.monotonic()
+
+        b.reads_healthy = True
+        engine._read_backoff_until = 0.0
+        engine.sync(BAR_TS + 120_000)
+        assert len(b.entry_calls) == 1
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_wedged_reads_halt_even_when_pending_verification_bails_out_first__():
+    """
+    The stuck-read grace halt must not sit behind another read.
+    ``_verify_pending_dispatches`` runs early in ``sync``, reads through the
+    same bridge, and returns out of ``sync`` on its own
+    ``ExchangeConnectionError`` — so a guard placed after it would never be
+    reached on exactly the wedged runs it exists to catch, and the halt could
+    never latch.
+    """
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
+
+    class _AllReadsDownBroker(MockBroker):
+        reads_down: bool = False
+
+        async def get_open_orders(self, symbol=None):
+            if self.reads_down:
+                raise ExchangeConnectionError("socket closed")
+            return await MockBroker.get_open_orders(self, symbol)
+
+        async def get_position(self, symbol):
+            if self.reads_down:
+                raise ExchangeConnectionError("socket closed")
+            return await MockBroker.get_position(self, symbol)
+
+    b = _AllReadsDownBroker()
+    b.raise_on_next_entry = OrderDispositionUnknownError(
+        "simulated timeout", client_order_id=expected_coid,
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    engine.sync(BAR_TS)
+    assert expected_coid in engine.pending_verification, "no pending dispatch parked"
+
+    # Every read is down from here: the pending verification bails out of sync
+    # before anything else runs.
+    b.reads_down = True
+    engine.sync(BAR_TS)
+    assert not engine.halted, "a transient read outage must not halt inside the grace"
+
+    engine._reads_unconfirmed_since = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine.sync(BAR_TS)
+    assert engine.halted
+
+
+def __test_rate_limit_backoff_blocks_new_exposure__():
+    """
+    While a venue ``retry_after`` backoff is unexpired the engine cannot read at
+    all — nothing is retained in flight to inspect, so the guard must fall back
+    on the confirmation flag rather than reading "no stuck read" as "healthy"
+    and dispatching against a position view it has no way to refresh.
+    """
+    b = MockBroker()
+    b.raise_on_next_get_position = ExchangeRateLimitError(
+        "error.too-many.requests", retry_after=30.0,
+    )
+    engine, pos = _mk_engine(b)
+
+    with pytest.raises(ExchangeConnectionError):
+        engine.reconcile()
+    assert engine._read_backoff_until > time.monotonic()
+    assert engine._inflight_read is None, "a synchronous 429 retains nothing"
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert b.entry_calls == [], "new exposure opened during the venue backoff"
+
+    # Backoff expired: the guard's re-read lands and dispatch resumes.
+    engine._read_backoff_until = 0.0
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+
+def __test_unconfirmed_view_still_cancels_and_closes__():
+    """
+    The unconfirmed-view gate must only block *new* exposure. Cancelling an
+    obsolete resting entry and dispatching ``strategy.close`` reduce risk — if
+    they were skipped for the whole grace window the cancelled entry could
+    still fill and an unwanted position would stay open while the strategy
+    believes it asked to flatten.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    # Reads are throttled from here: the view can no longer be confirmed.
+    b.raise_on_next_get_position = ExchangeRateLimitError(
+        "error.too-many.requests", retry_after=30.0,
+    )
+    with pytest.raises(ExchangeConnectionError):
+        engine.reconcile()
+    assert engine._read_backoff_until > time.monotonic()
+
+    # The script drops the resting entry, asks to flatten, and signals a new
+    # entry in the same bar.
+    del pos.entry_orders["L"]
+    pos.entry_orders["N"] = _entry_order("N", 1.0, limit=49_000.0)
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -1.0, order_type=_order_type_close,
+        exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    assert [c.intent.pine_id for c in b.cancel_calls] == ["L"], \
+        "obsolete resting entry was not cancelled on an unconfirmed view"
+    assert len(b.close_calls) == 1, \
+        "strategy.close was withheld on an unconfirmed view"
+    assert len(b.entry_calls) == 1, "new exposure opened during the venue backoff"
+
+
+def __test_read_resolving_at_the_timeout_boundary_is_not_lost__():
+    """
+    ``result(timeout=...)`` can raise while the coroutine completes in the same
+    instant. Dropping the future then would reduce a terminal fault — or a
+    venue ``retry_after`` — to a plain bridge timeout, reopening the read gate
+    on the very next cycle and hammering the venue it asked us to leave alone.
+    """
+    class _RacingFuture(futures.Future):
+        """Times out on the bounded wait, yet is already resolved underneath."""
+
+        def result(self, timeout=None):
+            if timeout is not None:
+                raise TimeoutError("bridge wait expired")
+            return super().result()
+
+    raced = _RacingFuture()
+    raced.set_exception(
+        ExchangeRateLimitError("error.too-many.requests", retry_after=30.0),
+    )
+
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+    # A loop only has to *exist* for the bridge to take its threadsafe path;
+    # the submission itself is stubbed out below, so it never runs.
+    engine._loop = asyncio.new_event_loop()
+
+    def _fake_submit(coro, _loop):
+        coro.close()
+        return raced
+
+    original = asyncio.run_coroutine_threadsafe
+    asyncio.run_coroutine_threadsafe = _fake_submit
+    try:
+        with pytest.raises(ExchangeConnectionError):
+            engine._run_async_read(b.get_position(SYMBOL))
+    finally:
+        asyncio.run_coroutine_threadsafe = original
+        engine._loop.close()
+
+    assert engine._read_backoff_until > time.monotonic(), \
+        "the raced read's retry_after was discarded as a bridge timeout"
+    assert engine._inflight_read is None, "a resolved future must not stay retained"
 
 
 def __test_reconcile_read_non_retryable_provider_error_fails_loud__():

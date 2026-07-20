@@ -363,7 +363,7 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     return val
 
 
-def correlation(source1: Series[float], source2: Series[float], length: int) -> float | NA:
+def correlation(source1: Series[float], source2: Series[float], length: int) -> PyneFloat:
     """
     Calculate the correlation of the source series with the given length.
 
@@ -510,7 +510,7 @@ def cum(source: Series[float | int]) -> PyneFloat:
     return var
 
 
-def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> float | NA:
+def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> PyneFloat:
     """
     Calculate the Mean Absolute Deviation (MAD) of the source series with the given length.
 
@@ -536,7 +536,7 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> f
 
 
 # noinspection PyPep8Naming
-def dmi(diLength: int, adxSmoothing: int) -> tuple[float | NA, float | NA, float | NA]:
+def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Calculate the Directional Movement Index (DMI) of the source series with the given DI length and ADX smoothing.
 
@@ -1081,7 +1081,7 @@ def mode(source: Series[TFI], length: int) -> TFI:
     return mode_val
 
 
-def mom(source: float, length: int) -> float | NA:
+def mom(source: float, length: int) -> PyneFloat:
     """
     Calculate the Momentum of the source series with the given length.
 

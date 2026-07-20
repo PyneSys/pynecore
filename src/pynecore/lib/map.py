@@ -37,7 +37,7 @@ def copy(id: dict[TKey, TValue]) -> dict[TKey, TValue]:
 
 
 # noinspection PyShadowingBuiltins
-def get(id: dict[TKey, TValue], key: TKey) -> TValue | NA:
+def get(id: dict[TKey, TValue], key: TKey) -> TValue:
     """
     Get the value of a key in the map.
 
@@ -71,7 +71,7 @@ def new() -> dict:
 
 
 # noinspection PyShadowingBuiltins
-def put(id: dict, key: Any, value: TValue) -> TValue | NA:
+def put(id: dict, key: Any, value: TValue) -> TValue:
     """
     Put a key-value pair in the map.
 
@@ -100,7 +100,7 @@ def put_all(id: dict[TKey, TValue], other: dict[TKey, TValue]):
 
 
 # noinspection PyShadowingBuiltins
-def remove(id: dict[TKey, TValue], key: TKey) -> TValue | NA:
+def remove(id: dict[TKey, TValue], key: TKey) -> TValue:
     """
     Remove a key-value pair from the map.
 

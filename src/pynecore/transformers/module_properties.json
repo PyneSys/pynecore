@@ -465,6 +465,12 @@
     "NA": {
       "type": "variable"
     },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
     },
@@ -1094,6 +1100,15 @@
     "NA": {
       "type": "variable"
     },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
+      "type": "variable"
+    },
     "all": {
       "type": "property"
     },
@@ -1235,6 +1250,12 @@
       "type": "variable"
     },
     "NA": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
       "type": "variable"
     },
     "all": {
@@ -1384,6 +1405,9 @@
     }
   },
   "lib.log": {
+    "DURABLE_LOG_WIDTH": {
+      "type": "variable"
+    },
     "Path": {
       "type": "variable"
     },
@@ -1445,6 +1469,9 @@
       "type": "variable"
     },
     "sim_info": {
+      "type": "variable"
+    },
+    "sys": {
       "type": "variable"
     },
     "warning": {
@@ -2523,6 +2550,18 @@
       "type": "variable"
     },
     "NA": {
+      "type": "variable"
+    },
+    "PyneBool": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
+    "PyneStr": {
       "type": "variable"
     },
     "ROUND_HALF_UP": {

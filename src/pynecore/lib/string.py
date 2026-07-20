@@ -7,6 +7,7 @@ from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
 
 from ..types.na import NA
+from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from ..types.format import Format
 from . import format as _format
@@ -262,7 +263,7 @@ def _datatime_fmt_tv2py(fmt: str) -> str:
 # Exported functions
 #
 
-def contains(source: str | NA[str], str_: str | NA[str]) -> bool | NA[bool]:
+def contains(source: str | NA[str], str_: str | NA[str]) -> PyneBool:
     """
     Returns true if the source string contains the str substring, false otherwise.
 
@@ -467,7 +468,7 @@ def match(source: str, regex: str) -> str:
     return m.group()
 
 
-def pos(source: str, str_: str) -> int | NA[int]:
+def pos(source: str, str_: str) -> PyneInt:
     """
     Returns the position of the first occurrence of the str string in the source string, 'na' otherwise.
 
@@ -482,7 +483,7 @@ def pos(source: str, str_: str) -> int | NA[int]:
 
 
 # noinspection PyShadowingNames
-def repeat(source: str, repeat: int, separator: str = '') -> str | NA[str]:
+def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     """
     Returns a new string consisting of the source string repeated the specified number of times,
     separated by the separator string.
@@ -507,7 +508,7 @@ def repeat(source: str, repeat: int, separator: str = '') -> str | NA[str]:
     return separator.join([source] * int(repeat))
 
 
-def replace(source: str, target: str, replacement: str, occurence=0) -> str | NA[str]:
+def replace(source: str, target: str, replacement: str, occurence=0) -> PyneStr:
     """
     Replaces the nth occurence of target string with the replacement string in the source string.
 
@@ -586,7 +587,7 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> str:
     return source[begin_pos:end_pos]
 
 
-def tonumber(string: str) -> float | NA[float]:
+def tonumber(string: str) -> PyneFloat:
     """
     Converts a value represented in string to its "float" equivalent, or `na` if the conversion is not possible.
 

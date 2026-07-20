@@ -6,6 +6,7 @@ from ..types.chart import ChartPoint
 from ..types.base import next_vid
 from ..types.label import LabelStyleEnum, Label
 from ..types.na import NA, na_int, na_float
+from ..types.pine_types import PyneFloat, PyneInt, PyneStr
 from ..lib import xloc as _xloc, yloc as _yloc, color as _color, size as _size, text as _text, font as _font
 from .. import lib
 
@@ -179,7 +180,7 @@ def copy(id):
 
 
 # noinspection PyShadowingBuiltins
-def get_text(id: Label) -> str | NA:
+def get_text(id: Label) -> PyneStr:
     """
     Returns the text of the label.
 
@@ -337,7 +338,7 @@ def set_yloc(id: Label, yloc: _yloc.YLoc) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def get_x(id: Label) -> int | NA:
+def get_x(id: Label) -> PyneInt:
     """
     Returns bar index or UNIX time (depending on the xloc value) of the label.
 
@@ -350,7 +351,7 @@ def get_x(id: Label) -> int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def get_y(id: Label) -> int | float | NA:
+def get_y(id: Label) -> PyneInt | PyneFloat:
     """
     Returns price of the label.
 
