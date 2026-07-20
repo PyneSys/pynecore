@@ -29,6 +29,10 @@ def list_plugins(
             None, '--type', '-t',
             help="Filter by capability (e.g. 'provider', 'cli')",
         ),
+        as_json: bool = Option(
+            False, '--json',
+            help="Machine readable output for tooling",
+        ),
 ):
     """
     List all installed PyneCore plugins.
@@ -36,7 +40,7 @@ def list_plugins(
     from ...core.plugin import discover_plugins, get_plugin_metadata, get_plugin_summary
 
     plugins = discover_plugins()
-    if not plugins:
+    if not plugins and not as_json:
         secho("No plugins installed.", fg=colors.YELLOW)
         secho("")
         return
@@ -60,6 +64,23 @@ def list_plugins(
             rows.append((name, display_name, version, caps_str, summary))
         except Exception as e:
             errors.append((name, str(e)))
+
+    if as_json:
+        import json
+        secho(json.dumps({
+            'plugins': [
+                {
+                    'name': name,
+                    'display_name': display_name,
+                    'version': version.lstrip('v'),
+                    'capabilities': caps_str.split(', '),
+                    'summary': summary,
+                }
+                for name, display_name, version, caps_str, summary in rows
+            ],
+            'errors': [{'name': name, 'error': error} for name, error in errors],
+        }))
+        return
 
     if not rows and not errors:
         secho("No plugins found for the given filter.", fg=colors.YELLOW)
