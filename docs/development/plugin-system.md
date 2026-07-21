@@ -605,6 +605,17 @@ Choose netting semantics when the venue exposes one aggregate symbol position.
 For hedged venues, retain each venue position leg and provide the broker's real
 `PositionPort` or an equivalent per-leg reconstruction in the profile.
 
+`VenueState.position` is the account-wide signed net position.
+`VenueState.position_owners` is an attribution ledger used by the lab to prove
+that the aggregate is exactly the sum of the isolated runs; it is not a set of
+independent venue positions. A broker snapshot should expose the account-wide
+view. For hedged profiles, `position_legs` retains account-level physical legs
+keyed by their owning run and Pine entry so the lab can check both aggregate and
+per-run reconstruction.
+Opposite signed owners are rejected by the netting reference profile because a
+single netted venue row cannot preserve those exposures independently; the same
+shape is valid in a hedged profile when both physical legs remain attributable.
+
 ### Replacing transports
 
 - For HTTP, override the request dispatcher and return recorded response
@@ -632,6 +643,14 @@ and return human-readable violations after calling the base implementation.
 Useful plugin checks include reduce-only sibling cancellation, activity-event
 fingerprint stability, per-leg hedged ownership, and exact price/quantity-grid
 rounding.
+
+Protective coverage is outcome-aware. Take-profit and stop-loss legs are OCO
+alternatives, so their quantities are never added together: every requested TP
+outcome and every requested SL/trailing outcome must independently cover its
+logical exit quantity. Coverage is also partitioned by `from_entry`; one
+physical leg cannot satisfy two different parent entries. Profiles that mirror
+real plugin orders into `VenueState.orders` must therefore preserve the
+physical leg type, logical intent key, and `from_entry` ownership.
 
 Keep deliberately broken control profiles beside the suite. A control scenario
 sets `expected_violation` to the relevant invariant text; it passes only when
@@ -689,6 +708,40 @@ The lab should stay fast and deterministic, but it is not a replacement for a
 small, tightly controlled final live smoke. Any newly discovered venue semantic
 must first be documented, then added to the offline profile before relying on a
 regression scenario for it.
+
+### Treating known failures as a completion contract
+
+PyneCore's reference corpus includes `broker_lab/coverage.py`, a machine-checked
+map from known failure families to named scenarios. It separates `covered`,
+`partial`, `missing`, and `live-only` cases and rejects stale evidence when a
+scenario is renamed or removed. Run it from the PyneCore repository:
+
+```bash
+python broker_lab/coverage.py --check
+python broker_lab/coverage.py --check --require-complete
+```
+
+`--require-complete` requires every offline-modelable P0 and P1 row to be
+covered. `live-only` rows remain explicit: authentication, rate limits, current
+instrument rules, matching behaviour, and real reset timing cannot honestly be
+proved by a fake transport.
+
+Use this workflow whenever a live test or production incident reveals a new
+failure family:
+
+1. Record the venue fact and decide whether it is deterministic at a replaceable
+   transport boundary. If not, add it as a documented `live-only` or probe row.
+2. Add the smallest failing offline scenario using the real engine, store, and
+   plugin decoder or request mapper.
+3. Add a deliberately broken control when a new invariant or oracle is needed.
+4. Fix the implementation and keep the minimized scenario as the regression.
+5. Add the scenario name to the coverage map and run both the repository smoke
+   suite and `coverage.py --check --require-complete`.
+6. Retain one final controlled live smoke to validate that the modeled venue
+   fact still matches reality.
+
+This makes the matrix a maintained regression contract rather than a checklist
+that drifts away from executable evidence.
 
 ## Combining Capabilities
 

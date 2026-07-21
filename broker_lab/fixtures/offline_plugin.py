@@ -70,12 +70,24 @@ class OfflineBrokerPlugin(BrokerPlugin[OfflineBrokerConfig]):
             timezone="UTC",
         )
 
-    def download_ohlcv(self, time_from, time_to, on_progress=None, limit=None, with_extra=False):
+    def download_ohlcv(
+        self, time_from, time_to, on_progress=None, limit=None, with_extra=False
+    ):
         del limit, with_extra
         if os.environ.get("PYNE_LAB_DOWNLOAD_FAILURE") == "permanent":
             raise ProviderError("offline permanent download failure")
         start = max(time_from, time_to - timedelta(minutes=5))
-        bars = [OHLCV(int((start + timedelta(minutes=index)).timestamp()), 100, 101, 99, 100, 1) for index in range(5)]
+        bars = [
+            OHLCV(
+                int((start + timedelta(minutes=index)).timestamp()),
+                100,
+                101,
+                99,
+                100,
+                1,
+            )
+            for index in range(5)
+        ]
         self.save_ohlcv_data(bars)
         if on_progress is not None:
             on_progress(time_to)
@@ -135,6 +147,11 @@ class OfflineBrokerPlugin(BrokerPlugin[OfflineBrokerConfig]):
         return None
 
     async def get_balance(self):
+        credential = os.environ.get("PYNE_LAB_SECRET", "")
+        if os.environ.get("PYNE_LAB_SECRET_FAILURE") == "1":
+            if not credential:
+                raise AssertionError("secret-redaction fixture requires a credential")
+            raise RuntimeError("offline unexpected credential failure")
         if os.environ.get("PYNE_LAB_BALANCE_FAILURE") == "1":
             raise ProviderError("offline startup balance failure")
         return {"USD": 1_000_000.0}

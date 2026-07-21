@@ -4197,6 +4197,7 @@ class OrderSyncEngine:
                 self._promote_pending_partial_bracket_legs(event)
                 self._retire_entry_stop_watch_on_fill(event)
             self._cascade_oca_cancel(event)
+            self._cascade_oca_reduce(event)
             # When a closing leg fully closes the position, drop the
             # entry + matching exit intents and clear Pine's order
             # dicts. Pine's ``strategy.exit`` is unconditional in most
@@ -5242,8 +5243,8 @@ class OrderSyncEngine:
         - The plugin declared ``oca_cancel = CapabilityLevel.NATIVE`` — the
           exchange registers and cancels the group natively.
         - The filled intent has no OCA group, or its type is not ``cancel``.
-          (``reduce`` groups amend quantities on fill; that belongs to the
-          partial-fill qty-amend workstream, not here.)
+          ``reduce`` groups are handled separately by
+          :meth:`_cascade_oca_reduce`.
         - The partial-fill policy is :data:`OcaPartialFillPolicy.FULL_FILL_ONLY`
           and the event is ``partial``.
         - The group was already processed in this sync — prevents a
@@ -5305,6 +5306,50 @@ class OrderSyncEngine:
             self._active_intents.pop(key, None)
             self._remove_pine_order_for_intent(intent)
             self._dispatch_cancel(intent)
+
+    def _cascade_oca_reduce(self, event: OrderEvent) -> None:
+        """Reduce software OCA siblings by each newly filled quantity slice.
+
+        Pine applies ``strategy.oca.reduce`` immediately at fill time. In live
+        mode the broker engine receives the same fill slices asynchronously,
+        so it must amend each still-working sibling before the next bar. The
+        fill idempotency gate runs before this method, which guarantees that a
+        replayed execution cannot reduce the sibling twice.
+        """
+        if event.fill_qty is None or event.fill_qty <= 0:
+            return
+        filled_key = self._filled_intent_key(event)
+        if filled_key is None:
+            return
+        filled_intent = self._active_intents.get(filled_key)
+        if filled_intent is None:
+            return
+        oca_name = getattr(filled_intent, 'oca_name', None)
+        if not oca_name or getattr(filled_intent, 'oca_type', None) != OcaType.REDUCE.value:
+            return
+
+        for key, sibling in list(self._active_intents.items()):
+            if key == filled_key:
+                continue
+            if getattr(sibling, 'oca_name', None) != oca_name:
+                continue
+            if getattr(sibling, 'oca_type', None) != OcaType.REDUCE.value:
+                continue
+            if not isinstance(sibling, EntryIntent):
+                continue
+            remaining = max(0.0, sibling.qty - float(event.fill_qty))
+            if remaining <= 1e-12:
+                self._active_intents.pop(key, None)
+                self._remove_pine_order_for_intent(sibling)
+                self._dispatch_cancel(sibling)
+                continue
+            replacement = dataclasses.replace(sibling, qty=remaining)
+            pine_order = self._position.entry_orders.get(sibling.pine_id)
+            if pine_order is not None:
+                pine_order.size = remaining if sibling.side == 'buy' else -remaining
+                pine_order.sign = 1.0 if sibling.side == 'buy' else -1.0
+            self._dispatch_modify(sibling, replacement)
+            self._active_intents[key] = replacement
 
     def _remove_pine_order_for_intent(self, intent: Intent) -> None:
         """Delete the Pine-side :class:`Order` backing ``intent``.
@@ -6112,6 +6157,13 @@ class OrderSyncEngine:
             intent = self._active_intents[key]
             if (isinstance(intent, ExitIntent)
                     and intent.from_entry == closed_entry_id):
+                # A software bracket exposes TP and SL as independent venue
+                # orders. The fill that flattened the parent terminalizes only
+                # one physical leg; dropping the logical exit before dispatching
+                # its cancel would orphan the reduce-only sibling. Native-OCA
+                # venues own this sweep themselves.
+                if not self._oca_cancel_native:
+                    self._dispatch_cancel(intent)
                 self._active_intents.pop(key, None)
                 self._order_mapping.pop(key, None)
                 self._drop_envelope(key)

@@ -41,7 +41,9 @@ class SubprocessProfile(ReferenceVenueProfile):
                 encoding="utf-8",
             )
             inherited = os.environ.get("PYTHONPATH", "")
-            pythonpath = os.pathsep.join(part for part in (str(metadata_root), str(_FIXTURES), inherited) if part)
+            pythonpath = os.pathsep.join(
+                part for part in (str(metadata_root), str(_FIXTURES), inherited) if part
+            )
             env = {
                 "PYTHONPATH": pythonpath,
                 "PYTHONNOUSERSITE": "1",
@@ -90,7 +92,11 @@ class SubprocessProfile(ReferenceVenueProfile):
             )
             inherited = os.environ.get("PYTHONPATH", "")
             env = {
-                "PYTHONPATH": os.pathsep.join(part for part in (str(metadata_root), str(_FIXTURES), inherited) if part),
+                "PYTHONPATH": os.pathsep.join(
+                    part
+                    for part in (str(metadata_root), str(_FIXTURES), inherited)
+                    if part
+                ),
                 "PYTHONNOUSERSITE": "1",
                 "PYNE_BROKER_LAB_OFFLINE": "1",
                 "PYNE_NO_COLOR_LOG": "1",
@@ -124,12 +130,16 @@ class SubprocessProfile(ReferenceVenueProfile):
         if step.kind == "pyne_run_clean":
             result = self._run_pyne()
             if result.returncode != 0:
-                raise AssertionError(f"clean pyne run failed: {result.stderr}\n{result.stdout}")
+                raise AssertionError(
+                    f"clean pyne run failed: {result.stderr}\n{result.stdout}"
+                )
             return True
         if step.kind == "pyne_run_transient_connect":
             result = self._run_pyne(fault_env={"PYNE_LAB_CONNECT_FAILURES": "1"})
             if result.returncode != 0:
-                raise AssertionError(f"transient-connect pyne run failed: {result.stderr}\n{result.stdout}")
+                raise AssertionError(
+                    f"transient-connect pyne run failed: {result.stderr}\n{result.stdout}"
+                )
             return True
         if step.kind == "pyne_run_permanent_connect":
             result = self._run_pyne(fault_env={"PYNE_LAB_CONNECT_FAILURE": "permanent"})
@@ -148,6 +158,22 @@ class SubprocessProfile(ReferenceVenueProfile):
             output = result.stdout + result.stderr
             if result.returncode == 0 or "startup balance failure" not in output:
                 raise AssertionError(f"startup exception was not surfaced: {result!r}")
+            return True
+        if step.kind == "pyne_run_secret_redaction":
+            secret = "broker-lab-secret-must-never-appear"
+            result = self._run_pyne(
+                fault_env={
+                    "PYNE_LAB_SECRET": secret,
+                    "PYNE_LAB_SECRET_FAILURE": "1",
+                }
+            )
+            output = result.stdout + result.stderr
+            if result.returncode == 0 or "unexpected credential failure" not in output:
+                raise AssertionError(f"credential failure was not surfaced: {result!r}")
+            if secret in output:
+                raise AssertionError(
+                    "credential leaked into CLI output or traceback locals"
+                )
             return True
         if step.kind == "pyne_run_two_shared":
             results = self._run_two_shared()
@@ -190,6 +216,12 @@ def build_suite(*, mode: str, seed: int) -> tuple[Scenario, ...]:
             profile_factory=SubprocessProfile,
             seed=seed,
             steps=(Step("pyne_run_startup_exception"),),
+        ),
+        Scenario(
+            name="real-pyne-run-redacts-credential-from-unexpected-traceback",
+            profile_factory=SubprocessProfile,
+            seed=seed,
+            steps=(Step("pyne_run_secret_redaction"),),
         ),
         Scenario(
             name="two-real-pyne-runs-share-workdir-and-ohlcv-safely",

@@ -4370,8 +4370,8 @@ def __test_two_fills_same_group_same_sync_emit_one_cancel__():
     assert {c.intent.pine_id for c in b.cancel_calls} == {"B", "C"}
 
 
-def __test_non_cancel_oca_does_not_cascade__():
-    """OCA-reduce groups stay alive on fill (partial-fill qty-amend is WS5)."""
+def __test_oca_reduce_full_fill_cancels_zero_quantity_sibling__():
+    """A full OCA-reduce fill retires an equal-sized sibling exactly once."""
     b = MockBroker()
     engine, pos = _mk_engine_with_policy(b)
     pos.entry_orders["A"] = _oca_entry(
@@ -4387,8 +4387,9 @@ def __test_non_cancel_oca_does_not_cascade__():
     ))
     engine.sync(BAR_TS + 60_000)
 
-    assert b.cancel_calls == []
-    assert "B" in engine.active_intents
+    assert len(b.cancel_calls) == 1
+    assert b.cancel_calls[0].intent.pine_id == "B"
+    assert "B" not in engine.active_intents
 
 
 def __test_standalone_fill_without_oca_group_is_quiet__():

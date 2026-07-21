@@ -15,6 +15,7 @@ from pynecore.core.broker.models import (
     ExchangeCapabilities,
     ExchangeOrder,
     ExchangePosition,
+    INTENT_KEY_SEP,
     LegType,
     OrderEvent,
     OrderStatus,
@@ -42,16 +43,19 @@ class VenueState:
 
     symbol: str = "LABUSD"
     orders: dict[str, VenueOrder] = field(default_factory=dict)
-    positions: dict[str, float] = field(default_factory=dict)
-    position_legs: dict[str, dict[str, float]] = field(default_factory=dict)
+    position: float = 0.0
+    position_owners: dict[str, float] = field(default_factory=dict)
+    position_legs: dict[tuple[str, str], float] = field(default_factory=dict)
     pending_events: list[tuple[str, OrderEvent]] = field(default_factory=list)
     calls: list[tuple[str, str, str]] = field(default_factory=list)
     next_id: int = 1
     reject_entries: int = 0
     skip_entries: int = 0
     read_error: Exception | None = None
-    stale_positions: dict[str, float] | None = None
-    terminal_snapshots: dict[str, tuple[OrderStatus, float, float]] = field(default_factory=dict)
+    stale_position: float | None = None
+    terminal_snapshots: dict[str, tuple[OrderStatus, float, float]] = field(
+        default_factory=dict
+    )
 
     def new_id(self) -> str:
         value = f"lab-{self.next_id}"
@@ -75,7 +79,9 @@ class ReferenceBroker:
     def get_capabilities(self) -> ExchangeCapabilities:
         return ExchangeCapabilities(short_selling=CapabilityLevel.NATIVE)
 
-    def _place(self, envelope: DispatchEnvelope, leg: LegType, kind: str) -> list[ExchangeOrder]:
+    def _place(
+        self, envelope: DispatchEnvelope, leg: LegType, kind: str
+    ) -> list[ExchangeOrder]:
         self.state.calls.append((self.run_name, kind, envelope.intent.intent_key))
         if leg is LegType.ENTRY and self.state.skip_entries:
             self.state.skip_entries -= 1
@@ -95,7 +101,11 @@ class ReferenceBroker:
             order_type=(
                 OrderType.STOP
                 if getattr(intent, "stop", None) is not None
-                else (OrderType.LIMIT if getattr(intent, "limit", None) is not None else OrderType.MARKET)
+                else (
+                    OrderType.LIMIT
+                    if getattr(intent, "limit", None) is not None
+                    else OrderType.MARKET
+                )
             ),
             qty=float(getattr(intent, "qty", 0.0)),
             filled_qty=0.0,
@@ -137,7 +147,31 @@ class ReferenceBroker:
         return self._place(envelope, LegType.ENTRY, "e")
 
     async def execute_exit(self, envelope: DispatchEnvelope) -> list[ExchangeOrder]:
-        return self._place(envelope, LegType.TAKE_PROFIT, "t")
+        intent = envelope.intent
+        limit = getattr(intent, "limit", None)
+        stop = getattr(intent, "stop", None)
+        orders: list[ExchangeOrder] = []
+        if limit is not None:
+            take_profit = self._place(envelope, LegType.TAKE_PROFIT, "t")[0]
+            take_profit = replace(
+                take_profit,
+                order_type=OrderType.LIMIT,
+                price=limit,
+                stop_price=None,
+            )
+            self.state.orders[take_profit.id].order = take_profit
+            orders.append(take_profit)
+        if stop is not None:
+            stop_loss = self._place(envelope, LegType.STOP_LOSS, "s")[0]
+            stop_loss = replace(
+                stop_loss,
+                order_type=OrderType.STOP,
+                price=None,
+                stop_price=stop,
+            )
+            self.state.orders[stop_loss.id].order = stop_loss
+            orders.append(stop_loss)
+        return orders or self._place(envelope, LegType.TAKE_PROFIT, "t")
 
     async def execute_close(self, envelope: DispatchEnvelope) -> ExchangeOrder:
         return self._place(envelope, LegType.CLOSE, "c")[0]
@@ -148,7 +182,8 @@ class ReferenceBroker:
             if (
                 venue_order.run_name == self.run_name
                 and venue_order.intent_key == envelope.intent.intent_key
-                and venue_order.order.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                and venue_order.order.status
+                in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
             ):
                 venue_order.order = replace(
                     venue_order.order,
@@ -183,7 +218,11 @@ class ReferenceBroker:
             for record in self.state.orders.values()
             if record.run_name == self.run_name
             and record.order.status is OrderStatus.OPEN
-            and (symbol is None or symbol == self.profile.symbol or record.order.symbol == symbol)
+            and (
+                symbol is None
+                or symbol == self.profile.symbol
+                or record.order.symbol == symbol
+            )
         ]
 
     async def get_position(self, symbol: str) -> ExchangePosition | None:
@@ -192,9 +231,9 @@ class ReferenceBroker:
             self.state.read_error = None
             raise error
         size = (
-            self.state.stale_positions.get(self.run_name, 0.0)
-            if self.state.stale_positions is not None
-            else self.state.positions.get(self.run_name, 0.0)
+            self.state.position
+            if self.state.stale_position is None
+            else self.state.stale_position
         )
         if size == 0.0:
             return None
@@ -252,9 +291,9 @@ class ReferenceVenueProfile:
         elif step.kind == "read_error":
             self.state.read_error = ExchangeConnectionError("injected read failure")
         elif step.kind == "stale_position":
-            self.state.stale_positions = dict(step.values.get("positions", {}))
+            self.state.stale_position = float(step.values.get("position", 0.0))
         elif step.kind == "fresh_position":
-            self.state.stale_positions = None
+            self.state.stale_position = None
         elif step.kind == "venue_cancel":
             self._venue_cancel(step)
         elif step.kind == "expect":
@@ -280,10 +319,14 @@ class ReferenceVenueProfile:
         record = self._select_order(step)
         qty = float(step.values.get("qty", record.order.remaining_qty))
         if qty <= 0.0 or qty > record.order.remaining_qty + 1e-12:
-            raise ValueError("fill qty must be positive and at most the remaining quantity")
+            raise ValueError(
+                "fill qty must be positive and at most the remaining quantity"
+            )
         remaining = max(0.0, record.order.remaining_qty - qty)
         filled = record.order.filled_qty + qty
-        status = OrderStatus.FILLED if remaining == 0.0 else OrderStatus.PARTIALLY_FILLED
+        status = (
+            OrderStatus.FILLED if remaining == 0.0 else OrderStatus.PARTIALLY_FILLED
+        )
         price = float(step.values.get("price", 100.0))
         record.order = replace(
             record.order,
@@ -296,21 +339,28 @@ class ReferenceVenueProfile:
         runtime.store_ctx.set_filled(record.order.client_order_id, filled)
         signed = qty if record.order.side == "buy" else -qty
         if record.leg_type is LegType.ENTRY:
-            self.state.positions[record.run_name] = self.state.positions.get(record.run_name, 0.0) + signed
+            self.state.position_owners[record.run_name] = (
+                self.state.position_owners.get(record.run_name, 0.0) + signed
+            )
             if self.venue_mode == "hedged":
-                legs = self.state.position_legs.setdefault(record.run_name, {})
-                legs[record.pine_id] = legs.get(record.pine_id, 0.0) + signed
+                key = (record.run_name, record.pine_id)
+                self.state.position_legs[key] = (
+                    self.state.position_legs.get(key, 0.0) + signed
+                )
         else:
-            current = self.state.positions.get(record.run_name, 0.0)
+            current = self.state.position_owners.get(record.run_name, 0.0)
             new_size = current + signed
             if current != 0.0 and current * new_size < 0.0:
                 new_size = 0.0
-            self.state.positions[record.run_name] = new_size
+            self.state.position_owners[record.run_name] = new_size
             if self.venue_mode == "hedged" and record.from_entry is not None:
-                legs = self.state.position_legs.setdefault(record.run_name, {})
-                leg_size = legs.get(record.from_entry, 0.0)
+                key = (record.run_name, record.from_entry)
+                leg_size = self.state.position_legs.get(key, 0.0)
                 reduced = leg_size + signed
-                legs[record.from_entry] = 0.0 if leg_size * reduced < 0.0 else reduced
+                self.state.position_legs[key] = (
+                    0.0 if leg_size * reduced < 0.0 else reduced
+                )
+        self.state.position = sum(self.state.position_owners.values())
         event = OrderEvent(
             order=record.order,
             event_type="filled" if remaining == 0.0 else "partial",
@@ -325,7 +375,9 @@ class ReferenceVenueProfile:
 
     def _deliver(self, runner: Any, step: Step) -> None:
         selected = [item for item in self.state.pending_events if item[0] == step.run]
-        self.state.pending_events = [item for item in self.state.pending_events if item[0] != step.run]
+        self.state.pending_events = [
+            item for item in self.state.pending_events if item[0] != step.run
+        ]
 
         def dispatch() -> None:
             for _, event in selected:
@@ -342,34 +394,72 @@ class ReferenceVenueProfile:
 
     def _venue_cancel(self, step: Step) -> None:
         record = self._select_order(step)
-        record.order = replace(record.order, status=OrderStatus.CANCELLED, remaining_qty=0.0)
+        record.order = replace(
+            record.order, status=OrderStatus.CANCELLED, remaining_qty=0.0
+        )
 
     def _expect(self, runner: Any, step: Step) -> None:
         values = step.values
         if "calls" in values and len(self.state.calls) != int(values["calls"]):
-            raise AssertionError(f"expected {values['calls']} broker calls, got {len(self.state.calls)}")
+            raise AssertionError(
+                f"expected {values['calls']} broker calls, got {len(self.state.calls)}"
+            )
         if "position" in values:
-            actual = self.state.positions.get(step.run, 0.0)
+            actual = self.state.position_owners.get(step.run, 0.0)
             if abs(actual - float(values["position"])) > 1e-9:
-                raise AssertionError(f"expected venue position {values['position']}, got {actual}")
+                raise AssertionError(
+                    f"expected venue position {values['position']}, got {actual}"
+                )
+        if "account_position" in values:
+            actual = self.state.position
+            if abs(actual - float(values["account_position"])) > 1e-9:
+                raise AssertionError(
+                    f"expected account position {values['account_position']}, got {actual}"
+                )
         if "engine_position" in values:
             actual = runner.runs[step.run].position.size
             if abs(actual - float(values["engine_position"])) > 1e-9:
-                raise AssertionError(f"expected engine position {values['engine_position']}, got {actual}")
+                raise AssertionError(
+                    f"expected engine position {values['engine_position']}, got {actual}"
+                )
         if "open_orders" in values:
             actual = sum(
-                record.run_name == step.run and record.order.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                record.run_name == step.run
+                and record.order.status
+                in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
                 for record in self.state.orders.values()
             )
             if actual != int(values["open_orders"]):
-                raise AssertionError(f"expected {values['open_orders']} open orders, got {actual}")
+                raise AssertionError(
+                    f"expected {values['open_orders']} open orders, got {actual}"
+                )
+        if "total_orders" in values:
+            actual = sum(
+                record.run_name == step.run for record in self.state.orders.values()
+            )
+            if actual != int(values["total_orders"]):
+                raise AssertionError(
+                    f"expected {values['total_orders']} total orders, got {actual}"
+                )
+        if values.get("distinct_order_ids"):
+            ids = [
+                record.order.id
+                for record in self.state.orders.values()
+                if record.run_name == step.run
+            ]
+            if len(ids) != len(set(ids)):
+                raise AssertionError(f"venue order ids are not distinct: {ids}")
         if "wire_symbols" in values:
             actual_symbols = {
-                record.order.symbol for record in self.state.orders.values() if record.run_name == step.run
+                record.order.symbol
+                for record in self.state.orders.values()
+                if record.run_name == step.run
             }
             expected_symbols = set(values["wire_symbols"])
             if actual_symbols != expected_symbols:
-                raise AssertionError(f"expected wire symbols {expected_symbols}, got {actual_symbols}")
+                raise AssertionError(
+                    f"expected wire symbols {expected_symbols}, got {actual_symbols}"
+                )
 
     def check_invariants(self, runner: Any) -> Sequence[str]:
         violations: list[str] = []
@@ -380,21 +470,31 @@ class ReferenceVenueProfile:
             call_counts[call] = call_counts.get(call, 0) + 1
         for call, count in call_counts.items():
             if count > 3:
-                violations.append(f"bounded retry exceeded for {call}: {count} dispatches")
+                violations.append(
+                    f"bounded retry exceeded for {call}: {count} dispatches"
+                )
         for record in self.state.orders.values():
             order = record.order
             if record.run_name not in runner.runs:
-                violations.append(f"order {order.id} is owned by unknown run {record.run_name}")
+                violations.append(
+                    f"order {order.id} is owned by unknown run {record.run_name}"
+                )
             if order.qty < 0.0 or order.filled_qty < 0.0 or order.remaining_qty < 0.0:
                 violations.append(f"negative venue quantity on {order.id}")
             if self.quantity_step > 0.0:
                 units = order.qty / self.quantity_step
                 if abs(units - round(units)) > 1e-8:
                     violations.append(
-                        f"quantity-grid residual on {order.id}: qty={order.qty} " f"step={self.quantity_step}"
+                        f"quantity-grid residual on {order.id}: qty={order.qty} "
+                        f"step={self.quantity_step}"
                     )
-            if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED) and order.remaining_qty != 0.0:
-                violations.append(f"terminal order {order.id} retains remaining quantity")
+            if (
+                order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED)
+                and order.remaining_qty != 0.0
+            ):
+                violations.append(
+                    f"terminal order {order.id} retains remaining quantity"
+                )
             terminal = self.state.terminal_snapshots.get(order.id)
             if terminal is not None:
                 if order.status not in (
@@ -402,9 +502,13 @@ class ReferenceVenueProfile:
                     OrderStatus.CANCELLED,
                     OrderStatus.REJECTED,
                 ):
-                    violations.append(f"terminal order {order.id} resurrected as {order.status.value}")
+                    violations.append(
+                        f"terminal order {order.id} resurrected as {order.status.value}"
+                    )
                 elif terminal != (order.status, order.filled_qty, order.qty):
-                    violations.append(f"terminal order {order.id} was modified after terminalization")
+                    violations.append(
+                        f"terminal order {order.id} was modified after terminalization"
+                    )
             elif order.status in (
                 OrderStatus.FILLED,
                 OrderStatus.CANCELLED,
@@ -419,9 +523,13 @@ class ReferenceVenueProfile:
                 OrderStatus.OPEN,
                 OrderStatus.PARTIALLY_FILLED,
             ):
-                previous = live_coids.setdefault(order.client_order_id, record.intent_key)
+                previous = live_coids.setdefault(
+                    order.client_order_id, record.intent_key
+                )
                 if previous != record.intent_key:
-                    violations.append(f"client order id {order.client_order_id} aliases two intents")
+                    violations.append(
+                        f"client order id {order.client_order_id} aliases two intents"
+                    )
                 intent_owner = (
                     record.run_name,
                     record.intent_key,
@@ -438,47 +546,92 @@ class ReferenceVenueProfile:
                     )
                 active_intents.add(intent_owner)
         if not self.state.pending_events:
+            owned_total = sum(self.state.position_owners.values())
+            if abs(owned_total - self.state.position) > 1e-9:
+                violations.append(
+                    f"account position ownership mismatch: owners={owned_total} "
+                    f"account={self.state.position}"
+                )
+            engine_total = sum(
+                runtime.position.size for runtime in runner.runs.values()
+            )
+            if abs(engine_total - self.state.position) > 1e-9:
+                violations.append(
+                    f"economic account position mismatch: engines={engine_total} "
+                    f"venue={self.state.position}"
+                )
+            owner_signs = {
+                1 if size > 0.0 else -1
+                for size in self.state.position_owners.values()
+                if abs(size) > 1e-9
+            }
+            if self.venue_mode == "netting" and len(owner_signs) > 1:
+                violations.append(
+                    "opposing run ownership on a netting account cannot be isolated"
+                )
             for run_name, runtime in runner.runs.items():
-                venue_size = self.state.positions.get(run_name, 0.0)
+                venue_size = self.state.position_owners.get(run_name, 0.0)
                 if abs(runtime.position.size - venue_size) > 1e-9:
                     violations.append(
                         f"economic position mismatch for {run_name}: "
                         f"engine={runtime.position.size} venue={venue_size}"
                     )
                 if self.venue_mode == "hedged":
-                    leg_total = sum(self.state.position_legs.get(run_name, {}).values())
+                    leg_total = sum(
+                        size
+                        for (owner, _), size in self.state.position_legs.items()
+                        if owner == run_name
+                    )
                     if abs(leg_total - venue_size) > 1e-9:
                         violations.append(
                             f"hedged leg reconstruction mismatch for {run_name}: "
                             f"legs={leg_total} venue={venue_size}"
                         )
-                protection = sum(
-                    record.order.remaining_qty
-                    for record in self.state.orders.values()
-                    if record.run_name == run_name
-                    and record.leg_type
-                    in (
-                        LegType.TAKE_PROFIT,
-                        LegType.STOP_LOSS,
-                        LegType.TRAILING_STOP,
-                    )
-                    and record.order.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
-                )
-                has_exit = any(
-                    record.run_name == run_name
-                    and record.leg_type
-                    in (
-                        LegType.TAKE_PROFIT,
-                        LegType.STOP_LOSS,
-                        LegType.TRAILING_STOP,
-                    )
-                    for record in self.state.orders.values()
-                )
-                if has_exit and protection + 1e-9 < abs(venue_size):
-                    violations.append(
-                        f"protection coverage shortfall for {run_name}: "
-                        f"protected={protection} position={abs(venue_size)}"
-                    )
+                if abs(venue_size) <= 1e-9:
+                    continue
+                required: dict[tuple[str | None, str], float] = {}
+                dispatched_intents = {
+                    intent_key
+                    for owner, _, intent_key in self.state.calls
+                    if owner == run_name
+                }
+                for (
+                    exit_id,
+                    from_entry,
+                ), logical_exit in runtime.position.exit_orders.items():
+                    intent_key = f"{exit_id}{INTENT_KEY_SEP}{from_entry}"
+                    if intent_key not in dispatched_intents:
+                        continue
+                    qty = abs(float(logical_exit.size))
+                    if logical_exit.limit is not None:
+                        key = (from_entry, "take-profit")
+                        required[key] = required.get(key, 0.0) + qty
+                    if logical_exit.stop is not None:
+                        key = (from_entry, "stop-loss")
+                        required[key] = required.get(key, 0.0) + qty
+                coverage: dict[tuple[str | None, str], float] = {}
+                for record in self.state.orders.values():
+                    if record.run_name != run_name or record.order.status not in (
+                        OrderStatus.OPEN,
+                        OrderStatus.PARTIALLY_FILLED,
+                    ):
+                        continue
+                    if record.leg_type is LegType.TAKE_PROFIT:
+                        outcome = "take-profit"
+                    elif record.leg_type in (LegType.STOP_LOSS, LegType.TRAILING_STOP):
+                        outcome = "stop-loss"
+                    else:
+                        continue
+                    key = (record.from_entry, outcome)
+                    coverage[key] = coverage.get(key, 0.0) + record.order.remaining_qty
+                for (from_entry, outcome), required_qty in required.items():
+                    protected = coverage.get((from_entry, outcome), 0.0)
+                    if protected + 1e-9 < required_qty:
+                        violations.append(
+                            f"{outcome} protection coverage shortfall for {run_name} "
+                            f"from_entry={from_entry!r}: protected={protected} "
+                            f"required={required_qty}"
+                        )
         return violations
 
     def close(self) -> None:

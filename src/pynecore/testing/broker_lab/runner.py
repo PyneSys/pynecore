@@ -13,7 +13,7 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.sync_engine import OrderSyncEngine
-from pynecore.lib.strategy import Order, _order_type_close, _order_type_entry
+from pynecore.lib.strategy import Order, _order_type_close, _order_type_entry, oca
 
 from .model import Scenario, ScenarioInvariantError, ScenarioResult, Step, VenueProfile
 from .scheduler import DeterministicScheduler
@@ -65,6 +65,15 @@ class ScenarioRunner:
         self._script_sentinel = object()
         self._old_script: Any = self._script_sentinel
 
+    @property
+    def workdir(self) -> Path:
+        """Return the isolated filesystem root of the active scenario."""
+        if self._root is None:
+            raise RuntimeError(
+                "scenario workdir is only available while a scenario is running"
+            )
+        return self._root
+
     def run(self, scenario: Scenario, *, minimize: bool = True) -> ScenarioResult:
         result = self._execute(scenario)
         if result.passed or not minimize or len(scenario.steps) < 2:
@@ -89,7 +98,10 @@ class ScenarioRunner:
                         expected_violation=scenario.expected_violation,
                     )
                 )
-                if not trial.passed and (trial.violation or "").split(":", 1)[0] == target:
+                if (
+                    not trial.passed
+                    and (trial.violation or "").split(":", 1)[0] == target
+                ):
                     steps = candidate
                     changed = True
                     break
@@ -122,7 +134,9 @@ class ScenarioRunner:
             self.close()
         if scenario.expected_violation is not None:
             if violation is None:
-                violation = f"expected violation was not raised: {scenario.expected_violation}"
+                violation = (
+                    f"expected violation was not raised: {scenario.expected_violation}"
+                )
             elif scenario.expected_violation in violation:
                 violation = None
         return ScenarioResult(
@@ -200,6 +214,8 @@ class ScenarioRunner:
                 order_type=_order_type_entry,
                 limit=values.get("limit"),
                 stop=values.get("stop"),
+                oca_name=values.get("oca_name"),
+                oca_type=getattr(oca, str(values.get("oca_type", "none"))),
             )
         elif step.kind == "amend":
             pine_id = str(values.get("id", "L"))
@@ -212,24 +228,55 @@ class ScenarioRunner:
                 order_type=_order_type_entry,
                 limit=values.get("limit", old.limit),
                 stop=values.get("stop", old.stop),
+                oca_name=values.get("oca_name", old.oca_name),
+                oca_type=getattr(oca, str(values.get("oca_type", old.oca_type))),
             )
-        elif step.kind in ("exit", "close"):
-            pine_id = str(values.get("id", "X" if step.kind == "exit" else "L"))
-            exit_id = pine_id if step.kind == "exit" else f"Close entry(s) order {pine_id}"
+        elif step.kind == "amend_exit":
+            exit_id = str(values.get("id", "X"))
+            from_entry = values.get("from_entry")
+            key = (exit_id, from_entry)
+            old = runtime.position.exit_orders.get(key)
+            if old is None:
+                raise ValueError(f"cannot amend unknown exit {key!r}")
+            order = Order(
+                from_entry,
+                old.size,
+                order_type=_order_type_close,
+                exit_id=exit_id,
+                limit=values.get("limit", old.limit),
+                stop=values.get("stop", old.stop),
+                trail_price=values.get("trail_price", old.trail_price),
+                trail_offset=values.get("trail_offset", old.trail_offset),
+            )
+            order.from_entry_na = from_entry is None
+            order.rest_leg = bool(values.get("rest_leg", old.rest_leg))
+            runtime.position.exit_orders[key] = order
+        elif step.kind in ("exit", "close", "close_percent"):
+            is_exit = step.kind == "exit"
+            pine_id = str(values.get("id", "X" if is_exit else "L"))
+            exit_id = pine_id if is_exit else f"Close entry(s) order {pine_id}"
             from_entry = values.get("from_entry")
             side = str(values.get("side", "sell"))
-            qty = float(values.get("qty", abs(runtime.position.size) or 1.0))
+            if step.kind == "close_percent":
+                percent = float(values["percent"])
+                if percent <= 0.0 or percent > 100.0:
+                    raise ValueError("close percent must be in (0, 100]")
+                qty = abs(runtime.position.size) * percent / 100.0
+            else:
+                qty = float(values.get("qty", abs(runtime.position.size) or 1.0))
             order = Order(
-                from_entry if step.kind == "exit" else pine_id,
+                from_entry if is_exit else pine_id,
                 qty if side == "buy" else -qty,
                 order_type=_order_type_close,
                 exit_id=exit_id,
                 limit=values.get("limit"),
                 stop=values.get("stop"),
+                trail_price=values.get("trail_price"),
+                trail_offset=values.get("trail_offset"),
             )
             order.from_entry_na = from_entry is None
             order.rest_leg = bool(values.get("rest_leg", False))
-            key = (exit_id, from_entry if step.kind == "exit" else pine_id)
+            key = (exit_id, from_entry if is_exit else pine_id)
             runtime.position.exit_orders[key] = order
         elif step.kind == "cancel":
             cancel_id = values.get("id")
@@ -243,7 +290,27 @@ class ScenarioRunner:
         elif step.kind == "sync":
             self.scheduler.advance(int(values.get("advance_ms", 1_000)))
             self.now_ms = self.scheduler.now_ms
-            runtime.engine.sync(self.now_ms, last_price=float(values.get("last_price", 100.0)))
+            runtime.engine.sync(
+                self.now_ms, last_price=float(values.get("last_price", 100.0))
+            )
+        elif step.kind == "sync_expect_error":
+            self.scheduler.advance(int(values.get("advance_ms", 1_000)))
+            self.now_ms = self.scheduler.now_ms
+            expected = str(values["type"])
+            try:
+                runtime.engine.sync(
+                    self.now_ms,
+                    last_price=float(values.get("last_price", 100.0)),
+                )
+            except Exception as exc:
+                if type(exc).__name__ != expected:
+                    raise AssertionError(
+                        f"expected sync error {expected}, got {type(exc).__name__}: {exc}"
+                    ) from exc
+            else:
+                raise AssertionError(
+                    f"expected sync error {expected}, but sync succeeded"
+                )
         elif step.kind == "advance":
             self.scheduler.advance(int(values.get("ms", 1_000)))
             self.now_ms = self.scheduler.now_ms
