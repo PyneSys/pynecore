@@ -2,6 +2,7 @@
 @pyne
 """
 import os
+import subprocess
 import sys
 import types
 import py_compile
@@ -168,3 +169,40 @@ def __test_foreign_pyc_in_readonly_cache_still_runs_transformed__(tmp_path):
     # source so the correct, transformed bytecode runs anyway.
     assert _is_current_transform(code)
     assert pyc.exists(), "the read-only stale cache should still be on disk (just ignored)"
+
+
+def __test_import_script_installs_hook_from_namespace_package_cwd__(tmp_path):
+    """The script boundary installs the hook when cwd shadows the editable package.
+
+    From the monorepo root, the checkout's top-level ``pynecore/`` directory
+    can make ``pynecore`` a namespace package, so its ``__init__`` never gets
+    the chance to install :class:`PyneImportHook`.  A foreign but timestamp-
+    valid ``.pyc`` must still be rejected when :func:`import_script` runs.
+    """
+    mod = tmp_path / "namespace_cwd_strategy.py"
+    mod.write_text(
+        '"""@pyne"""\n'
+        'from pynecore.lib import script\n'
+        '@script.indicator("namespace cwd")\n'
+        'def main():\n'
+        '    return None\n'
+    )
+    _write_foreign_pyc(mod, _cache_from_source(mod))
+
+    repo_root = Path(__file__).resolve().parents[4]
+    probe = (
+        "import sys; "
+        "from pathlib import Path; "
+        "from pynecore.core.script_runner import import_script; "
+        "module = import_script(Path(sys.argv[1])); "
+        "print(getattr(module, '__pyne_transformed__', 'missing'))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(mod)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == _get_transform_pipeline_hash()

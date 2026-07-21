@@ -65,6 +65,14 @@ def import_script(script_path: Path) -> ModuleType:
     """
     Import the script
     """
+    # ``pynecore`` can resolve as a namespace package when the CLI is launched
+    # from the monorepo root (the checkout's top-level ``pynecore/`` directory
+    # shadows the editable ``src/pynecore`` package).  In that case
+    # ``pynecore.__init__`` never runs, so relying on it to install the Pyne
+    # import hook lets a valid foreign ``.pyc`` bypass every AST transform.
+    # Import the hook at the actual script-import boundary as the definitive
+    # installation point; the module import is idempotent in normal installs.
+    from . import import_hook as _import_hook  # noqa: F401
     from importlib import import_module
     import re
 

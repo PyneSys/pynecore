@@ -275,6 +275,19 @@ def _uniq_title(title: str) -> str:
     return t
 
 
+def _auto_viz_title(seq_key: str, base: str) -> str:
+    """
+    Return a per-bar-stable default title for an untitled ``bgcolor``/``barcolor``/``fill``.
+
+    Numbered by call order among untitled records of the same kind (``base``,
+    ``base 1``, ``base 2``, ...), mirroring the id sequence so it stays stable
+    across bars. ``seq_key`` must differ from the id counter keys.
+    """
+    n = _viz_seq.get(seq_key, 0)
+    _viz_seq[seq_key] = n + 1
+    return base if n == 0 else f'{base} {n}'
+
+
 # noinspection PyProtectedMember,PyShadowingBuiltins
 def plotshape(series: Any, title: str | None = None, style: Any = None, location: Any = None,
               color: Any = None, offset: int = 0, text: str | None = None, textcolor: Any = None,
@@ -556,6 +569,8 @@ def bgcolor(color: Any = None, offset: int = 0, editable: bool = True, show_last
     if bar_index == 0:
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The bgcolor function can only be called from the main function!")
+    if title is None:
+        title = _auto_viz_title('bgcolor:title', 'Background color')
     n = _viz_seq.get('bgcolor', 0)
     _viz_seq['bgcolor'] = n + 1
     key = f'bgcolor#{n}'
@@ -588,6 +603,8 @@ def barcolor(color: Any = None, offset: int = 0, editable: bool = True, show_las
     if bar_index == 0:
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The barcolor function can only be called from the main function!")
+    if title is None:
+        title = _auto_viz_title('barcolor:title', 'Bar color')
     n = _viz_seq.get('barcolor', 0)
     _viz_seq['barcolor'] = n + 1
     key = f'barcolor#{n}'
@@ -666,6 +683,8 @@ def fill(*args: Any, **kwargs: Any) -> None:
     plot2 = kwargs.get('plot2') if 'plot2' in kwargs else kwargs.get('hline2')
     color = kwargs.get('color')
     title = kwargs.get('title')
+    if title is None:
+        title = _auto_viz_title('fill:title', 'Plots Background')
     editable = kwargs.get('editable', True)
     show_last = kwargs.get('show_last')
     fillgaps = kwargs.get('fillgaps', False)
