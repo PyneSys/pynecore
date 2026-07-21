@@ -2177,9 +2177,44 @@ def __test_marketable_whole_row_limit_exit_dispatches_close__():
 
     assert len(b.close_calls) == 1
     assert len(b.exit_calls) == 0
-    assert b.close_calls[0].intent.pine_id == "L"
+    # Dispatched under a NUL-delimited synthetic id so the close cannot
+    # collide in the diff's ``new_map`` with the persistent parent EntryIntent
+    # (both would otherwise key on the entry id "L").
+    assert b.close_calls[0].intent.pine_id == "__pyne_marketable_exit__TP\0L"
     assert b.close_calls[0].intent.side == "sell"
     assert b.close_calls[0].intent.qty == 1.0
+    # The Pine exit slot is retired so the next bar does not re-emit it.
+    assert ("TP", "L") not in pos.exit_orders
+
+
+def __test_marketable_whole_row_limit_exit_fires_with_persistent_parent__():
+    """The immediate close fires even while the filled parent entry persists.
+
+    ``record_fill`` never pops a filled ``strategy.entry`` from
+    ``position.entry_orders``, so ``build_intents`` emits an ``EntryIntent``
+    for the parent on every sync of an open position. The earlier
+    rewrite-to-``CloseIntent`` approach keyed the close on ``from_entry`` — the
+    same key as that persistent ``EntryIntent`` — and suppressed itself to
+    avoid the ``new_map`` collision, making the whole-row fix a permanent
+    no-op live (Capital.com marketable full exit). The direct dispatch under a
+    NUL-delimited synthetic id must fire regardless of the parent's presence.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    # The filled parent entry that record_fill leaves in the book.
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=60_000.0)
+
+    engine.sync(BAR_TS, last_price=61_000.0)
+
+    assert len(b.close_calls) == 1
+    assert len(b.exit_calls) == 0
+    assert b.close_calls[0].intent.side == "sell"
+    assert b.close_calls[0].intent.qty == 1.0
+    assert ("TP", "L") not in pos.exit_orders
 
 
 def __test_non_marketable_whole_row_limit_exit_still_attaches_tp__():

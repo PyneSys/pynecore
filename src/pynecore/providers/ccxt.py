@@ -441,7 +441,6 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 f"Unknown symbol {self.symbol!r} on {self._client.id}."
             ) from None
 
-        assert self.timeframe is not None
         opening_hours, session_starts, session_ends = self._create_24_7_sessions()
 
         # Derive pricescale from the tick size. ``round_to_mintick`` divides by
@@ -472,7 +471,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             ticker=ticker,
             currency=market_details['quote'],
             basecurrency=market_details['base'],
-            period=self.timeframe,
+            period=self.timeframe or "1D",
             type="crypto",
             mintick=mintick,
             pricescale=pricescale,

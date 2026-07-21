@@ -3972,9 +3972,18 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     size = qty * direction_sign
 
-    size = _size_round(size)
-    if size == 0.0:
-        return
+    # The Pine-side lot floor is a backtest-only quantization: TV silently
+    # snaps a sub-lot size to zero and drops the order. In broker mode the
+    # exchange owns the quantity grid — the plugin quantizes onto the venue
+    # step and emits an explicit below-minimum skip. Flooring here would
+    # instead drop a below-grid signal silently, before the order is ever
+    # built, hiding an invalid live signal from the operator. Keep the raw
+    # requested qty in broker mode so the sync engine dispatches it and the
+    # plugin's quantity preflight reports the skip.
+    if isinstance(position, SimPosition):
+        size = _size_round(size)
+        if size == 0.0:
+            return
 
     # Market entries keep their placement-close sizing (price-based orders
     # re-resolve at fill), so the big-money sizing gate is judged here. A

@@ -379,6 +379,25 @@ resets on a changed intent, a vanished key, or a dispatch that succeeds.
 """
 
 
+_TERMINAL_PLUGIN_SKIP_REASONS = frozenset({"below_min_size", "above_max_size"})
+"""Plugin preflight skip reasons that are a pure function of the entry intent
+(quantity vs the instrument grid / per-order minimum / maximum), independent
+of price or account state.
+
+Re-dispatching the identical intent reproduces the identical skip, so — unlike
+a transient exchange reject that a later bar may clear — there is nothing to
+retry. Under ``calc_on_every_tick`` a plain re-emission would otherwise POST
+the same doomed entry (and log the same skip) on every tick. The engine records
+such a skip as immediately exhausted (shares the
+:attr:`OrderSyncEngine._rejected_entry_intents` machinery), so exactly one skip
+is surfaced per distinct intent; a changed intent (e.g. a runtime sizing model
+that later yields a placeable qty) differs by snapshot and is dispatched
+freely. Notional-based skips are deliberately excluded: their bound moves with
+price, so a fixed qty can cross the threshold on a later tick and must keep
+re-evaluating.
+"""
+
+
 class _BoundedIdSet:
     """Insertion-ordered string-id cache with FIFO eviction at ``cap`` entries.
 
@@ -5134,13 +5153,27 @@ class OrderSyncEngine:
     ) -> None:
         """Increment the bounded reject counter for an outright-rejected entry.
 
-        Only the exchange-reject skip vehicle (``reason ==
-        "broker_rejected_entry"``, raised by the ``ExchangeOrderRejectedError``
-        branch of :meth:`_dispatch_new`) feeds the counter; a plugin-side skip
-        (below-min-size and friends) is a distinct, already-terminal decision
-        the plugin owns. Consecutive rejects of the identical intent add up;
-        a changed intent resets the count to one.
+        Two skip classes feed the suppression:
+
+        * The exchange-reject vehicle (``reason == "broker_rejected_entry"``,
+          raised by the ``ExchangeOrderRejectedError`` branch of
+          :meth:`_dispatch_new`) is transient — a risk / funds veto can clear
+          on a later bar — so consecutive rejects of the identical intent add
+          up and only the :data:`_ENTRY_REJECT_RETRY_CAP`-th silences it.
+        * A deterministic plugin preflight decline
+          (:data:`_TERMINAL_PLUGIN_SKIP_REASONS`: below-min / above-max size)
+          is a pure function of the intent, so re-dispatching reproduces it
+          verbatim. It is recorded as immediately exhausted — exactly one
+          skip is surfaced, then the identical intent is suppressed on every
+          subsequent tick (no per-tick retry storm under
+          ``calc_on_every_tick``).
+
+        A changed intent resets the count to one; the start-of-cycle pruning
+        pass drops the marker the moment Pine changes or cancels the order.
         """
+        if exc.reason in _TERMINAL_PLUGIN_SKIP_REASONS:
+            self._rejected_entry_intents[key] = (intent, _ENTRY_REJECT_RETRY_CAP)
+            return
         if exc.reason != "broker_rejected_entry":
             return
         marker = self._rejected_entry_intents.get(key)
@@ -9082,7 +9115,7 @@ class OrderSyncEngine:
     def _convert_marketable_limit_exits(
             self, intents: list[Intent], last_price: float | None,
     ) -> list[Intent]:
-        """Convert an already-marketable whole-row limit exit to a close.
+        """Fire an immediate close for an already-marketable whole-row limit exit.
 
         A pure ``strategy.exit(limit=X)`` (TP-only, no SL / trail / tick
         offsets) whose limit ``X`` is already on the fillable side of the
@@ -9095,31 +9128,33 @@ class OrderSyncEngine:
         validate the TP side against the live quote (Capital.com:
         ``error.invalid.takeprofit.minvalue``) a marketable TP is rejected —
         a valid limit exit is misclassified as a failed protection attach.
-        The engine-trigger *partial* path already handles this correctly
-        (its price-watch fires a close the moment the level is crossed); this
-        method restores the same immediate-close semantics for the whole-row
-        case by rewriting the intent into a :class:`CloseIntent` before the
-        diff runs.
 
-        Guards keep the rewrite surgical:
+        The engine-trigger *partial* path already handles this correctly
+        (:meth:`_dispatch_partial_bracket_close`): its price-watch fires an
+        immediate close through :meth:`_dispatch_new` under a NUL-delimited
+        synthetic ``pine_id`` and pops the Pine ``exit_orders`` slot so the
+        order is never re-emitted. This method gives the whole-row case the
+        SAME treatment. It cannot reuse the earlier rewrite-to-``CloseIntent``
+        approach: :attr:`CloseIntent.intent_key` is the bare ``pine_id`` and a
+        close keyed on ``from_entry`` collides in the diff's ``new_map`` with
+        the parent :class:`EntryIntent` — which persists for the whole
+        position lifetime (``record_fill`` never pops the entry ``Order``), so
+        the rewrite was suppressed for every real open position. Dispatching
+        directly under a collision-free synthetic id sidesteps that entirely.
+
+        Guards keep the conversion surgical:
 
         * ``last_price`` must be known — without a price context marketability
           cannot be judged, so the intent falls through to the native path.
-        * Only a *fresh* exit is converted (``intent_key`` not already active
-          nor mapped to a live broker order): once a native TP is attached the
+        * Only a *fresh* exit is fired (``intent_key`` not already active nor
+          mapped to a live broker order): once a native TP is attached the
           venue owns it, and a late marketable tick must let the venue fill it
           rather than double-dispatch a close.
         * A whole-row exit only — partial-qty brackets keep their existing
           engine-trigger routing.
-        * Skipped when an :class:`EntryIntent` in the same batch shares the
-          ``from_entry`` id (the synthesised close keys on that id and must not
-          clobber a concurrent re-entry in ``new_map``).
         """
         if last_price is None:
             return intents
-        entry_ids = {
-            i.pine_id for i in intents if isinstance(i, EntryIntent)
-        }
         converted: list[Intent] = []
         for intent in intents:
             if not isinstance(intent, ExitIntent):
@@ -9137,8 +9172,7 @@ class OrderSyncEngine:
             if (not is_pure_limit
                     or intent.is_partial_qty_bracket
                     or intent.intent_key in self._active_intents
-                    or intent.intent_key in self._order_mapping
-                    or intent.from_entry in entry_ids):
+                    or intent.intent_key in self._order_mapping):
                 converted.append(intent)
                 continue
             # Marketable side: a long parent exits by selling — its limit
@@ -9146,6 +9180,7 @@ class OrderSyncEngine:
             # already fillable when ``last_price >= tp``. A short parent
             # (buy-to-close) is the mirror.
             parent_long = intent.side == 'sell'
+            assert intent.tp_price is not None  # is_pure_limit guarantees it
             marketable = (
                 last_price >= intent.tp_price if parent_long
                 else last_price <= intent.tp_price
@@ -9153,22 +9188,84 @@ class OrderSyncEngine:
             if not marketable:
                 converted.append(intent)
                 continue
-            _blog_info(
-                "marketable limit exit %r (tp=%s, last_price=%s): dispatching "
-                "an immediate close instead of a native take-profit attach",
-                format_intent_key(intent.intent_key), intent.tp_price,
-                last_price,
-            )
-            converted.append(CloseIntent(
-                pine_id=intent.from_entry,
-                symbol=intent.symbol,
-                side=intent.side,
-                qty=intent.qty,
-                immediately=False,
-                comment=intent.comment_profit or intent.comment,
-                alert_message=intent.alert_message,
-            ))
+            if not self._dispatch_marketable_whole_row_close(intent, last_price):
+                # Dispatch could not be confirmed (parked / rejected) — leave
+                # the exit in place so the diff falls back to the native path
+                # and the next sync re-evaluates marketability.
+                converted.append(intent)
         return converted
+
+    def _dispatch_marketable_whole_row_close(
+            self, intent: ExitIntent, last_price: float,
+    ) -> bool:
+        """Fire one immediate close for a marketable whole-row limit exit.
+
+        Mirrors the success path of :meth:`_dispatch_partial_bracket_close`:
+        dispatch a :class:`CloseIntent` under a NUL-delimited synthetic
+        ``pine_id`` (provably collision-free — Pine string literals cannot
+        contain NUL), then, once the close is confirmed on the wire, retire the
+        Pine ``exit_orders`` slot so the intent-builder does not re-emit the
+        exit and the engine cannot double-dispatch.
+
+        :returns: ``True`` when the close landed (or was cleanly handled and
+            the exit retired); ``False`` when the dispatch was parked or
+            rejected and the caller should keep the exit for a later retry /
+            native fallback.
+        """
+        synth_pine_id = (
+            f"__pyne_marketable_exit__{intent.pine_id}\0{intent.from_entry}"
+        )
+        close_intent = CloseIntent(
+            pine_id=synth_pine_id,
+            symbol=intent.symbol,
+            side=intent.side,
+            qty=intent.qty,
+            immediately=True,
+            comment=intent.comment_profit or intent.comment,
+            alert_message=intent.alert_message,
+        )
+        _blog_info(
+            "marketable limit exit %r (tp=%s, last_price=%s): dispatching an "
+            "immediate close instead of a native take-profit attach",
+            format_intent_key(intent.intent_key), intent.tp_price, last_price,
+        )
+        try:
+            self._dispatch_new(close_intent)
+        except OrderSkippedByPlugin as e:
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+            _blog_warning(
+                "marketable close for %r skipped by plugin (%s) — keeping the "
+                "exit for native fallback", format_intent_key(intent.intent_key),
+                e.reason,
+            )
+            return False
+        except BrokerManualInterventionError:
+            raise
+        except ExchangeOrderRejectedError as e:
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+            _blog_warning(
+                "marketable close for %r rejected by broker (%s) — keeping the "
+                "exit for native fallback", format_intent_key(intent.intent_key),
+                type(e).__name__,
+            )
+            return False
+        # ``_dispatch_new`` swallows :class:`OrderDispositionUnknownError` and
+        # parks the close without populating ``_order_mapping``. Confirming and
+        # retiring the exit on that path would strand the position unprotected
+        # if the parked close eventually resolves ``'rejected'`` — keep the
+        # exit and let the next sync re-evaluate (the deterministic COID makes
+        # the re-dispatch idempotent).
+        if synth_pine_id not in self._order_mapping:
+            return False
+        self._active_intents[synth_pine_id] = close_intent
+        # Retire the Pine ``strategy.exit`` slot (mirrors the broker-FILL path
+        # :meth:`_remove_pine_order_for_intent` and the partial trigger's
+        # cleanup): without this the next bar's intent-builder rebuilds the
+        # ExitIntent and this method re-fires against the now-closing position.
+        self._position.exit_orders.pop((intent.pine_id, intent.from_entry), None)
+        return True
 
     def _diff_and_dispatch(
             self, intents: list[Intent], *, may_open_exposure: bool = True,
