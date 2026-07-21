@@ -158,6 +158,64 @@ def __test_retry_seq_changes_id__():
     assert b.endswith('1')
 
 
+# === DispatchEnvelope coid identity ======================================
+
+
+def __test_exit_envelope_folds_from_entry_into_coid__():
+    """Two global-exit brackets differing only in ``from_entry`` must get
+    distinct coids.
+
+    A pyramided position with one ``strategy.exit`` (no explicit
+    ``from_entry``) fans out to one :class:`ExitIntent` per entry, all
+    sharing the exit ``pine_id``. If the coid ignored ``from_entry`` both
+    brackets would collapse onto the same deterministic id, the venue would
+    dedup the second create, and half the position would be left
+    unprotected.
+    """
+    from pynecore.core.broker.models import DispatchEnvelope, ExitIntent
+
+    def _env(from_entry: str) -> DispatchEnvelope:
+        return DispatchEnvelope(
+            intent=ExitIntent(
+                pine_id='EXIT', from_entry=from_entry, symbol='ETHUSDT',
+                side='sell', qty=0.01, tp_price=1985.9, sl_price=1885.9,
+            ),
+            run_tag='abcd',
+            bar_ts_ms=1_700_000_000_000,
+        )
+
+    env_a = _env('A')
+    env_b = _env('B')
+    assert env_a.client_order_id(KIND_EXIT_TP) != env_b.client_order_id(KIND_EXIT_TP)
+    assert env_a.client_order_id(KIND_EXIT_SL) != env_b.client_order_id(KIND_EXIT_SL)
+    # Same intent identity -> deterministic (stable across calls).
+    assert env_a.client_order_id(KIND_EXIT_TP) == _env('A').client_order_id(KIND_EXIT_TP)
+
+
+def __test_entry_envelope_coid_ignores_missing_from_entry__():
+    """An :class:`EntryIntent` (no ``from_entry``) hashes the bare pine_id,
+    unchanged by the exit-identity fold."""
+    from pynecore.core.broker.models import DispatchEnvelope, EntryIntent
+    from pynecore.core.broker.models import OrderType
+
+    env = DispatchEnvelope(
+        intent=EntryIntent(
+            pine_id='Long', symbol='ETHUSDT', side='buy', qty=0.01,
+            order_type=OrderType.MARKET,
+        ),
+        run_tag='abcd',
+        bar_ts_ms=1_700_000_000_000,
+    )
+    expected = encode_wire_client_order_id(
+        build_client_order_id(
+            run_tag='abcd', pine_id='Long', bar_ts_ms=1_700_000_000_000,
+            kind=KIND_ENTRY,
+        ),
+        env.coid_max_len,
+    )
+    assert env.client_order_id(KIND_ENTRY) == expected
+
+
 # === Collision resistance ================================================
 
 

@@ -1222,13 +1222,30 @@ class DispatchEnvelope:
         return encode_wire_client_order_id(
             build_client_order_id(
                 run_tag=self.run_tag,
-                pine_id=self.intent.pine_id,
+                pine_id=self._coid_identity(),
                 bar_ts_ms=self.bar_ts_ms,
                 kind=kind,
                 retry_seq=self.retry_seq,
             ),
             self.coid_max_len,
         )
+
+    def _coid_identity(self) -> str:
+        """Return the identity string hashed into the client-order-id.
+
+        For an :class:`EntryIntent` / :class:`CloseIntent` the Pine id alone
+        uniquely identifies the dispatch. An :class:`ExitIntent` (and a
+        per-entry :class:`CancelIntent`) shares one exit ``pine_id`` across
+        every entry a global ``strategy.exit`` fans out to, so the id must
+        also fold in ``from_entry`` — otherwise two distinct protective
+        brackets on a pyramided position collapse onto the same
+        deterministic coid, the venue dedups the second create, and half the
+        position is left unprotected.
+        """
+        from_entry = getattr(self.intent, 'from_entry', None)
+        if from_entry is not None:
+            return f"{self.intent.pine_id}{INTENT_KEY_SEP}{from_entry}"
+        return self.intent.pine_id
 
 
 # === Compile-time detected script requirements ===

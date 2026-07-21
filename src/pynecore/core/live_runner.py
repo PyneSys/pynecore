@@ -51,6 +51,7 @@ from zoneinfo import ZoneInfo
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
+from pynecore.core.plugin import is_retryable_provider_error
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.lib.log import broker_info, broker_warning
@@ -316,6 +317,35 @@ def _warn_this_attempt(attempts: int) -> bool:
     a long outage instead of one per attempt.
     """
     return attempts <= 3 or attempts % 10 == 0
+
+
+def _is_transient_connect_error(exc: BaseException) -> bool:
+    """Whether a failed initial ``provider.connect()`` is worth retrying.
+
+    Extends the provider-error classification (:func:`is_retryable_provider_error`)
+    to the raw socket/TLS layer: a transient ``OSError``-derived fault — most
+    notably ``ConnectionResetError`` ([Errno 54]) raised straight out of
+    ``asyncio.open_connection`` during the TLS handshake — is a network blip, not
+    a user-actionable misconfiguration, so the startup connect should ride it out
+    on the backoff path rather than die before the handshake. The ``__cause__`` /
+    ``__context__`` chain is walked so a transient still classifies after being
+    re-wrapped. Permanent failures (bad symbol / credentials / account mode)
+    surface as a non-retryable :class:`ProviderError` and correctly return
+    ``False`` here so they keep failing fast.
+
+    :param exc: The exception raised by ``provider.connect()``.
+    :return: ``True`` if a retry could plausibly succeed.
+    """
+    if is_retryable_provider_error(exc):
+        return True
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def live_ohlcv_generator(
@@ -611,10 +641,55 @@ def live_ohlcv_generator(
         # Drives the rate-limited synth warning: first of a streak warns,
         # then every ``_SYNTH_WARN_EVERY``th, the rest log at DEBUG.
         synth_streak = 0
+        async def _connect_with_initial_backoff() -> None:
+            """Open the first provider connection, riding out transient faults.
+
+            A transient socket/TLS fault on the very first connect — a broker
+            edge reset (``ConnectionResetError``), a half-open network path —
+            must not kill the live run before the handshake. The same
+            classification the in-loop reconnect path applies to a mid-session
+            drop is extended here so the startup connect retries with capped
+            exponential backoff instead of propagating a raw traceback and
+            exiting. Retries are bounded by ``connect_timeout_seconds`` (the
+            window the constructing thread waits on ``connected_event``) so a
+            genuinely-down venue still surfaces a clean error inside that window
+            rather than looping forever, and a permanent misconfiguration
+            (non-retryable :class:`ProviderError`) is re-raised on the first
+            attempt so it keeps failing fast. The inter-attempt wait is
+            event-driven — raced against ``stop_aevent`` — so a shutdown request
+            abandons it at once without polling.
+            """
+            deadline = time.monotonic() + connect_timeout_seconds
+            attempt = 0
+            delay = provider.reconnect_delay
+            while True:
+                try:
+                    await provider.connect()
+                    return
+                except BaseException as exc:
+                    if not _is_transient_connect_error(exc):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    attempt += 1
+                    wait = min(delay, remaining)
+                    log = logger.warning if _warn_this_attempt(attempt) else logger.debug
+                    log("Initial connect failed (attempt %d): %s; "
+                        "retrying in %.1fs", attempt, exc, wait)
+                    try:
+                        await asyncio.wait_for(stop_aevent.wait(), timeout=wait)
+                        # Shutdown requested mid-backoff: surface the last
+                        # connect error so teardown runs and the caller unblocks.
+                        raise
+                    except asyncio.TimeoutError:
+                        pass
+                    delay = min(delay * 2.0, provider.max_reconnect_delay)
+
         try:
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
-                await provider.connect()
+                await _connect_with_initial_backoff()
             except BaseException as connect_exc:
                 # Record the real cause, then unblock the caller waiting on
                 # ``connected_event``. The append happens-before ``set()``,

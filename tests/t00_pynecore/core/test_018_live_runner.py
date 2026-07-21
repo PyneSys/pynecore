@@ -323,6 +323,72 @@ def __test_reconnect_retries_indefinitely_and_recovers__():
     assert provider.connect_calls >= 15
 
 
+# --- Initial connect retry tests ---
+
+class InitialConnectFlakyProvider(MockLiveProvider):
+    """Provider whose first ``connect()`` calls fail with a transient error.
+
+    Reproduces a startup socket/TLS reset — the raw ``ConnectionResetError``
+    ([Errno 54]) that killed the live run before the handshake. The initial
+    connect must ride it out on the backoff path and only then stream.
+    """
+
+    def __init__(self, bar_updates: list[OHLCV], fail_count: int,
+                 exc: BaseException | None = None):
+        super().__init__(bar_updates)
+        self.reconnect_delay = 0.001
+        self.max_reconnect_delay = 0.002
+        self.connect_calls = 0
+        self._remaining_failures = fail_count
+        self._exc = exc or ConnectionResetError(54, "Connection reset by peer")
+
+    async def connect(self):
+        self.connect_calls += 1
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise self._exc
+        self._connected = True
+
+
+def __test_initial_connect_retries_transient_reset__():
+    """A transient reset on the first connect is ridden out, not fatal.
+
+    Before the fix, a ``ConnectionResetError`` out of the initial
+    ``provider.connect()`` propagated raw and killed the run with a traceback
+    and ``exit 1``. It must now be classified transient and retried on the
+    startup backoff path so the stream survives and delivers its bars.
+    """
+    provider = InitialConnectFlakyProvider(
+        [_make_ohlcv(1000, is_closed=True, close=100.0)], fail_count=3)
+    _, bars = _drain(provider, "BTC/USDT", "1D")
+
+    assert provider.connect_calls == 4  # 3 transient failures + 1 success
+    assert len(bars) == 1
+    assert bars[0].close == 100.0
+
+
+def __test_initial_connect_permanent_error_fails_fast__():
+    """A permanent (non-transient) initial connect error is not retried.
+
+    A misconfiguration (bad symbol / credentials) surfaces as a plain
+    ``ValueError`` here — not ``OSError``-derived and not a retryable
+    ``ProviderError`` — so it must be raised on the first attempt instead of
+    looping. With ``raise_on_connect_failure`` the real cause surfaces to the
+    constructing caller.
+    """
+    import pytest
+
+    provider = InitialConnectFlakyProvider(
+        [_make_ohlcv(1000, is_closed=True, close=100.0)], fail_count=99,
+        exc=ValueError("unknown symbol"))
+
+    with pytest.raises(ValueError, match="unknown symbol"):
+        list(live_ohlcv_generator(
+            provider, "BTC/USDT", "1D", raise_on_connect_failure=True))
+
+    assert provider.connect_calls == 1
+
+
 # --- Queue overflow tests ---
 
 class FloodProvider(MockLiveProvider):

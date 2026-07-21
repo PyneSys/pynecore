@@ -2257,6 +2257,53 @@ def __test_marketable_limit_exit_with_stop_keeps_bracket_attach__():
     assert len(b.close_calls) == 0
 
 
+def __test_marketable_whole_row_stop_exit_dispatches_close__():
+    """An already-triggered pure stop exit closes immediately, not via SL attach.
+
+    ``strategy.exit(stop=X)`` on a long whose ``X`` sits above the current
+    market has already triggered its sell-stop — in Pine it fills on the next
+    bar. Routing it through the native stop-loss attach (``execute_exit``)
+    would ask the venue to accept a stop above the live quote, which native-SL
+    venues (Capital.com: ``error.invalid.stoploss.maxvalue``) reject. The
+    engine must instead dispatch an immediate close.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    # Long SL at 61_000; price already at 60_000 -> the sell-stop above the
+    # market has triggered and fills immediately.
+    pos.exit_orders[("SL", "L")] = _exit_order("L", -1.0, "SL", stop=61_000.0)
+
+    engine.sync(BAR_TS, last_price=60_000.0)
+
+    assert len(b.close_calls) == 1
+    assert len(b.exit_calls) == 0
+    assert b.close_calls[0].intent.pine_id == "__pyne_marketable_exit__SL\0L"
+    assert b.close_calls[0].intent.side == "sell"
+    assert b.close_calls[0].intent.qty == 1.0
+    assert ("SL", "L") not in pos.exit_orders
+
+
+def __test_non_marketable_whole_row_stop_exit_still_attaches_sl__():
+    """A resting (not-yet-triggered) stop exit keeps the native SL attach path."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    # Long SL at 45_000; price at 60_000 -> the sell-stop below the market has
+    # not been reached, so it must rest as a native stop-loss.
+    pos.exit_orders[("SL", "L")] = _exit_order("L", -1.0, "SL", stop=45_000.0)
+
+    engine.sync(BAR_TS, last_price=60_000.0)
+
+    assert len(b.exit_calls) == 1
+    assert len(b.close_calls) == 0
+    assert b.exit_calls[0].intent.sl_price == 45_000.0
+
+
 def _long_trade(entry_id: str, size: float) -> Trade:
     return Trade(size=size, entry_id=entry_id, entry_bar_index=0,
                  entry_time=0, entry_price=50_000.0, commission=0.0)

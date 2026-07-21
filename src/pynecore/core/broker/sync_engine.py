@@ -1983,7 +1983,7 @@ class OrderSyncEngine:
         # marketable take-profit is rejected, so preserve Pine's immediate
         # limit-exit fill semantics with a close (the engine-trigger partial
         # path already does this for a fractional exit).
-        dispatchable = self._convert_marketable_limit_exits(
+        dispatchable = self._convert_marketable_whole_row_exits(
             dispatchable, last_price,
         )
 
@@ -9112,22 +9112,30 @@ class OrderSyncEngine:
             corrected.append(intent)
         return corrected
 
-    def _convert_marketable_limit_exits(
+    def _convert_marketable_whole_row_exits(
             self, intents: list[Intent], last_price: float | None,
     ) -> list[Intent]:
-        """Fire an immediate close for an already-marketable whole-row limit exit.
+        """Fire an immediate close for an already-marketable whole-row exit.
 
-        A pure ``strategy.exit(limit=X)`` (TP-only, no SL / trail / tick
-        offsets) whose limit ``X`` is already on the fillable side of the
-        current price is, in Pine semantics, an immediate fill — the limit
-        order crosses on the next bar and closes the position at the open.
+        Covers both bare-``limit`` and bare-``stop`` whole-row exits:
+
+        * A pure ``strategy.exit(limit=X)`` (TP-only, no SL / trail / tick
+          offsets) whose limit ``X`` is already on the fillable side of the
+          current price is, in Pine semantics, an immediate fill — the limit
+          order crosses on the next bar and closes the position at the open.
+        * A pure ``strategy.exit(stop=X)`` (SL-only) whose stop ``X`` has
+          already been crossed (for a long exit, ``X`` above the market so the
+          sell-stop has triggered; a short exit is the mirror) is likewise an
+          immediate fill — Pine triggers the stop on the next bar and closes at
+          the open / stop.
 
         The whole-row native-bracket dispatch path
         (:meth:`_diff_and_dispatch` → ``execute_exit``) would instead attach
-        ``X`` as a native take-profit position attribute. On venues that
-        validate the TP side against the live quote (Capital.com:
-        ``error.invalid.takeprofit.minvalue``) a marketable TP is rejected —
-        a valid limit exit is misclassified as a failed protection attach.
+        ``X`` as a native take-profit / stop-loss position attribute. On venues
+        that validate the bracket side against the live quote (Capital.com:
+        ``error.invalid.takeprofit.minvalue`` / ``error.invalid.stoploss.
+        maxvalue``) an already-marketable bracket is rejected — a valid exit is
+        misclassified as a failed protection attach.
 
         The engine-trigger *partial* path already handles this correctly
         (:meth:`_dispatch_partial_bracket_close`): its price-watch fires an
@@ -9147,7 +9155,7 @@ class OrderSyncEngine:
         * ``last_price`` must be known — without a price context marketability
           cannot be judged, so the intent falls through to the native path.
         * Only a *fresh* exit is fired (``intent_key`` not already active nor
-          mapped to a live broker order): once a native TP is attached the
+          mapped to a live broker order): once a native bracket is attached the
           venue owns it, and a late marketable tick must let the venue fill it
           rather than double-dispatch a close.
         * A whole-row exit only — partial-qty brackets keep their existing
@@ -9160,35 +9168,58 @@ class OrderSyncEngine:
             if not isinstance(intent, ExitIntent):
                 converted.append(intent)
                 continue
-            is_pure_limit = (
-                intent.tp_price is not None
-                and intent.sl_price is None
-                and intent.trail_price is None
+            no_ticks_or_trail = (
+                intent.trail_price is None
                 and intent.trail_offset is None
                 and intent.profit_ticks is None
                 and intent.loss_ticks is None
                 and intent.trail_points_ticks is None
             )
-            if (not is_pure_limit
+            is_pure_limit = (
+                intent.tp_price is not None
+                and intent.sl_price is None
+                and no_ticks_or_trail
+            )
+            is_pure_stop = (
+                intent.sl_price is not None
+                and intent.tp_price is None
+                and no_ticks_or_trail
+            )
+            if (not (is_pure_limit or is_pure_stop)
                     or intent.is_partial_qty_bracket
                     or intent.intent_key in self._active_intents
                     or intent.intent_key in self._order_mapping):
                 converted.append(intent)
                 continue
-            # Marketable side: a long parent exits by selling — its limit
-            # sits above the open and fills once price rises to it, so it is
-            # already fillable when ``last_price >= tp``. A short parent
-            # (buy-to-close) is the mirror.
+            # Marketable side depends on the leg. A long parent exits by
+            # selling: its take-profit sits above the open and is fillable once
+            # ``last_price >= tp``; its stop-loss sits below and has triggered
+            # once ``last_price <= sl`` (an already-crossed stop above the
+            # market fires immediately). A short parent (buy-to-close) is the
+            # mirror on both legs.
             parent_long = intent.side == 'sell'
-            assert intent.tp_price is not None  # is_pure_limit guarantees it
-            marketable = (
-                last_price >= intent.tp_price if parent_long
-                else last_price <= intent.tp_price
-            )
+            if is_pure_limit:
+                trigger = intent.tp_price
+                assert trigger is not None  # is_pure_limit guarantees it
+                marketable = (
+                    last_price >= trigger if parent_long
+                    else last_price <= trigger
+                )
+                comment = intent.comment_profit or intent.comment
+            else:
+                trigger = intent.sl_price
+                assert trigger is not None  # is_pure_stop guarantees it
+                marketable = (
+                    last_price <= trigger if parent_long
+                    else last_price >= trigger
+                )
+                comment = intent.comment_loss or intent.comment
             if not marketable:
                 converted.append(intent)
                 continue
-            if not self._dispatch_marketable_whole_row_close(intent, last_price):
+            if not self._dispatch_marketable_whole_row_close(
+                    intent, last_price, trigger, comment,
+            ):
                 # Dispatch could not be confirmed (parked / rejected) — leave
                 # the exit in place so the diff falls back to the native path
                 # and the next sync re-evaluates marketability.
@@ -9197,8 +9228,9 @@ class OrderSyncEngine:
 
     def _dispatch_marketable_whole_row_close(
             self, intent: ExitIntent, last_price: float,
+            trigger_price: float, comment: str | None,
     ) -> bool:
-        """Fire one immediate close for a marketable whole-row limit exit.
+        """Fire one immediate close for a marketable whole-row exit.
 
         Mirrors the success path of :meth:`_dispatch_partial_bracket_close`:
         dispatch a :class:`CloseIntent` under a NUL-delimited synthetic
@@ -9221,13 +9253,14 @@ class OrderSyncEngine:
             side=intent.side,
             qty=intent.qty,
             immediately=True,
-            comment=intent.comment_profit or intent.comment,
+            comment=comment,
             alert_message=intent.alert_message,
         )
+        leg = "limit" if intent.tp_price is not None else "stop"
         _blog_info(
-            "marketable limit exit %r (tp=%s, last_price=%s): dispatching an "
-            "immediate close instead of a native take-profit attach",
-            format_intent_key(intent.intent_key), intent.tp_price, last_price,
+            "marketable %s exit %r (trigger=%s, last_price=%s): dispatching an "
+            "immediate close instead of a native bracket attach",
+            leg, format_intent_key(intent.intent_key), trigger_price, last_price,
         )
         try:
             self._dispatch_new(close_intent)
