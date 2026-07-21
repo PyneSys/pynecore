@@ -2157,6 +2157,9 @@
     "ABC": {
       "type": "variable"
     },
+    "ADOPTED_STARTUP_ENTRY_ID": {
+      "type": "variable"
+    },
     "IntEnum": {
       "type": "variable"
     },
