@@ -318,8 +318,17 @@ class ScenarioRunner:
 
             async def pump_one() -> None:
                 stream = runtime.broker.watch_orders()
+                timeout_seconds = float(values.get("timeout_seconds", 1.0))
                 try:
-                    event = await stream.__anext__()
+                    event = await asyncio.wait_for(
+                        stream.__anext__(),
+                        timeout=timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise AssertionError(
+                        "pump_watch received no broker event within "
+                        f"{timeout_seconds:g}s"
+                    ) from exc
                 finally:
                     await stream.aclose()
                 runtime.engine.on_order_event(event)

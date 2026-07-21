@@ -1,5 +1,6 @@
 """Opt-in reference suite for the public offline broker conformance lab."""
 
+import asyncio
 import socket
 from dataclasses import replace
 
@@ -68,6 +69,23 @@ class NetworkAttemptProfile(ReferenceVenueProfile):
             socket.create_connection(("127.0.0.1", 9), timeout=0.01)
             return True
         return super().handle_step(runner, step)
+
+
+class StalledWatchBroker(ReferenceBroker):
+    """Deliberately stalled stream proving event pumps are externally bounded."""
+
+    async def watch_orders(self):
+        await asyncio.Future()
+        yield  # pragma: no cover - the control must time out first
+
+
+class StalledWatchProfile(ReferenceVenueProfile):
+    """Control profile for a broker stream that never yields an event."""
+
+    def create_broker(self, run_name, store_ctx):
+        broker = StalledWatchBroker(self, run_name)
+        broker.store_ctx = store_ctx
+        return broker
 
 
 class BrokenInvariantProfile(ReferenceVenueProfile):
@@ -560,6 +578,13 @@ SMOKE = (
         seed=0,
         expected_violation="offline broker lab blocked a network attempt",
         steps=(Step("network_attempt"),),
+    ),
+    Scenario(
+        name="control-stalled-watch-is-bounded",
+        profile_factory=StalledWatchProfile,
+        seed=0,
+        expected_violation="pump_watch received no broker event within 0.01s",
+        steps=(Step("pump_watch", values={"timeout_seconds": 0.01}),),
     ),
     Scenario(
         name="control-terminal-resurrection-is-detected",

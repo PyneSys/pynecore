@@ -99,6 +99,7 @@ REQUIREMENTS = (
             "core:duplicate-fill-is-idempotent",
             "core:reordered-partial-fills-are-idempotent",
             "core:cancel-ack-without-push-is-terminal",
+            "core:control-stalled-watch-is-bounded",
             "ctrader:ctrader-missed-fill-push-is-recovered-once-from-reconcile-and-deal-history",
         ),
     ),
@@ -152,7 +153,10 @@ REQUIREMENTS = (
         "P0",
         "Global bracket over two entries",
         "covered",
-        ("bybit:bybit-two-entry-global-bracket-creates-four-physical-legs",),
+        (
+            "bybit:bybit-two-entry-global-bracket-creates-four-physical-legs",
+            "bybit:control-bybit-aliased-global-bracket-is-detected",
+        ),
     ),
     Requirement(
         "bybit-bracket-lifecycle",
@@ -245,6 +249,7 @@ REQUIREMENTS = (
             "capital:capitalcom-position-bracket-attach-replace-shape",
             "capital:capitalcom-bracket-cancel-stays-cleared-after-restart",
             "capital:capitalcom-trailing-attach-amend-clear-survives-restart",
+            "capital:control-capitalcom-missing-bracket-clear-is-detected",
         ),
     ),
     Requirement(
@@ -291,10 +296,12 @@ REQUIREMENTS = (
         "ctrader-concurrent-ownership",
         "cTrader",
         "P0",
-        "Concurrent same/opposite-direction run ownership",
+        "Concurrent same/opposite-direction run ownership and trade ledger isolation",
         "covered",
         (
             "ctrader:ctrader-concurrent-opposite-runs-remain-owned-while-account-net-is-zero",
+            "ctrader:ctrader-concurrent-same-direction-runs-ignore-foreign-pushes",
+            "ctrader:ctrader-control-foreign-push-ownership-leak-is-detected",
         ),
     ),
     Requirement(
@@ -328,8 +335,8 @@ REQUIREMENTS = (
         (
             "subprocess:real-pyne-run-transient-connect-retry",
             "subprocess:real-pyne-run-permanent-connect-fails-fast",
-            "ctrader:ctrader-real-connect-boundary-retries-transient-fault-once",
-            "ctrader:ctrader-real-connect-boundary-fails-fast-on-permanent-fault",
+            "ctrader:ctrader-wire-connect-translates-transient-oserror",
+            "ctrader:ctrader-connect-boundary-preserves-permanent-error-type",
         ),
     ),
     Requirement(
