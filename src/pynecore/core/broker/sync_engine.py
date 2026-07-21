@@ -149,7 +149,7 @@ from pynecore.core.broker.store_helpers import (
     iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
-from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID, ADOPTED_STARTUP_EXTRA_KEY
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
@@ -2810,6 +2810,15 @@ class OrderSyncEngine:
         own open position finds its entry row's cursor and returns the
         full size it left behind.
 
+        Rows a plugin synthesized at startup for an *untracked* venue leg
+        (flagged :data:`ADOPTED_STARTUP_EXTRA_KEY`) are excluded: on a
+        netting account those represent another run's slice adopted only so
+        the local close paths have a row to route against, so counting them
+        as owned would re-inflate the clamp and copy the foreign run's
+        exposure into ``_position`` — the exact cross-run double count the
+        clamp prevents. A genuine single-run restart keeps its own durable
+        entry row (never flagged adopted), so its exposure is unaffected.
+
         The journal query is scoped by ``run_instance_id`` only, with no
         symbol filter: a run trades a single symbol, and plugins journal
         rows under the venue wire symbol (e.g. ``ETHUSDT``) while
@@ -2824,6 +2833,8 @@ class OrderSyncEngine:
         for row in self._store_ctx.iter_live_orders():
             filled = row.filled_qty
             if filled == 0.0:
+                continue
+            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
                 continue
             owned += filled if row.side == 'buy' else -filled
         return owned

@@ -13,6 +13,21 @@ must treat an open FIFO that carries it as untracked exposure: a keyed
 flatten the adopted position rather than be dropped.
 """
 
+ADOPTED_STARTUP_EXTRA_KEY = "adopted_startup"
+"""``OrderRow.extras`` flag marking a store row a plugin synthesized at startup
+for an *untracked* live venue leg (one this run has no durable journal for).
+
+Such rows exist purely so the normal close/exit paths have a confirmed
+``position`` row to route a DELETE/opposite-close against — they are NOT a
+product of THIS run's own orders. Startup run-ownership reconstruction
+(:meth:`OrderSyncEngine._durable_owned_signed_size`) must therefore exclude
+them: on a one-way (netting) account two runs share one venue net, and a leg
+this run merely adopted for bookkeeping belongs to another run. Counting it as
+owned would re-inflate the ownership clamp and let the run copy a foreign
+run's exposure into ``_position`` — the very cross-run double count the clamp
+exists to prevent.
+"""
+
 
 class QtyType(StrLiteral):
     ...

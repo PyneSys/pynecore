@@ -39,6 +39,7 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 
 SYMBOL = "BTCUSDT"
@@ -2013,6 +2014,57 @@ def __test_startup_adopts_own_open_position_across_restart__(
         assert pos.sign == 1.0
         assert len(pos.open_trades) == 1
         assert pos.open_trades[0].size == 0.01
+        ctx.close()
+
+
+def __test_startup_ownership_excludes_adopted_startup_rows__(
+        tmp_path: Path,
+) -> None:
+    """A leg adopted for bookkeeping must not count as run-owned exposure.
+
+    Regression for the Capital.com concurrent-run double count: a plugin
+    seeds a confirmed ``position`` row (flagged ``adopted_startup``) for
+    every *untracked* live venue leg so the local close paths have a row to
+    route against. On a one-way (netting) account those adopted rows are
+    another run's slice folded into the one shared venue net. If startup
+    ownership reconstruction counted their ``filled_qty`` it would re-inflate
+    the clamp and copy the foreign exposure into ``_position`` — exactly the
+    aggregate double count (2x100 seen as 400) the clamp exists to stop.
+
+    Run B owns a 0.01 long via its own filled entry row and has *also*
+    adopted a foreign 0.02 leg. The venue net is 0.03, but B must adopt only
+    its own 0.01.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        # This run's own open long — a genuine filled entry row.
+        ctx.upsert_order(
+            "own-entry", symbol=SYMBOL, side="buy", qty=0.01,
+            state="confirmed", pine_entry_id="L", filled_qty=0.01,
+        )
+        # A foreign leg this run merely adopted for close-routing bookkeeping.
+        ctx.upsert_order(
+            "__pyne_adopted__foreign", symbol=SYMBOL, side="buy", qty=0.02,
+            state="confirmed", filled_qty=0.02,
+            extras={"kind": "position", ADOPTED_STARTUP_EXTRA_KEY: True},
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=0.03, entry_price=1_900.0,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="isolated",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 0.01, (
+            "only the run's own filled slice is owned — the adopted foreign "
+            "leg must not inflate the ownership clamp"
+        )
+        assert pos.sign == 1.0
         ctx.close()
 
 
