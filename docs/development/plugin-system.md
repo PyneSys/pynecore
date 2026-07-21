@@ -518,6 +518,178 @@ The `envelopes` and `pending_verifications` tables key on the **logical**
 Everything else keys on the **physical** `run_instance_id`, so historical
 runs stay isolated.
 
+## Offline Broker Conformance Lab
+
+The broker conformance lab exercises a broker plugin against the real
+`OrderSyncEngine`, `BrokerStore`, `RunContext`, and `BrokerPosition` without
+connecting to a venue. It is deliberately opt-in: suites live in a top-level
+`broker_lab/` directory, outside `tests/`, and are not collected by the normal
+PyneCore or plugin test commands.
+
+There are three distinct validation layers:
+
+1. `validate_plugin_contract()` checks that required methods, capabilities,
+   identity, and configuration are structurally coherent.
+2. The offline conformance lab checks lifecycle, persistence, event ordering,
+   idempotency, ownership, and modeled venue semantics deterministically.
+3. A final live venue smoke checks facts that an offline model cannot establish,
+   such as undocumented exchange behaviour, authentication, rate limits, and
+   production network timing.
+
+The lab can find duplicate dispatch after restart, replayed fills, stale-read
+dispatch, cross-run adoption, incomplete protective coverage, illegal terminal
+order resurrection, unbounded rejection retries, and quantity-grid residuals.
+It cannot prove that an undocumented venue response is modeled correctly, nor
+does it simulate price discovery, liquidity, matching priority, or outages in
+the real network. Passing proves only the semantics encoded in the profile.
+
+### Minimal profile and suite
+
+PyneCore ships a copyable reference at `broker_lab/suite.py`. A plugin profile
+implements `VenueProfile`; the usual pattern is to subclass the real broker and
+replace only its lowest transport boundary:
+
+```python
+from typing import Any
+
+from pynecore.testing.broker_lab import (
+    ReferenceVenueProfile,
+    Scenario,
+    Step,
+)
+from pynecore_foo import FooBroker
+
+
+class OfflineFooBroker(FooBroker):
+    def __init__(self, profile, run_name: str, store_ctx: Any):
+        super().__init__(symbol=profile.symbol, config=profile.config)
+        self.profile = profile
+        self.run_name = run_name
+        self.store_ctx = store_ctx
+
+    async def _http(self, method: str, path: str, payload=None):
+        return self.profile.transport.respond(method, path, payload)
+
+
+class FooProfile(ReferenceVenueProfile):
+    plugin_name = "foo-offline-lab"
+    account_id = "offline-account"
+    symbol = "EURUSD"
+    timeframe = "60"
+
+    def create_broker(self, run_name: str, store_ctx: Any):
+        return OfflineFooBroker(self, run_name, store_ctx)
+
+
+def build_suite(*, mode: str, seed: int):
+    smoke = Scenario(
+        name="restart-adopts-working-order",
+        profile_factory=FooProfile,
+        seed=seed,
+        steps=(
+            Step("entry", values={"id": "L", "qty": 1.0, "limit": 1.1}),
+            Step("sync"),
+            Step("restart"),
+            Step("entry", values={"id": "L", "qty": 1.0, "limit": 1.1}),
+            Step("sync"),
+            Step("expect", values={"open_orders": 1}),
+        ),
+    )
+    return (smoke,)
+```
+
+Use a shared account-level `VenueState` for every broker instance created by a
+profile. Separate `run_name` values represent isolated bot runs, while restart
+creates a new plugin, engine, and SQLite connection over the same run and store.
+Choose netting semantics when the venue exposes one aggregate symbol position.
+For hedged venues, retain each venue position leg and provide the broker's real
+`PositionPort` or an equivalent per-leg reconstruction in the profile.
+
+### Replacing transports
+
+- For HTTP, override the request dispatcher and return recorded response
+  objects. Record method, path, parameters, and body so scenarios can assert the
+  real plugin's request mapping.
+- For WebSocket, feed the real message decoder from an in-memory queue. Model
+  correlated ACK and PUSH independently: either may be delayed, duplicated,
+  reordered, or intentionally absent.
+- For a custom wire protocol, replace the lowest correlated request method and
+  return real decoded protocol messages. The cTrader suite, for example, keeps
+  the protobuf request and response types while replacing the socket.
+
+Do not patch production discovery or add runtime instrumentation. Subprocess
+fixtures can inject a temporary `.dist-info/entry_points.txt` on their isolated
+Python path. The lab blocks direct socket connection attempts, and every child
+must have an external timeout and its own temporary work directory. Never put
+credentials, demo accounts, or real order endpoints in an offline profile.
+
+### Invariants and plugin-specific checks
+
+The common profile checks economic position agreement, client-order-id
+uniqueness, terminal quantities, run ownership, fill idempotency, and physical
+TP/SL coverage. Add venue-specific checks in `VenueProfile.check_invariants()`
+and return human-readable violations after calling the base implementation.
+Useful plugin checks include reduce-only sibling cancellation, activity-event
+fingerprint stability, per-leg hedged ownership, and exact price/quantity-grid
+rounding.
+
+Keep deliberately broken control profiles beside the suite. A control scenario
+sets `expected_violation` to the relevant invariant text; it passes only when
+the oracle detects the injected defect.
+
+### Running and reproducing
+
+Run the short named corpus explicitly:
+
+```bash
+python -m pynecore.testing.broker_lab run broker_lab/suite.py --mode smoke
+```
+
+Run deterministic pairwise combinations separately:
+
+```bash
+python -m pynecore.testing.broker_lab run broker_lab/suite.py \
+  --mode extended --seed 1337
+```
+
+From the PyneSys workspace root, the shipped suites have these explicit entry
+points (none of them is part of the normal `pytest .../tests/` commands):
+
+```bash
+# PyneCore reference corpus
+python -m pynecore.testing.broker_lab run pynecore/broker_lab/suite.py --mode smoke
+python -m pynecore.testing.broker_lab run pynecore/broker_lab/suite.py --mode extended
+
+# Real CLI lifecycle with a temporary offline plugin
+python -m pynecore.testing.broker_lab run \
+  pynecore/broker_lab/subprocess_suite.py --mode smoke
+
+# Venue plugin profiles
+python -m pynecore.testing.broker_lab run \
+  plugins/pynecore-bybit/broker_lab/suite.py --mode smoke
+python -m pynecore.testing.broker_lab run \
+  plugins/pynecore-capitalcom/broker_lab/suite.py --mode smoke
+python -m pynecore.testing.broker_lab run \
+  plugins/pynecore-ctrader/broker_lab/suite.py --mode smoke
+```
+
+Replace `smoke` with `extended` and add `--seed N` for a plugin's pairwise
+corpus. The subprocess suite intentionally has only lifecycle smoke scenarios.
+Its temporary provider supplies a finite OHLCV stream and injects discovery via
+disposable `.dist-info` metadata; it never changes production plugin discovery.
+
+On failure, the command prints the seed, invariant, minimized step sequence,
+and a `--scenario ... --seed ...` reproduction fragment. The same suite and
+seed must generate the same scenarios and minimized reproduction. Minimized
+steps describe the smallest known model-level trigger; inspect the fake
+transport log and SQLite journal to determine whether the fault is in request
+mapping, event translation, persistence, or engine interaction.
+
+The lab should stay fast and deterministic, but it is not a replacement for a
+small, tightly controlled final live smoke. Any newly discovered venue semantic
+must first be documented, then added to the offline profile before relying on a
+regression scenario for it.
+
 ## Combining Capabilities
 
 A plugin can combine multiple capabilities via multiple inheritance.  The

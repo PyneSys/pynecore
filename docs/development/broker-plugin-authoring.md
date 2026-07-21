@@ -549,6 +549,13 @@ is hit by mainstream CFD/crypto venues:
 
 ## Testing conventions
 
+Use the opt-in [Offline Broker Conformance Lab](plugin-system.md#offline-broker-conformance-lab)
+for lifecycle, restart, concurrency, event-ordering, and modeled venue-semantic
+coverage. Keep its `broker_lab/` suite outside the normal `tests/` tree so it is
+never collected by the default plugin test command. The central plugin-system
+chapter contains the full profile API, transport replacement patterns, commands,
+and reproduction workflow.
+
 - The plugin's `tests/` directory must be a package (`__init__.py`),
   otherwise pytest collection silently skips it.
 - Test functions follow the `__test_*__` naming pattern.
