@@ -395,6 +395,15 @@ def live_ohlcv_generator(
     # ``broker_warning`` in the put path below flags any consumer lag.
     bar_queue: Queue[OHLCV | BaseException] = Queue()
     stop_event = threading.Event()
+    # Loop-side mirror of ``stop_event`` so an ``await`` running on the broker
+    # loop (the reconnect ``connect()`` / ``on_reconnect()`` handshake) can be
+    # abandoned the instant a shutdown is requested from the consumer thread.
+    # ``stop_event`` is a ``threading.Event`` — awaiting it from the loop would
+    # need a poll; the ``asyncio.Event`` here is *set* on the loop via
+    # ``call_soon_threadsafe`` (see ``_consumer``), keeping teardown event-driven
+    # and bounded even when a reconnect is in flight. Populated by ``_async_loop``
+    # with its running loop + event once it starts.
+    shutdown_signal: dict[str, Any] = {}
     # Signalled by ``_async_loop`` once ``provider.connect()`` has either
     # succeeded (WS subscribed, ready to receive bars) or failed (with
     # the exception already pushed into ``bar_queue``). Used to make
@@ -522,6 +531,48 @@ def live_ohlcv_generator(
         return _is_point_in_session(syminfo.opening_hours, local_dt)
 
     async def _async_loop():
+        # Loop-side shutdown signal: ``_consumer`` sets it (cross-thread, via
+        # ``call_soon_threadsafe``) alongside ``stop_event`` so a reconnect
+        # handshake awaiting ``provider.connect()`` here is abandoned at once
+        # rather than blocking teardown for the whole connect timeout.
+        stop_aevent = asyncio.Event()
+        shutdown_signal['loop'] = asyncio.get_running_loop()
+        shutdown_signal['event'] = stop_aevent
+
+        async def _await_or_stop(awaitable) -> bool:
+            """Await ``awaitable`` but abandon it if a shutdown is requested.
+
+            Races the awaitable against ``stop_aevent``. Returns ``True`` when
+            the shutdown signal won (the awaitable was cancelled — the caller
+            must stop reconnecting and let teardown proceed); ``False`` when the
+            awaitable finished on its own. Any exception it raised is
+            re-propagated so a genuine connect / reconnect failure still drives
+            the backoff-retry path.
+            """
+            task = asyncio.ensure_future(awaitable)
+            stop_waiter = asyncio.ensure_future(stop_aevent.wait())
+            try:
+                await asyncio.wait(
+                    {task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                stop_waiter.cancel()
+                if not stop_waiter.done():
+                    try:
+                        await stop_waiter
+                    except asyncio.CancelledError:
+                        pass
+            if task.done():
+                task.result()  # re-raise a connect/reconnect failure
+                return False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - teardown must not surface it
+                pass
+            return True
+
         # Declared before ``try`` so the ``finally`` branch can reference
         # it even when ``provider.connect()`` raises before assignment.
         engine_task: asyncio.Task | None = None
@@ -648,7 +699,8 @@ def live_ohlcv_generator(
                     "Connection error (attempt %d, offline %.0fs): %s",
                     attempts, offline_s, err,
                 )
-                await provider.on_disconnect()
+                if await _await_or_stop(provider.on_disconnect()):
+                    return attempts, True
                 # The exponent is clamped so the power stays a small int;
                 # the delay saturates at ``max_reconnect_delay`` anyway.
                 delay = min(
@@ -662,15 +714,18 @@ def live_ohlcv_generator(
                 if stop_event.is_set():
                     return attempts, True
                 try:
-                    await provider.disconnect()
+                    if await _await_or_stop(provider.disconnect()):
+                        return attempts, True
                 except Exception as disc_err:
                     logger.debug(
                         "disconnect() before reconnect raised: %s",
                         disc_err,
                     )
                 try:
-                    await provider.connect()
-                    await provider.on_reconnect()
+                    if await _await_or_stop(provider.connect()):
+                        return attempts, True
+                    if await _await_or_stop(provider.on_reconnect()):
+                        return attempts, True
                     # Give the freshly (re)subscribed feed a full
                     # staleness window to deliver before the liveness
                     # watchdog may declare it dead again.
@@ -1198,6 +1253,19 @@ def live_ohlcv_generator(
             logger.info("Live streaming interrupted by user")
         finally:
             stop_event.set()
+            # Wake a reconnect handshake blocked on ``provider.connect()`` on the
+            # broker loop: setting the threading Event alone is invisible to an
+            # in-flight ``await``, so mirror it onto the loop-side asyncio Event
+            # (see ``_async_loop._await_or_stop``) or teardown waits out the whole
+            # connect timeout before the producer thread can exit.
+            _sd_loop = shutdown_signal.get('loop')
+            _sd_event = shutdown_signal.get('event')
+            if _sd_loop is not None and _sd_event is not None:
+                try:
+                    _sd_loop.call_soon_threadsafe(_sd_event.set)
+                except RuntimeError:
+                    # Loop already closed — nothing left to wake.
+                    pass
             join_timeout = (shutdown_timeout + 5.0) if shutdown_timeout > 0 else None
             thread.join(timeout=join_timeout)
 

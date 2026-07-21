@@ -2,6 +2,7 @@
 Tests for the live runner async/sync bridge.
 """
 import asyncio
+import threading
 import time
 
 from pynecore.core.live_runner import live_ohlcv_generator, LiveBarStreamer
@@ -1168,3 +1169,64 @@ def __test_streamer_developing_peek_does_not_consume__():
     assert first is not None and second is not None
     assert first.timestamp == second.timestamp == 60
     assert streamer.pop_new_closed_bars() == []
+
+
+# --- Shutdown-while-reconnecting regression --------------------------------
+
+class _ReconnectHangProvider(MockLiveProvider):
+    """Connects once, then wedges the reconnect ``connect()`` forever.
+
+    Reproduces the live shape where a feed drop puts the runner into
+    ``_handle_connection_error`` and the reconnect handshake stalls (a broker
+    edge that accepts TCP but never finishes the app handshake). A shutdown
+    requested in that window must abandon the in-flight ``connect()`` at once —
+    not wait out the connect timeout / the ``shutdown_timeout + 5`` join.
+    """
+
+    def __init__(self):
+        super().__init__([])
+        self.reconnect_entered = threading.Event()
+        self._connect_calls = 0
+
+    async def connect(self):
+        self._connect_calls += 1
+        if self._connect_calls == 1:
+            self._connected = True
+            return
+        # Reconnect attempt: never completes until cancelled by the shutdown.
+        self.reconnect_entered.set()
+        await asyncio.Event().wait()
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        # First live pull fails -> drives the reconnect path.
+        self._connected = False
+        raise ConnectionError("feed dropped")
+
+
+def __test_shutdown_during_reconnect_is_prompt__():
+    """Closing the live generator while a reconnect is wedged must not block.
+
+    Regression for the cTrader ``adopted-cancel`` shutdown hang: the reconnect
+    ``await provider.connect()`` ran on the broker loop without observing the
+    stop signal, so teardown stalled for the whole connect timeout (SIGINT
+    produced no shutdown output for ~30 s, exit 137). The fix mirrors
+    ``stop_event`` onto a loop-side asyncio Event so the handshake is cancelled
+    immediately.
+    """
+    provider = _ReconnectHangProvider()
+    gen = live_ohlcv_generator(
+        provider, "BTC/USDT", "1D", shutdown_timeout=30.0,
+    )
+    it = iter(gen)
+    next(it)  # LIVE_TRANSITION — connect() succeeded, feed is live
+
+    assert provider.reconnect_entered.wait(timeout=5.0), \
+        "runner never reached the wedged reconnect"
+
+    start = time.monotonic()
+    gen.close()
+    elapsed = time.monotonic() - start
+    # Bounded teardown: well under the connect timeout (30 s) and the
+    # shutdown_timeout + 5 producer join. A few seconds of slack absorbs the
+    # loop teardown; the pre-fix behaviour blocked ~35 s.
+    assert elapsed < 10.0, f"shutdown blocked for {elapsed:.1f}s during reconnect"
