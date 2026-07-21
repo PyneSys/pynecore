@@ -114,6 +114,11 @@ class MockBroker:
     streamed_events: list[OrderEvent] = field(default_factory=list)
     watch_orders_impl: str = "generator"  # "generator" | "not_implemented"
     raise_on_next_entry: Exception | None = None
+    # Persistent entry-reject hook: unlike ``raise_on_next_entry`` (fires once
+    # then clears), this raises on EVERY ``execute_entry`` until reset, to prove
+    # the engine's bounded reject-retry cap terminalizes a permanently doomed
+    # entry instead of hammering the venue every tick.
+    always_raise_on_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
     raise_on_next_modify_entry: Exception | None = None
     raise_on_next_modify_exit: Exception | None = None
@@ -176,6 +181,8 @@ class MockBroker:
 
     async def execute_entry(self, envelope):
         self.entry_calls.append(envelope)
+        if self.always_raise_on_entry is not None:
+            raise self.always_raise_on_entry
         if self.raise_on_next_entry is not None:
             err = self.raise_on_next_entry
             self.raise_on_next_entry = None
@@ -379,6 +386,42 @@ def __test_entry_exchange_reject_does_not_halt_and_retries__():
     # Next sync re-attempts (broker no longer rejects) and the entry lands.
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 2
+    assert engine.active_intents.keys() == {"L"}
+
+
+def __test_entry_persistent_reject_is_bounded_not_hammered__():
+    """A permanently-rejected entry stops re-dispatching after the bounded cap."""
+    # Regression: under ``calc_on_every_tick`` the diff runs every tick, so an
+    # entry the venue permanently refuses (e.g. an already-crossed native
+    # trigger, Bybit retCode 110092) was re-POSTed every tick — an unbounded
+    # reject storm. The reject stays non-fatal (the bot keeps running) but the
+    # attempts must be BOUNDED: after the cap the identical resting entry is
+    # suppressed until the script changes or drops it.
+    from pynecore.core.broker.sync_engine import _ENTRY_REJECT_RETRY_CAP
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.always_raise_on_entry = ExchangeOrderRejectedError(
+        "expect Rising, but trigger_price <= current"
+    )
+
+    # Sync far more times than the cap — none halts, and the number of venue
+    # submissions is capped, not one-per-tick.
+    for _ in range(_ENTRY_REJECT_RETRY_CAP + 10):
+        engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+    assert "L" not in engine.active_intents
+
+    # The script drops the order (cancel) → the marker is pruned, so a genuinely
+    # new order on the same id retries freely once the venue accepts it.
+    del pos.entry_orders["L"]
+    engine.sync(BAR_TS)
+    b.always_raise_on_entry = None
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP + 1
     assert engine.active_intents.keys() == {"L"}
 
 
@@ -2109,6 +2152,74 @@ def __test_close_intent_dispatches_execute_close__():
     assert len(b.close_calls) == 1
     assert b.close_calls[0].intent.pine_id == "L"
     assert b.close_calls[0].intent.side == "sell"
+
+
+def __test_marketable_whole_row_limit_exit_dispatches_close__():
+    """An already-marketable pure limit exit closes immediately, not via TP attach.
+
+    ``strategy.exit(limit=X)`` on a long whose ``X`` is already on the
+    fillable side of the current price is an immediate fill in Pine — the
+    limit crosses on the next bar's open. Routing it through the native
+    take-profit attach (``execute_exit``) would ask the venue to accept a
+    marketable TP, which native-TP venues (Capital.com) reject. The engine
+    must instead dispatch an immediate close.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    # Long TP at 60_000; price already at 61_000 -> the sell limit is
+    # marketable (fills at 61_000, better than the 60_000 limit).
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=60_000.0)
+
+    engine.sync(BAR_TS, last_price=61_000.0)
+
+    assert len(b.close_calls) == 1
+    assert len(b.exit_calls) == 0
+    assert b.close_calls[0].intent.pine_id == "L"
+    assert b.close_calls[0].intent.side == "sell"
+    assert b.close_calls[0].intent.qty == 1.0
+
+
+def __test_non_marketable_whole_row_limit_exit_still_attaches_tp__():
+    """A resting (not-yet-marketable) limit exit keeps the native TP attach path."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    # Long TP at 60_000; price at 59_000 -> the sell limit has not been
+    # reached, so it must rest as a native take-profit.
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=60_000.0)
+
+    engine.sync(BAR_TS, last_price=59_000.0)
+
+    assert len(b.exit_calls) == 1
+    assert len(b.close_calls) == 0
+    assert b.exit_calls[0].intent.tp_price == 60_000.0
+
+
+def __test_marketable_limit_exit_with_stop_keeps_bracket_attach__():
+    """A marketable limit paired with a stop is a real bracket, not a bare close.
+
+    Only a *pure* limit exit (no SL / trail / tick offset) is converted — a
+    limit+stop bracket must keep its protective stop, so it stays on the
+    native attach path even when the limit leg is already marketable.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+
+    engine.sync(BAR_TS, last_price=61_000.0)
+
+    assert len(b.exit_calls) == 1
+    assert len(b.close_calls) == 0
 
 
 def _long_trade(entry_id: str, size: float) -> Trade:

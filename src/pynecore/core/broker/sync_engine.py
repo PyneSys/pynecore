@@ -364,6 +364,21 @@ before events are re-routed.
 """
 
 
+_ENTRY_REJECT_RETRY_CAP = 3
+"""Consecutive exchange-reject re-dispatch cap for one entry intent
+(:attr:`OrderSyncEngine._rejected_entry_intents`).
+
+An entry the exchange refuses outright is kept non-fatal — a risk / funds
+veto can clear on a later bar — so the diff loop re-attempts the SAME
+resting order on the next sync. Under ``calc_on_every_tick`` that sync runs
+every tick, so an order the venue permanently rejects (e.g. an
+already-crossed native trigger) would be re-POSTed every tick without a
+bound. After this many consecutive rejects of the identical intent the
+dispatch is suppressed until the script changes or drops it; the counter
+resets on a changed intent, a vanished key, or a dispatch that succeeds.
+"""
+
+
 class _BoundedIdSet:
     """Insertion-ordered string-id cache with FIFO eviction at ``cap`` entries.
 
@@ -640,6 +655,21 @@ class OrderSyncEngine:
         self._pine_bracket_reconstruct_done: bool = False
 
         self._active_intents: dict[str, Intent] = {}
+        # Bounded-retry bookkeeping for entries the exchange rejects outright
+        # (terminal reject: nothing opened), keyed by ``EntryIntent.intent_key``
+        # and holding ``(rejected snapshot, consecutive reject count)``. A
+        # rejected resting entry order is rebuilt unchanged from the Pine state
+        # on EVERY subsequent sync (``calc_on_every_tick`` runs the diff each
+        # tick), so an entry the venue keeps refusing would be re-POSTed every
+        # tick — an unbounded reject storm (measured: 15 rejects in 15 s on a
+        # single already-crossed stop-limit). The engine keeps the reject
+        # non-fatal (funds / risk vetoes may clear on a later bar) but caps the
+        # attempts at :data:`_ENTRY_REJECT_RETRY_CAP`: after that many
+        # consecutive rejects of the SAME intent the dispatch is suppressed (the
+        # bot keeps running, the signal stays dropped). A CHANGED intent on the
+        # key, a key that leaves the desired set, or a dispatch that finally
+        # succeeds resets the counter so a genuinely new order retries freely.
+        self._rejected_entry_intents: dict[str, tuple[EntryIntent, int]] = {}
         # Cumulative fill qty already applied to each in-flight ``CloseIntent``,
         # keyed by ``CloseIntent.intent_key`` (the bare ``pine_id``). ``record_fill``
         # reduces ``_position.size`` / ``open_trades`` on a partial close but never
@@ -1929,6 +1959,15 @@ class OrderSyncEngine:
                 dispatchable.append(i)
         self._deferred_exits = new_deferred
 
+        # Rewrite any already-marketable whole-row limit exit into an
+        # immediate close before the diff: on native-TP venues attaching a
+        # marketable take-profit is rejected, so preserve Pine's immediate
+        # limit-exit fill semantics with a close (the engine-trigger partial
+        # path already does this for a fractional exit).
+        dispatchable = self._convert_marketable_limit_exits(
+            dispatchable, last_price,
+        )
+
         # Re-drive every parked forced cancel BEFORE the diff — short-gate
         # and general alike, on every venue. A landed cancel clears its
         # ``_order_mapping`` entry before the adoption branch could reclaim
@@ -3125,23 +3164,48 @@ class OrderSyncEngine:
                             "realized P&L on this trade will be approximate",
                             broker_entry_price,
                         )
-                    # Prefer the real Pine parent entry id recovered from the
-                    # durable bracket-ownership ledger so a post-restart
-                    # ``strategy.exit(..., from_entry='L')`` still resolves the
-                    # seeded trade and can re-target the reconstructed bracket
-                    # (the Pine ``exit`` helper matches ``open_trades`` by
-                    # ``entry_id``). Falls back to the synthetic id when no
-                    # single parent can be recovered (no bracket, or pyramided
-                    # multi-parent position).
-                    adopted_entry_id = (
-                        self._recover_adopted_parent_entry_id()
-                        or ADOPTED_STARTUP_ENTRY_ID
+                    # Prefer a FAITHFUL per-entry FIFO reconstructed from the
+                    # durable order ledger: seed one parent trade per distinct
+                    # real Pine entry id that owns the adopted exposure, each
+                    # carrying its own filled size. On a HEDGED account two
+                    # separately-opened legs (entry ids ``A`` / ``B``, one broker
+                    # leg each) are then adopted as two 1000-unit trades rather
+                    # than one 2000 aggregate, so a later
+                    # ``strategy.close("A")`` binds to A's own 1000 and closes
+                    # only its leg (the Pine ``close`` helper sizes off the
+                    # matching ``open_trades`` entry) instead of flattening B
+                    # too. Falls back to the single synthetic-parent seed when
+                    # the ledger cannot faithfully account for the net (unmapped
+                    # / opposing exposure, or a durable sum that disagrees with
+                    # the adopted net).
+                    adopted_trades = self._recover_adopted_parent_trades(
+                        broker_signed,
                     )
-                    self._position.reconstruct_parent_trade(
-                        entry_id=adopted_entry_id,
-                        size=broker_signed,
-                        entry_price=broker_entry_price,
-                    )
+                    if adopted_trades:
+                        for entry_id, trade_size in adopted_trades:
+                            self._position.reconstruct_parent_trade(
+                                entry_id=entry_id,
+                                size=trade_size,
+                                entry_price=broker_entry_price,
+                            )
+                    else:
+                        # Prefer the real Pine parent entry id recovered from the
+                        # durable bracket-ownership ledger so a post-restart
+                        # ``strategy.exit(..., from_entry='L')`` still resolves the
+                        # seeded trade and can re-target the reconstructed bracket
+                        # (the Pine ``exit`` helper matches ``open_trades`` by
+                        # ``entry_id``). Falls back to the synthetic id when no
+                        # single parent can be recovered (no bracket, or pyramided
+                        # multi-parent position).
+                        adopted_entry_id = (
+                            self._recover_adopted_parent_entry_id()
+                            or ADOPTED_STARTUP_ENTRY_ID
+                        )
+                        self._position.reconstruct_parent_trade(
+                            entry_id=adopted_entry_id,
+                            size=broker_signed,
+                            entry_price=broker_entry_price,
+                        )
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
             # Skip while bot-initiated work is in flight — a close we
             # dispatched ourselves will flatten /positions seconds before
@@ -5048,6 +5112,40 @@ class OrderSyncEngine:
             "native cancel-all: expected cancel retired intent %s (%s)",
             format_intent_key(key), event,
         )
+
+    def _entry_reject_retry_exhausted(
+            self, key: str, intent: EntryIntent,
+    ) -> bool:
+        """Whether the bounded exchange-reject retry budget for ``key`` is spent.
+
+        ``True`` once the SAME entry intent has been rejected outright
+        :data:`_ENTRY_REJECT_RETRY_CAP` consecutive times — the diff loop then
+        suppresses the dispatch instead of re-POSTing the doomed order every
+        tick. A different intent snapshot on the key (the counter is keyed to
+        the exact intent) is never suppressed; the stale marker is dropped by
+        the start-of-cycle pruning pass.
+        """
+        marker = self._rejected_entry_intents.get(key)
+        return (marker is not None and marker[0] == intent
+                and marker[1] >= _ENTRY_REJECT_RETRY_CAP)
+
+    def _record_entry_reject(
+            self, key: str, intent: EntryIntent, exc: OrderSkippedByPlugin,
+    ) -> None:
+        """Increment the bounded reject counter for an outright-rejected entry.
+
+        Only the exchange-reject skip vehicle (``reason ==
+        "broker_rejected_entry"``, raised by the ``ExchangeOrderRejectedError``
+        branch of :meth:`_dispatch_new`) feeds the counter; a plugin-side skip
+        (below-min-size and friends) is a distinct, already-terminal decision
+        the plugin owns. Consecutive rejects of the identical intent add up;
+        a changed intent resets the count to one.
+        """
+        if exc.reason != "broker_rejected_entry":
+            return
+        marker = self._rejected_entry_intents.get(key)
+        count = marker[1] + 1 if marker is not None and marker[0] == intent else 1
+        self._rejected_entry_intents[key] = (intent, count)
 
     def _resolve_deferred_for_entry(self, entry_id: str) -> None:
         """An entry fill unblocks every exit that references it via ticks.
@@ -8429,6 +8527,84 @@ class OrderSyncEngine:
 
     # === Restart-time Pine-side bracket reconstruction ===
 
+    def _recover_adopted_parent_trades(
+            self, broker_signed: float,
+    ) -> list[tuple[str, float]]:
+        """Reconstruct the per-entry FIFO parent trades for a startup adoption.
+
+        The engine adopts the broker's NET size as one scalar, but on a HEDGED
+        account that net can be several separately-opened legs each carrying a
+        distinct real Pine entry id (``strategy.entry("A")`` /
+        ``strategy.entry("B")`` open one broker leg each). Seeding a single
+        aggregate parent trade would erase the entry-id ↔ exposure association
+        that survives restart in the durable order ledger, so a later
+        ``strategy.close("A")`` would size off the whole adopted position and
+        flatten B's leg too.
+
+        Rebuild that association from the run's persisted order rows: every live
+        entry row carries a durable ``filled_qty`` cursor and its
+        ``pine_entry_id``, so the run-owned exposure is the signed sum of those
+        cursors grouped by entry id. Returns one ``(entry_id, signed_size)`` pair
+        per distinct real entry id, insertion-ordered, so
+        :meth:`~pynecore.core.broker.position.BrokerPosition.reconstruct_parent_trade`
+        (which de-dups by entry id) seeds each exactly once — pyramided rows
+        sharing one id collapse to a single summed trade, distinct ids stay
+        separate.
+
+        Returns an EMPTY list (caller falls back to the single synthetic-parent
+        seed) whenever the ledger cannot faithfully account for the adopted net:
+
+        * a live row carries no real entry id (``None`` or the synthetic
+          :data:`ADOPTED_STARTUP_ENTRY_ID`) — the exposure is unmapped;
+        * any owned exposure opposes the adopted net's sign;
+        * the signed durable sum disagrees with ``broker_signed`` (an external
+          partial close / concurrent-run clamp shrank the adoptable net below
+          what the rows show) — reconstructing per-entry there would overstate
+          the position.
+
+        Rows a plugin synthesized for an untracked venue leg (flagged
+        :data:`ADOPTED_STARTUP_EXTRA_KEY`) are excluded, mirroring
+        :meth:`_durable_owned_signed_size`.
+
+        Pure-local: read-only over the persisted journal.
+        """
+        if self._store_ctx is None or broker_signed == 0.0:
+            return []
+        want_buy = broker_signed > 0.0
+        by_id: dict[str, float] = {}
+        order: list[str] = []
+        total = 0.0
+        for row in self._store_ctx.iter_live_orders():
+            filled = row.filled_qty
+            if filled <= 0.0:
+                continue
+            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
+                continue
+            entry_id = row.pine_entry_id
+            if not entry_id or entry_id == ADOPTED_STARTUP_ENTRY_ID:
+                # Unmapped exposure — cannot tie it to a real entry id, so the
+                # per-entry reconstruction would be a guess. Fall back.
+                return []
+            is_buy = row.side == 'buy'
+            if is_buy != want_buy:
+                # Durable exposure opposing the adopted net sign — a hedged
+                # both-sides book the net scalar cannot represent faithfully.
+                return []
+            signed = filled if is_buy else -filled
+            if entry_id not in by_id:
+                order.append(entry_id)
+            by_id[entry_id] = by_id.get(entry_id, 0.0) + signed
+            total += signed
+        if not order:
+            return []
+        if abs(total - broker_signed) > 1e-9:
+            # The durable sum disagrees with the adopted net (external partial
+            # close, or a concurrent-run ownership clamp). Seeding per-entry
+            # trades here would restore more (or less) than actually rests on
+            # the venue — let the caller seed the single clamped aggregate.
+            return []
+        return [(entry_id, by_id[entry_id]) for entry_id in order]
+
     def _recover_adopted_parent_entry_id(self) -> str | None:
         """Recover the single real Pine parent entry id for a startup adoption.
 
@@ -8903,6 +9079,97 @@ class OrderSyncEngine:
             corrected.append(intent)
         return corrected
 
+    def _convert_marketable_limit_exits(
+            self, intents: list[Intent], last_price: float | None,
+    ) -> list[Intent]:
+        """Convert an already-marketable whole-row limit exit to a close.
+
+        A pure ``strategy.exit(limit=X)`` (TP-only, no SL / trail / tick
+        offsets) whose limit ``X`` is already on the fillable side of the
+        current price is, in Pine semantics, an immediate fill — the limit
+        order crosses on the next bar and closes the position at the open.
+
+        The whole-row native-bracket dispatch path
+        (:meth:`_diff_and_dispatch` → ``execute_exit``) would instead attach
+        ``X`` as a native take-profit position attribute. On venues that
+        validate the TP side against the live quote (Capital.com:
+        ``error.invalid.takeprofit.minvalue``) a marketable TP is rejected —
+        a valid limit exit is misclassified as a failed protection attach.
+        The engine-trigger *partial* path already handles this correctly
+        (its price-watch fires a close the moment the level is crossed); this
+        method restores the same immediate-close semantics for the whole-row
+        case by rewriting the intent into a :class:`CloseIntent` before the
+        diff runs.
+
+        Guards keep the rewrite surgical:
+
+        * ``last_price`` must be known — without a price context marketability
+          cannot be judged, so the intent falls through to the native path.
+        * Only a *fresh* exit is converted (``intent_key`` not already active
+          nor mapped to a live broker order): once a native TP is attached the
+          venue owns it, and a late marketable tick must let the venue fill it
+          rather than double-dispatch a close.
+        * A whole-row exit only — partial-qty brackets keep their existing
+          engine-trigger routing.
+        * Skipped when an :class:`EntryIntent` in the same batch shares the
+          ``from_entry`` id (the synthesised close keys on that id and must not
+          clobber a concurrent re-entry in ``new_map``).
+        """
+        if last_price is None:
+            return intents
+        entry_ids = {
+            i.pine_id for i in intents if isinstance(i, EntryIntent)
+        }
+        converted: list[Intent] = []
+        for intent in intents:
+            if not isinstance(intent, ExitIntent):
+                converted.append(intent)
+                continue
+            is_pure_limit = (
+                intent.tp_price is not None
+                and intent.sl_price is None
+                and intent.trail_price is None
+                and intent.trail_offset is None
+                and intent.profit_ticks is None
+                and intent.loss_ticks is None
+                and intent.trail_points_ticks is None
+            )
+            if (not is_pure_limit
+                    or intent.is_partial_qty_bracket
+                    or intent.intent_key in self._active_intents
+                    or intent.intent_key in self._order_mapping
+                    or intent.from_entry in entry_ids):
+                converted.append(intent)
+                continue
+            # Marketable side: a long parent exits by selling — its limit
+            # sits above the open and fills once price rises to it, so it is
+            # already fillable when ``last_price >= tp``. A short parent
+            # (buy-to-close) is the mirror.
+            parent_long = intent.side == 'sell'
+            marketable = (
+                last_price >= intent.tp_price if parent_long
+                else last_price <= intent.tp_price
+            )
+            if not marketable:
+                converted.append(intent)
+                continue
+            _blog_info(
+                "marketable limit exit %r (tp=%s, last_price=%s): dispatching "
+                "an immediate close instead of a native take-profit attach",
+                format_intent_key(intent.intent_key), intent.tp_price,
+                last_price,
+            )
+            converted.append(CloseIntent(
+                pine_id=intent.from_entry,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=intent.qty,
+                immediately=False,
+                comment=intent.comment_profit or intent.comment,
+                alert_message=intent.alert_message,
+            ))
+        return converted
+
     def _diff_and_dispatch(
             self, intents: list[Intent], *, may_open_exposure: bool = True,
     ) -> None:
@@ -8962,6 +9229,18 @@ class OrderSyncEngine:
         # already-filled position (no entry intent in this sync) keep the
         # existing dispatch behaviour.
         skipped_entry_ids_this_sync: set[str] = set()
+
+        # Terminalized-reject bookkeeping: drop the memory of a rejected entry
+        # as soon as the desired order changes shape or disappears, so the
+        # suppression only ever silences the EXACT doomed order. A key still
+        # present with an equal intent keeps its marker (suppressed at the
+        # dispatch site below); a key whose intent changed, or that Pine no
+        # longer wants, is retried freely.
+        if self._rejected_entry_intents:
+            for rkey in list(self._rejected_entry_intents):
+                desired = new_map.get(rkey)
+                if desired != self._rejected_entry_intents[rkey][0]:
+                    del self._rejected_entry_intents[rkey]
 
         # Keys the §12 #4 coexistence preflight pops from ``new_map`` because a
         # partial and a whole-row exit collide on the same ``from_entry`` THIS
@@ -9907,6 +10186,18 @@ class OrderSyncEngine:
                         # close is in flight; once every marker settles, the
                         # next bar dispatches close_all normally.
                         continue
+                    if (isinstance(intent, EntryIntent)
+                            and self._entry_reject_retry_exhausted(key, intent)):
+                        # This EXACT entry order has been rejected outright by
+                        # the exchange up to the bounded cap and Pine keeps
+                        # rebuilding it unchanged from its resting-order state.
+                        # Re-POSTing it would just reproduce the same reject
+                        # every tick (an unbounded venue reject storm).
+                        # Suppress silently — the signal stays dropped, the bot
+                        # keeps running; the pruning pass above releases the
+                        # marker the moment the script changes or cancels it.
+                        skipped_entry_ids_this_sync.add(intent.pine_id)
+                        continue
                     try:
                         self._dispatch_new(intent)
                     except OrderSkippedByPlugin as e:
@@ -9920,7 +10211,10 @@ class OrderSyncEngine:
                         _blog_warning("%s", e)
                         if isinstance(intent, EntryIntent):
                             skipped_entry_ids_this_sync.add(intent.pine_id)
+                            self._record_entry_reject(key, intent, e)
                         continue
+                    if isinstance(intent, EntryIntent):
+                        self._rejected_entry_intents.pop(key, None)
                     self._active_intents[key] = intent
             elif intent != self._active_intents[key]:
                 if (isinstance(intent, EntryIntent)
@@ -10108,6 +10402,13 @@ class OrderSyncEngine:
                     # a live working remainder that the modify path owns.
                     filled_prev = self._active_entry_filled_qty.get(key, 0.0)
                     if filled_prev >= active_intent.qty - 1e-9:
+                        if self._entry_reject_retry_exhausted(key, intent):
+                            # Same reversal entry the exchange already rejected
+                            # up to the bounded cap and Pine keeps re-emitting
+                            # unchanged — suppress the per-tick re-POST (see the
+                            # fresh-key guard above for the full rationale).
+                            skipped_entry_ids_this_sync.add(intent.pine_id)
+                            continue
                         _blog_info(
                             "re-emitted entry %s supersedes a fully filled "
                             "prior entry (filled=%s) — dispatching a fresh "
@@ -10119,7 +10420,9 @@ class OrderSyncEngine:
                         except OrderSkippedByPlugin as e:
                             _blog_warning("%s", e)
                             skipped_entry_ids_this_sync.add(intent.pine_id)
+                            self._record_entry_reject(key, intent, e)
                             continue
+                        self._rejected_entry_intents.pop(key, None)
                         self._active_intents[key] = intent
                         continue
                 try:

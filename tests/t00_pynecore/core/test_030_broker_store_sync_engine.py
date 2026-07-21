@@ -2109,3 +2109,128 @@ def __test_owned_size_ignores_provider_vs_venue_symbol_domain__(
             "venue-symbol journal rows from ownership reconstruction"
         )
         ctx.close()
+
+
+def __test_startup_reconstructs_per_entry_trades_across_restart__(
+        tmp_path: Path,
+) -> None:
+    """Adoption seeds one parent trade per real entry id (hedged multi-leg).
+
+    Regression for the cTrader hedged over-close: two separately-opened
+    1000-unit long legs (entry ids ``A`` / ``B``, one broker leg each) are
+    adopted after a restart. The engine adopts the broker NET (2000) as one
+    scalar; without per-entry reconstruction it seeds a single aggregate
+    parent trade, so ``strategy.close("A")`` would size off the whole 2000 and
+    flatten B's leg too. The durable order ledger keeps each entry's
+    ``pine_entry_id`` + ``filled_qty`` across the restart, so adoption must
+    rebuild two distinct 1000-unit trades keyed ``A`` and ``B``.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order(
+            "entry-a", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="A", filled_qty=1000.0,
+        )
+        ctx.upsert_order(
+            "entry-b", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="B", filled_qty=1000.0,
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=2000.0, entry_price=1.14232,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="cross",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 2000.0
+        assert pos.sign == 1.0
+        by_id = {t.entry_id: t.size for t in pos.open_trades}
+        assert by_id == {"A": 1000.0, "B": 1000.0}, (
+            "each entry id must own its own 1000-unit trade so a keyed "
+            "close(id) reduces only that leg — got %r" % (by_id,)
+        )
+        ctx.close()
+
+
+def __test_startup_pyramided_same_id_collapses_to_one_trade__(
+        tmp_path: Path,
+) -> None:
+    """Two rows sharing one entry id adopt as a single summed parent trade.
+
+    ``reconstruct_parent_trade`` de-dups by entry id, so the per-entry
+    reconstruction must aggregate pyramided same-id rows into one trade whose
+    size equals the adopted net — never drop the second row and undercount.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order(
+            "entry-l1", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="L", filled_qty=1000.0,
+        )
+        ctx.upsert_order(
+            "entry-l2", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="L", filled_qty=1000.0,
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=2000.0, entry_price=1.14232,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="cross",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 2000.0
+        assert len(pos.open_trades) == 1
+        assert pos.open_trades[0].entry_id == "L"
+        assert pos.open_trades[0].size == 2000.0
+        ctx.close()
+
+
+def __test_startup_clamped_net_falls_back_to_single_seed__(
+        tmp_path: Path,
+) -> None:
+    """A durable sum above the adopted (clamped) net falls back to one seed.
+
+    When an external partial close / concurrent-run clamp shrinks the
+    adoptable net below what the durable rows show, per-entry reconstruction
+    would overstate the position. The engine must fall back to the single
+    aggregate seed capped at the clamped net.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order(
+            "entry-a", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="A", filled_qty=1000.0,
+        )
+        ctx.upsert_order(
+            "entry-b", symbol=SYMBOL, side="buy", qty=1000.0,
+            state="confirmed", pine_entry_id="B", filled_qty=1000.0,
+        )
+        # The venue only shows 1000 net — a leg was closed externally while the
+        # bot was down. The run owns 2000 durably, so the ownership clamp caps
+        # adoption at 1000; per-entry reconstruction (sum 2000) must not apply.
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=1000.0, entry_price=1.14232,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="cross",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 1000.0
+        assert len(pos.open_trades) == 1
+        assert pos.open_trades[0].size == 1000.0
+        ctx.close()
