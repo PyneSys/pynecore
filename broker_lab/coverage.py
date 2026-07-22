@@ -374,6 +374,18 @@ REQUIREMENTS = (
         ),
     ),
     Requirement(
+        "ctrader-rate-limit-reconnect-storm",
+        "cTrader",
+        "P1",
+        "Multi-symbol rate-limit, backpressure and bounded reconnect storm",
+        "covered",
+        (
+            "ctrader:ctrader-multisymbol-rate-limit-backpressure-reconnect-storm",
+            "ctrader:ctrader-control-read-rate-limit-crash-is-detected",
+            "ctrader:ctrader-control-order-rate-limit-backoff-is-detected",
+        ),
+    ),
+    Requirement(
         "live-auth-identity",
         "All",
         "live",

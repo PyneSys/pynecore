@@ -7162,6 +7162,25 @@ def __test_emulated_filled_entry_side_flip_dispatches_reversal_not_modify__():
     assert active.side == 'sell'
 
 
+def __test_emulated_same_bar_filled_entry_reversal_bumps_retry_sequence__():
+    """A same-bar reversal must not reuse the fully-filled entry's client ID."""
+    b = MockBroker()
+    b.position_port = b
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["pos"] = _entry_order("pos", 1000.0)
+
+    engine.sync(BAR_TS)
+    engine._route_event(_fill_event('buy', 1000.0, 1.0, pine_id="pos"))
+
+    pos.entry_orders["pos"] = _entry_order("pos", -1000.0)
+    b.raw_legs = [_pleg("7", "buy", 1000.0, open_time=1.0)]
+    engine.sync(BAR_TS)
+
+    assert b.close_leg_calls == [("7", 1000)]
+    assert b.place_leg_calls == [1000.0, 1000.0]
+    assert engine._envelopes["pos"].retry_seq == 1
+
+
 def __test_first_sync_drives_one_way_replay_when_emulating__():
     """The first sync drives the one-way restart replay once when a position_port is set."""
     b = MockBroker()

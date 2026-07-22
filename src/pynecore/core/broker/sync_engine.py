@@ -10646,6 +10646,16 @@ class OrderSyncEngine:
                             "entry cycle instead of modifying the consumed "
                             "order", format_intent_key(key), filled_prev,
                         )
+                        # The prior entry's client order ID is spent. A
+                        # calc-on-every-tick reversal can re-emit this key on
+                        # the same bar, where a plain fresh build would recreate
+                        # the identical ``retry_seq=0`` ID and let an
+                        # idempotency-caching venue adopt the filled order
+                        # instead of opening the reversal residual. Re-anchor
+                        # through the spent-ID path before dispatching the new
+                        # cycle: same-bar gets ``retry_seq + 1``; a later bar
+                        # discards the scoped bump and starts at zero.
+                        self._reanchor_envelope_after_reject(key)
                         try:
                             self._dispatch_new(intent)
                         except OrderSkippedByPlugin as e:
@@ -10722,7 +10732,16 @@ class OrderSyncEngine:
                 retry_seq=existing.retry_seq,
                 coid_max_len=self._coid_max_len,
             )
-        anchor = self._persisted_envelope_anchors.pop(intent.intent_key, None)
+        anchor = self._persisted_envelope_anchors.get(intent.intent_key)
+        if (anchor is not None
+                and self._persisted_entry_anchor_is_spent_reversal(intent, anchor)):
+            # A restart clears the in-memory active-intent sentinel. If the
+            # first re-emitted intent on the same bar reverses a fully-filled
+            # persisted entry, the stored anchor belongs to the consumed
+            # cycle and cannot be reused for the residual open.
+            self._reanchor_envelope_after_reject(intent.intent_key)
+            anchor = self._persisted_envelope_anchors.get(intent.intent_key)
+        self._persisted_envelope_anchors.pop(intent.intent_key, None)
         reject_anchor = self._reject_anchor_bars.get(intent.intent_key)
         if (anchor is not None and reject_anchor is not None
                 and reject_anchor.bar_ts_ms != self._current_bar_ts_ms):
@@ -10780,6 +10799,33 @@ class OrderSyncEngine:
                 retry_seq=envelope.retry_seq,
             )
         return envelope
+
+    def _persisted_entry_anchor_is_spent_reversal(
+            self, intent: Intent, anchor: EnvelopeRecord,
+    ) -> bool:
+        """Whether ``anchor`` names a filled opposite-side entry cycle.
+
+        This is the restart counterpart of the active-intent consumed-entry
+        branch in :meth:`_diff_and_dispatch`. The durable order row proves the
+        old entry reached a full fill; an opposite-side re-emission is therefore
+        a new cycle even when it occurs on the same bar timestamp.
+        """
+        if not isinstance(intent, EntryIntent) or self._store_ctx is None:
+            return False
+        for kind in (KIND_ENTRY, KIND_ENTRY_STOP):
+            prior = DispatchEnvelope(
+                intent=intent,
+                run_tag=self._run_tag,
+                bar_ts_ms=anchor.bar_ts_ms,
+                retry_seq=anchor.retry_seq,
+                coid_max_len=self._coid_max_len,
+            ).client_order_id(kind)
+            row = self._store_ctx.get_order(prior)
+            if row is None or row.side == intent.side:
+                continue
+            if row.filled_qty >= row.qty - 1e-9:
+                return True
+        return False
 
     def _persist_bumped_anchor_if_unjournaled(
             self, envelope: DispatchEnvelope,
