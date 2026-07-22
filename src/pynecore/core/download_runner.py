@@ -105,9 +105,6 @@ def download_to_file(
         provider: ProviderPlugin, *,
         time_from: datetime | str,
         time_to: datetime,
-        symbol: str | None = None,
-        timeframe: str | None = None,
-        ohlcv_dir: Path | None = None,
         truncate: bool = False,
         chunk_size: int | None = None,
         extra_data: bool = False,
@@ -120,6 +117,10 @@ def download_to_file(
     """
     Download OHLCV data into the provider's ``.ohlcv`` file.
 
+    The provider must already be bound to a symbol (built with one, so its
+    ``ohlcv_path`` and writer are set); every front-end constructs it that way,
+    which for multi-broker providers keeps the broker in the filename.
+
     :param provider: The provider instance to download with.
     :param time_from: Start date, or the ``"continue"`` sentinel to resume the
         existing file (falling back to all available data for
@@ -127,52 +128,28 @@ def download_to_file(
         datetimes are converted to UTC, naive ones are taken as UTC.
     :param time_to: End date (same timezone handling as ``time_from``); clamped
         to "now", as the future takes forever to download.
-    :param symbol: Symbol to (re)bind the provider to. Only for providers that
-        were constructed without a symbol (browser / service flows): a provider
-        built *with* a symbol may have normalized it in ``__init__``, so
-        overwriting it here would corrupt its state. Leave it None to download
-        whatever the provider is already bound to.
-    :param timeframe: Timeframe to rebind to, required together with ``symbol``.
-    :param ohlcv_dir: Directory of the ``.ohlcv`` file, required together with
-        ``symbol``.
     :param truncate: Drop the existing file content before downloading.
     :param chunk_size: Override the provider's per-request bar count.
     :param extra_data: Also fetch the provider's extra fields (``.extra.csv``).
     :param syminfo: Already-loaded symbol info. When None it is fetched (and
-        persisted) after the download, best-effort.
+        persisted) *before* the download, best-effort, so an interrupted
+        download still leaves a resumable file.
     :param on_start: Called once with the resolved :class:`DownloadPlan`, before
-        the first provider request.
+        the first OHLCV request.
     :param on_progress: Called with :class:`DownloadProgress` as the download
         advances. Never called for a ``fetch_all`` download.
     :param on_conflict: Policy or callback deciding what to do when the start
         date precedes the existing file's first bar. A callback may prompt (the
         CLI does) and must return one of the :data:`ConflictAction` values.
     :param provider_string: Canonical provider string to persist in the
-        ``[download]`` section of the syminfo TOML. None skips it.
+        ``[download]`` section of the syminfo TOML, written *before* the
+        download so the file stays re-downloadable by path even if the download
+        is cut short. None skips it.
     :return: The :class:`DownloadResult` of the finished download.
     :raises InvalidTimeRangeError: If the end date is before the start date.
     :raises DownloadConflictError: If a truncating conflict was answered with
         ``'abort'``.
     """
-    if symbol is not None:
-        # Bring the provider into the same state its constructor would have
-        # produced for this symbol: symbol + timeframe + exchange timeframe +
-        # ohlcv_path + writer must all agree before the context manager opens
-        # the file.
-        assert timeframe is not None and ohlcv_dir is not None
-        provider.symbol = symbol
-        provider.timeframe = timeframe
-        provider.xchg_timeframe = provider.to_exchange_timeframe(timeframe)
-        bound_path = provider.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
-        provider.ohlcv_path = bound_path
-        if provider.ohlcv_file is not None:
-            # A previous download may have left the writer open (the context
-            # manager does not run __exit__ if __enter__ itself failed)
-            provider.ohlcv_file.close()
-        provider.ohlcv_file = OHLCVWriter(bound_path)
-        # Per-symbol flag, must not leak from the previously downloaded symbol
-        provider.mincontract_estimated = False
-
     assert provider.ohlcv_path is not None
     ohlcv_path = provider.ohlcv_path
 
@@ -209,6 +186,21 @@ def download_to_file(
                 ohlcv_writer.seek(0)
                 ohlcv_writer.truncate()
 
+        # Persist the symbol info and the originating provider string BEFORE the
+        # (potentially long) download, so an interrupted or user-aborted download
+        # still leaves a resumable file: the [download] section lets it be
+        # continued by path, and "continue" picks up from the last written bar.
+        if syminfo is None:
+            # noinspection PyBroadException
+            try:
+                syminfo = provider.get_symbol_info()  # save_toml() side effect
+            except Exception:
+                syminfo = None  # Symbol info is best-effort, don't block the download
+        if provider_string is not None:
+            # No-op until the syminfo TOML exists; get_symbol_info() above (or the
+            # caller) is what creates it.
+            write_download_provider(ohlcv_path.with_suffix('.toml'), provider_string)
+
         total_seconds = 0 if fetch_all else max(0, int((resolved_to - resolved_from).total_seconds()))
         if on_start is not None:
             on_start(DownloadPlan(ohlcv_path=ohlcv_path, time_from=resolved_from,
@@ -231,24 +223,14 @@ def download_to_file(
                                 limit=chunk_size, with_extra=extra_data)
         bars_written = ohlcv_writer.size - size_before
 
-        if syminfo is None:
-            # noinspection PyBroadException
-            try:
-                syminfo = provider.get_symbol_info()
-            except Exception:
-                syminfo = None  # Symbol info is best-effort, the data is already saved
-
         # Refine the heuristic mincontract from the downloaded volume data
-        # (only when the provider had no exchange value for it)
+        # (only when the provider had no exchange value for it). save_toml()
+        # preserves the [download] section written before the download.
         if syminfo is not None and provider.mincontract_estimated:
             qty_step = ohlcv_writer.analyzed_qty_step or 0.0
             if qty_step > 0.0 and qty_step != syminfo.mincontract:
                 syminfo.mincontract = qty_step
                 syminfo.save_toml(ohlcv_path.with_suffix('.toml'))
-
-    # Record the canonical provider string so the file can be re-downloaded by path
-    if provider_string is not None:
-        write_download_provider(ohlcv_path.with_suffix('.toml'), provider_string)
 
     return DownloadResult(ohlcv_path=ohlcv_path, time_from=resolved_from, time_to=resolved_to,
                           fetch_all=fetch_all, bars_written=bars_written, syminfo=syminfo)

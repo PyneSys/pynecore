@@ -47,6 +47,12 @@ _HIGHLIGHTER = ReprHighlighter()
 # against bursting the provider during fast scrolling.
 _FETCH_DEBOUNCE_S = 0.15
 
+# A failed info fetch (e.g. a transient connection error) is cached only for
+# this long, then re-fetched on the next visit. Successful SymInfo stays cached
+# until LRU eviction — only errors expire, so transient failures self-heal
+# without hammering the provider.
+_ERROR_RETRY_COOLDOWN_S = 10.0
+
 # Footer block is one line of help text inside a Panel (2 border lines).
 _FOOTER_HEIGHT = 3
 
@@ -164,6 +170,16 @@ class SymbolBrowser:
         """Provider (+broker selector) prefix, e.g. ``"ccxt:BYBIT"`` — the
         browsed symbols carry no such prefix. Used to persist the canonical
         provider string next to a finished download; None disables that."""
+        # Broker selector for multi-broker providers, split off the prefix
+        # ("ccxt:BYBIT" -> "BYBIT"). Folded back before the browsed symbol when
+        # naming the .ohlcv file / building a download provider, so the broker
+        # survives in the filename (single-broker providers: None).
+        self._selector: str | None = (
+            provider_string_prefix.split(':', 1)[1]
+            if provider.multi_broker and provider_string_prefix
+            and ':' in provider_string_prefix
+            else None
+        )
         self.default_chunk_size = default_chunk_size
         self.default_extra_data = default_extra_data
         self.max_cache = max_cache
@@ -183,6 +199,8 @@ class SymbolBrowser:
 
         # Fetch state.
         self.info_cache: "OrderedDict[str, SymInfo | Exception]" = OrderedDict()
+        # monotonic time an error was cached, per symbol — drives error expiry.
+        self.error_since: dict[str, float] = {}
         self.pending_symbol: str | None = None
         self.pending_since: float = 0.0
         self.executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
@@ -226,7 +244,8 @@ class SymbolBrowser:
         self.info_cache[key] = value
         self.info_cache.move_to_end(key)
         while len(self.info_cache) > self.max_cache:
-            self.info_cache.popitem(last=False)
+            evicted, _ = self.info_cache.popitem(last=False)
+            self.error_since.pop(evicted, None)
 
     # ---- fetch worker -------------------------------------------------
 
@@ -244,9 +263,17 @@ class SymbolBrowser:
         if not self.filtered:
             return
         current = self.filtered[self.cursor]
-        if current in self.info_cache:
-            self.pending_symbol = None
-            return
+        cached = self.info_cache.get(current)
+        if cached is not None:
+            # A cached error is retried once its cooldown elapses; successful
+            # info stays put. This lets transient connection failures self-heal.
+            if isinstance(cached, Exception) and \
+                    now - self.error_since.get(current, 0.0) >= _ERROR_RETRY_COOLDOWN_S:
+                self.info_cache.pop(current, None)
+                self.error_since.pop(current, None)
+            else:
+                self.pending_symbol = None
+                return
         if self.pending_symbol != current:
             self.pending_symbol = current
             self.pending_since = now
@@ -256,7 +283,7 @@ class SymbolBrowser:
         self.active_symbol = current
         self.active_future = self.executor.submit(self._fetch_info, current)
 
-    def _maybe_collect_result(self) -> None:
+    def _maybe_collect_result(self, now: float) -> None:
         if self.active_future is None or not self.active_future.done():
             return
         sym = self.active_symbol
@@ -266,6 +293,11 @@ class SymbolBrowser:
             result = exc if isinstance(exc, Exception) else RuntimeError(repr(exc))
         if sym is not None:
             self._cache_put(sym, result)
+            # Errors expire after a cooldown; success is remembered permanently.
+            if isinstance(result, Exception):
+                self.error_since[sym] = now
+            else:
+                self.error_since.pop(sym, None)
         self.active_future = None
         self.active_symbol = None
 
@@ -412,6 +444,13 @@ class SymbolBrowser:
                 return f
         return None
 
+    def _filename_symbol(self, symbol: str) -> str:
+        """The browsed ``symbol`` folded with the broker selector, as the
+        provider constructor and :meth:`ProviderPlugin.get_ohlcv_path` expect
+        it (``"BYBIT:BTC/USDT:USDT"``). Keeps the broker in the ``.ohlcv``
+        filename for multi-broker providers; single-broker: symbol unchanged."""
+        return f"{self._selector}:{symbol}" if self._selector else symbol
+
     def _target_file_exists(self) -> bool:
         """Does the target OHLCV file already exist for the current
         symbol + chosen TF? Drives both the Truncate toggle visibility
@@ -432,7 +471,7 @@ class SymbolBrowser:
         # noinspection PyBroadException
         try:
             path = type(self.provider).get_ohlcv_path(
-                symbol, tf, self.ohlcv_dir)
+                self._filename_symbol(symbol), tf, self.ohlcv_dir)
         except Exception:
             # Provider plugin code is arbitrary — swallow anything so the
             # browser keeps running even if the plugin misbehaves.
@@ -673,9 +712,15 @@ class SymbolBrowser:
 
             provider_string = (f"{self.provider_string_prefix}:{symbol}@{tf}"
                                if self.provider_string_prefix else None)
+            # A dedicated instance built from the full "broker:symbol" (like the
+            # CLI): its constructor derives the broker-qualified .ohlcv path, and
+            # a background download cannot mutate the symbol under the browser's
+            # cursor (self.provider stays bound to whatever is being previewed).
+            dl_provider = type(self.provider)(
+                symbol=self._filename_symbol(symbol), timeframe=tf,
+                ohlcv_dir=self.ohlcv_dir, config=self.provider.config)
             download_to_file(
-                self.provider,
-                symbol=symbol, timeframe=tf, ohlcv_dir=self.ohlcv_dir,
+                dl_provider,
                 time_from=from_value, time_to=to_value,
                 truncate=truncate,
                 chunk_size=self.default_chunk_size,
@@ -720,6 +765,7 @@ class SymbolBrowser:
         if self.dl_label:
             sym = self.dl_label.split(' ', 1)[0]
             self.info_cache.pop(sym, None)
+            self.error_since.pop(sym, None)
 
     def _maybe_clear_status(self, now: float) -> None:
         if self.dl_status is None:
@@ -1092,7 +1138,7 @@ class SymbolBrowser:
                 if not self._handle_key(key):
                     return
             now = time.monotonic()
-            self._maybe_collect_result()
+            self._maybe_collect_result(now)
             self._maybe_collect_download()
             self._maybe_clear_status(now)
             self._maybe_start_fetch(now)

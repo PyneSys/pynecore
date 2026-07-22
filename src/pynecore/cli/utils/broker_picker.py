@@ -14,14 +14,13 @@ filter, ENTER selects, ``q`` / ESC quits.
 import shutil
 import sys
 import threading
+from typing import Protocol, Sequence
 
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
-
-from pynecore.core.plugin import Broker
 
 from .keyreader import Key, KeyOrChar, raw_terminal, read_key
 
@@ -30,6 +29,18 @@ _FOOTER_HEIGHT = 3
 
 # Panel top + bottom border lines deducted from the list panel height.
 _LIST_CHROME_LINES = 2
+
+
+class PickerItem(Protocol):
+    """Structural type for an item shown by :class:`BrokerPicker`."""
+
+    @property
+    def id(self) -> str:
+        ...
+
+    @property
+    def name(self) -> str:
+        ...
 
 
 class BrokerPicker:
@@ -42,16 +53,19 @@ class BrokerPicker:
     :ivar selected: The chosen broker id once :meth:`run` returns, else ``None``.
     """
 
-    def __init__(self, brokers: list[Broker], *, provider_name: str):
+    def __init__(self, brokers: Sequence[PickerItem], *, provider_name: str,
+                 item_name: str = "brokers"):
         """
         :param brokers: The brokers / exchanges to choose from.
         :param provider_name: Provider name shown in the panel title.
+        :param item_name: Plural name shown after ``provider_name`` in the title.
         """
-        self.brokers: list[Broker] = list(brokers)
+        self.brokers: list[PickerItem] = list(brokers)
         self.provider_name = provider_name
+        self.item_name = item_name
 
         # View state.
-        self.filtered: list[Broker] = list(self.brokers)
+        self.filtered: list[PickerItem] = list(self.brokers)
         self.cursor: int = 0
         self.scroll_offset: int = 0
         self.filter_text: str = ''
@@ -211,7 +225,7 @@ class BrokerPicker:
                 lines.append(Text(f"  {label}"))
         if not lines:
             lines.append(Text("  (no matches)", style="dim"))
-        title_parts = [f"{self.provider_name} brokers "
+        title_parts = [f"{self.provider_name} {self.item_name} "
                        f"({len(self.filtered)}/{len(self.brokers)})"]
         if self.filter_active or self.filter_text:
             cursor_marker = "_" if self.filter_active else ""
@@ -280,7 +294,7 @@ class BrokerPicker:
         :return: The chosen broker id, or ``None`` if the user quit.
         """
         if not self.brokers:
-            print("No brokers available.", file=sys.stderr)
+            print(f"No {self.item_name} available.", file=sys.stderr)
             return None
 
         # Reset so the picker can be re-run after a failed broker attempt.

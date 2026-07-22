@@ -51,6 +51,23 @@ def _list_provider_names() -> list[str]:
     return sorted(names)
 
 
+def _choose_provider() -> str | None:
+    """Open the installed-provider picker and return its selected entry point."""
+    from ..utils.provider_picker import ProviderChoice, ProviderPicker
+
+    providers: list[ProviderChoice] = []
+    for name, ep in discover_plugins().items():
+        try:
+            cls = ep.load()
+            if isinstance(cls, type) and issubclass(cls, ProviderPlugin):
+                display_name = getattr(cls, 'plugin_name', '')
+                providers.append(ProviderChoice(name, display_name))
+        except Exception:  # noqa
+            pass
+    providers.sort(key=lambda item: item.id)
+    return ProviderPicker(providers).run()
+
+
 def _resolve_provider_class(provider_name: str) -> type[ProviderPlugin]:
     """
     Load a data-provider plugin by name.
@@ -162,11 +179,12 @@ def _format_date_default(value, fallback: str) -> str:
 @app_data.command(cls=PluggableCommand)
 def download(
         ctx: Context,
-        provider: str = Argument(..., show_default=False,
-                                 help="Provider name (e.g. 'ccxt'), a full provider string "
-                                      "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D'), or the path of an "
-                                      "already downloaded .ohlcv/.toml file to re-download it "
-                                      "with its saved provider string (typically with -f continue)"),
+        provider: str | None = Argument(None, show_default=False,
+                                        help="Provider name (e.g. 'ccxt'), a full provider string "
+                                             "(e.g. 'ccxt:BYBIT:BTC/USDT:USDT@1D'), or the path of an "
+                                             "already downloaded .ohlcv/.toml file to re-download it "
+                                             "with its saved provider string (typically with -f continue). "
+                                             "Omit it in a terminal to choose interactively"),
         symbol: str | None = Option(None, '--symbol', '-s', show_default=False,
                                     help="Symbol (e.g. BYBIT:BTC/USDT:USDT). Ignored when the "
                                          "provider string already contains a symbol"),
@@ -213,6 +231,15 @@ def download(
     try:
         from ...core.config import ensure_config
         from ...core.download_info import read_download_provider
+
+        if provider is None:
+            if not sys.stdin.isatty():
+                secho("Error: Provider is required in non-interactive mode.",
+                      err=True, fg=colors.RED)
+                raise Exit(2)
+            provider = _choose_provider()
+            if provider is None:
+                return
 
         # A .ohlcv/.toml path re-downloads with the provider string persisted
         # in the [download] section of its syminfo TOML.
