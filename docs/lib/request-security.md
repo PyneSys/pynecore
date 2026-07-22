@@ -154,7 +154,7 @@ def main():
 security_data = {
     "USI:ADVN.NY": "workdir/data/USI_ADVN_NY",
     "USI:DECL.NY": "workdir/data/USI_DECL_NY",
-} 
+}
 ```
 
 > **Note:** When the timeframe argument is `""` (empty string), the chart's own timeframe is used.
