@@ -480,6 +480,18 @@ def __test_run_exit_bracket_replicates_across_legs__():
     assert _amended_levels(port) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
 
 
+def __test_run_exit_bracket_converts_trailing_ticks_to_price_distance__():
+    """The strategy's tick offset crosses PositionPort in absolute price units."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None, mintick=0.01)
+
+    _run(eng.run_exit_bracket(_exit_env("TR", "Long", trail=10.0), port))
+
+    assert len(port.amended) == 1
+    leg_id, side, tp, sl, trail, _coid = port.amended[0]
+    assert (leg_id, side, tp, sl, trail) == ("10", "sell", None, None, 0.1)
+
+
 def __test_run_exit_bracket_flat_skips__():
     """``run_exit_bracket`` on a flat book skips, amending no legs."""
     port = _FakePort([])

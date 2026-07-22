@@ -361,6 +361,19 @@ REQUIREMENTS = (
         ),
     ),
     Requirement(
+        "ctrader-trailing-restart",
+        "cTrader",
+        "P1",
+        "Trail-only attach, amend and clear preserve anchor across restart",
+        "covered",
+        (
+            "ctrader:ctrader-trail-only-amend-restart-clear-preserves-anchor",
+            "ctrader:ctrader-control-anchorless-restart-amend-is-detected",
+            "ctrader:ctrader-control-omitted-trailing-disable-is-detected",
+            "ctrader:ctrader-control-one-step-trailing-clear-is-rejected",
+        ),
+    ),
+    Requirement(
         "live-auth-identity",
         "All",
         "live",

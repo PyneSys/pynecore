@@ -658,6 +658,7 @@ class OrderSyncEngine:
         # per-leg close / bracket crash-safety.
         self._one_way_emulator = OneWayEmulator(
             store_ctx=store_ctx,
+            mintick=mintick,
             block_exposure_reopens=lambda: self._quarantined,
         )
         # Set on the first ``sync`` (deferred like ``_restart_entry_scan_done``):

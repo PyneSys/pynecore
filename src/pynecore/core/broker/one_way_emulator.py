@@ -177,15 +177,23 @@ class OneWayEmulator:
             self,
             store_ctx: 'RunContext | None',
             *,
+            mintick: float = 1.0,
             block_exposure_reopens: 'Callable[[], bool] | None' = None,
     ) -> None:
         self._store_ctx = store_ctx
+        self._mintick = mintick
         #: Engine-supplied gate consulted before a residual-open re-dispatch
         #: (the reversal reopen leg). Wired to the engine's quarantine latch:
         #: under quarantine the owed FIFO closes still run (risk-reducing)
         #: but the reopen is withheld and its breadcrumb stays live, so the
         #: committed reversal finishes after the operator restart.
         self._block_exposure_reopens = block_exposure_reopens
+
+    def _trail_price_distance(self, trail_offset: float | None) -> float | None:
+        """Convert Pine trailing-offset ticks to the PositionPort price unit."""
+        if trail_offset is None:
+            return None
+        return trail_offset * self._mintick
 
     # === Close fan-out ====================================================
 
@@ -546,7 +554,8 @@ class OneWayEmulator:
                 await port.amend_bracket(
                     intent.symbol, leg.leg_id, side=intent.side,
                     tp_price=intent.tp_price, sl_price=intent.sl_price,
-                    trail_offset=intent.trail_offset, coid=attach_coid,
+                    trail_offset=self._trail_price_distance(intent.trail_offset),
+                    coid=attach_coid,
                 )
             except ExchangeOrderRejectedError as exc:
                 # The amend was DEFINITIVELY rejected on a leg of an OPEN
@@ -1112,6 +1121,8 @@ class OneWayEmulator:
             symbol, leg_id, side=row.side,
             tp_price=extras.get(EXTRAS_KEY_BRACKET_OWN_TP),
             sl_price=extras.get(EXTRAS_KEY_BRACKET_OWN_SL),
-            trail_offset=extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET),
+            trail_offset=self._trail_price_distance(
+                extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
+            ),
             coid=extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID) or row.client_order_id,
         )
