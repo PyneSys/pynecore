@@ -9450,11 +9450,21 @@ class OrderSyncEngine:
         # cancel. Runs once per restart: each key is consumed on the first diff.
         if self._restart_reconstructed_entry_keys:
             for key in list(self._restart_reconstructed_entry_keys):
-                if key in new_map or key in self._active_intents:
+                desired = new_map.get(key)
+                if isinstance(desired, EntryIntent) or key in self._active_intents:
                     self._restart_reconstructed_entry_keys.pop(key, None)
                     continue
                 old = self._restart_reconstructed_entry_keys.pop(key)
                 if key not in self._order_mapping:
+                    continue
+                if isinstance(desired, CloseIntent):
+                    # A keyed close shares the reconstructed entry's key but
+                    # replaces it; it does not preserve the still-working
+                    # residual. Seed the old entry into the active diff slot
+                    # so the normal EntryIntent -> CloseIntent modify path
+                    # performs its cancel-first disposition protocol before
+                    # dispatching the reduce-only close.
+                    self._active_intents[key] = old
                     continue
                 _blog_info(
                     "restart: reconstructed entry %s was cancelled by the "

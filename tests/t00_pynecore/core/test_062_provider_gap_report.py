@@ -61,6 +61,25 @@ def __test_classify_splits_by_session__():
     assert closed == [out_slot]
 
 
+def __test_classify_session_boundaries_use_half_open_slots__():
+    """A slot ending at open is closed; the first slot starting at open is live."""
+    syminfo = SimpleNamespace(
+        opening_hours=[SymInfoInterval(day=0, start=time(9, 0), end=time(17, 0))],
+        timezone="UTC",
+    )
+    pre_open = _ts(2025, 1, 6, 8, 59)
+    first_open = _ts(2025, 1, 6, 9, 0)
+    last_open = _ts(2025, 1, 6, 16, 59)
+    first_closed = _ts(2025, 1, 6, 17, 0)
+
+    in_session, closed = _classify_missing_slots(
+        [pre_open, first_open, last_open, first_closed], syminfo, TF,
+    )
+
+    assert in_session == [first_open, last_open]
+    assert closed == [pre_open, first_closed]
+
+
 def __test_merge_intervals_coalesces_runs__():
     """Consecutive grid slots collapse into half-open ``[start, end)`` runs."""
     base = _ts(2025, 1, 6, 10, 0)

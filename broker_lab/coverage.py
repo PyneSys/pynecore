@@ -202,6 +202,17 @@ REQUIREMENTS = (
         ),
     ),
     Requirement(
+        "bybit-partial-fill-gap-recovery",
+        "Bybit",
+        "P1",
+        "Fragmented fill, private-stream gap, REST recovery and restart close",
+        "covered",
+        (
+            "bybit:bybit-fragmented-partial-fill-ws-gap-rest-recovery",
+            "bybit:control-bybit-distinct-id-duplicate-fragment-is-detected",
+        ),
+    ),
+    Requirement(
         "bybit-spot-inventory",
         "Bybit",
         "P1",
@@ -296,6 +307,18 @@ REQUIREMENTS = (
         (
             "capital:capitalcom-price-pagination-has-no-overlap-or-gap",
             "capital:capitalcom-missing-activity-falls-back-to-rest-position-snapshot",
+        ),
+    ),
+    Requirement(
+        "capital-weekend-session-handoff",
+        "Capital.com",
+        "P1",
+        "Weekend calendar, closed-gap classification, reopen history and session refresh",
+        "covered",
+        (
+            "capital:capitalcom-weekend-close-open-handoff-preserves-session-gaps",
+            "capital:control-capitalcom-weekend-gap-misclassification-is-detected",
+            "capital:capitalcom-session-refresh-precedes-weekend-reopen-history-read",
         ),
     ),
     Requirement(

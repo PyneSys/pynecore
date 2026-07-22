@@ -42,10 +42,9 @@ def _is_in_session(opening_hours, dt: datetime, tf_sec: int) -> bool:
     tuples ``(day, start_time, end_time)`` where ``day`` is Python weekday
     (0=Mon..6=Sun) and the times are in the symbol's source timezone.
 
-    Slot-aware: returns True as soon as the ``[dt, dt+tf_sec)`` candle window
-    touches a session. For point-in-time "is the market open right now?"
-    decisions, use :func:`_is_point_in_session` instead — the candle-overlap
-    variant reports a session as open one timeframe before its real start.
+    Slot-aware: returns True when the ``[dt, dt+tf_sec)`` candle window has a
+    positive-duration overlap with a session. For point-in-time "is the market
+    open right now?" decisions, use :func:`_is_point_in_session` instead.
 
     Overnight sessions are handled by inspecting both the current weekday
     interval and any previous-weekday interval whose end crosses midnight,
@@ -70,7 +69,7 @@ def _is_in_session(opening_hours, dt: datetime, tf_sec: int) -> bool:
                               microsecond=0) - timedelta(days=1)
             sedt = ssdt.replace(hour=se.hour, minute=se.minute, second=se.second,
                                 microsecond=0) + timedelta(days=1)
-            if candle_end >= ssdt and candle_start < sedt:
+            if candle_end > ssdt and candle_start < sedt:
                 return True
             continue
         if day != weekday:
@@ -79,7 +78,7 @@ def _is_in_session(opening_hours, dt: datetime, tf_sec: int) -> bool:
         sedt = dt.replace(hour=se.hour, minute=se.minute, second=se.second, microsecond=0)
         if sedt < ssdt:  # Overnight session that started today
             sedt += timedelta(days=1)
-        if candle_end >= ssdt and candle_start < sedt:
+        if candle_end > ssdt and candle_start < sedt:
             return True
 
     return False

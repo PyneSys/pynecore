@@ -7605,6 +7605,75 @@ def __test_cancel_only_restart_kept_entry_is_adopted_not_cancelled__(tmp_path):
         assert engine._restart_reconstructed_entry_keys == {}  # type: ignore[attr-defined]
 
 
+def __test_restart_close_cancels_partially_filled_entry_residual_first__(tmp_path):
+    """A keyed close replaces, rather than preserves, a reconstructed entry.
+
+    A partially filled working entry owns both live exposure and an unfilled
+    residual. After restart, ``strategy.close(entry_id)`` must cancel that
+    run-owned residual before dispatching the position close. A foreign
+    working order in the same venue snapshot is never reconstructed or
+    targeted.
+    """
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.storage import BrokerStore
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    own = ExchangeOrder(
+        id="wo-own", symbol=SYMBOL, side="buy",
+        order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.4,
+        remaining_qty=0.6, price=1.1, stop_price=None,
+        average_fill_price=1.1, status=OrderStatus.PARTIALLY_FILLED,
+        timestamp=0.0, fee=0.0, fee_currency="", client_order_id=live_coid,
+    )
+    foreign = replace(
+        own,
+        id="wo-foreign",
+        client_order_id="foreign-client-order-id",
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            _restart_identity(), script_source="src", script_path="t025.py",
+        )
+        _seed_live_entry_order_row(
+            ctx, coid=live_coid, order_id="wo-own", pine_id="L",
+        )
+        ctx.set_filled(live_coid, 0.4)
+        b = MockBroker()
+        b.open_orders = [own, foreign]
+        pos = BrokerPosition()
+        pos.size = 0.4
+        pos.sign = 1.0
+        pos.avg_price = 1.1
+        pos.reconstruct_parent_trade(
+            entry_id="L", size=0.4, entry_price=1.1,
+        )
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+
+        engine.settle_restart_state(BAR_TS)
+        assert engine._order_mapping["L"] == ["wo-own"]  # type: ignore[attr-defined]
+        pos.exit_orders[("Close entry(s) order L", "L")] = _exit_order(
+            "L", -0.4, "Close entry(s) order L",
+        )
+
+        engine.sync(BAR_TS)
+
+        assert len(b.cancel_calls) == 1
+        assert b.cancel_calls[0].intent.pine_id == "L"
+        assert len(b.close_calls) == 1
+        assert b.close_calls[0].intent.qty == 0.4
+        assert all(
+            call.intent.pine_id != "foreign-client-order-id"
+            for call in b.cancel_calls
+        )
+
+
 def __test_settle_restart_state_skips_when_already_reconstructed__(tmp_path):
     """Once reconstruction has latched, settle_restart_state is an immediate no-op.
 
