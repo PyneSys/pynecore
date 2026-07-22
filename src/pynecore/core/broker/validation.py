@@ -48,6 +48,7 @@ _SPOT_INVENTORY_PORT_ATTRS = (
     'cursor_scope',
     'base_tolerance',
     'settlement_grace_s',
+    'position_dust_threshold',
 )
 
 

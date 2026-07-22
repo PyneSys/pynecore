@@ -311,6 +311,7 @@ def __test_spot_inventory_port_surface_checked__():
         cursor_scope = "product"
         base_tolerance = Decimal("0.00000001")
         settlement_grace_s = 30.0
+        position_dust_threshold = Decimal("0.00000001")
 
         async def fetch_base_balance(self):
             return Decimal(0)
@@ -338,6 +339,7 @@ def __test_spot_port_excludes_short_selling_capability__():
         cursor_scope = "product"
         base_tolerance = Decimal("0.00000001")
         settlement_grace_s = 30.0
+        position_dust_threshold = Decimal("0.00000001")
 
         async def fetch_executions(self, cursor):
             return None

@@ -3630,6 +3630,60 @@ def __test_reconcile_clears_position_when_exchange_flat__():
     assert pos.avg_price is na_float
 
 
+def __test_reconcile_spot_dust_clears_without_external_close_warning__(caplog):
+    """A venue-hidden sub-grid spot residual is not a manual external close."""
+    from decimal import Decimal
+    import logging
+    from types import SimpleNamespace
+
+    b = MockBroker()
+    b.position = None
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    engine._sync_count = 1
+    pos.size = 0.000007
+    pos.sign = 1.0
+    pos.avg_price = 1924.07
+
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+
+    assert pos.size == 0.0
+    assert not any(
+        "external close detected" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(caplog):
+    """A tradable spot position disappearing at the venue remains actionable."""
+    from decimal import Decimal
+    import logging
+    from types import SimpleNamespace
+
+    b = MockBroker()
+    b.position = None
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    engine._sync_count = 1
+    pos.size = 0.00002
+    pos.sign = 1.0
+    pos.avg_price = 1924.07
+
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+
+    assert pos.size == 0.0
+    assert any(
+        "external close detected" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 def __test_reconcile_clears_open_trades_when_exchange_flat__():
     """When the exchange goes flat externally, open_trades MUST be wiped.
 

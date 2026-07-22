@@ -952,6 +952,33 @@ def __test_close_idempotent__(tmp_path: Path) -> None:
         ctx.close()
 
 
+def __test_foreign_live_exchange_order_ids_include_stopped_sibling__(
+        tmp_path: Path,
+) -> None:
+    """A stopped sibling keeps ownership of its still-live physical deal."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        run_a = _open_run(store, label="A")
+        run_b = _open_run(store, label="B")
+        other_account = _open_run(store, label="C", account_id="other-account")
+        run_a.upsert_order(
+            "a", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
+            exchange_order_id="deal-a",
+        )
+        run_b.upsert_order(
+            "b", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
+            exchange_order_id="deal-b",
+        )
+        other_account.upsert_order(
+            "c", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
+            exchange_order_id="deal-c",
+        )
+        run_a.close()
+
+        assert run_b.foreign_live_exchange_order_ids(symbol="EURUSD") == {
+            "deal-a"
+        }
+
+
 # === Torn write / recovery ================================================
 
 

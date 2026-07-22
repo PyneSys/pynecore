@@ -2,6 +2,7 @@ import asyncio
 import os
 import queue
 import signal
+import tempfile
 import threading
 import time
 import sys
@@ -24,7 +25,7 @@ from ..app import app, app_state
 from ..pluggable import PluggableCommand
 
 from ...utils.rich.date_column import DateColumn
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.aggregator import validate_aggregation
 from pynecore.lib.log import logger as pyne_logger
@@ -638,6 +639,39 @@ def _ohlcv_download_lock(ohlcv_path: Path | None):
         lock_file.close()
 
 
+@contextmanager
+def _atomic_ohlcv_download_target(provider: Any):
+    """Write one provider download privately, then atomically publish it.
+
+    The sidecar lock serializes publishers, while the temporary file keeps the
+    canonical path complete for readers during the entire rewrite. The
+    provider's original path and unopened writer are restored before return.
+    """
+    final_path = provider.ohlcv_path
+    if final_path is None:
+        yield
+        return
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp_path = tempfile.mkstemp(
+        prefix=f".{final_path.name}.", suffix=".tmp", dir=final_path.parent,
+    )
+    os.close(fd)
+    temp_path = Path(raw_temp_path)
+    original_writer = provider.ohlcv_file
+    try:
+        with _ohlcv_download_lock(final_path):
+            provider.ohlcv_path = temp_path
+            provider.ohlcv_file = OHLCVWriter(temp_path)
+            try:
+                yield
+                os.replace(temp_path, final_path)
+            finally:
+                provider.ohlcv_path = final_path
+                provider.ohlcv_file = original_writer
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
     """
     Download historical data from a provider and return the result.
@@ -744,7 +778,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         # bar-count pin below so no other process can rewrite the file between
         # our download and our reads.
         exact_from_ts: int | None = None
-        with _ohlcv_download_lock(provider_instance.ohlcv_path):
+        with _atomic_ohlcv_download_target(provider_instance):
             for attempt in range(max_retries + 1):
                 with provider_instance as ohlcv_writer:
                     ohlcv_writer.seek(0)

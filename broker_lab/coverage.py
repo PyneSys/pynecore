@@ -202,6 +202,17 @@ REQUIREMENTS = (
         ),
     ),
     Requirement(
+        "bybit-spot-inventory",
+        "Bybit",
+        "P1",
+        "USDC spot base/quote deltas, fee currency and sellable residual",
+        "covered",
+        (
+            "bybit:bybit-usdc-spot-inventory-fee-residual-roundtrip",
+            "bybit:bybit-usdc-spot-wrong-buy-fee-currency-negative-control",
+        ),
+    ),
+    Requirement(
         "capital-marketable-whole-row",
         "Capital.com",
         "P0",
@@ -247,7 +258,10 @@ REQUIREMENTS = (
         "P0",
         "Shared netting account with two run owners",
         "covered",
-        ("capital:capitalcom-shared-netting-runs-adopt-and-close-only-own-ledger",),
+        (
+            "capital:capitalcom-shared-netting-runs-adopt-and-close-only-own-ledger",
+            "capital:control-capitalcom-cross-run-delete-is-detected",
+        ),
     ),
     Requirement(
         "capital-bracket-lifecycle",

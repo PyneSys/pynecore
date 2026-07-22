@@ -92,6 +92,7 @@ class FakeSpotPort:
     cursor_scope = "product"
     base_tolerance = Decimal("0.000000005")
     settlement_grace_s = 30.0
+    position_dust_threshold = Decimal(0)
 
     def __init__(self, *, balance: Decimal = Decimal(0)) -> None:
         self.balance = balance

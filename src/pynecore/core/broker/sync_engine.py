@@ -33,8 +33,10 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from concurrent import futures
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
+from pynecore import lib
 from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
@@ -3236,16 +3238,26 @@ class OrderSyncEngine:
             # fresh entry in the opposite direction.
             if self._active_intents:
                 return
+            spot_port = getattr(self._broker, 'spot_inventory_port', None)
+            dust_threshold = getattr(
+                spot_port, 'position_dust_threshold', Decimal(0),
+            )
+            is_nontradable_spot_dust = (
+                isinstance(dust_threshold, Decimal)
+                and dust_threshold > 0
+                and Decimal(str(abs(self._position.size))) < dust_threshold
+            )
             # External flatten detected — wipe ALL trade state so a re-entry
             # on the next bar starts from a clean slate. Leaving stale
             # ``open_trades`` would corrupt P&L bookkeeping the moment the
             # next ``record_fill`` runs (FIFO close against trades that no
             # longer exist on the broker).
-            _blog_warning(
-                "exchange shows flat, internal=%s — external close detected, "
-                "clearing position state",
-                self._position.size,
-            )
+            if not is_nontradable_spot_dust:
+                _blog_warning(
+                    "exchange shows flat, internal=%s — external close detected, "
+                    "clearing position state",
+                    self._position.size,
+                )
             self._position.size = 0.0
             self._position.sign = 0.0
             self._position.avg_price = na_float
@@ -10007,6 +10019,25 @@ class OrderSyncEngine:
                     self._active_intents[key] = intent
                     if isinstance(intent, CloseIntent):
                         self._recovered_close_anchor_keys.discard(key)
+                elif (
+                    isinstance(intent, EntryIntent)
+                    and (filled_qty := self._filled_restart_entry_at_pyramiding_cap(
+                        intent
+                    )) is not None
+                ):
+                    # A filled entry survives restart as durable position state,
+                    # but not as an active working-order mapping. Re-emitting
+                    # the same Pine entry while its reconstructed trade already
+                    # reaches the strategy pyramiding cap is the sticky entry
+                    # declaration, not a fresh venue order.
+                    self._build_envelope(intent)
+                    self._active_intents[key] = intent
+                    self._active_entry_filled_qty[key] = filled_qty
+                    _blog_info(
+                        "re-emitted filled entry %s adopted at restart "
+                        "pyramiding cap (filled=%s); no broker dispatch",
+                        format_intent_key(key), filled_qty,
+                    )
                 elif (isinstance(intent, ExitIntent)
                         and intent.is_partial_qty_bracket
                         and self._partial_qty_bracket_exit_mode
@@ -10826,6 +10857,38 @@ class OrderSyncEngine:
             if row.filled_qty >= row.qty - 1e-9:
                 return True
         return False
+
+    def _filled_restart_entry_at_pyramiding_cap(
+            self, intent: EntryIntent,
+    ) -> float | None:
+        """Return durable same-entry fills when restart replay reached its cap.
+
+        A broker-mode market entry is dispatched before the simulator's
+        fill-time pyramiding check. Across restart, the filled order no longer
+        has a working-order mapping, so the first re-declaration would otherwise
+        look fresh and open a duplicate position. Restrict adoption to a real
+        strategy entry (never ``strategy.order``), a same-direction live
+        position, reconstructed open trades at the script's pyramiding cap and
+        a fully filled durable row carrying the same Pine entry id.
+        """
+        if self._store_ctx is None or intent.is_strategy_order:
+            return None
+        if self._position.size == 0.0:
+            return None
+        is_buy = intent.side == 'buy'
+        if is_buy != (self._position.size > 0.0):
+            return None
+        pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)
+        if len(self._position.open_trades) < max(1, pyramiding):
+            return None
+        filled = 0.0
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            if row.pine_entry_id != intent.pine_id or row.side != intent.side:
+                continue
+            if row.filled_qty < row.qty - 1e-9:
+                continue
+            filled += row.filled_qty
+        return filled if filled >= intent.qty - 1e-9 else None
 
     def _persist_bumped_anchor_if_unjournaled(
             self, envelope: DispatchEnvelope,

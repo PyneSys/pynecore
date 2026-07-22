@@ -1880,6 +1880,35 @@ class RunContext:
         for row in rows:
             yield _row_to_order(row)
 
+    def foreign_live_exchange_order_ids(self, *, symbol: str) -> set[str]:
+        """Return physical order ids claimed by another run on this account.
+
+        Ended run instances remain authoritative owners while their order row is
+        still live. This lets a restarting sibling distinguish genuinely
+        untracked venue exposure from a position opened by another run label.
+
+        :param symbol: Canonical broker symbol to scope the ownership query.
+        :return: Non-empty exchange order ids owned outside this run instance.
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT owned.exchange_order_id "
+                "FROM orders owned "
+                "JOIN runs owner_run "
+                "  ON owner_run.run_instance_id = owned.run_instance_id "
+                "JOIN runs current_run "
+                "  ON current_run.run_instance_id = ? "
+                "WHERE owned.run_instance_id != ? "
+                "  AND owned.closed_ts_ms IS NULL "
+                "  AND owned.exchange_order_id IS NOT NULL "
+                "  AND owned.exchange_order_id != '' "
+                "  AND owned.symbol = ? "
+                "  AND owner_run.account_id = current_run.account_id "
+                "  AND owner_run.plugin_name = current_run.plugin_name",
+                (self.run_instance_id, self.run_instance_id, symbol),
+            ).fetchall()
+        return {str(row['exchange_order_id']) for row in rows}
+
     # --- Events -----------------------------------------------------------
 
     def log_event(

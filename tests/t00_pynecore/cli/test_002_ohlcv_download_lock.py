@@ -13,8 +13,14 @@ context managers in the SAME process contend — the test drives that
 contention with two threads, fully offline.
 """
 import threading
+from types import SimpleNamespace
 
-from pynecore.cli.commands.run import _ohlcv_download_lock
+from pynecore.cli.commands.run import (
+    _atomic_ohlcv_download_target,
+    _ohlcv_download_lock,
+)
+from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.types.ohlcv import OHLCV
 
 
 def __test_ohlcv_download_lock_serializes_concurrent_writers__(tmp_path):
@@ -76,3 +82,42 @@ def __test_ohlcv_download_lock_noop_for_none_path__():
     """A live/in-memory feed with no shared file is a clean no-op."""
     with _ohlcv_download_lock(None):
         pass
+
+
+def __test_atomic_download_keeps_canonical_file_complete_during_rewrite__(
+        tmp_path,
+):
+    """A reader sees the prior complete file while a sibling rewrites privately."""
+    path = tmp_path / "prov_SYM_1.ohlcv"
+    provider = SimpleNamespace(ohlcv_path=path, ohlcv_file=OHLCVWriter(path))
+    first = OHLCV(1_700_000_000, 1.0, 2.0, 0.5, 1.5, 10.0)
+    second = OHLCV(1_700_000_060, 1.5, 2.5, 1.0, 2.0, 11.0)
+    with _atomic_ohlcv_download_target(provider):
+        with provider.ohlcv_file as writer:
+            writer.write(first)
+
+    private_truncated = threading.Event()
+    allow_publish = threading.Event()
+
+    def rewrite():
+        sibling = SimpleNamespace(
+            ohlcv_path=path, ohlcv_file=OHLCVWriter(path)
+        )
+        with _atomic_ohlcv_download_target(sibling):
+            with sibling.ohlcv_file as writer:
+                writer.seek(0)
+                writer.truncate()
+                private_truncated.set()
+                assert allow_publish.wait(timeout=5.0)
+                writer.write(second)
+
+    worker = threading.Thread(target=rewrite)
+    worker.start()
+    assert private_truncated.wait(timeout=5.0)
+    with OHLCVReader(path) as reader:
+        assert reader.end_timestamp == first.timestamp
+    allow_publish.set()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    with OHLCVReader(path) as reader:
+        assert reader.end_timestamp == second.timestamp

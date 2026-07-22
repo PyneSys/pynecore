@@ -156,6 +156,60 @@ def _mk_engine(
     return engine, pos
 
 
+def __test_restart_filled_entry_redeclaration_respects_pyramiding_cap__(
+        tmp_path: Path,
+) -> None:
+    """A filled same-id entry is adopted, while spare pyramiding can add."""
+    db = tmp_path / "broker.sqlite"
+    identity = RunIdentity(
+        strategy_id="integration", symbol=SYMBOL, timeframe="60",
+        account_id="test-account", label=None,
+    )
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        first = store.open_run(identity, script_source="// integration test")
+        first.upsert_order(
+            "entry-coid", symbol=SYMBOL, side="buy", qty=1.0,
+            filled_qty=1.0, state="confirmed", intent_key="L",
+            pine_entry_id="L", exchange_order_id="filled-1",
+        )
+        first.close()
+        restarted = store.open_run(
+            identity, script_source="// integration test"
+        )
+        broker = _MockBroker()
+        engine, position = _mk_engine(broker, restarted)
+        position.size = 1.0
+        position.sign = 1.0
+        position.avg_price = 100.0
+        position.reconstruct_parent_trade(
+            entry_id="L", size=1.0, entry_price=100.0
+        )
+        position.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry
+        )
+
+        lib._script.pyramiding = 1
+        engine.sync(BAR_TS)
+        assert broker.entry_calls == []
+
+        # Negative boundary: an explicit spare pyramiding slot remains a
+        # legitimate fresh entry and must not be swallowed by restart adoption.
+        broker2 = _MockBroker()
+        engine2, position2 = _mk_engine(broker2, restarted)
+        position2.size = 1.0
+        position2.sign = 1.0
+        position2.avg_price = 100.0
+        position2.reconstruct_parent_trade(
+            entry_id="L", size=1.0, entry_price=100.0
+        )
+        position2.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry
+        )
+        lib._script.pyramiding = 2
+        engine2.sync(BAR_TS + 60_000)
+        assert len(broker2.entry_calls) == 1
+
+
 # === Core restart round-trip ==============================================
 
 

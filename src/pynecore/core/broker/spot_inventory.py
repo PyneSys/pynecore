@@ -293,6 +293,11 @@ class SpotInventoryPort(Protocol):
     it is confirmed as a conflict. Venue settlement latency, not a
     tuning knob for hiding drift."""
 
+    position_dust_threshold: Decimal
+    """Positive base quantity below which the venue intentionally exposes
+    no engine position. This is normally the product's minimum quantity
+    increment. A zero value disables dust-to-flat reconciliation."""
+
     async def fetch_executions(self, cursor: str | None) -> SpotExecutionBatch:
         """Read the BOT's execution history from ``cursor``.
 
@@ -478,6 +483,14 @@ class SpotInventoryManager:
             raise ValueError(
                 f"port.base_tolerance must be a finite non-negative "
                 f"Decimal, got {port.base_tolerance!r}"
+            )
+        dust_threshold = port.position_dust_threshold
+        if not isinstance(dust_threshold, Decimal) \
+                or not dust_threshold.is_finite() \
+                or dust_threshold < 0:
+            raise ValueError(
+                f"port.position_dust_threshold must be a finite non-negative "
+                f"Decimal, got {dust_threshold!r}"
             )
         grace = port.settlement_grace_s
         if isinstance(grace, bool) \
