@@ -2876,6 +2876,45 @@ def __test_partial_close_does_not_redispatch_retained_entry__():
     assert pos.size == 0.0
 
 
+def __test_protected_partial_close_keeps_existing_bracket_armed__():
+    """A keyed partial close must not cancel or re-dispatch sibling protection.
+
+    A filled entry and ``strategy.close(entry_id)`` share one intent key. The
+    mismatched-kind modify fallback historically cancelled the consumed entry
+    before dispatching the close; that cancellation also evicted the active
+    bracket dependency, causing an immediate duplicate bracket dispatch while
+    the parent position row was already marked closing. A fully consumed entry
+    has no resting remainder to cancel, so the close must dispatch directly and
+    leave the existing TP/SL mapping untouched over the residual position.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 2.0)
+
+    engine.sync(BAR_TS)
+    engine._route_event(_fill_event('buy', 2.0, 50_000.0, pine_id="L"))
+    pos.exit_orders[("Bracket", "L")] = _exit_order(
+        "L", -2.0, "Bracket", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 1
+    bracket_key = "Bracket\0L"
+    bracket_mapping = list(engine.order_mapping[bracket_key])
+
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -1.0, order_type=_order_type_close,
+        exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 1.0
+    assert b.cancel_calls == []
+    assert len(b.exit_calls) == 1
+    assert engine.order_mapping[bracket_key] == bracket_mapping
+    assert isinstance(engine.active_intents[bracket_key], ExitIntent)
+
+
 def __test_consumed_entry_reanchors_over_stale_close_slot_without_dispatch__():
     """The consumed-entry guard alone re-anchors over a stale CloseIntent slot.
 
@@ -7215,6 +7254,59 @@ def __test_orphan_one_way_bracket_cleared_after_restart__(tmp_path):
         engine._diff_and_dispatch([])  # Pine emits nothing -> the exit is orphan
         assert ("1", None, None) in b.amend_calls  # bracket cleared to None
         assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+
+
+def __test_closed_position_cancels_durable_software_bracket_after_restart__(tmp_path):
+    """A final close sweeps durable software-OCA legs without an active exit slot."""
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025",
+                symbol=SYMBOL,
+                timeframe="60",
+                account_id="testbroker-demo",
+                label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        for coid, tp_level, sl_level in (
+                ("coid-tp", 120.0, None),
+                ("coid-sl", None, 90.0),
+        ):
+            ctx.upsert_order(
+                coid,
+                symbol="ETHPERP",
+                side="sell",
+                qty=2.0,
+                state="confirmed",
+                intent_key="X",
+                exchange_order_id=f"venue-{coid}",
+                pine_entry_id="X",
+                from_entry="L",
+                tp_level=tp_level,
+                sl_level=sl_level,
+            )
+
+        broker = MockBroker()
+        engine = OrderSyncEngine(
+            broker=broker,  # type: ignore[arg-type]
+            position=BrokerPosition(),
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            mintick=1.0,
+            store_ctx=ctx,
+        )
+
+        engine._cleanup_position_tracking("L")
+
+        assert len(broker.cancel_calls) == 1
+        cancel = broker.cancel_calls[0].intent
+        assert cancel.pine_id == "X"
+        assert cancel.from_entry == "L"
 
 
 def __test_active_one_way_bracket_not_orphan_swept__(tmp_path):

@@ -6152,21 +6152,69 @@ class OrderSyncEngine:
         self._active_intents.pop(closed_entry_id, None)
         self._order_mapping.pop(closed_entry_id, None)
         self._drop_envelope(closed_entry_id)
-        # Every exit intent that points at this entry.
-        for key in list(self._active_intents.keys()):
-            intent = self._active_intents[key]
+        # Every exit intent that points at this entry. Include Pine's bracket
+        # book as well as the active diff slots: a restart-recovered bracket can
+        # temporarily have durable broker legs while its active slot is absent,
+        # and a close fill in that window must still sweep both software-OCA
+        # legs. The plugin resolves the cancel through its durable ownership
+        # rows even when the in-memory mapping is already gone.
+        exits_to_retire: dict[str, ExitIntent] = {
+            key: intent
+            for key, intent in self._active_intents.items()
+            if (isinstance(intent, ExitIntent)
+                and intent.from_entry == closed_entry_id)
+        }
+        for intent in build_intents(
+                {}, self._position.exit_orders, self._symbol,
+                self._position.open_trades):
             if (isinstance(intent, ExitIntent)
                     and intent.from_entry == closed_entry_id):
-                # A software bracket exposes TP and SL as independent venue
-                # orders. The fill that flattened the parent terminalizes only
-                # one physical leg; dropping the logical exit before dispatching
-                # its cancel would orphan the reduce-only sibling. Native-OCA
-                # venues own this sweep themselves.
-                if not self._oca_cancel_native:
-                    self._dispatch_cancel(intent)
-                self._active_intents.pop(key, None)
-                self._order_mapping.pop(key, None)
-                self._drop_envelope(key)
+                exits_to_retire.setdefault(intent.intent_key, intent)
+        if self._store_ctx is not None and not self._oca_cancel_native:
+            durable_exits: dict[str, dict[str, Any]] = {}
+            for row in self._store_ctx.iter_live_orders(from_entry=closed_entry_id):
+                if (row.intent_key is None
+                        or (row.tp_level is None and row.sl_level is None)):
+                    continue
+                key = row.intent_key
+                if INTENT_KEY_SEP not in key:
+                    pine_id = row.pine_entry_id or key
+                    key = f'{pine_id}{INTENT_KEY_SEP}{closed_entry_id}'
+                recovered = durable_exits.setdefault(key, {
+                    'side': row.side,
+                    'qty': row.qty,
+                    'tp_price': None,
+                    'sl_price': None,
+                })
+                recovered['qty'] = max(float(recovered['qty']), row.qty)
+                if row.tp_level is not None:
+                    recovered['tp_price'] = row.tp_level
+                if row.sl_level is not None:
+                    recovered['sl_price'] = row.sl_level
+            for key, recovered in durable_exits.items():
+                pine_id, separator, from_entry = key.partition(INTENT_KEY_SEP)
+                if not separator or from_entry != closed_entry_id:
+                    continue
+                exits_to_retire.setdefault(key, ExitIntent(
+                    pine_id=pine_id,
+                    from_entry=from_entry,
+                    symbol=self._symbol,
+                    side=str(recovered['side']),
+                    qty=float(recovered['qty']),
+                    tp_price=recovered['tp_price'],
+                    sl_price=recovered['sl_price'],
+                ))
+        for key, intent in exits_to_retire.items():
+            # A software bracket exposes TP and SL as independent venue
+            # orders. The fill that flattened the parent terminalizes only
+            # one physical leg; dropping the logical exit before dispatching
+            # its cancel would orphan the reduce-only sibling. Native-OCA
+            # venues own this sweep themselves.
+            if not self._oca_cancel_native:
+                self._dispatch_cancel(intent)
+            self._active_intents.pop(key, None)
+            self._order_mapping.pop(key, None)
+            self._drop_envelope(key)
         # Pine-side order dicts.
         entry_orders = self._position.entry_orders
         exit_orders = self._position.exit_orders
@@ -14940,6 +14988,34 @@ class OrderSyncEngine:
                     self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
                 # CloseIntent or mismatched kinds — cancel + re-execute.
+                # A keyed ``strategy.close(entry_id)`` shares its intent key
+                # with the consumed parent EntryIntent. Once that entry is
+                # fully filled there is no resting order left to cancel, and
+                # cancelling the logical entry can also retire dependent
+                # protective exits before the reduce-only close settles. Send
+                # the close directly and leave sibling protection armed over
+                # the residual position. A partially filled entry still needs
+                # the ordinary cancel-then-close path below to remove its live
+                # working remainder first.
+                if (isinstance(old, EntryIntent)
+                        and isinstance(new, CloseIntent)):
+                    filled_entry = self._active_entry_filled_qty.get(
+                        old.intent_key, 0.0,
+                    )
+                    entry_order = self._position.entry_orders.get(old.pine_id)
+                    if (entry_order is not None
+                            and entry_order.filled_qty > filled_entry):
+                        filled_entry = entry_order.filled_qty
+                    if filled_entry >= old.qty - 1e-9:
+                        _blog_info(
+                            "dispatching keyed close %s directly over consumed "
+                            "entry (filled=%s qty=%s); dependent protection "
+                            "stays armed",
+                            format_intent_key(new.intent_key), filled_entry,
+                            old.qty,
+                        )
+                        self._dispatch_new(new)
+                        return
                 if old.intent_key in self._forced_cancel_pending:
                     # A prior cancel on this key is still un-landed; the
                     # per-sync :meth:`_retry_forced_cancels` owns it.

@@ -221,6 +221,16 @@ REQUIREMENTS = (
         ("capital:capitalcom-partial-marketable-exit-uses-exact-opposite-post",),
     ),
     Requirement(
+        "capital-partial-close-protection",
+        "Capital.com",
+        "P0",
+        "Protected partial close preserves native venue protection",
+        "covered",
+        (
+            "capital:capitalcom-protected-partial-close-preserves-venue-protection",
+        ),
+    ),
+    Requirement(
         "capital-durable-activity-replay",
         "Capital.com",
         "P0",
