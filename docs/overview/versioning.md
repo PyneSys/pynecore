@@ -1,6 +1,6 @@
 <!--
 ---
-weight: 108
+weight: 109
 title: "Versioning"
 description: "Versioning policy for PyneCore"
 icon: "history"

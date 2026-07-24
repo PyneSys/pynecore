@@ -1,6 +1,6 @@
 <!--
 ---
-weight: 102
+weight: 104
 title: "Differences from Pine Script"
 description: "Key differences between PyneCore and TradingView Pine Script"
 icon: "compare"

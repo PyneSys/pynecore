@@ -1,6 +1,6 @@
 <!--
 ---
-weight: 109
+weight: 108
 title: "Symbol Map"
 description: "Translate TradingView-canonical symbols to your provider-native data with a workdir-level symbol map"
 icon: "swap_horiz"

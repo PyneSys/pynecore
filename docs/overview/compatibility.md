@@ -1,6 +1,6 @@
 <!--
 ---
-weight: 103
+weight: 105
 title: "Pine Script Compatibility"
 description: "Implementation status of Pine Script v6 features in PyneCore"
 icon: "checklist"
