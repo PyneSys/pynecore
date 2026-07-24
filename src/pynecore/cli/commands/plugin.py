@@ -143,11 +143,11 @@ def plugin_info(
     from rich.padding import Padding
     import dataclasses
 
-    candidates = discover_plugin_entry_points().get(name)
+    plugins = discover_plugin_entry_points()
+    candidates = plugins.get(name)
     if not candidates:
-        secho(f"Plugin '{name}' not found.", fg=colors.RED, err=True)
-        secho(f"Install it with: pip install pynesys-pynecore-{name}  (official)", fg=colors.YELLOW, err=True)
-        secho(f"             or: pip install pynecore-{name}  (3rd party)", fg=colors.YELLOW, err=True)
+        secho(f"Plugin '{name}' is not installed.", fg=colors.RED, err=True)
+        secho(f"Available plugins: {', '.join(sorted(plugins)) or '(none)'}", fg=colors.YELLOW, err=True)
         raise Exit(1)
 
     if len(candidates) > 1:
@@ -169,12 +169,12 @@ def plugin_info(
     caps = _get_capabilities(cls)
 
     secho(f"\n  Plugin: {name}", fg=colors.BRIGHT_WHITE, bold=True)
-    secho(f"  Package:       {meta['package']}")
-    secho(f"  Version:       {meta['version'] or 'unknown'}")
-    secho(f"  Description:   {meta['description'] or '-'}")
-    secho(f"  Min PyneCore:  {'>=' + meta['min_pynecore'] if meta['min_pynecore'] else 'any'}")
-    secho(f"  Capabilities:  {', '.join(caps) if caps else 'library'}")
-    secho(f"  Entry point:   {ep.value}")
+    secho(f"  Package:        {meta['package']}")
+    secho(f"  Version:        {meta['version'] or 'unknown'}")
+    secho(f"  Description:    {meta['description'] or '-'}")
+    secho(f"  Needs PyneCore: {meta['requires_pynecore'] or 'any'}")
+    secho(f"  Capabilities:   {', '.join(caps) if caps else 'library'}")
+    secho(f"  Entry point:    {ep.value}")
 
     description = get_plugin_description(cls)
     if description:

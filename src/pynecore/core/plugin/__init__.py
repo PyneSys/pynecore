@@ -207,9 +207,7 @@ def load_plugin(name: str) -> type:
     candidates = grouped.get(name)
     if not candidates:
         raise PluginNotFoundError(
-            f"Plugin '{name}' not found. "
-            f"Install it with: pip install pynesys-pynecore-{name}  (official) "
-            f"or: pip install pynecore-{name}  (3rd party)\n"
+            f"Plugin '{name}' is not installed.\n"
             f"Available plugins: {', '.join(sorted(grouped)) or '(none)'}"
         )
     if len(candidates) > 1:
@@ -237,16 +235,18 @@ def get_plugin_metadata(ep: EntryPoint) -> dict[str, str]:
 
     :param ep: The entry point of the plugin.
     :return: Dict with ``name``, ``package``, ``version``, ``description``,
-        ``min_pynecore``.
+        ``requires_pynecore``, ``min_pynecore``.
     """
     assert ep.dist is not None
     meta = ep.dist.metadata
+    specifier = parse_pynecore_requirement(ep)
     return {
         'name': ep.name,
         'package': get_plugin_package(ep),
         'version': meta['Version'] or '',
         'description': meta['Summary'] or '',
-        'min_pynecore': _parse_min_pynecore(ep),
+        'requires_pynecore': specifier,
+        'min_pynecore': min_pynecore_version(specifier),
     }
 
 
@@ -279,24 +279,97 @@ def get_plugin_description(cls: type) -> str:
     return inspect.getdoc(cls) or ""
 
 
-def _parse_min_pynecore(ep: EntryPoint) -> str:
-    """
-    Extract the minimum PyneCore version from the package dependencies.
+PYNECORE_PACKAGE = 'pynesys-pynecore'
 
-    Parses ``pynesys-pynecore>=X.Y`` from the ``Requires-Dist`` list.
+_REQUIREMENT_RE = re.compile(
+    r'^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)'  # PEP 508 distribution name
+    r'\s*(?:\[(?P<extras>[^]]*)])?'  # optional extras
+    r'\s*(?:\((?P<paren>[^)]*)\)|(?P<bare>[^;]*))?'  # specifier, optionally parenthesized
+)
+
+_SPECIFIER_RE = re.compile(r'^\s*(?P<op>===|~=|==|!=|<=|>=|<|>)\s*(?P<version>\S+?)\s*$')
+
+# Operators that place a *lower* bound on the version
+_LOWER_BOUND_OPS = frozenset(('>=', '==', '===', '~='))
+
+
+def normalize_package_name(name: str) -> str:
+    """
+    Normalize a distribution name for comparison (PEP 503).
+
+    ``PyneSys_PyneCore`` and ``pynesys-pynecore`` are the same project.
+
+    :param name: Raw distribution name.
+    :return: Lowercase name with runs of ``-``, ``_``, ``.`` collapsed to ``-``.
+    """
+    return re.sub(r'[-_.]+', '-', name).strip().lower()
+
+
+def parse_pynecore_requirement(ep: EntryPoint) -> str:
+    """
+    Return the plugin's declared PyneCore version constraint.
+
+    Reads the ``Requires-Dist`` list and returns the whole specifier set of the
+    :data:`PYNECORE_PACKAGE` requirement — ``">=6.6.0"``, ``">=6.6.0,<7"``,
+    ``"~=6.6"`` — not just a lower bound, since an upper bound is meaningful:
+    PyneCore versions are ``PineVersion.Major.Minor``, so ``<7`` means "Pine v6
+    only".  Extras, parenthesized specifiers, environment markers, arbitrary
+    whitespace and non-normalized package names are all handled.
 
     :param ep: The entry point of the plugin.
-    :return: Version string (e.g. ``"6.5"``) or ``""`` if not found.
+    :return: Normalized specifier set (e.g. ``">=6.6.0,<7"``), or ``""`` if the
+        package does not declare a PyneCore dependency.
     """
     assert ep.dist is not None
-    requires = ep.dist.requires
-    if not requires:
-        return ''
-    for req in requires:
-        m = re.match(r'pynesys-pynecore(?:\[.*?])?>=([.\d]+)', req)
-        if m:
-            return m.group(1)
+    for req in ep.dist.requires or ():
+        m = _REQUIREMENT_RE.match(req.split(';', 1)[0])
+        if m is None or normalize_package_name(m.group('name')) != PYNECORE_PACKAGE:
+            continue
+        raw = m.group('paren') or m.group('bare') or ''
+        clauses = (_SPECIFIER_RE.match(c) for c in raw.split(',') if c.strip())
+        return ','.join(f"{c.group('op')}{c.group('version')}" for c in clauses if c)
     return ''
+
+
+def min_pynecore_version(specifier: str) -> str:
+    """
+    Return the lowest PyneCore version allowed by a specifier set.
+
+    Of the lower-bounding clauses (``>=``, ``==``, ``===``, ``~=``) the highest
+    version wins; upper bounds and exclusions are ignored.  Versions are
+    compared component-wise on their numeric release parts, so ``6.10.0`` is
+    correctly greater than ``6.9.0`` — a plain string compare is wrong here.
+
+    :param specifier: Specifier set as returned by
+        :func:`parse_pynecore_requirement`.
+    :return: Version string (e.g. ``"6.6.0"``), or ``""`` if the specifier set
+        has no lower bound.
+    """
+    best = ''
+    for clause in specifier.split(','):
+        m = _SPECIFIER_RE.match(clause)
+        if m is None or m.group('op') not in _LOWER_BOUND_OPS:
+            continue
+        version = m.group('version').rstrip('*').rstrip('.')
+        if not version:
+            continue
+        if not best or _version_key(version) > _version_key(best):
+            best = version
+    return best
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """
+    Return a comparable key for the numeric release part of a version.
+
+    Pre/post/local suffixes (``6.6.0rc1``, ``6.6.0+local``) are cut off — this
+    is used for ordering lower bounds, not for full PEP 440 semantics.
+
+    :param version: Version string.
+    :return: Tuple of the leading integer components.
+    """
+    release = re.match(r'\d+(?:\.\d+)*', version)
+    return tuple(int(p) for p in release.group(0).split('.')) if release else ()
 
 
 # Plugin type subclasses — import after Plugin is defined to avoid circular imports

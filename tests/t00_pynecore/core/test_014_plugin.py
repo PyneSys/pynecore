@@ -3,8 +3,13 @@ Tests for the plugin discovery and loading system.
 """
 
 from dataclasses import dataclass
+from importlib.metadata import EntryPoint
 
 from pynecore.core.plugin import (
+    PLUGIN_GROUP,
+    parse_pynecore_requirement,
+    min_pynecore_version,
+    normalize_package_name,
     Plugin,
     ProviderPlugin,
     ProviderError,
@@ -19,6 +24,8 @@ from pynecore.core.plugin import (
     get_available_plugin_names,
     get_plugin_metadata,
     PluginNotFoundError,
+    PluginNameConflictError,
+    discover_plugin_entry_points,
 )
 
 
@@ -53,7 +60,49 @@ def __test_load_plugin_not_found__():
         assert False, "Should have raised PluginNotFoundError"
     except PluginNotFoundError as e:
         assert "nonexistent_provider_xyz" in str(e)
-        assert "pip install" in str(e)
+        assert "Available plugins:" in str(e)
+        # No install command may be guessed from the plugin name: the package
+        # name is not derivable from it and the guessed names are unclaimed
+        # on PyPI (typosquat bait).
+        assert "pip install" not in str(e)
+
+
+def __test_name_conflict_only_fails_the_requested_name__(monkeypatch):
+    """A colliding entry-point name is listed, but only breaks its own load.
+
+    Two packages may declare the same ``pyne.plugin`` name. Discovery must
+    survive that (a blanket failure would take down every plugin lookup and
+    halt a running bot); only loading the ambiguous name itself may fail.
+    """
+    from pynecore.core import plugin as plugin_module
+
+    def _both(ep_name: str, value: str, dist_name: str) -> EntryPoint:
+        ep = EntryPoint(ep_name, value, PLUGIN_GROUP)
+        dist = _FakeDist(None)
+        dist.name = dist_name
+        dist.metadata = {'Name': dist_name}
+        object.__setattr__(ep, 'dist', dist)
+        return ep
+
+    fake_eps = [
+        _both('dup', 'pkg_z:X', 'zz-plugin'),
+        _both('dup', 'pkg_a:Y', 'aa-plugin'),
+        _both('solo', 'pkg_s:Z', 'solo-plugin'),
+    ]
+    monkeypatch.setattr(plugin_module, 'entry_points', lambda group=None: fake_eps)
+
+    grouped = discover_plugin_entry_points()
+    assert [p.value for p in grouped['dup']] == ['pkg_a:Y', 'pkg_z:X']  # deterministic order
+    assert len(grouped['solo']) == 1
+
+    # The single-winner view never raises, so unrelated plugins stay loadable.
+    assert set(discover_plugins()) == {'dup', 'solo'}
+
+    try:
+        load_plugin('dup')
+        assert False, "Should have raised PluginNameConflictError"
+    except PluginNameConflictError as e:
+        assert 'aa-plugin' in str(e) and 'zz-plugin' in str(e)
 
 
 def __test_get_available_plugin_names__():
@@ -79,6 +128,70 @@ def __test_plugin_metadata__():
     assert meta['name'] == 'ccxt'
     assert meta['version']  # should be non-empty
     assert meta['package'] == 'pynesys-pynecore'
+
+
+class _FakeDist:
+    """Minimal stand-in for an installed distribution."""
+
+    def __init__(self, requires: list[str] | None):
+        self.requires = requires
+        self.name = 'fake-plugin'
+        self.metadata = {'Name': 'fake-plugin'}
+
+
+def _fake_entry_point(requires: list[str] | None) -> EntryPoint:
+    ep = EntryPoint('fake', 'fake_module:FakePlugin', PLUGIN_GROUP)
+    object.__setattr__(ep, 'dist', _FakeDist(requires))
+    return ep
+
+
+def __test_parse_pynecore_requirement_forms__():
+    """The PyneCore dependency is recognised in every PEP 508 spelling."""
+    cases = {
+        'pynesys-pynecore>=6.6.0': '>=6.6.0',
+        'pynesys-pynecore >= 6.6.0': '>=6.6.0',           # whitespace
+        'pynesys-pynecore>=6.6.0,<7': '>=6.6.0,<7',       # upper bound kept
+        'pynesys-pynecore~=6.6': '~=6.6',                 # compatible release
+        'pynesys-pynecore (>=6.6.0,<7)': '>=6.6.0,<7',    # parenthesized
+        'pynesys_pynecore>=6.6.0': '>=6.6.0',             # non-normalized name
+        'PyneSys.PyneCore>=6.6': '>=6.6',
+        'pynesys-pynecore[all]>=6.6.0': '>=6.6.0',        # extras
+        "pynesys-pynecore>=6.6.0 ; python_version >= '3.11'": '>=6.6.0',  # marker
+        'pynesys-pynecore': '',                           # no constraint
+    }
+    for requirement, expected in cases.items():
+        assert parse_pynecore_requirement(_fake_entry_point([requirement])) == expected, requirement
+
+
+def __test_parse_pynecore_requirement_ignores_others__():
+    """Only the PyneCore dependency is read, and a missing one yields ''."""
+    assert parse_pynecore_requirement(_fake_entry_point(['httpx>=1.0'])) == ''
+    assert parse_pynecore_requirement(_fake_entry_point([])) == ''
+    assert parse_pynecore_requirement(_fake_entry_point(None)) == ''
+    ep = _fake_entry_point(['httpx>=1.0', 'pynesys-pynecore>=6.6.0'])
+    assert parse_pynecore_requirement(ep) == '>=6.6.0'
+
+
+def __test_min_pynecore_version__():
+    """The lower bound is picked numerically, not lexically."""
+    # PyneCore versions are PineVersion.Major.Minor — three numeric components,
+    # so a string compare would rank 6.9.0 above 6.10.0.
+    assert min_pynecore_version('>=6.9.0,>=6.10.0') == '6.10.0'
+    assert min_pynecore_version('>=6.6.0,<7') == '6.6.0'
+    assert min_pynecore_version('==6.6.1') == '6.6.1'
+    assert min_pynecore_version('~=6.6') == '6.6'
+    assert min_pynecore_version('==6.6.*') == '6.6'
+    # Upper bounds and exclusions carry no lower bound.
+    assert min_pynecore_version('<7') == ''
+    assert min_pynecore_version('!=6.6.0') == ''
+    assert min_pynecore_version('') == ''
+
+
+def __test_normalize_package_name__():
+    """PEP 503 normalization makes the distribution name comparable."""
+    assert normalize_package_name('PyneSys_PyneCore') == 'pynesys-pynecore'
+    assert normalize_package_name(' pynesys.pynecore ') == 'pynesys-pynecore'
+    assert normalize_package_name('pynesys--pynecore') == 'pynesys-pynecore'
 
 
 def __test_plugin_base_defaults__():
