@@ -37,33 +37,39 @@ def list_plugins(
     """
     List all installed PyneCore plugins.
     """
-    from ...core.plugin import discover_plugins, get_plugin_metadata, get_plugin_summary
+    from ...core.plugin import (
+        discover_plugin_entry_points, get_plugin_metadata, get_plugin_package, get_plugin_summary
+    )
 
-    plugins = discover_plugins()
+    plugins = discover_plugin_entry_points()
     if not plugins and not as_json:
         secho("No plugins installed.", fg=colors.YELLOW)
         secho("")
         return
 
-    # Collect data first to calculate column widths
+    # Collect data first to calculate column widths. A plugin name may be
+    # declared by several packages — list every one of them, flagged.
     rows = []
     errors = []
-    for name, ep in sorted(plugins.items()):
-        try:
-            cls = ep.load()
-            meta = get_plugin_metadata(ep)
-            caps = _get_capabilities(cls)
+    for name, eps in sorted(plugins.items()):
+        conflict = len(eps) > 1
+        for ep in eps:
+            try:
+                cls = ep.load()
+                meta = get_plugin_metadata(ep)
+                caps = _get_capabilities(cls)
 
-            if plugin_type and plugin_type not in caps:
-                continue
+                if plugin_type and plugin_type not in caps:
+                    continue
 
-            display_name = getattr(cls, 'plugin_name', '') or name
-            version = f"v{meta['version']}" if meta['version'] else ''
-            caps_str = ', '.join(caps) if caps else 'library'
-            summary = get_plugin_summary(cls) or meta['description']
-            rows.append((name, display_name, version, caps_str, summary))
-        except Exception as e:
-            errors.append((name, str(e)))
+                display_name = getattr(cls, 'plugin_name', '') or name
+                version = f"v{meta['version']}" if meta['version'] else ''
+                caps_str = ', '.join(caps) if caps else 'library'
+                summary = get_plugin_summary(cls) or meta['description']
+                rows.append((name, display_name, version, caps_str, summary,
+                             meta['package'], conflict))
+            except Exception as e:
+                errors.append((f"{name} ({get_plugin_package(ep)})" if conflict else name, str(e)))
 
     if as_json:
         import json
@@ -75,8 +81,10 @@ def list_plugins(
                     'version': version.lstrip('v'),
                     'capabilities': caps_str.split(', '),
                     'summary': summary,
+                    'package': package,
+                    'conflict': conflict,
                 }
-                for name, display_name, version, caps_str, summary in rows
+                for name, display_name, version, caps_str, summary, package, conflict in rows
             ],
             'errors': [{'name': name, 'error': error} for name, error in errors],
         }))
@@ -95,13 +103,25 @@ def list_plugins(
     secho(f"\n  Installed plugins:\n", fg=colors.BRIGHT_WHITE, bold=True)
 
     indent = 4 + w_name + 3
-    for name, display_name, version, caps_str, summary in rows:
-        secho(f"    {name:<{w_name}}   {display_name:<{w_disp}}   {version:<{w_ver}}   [{caps_str}]")
+    conflicting: dict[str, list[str]] = {}
+    for name, display_name, version, caps_str, summary, package, conflict in rows:
+        prefix = "  ! " if conflict else "    "
+        secho(f"{prefix}{name:<{w_name}}   {display_name:<{w_disp}}   {version:<{w_ver}}   [{caps_str}]",
+              fg=colors.YELLOW if conflict else None)
         if summary:
             secho(f"{' ' * indent}└─ {summary}", dim=True)
+        if conflict:
+            conflicting.setdefault(name, []).append(package)
 
     for name, error in errors:
         secho(f"    {name:<{w_name}}   (failed to load: {error})", fg=colors.RED)
+
+    if conflicting:
+        secho("")
+        secho("  ! Name conflicts:", fg=colors.YELLOW, bold=True)
+        for name, packages in sorted(conflicting.items()):
+            secho(f"    '{name}' is declared by: {', '.join(packages)}", fg=colors.YELLOW)
+        secho("    Loading such a plugin fails until all but one package is uninstalled.", dim=True)
 
     secho("")
     secho("  Use 'pyne plugin info <name>' for details.", dim=True)
@@ -115,20 +135,30 @@ def plugin_info(
     """
     Show detailed information about an installed plugin.
     """
-    from ...core.plugin import discover_plugins, get_plugin_metadata, get_plugin_description
+    from ...core.plugin import (
+        discover_plugin_entry_points, get_plugin_metadata, get_plugin_description, get_plugin_package
+    )
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.padding import Padding
     import dataclasses
 
-    plugins = discover_plugins()
-    if name not in plugins:
+    candidates = discover_plugin_entry_points().get(name)
+    if not candidates:
         secho(f"Plugin '{name}' not found.", fg=colors.RED, err=True)
         secho(f"Install it with: pip install pynesys-pynecore-{name}  (official)", fg=colors.YELLOW, err=True)
         secho(f"             or: pip install pynecore-{name}  (3rd party)", fg=colors.YELLOW, err=True)
         raise Exit(1)
 
-    ep = plugins[name]
+    if len(candidates) > 1:
+        secho(f"Plugin name '{name}' is ambiguous — declared by {len(candidates)} installed packages:",
+              fg=colors.RED, err=True)
+        for candidate in candidates:
+            secho(f"    {get_plugin_package(candidate)}  ({candidate.value})", fg=colors.YELLOW, err=True)
+        secho("Uninstall all but the one you want to use.", fg=colors.YELLOW, err=True)
+        raise Exit(1)
+
+    ep = candidates[0]
     try:
         cls = ep.load()
     except Exception as e:

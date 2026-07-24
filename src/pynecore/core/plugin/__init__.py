@@ -80,6 +80,15 @@ class PluginNotFoundError(ImportError):
     """Raised when a requested plugin is not installed."""
 
 
+class PluginNameConflictError(ImportError):
+    """Raised when the requested plugin name is provided by several packages.
+
+    Entry point names are not unique — any package may register the same
+    ``pyne.plugin`` name — so loading one of them by guesswork could run
+    foreign code under a trusted name.
+    """
+
+
 class ProviderError(Exception):
     """Base class for *expected*, user-actionable data-provider failures.
 
@@ -137,13 +146,51 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     return False
 
 
+def get_plugin_package(ep: EntryPoint) -> str:
+    """
+    Return the distribution (PyPI package) name providing an entry point.
+
+    :param ep: The entry point of the plugin.
+    :return: Package name, or ``"(unknown package)"`` if the distribution is
+        not resolvable.
+    """
+    if ep.dist is None:
+        return '(unknown package)'
+    return ep.dist.metadata['Name'] or ep.dist.name or '(unknown package)'
+
+
+def discover_plugin_entry_points() -> dict[str, list[EntryPoint]]:
+    """
+    Return every installed plugin entry point, grouped by plugin name.
+
+    Entry point names are **not** unique: any package may register e.g.
+    ``bybit`` under the ``pyne.plugin`` group, so a name may map to several
+    entry points.  Conflicts are reported here, never resolved silently.
+
+    :return: Mapping of plugin name to all entry points declaring it, each
+        list ordered deterministically by providing package.
+    """
+    grouped: dict[str, list[EntryPoint]] = {}
+    for ep in entry_points(group=PLUGIN_GROUP):
+        grouped.setdefault(ep.name, []).append(ep)
+    for eps in grouped.values():
+        eps.sort(key=lambda ep: (get_plugin_package(ep), ep.value))
+    return grouped
+
+
 def discover_plugins() -> dict[str, EntryPoint]:
     """
-    Return all installed plugins.
+    Return all installed plugins, one entry point per name.
 
-    :return: Mapping of plugin name to its :class:`EntryPoint`.
+    On a name conflict a deterministic winner is picked (first by providing
+    package name) so listings stay stable.  This function never raises on a
+    conflict on purpose: two unrelated third-party plugins colliding must not
+    take down every plugin lookup — that would halt a running bot.  Only
+    :func:`load_plugin` refuses to guess, and only for the requested name.
+
+    :return: Mapping of plugin name to a single :class:`EntryPoint`.
     """
-    return {ep.name: ep for ep in entry_points(group=PLUGIN_GROUP)}
+    return {name: eps[0] for name, eps in discover_plugin_entry_points().items()}
 
 
 def load_plugin(name: str) -> type:
@@ -153,16 +200,26 @@ def load_plugin(name: str) -> type:
     :param name: Plugin name as declared in the entry point.
     :return: The plugin class.
     :raises PluginNotFoundError: If no plugin with the given name is installed.
+    :raises PluginNameConflictError: If several installed packages declare the
+        same plugin name — loading either one would be a guess.
     """
-    eps = discover_plugins()
-    if name not in eps:
+    grouped = discover_plugin_entry_points()
+    candidates = grouped.get(name)
+    if not candidates:
         raise PluginNotFoundError(
             f"Plugin '{name}' not found. "
             f"Install it with: pip install pynesys-pynecore-{name}  (official) "
             f"or: pip install pynecore-{name}  (3rd party)\n"
-            f"Available plugins: {', '.join(sorted(eps)) or '(none)'}"
+            f"Available plugins: {', '.join(sorted(grouped)) or '(none)'}"
         )
-    return eps[name].load()
+    if len(candidates) > 1:
+        packages = ', '.join(get_plugin_package(ep) for ep in candidates)
+        raise PluginNameConflictError(
+            f"Plugin name '{name}' is ambiguous — declared by {len(candidates)} "
+            f"installed packages: {packages}\n"
+            f"Uninstall all but the one you want to use."
+        )
+    return candidates[0].load()
 
 
 def get_available_plugin_names() -> list[str]:
@@ -179,13 +236,14 @@ def get_plugin_metadata(ep: EntryPoint) -> dict[str, str]:
     Extract plugin metadata from its package distribution.
 
     :param ep: The entry point of the plugin.
-    :return: Dict with ``name``, ``version``, ``description``, ``min_pynecore``.
+    :return: Dict with ``name``, ``package``, ``version``, ``description``,
+        ``min_pynecore``.
     """
     assert ep.dist is not None
     meta = ep.dist.metadata
     return {
         'name': ep.name,
-        'package': meta['Name'] or '',
+        'package': get_plugin_package(ep),
         'version': meta['Version'] or '',
         'description': meta['Summary'] or '',
         'min_pynecore': _parse_min_pynecore(ep),
