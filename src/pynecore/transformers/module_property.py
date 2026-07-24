@@ -94,6 +94,14 @@ class ModulePropertyTransformer(ast.NodeTransformer):
         attr_info = module_attrs.get(name)
         if attr_info is not None:
             if attr_info["type"] == "property":
+                if full_path == "lib.na":
+                    # Bare ``na`` is a constant value (the interned typeless NA):
+                    # load it directly instead of emitting a per-bar ``lib.na()``
+                    # call. Explicit ``na(x)`` predicate calls are untouched above.
+                    result = ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()),
+                                           attr='_na_none', ctx=ast.Load())
+                    setattr(result, "_processed", True)
+                    return result
                 inner_attrs = self.module_info.get(full_path)
                 if inner_attrs is not None and name in inner_attrs:
                     # Promoted self-named property of a function-and-namespace module:

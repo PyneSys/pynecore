@@ -209,6 +209,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.input_transformer import InputTransformer
             from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
+            from pynecore.transformers.ne_guard import NeGuardTransformer
             from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
             from pynecore.transformers.locations import fix_locations
 
@@ -247,6 +248,12 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = InputTransformer().visit(transformed)
             transformed = SafeConvertTransformer().visit(transformed)
             transformed = SafeDivisionTransformer().visit(transformed)
+            # After SafeDivision so wrapped operands (safe_div calls) are bound
+            # once by the walrus instead of evaluating twice. Only user/compiled
+            # scripts get the guard: pynecore's own lib modules use the raw
+            # ``x != x`` nan idiom deliberately, and wrapping it would invert it
+            if not path.is_relative_to(Path(__file__).parent.parent):
+                transformed = NeGuardTransformer().visit(transformed)
             transformed = apply_layout(transformed, slot_layout)
 
             # Debugger-safe variant of ast.fix_missing_locations: synthetic

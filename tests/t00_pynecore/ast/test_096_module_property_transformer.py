@@ -23,7 +23,7 @@ def _transform(src: str) -> str:
 def __test_property_bare_read_becomes_call__():
     assert _transform("x = lib.ta.tr") == "x = lib.ta.tr()"
     assert _transform("x = lib.time") == "x = lib.time()"
-    assert _transform("x = lib.na") == "x = lib.na()"
+    assert _transform("x = lib.na") == "x = lib._na_none"
 
 
 def __test_property_explicit_call_untouched__():

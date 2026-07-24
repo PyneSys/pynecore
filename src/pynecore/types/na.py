@@ -52,14 +52,12 @@ class NA(Generic[T]):
     """
     __slots__ = ('type',)
 
-    _type_cache: dict[Type, 'NA'] = {}
+    _type_cache: dict[Type | None, 'NA'] = {}
 
     # noinspection PyShadowingBuiltins
     def __new__(cls, type: Type[T] | T | None = int) -> Self:
         if type is float:
             return _NAN  # type: ignore[return-value]
-        if type is None:
-            return super().__new__(cls)
         try:
             return cls._type_cache[type]  # type: ignore[reportReturnType]
         except KeyError:

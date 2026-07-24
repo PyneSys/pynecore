@@ -41,6 +41,10 @@ from ..core.resampler import (
     observed_week_key as _observed_week_key,
 )
 
+# The interned typeless na: bare ``na`` in compiled scripts evaluates through
+# ``is_na()`` on every bar, so its result must be a constant, not an allocation
+_na_none: NA = NA(None)
+
 __all__ = [
     # Other modules
     'syminfo', 'barstate', 'string', 'log', 'math', 'plot',
@@ -756,7 +760,7 @@ def is_na(source: Any = None) -> bool | NA:
     values. This matches that dual behavior.
     """
     if source is None:
-        return NA(None)
+        return _na_none
     # If the source is a type or GenericAlias (like list[float]), return NA of that type
     if isinstance(source, (type, GenericAlias)) and source is not NA:
         # na.pyi deliberately types NA(x) as x itself (so na sentinels flow as
