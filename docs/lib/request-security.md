@@ -97,6 +97,12 @@ Timeframe-only keys are convenient when all security calls use the same symbol (
 > For programmatic usage (ScriptRunner API), see
 > [Providing Security Data](../programmatic/script-runner.md#providing-security-data).
 
+> **Tip — skip the per-run `--security` flags.** To translate TradingView
+> symbols to your provider-native data once, for every run, declare them in a
+> workdir-level [Symbol Map](../overview/symbol-map.md)
+> (`config/symbol_map.toml`) instead. An explicit `--security` mapping still
+> overrides the symbol map when you need a one-off.
+
 ## Examples
 
 ### Multi-Timeframe Indicator

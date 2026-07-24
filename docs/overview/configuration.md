@@ -128,6 +128,22 @@ The script configuration file has two main sections:
    - The metadata is displayed as comments and cannot be modified
    - You can set the `value` to override the default value
 
+### Symbol Map (optional)
+
+A third, optional config file — `config/symbol_map.toml` — translates the
+TradingView-canonical symbols your script references into the provider-native
+symbols your data files carry, so `request.security()` contexts resolve without
+an explicit `--security` mapping:
+
+```toml
+[symbol_map]
+"NASDAQ:AAPL"   = "capitalcom:AAPL"
+"BINANCE:BTCUSDT" = "ccxt:BYBIT:BTC/USDT:USDT"
+```
+
+See [Symbol Map](./symbol-map.md) for the full schema, precedence rules, and
+backtest-vs-live behavior.
+
 ## How Configuration is Used
 
 ### Symbol Configuration Usage
