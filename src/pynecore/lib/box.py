@@ -120,9 +120,9 @@ def new(*args: Any, **kwargs: Any) -> Box:
         top = kwargs.get('top')
         right = kwargs.get('right')
         bottom = kwargs.get('bottom')
-        left_val = int(left) if isinstance(left, (int, float)) else na_int
+        left_val = int(left) if isinstance(left, (int, float)) and left == left else na_int
         top_val = top if isinstance(top, (int, float)) else na_float
-        right_val = int(right) if isinstance(right, (int, float)) else na_int
+        right_val = int(right) if isinstance(right, (int, float)) and right == right else na_int
         bottom_val = bottom if isinstance(bottom, (int, float)) else na_float
 
     box = Box(
@@ -381,7 +381,7 @@ def set_xloc(id: Box, left: int, right: int, xloc: _xloc.XLoc) -> None:
 def get_bottom(id: Box) -> PyneFloat:
     """Returns the price value of the bottom border of the box."""
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.bottom
 
 
@@ -411,5 +411,5 @@ def get_right(id: Box) -> PyneInt:
 def get_top(id: Box) -> PyneFloat:
     """Returns the price value of the top border of the box."""
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.top

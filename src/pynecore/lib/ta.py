@@ -12,7 +12,7 @@ import heapq
 
 from collections import deque
 
-from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool
+from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool, na_float
 from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
@@ -141,7 +141,7 @@ def accdist() -> PyneFloat:
 
     mfm = ((close - low) - (high - close)) / (high - low)
     mfv = mfm * volume
-    if not isinstance(mfv, NA):
+    if not (isinstance(mfv, NA) or mfv != mfv):
         ad += mfv
 
     return ad
@@ -167,8 +167,8 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     :return: The ALMA of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     length = int(length)
 
     # Use persistent weights to avoid recalculation
@@ -234,8 +234,8 @@ def bb(source: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFl
 
     middle = sma(source, length)
 
-    if isinstance(middle, NA):
-        return NA(float), NA(float), NA(float)
+    if (isinstance(middle, NA) or middle != middle):
+        return na_float, na_float, na_float
     std_dev *= mult
     return middle, middle + std_dev, middle - std_dev
 
@@ -250,8 +250,8 @@ def bbw(source: float, length: int, mult: float | int) -> PyneFloat:
     :return: The Bollinger Bands Width (BBW) of the source series
     """
     b, h, l = bb(source, length, mult)
-    if isinstance(b, NA) or b == 0.0:
-        return NA(float)
+    if (isinstance(b, NA) or b != b) or b == 0.0:
+        return na_float
     return ((h - l) / b) * 100
 
 
@@ -265,8 +265,8 @@ def cci(source: float, length: int) -> PyneFloat:
     """
     mean = sma(source, length)
     mdev = dev(source, length, _mean=mean)
-    if isinstance(mdev, NA):
-        return NA(float)
+    if (isinstance(mdev, NA) or mdev != mdev):
+        return na_float
     return (source - mean) / (0.015 * mdev)
 
 
@@ -293,10 +293,10 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
         source = cast(TFIB, round(source, 14))
     prev_val = source[length]  # noqa
 
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         # type(source) would be the NA class itself — keep the source sentinel's type
         return cast(TFIB, source)
-    if isinstance(prev_val, NA):
+    if (isinstance(prev_val, NA) or prev_val != prev_val):
         return NA(type(source))
     if isinstance(source, float):
         return cast(TFIB, round(source - prev_val, 14))  # noqa
@@ -314,8 +314,8 @@ def cmo(source: float, length: int) -> PyneFloat:
     :return: The Chande Momentum Oscillator (CMO) of the source series
     """
     momentum = change(source)
-    if isinstance(momentum, NA):
-        return NA(float)
+    if (isinstance(momentum, NA) or momentum != momentum):
+        return na_float
     sum1 = lib_math.sum(momentum if momentum >= 0.0 else 0.0, length)
     sum2 = lib_math.sum(0.0 if momentum >= 0.0 else -momentum, length)
     return 100 * (sum1 - sum2) / (sum1 + sum2)
@@ -333,12 +333,12 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     count: Persistent[int] = 0
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
-    val: Persistent[float] = NA(float)
+    val: Persistent[float] = na_float
 
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         # An NA bar leaves the window unchanged; hold the last full value
         # (still NA while warming up)
-        return NA(float) if count < length else val
+        return na_float if count < length else val
 
     # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
     # indexes past NA gaps to the true oldest value still inside the window.
@@ -356,7 +356,7 @@ def cog(source: Series[float], length: int) -> PyneFloat:
         summ += source
         weighted_summ += source * (length - count)
         if count < length:
-            return NA(float)
+            return na_float
 
     # Normal calculation phase
     else:
@@ -396,7 +396,7 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     count: Persistent[int] = 0
     na_window: Persistent[int] = 0
 
-    cur_na = isinstance(source1, NA) or isinstance(source2, NA)
+    cur_na = (isinstance(source1, NA) or source1 != source1) or (isinstance(source2, NA) or source2 != source2)
 
     if count < length:
         # Still filling the window; no bar leaves it yet.
@@ -410,11 +410,11 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
             sum_y2 += source2 * source2
         count += 1
         if count < length:
-            return NA(float)
+            return na_float
     else:
         old1 = source1[length]
         old2 = source2[length]
-        old_na = isinstance(old1, NA) or isinstance(old2, NA)
+        old_na = (isinstance(old1, NA) or old1 != old1) or (isinstance(old2, NA) or old2 != old2)
         if not cur_na and not old_na:
             # na-free fast path: same operations and order as before, to keep the
             # documented ~7-digit match with Pine's correlation.
@@ -444,13 +444,13 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
                 sum_y2 -= old2 * old2
 
     if na_window:
-        return NA(float)
+        return na_float
     try:
         numerator = (length * sum_xy) - (sum_x * sum_y)
         denominator = math.sqrt((length * sum_x2 - sum_x * sum_x) * (length * sum_y2 - sum_y * sum_y))
         return numerator / denominator
     except (ValueError, ZeroDivisionError):
-        return NA(float)
+        return na_float
 
 
 def cross(source1: float, source2: float) -> PyneBool:
@@ -477,7 +477,7 @@ def crossover(source1: float, source2: float) -> PyneBool:
     res = source1 > source2 and l1_lte_l2
     # Only refresh the relation on bars where it is defined; TV compares against the
     # last bar with both sources present, so na gaps must not reset the state
-    if not (isinstance(source1, NA) or isinstance(source2, NA)):
+    if not ((isinstance(source1, NA) or source1 != source1) or (isinstance(source2, NA) or source2 != source2)):
         l1_lte_l2 = source1 <= source2
     return res
 
@@ -495,7 +495,7 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     res = source1 < source2 and l1_gte_l2
     # Only refresh the relation on bars where it is defined; TV compares against the
     # last bar with both sources present, so na gaps must not reset the state
-    if not (isinstance(source1, NA) or isinstance(source2, NA)):
+    if not ((isinstance(source1, NA) or source1 != source1) or (isinstance(source2, NA) or source2 != source2)):
         l1_gte_l2 = source1 >= source2
     return res
 
@@ -507,8 +507,8 @@ def cum(source: Series[float | int]) -> PyneFloat:
     :param source: The source series
     :return: The cumulative sum of the source series
     """
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     var: Persistent[float] = 0.0
     var += source
     return var
@@ -529,8 +529,8 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     length = int(length)
 
     mean = _mean if _mean is not None else sma(source, length)
-    if isinstance(mean, NA):
-        return NA(float)
+    if (isinstance(mean, NA) or mean != mean):
+        return na_float
 
     summ = 0.0
     for i in builtins.range(length):
@@ -555,15 +555,15 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFlo
     assert adxSmoothing > 0, "Invalid ADX smoothing, ADX smoothing must be greater than 0!"
     up = change(high)
     down = -change(low)
-    if isinstance(up, NA) or isinstance(down, NA):
-        return NA(float), NA(float), NA(float)
+    if (isinstance(up, NA) or up != up) or (isinstance(down, NA) or down != down):
+        return na_float, na_float, na_float
     a = atr(diLength)
     plus_dm = up if (up > down and up > 0.0) else 0.0
     minus_dm = down if (down > up and down > 0.0) else 0.0
     p = rma(plus_dm, diLength)
     m = rma(minus_dm, diLength)
-    if isinstance(a, NA) or isinstance(p, NA) or isinstance(m, NA) or a == 0.0:
-        return NA(float), NA(float), NA(float)
+    if (isinstance(a, NA) or a != a) or (isinstance(p, NA) or p != p) or (isinstance(m, NA) or m != m) or a == 0.0:
+        return na_float, na_float, na_float
     p = 100 * p / a
     m = 100 * m / a
     summ = p + m
@@ -585,14 +585,14 @@ def ema(source: PyneFloat, length: int, _alpha: float | None = None) -> PyneFloa
     if length == 1:  # Shortcut
         return source
 
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     alpha: Persistent[float] = _alpha or (2 / (length + 1))
-    last_val: Persistent[float] = NA(float)
+    last_val: Persistent[float] = na_float
 
     # Use SMA at warming stage
-    if isinstance(last_val, NA):
+    if (isinstance(last_val, NA) or last_val != last_val):
         last_val = sma(source, length)
         return last_val
 
@@ -613,10 +613,10 @@ def falling(source: float, length: int) -> bool:
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
-    last_val: Persistent[float] = NA(float)
+    last_val: Persistent[float] = na_float
     counter: Persistent[int] = 0
 
-    if isinstance(last_val, NA):
+    if (isinstance(last_val, NA) or last_val != last_val):
         last_val = source
         return False
 
@@ -644,10 +644,10 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     :param _check_eq: If true, check for equality too, internal use only
     :return: The highest value of the source series
     """
-    last_max: Persistent[float] = NA(float)
+    last_max: Persistent[float] = na_float
     last_max_index: Persistent[int] = 0
 
-    if last_max < source or isinstance(last_max, NA) or (_check_eq and last_max == source):
+    if last_max < source or (isinstance(last_max, NA) or last_max != last_max) or (_check_eq and last_max == source):
         last_max = source
         last_max_index = 0
 
@@ -668,7 +668,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     last_max_index += 1
 
     if bar_index < length - 1:
-        return NA(float) if not _tuple else (NA(float), NA(float))  # type: ignore[return-value]
+        return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
 
     if _bars:
         return -max_index
@@ -709,14 +709,14 @@ def hma(source: float, length: int) -> PyneFloat:
     :return: The Hull Moving Average (HMA) of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     length = int(length)
 
     ma_np2 = wma(source, length // 2)
     ma = wma(source, length)
-    if isinstance(ma, NA) or isinstance(ma_np2, NA):
-        return NA(float)
+    if (isinstance(ma, NA) or ma != ma) or (isinstance(ma_np2, NA) or ma_np2 != ma_np2):
+        return na_float
     return wma(2 * ma_np2 - ma, int(length ** 0.5))
 
 
@@ -748,10 +748,10 @@ def kc(series: float, length: int, mult: float | int, useTrueRange: bool = True)
     base = ema(series, length)
     span = tr(False) if useTrueRange else (high - low)
     range_ma = ema(span, length)
-    if isinstance(base, NA):
-        return NA(float), NA(float), NA(float)
-    if isinstance(range_ma, NA):
-        return base, NA(float), NA(float)
+    if (isinstance(base, NA) or base != base):
+        return na_float, na_float, na_float
+    if (isinstance(range_ma, NA) or range_ma != range_ma):
+        return base, na_float, na_float
     range_ma *= mult
     return base, base + range_ma, base - range_ma
 
@@ -768,8 +768,8 @@ def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True
     :return: The Keltner Channels Width (KCW) of the source series
     """
     b, h, l = kc(series, length, mult, useTrueRange)
-    if isinstance(b, NA) or b == 0.0:
-        return NA(float)
+    if (isinstance(b, NA) or b != b) or b == 0.0:
+        return na_float
     return (h - l) / b
 
 
@@ -797,9 +797,9 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     sum_y: Persistent[float] = 0.0  # Sum of source values in the window
     sum_xy: Persistent[float] = 0.0  # Weighted sum: sum((window_size - 1 - i) * source[i])
 
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         if bar_count < window_size:
-            return NA(float)
+            return na_float
         # An NA bar leaves the window unchanged; fall through to report the held value
     else:
         # NA values are NOT stored in the buffer, only skipped, so ``src[window_size]``
@@ -817,7 +817,7 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
 
             # Return NA until we have enough data
             if bar_count < window_size:
-                return NA(float)
+                return na_float
         else:
             # Rolling update: remove the oldest value when the window is full
             dropped_value = src[window_size]
@@ -850,10 +850,10 @@ def lowest(source: Series[float], length: int,
     :param _check_eq: If true, check for equality too, internal use only
     :return: The lowest value of the source series
     """
-    last_min: Persistent[float] = NA(float)
+    last_min: Persistent[float] = na_float
     last_min_index: Persistent[int] = 0
 
-    if last_min > source or isinstance(last_min, NA) or (_check_eq and last_min == source):
+    if last_min > source or (isinstance(last_min, NA) or last_min != last_min) or (_check_eq and last_min == source):
         last_min = source
         last_min_index = 0
 
@@ -874,7 +874,7 @@ def lowest(source: Series[float], length: int,
     last_min_index += 1
 
     if bar_index < length - 1:
-        return NA(float) if not _tuple else (NA(float), NA(int))  # type: ignore[return-value]
+        return na_float if not _tuple else (na_float, NA(int))  # type: ignore[return-value]
 
     if _bars:
         return -min_index
@@ -926,12 +926,12 @@ def macd(source: float, fastlen: int, slowlen: int, siglen: int) \
     assert siglen > 0, "Invalid signal length, signal length must be greater than 0!"
     fast = ema(source, fastlen)
     slow = ema(source, slowlen)
-    if isinstance(fast, NA) or isinstance(slow, NA):
-        return NA(float), NA(float), NA(float)
+    if (isinstance(fast, NA) or fast != fast) or (isinstance(slow, NA) or slow != slow):
+        return na_float, na_float, na_float
     macd_val = fast - slow
     signal = ema(macd_val, siglen)
-    if isinstance(signal, NA):
-        return macd_val, NA(float), NA(float)
+    if (isinstance(signal, NA) or signal != signal):
+        return macd_val, na_float, na_float
     return macd_val, signal, macd_val - signal
 
 
@@ -943,8 +943,8 @@ def max(source: Series[float]) -> PyneFloat:
     :param source: The source series
     :return: The maximum value of the source series
     """
-    max_val: Persistent[float] = NA(float)
-    if max_val < source or isinstance(max_val, NA):
+    max_val: Persistent[float] = na_float
+    if max_val < source or (isinstance(max_val, NA) or max_val != max_val):
         max_val = source
     return max_val
 
@@ -962,7 +962,7 @@ def median(source: Series[TFI], length: int) -> TFI:
         return source
     length = int(length)
 
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         # type(source) would be the NA class itself — keep the source sentinel's type
         return cast(TFI, source)
 
@@ -1017,15 +1017,15 @@ def mfi(source: float, length: int) -> PyneFloat:
     :return: The Money Flow Index (MFI) of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     length = int(length)
 
     chg = change(source)
-    upper = lib_math.sum(volume * (0.0 if not isinstance(chg, NA) and chg <= 0 else source), length)
-    lower = lib_math.sum(volume * (0.0 if not isinstance(chg, NA) and chg >= 0 else source), length)
-    if isinstance(upper, NA) or isinstance(lower, NA):
-        return NA(float)
+    upper = lib_math.sum(volume * (0.0 if not (isinstance(chg, NA) or chg != chg) and chg <= 0 else source), length)
+    lower = lib_math.sum(volume * (0.0 if not (isinstance(chg, NA) or chg != chg) and chg >= 0 else source), length)
+    if (isinstance(upper, NA) or upper != upper) or (isinstance(lower, NA) or lower != lower):
+        return na_float
     return 100.0 - (100 * lower / (upper + lower))
 
 
@@ -1037,8 +1037,8 @@ def min(source: Series[float]) -> PyneFloat:
     :param source: The source series
     :return: The minimum value of the source series
     """
-    min_val: Persistent[float] = NA(float)
-    if min_val > source or isinstance(min_val, NA):
+    min_val: Persistent[float] = na_float
+    if min_val > source or (isinstance(min_val, NA) or min_val != min_val):
         min_val = source
     return min_val
 
@@ -1054,14 +1054,14 @@ def mode(source: Series[TFI], length: int) -> TFI:
              the smallest value instead. Returns na during warm-up period.
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         return cast(TFI, source)
     if bar_index < length - 1:
         return cast(TFI, NA(builtins.type(source)))
     length = int(length)
 
     # Store values for quick access
-    values = [source[i] for i in builtins.range(length) if not isinstance(source[i], NA)]
+    values = [source[i] for i in builtins.range(length) if not (isinstance(source[i], NA) or source[i] != source[i])]
     if not values:
         return cast(TFI, NA(builtins.type(source)))
 
@@ -1129,8 +1129,8 @@ def obv() -> PyneFloat:
     :return: On Balance Volume
     """
     chg = change(close)
-    if isinstance(chg, NA):
-        return NA(float)
+    if (isinstance(chg, NA) or chg != chg):
+        return na_float
     if chg > 0:
         chg = 1.0
     elif chg < 0:
@@ -1156,11 +1156,11 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # buffer to fit it (the per-series default may be smaller). Done before the
     # warmup guard so the oldest candles are kept from the first bar on.
     max_bars_back(source, length)
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     if bar_index < length - 1:
-        return NA(float)
+        return na_float
 
     return array.percentile_linear_interpolation(source[:length], percentage)  # type: ignore
 
@@ -1181,11 +1181,11 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # buffer to fit it (the per-series default may be smaller). Done before the
     # warmup guard so the oldest candles are kept from the first bar on.
     max_bars_back(source, length)
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     if bar_index < length - 1:
-        return NA(float)
+        return na_float
 
     return array.percentile_nearest_rank(source[:length], percentage)  # type: ignore
 
@@ -1205,11 +1205,11 @@ def percentrank(source: Series[float], length: int) -> PyneFloat:
     # ``max_bars_back == length`` (capacity ``length + 1``) holds exactly that.
     # Done before the warmup guard so the oldest candles are kept from bar 0.
     max_bars_back(source, length)
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     if bar_index < length:
-        return NA(float)
+        return na_float
 
     return array.percentrank(source[:length + 1], 0)  # type: ignore
 
@@ -1229,22 +1229,22 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
     :param developing: If true, values recalculate on each bar using current OHLC;
                       if false (default), values remain constant until the next anchor
     :return: Array of 11 float values: [P, R1, S1, R2, S2, R3, S3, R4, S4, R5, S5]
-             Not all types support all levels - unsupported ones return NA(float)
+             Not all types support all levels - unsupported ones return na_float
     """
     # Persistent state for anchor-based calculation
     # These store the COMPLETED previous period's values (used when developing=False)
-    prev_period_high: Persistent[float] = NA(float)
-    prev_period_low: Persistent[float] = NA(float)
-    prev_period_close: Persistent[float] = NA(float)
-    prev_period_open: Persistent[float] = NA(float)
+    prev_period_high: Persistent[float] = na_float
+    prev_period_low: Persistent[float] = na_float
+    prev_period_close: Persistent[float] = na_float
+    prev_period_open: Persistent[float] = na_float
 
     # These accumulate values for the CURRENT period (will become prev_period on next anchor)
-    curr_period_high: Persistent[float] = NA(float)
-    curr_period_low: Persistent[float] = NA(float)
-    curr_period_open: Persistent[float] = NA(float)
+    curr_period_high: Persistent[float] = na_float
+    curr_period_low: Persistent[float] = na_float
+    curr_period_open: Persistent[float] = na_float
     is_first_bar_of_period: Persistent[bool] = True
 
-    levels: Persistent[list[PyneFloat]] = [NA(float)] * 11
+    levels: Persistent[list[PyneFloat]] = [na_float] * 11
     had_anchor: Persistent[bool] = False
 
     # Normalize type to lowercase for case-insensitive comparison
@@ -1266,20 +1266,20 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         had_anchor = True
     else:
         # Accumulate OHLC extremes for current period
-        if is_first_bar_of_period or isinstance(curr_period_high, NA):
+        if is_first_bar_of_period or (isinstance(curr_period_high, NA) or curr_period_high != curr_period_high):
             curr_period_high = high
             curr_period_low = low
             curr_period_open = open
             is_first_bar_of_period = False
         else:
-            if not isinstance(high, NA) and high > curr_period_high:
+            if not (isinstance(high, NA) or high != high) and high > curr_period_high:
                 curr_period_high = high
-            if not isinstance(low, NA) and low < curr_period_low:
+            if not (isinstance(low, NA) or low != low) and low < curr_period_low:
                 curr_period_low = low
 
     # If no anchor has occurred yet, return all NA values
     if not had_anchor:
-        return [NA(float)] * 11
+        return [na_float] * 11
 
     # Determine which OHLC values to use
     if developing:
@@ -1296,8 +1296,8 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         o = prev_period_open
 
     # Check for NA values
-    if isinstance(h, NA) or isinstance(l, NA) or isinstance(c, NA):
-        return [NA(float)] * 11
+    if (isinstance(h, NA) or h != h) or (isinstance(l, NA) or l != l) or (isinstance(c, NA) or c != c):
+        return [na_float] * 11
 
     # Calculate range
     rng = h - l
@@ -1312,7 +1312,7 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         s2 = p - rng
         r3 = r1 + rng
         s3 = s1 - rng
-        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+        levels = [p, r1, s1, r2, s2, r3, s3, na_float, na_float, na_float, na_float]
 
     elif type_lower == "fibonacci":
         # Fibonacci Pivot Points
@@ -1323,15 +1323,15 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         s2 = p - 0.618 * rng
         r3 = p + 1.000 * rng
         s3 = p - 1.000 * rng
-        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+        levels = [p, r1, s1, r2, s2, r3, s3, na_float, na_float, na_float, na_float]
 
     elif type_lower == "woodie":
         # Woodie Pivot Points
         # Note: Woodie uses current period's OPEN (not prev period's close) for the "close" component
         # This makes Woodie more responsive to current price action
         woodie_c = curr_period_open if not developing else close
-        if isinstance(woodie_c, NA):
-            return [NA(float)] * 11
+        if (isinstance(woodie_c, NA) or woodie_c != woodie_c):
+            return [na_float] * 11
         p = (h + l + 2 * woodie_c) / 4
         r1 = 2 * p - l
         s1 = 2 * p - h
@@ -1339,12 +1339,12 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         s2 = p - rng
         r3 = r1 + rng
         s3 = s1 - rng
-        levels = [p, r1, s1, r2, s2, r3, s3, NA(float), NA(float), NA(float), NA(float)]
+        levels = [p, r1, s1, r2, s2, r3, s3, na_float, na_float, na_float, na_float]
 
     elif type_lower == "dm":
         # DeMark Pivot Points
-        if isinstance(o, NA):
-            return [NA(float)] * 11
+        if (isinstance(o, NA) or o != o):
+            return [na_float] * 11
 
         if c < o:
             x = h + 2 * l + c
@@ -1357,8 +1357,8 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         r1 = x / 2 - l
         s1 = x / 2 - h
         # DM only has P, R1, S1
-        levels = [p, r1, s1, NA(float), NA(float), NA(float), NA(float),
-                  NA(float), NA(float), NA(float), NA(float)]
+        levels = [p, r1, s1, na_float, na_float, na_float, na_float,
+                  na_float, na_float, na_float, na_float]
 
     elif type_lower == "camarilla":
         # Camarilla Pivot Points
@@ -1372,11 +1372,11 @@ def pivot_point_levels(type: str, anchor: bool, developing: bool = False) -> lis
         r4 = c + rng * 1.1 / 2
         s4 = c - rng * 1.1 / 2
         # Camarilla has P, R1-R4, S1-S4 (no R5, S5)
-        levels = [p, r1, s1, r2, s2, r3, s3, r4, s4, NA(float), NA(float)]
+        levels = [p, r1, s1, r2, s2, r3, s3, r4, s4, na_float, na_float]
 
     else:
         # Unknown type - return all NA
-        levels = [NA(float)] * 11
+        levels = [na_float] * 11
 
     return levels
 
@@ -1394,8 +1394,8 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
 
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     pivotrange = leftbars + rightbars + 1
     ph, pi = cast(tuple[float, int], highest(source, pivotrange, _tuple=True, _check_eq=True))
@@ -1403,7 +1403,7 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     if pi == -rightbars:
         return ph
 
-    return NA(float)
+    return na_float
 
 
 @overload
@@ -1418,8 +1418,8 @@ def pivothigh(leftbars: int, rightbars: int) -> PyneFloat:
     try:
         return pivothigh(safe_convert.safe_float(high), leftbars, rightbars)  # type: ignore
     except TypeError:
-        if isinstance(high, NA):
-            return NA(float)
+        if (isinstance(high, NA) or high != high):
+            return na_float
         else:
             raise
 
@@ -1437,15 +1437,15 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
 
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     pivotrange = leftbars + rightbars + 1
     pl, pi = cast(tuple[float, int], lowest(source, pivotrange, _tuple=True, _check_eq=True))
     if pi == -rightbars:
         return pl
 
-    return NA(float)
+    return na_float
 
 
 @overload
@@ -1460,8 +1460,8 @@ def pivotlow(leftbars: int, rightbars: int) -> PyneFloat:
     try:
         return pivotlow(safe_convert.safe_float(low), leftbars, rightbars)  # type: ignore
     except TypeError:
-        if isinstance(low, NA):
-            return NA(float)
+        if (isinstance(low, NA) or low != low):
+            return na_float
         else:
             raise
 
@@ -1479,7 +1479,9 @@ def pvi() -> PyneFloat:
     prev_pvi: Persistent[float] = 1.0
 
     _pvi = prev_pvi + ((close - prev_close) / prev_close) * prev_pvi if volume > prev_volume else prev_pvi
-    if isinstance(_pvi, NA):
+    # na() predicate semantics: a division by zero (prev_close warmup 0.0) gives
+    # inf, which is na on TV — not just nan, so the guard must be isfinite-based.
+    if isinstance(_pvi, NA) or not math.isfinite(_pvi):
         _pvi = prev_pvi
 
     prev_close = close
@@ -1497,7 +1499,7 @@ def pvt() -> PyneFloat:
 
     :return: Price Volume Trend
     """
-    prev_close: Persistent[float] = NA(float)
+    prev_close: Persistent[float] = na_float
     chg = close - prev_close
     res = cum((chg / prev_close) * volume)
     prev_close = close
@@ -1514,8 +1516,8 @@ def range(source: Series[float], length: int) -> PyneFloat:
     :return: The range of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     length = int(length)
 
     return highest(source, length) - lowest(source, length)
@@ -1535,11 +1537,11 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     # buffer to fit it (the per-series default may be smaller). Done before the
     # warmup guard so the oldest candles are kept from the first bar on.
     max_bars_back(source, length)
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     if bar_index < length:
-        return NA(float)
+        return na_float
 
     # Collect values for performance
     values = cast(list[float], source[:length])  # type: ignore
@@ -1582,10 +1584,10 @@ def rising(source: float, length: int) -> bool:
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
-    last_val: Persistent[float] = NA(float)
+    last_val: Persistent[float] = na_float
     counter: Persistent[int] = 0
 
-    if isinstance(last_val, NA):
+    if (isinstance(last_val, NA) or last_val != last_val):
         last_val = source
         return False
 
@@ -1618,8 +1620,8 @@ def roc(source: Series[float], length: int) -> PyneFloat:
     :return: The Rate of Change (ROC) of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
     length = int(length)
     # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
     # per-series default max_bars_back (500); otherwise it reads na and the roc is na.
@@ -1628,8 +1630,8 @@ def roc(source: Series[float], length: int) -> PyneFloat:
     prev_val = source[length]
     chg = change(source, length)
 
-    if isinstance(prev_val, NA):
-        return NA(float)
+    if (isinstance(prev_val, NA) or prev_val != prev_val):
+        return na_float
 
     return 100 * chg / prev_val
 
@@ -1644,13 +1646,13 @@ def rsi(source: float, length: int) -> PyneFloat:
     :return: The Relative Strength Index (RSI) of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
-    prev_src: Persistent[float] = NA(float)
-    if isinstance(prev_src, NA):
+    prev_src: Persistent[float] = na_float
+    if (isinstance(prev_src, NA) or prev_src != prev_src):
         prev_src = source
-        return NA(float)
+        return na_float
 
     rma_u = rma(builtins.max(source - prev_src, 0.0), length)
     rma_d = rma(builtins.max(prev_src - source, 0.0), length)
@@ -1675,13 +1677,13 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     assert max <= 0.5, "Maximum cannot exceed 0.5!"
 
     if bar_index == 0:
-        return NA(float)
+        return na_float
 
     # Persistent states
     pos_long: Persistent[bool] = True  # Current position (long/short)
     af: Persistent[float] = start  # Current acceleration factor
-    sar_val: Persistent[float] = NA(float)  # Current SAR value
-    ep: Persistent[float] = NA(float)  # Extreme point
+    sar_val: Persistent[float] = na_float  # Current SAR value
+    ep: Persistent[float] = na_float  # Extreme point
 
     # Initialize on second bar
     if bar_index == 1:
@@ -1710,7 +1712,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
                 next_sar,
                 high,
                 high[1],
-                high[2] if not isinstance(high[2], NA) else high[1]
+                high[2] if not (isinstance(high[2], NA) or high[2] != high[2]) else high[1]
             )
             ep = low  # New EP
         else:
@@ -1718,7 +1720,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
             next_sar = builtins.min(
                 next_sar,
                 low[1],
-                low[2] if not isinstance(low[2], NA) else low[1]
+                low[2] if not (isinstance(low[2], NA) or low[2] != low[2]) else low[1]
             )
             if high > ep:  # New peak
                 ep = high
@@ -1734,7 +1736,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
                 next_sar,
                 low,
                 low[1],
-                low[2] if not isinstance(low[2], NA) else low[1]
+                low[2] if not (isinstance(low[2], NA) or low[2] != low[2]) else low[1]
             )
             ep = high  # New EP
         else:
@@ -1742,7 +1744,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
             next_sar = builtins.max(
                 next_sar,
                 high[1],
-                high[2] if not isinstance(high[2], NA) else high[1]
+                high[2] if not (isinstance(high[2], NA) or high[2] != high[2]) else high[1]
             )
             if low < ep:  # New trough
                 ep = low
@@ -1776,7 +1778,7 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
     try:
         return math.sqrt(variance(source, length, biased))
     except TypeError:
-        return NA(float)
+        return na_float
 
 
 # noinspection PyShadowingNames
@@ -1792,8 +1794,8 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     :return: The Stochastic Oscillator of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA) or isinstance(high, NA) or isinstance(low, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source) or (isinstance(high, NA) or high != high) or (isinstance(low, NA) or low != low):
+        return na_float
     length = int(length)
 
     highs: Series[float] = high
@@ -1802,7 +1804,7 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     lmin = lowest(lows, length)
 
     if bar_index < length - 1:
-        return NA(float)
+        return na_float
 
     dl_diff = source - lmin
     hl_diff = hmax - lmin
@@ -1826,11 +1828,11 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
     assert atr_period > 0, "Invalid ATR period, must be greater than 0!"
 
     # Store persistent state
-    prev_lower: Persistent[float] = NA(float)
-    prev_upper: Persistent[float] = NA(float)
-    prev_close: Persistent[float] = NA(float)
+    prev_lower: Persistent[float] = na_float
+    prev_upper: Persistent[float] = na_float
+    prev_close: Persistent[float] = na_float
     prev_direction: Persistent[int] = NA(int)
-    prev_supertrend: Persistent[float] = NA(float)
+    prev_supertrend: Persistent[float] = na_float
 
     # Calculate base values
     src = hl2
@@ -1840,15 +1842,15 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
     if bar_index == 0:
         return 0.0, 1
 
-    if isinstance(src, NA) or isinstance(atr_val, NA):
-        return NA(float), prev_direction if not isinstance(prev_direction, NA) else 1
+    if (isinstance(src, NA) or src != src) or (isinstance(atr_val, NA) or atr_val != atr_val):
+        return na_float, prev_direction if not (isinstance(prev_direction, NA) or prev_direction != prev_direction) else 1
 
     # Calculate bands
     upper = src + factor * atr_val
     lower = src - factor * atr_val
 
     # First value initialization
-    if isinstance(prev_direction, NA):
+    if (isinstance(prev_direction, NA) or prev_direction != prev_direction):
         direction = 1
         supertrend = upper
         prev_direction = direction
@@ -1895,8 +1897,8 @@ def swma(source: Series[float]) -> PyneFloat:
     :param source: The source series
     :return: The SWWMA of the source series
     """
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     return (source + 2 * source[1] + 2 * source[2] + source[3]) / 6
 
@@ -1911,10 +1913,10 @@ def tr(handle_na: bool = False) -> PyneFloat:
                       current day high-low. Otherwise (if false) tr would return NaN in such cases
     :return: True Range (TR)
     """
-    prev_close: Persistent[float] = NA(float)
+    prev_close: Persistent[float] = na_float
 
-    if isinstance(prev_close, NA):
-        val = (high - low) if handle_na else NA(float)
+    if (isinstance(prev_close, NA) or prev_close != prev_close):
+        val = (high - low) if handle_na else na_float
     else:
         val = builtins.max(high - low, abs(high - prev_close), abs(low - prev_close))
 
@@ -1934,27 +1936,27 @@ def tsi(source: Series[float], short_length: int, long_length: int) -> PyneFloat
     """
     assert short_length > 0, "Invalid short length, must be greater than 0!"
     assert long_length > 0, "Invalid long length, must be greater than 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     # Calculate momentum
     momentum = change(source)
-    if isinstance(momentum, NA):
-        return NA(float)
+    if (isinstance(momentum, NA) or momentum != momentum):
+        return na_float
 
     # First smooth both momentum and abs(momentum)
     momentum_ema = ema(momentum, long_length)
     abs_momentum_ema = ema(abs(momentum), long_length)
 
-    if isinstance(momentum_ema, NA) or isinstance(abs_momentum_ema, NA):
-        return NA(float)
+    if (isinstance(momentum_ema, NA) or momentum_ema != momentum_ema) or (isinstance(abs_momentum_ema, NA) or abs_momentum_ema != abs_momentum_ema):
+        return na_float
 
     # Second smooth
     tsi_value = ema(momentum_ema, short_length)
     abs_value = ema(abs_momentum_ema, short_length)
 
-    if isinstance(abs_value, NA):
-        return NA(float)
+    if (isinstance(abs_value, NA) or abs_value != abs_value):
+        return na_float
 
     return tsi_value / abs_value
 
@@ -1979,8 +1981,8 @@ def variance(source: Series[float],
     # poisons the Welford accumulators permanently (feeds stdev/bb/bbw/kc). Runs before the
     # na guard so the buffer keeps growing on na bars too, ahead of any wrap.
     max_bars_back(source, length)
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     # Welford online recurrence with Pébay (2008) decremental step for sliding
     # window. Avoids the catastrophic cancellation of the textbook
@@ -2017,7 +2019,7 @@ def variance(source: Series[float],
     m2 = t
 
     if count < length:
-        return NA(float)
+        return na_float
 
     if count > length:
         # Remove oldest sample (Welford decremental, Pébay 2008)
@@ -2053,8 +2055,8 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     :return: The value of the source series when the condition is true for the given occurrence
     """
     assert occurrence >= 0, "Invalid occurrence, must be >= 0!"
-    if isinstance(source, NA):
-        return NA(float)
+    if (isinstance(source, NA) or source != source):
+        return na_float
 
     values: Persistent[deque[float]] = deque(maxlen=occurrence + 1)
 
@@ -2063,7 +2065,7 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
 
     if len(values) == occurrence + 1:
         return values[0]
-    return NA(float)
+    return na_float
 
 
 # noinspection PyUnusedLocal
@@ -2084,8 +2086,8 @@ def vwap(source: Series[float] | None = None, anchor: bool | None = None,
     """
     if source is None:
         source = hlc3
-    if isinstance(source, NA):
-        return NA(float) if stdev_mult is None else (NA(float), NA(float), NA(float))
+    if (isinstance(source, NA) or source != source):
+        return na_float if stdev_mult is None else (na_float, na_float, na_float)
 
     # Persistent variables for calculation
     sum_vol: Persistent[float] = 0.0
@@ -2107,12 +2109,12 @@ def vwap(source: Series[float] | None = None, anchor: bool | None = None,
         sum_vol += volume
         sum_pv += source * volume
     else:  # There was no anchor yet
-        return NA(float) if stdev_mult is None else (NA(float), NA(float), NA(float))
+        return na_float if stdev_mult is None else (na_float, na_float, na_float)
 
     # Calculate VWAP
     vwap_value = sum_pv / sum_vol
-    if isinstance(vwap_value, NA):
-        return NA(float) if stdev_mult is None else (NA(float), NA(float), NA(float))
+    if (isinstance(vwap_value, NA) or vwap_value != vwap_value):
+        return na_float if stdev_mult is None else (na_float, na_float, na_float)
 
     # If stdev_mult is specified, calculate bands
     if had_anchor and stdev_mult is not None:
@@ -2137,7 +2139,7 @@ def wad() -> PyneFloat:
 
     :return: Williams Accumulation/Distribution
     """
-    prev_close: Persistent[float] = NA(float)
+    prev_close: Persistent[float] = na_float
     true_high = builtins.max(high, prev_close)
     true_low = builtins.min(low, prev_close)
     momentum = close - prev_close
@@ -2164,10 +2166,10 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
 
-    if isinstance(source, NA):
+    if (isinstance(source, NA) or source != source):
         # An NA bar leaves the window unchanged; hold the last full value
         # (still NA while warming up)
-        return NA(float) if count < length else weighted_summ / denom
+        return na_float if count < length else weighted_summ / denom
 
     # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
     # indexes past NA gaps to the true oldest value still inside the window.
@@ -2185,7 +2187,7 @@ def wma(source: Series[float], length: int) -> PyneFloat:
         summ += source
         weighted_summ += source * count
         if count < length:
-            return NA(float)
+            return na_float
 
     # Normal calculation phase
     else:

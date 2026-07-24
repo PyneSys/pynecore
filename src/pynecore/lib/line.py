@@ -107,9 +107,9 @@ def new(*args: Any, **kwargs: Any) -> Line:
         y1 = kwargs.get('y1')
         x2 = kwargs.get('x2')
         y2 = kwargs.get('y2')
-        x1_val = int(x1) if isinstance(x1, (int, float)) else na_int
+        x1_val = int(x1) if isinstance(x1, (int, float)) and x1 == x1 else na_int
         y1_val = y1 if isinstance(y1, (int, float)) else na_float
-        x2_val = int(x2) if isinstance(x2, (int, float)) else na_int
+        x2_val = int(x2) if isinstance(x2, (int, float)) and x2 == x2 else na_int
         y2_val = y2 if isinstance(y2, (int, float)) else na_float
 
     line_obj = Line(
@@ -185,7 +185,7 @@ def get_y1(id: Line) -> PyneFloat:
     :return: Price of the first point
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.y1
 
 
@@ -211,7 +211,7 @@ def get_y2(id: Line) -> PyneFloat:
     :return: Price of the second point
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.y2
 
 
@@ -409,7 +409,7 @@ def get_price(id: Line, x: int) -> PyneFloat:
     :raises RuntimeError: If the line was created with xloc.bar_time instead of xloc.bar_index
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     
     # Check if line was created with xloc.bar_index
     if id.xloc != _xloc.bar_index:

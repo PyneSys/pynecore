@@ -7,7 +7,7 @@ import statistics
 
 from ..utils.sequence_view import SequenceView
 
-from ..types.na import NA
+from ..types.na import NA, na_float
 from ..types.color import Color
 from ..types.box import Box
 from ..types.line import Line
@@ -89,7 +89,7 @@ def _non_na(id: list[T]) -> list[T]:
     :param id: Input array, possibly containing na elements
     :return: New list containing only the non-na elements, in original order
     """
-    return [i for i in id if not isinstance(i, NA)]
+    return [i for i in id if not (isinstance(i, NA) or i != i)]
 
 
 # noinspection PyShadowingBuiltins
@@ -113,7 +113,7 @@ def avg(id: list[Number]) -> float:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return na_float
     return builtins.sum(a) / len(a)
 
 
@@ -239,9 +239,9 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
     """
     assert len(id1) == len(id2), "Input arrays must have the same length!"
     pairs = [(v1, v2) for v1, v2 in zip(id1, id2)
-             if not isinstance(v1, NA) and not isinstance(v2, NA)]
+             if not (isinstance(v1, NA) or v1 != v1 or isinstance(v2, NA) or v2 != v2)]
     if not pairs:
-        return NA(float)
+        return na_float
     # Online (Welford) co-moment — matches TradingView bit-for-bit for both
     # the biased and unbiased result, where the classic two-pass
     # ``sum((x-mx)*(y-my)) / divisor`` lands a couple of ulps off on the
@@ -438,7 +438,7 @@ def median(id: list[Number]) -> float:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return na_float
     return statistics.median(a)
 
 
@@ -493,7 +493,7 @@ def _na_size(size: int | NA) -> int:
     :param size: Requested array size, possibly ``na``
     :return: Non-negative integer size
     """
-    if isinstance(size, NA):
+    if isinstance(size, NA) or size != size:
         return 0
     assert size >= 0, "Size must be >=0!"
     return size
@@ -602,7 +602,7 @@ def new_color(size: int | NA = 0, initial_value: Color = NA(Color)) -> list[Colo
 
 
 # noinspection PyShadowingNames
-def new_float(size: int | NA = 0, initial_value: float | int = NA(float)) -> list[float]:
+def new_float(size: int | NA = 0, initial_value: float | int = na_float) -> list[float]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -672,11 +672,11 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     if not (0 <= percentage <= 100):
         raise ValueError("Percentage must be between 0 and 100")
 
-    has_na = any(isinstance(v, NA) for v in id)
+    has_na = any(isinstance(v, NA) or v != v for v in id)
     # filter() instead of a comprehension: PyCharm mis-narrows `not isinstance`
     # inside comprehension conditions (elements would type as NA, not float)
-    non_na = sorted(filter(lambda v: not isinstance(v, NA), id))
-    sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
+    non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
+    sorted_arr = non_na + [na_float] * (len(id) - len(non_na))
     n = len(id)
 
     # 1-based interpolation position over the full length
@@ -696,7 +696,7 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     if frac == 0:
         return sorted_arr[lower - 1]
     if has_na:
-        return NA(float)
+        return na_float
     return sorted_arr[lower - 1] + frac * (sorted_arr[lower] - sorted_arr[lower - 1])
 
 
@@ -721,8 +721,8 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
         raise ValueError("Percentage must be between 0 and 100")
 
     # filter() instead of a comprehension: see percentile_linear_interpolation
-    non_na = sorted(filter(lambda v: not isinstance(v, NA), id))
-    sorted_arr = non_na + [NA(float)] * (len(id) - len(non_na))
+    non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
+    sorted_arr = non_na + [na_float] * (len(id) - len(non_na))
     n = len(id)
     if percentage == 0:
         return sorted_arr[0]
@@ -758,11 +758,11 @@ def percentrank(id: list[Number], index: int) -> float:
 
     # Get value at index
     value = id[index]
-    if isinstance(value, NA):
-        return NA(float)
+    if isinstance(value, NA) or value != value:
+        return na_float
 
     # Count non-na elements less than or equal to the target value
-    count = builtins.sum(1 for x in id if not isinstance(x, NA) and x <= value)
+    count = builtins.sum(1 for x in id if not (isinstance(x, NA) or x != x) and x <= value)
 
     # Calculate percentage
     return (count - 1) * 100 / (len(id) - 1)
@@ -969,7 +969,7 @@ def stdev(id: list[Number], biased: bool = True) -> float:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return na_float
     if len(a) < 2:
         return 0.0
     if not biased:
@@ -988,7 +988,7 @@ def sum(id: list[float | int]) -> float | int:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return na_float
     return builtins.sum(a)
 
 
@@ -1014,7 +1014,7 @@ def variance(id: list[Number], biased: bool = True) -> float:
     """
     a = _non_na(id)
     if not a:
-        return NA(float)
+        return na_float
     if len(a) < 2:
         return 0.0
     if not biased:

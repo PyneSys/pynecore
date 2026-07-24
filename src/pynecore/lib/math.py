@@ -3,7 +3,7 @@ import builtins
 import math
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 
-from ..types.na import NA
+from ..types.na import NA, na_float
 from ..types import PyneFloat, PyneInt
 
 from . import syminfo
@@ -32,8 +32,8 @@ def abs(number: TFI | NA[TFI]) -> PyneFloat:
     :param number: A number.
     :return: The absolute value of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     return builtins.abs(number)
 
 
@@ -44,8 +44,8 @@ def acos(value: TFI | NA[TFI]) -> PyneFloat:
     :param value: A value.
     :return: The arc cosine of the value.
     """
-    if isinstance(value, NA):
-        return NA(float)
+    if (isinstance(value, NA) or value != value):
+        return na_float
     return math.acos(value)
 
 
@@ -56,8 +56,8 @@ def asin(value: TFI | NA[TFI]) -> PyneFloat:
     :param value: A value.
     :return: The arc sine of the value.
     """
-    if isinstance(value, NA):
-        return NA(float)
+    if (isinstance(value, NA) or value != value):
+        return na_float
     return math.asin(value)
 
 
@@ -68,8 +68,8 @@ def atan(value: TFI | NA[TFI]) -> PyneFloat:
     :param value: A value.
     :return: The arc tangent of the value.
     """
-    if isinstance(value, NA):
-        return NA(float)
+    if (isinstance(value, NA) or value != value):
+        return na_float
     return math.atan(value)
 
 
@@ -82,8 +82,8 @@ def avg(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
     assert numbers, "At least one number is necessary!"
 
-    if any(isinstance(n, NA) for n in numbers):
-        return NA(float)
+    if any((isinstance(n, NA) or n != n) for n in numbers):
+        return na_float
 
     return builtins.sum(n for n in numbers) / len(numbers)
 
@@ -95,7 +95,7 @@ def ceil(number: TFI | NA[TFI]) -> PyneInt:
     :param number: A number.
     :return: The smallest integer greater than or equal to the number.
     """
-    if isinstance(number, NA):
+    if (isinstance(number, NA) or number != number):
         return NA(int)
     return math.ceil(number)
 
@@ -107,8 +107,8 @@ def cos(angle: TFI | NA[TFI]) -> PyneFloat:
     :param angle: An angle in radians.
     :return: The cosine of the angle.
     """
-    if isinstance(angle, NA):
-        return NA(float)
+    if (isinstance(angle, NA) or angle != angle):
+        return na_float
     return math.cos(angle)
 
 
@@ -119,8 +119,8 @@ def exp(number: TFI | NA[TFI]) -> PyneFloat:
     :param number: A number.
     :return: e raised to the power of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     return math.exp(number)
 
 
@@ -131,7 +131,7 @@ def floor(number: TFI | NA[TFI]) -> PyneInt:
     :param number: A number.
     :return: The largest integer less than or equal to the number.
     """
-    if isinstance(number, NA):
+    if (isinstance(number, NA) or number != number):
         return NA(int)
     # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2)
     return math.floor(number)
@@ -144,8 +144,8 @@ def log(number: TFI | NA[TFI]) -> PyneFloat:
     :param number: A number.
     :return: The natural logarithm of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     return math.log(number)
 
 
@@ -156,30 +156,33 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
     :param number: A number.
     :return: The base-10 logarithm of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     return math.log10(number)
 
 
 def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
     """
-    Return the na matching the operands' numeric contract: NA(float) when any
+    Return the na matching the operands' numeric contract: na_float when any
     type-carrying operand is float-like, NA(int) when the type-carrying operands
     are all int-like, the typeless na when no operand carries a type at all.
     Typeless na operands are neutral — they must not push an int contract to float.
     """
     saw_typed = False
     for n in numbers:
+        if n != n:
+            # A native nan is a float-typed na by definition
+            return na_float
         if isinstance(n, NA):
             if n.type is None:
                 continue
             saw_typed = True
             if n.type is not int:
-                return NA(float)
+                return na_float
         else:
             saw_typed = True
             if not isinstance(n, int):
-                return NA(float)
+                return na_float
     return NA(int) if saw_typed else NA(None)
 
 
@@ -201,7 +204,7 @@ def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
     assert numbers, "At least one number is necessary!"
 
-    if any(isinstance(n, NA) for n in numbers):
+    if any((isinstance(n, NA) or n != n) for n in numbers):
         return _na_of_operands(numbers)
 
     return builtins.max(cast(list[TFI], numbers))
@@ -225,7 +228,7 @@ def min(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
     assert numbers, "At least one number is necessary!"
 
-    if any(isinstance(n, NA) for n in numbers):
+    if any((isinstance(n, NA) or n != n) for n in numbers):
         return _na_of_operands(numbers)
 
     return builtins.min(cast(list[TFI], numbers))
@@ -240,8 +243,8 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     :param exponent: The exponent number.
     :return: The base number raised to the power of the exponent number.
     """
-    if isinstance(base, NA) or isinstance(exponent, NA):
-        return NA(float)
+    if (isinstance(base, NA) or base != base) or (isinstance(exponent, NA) or exponent != exponent):
+        return na_float
 
     return base ** exponent
 
@@ -263,9 +266,9 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     :param precision: The number of decimal places to round to.
     :return: The rounded number.
     """
-    if isinstance(number, NA):
+    if (isinstance(number, NA) or number != number):
         # No precision means the int contract (first overload), so an int-typed na
-        return NA(float) if isinstance(precision, int) else NA(int)
+        return na_float if isinstance(precision, int) else NA(int)
     # TV-measured: ties round away from zero on the decimal (shortest-repr) value,
     # not half-even on the binary double (round(2.5) == 3, round(-2.5) == -3,
     # round(2.675, 2) == 2.68 — builtins.round gives 2, -2 and 2.67 there)
@@ -295,8 +298,8 @@ def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat:
     """
     Returns value rounded to symbol's mintick with ties rounding up.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     # `mintick = minmove / pricescale` (Pine syminfo). Reconstruct via int math so
     # `minmove=1` paths stay bit-identical to the old formula, while `minmove != 1`
     # symbols (e.g. QM1!: mintick=0.025, pricescale=1000, minmove=25) round correctly.
@@ -310,8 +313,8 @@ def sign(number: TFI | NA[TFI]) -> PyneFloat:
     :param number: A number.
     :return: The sign of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     if number == 0.0:
         return 0.0
     if number > 0.0:
@@ -326,8 +329,8 @@ def sin(angle: float | int | NA) -> PyneFloat:
     :param angle: An angle in radians.
     :return: The sine of the angle.
     """
-    if isinstance(angle, NA):
-        return NA(float)
+    if (isinstance(angle, NA) or angle != angle):
+        return na_float
     return math.sin(angle)
 
 
@@ -338,12 +341,12 @@ def sqrt(number: float | int | NA) -> PyneFloat:
     :param number: A number.
     :return: The square root of the number.
     """
-    if isinstance(number, NA):
-        return NA(float)
+    if (isinstance(number, NA) or number != number):
+        return na_float
     try:
         return math.sqrt(number)
     except ValueError:
-        return NA(float)
+        return na_float
 
 
 def tan(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -353,8 +356,8 @@ def tan(angle: TFI | NA[TFI]) -> PyneFloat:
     :param angle: An angle in radians.
     :return: The tangent of the angle.
     """
-    if isinstance(angle, NA):
-        return NA(float)
+    if (isinstance(angle, NA) or angle != angle):
+        return na_float
     return math.tan(angle)
 
 
@@ -365,8 +368,8 @@ def todegrees(angle: TFI | NA[TFI]) -> PyneFloat:
     :param angle: An angle in radians.
     :return: The angle in degrees.
     """
-    if isinstance(angle, NA):
-        return NA(float)
+    if (isinstance(angle, NA) or angle != angle):
+        return na_float
     return math.degrees(angle)
 
 
@@ -377,6 +380,6 @@ def toradians(angle: TFI | NA[TFI]) -> PyneFloat:
     :param angle: An angle in degrees.
     :return: The angle in radians.
     """
-    if isinstance(angle, NA):
-        return NA(float)
+    if (isinstance(angle, NA) or angle != angle):
+        return na_float
     return math.radians(angle)

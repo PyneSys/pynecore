@@ -87,7 +87,7 @@ def __test_htf_lookahead_on_steps_into_containing_period__(runner, log):
     import sys
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     sys.modules.pop(Path(__file__).stem, None)
 
@@ -113,14 +113,14 @@ def __test_htf_lookahead_on_steps_into_containing_period__(runner, log):
 
         # prev_on: yesterday's close via the inner close[1]; day 0 has no prior.
         if day == 0:
-            assert isinstance(prev_on, NA), f"day 0 h12: prev_on={prev_on} should be na"
+            assert isna_num(prev_on), f"day 0 h12: prev_on={prev_on} should be na"
         else:
             assert prev_on == _daily_close(day - 1), \
                 f"day {day} h12: prev_on={prev_on} != {_daily_close(day - 1)} (D-1 close)"
 
         # prev_off: last-closed daily context, so close[1] is D-2.
         if day < 2:
-            assert isinstance(prev_off, NA), f"day {day} h12: prev_off={prev_off} should be na"
+            assert isna_num(prev_off), f"day {day} h12: prev_off={prev_off} should be na"
         else:
             assert prev_off == _daily_close(day - 2), \
                 f"day {day} h12: prev_off={prev_off} != {_daily_close(day - 2)} (D-2 close)"

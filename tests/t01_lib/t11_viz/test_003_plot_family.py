@@ -31,7 +31,7 @@ def __test_plot_family__(runner):
     the right kind and style/char/location/color fields.
     """
     from pynecore import lib
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
     from pynecore.types.ohlcv import OHLCV
 
     base = 1704067200
@@ -55,7 +55,7 @@ def __test_plot_family__(runner):
         assert rec["sh"] == (1 if c > o else 0)
         # plotshape NA propagation: close[1] is NA on bar 0.
         if i == 0:
-            assert isinstance(rec["shna"], NA)
+            assert isna_num(rec["shna"])
         else:
             assert rec["shna"] in (0, 1)
         # plotchar / plotarrow store the raw series value.

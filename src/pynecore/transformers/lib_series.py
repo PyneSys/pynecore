@@ -139,10 +139,23 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
         if (module, attr_key, function_key) not in self.used_series:
             self.used_series.add((module, attr_key, function_key))
 
-            # Create Series declaration with proper attribute chain
+            # Create Series declaration with proper attribute chain. Builtin
+            # price series are float — a Series[float] annotation makes the
+            # SeriesTransformer carry the element type into the slot layout,
+            # so their buffers return the native nan for out-of-range reads.
+            if type_annotation is None:
+                if is_builtin_price:
+                    annotation: ast.expr = ast.Subscript(
+                        value=ast.Name(id='Series', ctx=ast.Load()),
+                        slice=ast.Name(id='float', ctx=ast.Load()),
+                        ctx=ast.Load())
+                else:
+                    annotation = ast.Name(id='Series', ctx=ast.Load())
+            else:
+                annotation = cast(ast.expr, type_annotation)
             decl = ast.AnnAssign(
                 target=ast.Name(id=local_name, ctx=ast.Store()),
-                annotation=cast(ast.expr, type_annotation or ast.Name(id='Series', ctx=ast.Load())),
+                annotation=annotation,
                 value=self._create_attribute_chain([module] + attr_chain),
                 simple=1
             )

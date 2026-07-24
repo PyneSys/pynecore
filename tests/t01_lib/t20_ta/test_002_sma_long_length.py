@@ -25,7 +25,7 @@ def __test_sma_long_length__(runner):
     """
     from datetime import datetime, UTC
     from pynecore.types.ohlcv import OHLCV
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     n_bars = 1300
     base_ts = int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp())
@@ -59,7 +59,7 @@ def __test_sma_long_length__(runner):
         seen.append(plot["close"])
         # sma1000: na during warmup, a value once warm — the regression (pre-fix it
         # stayed na for the whole run after a single bar).
-        assert (plot["sma1000"] is None or isinstance(plot["sma1000"], NA)) == (i < 999), \
+        assert (plot["sma1000"] is None or isna_num(plot["sma1000"])) == (i < 999), \
             f"sma1000 warmup/na boundary wrong at bar {i}"
         if i >= 999:
             assert abs(plot["sma1000"] - rolling_mean(i, 1000)) < 1e-6, \

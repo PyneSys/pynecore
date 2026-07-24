@@ -79,7 +79,7 @@ def _chart_bars():
 def _assert_matches_expected(rows, log):
     """Assert the collected (n, sum) plot rows match the analytic expectation."""
     import math
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     assert len(rows) == len(_EXPECTED_SIZE), (
         f"bar count {len(rows)} != {len(_EXPECTED_SIZE)}"
@@ -90,9 +90,9 @@ def _assert_matches_expected(rows, log):
         )
         expected_sum = _EXPECTED_SUM[i]
         if expected_sum is None:
-            assert isinstance(s, NA), f"bar {i}: expected na, got {s!r}"
+            assert isna_num(s), f"bar {i}: expected na, got {s!r}"
         else:
-            assert not isinstance(s, NA), f"bar {i}: expected {expected_sum}, got na"
+            assert not isna_num(s), f"bar {i}: expected {expected_sum}, got na"
             assert math.isclose(float(s), expected_sum, abs_tol=1e-9), (
                 f"bar {i}: sum {s} != {expected_sum}"
             )

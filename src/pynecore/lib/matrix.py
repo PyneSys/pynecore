@@ -3,7 +3,7 @@ from typing import Any
 
 from ..core.module_property import module_property
 from ..types.matrix import Matrix
-from ..types.na import NA
+from ..types.na import NA, na_float
 
 _registry: list[Matrix] = []
 
@@ -22,7 +22,7 @@ def new(rows: int = 0, columns: int = 0, initial_value: Any = None) -> Matrix:
     :return: The ID of the new matrix object.
     """
     if initial_value is None:
-        initial_value = NA(float)
+        initial_value = na_float
 
     matrix_obj = Matrix(rows, columns, initial_value)
     _registry.append(matrix_obj)
@@ -105,7 +105,7 @@ def avg(id: Matrix | NA) -> float | int | NA:
     :return: The average value from the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.avg()
 
 
@@ -159,7 +159,7 @@ def det(id: Matrix | NA) -> float | int | NA:
     :return: The determinant value of the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.det()
 
 
@@ -415,7 +415,7 @@ def max(id: Matrix | NA) -> float | int | NA:
     :return: The maximum value from the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.max()
 
 
@@ -428,7 +428,7 @@ def median(id: Matrix | NA) -> float | int | NA:
     :return: The median value from the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.median()
 
 
@@ -441,7 +441,7 @@ def min(id: Matrix | NA) -> float | int | NA:
     :return: The minimum value from the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.min()
 
 
@@ -454,7 +454,7 @@ def mode(id: Matrix | NA) -> float | int | NA:
     :return: The most frequently occurring value from the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.mode()
 
 
@@ -691,7 +691,7 @@ def trace(id: Matrix | NA) -> float | int | NA:
     :return: The trace value of the matrix.
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.trace()
 
 

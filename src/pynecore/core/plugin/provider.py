@@ -1,4 +1,5 @@
-from typing import Callable, NamedTuple
+import logging
+from typing import Callable, NamedTuple, TYPE_CHECKING
 from abc import abstractmethod, ABCMeta
 from pathlib import Path
 from datetime import datetime
@@ -8,6 +9,11 @@ from pynecore.core.syminfo import SymInfo, default_mincontract
 from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
 
 from . import Plugin, ConfigT
+
+if TYPE_CHECKING:
+    from pynecore.core.symbol_map import SymbolMap
+
+logger = logging.getLogger(__name__)
 
 
 class Broker(NamedTuple):
@@ -48,6 +54,16 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     syminfo: SymInfo | None = None
     """Symbol info pre-fetched by the chart side (security subprocesses store
     it here instead of issuing a second REST round-trip)."""
+
+    global_symbol_map: 'SymbolMap | None' = None
+    """Global workdir symbol map (``config/symbol_map.toml``), consulted by
+    :meth:`resolve_symbol` AFTER the plugin's own ``config.symbol_map``. Set by
+    the framework on the chart provider instance; ``None`` disables the fallback."""
+
+    provider_name: str | None = None
+    """This provider's entry-point name, used to gate global-map entries to the
+    running provider (an entry naming a different provider is warned + skipped,
+    pending multi-provider support)."""
 
     fetch_all_by_default: bool = False
     """If True, fetch all available data when no start date is given (instead of 1 year)."""
@@ -142,10 +158,13 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
 
         Live ``request.security()`` calls hand the framework a TradingView-style
         symbol (e.g. ``"FX:EURUSD"``). This method consults
-        ``config.symbol_map`` first (the per-plugin TOML translation table);
-        if the key is not mapped the default fallback is the identity, i.e.
-        the Pine key is forwarded unchanged on the assumption that the user
-        already wrote a plugin-native symbol.
+        ``config.symbol_map`` first (the per-plugin TOML translation table),
+        then the global workdir ``symbol_map.toml`` (:attr:`global_symbol_map`,
+        only for entries whose provider matches :attr:`provider_name` — an entry
+        naming a different provider is warned + skipped); if the key is not
+        mapped the default fallback is the identity, i.e. the Pine key is
+        forwarded unchanged on the assumption that the user already wrote a
+        plugin-native symbol.
 
         ``normalize_symbol`` is deliberately **not** used as the fallback:
         provider instances bind ``normalize_symbol`` to the chart's own
@@ -162,6 +181,19 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         sm = getattr(self.config, 'symbol_map', None)
         if sm and pine_key in sm:
             return sm[pine_key]
+        gm = self.global_symbol_map
+        if gm:
+            mapped = gm.resolve(pine_key)
+            if mapped is not None:
+                if self.provider_name is not None and mapped.provider != self.provider_name:
+                    logger.warning(
+                        "Skipping global symbol_map entry %r -> %r: it targets "
+                        "provider %r but the running provider is %r "
+                        "(multi-provider resolution is not supported yet).",
+                        pine_key, f"{mapped.provider}:{mapped.native_symbol}",
+                        mapped.provider, self.provider_name)
+                else:
+                    return mapped.native_symbol
         return pine_key
 
     @classmethod

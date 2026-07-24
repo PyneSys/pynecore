@@ -375,10 +375,13 @@ def dict_comparator() -> DictComparatorProtocol:
         try:
             for key, value in a.items():
                 assert key in b
-                if isinstance(value, NA):
-                    assert isinstance(b[key], NA)
-                elif isinstance(b[key], NA):
-                    assert isinstance(value, NA)
+                # na is representation-agnostic: an NA object and a native nan are
+                # the same "na" (math.isclose(nan, nan) is False, so na must be
+                # matched structurally, not numerically).
+                a_na = isinstance(value, NA) or (isinstance(value, float) and value != value)
+                b_na = isinstance(b[key], NA) or (isinstance(b[key], float) and b[key] != b[key])
+                if a_na or b_na:
+                    assert a_na and b_na
                 elif isinstance(value, (float, int)):
                     assert isinstance(b[key], (float, int))
                     assert math.isclose(value, b[key], abs_tol=abs_tol, rel_tol=rel_tol)

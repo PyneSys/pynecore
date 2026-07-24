@@ -10,7 +10,7 @@ re-exports the functions, and the layouts travel on the function objects.
 # imports at transform time, so NA() calls stay direct instead of anchored
 from typing import TypeVar
 
-from pynecore.types import NA, Persistent, PyneFloat, PyneInt, Series
+from pynecore.types import NA, Persistent, PyneFloat, PyneInt, Series, na_float
 from pynecore.core.random import PineRandom as _PineRandom
 # lib import (normalized to ``from pynecore import lib``) so the statement-position
 # ``max_bars_back`` call below is anchored and converted to a buffer resize.
@@ -60,7 +60,12 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     prev_length: Persistent[int] = 0
     removals: Persistent[int] = 0
 
-    if not isinstance(source, NA):
+    # Representation-agnostic na test: an na source is either an NA object or a
+    # native nan (OHLCV gaps can already deliver a bare nan). Both must be
+    # excluded from the na-compacted buffer, or ``src[k]`` would poison ``summ``.
+    source_na = isinstance(source, NA) or source != source
+
+    if not source_na:
         # Record every non-na bar's value into the sliding buffer BEFORE any
         # early return (shortcut / warmup), so the positional recompute below
         # sees a complete history with no holes. NA values are intentionally
@@ -96,7 +101,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     prev_length = length
     if changed:
         removals = 0
-        if isinstance(source, NA):
+        if source_na:
             # Length changed on an na bar: the old window is stale and cannot be
             # rebuilt from a missing current value; restart the warmup cleanly.
             summ = 0.0
@@ -108,7 +113,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
             found = 0
             for i in range(length):
                 v = src[i]
-                if isinstance(v, NA):
+                if isinstance(v, NA) or v != v:
                     # The buffer is na-compacted, so the first na marks the end of
                     # available history — every deeper index is na too. Stop here
                     # instead of scanning the rest (keeps the recompute O(available),
@@ -123,27 +128,27 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
                 summ = 0.0
                 count = 0
                 compensation = 0.0
-                return NA(float)
+                return na_float
             summ = recomputed
             compensation = comp
             count = length
             return recomputed
 
     if count < length - 1:
-        if not isinstance(source, NA):
+        if not source_na:
             count += 1
             # Kahan summation for adding new value
             corrected_value = float(source) - compensation
             new_sum = summ + corrected_value
             compensation = (new_sum - summ) - corrected_value
             summ = new_sum
-        return NA(float)
+        return na_float
     elif count == length - 1:
-        if isinstance(source, NA):
-            return NA(float)
+        if source_na:
+            return na_float
         count += 1
     else:
-        if isinstance(source, NA):
+        if source_na:
             return summ
         # Exact resync: the incremental remove+add path below carries residual
         # rounding error from bars long outside the window (Kahan bounds it but
@@ -166,7 +171,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
             found = 0
             for i in range(length):
                 v = src[i]
-                if isinstance(v, NA):
+                if isinstance(v, NA) or v != v:
                     break
                 found += 1
                 corrected = float(v) - comp

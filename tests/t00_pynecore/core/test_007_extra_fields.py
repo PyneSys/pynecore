@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pynecore import Series
 from pynecore.lib import script, bar_index, close, extra_fields, na
-from pynecore.types.na import NA
+from pynecore.types.na import isna_num
 
 
 @script.indicator(title="Extra Fields Test")
@@ -58,7 +58,7 @@ def __test_extra_fields_series_history__(script_path, module_key, syminfo, csv_r
             expected = expected_prev_rsi[i]
 
             if expected is None:
-                assert isinstance(prev, NA), f"Bar {i}: expected na, got {prev}"
+                assert isna_num(prev), f"Bar {i}: expected na, got {prev}"
             elif expected == '':
                 assert prev == '', f"Bar {i}: expected empty string, got {prev!r}"
             else:

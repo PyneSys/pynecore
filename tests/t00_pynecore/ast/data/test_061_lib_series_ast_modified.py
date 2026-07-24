@@ -2,7 +2,7 @@
 @pyne
 """
 from pynecore import lib
-__pyne_slot_layout__ = {'main': {'init': (None, None, None), 'series': ((0, None), (1, None), (2, None)), 'varip': (), 'children': (), 'names': ('__lib·close', '__lib·high', '__lib·low')}}
+__pyne_slot_layout__ = {'main': {'init': (None, None, None), 'series': ((0, None, 'float'), (1, None, 'float'), (2, None, 'float')), 'varip': (), 'children': (), 'names': ('__lib·close', '__lib·high', '__lib·low')}}
 
 def main(__state·main__):
     __lib·close = __state·main__[0].add(lib.close)

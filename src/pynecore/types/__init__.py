@@ -1,7 +1,7 @@
 from .persistent import Persistent
 from .ib_persistent import IBPersistent, IBPersistentSeries
 from .series import Series, PersistentSeries
-from .na import NA
+from .na import NA, na_float
 from .pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from .box import Box

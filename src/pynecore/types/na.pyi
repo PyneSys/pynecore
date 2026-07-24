@@ -3,6 +3,9 @@ from typing import Any, TypeVar, Generic, Type, Iterator
 T = TypeVar('T')
 
 
+def isna_num(x: Any) -> bool: ...
+
+
 class NA(Generic[T]):
     type: Type[T] | T | None
 
@@ -73,10 +76,8 @@ class NA(Generic[T]):
 # The singleton constants wear the same "plain T" face as __new__ above:
 # na_float must be assignable wherever a float is, or every hot-path use of the
 # interned constants (instead of an NA(float) call) would false-positive.
+# (na_float genuinely IS a float now — the interned native nan.)
 na_float: float
 na_int: int
 na_str: str
 na_bool: bool
-na_inf: float
-na_neg_inf: float
-na_nan: float

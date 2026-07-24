@@ -2,7 +2,8 @@ from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import sys
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
 from math import log10, floor, frexp
 from pathlib import Path
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.sync_engine import OrderSyncEngine
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import ScriptRequirements
+    from pynecore.core.symbol_map import MappedSymbol
 
 __all__ = [
     'import_script',
@@ -402,6 +404,19 @@ class SecurityRequirement:
         module rather than the main script.
     :ivar has_security_mapping: ``True`` when a matching ``--security`` key was
         provided for this symbol/timeframe.
+    :ivar has_global_map: ``True`` when the global ``config/symbol_map.toml``
+        maps this symbol (optionally per-timeframe).
+    :ivar mapped_provider: Provider name of the global-map hit, or ``None``.
+    :ivar mapped_native_symbol: Provider-native symbol of the global-map hit,
+        or ``None``.
+    :ivar mapped_file: The ``.ohlcv`` path derived from the global-map hit via
+        ``ProviderPlugin.get_ohlcv_path`` (backtest), or ``None``.
+    :ivar mapped_file_exists: ``True`` when :attr:`mapped_file` exists on disk.
+    :ivar download_suggestion: A ready-to-run ``pyne data download`` command for
+        the mapped-but-missing file, or ``None``.
+    :ivar file_suggestions: Existing ``.ohlcv`` file stems in the data dir whose
+        ticker matches this symbol (ignoring the exchange prefix) — candidate
+        sources when there is no global-map hit.
     """
     sec_id: str
     symbol: str | None
@@ -410,6 +425,13 @@ class SecurityRequirement:
     ignore_invalid_symbol: bool
     from_library: bool
     has_security_mapping: bool
+    has_global_map: bool = False
+    mapped_provider: str | None = None
+    mapped_native_symbol: str | None = None
+    mapped_file: str | None = None
+    mapped_file_exists: bool = False
+    download_suggestion: str | None = None
+    file_suggestions: list[str] = dataclasses_field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -443,7 +465,7 @@ class ScriptRunner:
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
-                 '_round_decimals',
+                 '_round_decimals', '_config_dir', '_symbol_map',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -464,7 +486,8 @@ class ScriptRunner:
                  chart_provider_name: str | None = None,
                  chart_provider_instance: Any = None,
                  time_from: datetime | None = None,
-                 chart_data_path: Path | None = None):
+                 chart_data_path: Path | None = None,
+                 config_dir: Path | None = None):
         """
         Initialize the script runner
 
@@ -536,6 +559,22 @@ class ScriptRunner:
         # otherwise handed only an OHLCV iterator, not a file the security child
         # can open. ``None`` in live/provider streaming mode (no static file).
         self._chart_data_path: Path | None = chart_data_path
+        # Global workdir symbol map (``config/symbol_map.toml``): translates
+        # TradingView-style ``request.security()`` symbols to provider-native
+        # ones for backtest file resolution and live ``PluginSymbol`` building.
+        # A missing/malformed file yields an empty map (never crashes a run).
+        from .symbol_map import SymbolMap
+        self._config_dir: Path | None = config_dir
+        self._symbol_map: SymbolMap = SymbolMap.load(config_dir)
+        # Expose the global map + running provider name on the chart provider
+        # so its ``resolve_symbol`` can fall back to the global map (gated on a
+        # matching provider) after the plugin's own ``config.symbol_map``.
+        if chart_provider_instance is not None:
+            try:
+                chart_provider_instance.global_symbol_map = self._symbol_map
+                chart_provider_instance.provider_name = chart_provider_name
+            except (AttributeError, TypeError):
+                pass
         # Chart-side ``--from`` (already datetime). Forwarded into every
         # live-mode :class:`PluginSymbol` so each security context's warmup
         # window inherits the chart's look-back range instead of the
@@ -2596,10 +2635,17 @@ class ScriptRunner:
                     or sym_str in keys
                     or tf_str in keys
             )
+            is_cross_symbol = sym_str != chart_symbol
+            # Global map + derived-file status are only meaningful for
+            # cross-symbol requirements (same-symbol feeds resample from the
+            # chart data). Only compute the disk-scan for those.
+            map_fields = (self._describe_global_map(sym_str, tf_str)
+                          if is_cross_symbol else {})
             req = SecurityRequirement(
                 sec_id=sec_id, symbol=sym_str, timeframe=tf_str, is_ltf=is_ltf,
                 ignore_invalid_symbol=ignore_invalid, from_library=from_library,
                 has_security_mapping=has_mapping,
+                **map_fields,
             )
             if sym_str == chart_symbol and tf_str == chart_tf:
                 chart_main.append(req)
@@ -2618,6 +2664,100 @@ class ScriptRunner:
             cross_symbol=sorted(cross_symbol, key=_sort_key),
             dynamic=sorted(dynamic, key=_sort_key),
         )
+
+    def _data_dir(self) -> 'Path | None':
+        """Return the workdir data directory, if derivable.
+
+        Backtest: the parent of the chart's own ``.ohlcv`` file. Live: the
+        chart provider's OHLCV dir. ``None`` when neither is available.
+        """
+        if self._chart_data_path is not None:
+            return Path(self._chart_data_path).parent
+        return self._chart_ohlcv_dir()
+
+    def _describe_global_map(self, symbol: str, timeframe: str) -> dict:
+        """Build the global-map report fields for one cross-symbol requirement.
+
+        Returns a kwargs dict for :class:`SecurityRequirement`: the global-map
+        hit (provider + native symbol), the derived ``.ohlcv`` file and whether
+        it exists, a ready-to-run download suggestion for a mapped-but-missing
+        file, and — as a fallback when unmapped — existing data-dir files whose
+        ticker matches (ignoring the exchange prefix).
+        """
+        data_dir = self._data_dir()
+        mapped = self._symbol_map.resolve(symbol, timeframe or None)
+        if mapped is None:
+            return {'file_suggestions': self._scan_ticker_suggestions(symbol, data_dir)}
+        expected = self._mapped_ohlcv_path(mapped, timeframe, data_dir)
+        exists = bool(expected is not None and expected.exists())
+        download_suggestion = None
+        if expected is not None and not exists:
+            download_suggestion = (
+                f"pyne data download "
+                f"'{mapped.provider}:{mapped.native_symbol}@{timeframe}'"
+            )
+        return {
+            'has_global_map': True,
+            'mapped_provider': mapped.provider,
+            'mapped_native_symbol': mapped.native_symbol,
+            'mapped_file': str(expected) if expected is not None else None,
+            'mapped_file_exists': exists,
+            'download_suggestion': download_suggestion,
+        }
+
+    @staticmethod
+    def _mapped_ohlcv_path(mapped: 'MappedSymbol', timeframe: str,
+                           data_dir: 'Path | None') -> 'Path | None':
+        """Derive the expected ``.ohlcv`` path for a global-map hit.
+
+        Uses the mapped provider's own ``get_ohlcv_path`` (a classmethod, so
+        per-provider naming overrides are honored). Returns ``None`` when the
+        data dir is unknown or the provider plugin cannot be loaded.
+        """
+        if data_dir is None:
+            return None
+        from .plugin import load_plugin
+        from .plugin.provider import ProviderPlugin
+        try:
+            provider_cls = load_plugin(mapped.provider)
+        except Exception:  # noqa: BLE001 - unknown/uninstalled provider
+            return None
+        if not (isinstance(provider_cls, type) and issubclass(provider_cls, ProviderPlugin)):
+            return None
+        return provider_cls.get_ohlcv_path(
+            mapped.native_symbol, timeframe, data_dir,
+            provider_name=mapped.provider)
+
+    def _scan_ticker_suggestions(self, symbol: str, data_dir: 'Path | None') -> list[str]:
+        """Return existing ``.ohlcv`` stems whose ticker matches ``symbol``.
+
+        Scans the data dir's sibling syminfo ``.toml`` files and matches on
+        ``[symbol].ticker`` ignoring the exchange prefix (case-insensitive), so
+        e.g. ``NASDAQ:AAPL`` suggests a ``capitalcom_AAPL_1D.ohlcv`` file whose
+        toml records ticker ``AAPL``.
+        """
+        if data_dir is None or not data_dir.is_dir():
+            return []
+        want = symbol.rsplit(':', 1)[-1].strip().upper()
+        if not want:
+            return []
+        out: list[str] = []
+        for toml_path in sorted(data_dir.glob('*.toml')):
+            ohlcv_path = toml_path.with_suffix('.ohlcv')
+            if not ohlcv_path.exists():
+                continue
+            try:
+                with open(toml_path, 'rb') as f:
+                    data = tomllib.load(f)
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            sym = data.get('symbol')
+            if not isinstance(sym, dict):
+                continue
+            ticker = sym.get('ticker')
+            if isinstance(ticker, str) and ticker.strip().upper() == want:
+                out.append(ohlcv_path.stem)
+        return out
 
     def _resolve_security_data(self, contexts: dict) -> 'dict[str, str | PluginSymbol | None]':
         """
@@ -2685,6 +2825,47 @@ class ScriptRunner:
                     and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
                 result[sec_id] = str(self._chart_data_path)
                 continue
+
+            # Same-symbol request on the chart's own symbol at a different
+            # (coarser) timeframe with no explicit ``--security`` mapping
+            # (backtest): serve from the chart's own feed — the child pre-resamples
+            # it to the security period via ``_resample_finer_security_feed``.
+            # LTF (finer than the chart) genuinely needs sub-bars the chart feed
+            # cannot supply, so it is excluded and falls through to the error.
+            if (chart_type is None
+                    and not ctx.get('is_ltf')
+                    and self._chart_provider_instance is None
+                    and self._chart_data_path is not None
+                    and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
+                result[sec_id] = str(self._chart_data_path)
+                continue
+
+            # Global workdir symbol_map.toml (backtest): translate the
+            # TradingView-style symbol to a provider-native one and derive the
+            # expected ``.ohlcv`` file. This overrides the identity live-provider
+            # fallback but is itself overridden by an explicit ``--security``
+            # mapping and by the chart-symbol branches above.
+            if self._chart_provider_instance is None:
+                mapped = self._symbol_map.resolve(symbol, timeframe or None)
+                if mapped is not None:
+                    tf_for_file = timeframe or str(self.syminfo.period)
+                    data_dir = self._data_dir()
+                    expected = self._mapped_ohlcv_path(mapped, tf_for_file, data_dir)
+                    if expected is not None and expected.exists():
+                        result[sec_id] = str(expected)
+                        continue
+                    if ctx.get('ignore_invalid_symbol'):
+                        result[sec_id] = None
+                        continue
+                    if expected is not None:
+                        raise ValueError(
+                            f"Security {symbol!r} @ {tf_for_file!r} is mapped to "
+                            f"{mapped.provider}:{mapped.native_symbol!r} by "
+                            f"config/symbol_map.toml, but the derived data file "
+                            f"{expected.name} was not found in {expected.parent}. "
+                            f"Download it with: pyne data download "
+                            f"'{mapped.provider}:{mapped.native_symbol}@{tf_for_file}'"
+                        )
 
             # No explicit mapping — fall back to chart-provider resolution
             # in live mode.

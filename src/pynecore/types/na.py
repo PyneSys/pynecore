@@ -1,76 +1,63 @@
-from __future__ import annotations
+from math import isfinite
 from typing import Any, TypeVar, Generic, Type, Self
 
 __all__ = [
-    'NA', 'na_float', 'na_int', 'na_bool', 'na_str',
-    'na_inf', 'na_neg_inf', 'na_nan',
+    'NA', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num',
 ]
 
 T = TypeVar('T')
 
-
-# Sentinel "types" used as markers for Pine-native special float values.
-# We never instantiate these; they only serve as unique identifiers stored
-# in NA.type and cached by _type_cache.
-class _InfType:
-    """Sentinel marking an NA that arithmetically behaves as +inf."""
-    _na_value = float('inf')
-    __name__ = 'inf'
-
-
-class _NegInfType:
-    """Sentinel marking an NA that arithmetically behaves as -inf."""
-    _na_value = float('-inf')
-    __name__ = 'neg_inf'
-
-
-class _NanType:
-    """Sentinel marking an NA that arithmetically behaves as nan."""
-    _na_value = float('nan')
-    __name__ = 'nan'
-
-
-_INF = float('inf')
-_NEG_INF = float('-inf')
+# The one float na: Pine's float-typed na IS a native IEEE-754 nan.
+# Interned so identity-based fast paths (dict key lookup, ``is`` checks)
+# always see the same object when the na came from ``NA(float)``.
 _NAN = float('nan')
 
 
-def _resolve(x: Any) -> Any:
-    """Unwrap a valued NA to its backing float; pass through everything else."""
+def isna_num(x: Any) -> bool:
+    """
+    Representation-agnostic na test for numeric (float-typed) values.
+
+    Accepts both representations of a Pine numeric na: the ``NA`` object and a
+    native non-finite float. Uses Pine's ``na()`` predicate semantics
+    (``not isfinite``), so ``inf`` and ``-inf`` count as na too — matching
+    TradingView, where ``na(inf)`` is ``true``.
+
+    Cold paths only: never call this in a per-bar hot loop. Hot loops use the
+    inline idioms ``x != x`` (nan-only) or ``isinstance(x, NA) or x != x``.
+
+    :param x: value to test
+    :return: ``True`` if ``x`` is a numeric na, ``False`` otherwise
+    """
     if isinstance(x, NA):
-        return getattr(x.type, '_na_value', None)
-    return x
-
-
-def _wrap(result: float) -> Any:
-    """Normalize a float result back to one of the NA singletons, or NA(float)."""
-    if result != result:  # nan
-        return na_nan
-    if result == _INF:
-        return na_inf
-    if result == _NEG_INF:
-        return na_neg_inf
-    # Finite result from an inf/nan operand should not happen under IEEE-754
-    return NA(float)
+        return True
+    try:
+        return not isfinite(x)
+    except TypeError:
+        return False
 
 
 class NA(Generic[T]):
     """
-    Class representing NA (Not Available) values.
+    Class representing NA (Not Available) values for non-float types.
 
-    NA can optionally carry a Pine-native special value marker (inf, -inf, nan)
-    via its `type` slot pointing to one of the sentinel types (_InfType, etc.).
-    Valued NAs still report True under `isinstance(x, NA)` and Pine's `na()`
-    predicate — preserving the lib-internal NA-skip semantics — while their
-    comparison and arithmetic operators follow IEEE-754 so that user-level
-    Pine expressions (e.g. `inf > 40`) match TradingView behavior.
+    ``NA(float)`` does NOT construct an instance: it returns the interned
+    native ``float('nan')`` — Pine's float na is a real IEEE-754 nan, so
+    arithmetic and comparisons on it run at native float speed. This shim in
+    ``__new__`` is a permanent compatibility contract: every already-compiled
+    script calling ``NA(float)`` (and the ``na(float)`` constructor face)
+    transparently produces the native nan.
+
+    All other types (int, str, drawing objects, UDTs, ...) get interned NA
+    instances: every operation returns self, every comparison is False.
     """
     __slots__ = ('type',)
 
-    _type_cache: dict[Type, NA] = {}
+    _type_cache: dict[Type, 'NA'] = {}
 
     # noinspection PyShadowingBuiltins
     def __new__(cls, type: Type[T] | T | None = int) -> Self:
+        if type is float:
+            return _NAN  # type: ignore[return-value]
         if type is None:
             return super().__new__(cls)
         try:
@@ -102,107 +89,50 @@ class NA(Generic[T]):
     def __hash__(self) -> int:
         return hash(self.type)
 
-    def __int__(self) -> NA[int]:
+    def __int__(self) -> 'NA[int]':
         # We solve this with an AST Transformer
         raise TypeError("NA cannot be converted to int")
 
-    def __float__(self) -> NA[float]:
+    def __float__(self) -> 'NA[float]':
         # We solve this with an AST Transformer
         raise TypeError("NA cannot be converted to float")
 
     def __bool__(self) -> bool:
         return False
 
-    def __round__(self, n=None):
+    def __round__(self, n=None) -> Self:
         return self
 
     #
-    # Arithmetic operations
+    # Arithmetic operations — every operation propagates self
     #
 
-    def __neg__(self) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        return _wrap(-v)
+    def __neg__(self) -> Self:
+        return self
 
-    def __add__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(v + o)
-        except TypeError:
-            return self
+    def __add__(self, _: Any) -> Self:
+        return self
 
-    def __radd__(self, other: Any) -> Any:
-        return self.__add__(other)
+    def __radd__(self, _: Any) -> Self:
+        return self
 
-    def __sub__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(v - o)
-        except TypeError:
-            return self
+    def __sub__(self, _: Any) -> Self:
+        return self
 
-    def __rsub__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(o - v)
-        except TypeError:
-            return self
+    def __rsub__(self, _: Any) -> Self:
+        return self
 
-    def __mul__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(v * o)
-        except TypeError:
-            return self
+    def __mul__(self, _: Any) -> Self:
+        return self
 
-    def __rmul__(self, other: Any) -> Any:
-        return self.__mul__(other)
+    def __rmul__(self, _: Any) -> Self:
+        return self
 
-    def __truediv__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(v / o)
-        except (TypeError, ZeroDivisionError):
-            return self
+    def __truediv__(self, _: Any) -> Self:
+        return self
 
-    def __rtruediv__(self, other: Any) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        o = _resolve(other)
-        if o is None:
-            return self
-        try:
-            return _wrap(o / v)
-        except (TypeError, ZeroDivisionError):
-            return self
+    def __rtruediv__(self, _: Any) -> Self:
+        return self
 
     def __mod__(self, _: Any) -> Self:
         return self
@@ -210,11 +140,8 @@ class NA(Generic[T]):
     def __rmod__(self, _: Any) -> Self:
         return self
 
-    def __abs__(self) -> Any:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return self
-        return _wrap(abs(v))
+    def __abs__(self) -> Self:
+        return self
 
     #
     # Bitwise operations
@@ -254,83 +181,26 @@ class NA(Generic[T]):
         return self
 
     #
-    # Comparisons
-    #
-    # Plain NA: all comparisons False (Pine semantics).
-    # Valued NA: IEEE-754 semantics against the backing float.
+    # Comparisons — all False (Pine semantics)
     #
 
-    def __eq__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v == o
-        except TypeError:
-            return False
+    def __eq__(self, _: Any) -> bool:
+        return False
 
-    def __ne__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v != o
-        except TypeError:
-            return False
+    def __ne__(self, _: Any) -> bool:
+        return False
 
-    def __gt__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v > o
-        except TypeError:
-            return False
+    def __gt__(self, _: Any) -> bool:
+        return False
 
-    def __lt__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v < o
-        except TypeError:
-            return False
+    def __lt__(self, _: Any) -> bool:
+        return False
 
-    def __le__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v <= o
-        except TypeError:
-            return False
+    def __le__(self, _: Any) -> bool:
+        return False
 
-    def __ge__(self, other: Any) -> bool:
-        v: float | None = getattr(self.type, '_na_value', None)
-        if v is None:
-            return False
-        o = _resolve(other)
-        if o is None:
-            return False
-        try:
-            return v >= o
-        except TypeError:
-            return False
+    def __ge__(self, _: Any) -> bool:
+        return False
 
     #
     # In contexts
@@ -363,12 +233,7 @@ class NA(Generic[T]):
         return self
 
 
-na_float = NA(float)
+na_float: float = _NAN
 na_int = NA(int)
 na_str = NA(str)
 na_bool = NA(bool)
-
-# Pine-native special float singletons. Cached by _type_cache through __new__.
-na_inf = NA(_InfType)
-na_neg_inf = NA(_NegInfType)
-na_nan = NA(_NanType)

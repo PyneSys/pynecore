@@ -119,7 +119,7 @@ def _ref_sum_factory():
         if length == 1:
             return source
         length = int(length)
-        isna = isinstance(source, NA)
+        isna = isinstance(source, NA) or source != source
         if not isna:
             buf.append(float(source))
         if count < length - 1:
@@ -162,8 +162,8 @@ def __test_math_sum_bit_exact__():
         for v in values:
             got = lib.math.sum(state, v, 5)
             want = ref(v, 5)
-            if isinstance(want, NA):
-                assert isinstance(got, NA)
+            if isinstance(want, NA) or want != want:
+                assert isinstance(got, NA) or got != got
             else:
                 assert got == want
             next_bar()
@@ -173,7 +173,8 @@ def __test_math_sum_length_one_shortcut__():
     """ length == 1 returns the source untouched, without buffering """
     state = _make_state(lib.math.sum.__pyne_layout__)
     assert lib.math.sum(state, 3.3, 1) == 3.3
-    assert isinstance(lib.math.sum(state, NA(float), 1), NA)
+    na_result = lib.math.sum(state, NA(float), 1)
+    assert na_result != na_result  # the untouched na source is the native nan
     assert state[2] == 0  # the count slot stayed untouched
 
 

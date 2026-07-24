@@ -86,6 +86,7 @@ class _Slot:
     name: str  # debug name for the layout 'names' tuple
     init: ast.expr  # template expression for the layout 'init' tuple
     max_bars_back: ast.expr | None = None  # series slots only
+    series_elem: str | None = None  # series slots only: element type name ('float') or None
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
     varip: bool = False  # var slots and their kahan companions only
@@ -134,15 +135,18 @@ class ScopeLayout:
         return self._add(_Slot(len(self.slots), 'kahan', f'{name}·kahan', ast.Constant(value=0.0),
                                varip=varip))
 
-    def add_series(self, name: str, max_bars_back: ast.expr) -> int:
+    def add_series(self, name: str, max_bars_back: ast.expr, elem: str | None = None) -> int:
         """Allocate a series slot (``_make_state`` puts a fresh ``SeriesImpl`` here).
 
         :param name: Source-level variable name (debug only).
         :param max_bars_back: Expression for the series' ``max_bars_back`` argument.
+        :param elem: Element type name from the ``Series[T]`` annotation when it
+            is statically known (currently only ``'float'`` matters: those
+            series get the native nan as their out-of-range na value).
         :return: The allocated slot index.
         """
         return self._add(_Slot(len(self.slots), 'series', name, ast.Constant(value=None),
-                               max_bars_back=max_bars_back))
+                               max_bars_back=max_bars_back, series_elem=elem))
 
     def add_child(self, call_id: str, *, in_loop: bool) -> int:
         """Allocate a child slot for an isolated call site.
@@ -255,7 +259,8 @@ def _scope_entry_ast(scope: ScopeLayout) -> ast.Dict:
     series = ast.Tuple(
         elts=[ast.Tuple(elts=[ast.Constant(value=slot.index),
                               slot.max_bars_back if slot.max_bars_back is not None
-                              else ast.Constant(value=None)],
+                              else ast.Constant(value=None),
+                              ast.Constant(value=slot.series_elem)],
                         ctx=ast.Load())
               for slot in scope.slots if slot.kind == 'series'],
         ctx=ast.Load())

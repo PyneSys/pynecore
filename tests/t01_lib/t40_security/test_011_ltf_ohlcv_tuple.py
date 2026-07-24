@@ -95,7 +95,7 @@ def _assert(rows, expected_size, expected_base_sum):
     ``size * {open:1000, high:3000, low:0, close:2000}`` — confirming the arrays
     stay column-major. An empty window yields size 0 and na sums."""
     import math
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     assert len(rows) == len(expected_size), f"bar count {len(rows)} != {len(expected_size)}"
     for i, (n, so, sh, sl, sc) in enumerate(rows):
@@ -104,13 +104,13 @@ def _assert(rows, expected_size, expected_base_sum):
         base_sum = expected_base_sum[i]
         if base_sum is None:
             for label, s in (("open", so), ("high", sh), ("low", sl), ("close", sc)):
-                assert isinstance(s, NA), f"bar {i} {label}: expected na, got {s!r}"
+                assert isna_num(s), f"bar {i} {label}: expected na, got {s!r}"
             continue
         for label, s, offset in (
                 ("low", sl, 0.0), ("open", so, 1000.0),
                 ("close", sc, 2000.0), ("high", sh, 3000.0)):
             expected = base_sum + size * offset
-            assert not isinstance(s, NA), f"bar {i} {label}: expected {expected}, got na"
+            assert not isna_num(s), f"bar {i} {label}: expected {expected}, got na"
             assert math.isclose(float(s), expected, abs_tol=1e-9), \
                 f"bar {i} {label}: sum {s} != {expected}"
 

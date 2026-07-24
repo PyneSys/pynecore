@@ -121,7 +121,7 @@ def new(*args: Any, **kwargs: Any) -> Label:
     else:
         x = kwargs.get('x')
         y = kwargs.get('y')
-        x_val = int(x) if isinstance(x, (int, float)) else na_int
+        x_val = int(x) if isinstance(x, (int, float)) and x == x else na_int
         y_val = y if isinstance(y, (int, float)) else na_float
 
     label_obj = Label(
@@ -359,5 +359,5 @@ def get_y(id: Label) -> PyneInt | PyneFloat:
     :return: Price of the label
     """
     if isinstance(id, NA):
-        return NA(float)
+        return na_float
     return id.y

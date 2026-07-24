@@ -1005,11 +1005,23 @@ def _print_data_requirements(requirements: DataRequirements, script_name: str) -
 
     if requirements.cross_symbol:
         lines.append("")
-        lines.append("Cross-symbol data (separate download / --security mapping required):")
+        lines.append("Cross-symbol data (separate download / symbol_map / --security required):")
         for r in requirements.cross_symbol:
-            suffix = (" [mapping present]" if r.has_security_mapping
-                      else " ! no --security mapping")
+            if r.has_security_mapping:
+                suffix = " [--security mapping present]"
+            elif r.has_global_map:
+                status = "ok" if r.mapped_file_exists else "missing"
+                fname = Path(r.mapped_file).name if r.mapped_file else "?"
+                suffix = (f" [symbol_map -> {r.mapped_provider}:"
+                          f"{r.mapped_native_symbol} -> {fname} ({status})]")
+            else:
+                suffix = " ! no mapping"
             lines.append(f"  -> {r.symbol} @ {r.timeframe}{_tags(r)}{suffix}")
+            if r.has_global_map and not r.mapped_file_exists and r.download_suggestion:
+                lines.append(f"       download: {r.download_suggestion}")
+            elif not r.has_global_map and r.file_suggestions:
+                lines.append(f"       existing data matching ticker: "
+                             f"{', '.join(r.file_suggestions)}")
 
     if requirements.dynamic:
         lines.append("")
@@ -1619,7 +1631,8 @@ def run(
                                           chart_provider_name=chart_provider_name,
                                           chart_provider_instance=chart_provider_instance,
                                           time_from=time_from_dt,
-                                          chart_data_path=data_path)
+                                          chart_data_path=data_path,
+                                          config_dir=app_state.config_dir)
                 finally:
                     # Remove lib directory from Python path
                     if lib_path_added:

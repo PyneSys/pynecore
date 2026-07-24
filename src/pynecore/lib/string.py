@@ -6,7 +6,7 @@ from functools import lru_cache
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
 
-from ..types.na import NA
+from ..types.na import NA, na_float
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from ..types.format import Format
@@ -50,7 +50,7 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
     :param precision: Custom precision format string (like '#.##')
     :return: Formatted string
     """
-    if isinstance(value, NA) or value is None:
+    if isinstance(value, NA) or value is None or value != value:  # NA object or native nan
         return "NaN"
 
     # Handle special formats first
@@ -597,7 +597,7 @@ def tonumber(string: str) -> PyneFloat:
     try:
         return float(string)
     except ValueError:
-        return NA(float)
+        return na_float
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames

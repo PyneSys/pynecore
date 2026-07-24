@@ -3,9 +3,11 @@
 """
 import math
 
-from pynecore.types.na import NA, na_inf, na_neg_inf, na_nan, na_float
+from pynecore.types.na import NA, na_float, na_int, na_str
 from pynecore.core.safe_convert import safe_div
+from pynecore.lib import map as pine_map
 from pynecore.lib import na as is_na
+from pynecore.lib import nz
 
 
 def main():
@@ -14,156 +16,108 @@ def main():
 
 
 #
-# Identity and isinstance
+# Representation: NA(float) is the native nan
 #
 
-def __test_valued_na_are_singletons__():
-    """Valued NAs are cached singletons — repeated construction returns the same instance"""
-    from pynecore.types.na import _InfType, _NegInfType, _NanType
-    assert NA(_InfType) is na_inf
-    assert NA(_NegInfType) is na_neg_inf
-    assert NA(_NanType) is na_nan
+def __test_na_float_is_native_nan__():
+    """NA(float) returns a real IEEE-754 nan float, not an NA object"""
+    x = NA(float)
+    assert isinstance(x, float)
+    assert not isinstance(x, NA)
+    assert x != x
+    assert math.isnan(x)
 
 
-def __test_valued_na_are_instances_of_NA__():
-    """isinstance(x, NA) is True for valued singletons, so NA-skip guards keep working."""
-    assert isinstance(na_inf, NA)
-    assert isinstance(na_neg_inf, NA)
-    assert isinstance(na_nan, NA)
+def __test_na_float_is_interned__():
+    """NA(float) always returns the same interned nan object (identity fast paths)"""
+    assert NA(float) is NA(float)
+    assert NA(float) is na_float
 
 
-def __test_valued_na_distinct_from_plain_na__():
-    """Valued singletons must not collide with plain NA(float)"""
-    assert na_inf is not na_float
-    assert na_neg_inf is not na_float
-    assert na_nan is not na_float
-
-
-#
-# Comparisons — Pine IEEE-754 semantics for valued NA
-#
-
-def __test_na_inf_greater_than_finite__():
-    """na_inf behaves like +inf in comparisons: inf > any_finite is True"""
-    assert (na_inf > 40) is True
-    assert (na_inf > 0) is True
-    assert (na_inf > -1e300) is True
-    assert (na_inf >= 1e300) is True
-
-
-def __test_na_inf_not_less_than_finite__():
-    """inf < any_finite is False"""
-    assert (na_inf < 40) is False
-    assert (na_inf <= 40) is False
-
-
-def __test_na_neg_inf_less_than_finite__():
-    """-inf < any finite is True (IEEE-754: -inf is the smallest)"""
-    assert (na_neg_inf < 0) is True
-    assert (na_neg_inf < -1e300) is True
-    assert (na_neg_inf > -1e300) is False
-
-
-def __test_na_nan_comparisons_always_false__():
-    """NaN comparisons always return False (IEEE-754)"""
-    assert (na_nan > 0) is False
-    assert (na_nan < 0) is False
-    assert (na_nan == 0) is False
-    assert (na_nan >= 0) is False
-    assert (na_nan <= 0) is False
-
-
-def __test_plain_na_comparisons_always_false__():
-    """Plain NA comparisons still return False — backwards compatible"""
-    plain = na_float
-    assert (plain > 40) is False
-    assert (plain < 40) is False
-    assert (plain == 40) is False
-    assert (plain >= 40) is False
-    assert (plain <= 40) is False
-
-
-def __test_valued_na_against_each_other__():
-    """Comparisons between valued NAs follow IEEE-754"""
-    assert (na_inf > na_neg_inf) is True
-    assert (na_neg_inf < na_inf) is True
-    # inf == inf is True in IEEE-754
-    assert (na_inf == na_inf) is True
-    # nan vs anything is False
-    assert (na_nan == na_nan) is False
-    assert (na_inf > na_nan) is False
-    assert (na_neg_inf < na_nan) is False
+def __test_non_float_na_stays_object__():
+    """int/str/bool na remain interned NA objects — Python int/str have no nan"""
+    assert isinstance(NA(int), NA)
+    assert isinstance(NA(str), NA)
+    assert NA(int) is na_int
+    assert NA(str) is na_str
 
 
 #
-# Arithmetic — normalization back to singletons
+# Native IEEE-754 semantics of the float na
 #
 
-def __test_inf_times_positive__():
-    """inf * positive finite is still inf"""
-    assert na_inf * 100 is na_inf
-    assert 100 * na_inf is na_inf
-    assert na_inf * 1.5 is na_inf
+def __test_nan_arithmetic_propagates__():
+    """nan contaminates all arithmetic, like the NA object used to"""
+    x = NA(float)
+    assert math.isnan(x + 5)
+    assert math.isnan(5 - x)
+    assert math.isnan(x * 2.0)
+    assert math.isnan(x / 3.0)
+    assert math.isnan(-x)
+    assert math.isnan(abs(x))
 
 
-def __test_inf_times_negative__():
-    """inf * negative finite is -inf"""
-    assert na_inf * -1 is na_neg_inf
-    assert -1 * na_inf is na_neg_inf
+def __test_nan_ordering_comparisons_false__():
+    """<, >, <=, >=, == on nan are all False (TV-verified P1: same on TV)"""
+    x = NA(float)
+    assert (x > 0) is False
+    assert (x < 0) is False
+    assert (x >= 0) is False
+    assert (x <= 0) is False
+    assert (x == 0) is False
+    assert (x == x) is False
 
 
-def __test_inf_times_zero_is_nan__():
-    """inf * 0 is nan (IEEE-754)"""
-    assert na_inf * 0 is na_nan
-    assert 0 * na_inf is na_nan
+def __test_nan_ne_is_true_at_python_level__():
+    """nan != x is True in raw IEEE — the ONE operator differing from TV.
+
+    TV evaluates `na != close` as false; compiled Pine `!=` therefore gets a
+    compiler-side wrapper (Phase 3). At the Python level the raw IEEE result
+    stays — this is what makes the `x != x` na-check idiom work.
+    """
+    x = NA(float)
+    assert (x != x) is True
+    assert (x != 0.0) is True
 
 
-def __test_inf_minus_inf_is_nan__():
-    """inf - inf is nan"""
-    assert (na_inf - na_inf) is na_nan
-    assert (na_inf + na_neg_inf) is na_nan
-
-
-def __test_neg_inf_plus_finite__():
-    """-inf + finite stays -inf"""
-    assert (na_neg_inf + 5) is na_neg_inf
-    assert (5 + na_neg_inf) is na_neg_inf
-
-
-def __test_negation__():
-    """-na_inf == na_neg_inf, -na_neg_inf == na_inf"""
-    assert -na_inf is na_neg_inf
-    assert -na_neg_inf is na_inf
-    # -nan stays nan
-    assert -na_nan is na_nan
-
-
-def __test_abs__():
-    """abs(-inf) == inf, abs(nan) stays nan"""
-    assert abs(na_neg_inf) is na_inf
-    assert abs(na_inf) is na_inf
-    assert abs(na_nan) is na_nan
-
-
-def __test_nan_propagation__():
-    """nan contaminates all arithmetic"""
-    assert (na_nan + 5) is na_nan
-    assert (na_nan * 5) is na_nan
-    assert (na_nan - 5) is na_nan
-    assert (5 + na_nan) is na_nan
-
-
-def __test_plain_na_arithmetic_unchanged__():
-    """Plain NA arithmetic still returns plain NA — lib code stays functional"""
-    plain = na_float
-    assert (plain + 5) is plain
-    assert (plain * 5) is plain
-    assert (plain - 5) is plain
-    assert (5 + plain) is plain
+def __test_inf_semantics_are_raw_ieee__():
+    """inf participates in arithmetic and comparisons as a normal IEEE value
+    (TV-verified P4: inf > 40 is true while na(inf) is also true)"""
+    inf = math.inf
+    assert (inf > 40) is True
+    assert (-inf < 0) is True
+    assert inf + 5 == inf
+    assert math.isnan(inf - inf)
+    assert math.isnan(inf * 0)
 
 
 #
-# safe_div — Pine-compatible division
+# NA object semantics unchanged for non-float types
+#
+
+def __test_na_object_comparisons_always_false__():
+    """NA object comparisons still return False, including !="""
+    x = na_int
+    assert (x > 40) is False
+    assert (x < 40) is False
+    assert (x == 40) is False
+    assert (x != 40) is False
+    assert (x != x) is False
+
+
+def __test_na_object_arithmetic_propagates_self__():
+    """NA object arithmetic returns the same NA object"""
+    x = na_int
+    assert (x + 5) is x
+    assert (5 + x) is x
+    assert (x * 5) is x
+    assert (x - 5) is x
+    assert abs(x) is x
+    assert (-x) is x
+
+
+#
+# safe_div — raw IEEE results (P4)
 #
 
 def __test_safe_div_normal_division__():
@@ -173,28 +127,28 @@ def __test_safe_div_normal_division__():
 
 
 def __test_safe_div_positive_by_zero_is_inf__():
-    """positive / 0 returns na_inf singleton"""
-    assert safe_div(2155.0, 0.0) is na_inf
-    assert safe_div(1.0, 0.0) is na_inf
+    """positive / 0 returns raw +inf"""
+    assert safe_div(2155.0, 0.0) == math.inf
+    assert safe_div(1.0, 0.0) == math.inf
 
 
 def __test_safe_div_negative_by_zero_is_neg_inf__():
-    """negative / 0 returns na_neg_inf singleton"""
-    assert safe_div(-2155.0, 0.0) is na_neg_inf
-    assert safe_div(-1.0, 0.0) is na_neg_inf
+    """negative / 0 returns raw -inf"""
+    assert safe_div(-2155.0, 0.0) == -math.inf
+    assert safe_div(-1.0, 0.0) == -math.inf
 
 
 def __test_safe_div_zero_by_zero_is_nan__():
-    """0 / 0 returns na_nan singleton"""
-    assert safe_div(0.0, 0.0) is na_nan
+    """0 / 0 returns nan"""
+    assert math.isnan(safe_div(0.0, 0.0))
 
 
-def __test_safe_div_na_input_returns_plain_na__():
-    """NA input propagates as plain NA, not a valued singleton"""
-    result = safe_div(na_float, 2.0)
-    assert isinstance(result, NA)
-    assert result is not na_inf
-    assert result is not na_nan
+def __test_safe_div_na_input_returns_nan__():
+    """na input propagates as nan"""
+    assert math.isnan(safe_div(NA(float), 2.0))
+    assert math.isnan(safe_div(2.0, NA(float)))
+    result = safe_div(na_int, 2.0)
+    assert math.isnan(result)
 
 
 def __test_safe_div_result_pine_semantics__():
@@ -203,33 +157,28 @@ def __test_safe_div_result_pine_semantics__():
     max_profit = 0.0
     drop_percent = safe_div(profit_drop, max_profit) * 100
     # inf * 100 = inf
-    assert drop_percent is na_inf
+    assert drop_percent == math.inf
     # Pine semantic: inf > 40 is True
     assert (drop_percent > 40) is True
     assert (drop_percent > 20) is True
 
 
 #
-# is_na — predicate must recognize valued NAs as NA
+# is_na — the na() predicate is not-isfinite for floats (P4)
 #
 
-def __test_is_na_on_valued_singletons__():
-    """Pine's na() predicate must return True for valued NA singletons"""
-    assert is_na(na_inf) is True
-    assert is_na(na_neg_inf) is True
-    assert is_na(na_nan) is True
-
-
-def __test_is_na_on_plain_na__():
-    """Plain NA still returns True"""
-    assert is_na(na_float) is True
-
-
-def __test_is_na_on_native_float_inf_nan__():
-    """Defensive: native float inf/nan should also be recognized as na"""
+def __test_is_na_on_non_finite_floats__():
+    """na() reports inf/-inf/nan as na (TV-verified: na(inf) is true)"""
     assert is_na(float('inf')) is True
     assert is_na(float('-inf')) is True
     assert is_na(float('nan')) is True
+    assert is_na(NA(float)) is True
+
+
+def __test_is_na_on_na_objects__():
+    """NA objects still report as na"""
+    assert is_na(na_int) is True
+    assert is_na(na_str) is True
 
 
 def __test_is_na_on_finite_values__():
@@ -240,21 +189,56 @@ def __test_is_na_on_finite_values__():
 
 
 #
-# ta.*-style internal guard: isinstance(mfv, NA) still filters out valued NA
+# nz — replacement follows the na() predicate (inf counts as na, P4)
 #
 
-def __test_isinstance_na_guards_still_work__():
-    """Simulates ta.accdist pattern: valued-NA operand must be caught by isinstance check"""
-    ad = 100.0
-    # Mimic mfm = 0/0 -> na_nan; mfv = na_nan * volume -> na_nan
-    mfm = safe_div(0.0, 0.0)
-    mfv = mfm * 1000  # volume
-    assert mfv is na_nan
-    assert isinstance(mfv, NA)
-    # The internal guard blocks the accumulation
-    if not isinstance(mfv, NA):
-        ad += mfv  # would poison ad
-    assert ad == 100.0  # unchanged, correct
+def __test_nz_replaces_nan__():
+    assert nz(NA(float), -5.0) == -5.0
+    assert nz(float('nan')) == 0
+
+
+def __test_nz_replaces_inf__():
+    """TV-verified P4: nz(inf, -5) is -5"""
+    assert nz(float('inf'), -5.0) == -5.0
+    assert nz(float('-inf'), -5.0) == -5.0
+
+
+def __test_nz_keeps_finite_and_na_objects_replaced__():
+    assert nz(3.25, -5.0) == 3.25
+    assert nz(0.0, -5.0) == 0.0
+    assert nz(na_int, 7) == 7
+
+
+#
+# map — an na key is storable and retrievable (TV-verified P5)
+#
+
+def __test_map_nan_key_roundtrip__():
+    """map.put with a float na key, then get/contains with a DIFFERENT nan object"""
+    m = pine_map.new()
+    pine_map.put(m, NA(float), 1.0)
+    assert pine_map.size(m) == 1
+    assert pine_map.contains(m, float('nan')) is True
+    assert pine_map.get(m, float('nan')) == 1.0
+
+
+def __test_map_nan_key_overwrite_and_remove__():
+    """Two nan keys canonicalize to one entry; remove finds it too"""
+    m = pine_map.new()
+    pine_map.put(m, float('nan'), 1.0)
+    old = pine_map.put(m, math.nan, 2.0)
+    assert old == 1.0
+    assert pine_map.size(m) == 1
+    assert pine_map.remove(m, float('nan')) == 2.0
+    assert pine_map.size(m) == 0
+
+
+def __test_map_normal_keys_unaffected__():
+    m = pine_map.new()
+    pine_map.put(m, 1.5, 'a')
+    pine_map.put(m, float('nan'), 'b')
+    assert pine_map.get(m, 1.5) == 'a'
+    assert pine_map.size(m) == 2
 
 
 #
@@ -269,5 +253,5 @@ def __test_in_operator_on_na_is_false_not_infinite__():
     IndexError) makes it loop forever.
     """
     assert ('anything' in NA(str)) is False
-    assert (42 in na_float) is False
+    assert (42 in na_int) is False
     assert (None in NA(bool)) is False

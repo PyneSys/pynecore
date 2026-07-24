@@ -76,7 +76,7 @@ def __test_ltf_opaque_tuple__(runner, log):
     import math
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     with tempfile.TemporaryDirectory() as td:
         ltf_path = _write_ltf(
@@ -95,13 +95,13 @@ def __test_ltf_opaque_tuple__(runner, log):
     for i, ((n, su, sd), (size, base_sum)) in enumerate(zip(rows, expected)):
         assert int(n) == size, f"bar {i}: size {n} != {size}"
         if base_sum is None:
-            assert isinstance(su, NA), f"bar {i} up: expected na, got {su!r}"
-            assert isinstance(sd, NA), f"bar {i} dn: expected na, got {sd!r}"
+            assert isna_num(su), f"bar {i} up: expected na, got {su!r}"
+            assert isna_num(sd), f"bar {i} dn: expected na, got {sd!r}"
             continue
         exp_up = base_sum + size * 2001.0
         exp_dn = base_sum + size * 1999.0
-        assert not isinstance(su, NA) and math.isclose(float(su), exp_up, abs_tol=1e-9), \
+        assert not isna_num(su) and math.isclose(float(su), exp_up, abs_tol=1e-9), \
             f"bar {i} up: sum {su} != {exp_up}"
-        assert not isinstance(sd, NA) and math.isclose(float(sd), exp_dn, abs_tol=1e-9), \
+        assert not isna_num(sd) and math.isclose(float(sd), exp_dn, abs_tol=1e-9), \
             f"bar {i} dn: sum {sd} != {exp_dn}"
     log.info("LTF opaque-tuple columns correct (LHS-derived arity)")

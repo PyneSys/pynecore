@@ -706,7 +706,7 @@ class _RealSeriesHarness:
     """
 
     _ROOT = "test_ltf_series_rollback_root"
-    _LAYOUT = {'init': (None,), 'series': [(0, 500)], 'varip': (),
+    _LAYOUT = {'init': (None,), 'series': [(0, 500, None)], 'varip': (),
                'children': (), 'names': ('hist',)}
 
     def __init__(self, *, roll_series: bool):

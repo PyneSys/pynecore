@@ -205,7 +205,12 @@ class PersistentTransformer(ast.NodeTransformer):
                 ],
                 orelse=[])
 
-        init = node.value if node.value is not None else ast.Name(id='na', ctx=ast.Load())
+        # A bare-``na`` default must be the na VALUE, not the ``na`` name — at module
+        # level ``na`` resolves to the ``is_na`` function object. Emit ``lib.na()``.
+        na_init = ast.Call(
+            func=ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()), attr='na', ctx=ast.Load()),
+            args=[], keywords=[])
+        init = node.value if node.value is not None else na_init
         slot = scope_layout.add_var(var_name, init, varip=varip)
         self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
         return None

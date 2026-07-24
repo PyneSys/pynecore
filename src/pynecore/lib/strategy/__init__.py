@@ -111,8 +111,10 @@ def _na_to_none(value: PyneStr | NA[str]) -> str | None: ...
 
 
 def _na_to_none(value):  # type: ignore[misc]
-    """Convert NA to None, pass through everything else."""
-    return None if isinstance(value, NA) else value
+    """Convert na (NA object or native nan float) to None, pass through everything else."""
+    if isinstance(value, NA) or value != value:
+        return None
+    return value
 
 
 def _exit_order_key(order_: 'Order') -> '_ExitOrderKey':
@@ -3440,7 +3442,7 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     :param qty: The quantity to round
     :return: The rounded quantity
     """
-    if isinstance(qty, NA):
+    if (isinstance(qty, NA) or qty != qty):
         return na_float
     rfactor = syminfo._size_round_factor  # noqa
     # Floor to the lot step (1 / rfactor). The float64 product can land an exact
@@ -3487,7 +3489,7 @@ def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     :param direction: The direction of the price
     :return: The rounded price
     """
-    if isinstance(price, NA):
+    if (isinstance(price, NA) or price != price):
         return na_float
     pricescale = syminfo.pricescale
     minmove = syminfo.minmove
@@ -3541,7 +3543,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     position = lib._script.position
 
-    if not isinstance(qty, NA) and qty <= 0.0:
+    if not (isinstance(qty, NA) or qty != qty) and qty <= 0.0:
         return
 
     if position.size == 0.0:
@@ -3572,8 +3574,8 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
             # caps this to the residual position size before dispatch.
             bound_size = adopted_size
 
-    if isinstance(qty, NA):
-        if not isinstance(qty_percent, NA):
+    if (isinstance(qty, NA) or qty != qty):
+        if not (isinstance(qty_percent, NA) or qty_percent != qty_percent):
             size = _size_round(-bound_size * (qty_percent * 0.01))
         else:
             size = -bound_size
@@ -3935,12 +3937,12 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
 
-    if isinstance(limit, NA):
+    if (isinstance(limit, NA) or limit != limit):
         limit = None
     elif limit is not None:
         # We need negative direction for entry limit orders - NOTE: it is tested
         limit = _price_round(limit, -direction_sign)
-    if isinstance(stop, NA):
+    if (isinstance(stop, NA) or stop != stop):
         stop = None
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
@@ -3954,7 +3956,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # 26560/26561 exact). The sizing price is the price the order would
     # execute at NOW — the current price when immediately executable, the
     # limit/stop price while it rests.
-    deferred_default = isinstance(qty, NA)
+    deferred_default = (isinstance(qty, NA) or qty != qty)
     market_sizing_price: float | None = None
     if deferred_default:
         exec_price = position.c
@@ -4163,7 +4165,7 @@ def exit(id: str, from_entry: str = "",
         if existing is not None and existing.consumed:
             return
 
-        is_rest_leg = isinstance(qty, NA) and isinstance(qty_percent, NA)
+        is_rest_leg = (isinstance(qty, NA) or qty != qty) and (isinstance(qty_percent, NA) or qty_percent != qty_percent)
         # Sibling legs reserve slices of the entry first-come-first-served
         # (consumed siblings keep their reservation until the entry fully
         # closes). Only sticky exit legs (book_seq is None) count as siblings;
@@ -4180,9 +4182,9 @@ def exit(id: str, from_entry: str = "",
         # holds 100% never creates an order (553/553 cycles), and against a
         # qty_percent=75 stop leg the same call is reduced to the remaining
         # 25% instead of being dropped.
-        if not isinstance(qty, NA):
+        if not (isinstance(qty, NA) or qty != qty):
             reserved = min(abs(qty), unreserved)
-        elif not isinstance(qty_percent, NA):
+        elif not (isinstance(qty_percent, NA) or qty_percent != qty_percent):
             reserved = min(abs(init_size) * (qty_percent * 0.01), unreserved)
         else:
             # No-qty "rest" leg: the whole unreserved remainder, so it never
@@ -4222,8 +4224,8 @@ def exit(id: str, from_entry: str = "",
         # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
         # from a flat position_avg_price (na) on a bar before the entry fills --
         # not a level-less market close that fires at the next open.
-        if (isinstance(limit, NA) and isinstance(stop, NA) and isinstance(profit, NA)
-                and isinstance(loss, NA) and _trail_price is None
+        if ((isinstance(limit, NA) or limit != limit) and (isinstance(stop, NA) or stop != stop) and (isinstance(profit, NA) or profit != profit)
+                and (isinstance(loss, NA) or loss != loss) and _trail_price is None
                 and trail_points_ticks is None):
             return
 
@@ -4411,11 +4413,11 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
 
-    if isinstance(limit, NA):
+    if (isinstance(limit, NA) or limit != limit):
         limit = None
     elif limit is not None:
         limit = _price_round(limit, direction_sign)  # TODO: test this if the direction here is correct
-    if isinstance(stop, NA):
+    if (isinstance(stop, NA) or stop != stop):
         stop = None
     elif stop is not None:
         stop = _price_round(stop, -direction_sign)  # TODO: test this if the direction here is correct
@@ -4425,7 +4427,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # The size computed here is the placement estimate, taken at the price the
     # order would execute at NOW — the current price when immediately
     # executable, the limit/stop price while it rests.
-    deferred_default = isinstance(qty, NA)
+    deferred_default = (isinstance(qty, NA) or qty != qty)
     market_sizing_price: float | None = None
     if deferred_default:
         exec_price = float(lib.close)
@@ -4488,7 +4490,7 @@ def avg_losing_trade() -> PyneFloat:
         return 0.0
     position = lib._script.position
     if position.losstrades == 0:
-        return NA(float)
+        return na_float
     return position.grossloss / position.losstrades
 
 
@@ -4499,7 +4501,7 @@ def avg_trade() -> PyneFloat:
         return 0.0
     position = lib._script.position
     if position.closed_trades_count == 0:
-        return NA(float)
+        return na_float
     return position.netprofit / position.closed_trades_count
 
 
@@ -4510,7 +4512,7 @@ def avg_winning_trade() -> PyneFloat:
         return 0.0
     position = lib._script.position
     if position.wintrades == 0:
-        return NA(float)
+        return na_float
     return position.grossprofit / position.wintrades
 
 

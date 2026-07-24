@@ -775,3 +775,83 @@ def aggregate(
 
     secho(f"Aggregated {source_count:,} → {target_count:,} candles ({source_tf} → {timeframe})")
     secho(f'Output: "{out_path}"')
+
+
+_SYMBOL_MAP_HEADER = """\
+# Global symbol map: TradingView-style script symbols -> provider-qualified
+# native symbols. The value format matches the [download] provider string
+# ("provider:BROKER:SYMBOL"). An optional ":TF" suffix on the KEY overrides a
+# single timeframe. One entry serves both backtest (the .ohlcv file is derived
+# via the provider's naming convention) and live (a native PluginSymbol).
+#
+# Example:
+#   [symbol_map]
+#   "BINANCE:BTCUSDT" = "ccxt:BYBIT:BTC/USDT:USDT"
+#   "NASDAQ:AAPL" = "capitalcom:AAPL"
+#   "NASDAQ:AAPL:60" = "capitalcom:AAPL"
+"""
+
+
+@app_data.command(name="map")
+def map_symbol(
+        tv_symbol: str = Argument(...,
+                                  help="TradingView-style symbol key, e.g. 'NASDAQ:AAPL' "
+                                       "or 'NASDAQ:AAPL:60' for a per-timeframe override"),
+        provider_symbol: str = Argument(...,
+                                        help="Provider-qualified native symbol, e.g. "
+                                             "'capitalcom:AAPL' or 'ccxt:BYBIT:BTC/USDT:USDT'"),
+):
+    """
+    Add or update a global symbol_map.toml entry.
+
+    Writes <workdir>/config/symbol_map.toml, creating it with a documented
+    header when absent and preserving existing entries and comments otherwise.
+    """
+    from ...core.symbol_map import MappedSymbol, SYMBOL_MAP_FILENAME
+
+    mapped = MappedSymbol.parse(provider_symbol)
+    if mapped is None:
+        secho(
+            f"Invalid provider symbol {provider_symbol!r}: expected "
+            f"'provider:native_symbol' (e.g. 'capitalcom:AAPL').",
+            err=True, fg=colors.RED)
+        raise Exit(1)
+
+    path = app_state.config_dir / SYMBOL_MAP_FILENAME
+    key_line = f'"{tv_symbol}" = "{provider_symbol}"'
+
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{_SYMBOL_MAP_HEADER}\n[symbol_map]\n{key_line}\n",
+                        encoding="utf-8")
+        secho(f'Created {path} with {tv_symbol} -> {provider_symbol}')
+        return
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    key_prefix = f'"{tv_symbol}"'
+    replaced = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(key_prefix):
+            after = stripped[len(key_prefix):].lstrip()
+            if after.startswith("="):
+                lines[i] = key_line
+                replaced = True
+                break
+
+    if not replaced:
+        # Insert right after the [symbol_map] header, or append the whole
+        # table when the file has no [symbol_map] section yet.
+        header_idx = next(
+            (i for i, ln in enumerate(lines) if ln.strip() == "[symbol_map]"), None)
+        if header_idx is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append("[symbol_map]")
+            lines.append(key_line)
+        else:
+            lines.insert(header_idx + 1, key_line)
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    verb = "Updated" if replaced else "Added"
+    secho(f'{verb} {tv_symbol} -> {provider_symbol} in {path}')

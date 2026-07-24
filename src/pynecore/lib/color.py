@@ -73,7 +73,7 @@ def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color 
     :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
     """
     # Pine propagates na: a na color or na transparency yields a na color
-    if isinstance(color, NA) or isinstance(transp, NA):
+    if isinstance(color, NA) or isinstance(transp, NA) or transp != transp:
         return NA(Color)
     if isinstance(color, str):
         color = Color(color)
@@ -111,7 +111,9 @@ def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA
     :return: A color calculated from the linear gradient between bottom_color to top_color
     """
     # na value/bounds propagate: TradingView returns a na color for such a bar.
-    if isinstance(value, NA) or isinstance(bottom_value, NA) or isinstance(top_value, NA):
+    if (isinstance(value, NA) or value != value
+            or isinstance(bottom_value, NA) or bottom_value != bottom_value
+            or isinstance(top_value, NA) or top_value != top_value):
         return NA(Color)
 
     # Handle edge cases

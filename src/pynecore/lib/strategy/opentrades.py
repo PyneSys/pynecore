@@ -1,4 +1,4 @@
-from ...types.na import NA
+from ...types.na import NA, na_float
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
@@ -18,7 +18,7 @@ def commission(trade_num: int) -> PyneFloat:
     :return: The sum of entry and exit fees paid in the open trade, expressed in strategy.account_currency
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -92,13 +92,13 @@ def entry_price(trade_num: int) -> PyneFloat:
     :return: The price of the open trade's entry
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
         return lib._script.position.open_trades[trade_num].entry_price
     except (IndexError, AssertionError):
-        return NA(float)
+        return na_float
 
 
 # noinspection PyProtectedMember
@@ -128,7 +128,7 @@ def max_drawdown(trade_num: int) -> PyneFloat:
     :return: The maximum drawdown of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -146,7 +146,7 @@ def max_drawdown_percent(trade_num: int) -> PyneFloat:
     :return: The maximum drawdown percentage of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -164,7 +164,7 @@ def max_runup(trade_num: int) -> PyneFloat:
     :return: The maximum runup of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -182,7 +182,7 @@ def max_runup_percent(trade_num: int) -> PyneFloat:
     :return: The maximum runup percentage of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -199,7 +199,7 @@ def profit(trade_num: int) -> PyneFloat:
     :return: The profit of the open trade expressed in strategy.account_currency
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -216,7 +216,7 @@ def profit_percent(trade_num: int) -> PyneFloat:
     :return: The profit percentage of the open trade
     """
     if trade_num < 0:
-        return NA(float)
+        return na_float
     try:
         assert lib._script is not None
         assert lib._script.position is not None

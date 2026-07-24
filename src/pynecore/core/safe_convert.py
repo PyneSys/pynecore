@@ -1,5 +1,9 @@
+from math import inf as _INF
+
 from ..types import NA, PyneFloat, PyneInt
-from ..types.na import na_inf, na_neg_inf, na_nan
+from ..types.na import na_float as _NAN
+
+_NEG_INF = -_INF
 
 
 def safe_div(a: PyneFloat, b: PyneFloat):
@@ -8,27 +12,26 @@ def safe_div(a: PyneFloat, b: PyneFloat):
 
     Pine's `na()` predicate reports inf/-inf/nan as NA, but arithmetic and
     comparisons on those values follow IEEE-754 (e.g. `inf > 40` is true).
-    To satisfy both behaviors we return valued-NA singletons on division by
-    zero: `isinstance(x, NA)` stays true (lib-internal NA-skip keeps working),
-    while comparisons and arithmetic dispatch to the backing float.
+    Native floats give exactly that: division by zero returns raw inf/-inf/nan,
+    the `na()` predicate (`not isfinite`) reports them as na, and arithmetic
+    and comparisons on them follow IEEE-754 natively.
 
     @param a: The numerator.
     @param b: The denominator.
-    @return: a/b, one of the valued-NA singletons on zero denominator, or
-             plain NA(float) if inputs are NA.
+    @return: a/b, raw inf/-inf/nan on zero denominator, or nan for na inputs.
     """
-    if a is NA() or b is NA():
-        return NA(float)
+    if isinstance(a, NA) or a != a or isinstance(b, NA) or b != b:
+        return _NAN
     try:
         return a / b
     except ZeroDivisionError:
         if a > 0:
-            return na_inf
+            return _INF
         if a < 0:
-            return na_neg_inf
-        return na_nan
+            return _NEG_INF
+        return _NAN
     except TypeError:
-        return NA(float)
+        return _NAN
 
 
 def safe_float(value: PyneFloat) -> float:
@@ -37,13 +40,13 @@ def safe_float(value: PyneFloat) -> float:
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.
 
     @param value: The value to convert to float.
-    @return: The float value, or NA(float) if TypeError occurs.
+    @return: The float value, or _NAN if TypeError occurs.
     """
     try:
         return float(value)
     except TypeError:
         # NA values throw TypeError, convert these to NA
-        return NA(float)
+        return _NAN
 
 
 def safe_int(value: PyneInt) -> int:
@@ -56,6 +59,6 @@ def safe_int(value: PyneInt) -> int:
     """
     try:
         return int(value)
-    except TypeError:
-        # NA values throw TypeError, convert these to NA
+    except (TypeError, ValueError, OverflowError):
+        # NA objects throw TypeError; int(nan) throws ValueError; int(inf) OverflowError
         return NA(int)

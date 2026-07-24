@@ -10,6 +10,11 @@ __all__ = ['SeriesImpl', 'inline_series']
 
 T = TypeVar('T')
 
+# Interned na sentinel of untyped series (element type unknown at transform
+# time). Hybrid guards (``isinstance(x, NA) or x != x``) treat it and the
+# native nan as the same na.
+_NA_UNTYPED: NA = NA(T)
+
 
 class SeriesImpl(Generic[T]):
     """
@@ -23,7 +28,7 @@ class SeriesImpl(Generic[T]):
     __slots__ = ('_buffer',
                  '_max_bars_back', '_max_bars_back_set',
                  '_capacity', '_write_pos', '_size',
-                 '_last_bar_index')
+                 '_last_bar_index', '_na')
 
     DEFAULT_MAX_BARS_BACK = 500  # This can be set globally by indicator or strategy commands
     MAXIMUM_MAX_BARS_BACK = 5000  # This is the maximum allowed value
@@ -31,16 +36,22 @@ class SeriesImpl(Generic[T]):
     _lib: ModuleType = None  # Placeholder for the lib module
 
     # noinspection PyMissingConstructor
-    def __init__(self, max_bars_back: int | None = None):
+    def __init__(self, max_bars_back: int | None = None, na_value: T | None = None):
         """
         :param max_bars_back: Optional initial capacity for historical lookback.
                               If not provided, DEFAULT_MAX_BARS_BACK is used.
                               The actual buffer capacity will be (max_bars_back + 1).
+        :param na_value: The na sentinel returned for out-of-range reads.
+                         Float series pass the native nan here so a warmup /
+                         out-of-history read behaves exactly like every other
+                         float na; untyped series keep the interned NA object.
         """
         # Importing the lib module here to avoid circular imports
         if not SeriesImpl._lib:
             from .. import lib
             SeriesImpl._lib = lib
+
+        self._na: T | NA[T] = _NA_UNTYPED if na_value is None else na_value
 
         self._max_bars_back = max_bars_back or self.DEFAULT_MAX_BARS_BACK
         self._max_bars_back_set = max_bars_back or 0
@@ -171,7 +182,7 @@ class SeriesImpl(Generic[T]):
         :return: The value that was set, or na if buffer is empty.
         """
         if self._size == 0:
-            return cast(NA[T], NA(T))
+            return self._na
 
         pos = self._write_pos - 1
         if pos < 0:
@@ -237,13 +248,14 @@ class SeriesImpl(Generic[T]):
             key = 0
 
         if isinstance(key, float):
-            key = int(key)
+            # A native nan offset is an na offset -> current bar (int(nan) raises)
+            key = 0 if key != key else int(key)
 
         if isinstance(key, int):
             # Pine: out-of-range subscript -> na (covers both negative and
             # positive past-end indices).
             if key < 0 or key >= self._size:
-                return cast(NA[T], NA(T))
+                return self._na
             pos = self._write_pos - 1 - key
             if pos < 0:
                 pos += self._capacity

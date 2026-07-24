@@ -1,5 +1,11 @@
 from typing import TypeVar, Any
-from pynecore.types.na import NA
+# Canonical nan map key (the interned na_float). A nan never equals itself, so
+# two different nan float objects miss each other in a dict; the CPython lookup
+# identity fast path DOES hit for the same object though. Canonicalizing every
+# nan key to this interned constant makes an na key storable and retrievable
+# (TV-verified: map.get / contains find a float(na) key after map.put with one).
+# Imported underscored so it stays out of the lib module-property registry.
+from pynecore.types.na import NA, na_float as _NAN_KEY
 
 TKey = TypeVar('TKey')
 TValue = TypeVar('TValue')
@@ -23,6 +29,8 @@ def contains(id: dict, key: Any) -> bool:
     :param id: The map to check.
     :param key: The key to check for.
     """
+    if key != key:
+        key = _NAN_KEY
     return key in id
 
 
@@ -45,6 +53,8 @@ def get(id: dict[TKey, TValue], key: TKey) -> TValue:
     :param key: The key to get the value from.
     :return: The value associated with the key, or na when the key is absent.
     """
+    if key != key:
+        key = _NAN_KEY
     try:
         return id[key]
     except KeyError:
@@ -80,6 +90,8 @@ def put(id: dict, key: Any, value: TValue) -> TValue:
     :param value: The value to put in the map.
     :return: The value that was previously in the map.
     """
+    if key != key:
+        key = _NAN_KEY
     try:
         old_value = id[key]
     except KeyError:
@@ -108,10 +120,12 @@ def remove(id: dict[TKey, TValue], key: TKey) -> TValue:
     :param key: The key to remove from the map.
     :return: The value that was removed from the map.
     """
+    if key != key:
+        key = _NAN_KEY
     try:
         return id.pop(key)
     except KeyError:
-        return NA(None)  # We don't no the type of the map values here run-time
+        return NA(None)  # We don't know the type of the map values at run-time
 
 
 # noinspection PyShadowingBuiltins

@@ -26,8 +26,10 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
     so sharing them between instances without copying is safe. Series and
     loop-site child slots hold ``None`` placeholders here.
 ``series``
-    ``(slot, max_bars_back)`` pairs; :func:`_make_state` puts a fresh
-    :class:`~pynecore.core.series.SeriesImpl` into these slots.
+    ``(slot, max_bars_back, elem)`` triples; :func:`_make_state` puts a fresh
+    :class:`~pynecore.core.series.SeriesImpl` into these slots. ``elem`` is
+    the statically known element type name (``'float'`` selects the native
+    nan as the series' out-of-range na value) or ``None``.
 ``varip``
     Slot indexes of ``varip`` variables (excluded from var rollback).
 ``children``
@@ -82,6 +84,7 @@ from functools import partial
 
 from .pine_export import Exported
 from .series import SeriesImpl
+from ..types.na import na_float as _NAN
 
 __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
@@ -137,8 +140,8 @@ def _make_state(layout: dict[str, Any]) -> list:
     :return: New state vector.
     """
     state = list(layout['init'])
-    for slot, max_bars_back in layout['series']:
-        state[slot] = SeriesImpl(max_bars_back)
+    for slot, max_bars_back, elem in layout['series']:
+        state[slot] = SeriesImpl(max_bars_back, _NAN if elem == 'float' else None)
     for slot, _call_id, in_loop in layout['children']:
         if in_loop:
             state[slot] = []
@@ -349,7 +352,7 @@ def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
     :param layout: Layout entry.
     :return: Rollback slot indexes.
     """
-    excluded = {slot for slot, _max_bars_back in layout['series']}
+    excluded = {slot for slot, _max_bars_back, _elem in layout['series']}
     excluded.update(layout['varip'])
     excluded.update(slot for slot, _call_id, _in_loop in layout['children'])
     return tuple(i for i in range(len(layout['init'])) if i not in excluded)
@@ -438,7 +441,7 @@ class RootSeriesSnapshot:
         entries = (_root_vectors.values() if keys is None
                    else (_root_vectors[key] for key in keys if key in _root_vectors))
         for state, layout in entries:
-            slots = tuple(slot for slot, _max_bars_back in layout['series'])
+            slots = tuple(slot for slot, _max_bars_back, _elem in layout['series'])
             if slots:
                 self._targets.append((state, slots))
 
@@ -475,7 +478,7 @@ def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
     """
     layout: dict[str, Any] = getattr(func_or_layout, '__pyne_layout__', func_or_layout)
     names = layout.get('names')
-    series_slots = {slot for slot, _max_bars_back in layout['series']}
+    series_slots = {slot for slot, _max_bars_back, _elem in layout['series']}
     child_ids = {slot: call_id for slot, call_id, _in_loop in layout['children']}
     out: dict[str, Any] = {}
     for i, value in enumerate(state):

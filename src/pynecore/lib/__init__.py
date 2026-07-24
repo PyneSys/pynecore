@@ -763,8 +763,7 @@ def is_na(source: Any = None) -> bool | NA:
         # values in user scripts), which contradicts the honest annotation here
         return NA(source)  # pyright: ignore[reportReturnType]
     if isinstance(source, float):
-        if _math.isnan(source) or _math.isinf(source):
-            return True
+        return not _math.isfinite(source)
     return isinstance(source, NA) or source is NA
 
 
@@ -778,10 +777,15 @@ def nz(source: Any, replacement: Any = 0) -> Any:
     """
     Replace NA values with a replacement value or 0 if not specified
 
+    Uses the na() predicate semantics for floats: inf/-inf/nan are all na
+    (TV-verified: ``nz(inf, -5)`` is ``-5``).
+
     :param source: The source value
     :param replacement: The replacement value, default is 0
     :return: The source value if it is not NA, otherwise the replacement value
     """
+    if isinstance(source, float):
+        return source if _math.isfinite(source) else replacement
     if isinstance(source, NA):
         return replacement
     return source

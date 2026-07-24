@@ -83,14 +83,16 @@ class SeriesTransformer(ast.NodeTransformer):
                                attr=method, ctx=ast.Load()),
             args=args, keywords=[])
 
-    def _register(self, var_name: str) -> int:
+    def _register(self, var_name: str, elem: str | None = None) -> int:
         """Allocate a series slot for a declaration in the current scope.
 
         :param var_name: Source-level variable name.
+        :param elem: Statically known element type name from the ``Series[T]``
+            annotation (``'float'`` selects the native-nan na value), or None.
         :return: The allocated slot index.
         """
         slot = self.layout.scope(self.current_scope).add_series(
-            var_name, ast.Constant(value=None))
+            var_name, ast.Constant(value=None), elem)
         self.series_slots.setdefault(self.current_scope, {})[var_name] = slot
         self.series_declarations[self.current_scope].add(var_name)
         self.local_vars[self.current_scope].add(var_name)
@@ -103,6 +105,23 @@ class SeriesTransformer(ast.NodeTransformer):
             return (isinstance(annotation.value, ast.Name)
                     and annotation.value.id == 'Series')
         return isinstance(annotation, ast.Name) and annotation.id == 'Series'
+
+    @staticmethod
+    def _series_elem(annotation: ast.expr) -> str | None:
+        """Element type name of a ``Series[T]`` annotation, if statically known.
+
+        Only ``'float'`` is meaningful downstream (it selects the native nan
+        as the series' na value); everything else — bare ``Series``, other
+        element types, complex annotations — yields None.
+
+        :param annotation: The (Series) type annotation.
+        :return: ``'float'`` for ``Series[float]``, otherwise None.
+        """
+        if (isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.slice, ast.Name)
+                and annotation.slice.id == 'float'):
+            return 'float'
+        return None
 
     # --- visitors --------------------------------------------------------
 
@@ -131,7 +150,7 @@ class SeriesTransformer(ast.NodeTransformer):
         for arg in node.args.args:
             self.local_vars[self.current_scope].add(arg.arg)
             if arg.annotation is not None and self._is_series_type(arg.annotation):
-                slot = self._register(arg.arg)
+                slot = self._register(arg.arg, self._series_elem(arg.annotation))
                 arg.annotation = (arg.annotation.slice
                                   if isinstance(arg.annotation, ast.Subscript) else None)
                 param_inits.append(ast.Assign(
@@ -167,7 +186,7 @@ class SeriesTransformer(ast.NodeTransformer):
         if not self.current_scope:
             raise SyntaxError("Series variables must be declared inside a function")
 
-        slot = self._register(node.target.id)
+        slot = self._register(node.target.id, self._series_elem(node.annotation))
         if node.value is None:
             return None
         return ast.Assign(

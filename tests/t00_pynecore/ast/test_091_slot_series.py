@@ -71,7 +71,7 @@ def main(x):
 ''')
     layout = ns['__pyne_slot_layout__']['main']
     assert layout['init'] == (None,)
-    assert layout['series'] == ((0, None),)
+    assert layout['series'] == ((0, None, None),)
     assert layout['names'] == ('s',)
     state = _make_state(layout)
     assert isinstance(state[0], SeriesImpl)
@@ -101,7 +101,7 @@ def main(x):
     with _bars() as next_bar:
         value, prev = ns['main'](state, 3.0)
         assert value == 7.0
-        assert isinstance(prev, NA)
+        assert prev != prev  # float series: out-of-range na is the native nan
         next_bar()
         value, prev = ns['main'](state, 10.0)
         assert (value, prev) == (21.0, 7.0)
@@ -118,10 +118,11 @@ def f(src: Series[float], length):
     return src[1] + length
 ''')
     layout = ns['__pyne_slot_layout__']['f']
-    assert layout['series'] == ((0, None),)
+    assert layout['series'] == ((0, None, 'float'),)
     state = _make_state(layout)
     with _bars() as next_bar:
-        assert isinstance(ns['f'](state, 5.0, 100), NA)
+        first = ns['f'](state, 5.0, 100)
+        assert first != first  # float series: out-of-range na is the native nan
         next_bar()
         assert ns['f'](state, 7.0, 100) == 105.0
     assert 'def f(__state__, src: float, length):' in dump
@@ -170,7 +171,8 @@ def main(x):
     state = _make_state(layouts['main'])
     with _bars() as next_bar:
         prev = ns['main'](state, 1.0)
-        assert isinstance(prev(), NA)
+        first = prev()
+        assert first != first  # float series: out-of-range na is the native nan
         next_bar()
         prev = ns['main'](state, 2.0)
         assert prev() == 1.0
@@ -189,13 +191,13 @@ def main():
 ''')
     layout = ns['__pyne_slot_layout__']['main']
     # slot 0: the series buffer, slot 1: the persistent scalar
-    assert layout['series'] == ((0, None),)
+    assert layout['series'] == ((0, None, 'float'),)
     assert layout['init'] == (None, 0.5)
     state = _make_state(layout)
     with _bars() as next_bar:
         value, prev = ns['main'](state)
         assert value == 1.5
-        assert isinstance(prev, NA)
+        assert prev != prev  # float series: out-of-range na is the native nan
         next_bar()
         value, prev = ns['main'](state)
         assert (value, prev) == (2.5, 1.5)
@@ -218,12 +220,12 @@ def main():
     layouts = ns['__pyne_slot_layout__']
     assert set(layouts) == {'main'}  # both buffers anchor in main
     layout = layouts['main']
-    assert layout['series'] == ((0, None), (1, None))
+    assert layout['series'] == ((0, None, 'float'), (1, None, 'float'))
     state = _make_state(layout)
     with _bars() as next_bar:
         ns['lib'] = SimpleNamespace(close=10.0, high=11.0)
         a, _nested = ns['main'](state)
-        assert isinstance(a, NA)
+        assert a != a  # float series: out-of-range na is the native nan
         next_bar()
         ns['lib'] = SimpleNamespace(close=20.0, high=21.0)
         a, nested = ns['main'](state)
@@ -249,7 +251,8 @@ def main(x):
         for value in (1.0, 2.0, 3.0, 4.0):
             results.append(ns['main'](state, value))
             next_bar()
-    assert isinstance(results[0], NA) and isinstance(results[1], NA)
+    # float series: out-of-range na is the native nan
+    assert results[0] != results[0] and results[1] != results[1]
     assert results[2:] == [1.0, 2.0]
     assert '__state__[0].max_bars_back = 3' in dump
     assert 'lib.max_bars_back' not in dump

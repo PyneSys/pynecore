@@ -82,16 +82,16 @@ def _run(runner, chart_n, ltf_bars):
 
 def _assert(rows, expected_size, expected_sum):
     import math
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     assert len(rows) == len(expected_size), f"bar count {len(rows)} != {len(expected_size)}"
     for i, (n, s) in enumerate(rows):
         assert int(n) == expected_size[i], f"bar {i}: size {n} != {expected_size[i]}"
         exp = expected_sum[i]
         if exp is None:
-            assert isinstance(s, NA), f"bar {i}: expected na, got {s!r}"
+            assert isna_num(s), f"bar {i}: expected na, got {s!r}"
         else:
-            assert not isinstance(s, NA), f"bar {i}: expected {exp}, got na"
+            assert not isna_num(s), f"bar {i}: expected {exp}, got na"
             assert math.isclose(float(s), exp, abs_tol=1e-9), f"bar {i}: sum {s} != {exp}"
 
 

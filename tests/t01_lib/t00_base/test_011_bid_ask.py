@@ -16,7 +16,7 @@ def __test_bid_ask__(runner, log):
     from datetime import datetime, UTC
 
     from pynecore.types.ohlcv import OHLCV
-    from pynecore.types.na import NA
+    from pynecore.types.na import isna_num
 
     base = int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp())
 
@@ -30,6 +30,6 @@ def __test_bid_ask__(runner, log):
     ]
 
     for _candle, _plot in runner(iter(candles)).run_iter():
-        assert isinstance(_plot["bid"], NA), f"bid should be na, got {_plot['bid']!r}"
-        assert isinstance(_plot["ask"], NA), f"ask should be na, got {_plot['ask']!r}"
-        assert isinstance(_plot["bid_prev"], NA), f"bid[1] should be na, got {_plot['bid_prev']!r}"
+        assert isna_num(_plot["bid"]), f"bid should be na, got {_plot['bid']!r}"
+        assert isna_num(_plot["ask"]), f"ask should be na, got {_plot['ask']!r}"
+        assert isna_num(_plot["bid_prev"]), f"bid[1] should be na, got {_plot['bid_prev']!r}"

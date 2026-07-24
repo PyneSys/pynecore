@@ -16,6 +16,7 @@ from pynecore.core.broker.models import LegType
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
+from pynecore.types import NA
 
 if TYPE_CHECKING:
     from pynecore.lib.strategy import direction
@@ -482,7 +483,7 @@ class BrokerPosition(PositionBase):
             # Opening or adding to an existing position (same direction)
             new_abs = abs(new_size)
             old_abs = abs(self.size)
-            if old_abs == 0.0 or self.avg_price is na_float:
+            if old_abs == 0.0 or isinstance(self.avg_price, NA) or self.avg_price != self.avg_price:
                 self.avg_price = fill_price
             else:
                 self.avg_price = (self.avg_price * old_abs + fill_price * fill_qty) / new_abs

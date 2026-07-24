@@ -26,7 +26,7 @@ LAYOUT_LEAF = {
 # slot 3: loop child list, slot 4: varip
 LAYOUT_PARENT = {
     'init': (0, None, None, None, False),
-    'series': ((1, 10),),
+    'series': ((1, 10, None),),
     'varip': (4,),
     'children': ((2, 'main·acc·0', False), (3, 'main·acc·1', True)),
     'names': ('count', 'src', 'acc·0', 'acc·1', 'flag'),

@@ -318,6 +318,9 @@
     "mode": {
       "type": "variable"
     },
+    "na_float": {
+      "type": "variable"
+    },
     "new": {
       "type": "variable"
     },
@@ -936,9 +939,6 @@
     "Dividends": {
       "type": "variable"
     },
-    "NA": {
-      "type": "variable"
-    },
     "future_amount": {
       "type": "variable"
     },
@@ -949,6 +949,9 @@
       "type": "variable"
     },
     "gross": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "net": {
@@ -978,6 +981,9 @@
       "type": "variable"
     },
     "future_time": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "standardized": {
@@ -1583,6 +1589,9 @@
     "min": {
       "type": "variable"
     },
+    "na_float": {
+      "type": "variable"
+    },
     "phi": {
       "type": "variable"
     },
@@ -1736,6 +1745,9 @@
       "type": "variable"
     },
     "mult": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "new": {
@@ -2402,6 +2414,9 @@
     "max_runup_percent": {
       "type": "variable"
     },
+    "na_float": {
+      "type": "variable"
+    },
     "profit": {
       "type": "variable"
     },
@@ -2498,6 +2513,9 @@
       "type": "variable"
     },
     "max_runup_percent": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "opentrades": {
@@ -2603,6 +2621,9 @@
     "match": {
       "type": "variable"
     },
+    "na_float": {
+      "type": "variable"
+    },
     "pos": {
       "type": "variable"
     },
@@ -2699,6 +2720,9 @@
       "type": "variable"
     },
     "mintick": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "opening_hours": {
@@ -2965,6 +2989,9 @@
       "type": "variable"
     },
     "mom": {
+      "type": "variable"
+    },
+    "na_float": {
       "type": "variable"
     },
     "nvi": {

@@ -90,6 +90,15 @@ class CSVWriter:
 
         # Format string for float values
         fmt = '{:' + self._float_fmt + '}'
+
+        def fmt_float(x: object) -> str:
+            # Canonicalize na to Pine's "NaN". A native nan would format lowercase
+            # ("nan") via fmt; an NA object formats as "NaN" already but we keep the
+            # branch representation-agnostic so both map to the same token.
+            if isinstance(x, NA) or x != x:
+                return "NaN"
+            return fmt.format(x)
+
         row = []
 
         assert self._file is not None
@@ -139,12 +148,14 @@ class CSVWriter:
                         row.append(str(data.timestamp))
 
                     # Format OHLCV values
-                    row.extend(fmt.format(x) for x in (data.open, data.high, data.low, data.close, data.volume))
+                    row.extend(fmt_float(x) for x in (data.open, data.high, data.low, data.close, data.volume))
                     # Format extra fields
                     if data.extra_fields:
                         for value in data.extra_fields.values():
                             if isinstance(value, float):
-                                row.append(fmt.format(value))
+                                row.append(fmt_float(value))
+                            elif isinstance(value, NA):
+                                row.append("NaN")
                             else:
                                 row.append(str(value))
 
@@ -152,12 +163,14 @@ class CSVWriter:
                 else:
                     for value in data:
                         if isinstance(value, float):
-                            row.append(fmt.format(value))
+                            row.append(fmt_float(value))
                         elif isinstance(value, datetime):
                             if self._timestamp_as_iso:
                                 row.append(value.isoformat())
                             else:
                                 row.append(str(value))
+                        elif isinstance(value, NA):
+                            row.append("NaN")
                         else:
                             row.append(str(value))
 
@@ -405,7 +418,7 @@ class CSVReader:
             name = name.replace('&quot;', '"')  # Handle HTML quote entities
             try:
                 value = row[idx]
-                if value == "NaN" or value == "na":
+                if value == "NaN" or value == "na" or value == "nan":
                     extra[name] = NA()
                 else:
                     try:

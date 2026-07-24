@@ -1,4 +1,4 @@
-from ..types.na import NA
+from ..types.na import NA, na_float
 
 from ..types.color import Color
 from ..types.label import Label
@@ -44,7 +44,7 @@ def cast_bool(x: bool | int | float | NA) -> bool:
     :param x: The value to convert
     :return: The casted value
     """
-    if isinstance(x, NA):
+    if isinstance(x, NA) or x != x:  # NA object or native nan
         return False
     return not not x
 
@@ -66,7 +66,7 @@ def cast_int(x: int | float | NA) -> int:
     :param x: The value to convert
     :return: The casted value
     """
-    if isinstance(x, NA):
+    if isinstance(x, NA) or x != x:  # NA object or native nan
         return NA(int)
     return int(x)
 
@@ -88,8 +88,8 @@ def cast_float(x: float | int | NA) -> float:
     :param x: The value to convert
     :return: The casted value
     """
-    if isinstance(x, NA):
-        return NA(float)
+    if isinstance(x, NA) or x != x:  # NA object or native nan
+        return na_float
     return float(x)
 
 
