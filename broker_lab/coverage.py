@@ -330,6 +330,17 @@ REQUIREMENTS = (
         ("ctrader:ctrader-cancel-ack-without-push-terminalizes",),
     ),
     Requirement(
+        "ctrader-reconnect-history-settlement",
+        "cTrader",
+        "P0",
+        "Reconnect history retries a temporarily empty just-closed trendbar response",
+        "covered",
+        (
+            "ctrader:ctrader-reconnect-retries-temporarily-empty-history",
+            "ctrader:ctrader-control-one-shot-empty-history-is-detected",
+        ),
+    ),
+    Requirement(
         "ctrader-hedged-restart-close",
         "cTrader",
         "P0",
