@@ -31,6 +31,7 @@ Discovery::
 import inspect
 import re
 import sys
+from collections.abc import Iterable
 from typing import TypeVar, Generic, Any
 
 # noinspection PyProtectedMember
@@ -305,23 +306,26 @@ def normalize_package_name(name: str) -> str:
     return re.sub(r'[-_.]+', '-', name).strip().lower()
 
 
-def parse_pynecore_requirement(ep: EntryPoint) -> str:
+def parse_pynecore_requires(requires: Iterable[str]) -> str:
     """
-    Return the plugin's declared PyneCore version constraint.
+    Return the PyneCore version constraint declared in a ``Requires-Dist`` list.
 
-    Reads the ``Requires-Dist`` list and returns the whole specifier set of the
-    :data:`PYNECORE_PACKAGE` requirement — ``">=6.6.0"``, ``">=6.6.0,<7"``,
-    ``"~=6.6"`` — not just a lower bound, since an upper bound is meaningful:
-    PyneCore versions are ``PineVersion.Major.Minor``, so ``<7`` means "Pine v6
-    only".  Extras, parenthesized specifiers, environment markers, arbitrary
-    whitespace and non-normalized package names are all handled.
+    Returns the whole specifier set of the :data:`PYNECORE_PACKAGE` requirement
+    — ``">=6.6.0"``, ``">=6.6.0,<7"``, ``"~=6.6"`` — not just a lower bound,
+    since an upper bound is meaningful: PyneCore versions are
+    ``PineVersion.Major.Minor``, so ``<7`` means "Pine v6 only".  Extras,
+    parenthesized specifiers, environment markers, arbitrary whitespace and
+    non-normalized package names are all handled.
 
-    :param ep: The entry point of the plugin.
+    Takes the raw requirement strings rather than a distribution, so it also
+    works on metadata read from outside the running environment (e.g. the PyPI
+    JSON API's ``requires_dist``).
+
+    :param requires: ``Requires-Dist`` values of a distribution.
     :return: Normalized specifier set (e.g. ``">=6.6.0,<7"``), or ``""`` if the
         package does not declare a PyneCore dependency.
     """
-    assert ep.dist is not None
-    for req in ep.dist.requires or ():
+    for req in requires:
         m = _REQUIREMENT_RE.match(req.split(';', 1)[0])
         if m is None or normalize_package_name(m.group('name')) != PYNECORE_PACKAGE:
             continue
@@ -329,6 +333,18 @@ def parse_pynecore_requirement(ep: EntryPoint) -> str:
         clauses = (_SPECIFIER_RE.match(c) for c in raw.split(',') if c.strip())
         return ','.join(f"{c.group('op')}{c.group('version')}" for c in clauses if c)
     return ''
+
+
+def parse_pynecore_requirement(ep: EntryPoint) -> str:
+    """
+    Return the plugin's declared PyneCore version constraint.
+
+    :param ep: The entry point of the plugin.
+    :return: Normalized specifier set (e.g. ``">=6.6.0,<7"``), or ``""`` if the
+        package does not declare a PyneCore dependency.
+    """
+    assert ep.dist is not None
+    return parse_pynecore_requires(ep.dist.requires or ())
 
 
 def min_pynecore_version(specifier: str) -> str:
