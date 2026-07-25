@@ -153,15 +153,15 @@ pluggable; nested subcommands are addressed by their space-separated path,
 e.g. `"data download"`):
 
 ```python
-import click
+from pynecore.core.plugin import CLIPlugin, CLIOption
 
 class FooPlugin(CLIPlugin):
     @staticmethod
-    def cli_params(command_name: str) -> list[click.Parameter]:
+    def cli_params(command_name: str) -> list[CLIOption]:
         if command_name == "run":
             return [
-                click.Option(
-                    ["--verbose", "-V"],
+                CLIOption(
+                    ("--verbose", "-V"),
                     is_flag=True,
                     default=False,
                     help="Enable verbose output",
@@ -179,9 +179,17 @@ def run(ctx: typer.Context, script: Path = ..., data: Path = ...):
     verbose = ctx.plugin_params.get("verbose", False)
 ```
 
-> **Note:** Use standard `click.Option` / `click.Argument` — these are the same
-> objects you'd use in any Click application.  Typer-specific features like
-> `rich_help_panel` are not available on injected parameters.
+A single option string can be passed directly (`CLIOption("--verbose", ...)`);
+pass a tuple when the option has a short form as well.  Besides `is_flag`,
+`default` and `help`, a spec accepts `type` (any single-argument converter such
+as `int` or `pathlib.Path`), `choices`, `metavar`, `required`, `multiple`,
+`hidden`, `envvar` and `rich_help_panel`.
+
+> **Note:** Describe options with `CLIOption`, never build parser objects
+> yourself.  Click is not a PyneCore dependency, and since Typer 0.26 it is not
+> a Typer dependency either — Typer vendors a reduced fork of it, whose parser
+> rejects foreign `click.Option` instances.  `CLIOption` keeps plugins working
+> across all of those.
 
 #### Conflict Detection
 
@@ -753,9 +761,8 @@ propagate it:
 
 ```python
 from dataclasses import dataclass
-import click
 import typer
-from pynecore.core.plugin import ProviderPlugin, CLIPlugin, override
+from pynecore.core.plugin import ProviderPlugin, CLIPlugin, CLIOption, override
 
 
 @dataclass
@@ -804,9 +811,9 @@ class FooPlugin(ProviderPlugin[FooConfig], CLIPlugin):
     # --- CLIPlugin: parameter hooks ---
 
     @staticmethod
-    def cli_params(command_name: str) -> list[click.Parameter]:
+    def cli_params(command_name: str) -> list[CLIOption]:
         if command_name == "run":
-            return [click.Option(["--sandbox"], is_flag=True, default=False)]
+            return [CLIOption("--sandbox", is_flag=True, default=False)]
         return []
 ```
 

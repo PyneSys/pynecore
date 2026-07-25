@@ -1,15 +1,11 @@
 import logging
-import sys
 from pathlib import Path
 
-try:
-    import click
-except ImportError:
-    print("You need to install click to run Pyne CLI. Please run `pip install click`.", file=sys.stderr)
-    raise SystemExit(1)
 import typer
+from typer.core import TyperGroup
 
 from ..app import app, app_state
+from ..pluggable import PluggableCommand
 from ..utils.error_hook import setup_global_error_logging
 
 # Import commands
@@ -284,25 +280,22 @@ _BUILTIN_COMMANDS = {'run', 'data', 'compile', 'benchmark', 'debug', 'plugin'}
 _PLUGGABLE_COMMANDS = ('run', 'data download')
 
 
-def _resolve_command(group: "click.Group", path: str) -> "click.Command | None":
-    """Walk a space-separated command path into nested Click groups."""
-    node: click.Command = group
+def _resolve_command(group: TyperGroup, path: str) -> PluggableCommand | None:
+    """Walk a space-separated command path down to a pluggable command."""
     parts = path.split()
+    node = group
     for part in parts[:-1]:
-        if not isinstance(node, click.Group):
+        child = node.commands.get(part)
+        if not isinstance(child, TyperGroup):
             return None
-        node = node.commands.get(part)  # type: ignore[assignment]
-        if node is None:
-            return None
-    if not isinstance(node, click.Group):
-        return None
-    return node.commands.get(parts[-1])
+        node = child
+    leaf = node.commands.get(parts[-1])
+    return leaf if isinstance(leaf, PluggableCommand) else None
 
 
 def _register_cli_plugins():
     """Load CLIPlugin subcommands and parameter hooks from installed plugins."""
     from ...core.plugin import discover_plugins, CLIPlugin
-    from ..pluggable import PluggableCommand
 
     for name, ep in discover_plugins().items():
         try:
@@ -330,15 +323,15 @@ def _register_cli_plugins():
                     continue
 
                 group = typer.main.get_command(app)
-                assert isinstance(group, click.Group)
-                click_cmd = _resolve_command(group, cmd_path)
-                if not isinstance(click_cmd, PluggableCommand):
+                assert isinstance(group, TyperGroup)
+                command = _resolve_command(group, cmd_path)
+                if command is None:
                     continue
 
                 for param in params:
-                    if not click_cmd.register_plugin_param(param):
+                    if not command.register_plugin_param(param):
                         typer.secho(
-                            f"Warning: plugin '{name}' param '{param.name}' "
+                            f"Warning: plugin '{name}' param '{param.decls[0]}' "
                             f"conflicts on '{cmd_path}'",
                             fg="yellow", err=True,
                         )

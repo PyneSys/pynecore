@@ -36,10 +36,13 @@ classifiers = [
 dependencies = []
 
 # With user-friendly CLI
-optional-dependencies.cli = ["typer", "rich", "tzdata"]
+# Typer floor: 0.16 is the first release exposing TyperChoice, needed to build
+# plugin-injected CLI options without depending on Click (Typer dropped its own
+# Click dependency in 0.26 in favour of a vendored fork).
+optional-dependencies.cli = ["typer>=0.16", "rich", "tzdata"]
 
 # All optional dependencies for cli and all built-in providers
-optional-dependencies.all = ["typer", "rich", "httpx", "ccxt", "pycryptodome", "tzdata"]
+optional-dependencies.all = ["typer>=0.16", "rich", "httpx", "ccxt", "pycryptodome", "tzdata"]
 
 #Optional dependencies for development
 optional-dependencies.dev = ["pytest", "pytest-spec"]
