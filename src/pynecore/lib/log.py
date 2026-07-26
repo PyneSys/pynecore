@@ -104,13 +104,12 @@ if rich:
 
                 # Create table for log output
                 output = Table.grid(padding=(0, 1))
-                output.expand = True
 
                 # Add columns - no style for first two columns to allow Text styling
                 output.add_column()  # Time column
                 output.add_column()  # Bar index column
                 output.add_column(style="log.level", width=8)  # Level column
-                output.add_column(ratio=1, style="log.message", overflow="fold")  # Message column
+                output.add_column(style="log.message", overflow="fold")  # Message column
 
                 # Build row with styled Text objects
                 row = [
