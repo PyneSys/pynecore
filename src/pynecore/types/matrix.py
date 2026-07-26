@@ -30,6 +30,10 @@ class Matrix(Generic[T]):
         # is an ``enumerate()`` over the same iterator.
         return iter(self.data)
 
+    def __len__(self) -> int:
+        """The number of rows, so ``len(matrix)`` mirrors ``matrix.rows()``."""
+        return len(self.data)
+
     @property
     def rows(self) -> int:
         """Return the number of rows in the matrix."""
