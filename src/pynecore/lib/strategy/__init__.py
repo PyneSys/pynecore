@@ -35,7 +35,7 @@ __all__ = [
 
     'Trade', 'Order', 'PositionBase', 'SimPosition',
     "cancel", "cancel_all", "close", "close_all", "convert_to_account", "convert_to_symbol",
-    "entry", "exit", "order",
+    "default_entry_qty", "entry", "exit", "order",
 
     "closedtrades", "opentrades",
 ]
@@ -3910,6 +3910,22 @@ def _default_entry_qty(price: float) -> float:
         return lib._script.default_qty_value
     money, unit_cost = budget
     return money / unit_cost
+
+
+# noinspection PyShadowingNames
+def default_entry_qty(price: float) -> float:
+    """
+    The quantity of contracts/shares/lots/units a default-sized entry
+    (``strategy.entry`` without an explicit ``qty``) would buy at ``price``,
+    per the strategy's ``default_qty_type`` / ``default_qty_value``.
+
+    Public Pine API (``strategy.default_entry_qty``) over the internal
+    :func:`_default_entry_qty`.
+
+    :param price: The price the entry would execute at
+    :return: The default order size in contracts
+    """
+    return _default_entry_qty(price)
 
 
 # Distance threshold (in ticks) of the big-money gate's down-step in the
