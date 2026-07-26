@@ -55,7 +55,7 @@ from pynecore.core.plugin import is_retryable_provider_error
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.lib.log import broker_info, broker_warning
-from pynecore.lib.session import _is_in_session, _is_point_in_session
+from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 
 __all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer']
@@ -543,7 +543,7 @@ def live_ohlcv_generator(
             return True
         assert syminfo is not None and _sym_tz is not None
         local_dt = datetime.fromtimestamp(epoch_ts, tz=_sym_tz)
-        return _is_in_session(syminfo.opening_hours, local_dt, tf_seconds)
+        return is_in_session(syminfo.opening_hours, local_dt, tf_seconds)
 
     def _market_open_now() -> bool:
         """Point-in-time "is the market open right now?" check.
@@ -558,7 +558,7 @@ def live_ohlcv_generator(
             return True
         assert syminfo is not None and _sym_tz is not None
         local_dt = datetime.fromtimestamp(time.time(), tz=_sym_tz)
-        return _is_point_in_session(syminfo.opening_hours, local_dt)
+        return is_point_in_session(syminfo.opening_hours, local_dt)
 
     async def _async_loop():
         # Loop-side shutdown signal: ``_consumer`` sets it (cross-thread, via

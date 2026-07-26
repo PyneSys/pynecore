@@ -37,6 +37,7 @@ from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
+from pynecore.core.session import is_in_session
 from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
 
@@ -519,7 +520,6 @@ def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
     opening_hours = getattr(syminfo, 'opening_hours', None)
     if not opening_hours:
         return list(missing), []
-    from pynecore.lib.session import _is_in_session
     try:
         tz = ZoneInfo(syminfo.timezone)
     except Exception:  # noqa: BLE001
@@ -528,7 +528,7 @@ def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
     closed: list[int] = []
     for ts in missing:
         local_dt = datetime.fromtimestamp(ts, tz)
-        if _is_in_session(opening_hours, local_dt, tf_seconds):
+        if is_in_session(opening_hours, local_dt, tf_seconds):
             in_session.append(ts)
         else:
             closed.append(ts)
