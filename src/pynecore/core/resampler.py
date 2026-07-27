@@ -290,6 +290,81 @@ def weekday_from_ordinal(year: int, idx: int) -> date:
     return base + timedelta(days=rem if bw + rem <= 4 else rem + 2)
 
 
+def trading_day_end_sec(d: date, tz: ZoneInfo | dt_timezone | None,
+                        opening_hours: 'list[SymInfoInterval] | None') -> int | None:
+    """
+    Epoch seconds of the scheduled end of trading day ``d``.
+
+    The day ends with the last of its sessions: a rolling (overnight) interval
+    belongs to the trading day it opens into and ends the following weekday, a
+    bounded day session ends on its own weekday. A round-the-clock interval
+    (``00:00-00:00``) has no meaningful end inside the day and is skipped, which
+    keeps 24/7 feeds on the plain open-driven model.
+
+    TradingView closes a daily bar at this instant, which :func:`trading_day`
+    cannot express — it answers with a calendar date, derived from opens alone.
+    The last trading day of an overnight market's week makes the gap obvious: it
+    opens the previous evening and ends when the week closes, without any open of
+    its own (FX runs Sunday 17:00 -> Friday 17:00, so nothing opens on a Friday).
+
+    :param d: Trading day date
+    :param tz: Exchange timezone (``None`` uses the system's local timezone)
+    :param opening_hours: ``SymInfo.opening_hours``
+    :return: Latest scheduled end of ``d`` in epoch seconds, ``None`` if unknown
+    """
+    if not opening_hours:
+        return None
+    w = d.weekday()
+    best: int | None = None
+    for day, start, end in opening_hours:
+        if rolls_trading_day(start, end):
+            # Opens on weekday ``day``, so it ends inside trading day ``day + 1``
+            if (day + 1) % 7 != w:
+                continue
+        elif day != w or end <= start:
+            continue
+        sec = int(datetime(d.year, d.month, d.day,
+                           end.hour, end.minute, end.second, tzinfo=tz).timestamp())
+        if best is None or sec > best:
+            best = sec
+    return best
+
+
+def scheduled_day_open_sec(d: date, tz: ZoneInfo | dt_timezone | None,
+                           session_starts: 'list[SymInfoSession] | None',
+                           overnight: dict[int, dt_time]) -> int | None:
+    """
+    Epoch seconds of the session open that begins trading day ``d``, if scheduled.
+
+    For overnight markets this is the previous day's evening open (CME Monday
+    trading day -> Sunday 17:00). Returns ``None`` when the template schedules no
+    open for ``d`` at all — a weekend day on a Mon-Fri market — which lets a
+    caller walking the period grid skip such days instead of inventing one.
+
+    :param d: Trading day date
+    :param tz: Exchange timezone (``None`` uses the system's local timezone)
+    :param session_starts: ``SymInfo.session_starts`` template
+    :param overnight: Per-weekday rolling opens from :func:`overnight_opens`
+    :return: Session open in epoch seconds, ``None`` if ``d`` is not scheduled
+    """
+    best: int | None = None
+    if session_starts:
+        for delta in (1, 0):
+            od = d - timedelta(days=delta)
+            w = od.weekday()
+            for day, t in session_starts:
+                if day != w:
+                    continue
+                rolls = w in overnight and t >= overnight[w]
+                if (delta == 1) != rolls:
+                    continue
+                sec = int(datetime(od.year, od.month, od.day,
+                                   t.hour, t.minute, t.second, tzinfo=tz).timestamp())
+                if best is None or sec < best:
+                    best = sec
+    return best
+
+
 def trading_day_open_sec(d: date, tz: ZoneInfo | dt_timezone | None,
                          session_starts: 'list[SymInfoSession] | None',
                          overnight: dict[int, dt_time]) -> int:
@@ -308,21 +383,7 @@ def trading_day_open_sec(d: date, tz: ZoneInfo | dt_timezone | None,
     :param overnight: Per-weekday rolling opens from :func:`overnight_opens`
     :return: Session open in epoch seconds
     """
-    best: int | None = None
-    if session_starts:
-        for delta in (1, 0):
-            od = d - timedelta(days=delta)
-            w = od.weekday()
-            for day, t in session_starts:
-                if day != w:
-                    continue
-                rolls = w in overnight and t >= overnight[w]
-                if (delta == 1) != rolls:
-                    continue
-                sec = int(datetime(od.year, od.month, od.day,
-                                   t.hour, t.minute, t.second, tzinfo=tz).timestamp())
-                if best is None or sec < best:
-                    best = sec
+    best = scheduled_day_open_sec(d, tz, session_starts, overnight)
     if best is None:
         return int(datetime(d.year, d.month, d.day, tzinfo=tz).timestamp())
     return best
@@ -571,8 +632,13 @@ class Resampler:
         """
         Calculate the bar opening time for the current timeframe.
 
-        For daily, weekly, and monthly timeframes, the timezone determines where
-        midnight falls — i.e., which calendar day a timestamp belongs to.
+        For daily, weekly, and monthly timeframes the timezone determines where
+        the day boundary falls — i.e., which calendar day a timestamp belongs to.
+        Without ``session_starts`` that boundary is the timezone's midnight; with
+        one the period is the *trading* day (week/month) and it opens at that
+        period's session open, which for an overnight market is the previous
+        evening (FX daily bars open 17:00 New York). The two coincide for markets
+        whose session opens at midnight, so 24/7 feeds are unaffected either way.
 
         For intraday timeframes the bar grid is, by default, a pure UTC-epoch
         clock-floor (session-unaware fast path). When ``session_starts`` is given
@@ -655,6 +721,56 @@ class Resampler:
                 if gmode == 'weekday' and slot.weekday() >= 5:
                     # First scheduled day of the period's first month
                     slot += timedelta(days=7 - slot.weekday())
+
+            bar_start_sec = trading_day_open_sec(slot, tz, session_starts, on)
+
+        elif modifier in ('D', 'W', 'M') and session_starts:
+            # Single-period D/W/M on a market with a known session template. The
+            # period is the trading day (week/month) the timestamp belongs to, and
+            # it opens at that period's session open — for an overnight market the
+            # previous evening, exactly as TradingView stamps it (FX daily bars
+            # open 17:00 New York, not at New York midnight). Identical to the
+            # local-midnight branch below whenever the session opens at 00:00, so
+            # 24/7 and midnight-opening markets are unaffected.
+            on = overnight_opens(opening_hours, session_starts)
+            td = trading_day(current_time_sec, tz, on)
+
+            # A session-anchored period runs from its own open to the next one,
+            # so ``trading_day`` — which answers with a calendar date — has to be
+            # corrected at both ends of that window.
+            day_end = trading_day_end_sec(td, tz, opening_hours)
+            if day_end is not None and current_time_sec >= day_end:
+                # At or after the day's own close the period is over, but
+                # ``trading_day`` still answers with that day (its next open is
+                # what rolls it, and that may be days away, or never within the
+                # week). Step past it, otherwise the closing chart bar would
+                # resolve to the very period it completes.
+                td += timedelta(days=1)
+            else:
+                # Before the day's own open (a pre-market bar, or the overnight
+                # gap of a market that closes and reopens) the containing period
+                # is the previous SCHEDULED day's — skipping weekend days the
+                # template has no open for, so no phantom period is invented.
+                for _ in range(8):
+                    day_open = scheduled_day_open_sec(td, tz, session_starts, on)
+                    if day_open is not None and current_time_sec >= day_open:
+                        break
+                    td -= timedelta(days=1)
+
+            if modifier == 'D':
+                slot = td
+
+            elif modifier == 'W':
+                slot = td - timedelta(days=td.weekday())
+
+            else:  # 'M'
+                slot = date(td.year, td.month, 1)
+                if slot.weekday() >= 5:
+                    day_set = {day for day, _t in session_starts}
+                    if len(day_set) != 7:
+                        # Weekday market: the period starts on the month's first
+                        # scheduled day, not on a weekend calendar first.
+                        slot += timedelta(days=7 - slot.weekday())
 
             bar_start_sec = trading_day_open_sec(slot, tz, session_starts, on)
 

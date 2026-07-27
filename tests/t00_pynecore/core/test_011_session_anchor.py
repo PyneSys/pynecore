@@ -101,8 +101,12 @@ def __test_needs_anchor_is_per_timeframe__(log):
     # 00:00 open is on-grid for both.
     ss0 = [SymInfoSession(day=d, time=time(0, 0, 0)) for d in range(7)]
     assert _needs_session_anchor(ss0, _NY, "60") is False
-    # Daily/weekly/monthly are never session-anchored here.
-    assert _needs_session_anchor(ss, _NY, "1D") is False
+    # Daily/weekly/monthly anchor too: TradingView stamps a daily bar with its
+    # session open, measured on both a 09:30 equity (NASDAQ:AAPL daily bars at
+    # 14:30 UTC = 09:30 New York) and a 17:00 FX week (CAPITALCOM:EURUSD at
+    # 21:00 UTC = 17:00 New York). A midnight open leaves them on the grid.
+    assert _needs_session_anchor(ss, _NY, "1D") is True
+    assert _needs_session_anchor(ss0, _NY, "1D") is False
 
 
 def __test_get_confirmed_time_session_anchored__(log):

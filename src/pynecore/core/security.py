@@ -292,6 +292,11 @@ class SecurityState:
     # security's own exchange timezone (correct even for cross-symbol HTF).
     session_starts: 'list[SymInfoSession] | None' = None
     session_tz: ZoneInfo | None = None
+    # The security's own ``opening_hours``, carried alongside ``session_starts``
+    # so the D/W/M trading-day roll can be read from real session bounds instead
+    # of being inferred from opens alone — the last trading day of an overnight
+    # market's week ends without a new open (see ``overnight_opens``).
+    session_opening_hours: 'list[SymInfoInterval] | None' = None
 
     # Daily/weekly/monthly HTF confirmation (chart-side). The child's data file
     # realizes the actual trading calendar, so confirmation rides the child's
@@ -461,7 +466,8 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
             # Off-grid intraday session → anchor HTF bars to the session open,
             # using the security's own exchange timezone.
             return resampler.get_bar_time(
-                chart_time, state.session_tz, state.session_starts)
+                chart_time, state.session_tz, state.session_starts,
+                state.session_opening_hours)
         return resampler.get_bar_time(chart_time, state.tz)
 
     # OFF / LAST_CLOSED (and the historical ON fallback): the period preceding
@@ -473,9 +479,11 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         # Off-grid intraday session → anchor HTF bars to the session open,
         # using the security's own exchange timezone.
         period = resampler.get_bar_time(
-            close_time, state.session_tz, state.session_starts)
+            close_time, state.session_tz, state.session_starts,
+            state.session_opening_hours)
         grid_target = resampler.get_bar_time(
-            period - 1, state.session_tz, state.session_starts)
+            period - 1, state.session_tz, state.session_starts,
+            state.session_opening_hours)
     else:
         period = resampler.get_bar_time(close_time, state.tz)
         grid_target = resampler.get_bar_time(period - 1, state.tz)
@@ -1144,13 +1152,17 @@ def _needs_session_anchor(
     timeframe: str,
 ) -> bool:
     """
-    Whether intraday ``timeframe`` bars need session anchoring for this market.
+    Whether ``timeframe`` bars need session anchoring for this market.
 
     Session anchoring changes nothing when every declared session open already
-    lands on the ``timeframe`` UTC-epoch grid (24/7, on-hour, session-aligned
-    markets), so those keep the zero-overhead clock-floor fast path. The open is
-    probed on both a winter and a summer date to cover both DST offsets. The test
-    is deliberately conservative: it anchors whenever any open is off-grid.
+    lands on the ``timeframe`` grid, so those markets keep the zero-overhead
+    clock-floor fast path. For intraday timeframes the grid is the UTC epoch one
+    (24/7, on-hour, session-aligned markets are already on it) and the open is
+    probed on both a winter and a summer date to cover both DST offsets. For
+    D/W/M the grid is the exchange timezone's midnight, so anchoring matters
+    exactly for markets whose trading day opens at another hour — FX at 17:00,
+    futures at 18:00. The test is deliberately conservative: it anchors whenever
+    any open is off-grid.
 
     :param session_starts: Per-trading-day primary opens.
     :param tzinfo: The market's exchange timezone.
@@ -1165,7 +1177,7 @@ def _needs_session_anchor(
     # noinspection PyProtectedMember
     modifier, _ = tf_module._process_tf(timeframe)
     if modifier not in ('S', ''):
-        return False  # D/W/M alignment is timezone-driven, not session-anchored
+        return any(s.time != time(0, 0) for s in session_starts)
     tf_seconds = tf_module.in_seconds(timeframe)
     for probe in (_WINTER_PROBE, _SUMMER_PROBE):
         for s in session_starts:
@@ -1184,22 +1196,22 @@ def resolve_session_anchor(
     si: 'SymInfo | None',
     timeframe: str,
     fallback_tz: ZoneInfo,
-) -> 'tuple[list[SymInfoSession] | None, ZoneInfo | None]':
+) -> 'tuple[list[SymInfoSession] | None, ZoneInfo | None, list[SymInfoInterval] | None]':
     """
-    Decide intraday HTF session anchoring for one security context.
+    Decide HTF session anchoring for one security context.
 
-    Returns ``(session_starts, session_tz)`` to store on the ``SecurityState`` so
-    ``_get_confirmed_time`` anchors HTF bars to the session open, or ``(None,
-    None)`` when the market opens on the ``timeframe`` grid (the clock-floor fast
-    path). ``session_tz`` is the security's own exchange timezone — correct even
-    for a cross-symbol HTF in a different session.
+    Returns ``(session_starts, session_tz, opening_hours)`` to store on the
+    ``SecurityState`` so ``_get_confirmed_time`` anchors HTF bars to the session
+    open, or all-``None`` when the market opens on the ``timeframe`` grid (the
+    clock-floor fast path). ``session_tz`` is the security's own exchange
+    timezone — correct even for a cross-symbol HTF in a different session.
 
     :param si: The security's own ``SymInfo`` (``None`` → no anchoring).
     :param timeframe: The resolved HTF string (e.g. ``"60"``).
     :param fallback_tz: Timezone used if the syminfo timezone is missing/invalid.
     """
     if si is None or not getattr(si, 'session_starts', None):
-        return None, None
+        return None, None, None
     if si.timezone:
         try:
             # parse_timezone resolves both IANA names and UTC/GMT±HHMM offset
@@ -1212,8 +1224,8 @@ def resolve_session_anchor(
     else:
         si_tz = fallback_tz
     if _needs_session_anchor(si.session_starts, si_tz, timeframe):
-        return si.session_starts, si_tz
-    return None, None
+        return si.session_starts, si_tz, getattr(si, 'opening_hours', None) or None
+    return None, None, None
 
 
 def _session_bar_closes(
@@ -1608,6 +1620,7 @@ def setup_security_states(
         na_on_developing = False
         anchor_starts: 'list[SymInfoSession] | None' = None
         anchor_tz: ZoneInfo | None = None
+        anchor_oh: 'list[SymInfoInterval] | None' = None
         plain_ltf = False
         if is_ltf:
             is_gaps_on = False
@@ -1662,7 +1675,8 @@ def setup_security_states(
                 # cross-symbol HTF in a different exchange session.
                 si = (sec_syminfos.get(sec_id)
                       if sec_syminfos is not None else None) or chart_syminfo
-                anchor_starts, anchor_tz = resolve_session_anchor(si, timeframe, tz)
+                anchor_starts, anchor_tz, anchor_oh = resolve_session_anchor(
+                    si, timeframe, tz)
 
                 if is_same_symbol:
                     htf_aggregator = HTFAggregator(
@@ -1695,6 +1709,7 @@ def setup_security_states(
             na_on_developing=na_on_developing,
             session_starts=anchor_starts,
             session_tz=anchor_tz,
+            session_opening_hours=anchor_oh,
             chart_off=chart_off,
             chart_resampler=chart_ltf_resampler if (is_ltf or plain_ltf) else None,
             chart_dwm_modifier=chart_ltf_modifier if (is_ltf or plain_ltf) else '',

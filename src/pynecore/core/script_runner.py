@@ -1489,16 +1489,18 @@ class ScriptRunner:
                     resolved_path = resolved[sid]
                     sec_ohlcv_paths[sid] = resolved_path
                     # Now that the real symbol/timeframe are known, redo the
-                    # intraday session-anchor decision (the placeholder TF at
-                    # setup may have been the chart TF, and the syminfo may only
-                    # now be resolved).
+                    # session-anchor decision (the placeholder TF at setup may
+                    # have been the chart TF, and the syminfo may only now be
+                    # resolved).
                     if same_tf or plain_ltf:
                         sec_state.session_starts = None
                         sec_state.session_tz = None
+                        sec_state.session_opening_hours = None
                     else:
                         from .security import resolve_session_anchor
                         si = self._sec_syminfos.get(sid) or self.syminfo
-                        sec_state.session_starts, sec_state.session_tz = (
+                        (sec_state.session_starts, sec_state.session_tz,
+                         sec_state.session_opening_hours) = (
                             resolve_session_anchor(si, resolved_tf, self.tz))
                     if plain_ltf and sec_state.chart_resampler is None:
                         # Single-period civil D/W/M chart: the LTF target needs

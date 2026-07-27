@@ -2053,6 +2053,9 @@
     "extended": {
       "type": "variable"
     },
+    "is_in_session": {
+      "type": "variable"
+    },
     "isfirstbar": {
       "type": "property"
     },
