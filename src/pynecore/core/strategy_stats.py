@@ -29,6 +29,10 @@ class StrategyStatistics:
     max_equity_runup_percent: float = 0.0
     max_equity_drawdown: float = 0.0
     max_equity_drawdown_percent: float = 0.0
+    equity_max_drawdown: float = 0.0
+    equity_max_drawdown_percent: float = 0.0
+    real_max_drawdown: float = 0.0
+    real_max_drawdown_percent: float = 0.0
     buy_and_hold_return: float = 0.0
     buy_and_hold_return_percent: float = 0.0
     sharpe_ratio: float = 0.0
@@ -87,6 +91,14 @@ class StrategyStatistics:
     short_largest_losing_trade_percent: float = 0.0
     short_avg_bars: float = 0.0
 
+    # P&L breakdown (realized / unrealized / total)
+    total_pnl: float = 0.0
+    total_pnl_percent: float = 0.0
+    realized_pnl: float = 0.0
+    realized_pnl_percent: float = 0.0
+    unrealized_pnl: float = 0.0
+    unrealized_pnl_percent: float = 0.0
+
     # Other metrics
     margin_calls: int = 0
     max_contracts_held: float = 0.0
@@ -114,6 +126,10 @@ class StrategyStatistics:
             "Max Equity Run-up %": self.max_equity_runup_percent,
             "Max Equity Drawdown": self.max_equity_drawdown,
             "Max Equity Drawdown %": self.max_equity_drawdown_percent,
+            "Unrealized Max Drawdown": self.equity_max_drawdown,
+            "Unrealized Max Drawdown %": self.equity_max_drawdown_percent,
+            "Real Max Drawdown": self.real_max_drawdown,
+            "Real Max Drawdown %": self.real_max_drawdown_percent,
             "Buy & Hold Return": self.buy_and_hold_return,
             "Buy & Hold Return %": self.buy_and_hold_return_percent,
             "Sharpe Ratio": self.sharpe_ratio,
@@ -176,6 +192,14 @@ class StrategyStatistics:
             "Short Largest Losing Trade %": self.short_largest_losing_trade_percent,
             "Short Avg # Bars": self.short_avg_bars,
 
+            # P&L breakdown
+            "Total P&L": self.total_pnl,
+            "Total P&L %": self.total_pnl_percent,
+            "Realized P&L": self.realized_pnl,
+            "Realized P&L %": self.realized_pnl_percent,
+            "Unrealized P&L": self.unrealized_pnl,
+            "Unrealized P&L %": self.unrealized_pnl_percent,
+
             # Other
             "Margin Calls": self.margin_calls,
             "Max Contracts Held": self.max_contracts_held,
@@ -215,11 +239,25 @@ def calculate_strategy_statistics(
     stats.max_equity_drawdown_percent = float(position.max_drawdown_percent)
     stats.max_equity_runup_percent = float(position.max_runup_percent)
 
+    # Fork-parity drawdown family (percents already computed per-bar in Position)
+    stats.equity_max_drawdown = float(position.equity_max_drawdown)
+    stats.equity_max_drawdown_percent = float(position.equity_max_drawdown_percent)
+    stats.real_max_drawdown = float(position.real_max_drawdown)
+    stats.real_max_drawdown_percent = float(position.real_max_drawdown_percent)
+
+    # P&L breakdown: realized (closed) + unrealized (open) = total
+    stats.realized_pnl = stats.net_profit
+    stats.unrealized_pnl = float(position.openprofit) if not isinstance(position.openprofit, NA) else 0.0
+    stats.total_pnl = stats.realized_pnl + stats.unrealized_pnl
+
     # Calculate percentages
     if initial_capital > 0:
         stats.net_profit_percent = (stats.net_profit / initial_capital) * 100
         stats.gross_profit_percent = (stats.gross_profit / initial_capital) * 100
         stats.gross_loss_percent = (stats.gross_loss / initial_capital) * 100
+        stats.realized_pnl_percent = (stats.realized_pnl / initial_capital) * 100
+        stats.unrealized_pnl_percent = (stats.unrealized_pnl / initial_capital) * 100
+        stats.total_pnl_percent = (stats.total_pnl / initial_capital) * 100
 
     # Buy & Hold calculation
     if first_price and last_price and first_price > 0:
@@ -458,6 +496,19 @@ def write_strategy_statistics_csv(
     :param stats: Calculated strategy statistics
     :param csv_writer: CSV writer instance (already opened)
     """
+    # P&L breakdown: Total / Realized / Unrealized (fork-parity)
+    csv_writer.write("Total P&L",
+                     stats.total_pnl, stats.total_pnl_percent,
+                     "", "", "", ""
+                     )
+    csv_writer.write("Realized P&L",
+                     stats.realized_pnl, stats.realized_pnl_percent,
+                     "", "", "", ""
+                     )
+    csv_writer.write("Unrealized P&L",
+                     stats.unrealized_pnl, stats.unrealized_pnl_percent,
+                     "", "", "", ""
+                     )
     # Row 1: Net profit
     csv_writer.write("Net profit",
                      stats.net_profit, stats.net_profit_percent,
@@ -495,6 +546,15 @@ def write_strategy_statistics_csv(
     # Row 7: Max equity drawdown
     csv_writer.write("Max equity drawdown",
                      stats.max_equity_drawdown, stats.max_equity_drawdown_percent,
+                     "", "", "", ""
+                     )
+    # Unrealized (intrabar) + Real max drawdown (fork-parity)
+    csv_writer.write("Unrealized max drawdown",
+                     stats.equity_max_drawdown, stats.equity_max_drawdown_percent,
+                     "", "", "", ""
+                     )
+    csv_writer.write("Real max drawdown",
+                     stats.real_max_drawdown, stats.real_max_drawdown_percent,
                      "", "", "", ""
                      )
     # Row 8: Max contracts held
