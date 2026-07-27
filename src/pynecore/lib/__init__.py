@@ -124,10 +124,10 @@ _main_timeframe: str | None = None
 _plot_data: dict[str, Any] = {}
 
 # Plot-family registration state
-_plot_meta: dict[str, PlotMeta] = {}   # id -> meta, insertion order = registration order
-_plot_meta_new: list[PlotMeta] = []    # pending metas, drained only by the viz writer
-_viz_dyn: dict[str, Any] = {}          # per-bar dynamic channels, cleared with _plot_data
-_viz_seq: dict[str, int] = {}          # per-bar ordinal counters for bgcolor/barcolor/fill/hline
+_plot_meta: dict[str, PlotMeta] = {}  # id -> meta, insertion order = registration order
+_plot_meta_new: list[PlotMeta] = []  # pending metas, drained only by the viz writer
+_viz_dyn: dict[str, Any] = {}  # per-bar dynamic channels, cleared with _plot_data
+_viz_seq: dict[str, int] = {}  # per-bar ordinal counters for bgcolor/barcolor/fill/hline
 
 # Extra fields from CSV data (beyond OHLCV), populated each bar by ScriptRunner
 extra_fields: dict[str, Any] = {}
@@ -444,7 +444,7 @@ def plotarrow(series: Any, title: str | None = None, colorup: Any = None, colord
         _viz_dyn[t] = (colorup, colordown)
 
 
-# noinspection PyProtectedMember,PyShadowingBuiltins
+# noinspection PyProtectedMember,PyShadowingBuiltins,shadowing-names
 def plotcandle(open: Any, high: Any, low: Any, close: Any, title: str | None = None,
                color: Any = None, wickcolor: Any = None, editable: bool = True,
                show_last: int | None = None, bordercolor: Any = None, display: Any = None,
@@ -503,7 +503,7 @@ def plotcandle(open: Any, high: Any, low: Any, close: Any, title: str | None = N
         _viz_dyn[t] = (color, wickcolor, bordercolor)
 
 
-# noinspection PyProtectedMember,PyShadowingBuiltins
+# noinspection PyProtectedMember,PyShadowingBuiltins,shadowing-names
 def plotbar(open: Any, high: Any, low: Any, close: Any, title: str | None = None, color: Any = None,
             editable: bool = True, show_last: int | None = None, display: Any = None,
             format: str | None = None, precision: int | None = None,
@@ -633,7 +633,7 @@ _FILL_GRADIENT_PARAMS = ('plot1', 'plot2', 'top_value', 'bottom_value', 'top_col
                          'bottom_color', 'title', 'display', 'fillgaps', 'editable')
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,incorrect-docstring
 def fill(*args: Any, **kwargs: Any) -> None:
     """
     Fill the area between two plots or two hlines.
@@ -923,13 +923,18 @@ def second(time: int | None = None, timezone: str | None = None) -> int:
 
 ### Session parsing and validation helpers ###
 
-def _parse_session_string(session: str, timezone: str | None = None) -> 'SessionInfo':
+def _parse_session_string(session: str, timezone: str | None = None) -> list['SessionInfo']:
     """
-    Parse a session string into a SessionInfo object.
+    Parse a session string into one SessionInfo per time range.
 
-    :param session: Session string (e.g., "0930-1600", "0930-1600:23456", "0000-0000:1234567")
+    A session may list several comma-separated ranges ("0400-0700,0900-1300"); the
+    optional ``:days`` suffix applies to the whole specification, so every range
+    shares the same day set and timezone.
+
+    :param session: Session string (e.g., "0930-1600", "0930-1600:23456",
+                    "0400-0700,0900-1300:23456", "0000-0000:1234567")
     :param timezone: Timezone string, defaults to exchange timezone if None
-    :return: SessionInfo object
+    :return: One SessionInfo per time range, in the order they were written
     :raises ValueError: If session string is invalid
     """
     from ..types.session import SessionInfo
@@ -953,32 +958,33 @@ def _parse_session_string(session: str, timezone: str | None = None) -> 'Session
         # Default days in Pine Script v5 is all days (1234567)
         days_part = "1234567"
 
-    # Parse time part (HHMM-HHMM format)
-    if '-' not in time_part:
-        raise ValueError(f"Invalid session format: {session}. Expected HHMM-HHMM format")
+    # Parse time part (one or more comma-separated HHMM-HHMM ranges)
+    ranges: list[tuple[dt_time, dt_time]] = []
+    for range_part in time_part.split(','):
+        if '-' not in range_part:
+            raise ValueError(f"Invalid session format: {session}. Expected HHMM-HHMM format")
 
-    start_str, end_str = time_part.split('-', 1)
+        start_str, end_str = range_part.split('-', 1)
 
-    if len(start_str) != 4 or len(end_str) != 4:
-        raise ValueError(f"Invalid time format in session: {session}. Expected HHMM-HHMM")
+        if len(start_str) != 4 or len(end_str) != 4:
+            raise ValueError(f"Invalid time format in session: {session}. Expected HHMM-HHMM")
 
-    try:
-        start_hour = int(start_str[:2])
-        start_minute = int(start_str[2:])
-        end_hour = int(end_str[:2])
-        end_minute = int(end_str[2:])
+        try:
+            start_hour = int(start_str[:2])
+            start_minute = int(start_str[2:])
+            end_hour = int(end_str[:2])
+            end_minute = int(end_str[2:])
 
-        # Validate time values
-        if not (0 <= start_hour <= 23 and 0 <= start_minute <= 59):
-            raise ValueError(f"Invalid start time: {start_str}")
-        if not (0 <= end_hour <= 23 and 0 <= end_minute <= 59):
-            raise ValueError(f"Invalid end time: {end_str}")
+            # Validate time values
+            if not (0 <= start_hour <= 23 and 0 <= start_minute <= 59):
+                raise ValueError(f"Invalid start time: {start_str}")
+            if not (0 <= end_hour <= 23 and 0 <= end_minute <= 59):
+                raise ValueError(f"Invalid end time: {end_str}")
 
-        start_time = dt_time(start_hour, start_minute)
-        end_time = dt_time(end_hour, end_minute)
+            ranges.append((dt_time(start_hour, start_minute), dt_time(end_hour, end_minute)))
 
-    except ValueError as e:
-        raise ValueError(f"Invalid time values in session: {session}") from e
+        except ValueError as e:
+            raise ValueError(f"Invalid time values in session: {session}") from e
 
     # Parse days (1=Sunday, 2=Monday, ..., 7=Saturday)
     try:
@@ -991,28 +997,32 @@ def _parse_session_string(session: str, timezone: str | None = None) -> 'Session
     except ValueError as e:
         raise ValueError(f"Invalid days specification: {days_part}") from e
 
-    return SessionInfo(
-        start_time=start_time,
-        end_time=end_time,
-        days=days,
-        timezone=timezone
-    )
+    return [
+        SessionInfo(start_time=start_time, end_time=end_time, days=days, timezone=timezone)
+        for start_time, end_time in ranges
+    ]
 
 
-def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe: str) -> bool:
+def _is_bar_in_session(bar_time_ms: int, session_infos: list['SessionInfo'],
+                       timeframe: str) -> bool:
     """
-    Check if a bar time falls within the specified session.
+    Check if a bar time falls within any of the specified session ranges.
 
     :param bar_time_ms: Bar time in milliseconds (UNIX timestamp)
-    :param session_info: Session information
+    :param session_infos: Session ranges of one session specification -- every range
+                          shares the same day set and timezone, and the bar is in
+                          session as soon as one of them contains it
     :param timeframe: Timeframe string for calculating bar duration
     :return: True if bar is within session, False otherwise
     """
     from datetime import datetime, timedelta
 
+    if not session_infos:
+        return False
+
     # Convert bar time to datetime in session timezone
     bar_dt = datetime.fromtimestamp(bar_time_ms / 1000)
-    session_tz = _parse_timezone(session_info.timezone)
+    session_tz = _parse_timezone(session_infos[0].timezone)
     bar_dt_local = bar_dt.astimezone(session_tz)
 
     # Get the day of week in TradingView format (1=Sunday, 2=Monday, ..., 7=Saturday)
@@ -1021,16 +1031,6 @@ def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe:
     tv_weekday = (python_weekday + 2) % 7
     if tv_weekday == 0:
         tv_weekday = 7
-
-    # Check if the day is in the session days
-    if tv_weekday not in session_info.days:
-        return False
-
-    # A session whose start equals its end spans the full 24 hours -- this is
-    # Pine's "0000-0000" all-day session (the default of ``input.session``).
-    # The day of week is already validated above, so every bar on it qualifies.
-    if session_info.start_time == session_info.end_time:
-        return True
 
     # Get bar time components
     bar_time = bar_dt_local.time()
@@ -1046,20 +1046,34 @@ def _is_bar_in_session(bar_time_ms: int, session_info: 'SessionInfo', timeframe:
     bar_end_dt = bar_dt_local + timedelta(seconds=tf_seconds)
     bar_end_time = bar_end_dt.time()
 
-    # Handle overnight sessions
-    if session_info.is_overnight:
-        # Session spans midnight (e.g., 22:00-06:00)
-        # Bar is in session if it starts after session start OR ends before session end
-        in_session = (bar_time >= session_info.start_time or
-                      bar_end_time <= session_info.end_time)
-    else:
-        # Normal session within same day
-        # Bar is in session if it overlaps with the session time range
-        # Bar overlaps if: bar_start < session_end AND bar_end > session_start
-        in_session = (bar_time < session_info.end_time and
-                      bar_end_time > session_info.start_time)
+    for session_info in session_infos:
+        # Check if the day is in the session days
+        if tv_weekday not in session_info.days:
+            continue
 
-    return in_session
+        # A session whose start equals its end spans the full 24 hours -- this is
+        # Pine's "0000-0000" all-day session (the default of ``input.session``).
+        # The day of week is already validated above, so every bar on it qualifies.
+        if session_info.start_time == session_info.end_time:
+            return True
+
+        # Handle overnight sessions
+        if session_info.is_overnight:
+            # Session spans midnight (e.g., 22:00-06:00)
+            # Bar is in session if it starts after session start OR ends before session end
+            in_session = (bar_time >= session_info.start_time or
+                          bar_end_time <= session_info.end_time)
+        else:
+            # Normal session within same day
+            # Bar is in session if it overlaps with the session time range
+            # Bar overlaps if: bar_start < session_end AND bar_end > session_start
+            in_session = (bar_time < session_info.end_time and
+                          bar_end_time > session_info.start_time)
+
+        if in_session:
+            return True
+
+    return False
 
 
 def _intraday_session_args(timeframe: str) -> tuple:
@@ -1471,14 +1485,14 @@ def time(timeframe: str | None = None, session: str | int | None = None,
 
     # Parse session string
     try:
-        session_info = _parse_session_string(session, timezone)
+        session_infos = _parse_session_string(session, timezone)
     except ValueError:
         # Invalid session string
         return NA(int)
 
     # Check if the bar is within the session
     try:
-        if _is_bar_in_session(bar_time, session_info, timeframe):
+        if _is_bar_in_session(bar_time, session_infos, timeframe):
             return bar_time
         else:
             return NA(int)
@@ -1775,14 +1789,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     # Parse session string
     try:
-        session_info = _parse_session_string(session, timezone)
+        session_infos = _parse_session_string(session, timezone)
     except ValueError:
         # Invalid session string
         return NA(int)
 
     # Check if the bar is within the session (using bar start time for session validation)
     try:
-        if _is_bar_in_session(bar_start_time, session_info, timeframe):
+        if _is_bar_in_session(bar_start_time, session_infos, timeframe):
             return bar_close_time
         else:
             return NA(int)
