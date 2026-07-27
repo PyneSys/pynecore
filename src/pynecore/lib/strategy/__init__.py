@@ -724,6 +724,10 @@ class SimPosition(PositionBase):
         'size', 'sign', 'avg_price', 'cum_profit',
         'entry_equity', 'max_equity', 'min_equity',
         'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
+        'peak_equity', 'peak_realized_equity',
+        'close_max_drawdown', 'close_max_drawdown_percent',
+        'equity_max_drawdown', 'equity_max_drawdown_percent',
+        'real_max_drawdown', 'real_max_drawdown_percent',
         'entry_summ', 'open_commission',
         'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
         'risk_max_drawdown_value', 'risk_max_drawdown_type', 'risk_max_drawdown_alert',
@@ -786,6 +790,15 @@ class SimPosition(PositionBase):
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
+        # Fork-parity drawdown accumulators (P5): TV-close-based, intrabar-unrealized, and real
+        self.peak_equity: float = 0.0
+        self.peak_realized_equity: float = 0.0
+        self.close_max_drawdown: float = 0.0
+        self.close_max_drawdown_percent: float = 0.0
+        self.equity_max_drawdown: float = 0.0
+        self.equity_max_drawdown_percent: float = 0.0
+        self.real_max_drawdown: float = 0.0
+        self.real_max_drawdown_percent: float = 0.0
         self.entry_summ: PyneFloat = 0.0
         self.open_commission: float = 0.0
 
@@ -3110,6 +3123,64 @@ class SimPosition(PositionBase):
         if self.drawdown_summ or self.runup_summ:
             self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
             self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
+
+        # --- Fork-parity intrabar / TV-style drawdown accumulators (P5) ---
+        initial_capital = lib._script.initial_capital
+        commission_type = lib._script.commission_type
+        commission_value = lib._script.commission_value
+        pv = syminfo.pointvalue
+
+        # Real max drawdown: max sum of unrealized losses from losing open trades
+        if self.open_trades:
+            open_loss = 0.0
+            total_cost = 0.0
+            for trade in self.open_trades:
+                if trade.profit < 0:
+                    open_loss += trade.profit
+                    total_cost += abs(trade.size) * trade.entry_price * pv
+            if open_loss < 0:
+                current_dd = -open_loss
+                current_dd_pct = (current_dd / total_cost) * 100.0 if total_cost != 0 else 0.0
+                self.real_max_drawdown = max(self.real_max_drawdown, current_dd)
+                self.real_max_drawdown_percent = max(self.real_max_drawdown_percent, current_dd_pct)
+
+        # Close-based (TradingView-style) max drawdown: peak-to-trough of close equity,
+        # percent taken against the peak it fell from.
+        close_equity = initial_capital + self.netprofit + self.openprofit
+        self.peak_equity = max(self.peak_equity, close_equity)
+        _close_dd = self.peak_equity - close_equity
+        if _close_dd > self.close_max_drawdown:
+            self.close_max_drawdown = _close_dd
+            self.close_max_drawdown_percent = (
+                (_close_dd / self.peak_equity) * 100.0 if self.peak_equity != 0 else 0.0
+            )
+
+        # Equity (intrabar/unrealized) max drawdown: worst-case open P&L this bar,
+        # anchored to peak REALIZED equity (TV Max_Equity reference).
+        worst_case_open_pnl = 0.0
+        if self.open_trades:
+            for trade in self.open_trades:
+                worst_price = self.l if trade.size > 0 else self.h
+                raw_pnl = (worst_price - trade.entry_price) * trade.size * pv
+                if commission_type == _commission.percent:
+                    comm_cost = abs(trade.size) * trade.entry_price * pv * commission_value * 0.01
+                elif commission_type == _commission.cash_per_contract:
+                    comm_cost = abs(trade.size) * commission_value
+                elif commission_type == _commission.cash_per_order:
+                    comm_cost = commission_value
+                else:
+                    comm_cost = 0.0
+                worst_case_open_pnl += raw_pnl - comm_cost
+
+        realized_equity = initial_capital + self.netprofit
+        worst_equity = realized_equity + worst_case_open_pnl
+        self.peak_realized_equity = max(self.peak_realized_equity, realized_equity)
+        drawdown_from_peak = self.peak_realized_equity - worst_equity
+        if drawdown_from_peak > 0:
+            self.equity_max_drawdown = max(self.equity_max_drawdown, drawdown_from_peak)
+            _dd_pct = (drawdown_from_peak / self.peak_realized_equity) * 100.0 \
+                if self.peak_realized_equity != 0 else 0.0
+            self.equity_max_drawdown_percent = max(self.equity_max_drawdown_percent, _dd_pct)
 
     def _finalize_new_closed_trades(self) -> None:
         """Apply cumulative stats to every trade closed on this bar.
