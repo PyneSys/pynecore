@@ -29,8 +29,8 @@ class StrategyStatistics:
     max_equity_runup_percent: float = 0.0
     max_equity_drawdown: float = 0.0
     max_equity_drawdown_percent: float = 0.0
-    equity_max_drawdown: float = 0.0
-    equity_max_drawdown_percent: float = 0.0
+    unrealized_max_drawdown: float = 0.0
+    unrealized_max_drawdown_percent: float = 0.0
     real_max_drawdown: float = 0.0
     real_max_drawdown_percent: float = 0.0
     buy_and_hold_return: float = 0.0
@@ -126,8 +126,8 @@ class StrategyStatistics:
             "Max Equity Run-up %": self.max_equity_runup_percent,
             "Max Equity Drawdown": self.max_equity_drawdown,
             "Max Equity Drawdown %": self.max_equity_drawdown_percent,
-            "Unrealized Max Drawdown": self.equity_max_drawdown,
-            "Unrealized Max Drawdown %": self.equity_max_drawdown_percent,
+            "Unrealized Max Drawdown": self.unrealized_max_drawdown,
+            "Unrealized Max Drawdown %": self.unrealized_max_drawdown_percent,
             "Real Max Drawdown": self.real_max_drawdown,
             "Real Max Drawdown %": self.real_max_drawdown_percent,
             "Buy & Hold Return": self.buy_and_hold_return,
@@ -234,8 +234,8 @@ def calculate_strategy_statistics(
     stats.max_equity_drawdown = float(position.max_drawdown) if not isinstance(position.max_drawdown, NA) else 0.0
     stats.max_equity_runup = float(position.max_runup) if not isinstance(position.max_runup, NA) else 0.0
     # Fork-parity drawdown family (percents already computed per-bar in Position)
-    stats.equity_max_drawdown = float(position.equity_max_drawdown)
-    stats.equity_max_drawdown_percent = float(position.equity_max_drawdown_percent)
+    stats.unrealized_max_drawdown = float(position.unrealized_max_drawdown)
+    stats.unrealized_max_drawdown_percent = float(position.unrealized_max_drawdown_percent)
     stats.real_max_drawdown = float(position.real_max_drawdown)
     stats.real_max_drawdown_percent = float(position.real_max_drawdown_percent)
 
@@ -540,7 +540,7 @@ def write_strategy_statistics_csv(
                      )
     # Unrealized (intrabar) + Real max drawdown (fork-parity)
     csv_writer.write("Unrealized max drawdown",
-                     stats.equity_max_drawdown, stats.equity_max_drawdown_percent,
+                     stats.unrealized_max_drawdown, stats.unrealized_max_drawdown_percent,
                      "", "", "", ""
                      )
     csv_writer.write("Real max drawdown",

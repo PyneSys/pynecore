@@ -724,9 +724,8 @@ class SimPosition(PositionBase):
         'size', 'sign', 'avg_price', 'cum_profit',
         'entry_equity', 'max_equity', 'min_equity',
         'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
-        'peak_equity', 'peak_realized_equity',
-        'close_max_drawdown', 'close_max_drawdown_percent',
-        'equity_max_drawdown', 'equity_max_drawdown_percent',
+        'peak_realized_equity',
+        'unrealized_max_drawdown', 'unrealized_max_drawdown_percent',
         'real_max_drawdown', 'real_max_drawdown_percent',
         'entry_summ', 'open_commission',
         'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
@@ -790,13 +789,10 @@ class SimPosition(PositionBase):
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
-        # Fork-parity drawdown accumulators (P5): TV-close-based, intrabar-unrealized, and real
-        self.peak_equity: float = 0.0
+        # P5 drawdown accumulators: intrabar-unrealized (worst-case) and real (losing-open)
         self.peak_realized_equity: float = 0.0
-        self.close_max_drawdown: float = 0.0
-        self.close_max_drawdown_percent: float = 0.0
-        self.equity_max_drawdown: float = 0.0
-        self.equity_max_drawdown_percent: float = 0.0
+        self.unrealized_max_drawdown: float = 0.0
+        self.unrealized_max_drawdown_percent: float = 0.0
         self.real_max_drawdown: float = 0.0
         self.real_max_drawdown_percent: float = 0.0
         self.entry_summ: PyneFloat = 0.0
@@ -3144,18 +3140,7 @@ class SimPosition(PositionBase):
                 self.real_max_drawdown = max(self.real_max_drawdown, current_dd)
                 self.real_max_drawdown_percent = max(self.real_max_drawdown_percent, current_dd_pct)
 
-        # Close-based (TradingView-style) max drawdown: peak-to-trough of close equity,
-        # percent taken against the peak it fell from.
-        close_equity = initial_capital + self.netprofit + self.openprofit
-        self.peak_equity = max(self.peak_equity, close_equity)
-        _close_dd = self.peak_equity - close_equity
-        if _close_dd > self.close_max_drawdown:
-            self.close_max_drawdown = _close_dd
-            self.close_max_drawdown_percent = (
-                (_close_dd / self.peak_equity) * 100.0 if self.peak_equity != 0 else 0.0
-            )
-
-        # Equity (intrabar/unrealized) max drawdown: worst-case open P&L this bar,
+        # Unrealized (intrabar) max drawdown: worst-case open P&L this bar,
         # anchored to peak REALIZED equity (TV Max_Equity reference).
         worst_case_open_pnl = 0.0
         if self.open_trades:
@@ -3177,10 +3162,10 @@ class SimPosition(PositionBase):
         self.peak_realized_equity = max(self.peak_realized_equity, realized_equity)
         drawdown_from_peak = self.peak_realized_equity - worst_equity
         if drawdown_from_peak > 0:
-            self.equity_max_drawdown = max(self.equity_max_drawdown, drawdown_from_peak)
+            self.unrealized_max_drawdown = max(self.unrealized_max_drawdown, drawdown_from_peak)
             _dd_pct = (drawdown_from_peak / self.peak_realized_equity) * 100.0 \
                 if self.peak_realized_equity != 0 else 0.0
-            self.equity_max_drawdown_percent = max(self.equity_max_drawdown_percent, _dd_pct)
+            self.unrealized_max_drawdown_percent = max(self.unrealized_max_drawdown_percent, _dd_pct)
 
     def _finalize_new_closed_trades(self) -> None:
         """Apply cumulative stats to every trade closed on this bar.
