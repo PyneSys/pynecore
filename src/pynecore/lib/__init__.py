@@ -69,6 +69,8 @@ __all__ = [
 
     'fixnan', 'nz',
 
+    '__dividends_tickerid', '__earnings_tickerid', '__splits_tickerid',
+
     # Module properties
     'dayofmonth', 'dayofweek', 'hour', 'minute', 'month', 'second', 'weekofyear', 'year',
     'time', 'time_close', 'time_tradingday', 'timenow', 'na',
@@ -793,6 +795,59 @@ def nz(source: Any, replacement: Any = 0) -> Any:
     if isinstance(source, NA):
         return replacement
     return source
+
+
+# Prefix of TradingView's corporate-action data feeds. The three
+# ``__*_tickerid()`` helpers below are undocumented Pine built-ins that map a
+# regular ticker identifier onto such a feed, so that ``request.security()``
+# can read dividend/earnings/split events as a daily series.
+_CORPORATE_ACTION_PREFIX = 'ESD_FACTSET'
+
+
+def _corporate_action_tickerid(tickerid: str, feed: str) -> str:
+    """
+    Build a corporate-action feed identifier from a ticker identifier.
+
+    TV-measured (2026-07-27): ``NASDAQ:AAPL`` becomes
+    ``ESD_FACTSET:NASDAQ;AAPL;DIVIDENDS`` — a purely syntactic rewrite, applied
+    to any exchange/symbol pair without validating either.
+
+    :param tickerid: A ``EXCHANGE:SYMBOL`` ticker identifier
+    :param feed: The feed name (``DIVIDENDS``, ``EARNINGS``, ``SPLITS``)
+    :return: The corporate-action feed identifier
+    """
+    exchange, _, symbol = str(tickerid).partition(':')
+    return f"{_CORPORATE_ACTION_PREFIX}:{exchange};{symbol};{feed}"
+
+
+def __dividends_tickerid(tickerid: str) -> str:
+    """
+    Ticker identifier of the dividends feed of a symbol.
+
+    :param tickerid: A ``EXCHANGE:SYMBOL`` ticker identifier
+    :return: The dividends feed identifier
+    """
+    return _corporate_action_tickerid(tickerid, 'DIVIDENDS')
+
+
+def __earnings_tickerid(tickerid: str) -> str:
+    """
+    Ticker identifier of the earnings feed of a symbol.
+
+    :param tickerid: A ``EXCHANGE:SYMBOL`` ticker identifier
+    :return: The earnings feed identifier
+    """
+    return _corporate_action_tickerid(tickerid, 'EARNINGS')
+
+
+def __splits_tickerid(tickerid: str) -> str:
+    """
+    Ticker identifier of the splits feed of a symbol.
+
+    :param tickerid: A ``EXCHANGE:SYMBOL`` ticker identifier
+    :return: The splits feed identifier
+    """
+    return _corporate_action_tickerid(tickerid, 'SPLITS')
 
 
 #

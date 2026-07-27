@@ -11,8 +11,12 @@ T = TypeVar('T')
 
 class Series(Generic[T]):
     """
-    This is the runtime, do nothing implementation of the Series type. The actual Series behavior is
-    implented in AST Transformers and the SeriesImpl class.
+    Runtime placeholder for the Pine ``series`` type: it passes the value
+    through unchanged, so the annotation costs nothing at runtime.
+
+    The actual series behavior — history and ``[n]`` indexing — is implemented
+    by the AST transformers and the ``SeriesImpl`` class. What users see on
+    hover comes from ``series.pyi``, not from here.
     """
 
     def __new__(cls, val: T) -> T:
