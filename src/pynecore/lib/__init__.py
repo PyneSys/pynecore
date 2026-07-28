@@ -325,7 +325,11 @@ def plotshape(series: Any, title: str | None = None, style: Any = None, location
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plotshape function can only be called from the main function!")
     t = _uniq_title('Shape' if title is None else title)
-    _plot_data[t] = series if is_na(series) else int(bool(series))
+    # TradingView exports whatever the series holds, not a truthiness flag: a
+    # numeric series marks the bar AND carries its value into the exported
+    # column (measured: ``plotshape(cond ? high : na, location=location.abovebar)``
+    # exports the price). Only a genuine bool is serialized, as 0/1.
+    _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
     if meta is None:
         meta = PlotMeta(id=t, kind='shape', title=t, style=style, location=location, color=color,
@@ -376,7 +380,7 @@ def plotchar(series: Any, title: str | None = None, char: str | None = None, loc
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plotchar function can only be called from the main function!")
     t = _uniq_title('Char' if title is None else title)
-    _plot_data[t] = series
+    _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
     if meta is None:
         meta = PlotMeta(id=t, kind='char', title=t, char=char, location=location, color=color,
@@ -424,7 +428,7 @@ def plotarrow(series: Any, title: str | None = None, colorup: Any = None, colord
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plotarrow function can only be called from the main function!")
     t = _uniq_title('Arrows' if title is None else title)
-    _plot_data[t] = series
+    _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
     if meta is None:
         meta = PlotMeta(id=t, kind='arrow', title=t, colorup=colorup, colordown=colordown,

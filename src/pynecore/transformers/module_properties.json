@@ -2609,6 +2609,9 @@
     "format_time": {
       "type": "variable"
     },
+    "isinf": {
+      "type": "variable"
+    },
     "length": {
       "type": "variable"
     },

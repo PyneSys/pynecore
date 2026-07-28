@@ -143,9 +143,10 @@ repeated `id` as an update of the earlier record.
 | `c`    | object | `{plot_id: color}` — only for color channels that **changed** this bar. Omitted when empty. |
 
 `plotcandle` / `plotbar` expand to four keys per call: `"<title> (open)"`, `"<title> (high)"`,
-`"<title> (low)"`, `"<title> (close)"`. `plotshape` stores `0`/`1` (or `null` when its series is
-na); `plotchar` and `plotarrow` store the raw series value. Non-finite floats and na are encoded as
-`null`.
+`"<title> (low)"`, `"<title> (close)"`. `plotshape`, `plotchar` and `plotarrow` store the raw series
+value, with a bool series serialized as `0`/`1` — a marker call whose series is numeric (the usual
+`cond ? high : na` idiom) keeps that number, matching what TradingView exports. Non-finite floats and
+na are encoded as `null`.
 
 ### `ev` — drawing event (journal mode only)
 

@@ -9,10 +9,10 @@ from pynecore.lib import (
 
 @script.indicator("Family", "fam", overlay=True)
 def main():
-    # plotshape stores int(bool(series)); an NA series propagates as NA.
+    # plotshape stores the series as-is; only a bool is narrowed to 0/1.
     plotshape(close > open, "sh", style=shape.triangleup, location=location.belowbar,
               color=color.red)
-    # close[1] is NA on bar 0 -> stored as NA; a real value afterwards -> int(bool()).
+    # A numeric series keeps its value, like on TradingView; close[1] is NA on bar 0.
     plotshape(close[1], "shna")
     # plotchar stores the raw series value.
     plotchar(close, "ch", char="X", location=location.top, color=color.blue)
@@ -26,9 +26,9 @@ def main():
 def __test_plot_family__(runner):
     """plotshape/plotchar/plotarrow/plotcandle/plotbar populate _plot_data and register metas.
 
-    Verifies per-bar values (plotshape 0/1 with NA propagation, plotchar/plotarrow raw
-    series, plotcandle/plotbar four OHLC keys) and that each family registers a PlotMeta with
-    the right kind and style/char/location/color fields.
+    Verifies per-bar values (plotshape bool as 0/1 and a numeric series verbatim,
+    plotchar/plotarrow raw series, plotcandle/plotbar four OHLC keys) and that each family
+    registers a PlotMeta with the right kind and style/char/location/color fields.
     """
     from pynecore import lib
     from pynecore.types.na import isna_num
@@ -51,13 +51,13 @@ def __test_plot_family__(runner):
     assert len(per_bar) == 4
     for i, (o, h, l, c) in enumerate(rows):
         rec = per_bar[i]
-        # plotshape: 0/1 based on the boolean series.
+        # plotshape: a bool series narrows to 0/1.
         assert rec["sh"] == (1 if c > o else 0)
-        # plotshape NA propagation: close[1] is NA on bar 0.
+        # plotshape: a numeric series is stored verbatim, NA propagates.
         if i == 0:
             assert isna_num(rec["shna"])
         else:
-            assert rec["shna"] in (0, 1)
+            assert rec["shna"] == rows[i - 1][3]
         # plotchar / plotarrow store the raw series value.
         assert rec["ch"] == c
         assert rec["ar"] == c - o

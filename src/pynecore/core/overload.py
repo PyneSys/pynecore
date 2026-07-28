@@ -36,7 +36,7 @@ from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
-from .instance_state import _bind_target, _make_state, register_shared_cache
+from .instance_state import _bind_target, _make_state, register_shared_cache, __dyn_default__
 from ..types.base import StrLiteral
 from ..types.na import NA
 
@@ -194,9 +194,15 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
             bound = impl.sig.bind(*args, **kwargs)
             bound.apply_defaults()
 
+            # ``__dyn_default__`` marks a parameter DynamicDefaultTransformer
+            # took over: the declared default referenced ``lib.*`` (``= na``
+            # above all), so the real value is computed in the body when the
+            # argument is omitted. The sentinel is a bare object() and matches
+            # no annotation -- type-checking it would reject every overload
+            # whose optional parameters the caller left out.
             if all(_check_type(value, impl.type_hints[name])
                    for name, value in bound.arguments.items()
-                   if name in impl.type_hints):
+                   if name in impl.type_hints and value is not __dyn_default__):
                 return impl
         except TypeError:
             continue

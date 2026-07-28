@@ -92,10 +92,14 @@ sources in order — the **first hit wins**:
 
 1. **Explicit `--security` mapping** (or the programmatic `security_data` dict) —
    an exact `SYMBOL:TF`, then `SYMBOL`, then `TF` key.
-2. **The chart's own feed** — when the security symbol is the chart symbol
-   (same symbol at a coarser timeframe, or a `ticker.heikinashi()` chart-type
-   request), it is served from the chart data / live stream directly.
-3. **The global symbol map** — `config/symbol_map.toml`.
+2. **The chart's own feed** — a `ticker.heikinashi()` chart-type request on the
+   chart symbol is served from the chart data / live stream directly, since the
+   transform is per bar and needs no extra history. The chart symbol at a
+   *different* timeframe is NOT: a coarser context would start at the chart's
+   first bar instead of carrying its own history, and a finer one needs sub-bars
+   the chart feed does not contain, so it requires an explicit `--security` feed.
+3. **The global symbol map** — `config/symbol_map.toml`. Skipped for the chart's
+   own symbol, which Pine guarantees is the same instrument as the chart.
 4. **Provider identity fallback (live only)** — the Pine symbol is forwarded to
    the live provider unchanged, on the assumption it is already provider-native.
 

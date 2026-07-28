@@ -1230,9 +1230,14 @@ class ScriptRunner:
                 from .security_process import security_process_main
                 from multiprocessing import Process
 
-                # Detect same-context: symbol+TF identical to chart
+                # Detect same-context: symbol+TF identical to chart. Pine names the
+                # chart instrument either bare (``syminfo.ticker``) or exchange
+                # qualified (``syminfo.tickerid``, the form a literal
+                # ``"BINANCE:BTCUSDT"`` also takes) — both must short-circuit, or a
+                # request for the chart's own bars would go looking for a data file.
                 chart_ticker = str(lib.syminfo.ticker)
                 chart_tf = str(lib.syminfo.period)
+                own_symbols = {chart_ticker, f"{lib.syminfo.prefix}:{chart_ticker}"}
                 same_context_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
                     sym = ctx.get('symbol')
@@ -1241,7 +1246,7 @@ class ScriptRunner:
                         # An empty string selects the chart's timeframe (Pine semantics)
                         tf_val = chart_tf
                     tf = str(tf_val)
-                    if sym is not None and str(sym) == chart_ticker and tf == chart_tf:
+                    if sym is not None and str(sym) in own_symbols and tf == chart_tf:
                         same_context_ids.add(sec_id)
 
                 # Separate static and deferred contexts. The security transformer
@@ -1436,7 +1441,7 @@ class ScriptRunner:
                     # request (Heikin Ashi) is excluded — it always needs a
                     # subprocess that applies the per-bar transform.
                     if (chart_type is None and chart_ticker is not None
-                            and str(base_symbol) == chart_ticker
+                            and str(base_symbol) in own_symbols
                             and resolved_tf == current_chart_tf):
                         _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                         _state.timeframe = resolved_tf
@@ -2797,6 +2802,7 @@ class ScriptRunner:
             timeframe = str(ctx.get('timeframe', ''))
 
             entry: str | Path | PluginSymbol | None = None
+            map_hint = ''
             # Try exact "SYMBOL:TF" match, then symbol-only, then TF-only.
             key = f"{symbol}:{timeframe}"
             if key in self._security_data:
@@ -2828,40 +2834,41 @@ class ScriptRunner:
                 result[sec_id] = str(self._chart_data_path)
                 continue
 
-            # Same-symbol request on the chart's own symbol at a different
-            # (coarser) timeframe with no explicit ``--security`` mapping
-            # (backtest): serve from the chart's own feed — the child pre-resamples
-            # it to the security period via ``_resample_finer_security_feed``.
-            # LTF (finer than the chart) genuinely needs sub-bars the chart feed
-            # cannot supply, so it is excluded and falls through to the error.
-            if (chart_type is None
-                    and not ctx.get('is_ltf')
-                    and self._chart_provider_instance is None
-                    and self._chart_data_path is not None
-                    and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
-                result[sec_id] = str(self._chart_data_path)
-                continue
+            # The chart's own symbol at a DIFFERENT timeframe deliberately has no
+            # branch here: a coarser (HTF) resample of the chart feed would start
+            # at the chart's first bar while TradingView's HTF context carries its
+            # own deep history, and a finer (LTF) request needs sub-bars the chart
+            # feed does not contain. The resolver cannot know how much warmup the
+            # expression wants, so such a context falls through to the explicit
+            # "no data" error and the caller supplies a real feed via
+            # ``--security`` — exactly what ``pyne run --list-data`` asks for. The
+            # chart's own symbol AT the chart timeframe never reaches here;
+            # ``_deferred_resolve`` short-circuits it to the inline same-context
+            # path.
 
             # Global workdir symbol_map.toml (backtest): translate the
             # TradingView-style symbol to a provider-native one and derive the
             # expected ``.ohlcv`` file. This overrides the identity live-provider
             # fallback but is itself overridden by an explicit ``--security``
-            # mapping and by the chart-symbol branches above.
-            if self._chart_provider_instance is None:
+            # mapping and by the chart-symbol branch above. The chart's own symbol
+            # is excluded: Pine guarantees such a context is the same instrument as
+            # the chart, so routing it through the map would serve another venue's
+            # prices for it.
+            if (self._chart_provider_instance is None
+                    and symbol != f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
                 mapped = self._symbol_map.resolve(symbol, timeframe or None)
                 if mapped is not None:
                     tf_for_file = timeframe or str(self.syminfo.period)
-                    data_dir = self._data_dir()
-                    expected = self._mapped_ohlcv_path(mapped, tf_for_file, data_dir)
+                    expected = self._mapped_ohlcv_path(mapped, tf_for_file, self._data_dir())
                     if expected is not None and expected.exists():
                         result[sec_id] = str(expected)
                         continue
-                    if ctx.get('ignore_invalid_symbol'):
-                        result[sec_id] = None
-                        continue
                     if expected is not None:
-                        raise ValueError(
-                            f"Security {symbol!r} @ {tf_for_file!r} is mapped to "
+                        # A map entry whose file is missing is a hint on the canonical
+                        # error below, never an error of its own: raising here would
+                        # replace the message callers match on to discover contexts.
+                        map_hint = (
+                            f" Note: {symbol!r} @ {tf_for_file!r} is mapped to "
                             f"{mapped.provider}:{mapped.native_symbol!r} by "
                             f"config/symbol_map.toml, but the derived data file "
                             f"{expected.name} was not found in {expected.parent}. "
@@ -2893,6 +2900,7 @@ class ScriptRunner:
                 f"(symbol={symbol!r}, timeframe={timeframe!r}). "
                 f"Provide data via the security_data parameter, e.g.: "
                 f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
+                f"{map_hint}"
             )
         return result
 

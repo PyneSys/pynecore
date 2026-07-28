@@ -473,7 +473,9 @@ def crossover(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed over the given series
     """
-    l1_lte_l2: Persistent[bool] = NA(bool)
+    # Pine has no na bool: with no previous relation to compare against there is
+    # no cross, so the first bar where both sources are defined yields false, not na
+    l1_lte_l2: Persistent[bool] = False
     res = source1 > source2 and l1_lte_l2
     # Only refresh the relation on bars where it is defined; TV compares against the
     # last bar with both sources present, so na gaps must not reset the state
@@ -491,7 +493,9 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed under the given series
     """
-    l1_gte_l2: Persistent[bool] = NA(bool)
+    # Pine has no na bool: with no previous relation to compare against there is
+    # no cross, so the first bar where both sources are defined yields false, not na
+    l1_gte_l2: Persistent[bool] = False
     res = source1 < source2 and l1_gte_l2
     # Only refresh the relation on bars where it is defined; TV compares against the
     # last bar with both sources present, so na gaps must not reset the state

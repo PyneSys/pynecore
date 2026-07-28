@@ -388,7 +388,15 @@ class OHLCVWriter:
             self._start_timestamp = first_timestamp
             self._interval = second_timestamp - first_timestamp
             assert self._interval is not None
-            self._last_timestamp = first_timestamp + self._interval * (self._size - 1)
+            # Read the last record instead of extrapolating from the first
+            # interval: a real feed is not evenly spaced. Monthly bars are
+            # 28-31 days apart by definition, and any gapped series (halts,
+            # weekends, a missing session) breaks the arithmetic too. The
+            # extrapolated value ran far ahead of the file and rejected every
+            # legitimate append as out of order.
+            self._file.seek((self._size - 1) * RECORD_SIZE)
+            data = self._file.read(4)
+            self._last_timestamp = struct.unpack('I', data)[0]
 
         # Position at end for appending
         self._file.seek(0, os.SEEK_END)
@@ -1616,29 +1624,32 @@ class OHLCVReader:
         Open file and create memory mapping
         """
         self._file = open(self.path, 'rb')
-        if os.path.getsize(self.path) > 0:
-            # Detect if this is a text file masquerading as binary OHLCV
-            self._file.seek(0)
-            first_chunk = self._file.read(32)
-            self._file.seek(0)  # Reset position
+        size = os.path.getsize(self.path)
+        if size > 0:
+            # Detect a text file masquerading as binary OHLCV. Decodability alone
+            # does not prove text: a valid record whose every byte falls below
+            # 0x80 (small prices, zero volume) decodes as ASCII just as well. A
+            # record file is always a whole number of fixed-size records, so the
+            # length is what settles it.
+            if size % RECORD_SIZE != 0:
+                self._file.seek(0)
+                first_chunk = self._file.read(256)
+                self._file.seek(0)  # Reset position
 
-            try:
-                # If 256 bytes decode as ASCII, it's definitely not binary OHLCV
-                first_chunk.decode('ascii')
-
-                # If we get here, it's text - show error with CLI fix
-                raise ValueError(
-                    f"Text file detected with .ohlcv extension!\n"
-                    f"To convert CSV to binary OHLCV format:\n"
-                    f"  pyne data convert-from {Path(self.path).with_suffix('.csv')} "
-                    f"--symbol YOUR_SYMBOL --provider custom"
-                )
-            except UnicodeDecodeError:
-                # Can't decode as ASCII → it's binary, proceed normally
-                pass
+                try:
+                    first_chunk.decode('ascii')
+                except UnicodeDecodeError:
+                    pass  # Not decodable → binary, proceed normally
+                else:
+                    raise ValueError(
+                        f"Text file detected with .ohlcv extension!\n"
+                        f"To convert CSV to binary OHLCV format:\n"
+                        f"  pyne data convert-from {Path(self.path).with_suffix('.csv')} "
+                        f"--symbol YOUR_SYMBOL --provider custom"
+                    )
 
             self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-            self._size = os.path.getsize(self.path) // RECORD_SIZE
+            self._size = size // RECORD_SIZE
 
             if self._size >= 2:
                 self._start_timestamp = struct.unpack('I', self._mmap[0:4])[0]

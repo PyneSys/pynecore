@@ -2,6 +2,7 @@ from typing import Any
 import re
 
 from functools import lru_cache
+from math import isinf
 
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
@@ -26,7 +27,8 @@ __all__ = ['contains', 'endswith', 'format', 'format_time', 'length', 'lower', '
 #
 
 # noinspection PyProtectedMember
-def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###') -> str:
+def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###',
+                   *, decimal_format: bool = False) -> str:
     """
     Format a number according to Pine rules.
 
@@ -48,10 +50,49 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
     :param value: Value to format
     :param fmt_type: Format type (integer, currency, percent, mintick, volume, price, inherit)
     :param precision: Custom precision format string (like '#.##')
+    :param decimal_format: True for ``str.format()`` (Java DecimalFormat engine),
+                           False for ``str.tostring()`` (chart number formatter)
     :return: Formatted string
     """
     if isinstance(value, NA) or value is None or value != value:  # NA object or native nan
-        return "NaN"
+        # DecimalFormat prints NaN bare; the chart formatter keeps percent's '%'
+        return "NaN%" if fmt_type == _format.percent and not decimal_format else "NaN"
+
+    if isinf(value):
+        # Infinity must never reach the digit patterns -- round() raises
+        # OverflowError and Decimal raises InvalidOperation on it. TV's two number
+        # formatters disagree on what to print, so they are handled separately.
+        if not decimal_format:
+            # str.tostring() uses the chart's number formatter: "NaN" for every
+            # format but format.mintick, which stringifies the raw double. Percent
+            # still appends '%', and volume its magnitude suffix, which for an
+            # infinite magnitude is always 'T'.
+            if fmt_type == _format.mintick:
+                return "-Infinity" if value < 0 else "Infinity"
+            if fmt_type == _format.percent:
+                return "NaN%"
+            if fmt_type == _format.volume:
+                return "NaNT"
+            return "NaN"
+        # str.format() is Java DecimalFormat: the infinity symbol carries the
+        # pattern's prefix and suffix ('$∞', '∞%', '+∞'), unlike NaN which is bare.
+        if fmt_type in ('price', 'currency'):
+            prefix, suffix = ('-$' if value < 0 else '$'), ''
+        elif fmt_type == _format.percent:
+            prefix, suffix = ('-' if value < 0 else ''), '%'
+        elif fmt_type:
+            prefix, suffix = ('-' if value < 0 else ''), ''
+        else:
+            subpatterns = precision.split(';')
+            negative_subpattern = value < 0 and len(subpatterns) > 1
+            chosen = subpatterns[1] if negative_subpattern else subpatterns[0]
+            prefix = '-' if value < 0 and not negative_subpattern else ''
+            suffix = ''
+            digit_idx = [i for i, c in enumerate(chosen) if c in '#0.,']
+            if digit_idx:
+                prefix += chosen[:digit_idx[0]]
+                suffix = chosen[digit_idx[-1] + 1:]
+        return prefix + '∞' + suffix
 
     # Handle special formats first
     if fmt_type == _format.mintick:
@@ -192,7 +233,7 @@ def _format_value(value: Any, _no_format_numbers=False) -> str:
         return value
     elif isinstance(value, float):
         # Use default formatting for floats
-        return _format_number(value) if not _no_format_numbers else str(value)
+        return _format_number(value, decimal_format=True) if not _no_format_numbers else str(value)
     elif isinstance(value, bool):
         return str(value).lower()
     elif isinstance(value, NA) or value is None:
@@ -350,6 +391,7 @@ def format(formatString: str, *args: Any) -> str:
         if len(parts) >= 2 and parts[1] == 'number':
             if len(parts) >= 3:
                 return _format_number(safe_convert.safe_float(value),
+                                      decimal_format=True,
                                       fmt_type=parts[2] if parts[2] in (
                                           'integer', 'currency',
                                           _format.percent,
@@ -359,7 +401,7 @@ def format(formatString: str, *args: Any) -> str:
                                           _format.inherit
                                       ) else '',
                                       precision=parts[2])
-            return _format_number(safe_convert.safe_float(value))
+            return _format_number(safe_convert.safe_float(value), decimal_format=True)
 
         return _format_value(value)
 
