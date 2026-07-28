@@ -50,7 +50,7 @@ def _make_syminfo(period: str = '5'):
     )
 
 
-def _make_ohlcv(num_bars: int, base_ts: int = 1704067200, period: int = 300):
+def _make_ohlcv(num_bars: int, base_ts: int = 1_704_067_200_000, period: int = 300_000):
     """Create simple flat OHLCV bars."""
     from pynecore.types.ohlcv import OHLCV
     return [

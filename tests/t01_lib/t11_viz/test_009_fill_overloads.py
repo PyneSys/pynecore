@@ -33,8 +33,8 @@ def __test_fill_positional_overloads__(runner, tmp_path):
     from pynecore.core.viz import color_str
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200
-    bars = [OHLCV(timestamp=base + i * 300, open=100.0, high=101.0, low=99.0,
+    base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
+    bars = [OHLCV(timestamp=base + i * 300_000, open=100.0, high=101.0, low=99.0,
                   close=100.5, volume=100.0) for i in range(3)]
 
     out = tmp_path / "viz.ndjson"

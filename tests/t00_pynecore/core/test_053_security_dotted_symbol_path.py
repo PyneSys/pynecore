@@ -1,12 +1,13 @@
 """
 @pyne
 """
-import struct
 import tempfile
 from pathlib import Path
 
 from pynecore.core.currency import CurrencyRateProvider
+from pynecore.core.ohlcv import OHLCVWriter
 from pynecore.core.script_runner import ScriptRunner
+from pynecore.types.ohlcv import OHLCV
 
 
 def _make_ohlcv(dir_path: Path, stem: str) -> str:
@@ -20,8 +21,8 @@ def _make_ohlcv(dir_path: Path, stem: str) -> str:
     """
     base = dir_path / stem
     ohlcv_path = base.with_name(base.name + ".ohlcv")
-    with open(ohlcv_path, "wb") as f:
-        f.write(struct.pack("Ifffff", 1000, 1.0, 1.0, 1.0, 1.0, 100.0))
+    with OHLCVWriter(ohlcv_path, "60", truncate=True) as writer:
+        writer.write(OHLCV(1_000_000, 1.0, 1.0, 1.0, 1.0, 100.0))
     with open(base.with_name(base.name + ".toml"), "w") as f:
         f.write("")
     return str(base)

@@ -19,21 +19,22 @@ def main():
 # (not a fixed/nominal span): a week is exactly 7 days, and January is 31 days —
 # ``in_seconds("1M")`` is only a nominal ~30.4-day month, so an arithmetic target
 # would leak Jan 31 into February.
-_DAY = 86400
+# Every timestamp here is Unix MILLISECONDS.
+_DAY = 86_400_000
 _LTF_TF = "1D"
 
 
 def _write_ltf(tmp_dir, bars):
-    """Write a 1-day LTF feed from ``(timestamp_s, close)`` pairs (+ a 24/7 UTC
+    """Write a 1-day LTF feed from ``(timestamp_ms, close)`` pairs (+ a 24/7 UTC
     ``.toml`` sidecar the subprocess loads on startup); return the path.
     """
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_LTFSYM_1D.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1D") as w:
         for ts, c in bars:
             c = float(c)
             w.write(OHLCV(timestamp=ts, open=c, high=c, low=c, close=c, volume=1.0))
@@ -53,8 +54,8 @@ def _write_ltf(tmp_dir, bars):
 
 
 def _chart_bars(timestamps):
-    """Chart bars at the given epoch-second opens; OHLCV body is irrelevant to
-    the LTF result.
+    """Chart bars at the given epoch-millisecond opens; OHLCV body is irrelevant
+    to the LTF result.
     """
     from pynecore.types.ohlcv import OHLCV
     return [
@@ -115,7 +116,7 @@ def __test_ltf_weekly_monthly_chart_window__(runner, log):
     # window. 2025-01-06 is a Monday. Feed is 10 contiguous daily bars (closes
     # 1..10): week 0 [Mon Jan 6, Mon Jan 13) -> days 1..7 (sum 28), week 1 the
     # 3-day tail Jan 13..15 (sum 27).
-    mon = int(datetime(2025, 1, 6, tzinfo=utc).timestamp())
+    mon = int(datetime(2025, 1, 6, tzinfo=utc).timestamp()) * 1000
     chart_opens = [mon, mon + 7 * _DAY]
     ltf_bars = [(mon + d * _DAY, d + 1) for d in range(10)]
     rows = _run(runner, "1W", chart_opens, ltf_bars)
@@ -126,8 +127,8 @@ def __test_ltf_weekly_monthly_chart_window__(runner, log):
     # 34 contiguous daily bars from Jan 1 (closes 1..34): January has 31 days, so
     # the Jan bar holds all 31 (sum 496) and February the 3-day tail Feb 1..3
     # (sum 99). A nominal-month (~30.4d) target would wrongly leak Jan 31.
-    jan1 = int(datetime(2025, 1, 1, tzinfo=utc).timestamp())
-    feb1 = int(datetime(2025, 2, 1, tzinfo=utc).timestamp())
+    jan1 = int(datetime(2025, 1, 1, tzinfo=utc).timestamp()) * 1000
+    feb1 = int(datetime(2025, 2, 1, tzinfo=utc).timestamp()) * 1000
     chart_opens = [jan1, feb1]
     ltf_bars = [(jan1 + d * _DAY, d + 1) for d in range(34)]
     rows = _run(runner, "1M", chart_opens, ltf_bars)

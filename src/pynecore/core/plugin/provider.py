@@ -6,7 +6,8 @@ from datetime import datetime
 
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo, default_mincontract
-from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
+from pynecore.core.ohlcv import OHLCVWriter, OHLCVReader
+from pynecore.lib.timeframe import _process_tf
 
 from . import Plugin, ConfigT
 
@@ -129,10 +130,22 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         if ohlcv_dir:
             assert symbol and timeframe
             self.ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
+            # The written file declares its period with an explicit multiplier
+            # ('D' -> '1D'), so the same timeframe always maps to one file period.
+            # noinspection PyProtectedMember
+            modifier, multiplier = _process_tf(timeframe)
+            period = f"{multiplier}{modifier}" if modifier else str(multiplier)
+            self.ohlcv_file = OHLCVWriter(self.ohlcv_path, period)
         else:
             self.ohlcv_path = None
-        self.ohlcv_file = OHLCVWriter(self.ohlcv_path) if self.ohlcv_path else None
+            self.ohlcv_file = None
         self.config: ConfigT | None = config
+        self.resume_timestamp: int | None = None
+        """Timestamp of the last bar the target file already held when the current
+        download started. :meth:`save_ohlcv_data` drops everything up to it, so a
+        continuation may ask the exchange for a window that overlaps the stored data
+        without the overlap turning into a duplicate-timestamp error. Set by the
+        download flow; ``None`` outside a download."""
 
     def normalize_symbol(self, symbol: str) -> str:
         """
@@ -293,14 +306,22 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         """
         Save OHLCV data to the file.
 
+        Bars at or before :attr:`resume_timestamp` are already stored and are
+        dropped instead of written: a continuation deliberately requests a window
+        that reaches back into the existing data, because the opening instant of
+        the next bar cannot be predicted from the period alone (calendar months and
+        daylight-saving shifts move it). Bars past that boundary must still be
+        strictly increasing — the writer rejects them otherwise.
+
         :param data: Single OHLCV record or list of records.
         """
         assert self.ohlcv_file is not None
-        if isinstance(data, OHLCV):
-            self.ohlcv_file.write(data)
-        else:
-            for candle in data:
-                self.ohlcv_file.write(candle)
+        candles = (data,) if isinstance(data, OHLCV) else data
+        boundary = self.resume_timestamp
+        for candle in candles:
+            if boundary is not None and candle.timestamp <= boundary:
+                continue
+            self.ohlcv_file.write(candle)
 
     @abstractmethod
     def download_ohlcv(self, time_from: datetime, time_to: datetime,

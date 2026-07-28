@@ -15,13 +15,12 @@ Sources of exchange-rate data, in priority order:
 """
 from __future__ import annotations
 
-import struct
 import bisect
 from math import isnan
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .ohlcv_file import RECORD_SIZE
+from .ohlcv import OHLCVReader, record_count
 from .security_shm import ResultReader
 
 if TYPE_CHECKING:
@@ -200,35 +199,44 @@ class CurrencyRateProvider:
         return float('nan')
 
     def _lookup_file(self, ohlcv_path: str, timestamp: int) -> float:
-        """Static-file path (backtest only)."""
+        """
+        Static-file path (backtest only).
+
+        :param ohlcv_path: OHLCV file backing this pair.
+        :param timestamp: Bar time in UNIX seconds, as :func:`get_rate` receives it.
+        :return: Close of the last bar at or before the timestamp, or NaN.
+        """
         if ohlcv_path not in self._file_rate_cache:
             self._load_ohlcv(ohlcv_path)
         timestamps, closes = self._file_rate_cache[ohlcv_path]
         if not timestamps:
             return float('nan')
-        idx = bisect.bisect_right(timestamps, timestamp) - 1
+        # The cache holds OHLCV timestamps, which are milliseconds.
+        idx = bisect.bisect_right(timestamps, timestamp * 1000) - 1
         if idx < 0:
             return float('nan')
         return closes[idx]
 
     def _load_ohlcv(self, ohlcv_path: str) -> None:
-        """Load timestamps and close prices from binary OHLCV file."""
+        """
+        Cache millisecond timestamps and close prices of an OHLCV file.
+
+        An unreadable or damaged file caches an empty series, which
+        :meth:`_lookup_file` reports as NaN — the same answer as a missing pair.
+
+        :param ohlcv_path: OHLCV file to load.
+        """
         timestamps: list[int] = []
         closes: list[float] = []
-        path = Path(ohlcv_path)
-        if not path.exists():
-            self._file_rate_cache[ohlcv_path] = (timestamps, closes)
-            return
-        file_size = path.stat().st_size
-        bar_count = file_size // RECORD_SIZE
-        with open(path, 'rb') as f:
-            data = f.read()
-        for i in range(bar_count):
-            offset = i * RECORD_SIZE
-            ts = struct.unpack_from('I', data, offset)[0]
-            close = struct.unpack_from('f', data, offset + 16)[0]
-            timestamps.append(ts)
-            closes.append(close)
+        if Path(ohlcv_path).exists():
+            try:
+                with OHLCVReader(ohlcv_path) as reader:
+                    for candle in reader:
+                        timestamps.append(candle.timestamp)
+                        closes.append(candle.close)
+            except (OSError, ValueError):
+                timestamps.clear()
+                closes.clear()
         self._file_rate_cache[ohlcv_path] = (timestamps, closes)
 
     def close(self) -> None:
@@ -239,11 +247,8 @@ class CurrencyRateProvider:
 
     @staticmethod
     def _get_ohlcv_bar_count(path: str) -> int:
-        """Get the number of bars in an OHLCV file without opening it."""
-        try:
-            return Path(path).stat().st_size // RECORD_SIZE
-        except OSError:
-            return 0
+        """Get the number of bars in an OHLCV file without opening a reader."""
+        return record_count(path)
 
     @staticmethod
     def _resolve_ohlcv_path(path: str | Path) -> str | None:

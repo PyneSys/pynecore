@@ -55,7 +55,7 @@ __all__ = ["LiveLtfCollector", "IntrabarLike"]
 class IntrabarLike(Protocol):
     """Minimal shape the collector needs from an intrabar (an ``OHLCV``).
 
-    Only the ``timestamp`` (seconds) is read here; the value an intrabar
+    Only the ``timestamp`` (Unix milliseconds) is read here; the value an intrabar
     contributes to the array comes from ``run_intrabar``, not from the OHLCV.
     ``OHLCV`` is an immutable ``NamedTuple``, so a reference kept for replay
     cannot be mutated out from under the collector.
@@ -258,7 +258,7 @@ class LiveLtfCollector:
         # nothing (it already drained in the loop).
         baseline_advanced = False
         for bar in closed_bars:
-            ts_ms = int(bar.timestamp * 1000)
+            ts_ms = bar.timestamp
             if (self._developing is not None and ts_ms == self._developing.ts_ms
                     and not self._pending):
                 # In-order close of the current developing intrabar (no reorder):
@@ -315,7 +315,7 @@ class LiveLtfCollector:
                 if (self._developing is not None
                         and self._developing.ts_ms < ts_ms
                         and not (developing_bar is not None
-                                 and int(developing_bar.timestamp * 1000)
+                                 and developing_bar.timestamp
                                  == self._developing.ts_ms)):
                     self._window.promote_developing_to_provisional()
                     self._pending.append(self._developing)
@@ -388,7 +388,7 @@ class LiveLtfCollector:
 
         # ── Developing intrabar (live last element) ──
         if not chart_confirmed and developing_bar is not None:
-            ts_ms = int(developing_bar.timestamp * 1000)
+            ts_ms = developing_bar.timestamp
             if period_start <= ts_ms < period_end_exclusive:
                 cur = self._developing
                 if cur is not None and ts_ms == cur.ts_ms:

@@ -79,7 +79,7 @@ class OfflineBrokerPlugin(BrokerPlugin[OfflineBrokerConfig]):
         start = max(time_from, time_to - timedelta(minutes=5))
         bars = [
             OHLCV(
-                int((start + timedelta(minutes=index)).timestamp()),
+                int((start + timedelta(minutes=index)).timestamp() * 1000),
                 100,
                 101,
                 99,
@@ -113,7 +113,7 @@ class OfflineBrokerPlugin(BrokerPlugin[OfflineBrokerConfig]):
         del symbol, timeframe
         if self._live_index == 0:
             self._live_index += 1
-            return OHLCV(2_000_000_000, 100, 101, 99, 100, 1, is_closed=True)
+            return OHLCV(2_000_000_000_000, 100, 101, 99, 100, 1, is_closed=True)
         raise asyncio.CancelledError()
 
     async def can_shutdown(self):

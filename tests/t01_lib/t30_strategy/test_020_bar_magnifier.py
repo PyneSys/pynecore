@@ -36,13 +36,13 @@ def _make_sub_bars(base_ts: int, prices: list[tuple[float, float, float, float]]
     """
     Create 1-minute OHLCV sub-bars from a list of (open, high, low, close) tuples.
 
-    :param base_ts: Starting timestamp in seconds
+    :param base_ts: Starting timestamp in milliseconds
     :param prices: List of (O, H, L, C) tuples, one per minute
     :return: List of OHLCV objects
     """
     from pynecore.types.ohlcv import OHLCV
     return [
-        OHLCV(timestamp=base_ts + i * 60, open=o, high=h, low=l, close=c, volume=100.0)
+        OHLCV(timestamp=base_ts + i * 60_000, open=o, high=h, low=l, close=c, volume=100.0)
         for i, (o, h, l, c) in enumerate(prices)
     ]
 
@@ -80,7 +80,7 @@ def __test_magnifier_tp_hits_before_sl_when_price_goes_up_first__(script_path, m
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='5')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (ms)
 
     # Bar 0: entry bar — flat, just to get a position opened
     # (market order fills at open of next bar, so we need bar 0 for the entry signal
@@ -95,7 +95,7 @@ def __test_magnifier_tp_hits_before_sl_when_price_goes_up_first__(script_path, m
 
     # Bar 1: market order fills at open (100), then exit orders are placed.
     # But exits won't process until bar 2.
-    bar1_subs = _make_sub_bars(base_ts + 300, [
+    bar1_subs = _make_sub_bars(base_ts + 300_000, [
         (100.0, 100.5, 99.5, 100.0),
         (100.0, 100.5, 99.5, 100.0),
         (100.0, 100.5, 99.5, 100.0),
@@ -104,7 +104,7 @@ def __test_magnifier_tp_hits_before_sl_when_price_goes_up_first__(script_path, m
     ])
 
     # Bar 2: price goes UP FIRST then down — TP at 110 should hit before SL at 90
-    bar2_subs = _make_sub_bars(base_ts + 600, [
+    bar2_subs = _make_sub_bars(base_ts + 600_000, [
         (100.0, 105.0, 100.0, 105.0),  # up
         (105.0, 112.0, 105.0, 110.0),  # up more, hits TP at 110
         (110.0, 110.0, 95.0,   95.0),  # drops (but TP already filled!)
@@ -151,7 +151,7 @@ def __test_magnifier_sl_hits_before_tp_when_price_goes_down_first__(script_path,
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='5')
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
 
     # Bar 0: entry bar
     bar0_subs = _make_sub_bars(base_ts, [
@@ -163,7 +163,7 @@ def __test_magnifier_sl_hits_before_tp_when_price_goes_down_first__(script_path,
     ])
 
     # Bar 1: fill bar
-    bar1_subs = _make_sub_bars(base_ts + 300, [
+    bar1_subs = _make_sub_bars(base_ts + 300_000, [
         (100.0, 100.5, 99.5, 100.0),
         (100.0, 100.5, 99.5, 100.0),
         (100.0, 100.5, 99.5, 100.0),
@@ -172,7 +172,7 @@ def __test_magnifier_sl_hits_before_tp_when_price_goes_down_first__(script_path,
     ])
 
     # Bar 2: price goes DOWN FIRST then up — SL at 90 should hit before TP at 110
-    bar2_subs = _make_sub_bars(base_ts + 600, [
+    bar2_subs = _make_sub_bars(base_ts + 600_000, [
         (100.0, 100.0, 95.0,  95.0),   # down
         (95.0,  95.0,  88.0,  90.0),   # down more, hits SL at 90
         (90.0,  105.0, 90.0,  105.0),  # recovers (but SL already filled!)

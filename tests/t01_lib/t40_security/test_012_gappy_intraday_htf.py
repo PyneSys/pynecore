@@ -18,25 +18,28 @@ def main():
     plot(hh, "hh")
 
 
-# A 60-minute HTF feed with a 2-hour gap. ``OHLCVWriter`` forward-fills the gap
-# (hours 4 and 5) with flat V=-1 bars, so the stored feed is continuous even
-# though only hours 0,1,2,3,6 carry real bars. ``high`` is distinctive per bar
-# so both the confirmed value and the highest-of-3 lookback are unambiguous.
-_T0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to the 3600s and 300s grids
+# A 60-minute HTF feed with a 2-hour hole: only hours 0,1,2,3,6 carry bars, and
+# the store holds exactly those five records — hours 4 and 5 are simply absent,
+# so the file's DENSE flag stays clear. ``high`` is distinctive per bar so both
+# the confirmed value and the highest-of-3 lookback are unambiguous.
+# Every timestamp here is Unix MILLISECONDS.
+_T0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 1h and 5m grids
+_HOUR = 3_600_000
+_CHART_STEP = 300_000  # 5 minutes
 _REAL = {0: (100, 9), 1: (10, 9), 2: (11, 10), 3: (50, 20), 6: (13, 13)}  # hour -> (high, close)
 
 
 def _write_htf(tmp_dir):
     """Write the gappy 60-minute HTF feed (+ a 24/7 UTC ``.toml``); return the path."""
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "HTF60.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "60") as w:
         for hour, (hi, cl) in _REAL.items():
-            w.write(OHLCV(timestamp=_T0 + hour * 3600,
+            w.write(OHLCV(timestamp=_T0 + hour * _HOUR,
                           open=float(hi), high=float(hi), low=float(cl), close=float(cl),
                           volume=1.0))
 
@@ -56,27 +59,26 @@ def _write_htf(tmp_dir):
 def _chart_bars(n):
     """``n`` dense 5-minute chart bars from ``_T0`` (OHLC body is irrelevant)."""
     from pynecore.types.ohlcv import OHLCV
-    return [OHLCV(timestamp=_T0 + i * 300, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0)
+    return [OHLCV(timestamp=_T0 + i * _CHART_STEP,
+                  open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0)
             for i in range(n)]
 
 
-def __test_gappy_intraday_htf_skips_fills_and_holds_over_gap__(runner, log):
+def __test_gappy_intraday_htf_reads_real_bars_and_holds_over_gap__(runner, log):
     """A gappy intraday HTF feed: the child reads only real bars and holds over the gap.
 
     Regression for the session-gapped intraday ``request.security()`` HTF chain:
 
-    * The security child must read only the REAL HTF bars, never the V=-1 gap
-      fills the OHLCV file stores for the missing hours 4 and 5. A bar-count
-      history read (``ta.highest(high, 3)``) therefore spans 3 real HTF bars,
-      not 3 feed rows padded with fills — so at hour 7 it reaches the hour-3
-      high (50), not the fills' carried close (20).
+    * The security child sees only the five REAL HTF bars the file holds — hours
+      4 and 5 are absent, not padded. A bar-count history read
+      (``ta.highest(high, 3)``) therefore spans 3 real HTF bars, so at hour 7 it
+      reaches the hour-3 high (50), not a carried-forward close (20).
     * ``lookahead_off`` confirmation must hold the last CLOSED fixed-span bar
       across the gap. Hour 3's bar closes at hour 4, so hours 4, 5 and 6 all
       report it (high 50) — never a stale earlier bar and never ``na``.
 
-    Both break without the gap-compacted child read + the real-open clamp:
-    without compaction hour 7's ``hh`` would be 20; without the clamp the gap
-    hours would read the hour-2 bar (11) or ``na``.
+    The second point breaks without the real-open clamp: the gap hours would read
+    the hour-2 bar (11) or ``na``.
     """
     import sys
     import tempfile
@@ -93,7 +95,7 @@ def __test_gappy_intraday_htf_skips_fills_and_holds_over_gap__(runner, log):
         # hour-6 bar close so it can be confirmed.
         r = runner(_chart_bars(8 * 12), security_data={"60": htf_path})
         for candle, pv in r.run_iter():
-            minute_of_day = (candle.timestamp - _T0) // 60
+            minute_of_day = (candle.timestamp - _T0) // 60_000
             rows[(minute_of_day // 60, minute_of_day % 60)] = (pv.get("h60"), pv.get("hh"))
 
     def h60(hr):
@@ -119,26 +121,27 @@ def __test_gappy_intraday_htf_skips_fills_and_holds_over_gap__(runner, log):
 
     # Bar-count history read over real bars only: at hour 3 the window covers the
     # hour-0..2 bars (max 100); at hour 7 it covers the hour-2/3/6 bars (max 50) —
-    # the gap fills are NOT counted (otherwise the window would stop at 20).
+    # the missing hours consume no slot (otherwise the window would stop at 20).
     assert hh(3) == 100, f"hour 3: hh={hh(3)} != 100 (max of hour 0..2 highs)"
-    assert hh(7) == 50, f"hour 7: hh={hh(7)} != 50 (max of real hour 2/3/6 highs, fills excluded)"
+    assert hh(7) == 50, f"hour 7: hh={hh(7)} != 50 (max of the hour 2/3/6 highs)"
 
-    log.info("gappy intraday HTF: child skips V=-1 fills, holds the closed bar across the gap")
+    log.info("gappy intraday HTF: child sees only real bars, holds the closed bar across the gap")
 
 
 def __test_load_htf_bar_opens_gappy_vs_dense_intraday__(log):
     """``load_htf_bar_opens`` arms the real-open clamp for a gappy intraday feed only.
 
-    A gappy intraday HTF feed (real bars sparser than the stored, gap-filled
-    grid) gets ``bar_opens`` set to the REAL opens with single-period
-    (clamp) semantics. A dense feed and an LTF context stay no-ops — the cheaper
-    arithmetic grid / the LTF intrabar machinery handle them.
+    A gappy intraday HTF feed — bars that do not tile the timeframe grid, which
+    the v2 header states outright via its DENSE flag — gets ``bar_opens`` set to
+    the real opens with single-period (clamp) semantics. A grid-tiling feed and an
+    LTF context stay no-ops: the cheaper arithmetic grid / the LTF intrabar
+    machinery handle them.
     """
     import tempfile
     from pathlib import Path
     from zoneinfo import ZoneInfo
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.resampler import Resampler
     from pynecore.core.security import SecurityState, load_htf_bar_opens
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
@@ -152,10 +155,10 @@ def __test_load_htf_bar_opens_gappy_vs_dense_intraday__(log):
 
     def _feed(tmp_dir, name, hours):
         path = tmp_dir / f"{name}.ohlcv"
-        with OHLCVWriter(path) as w:
+        with OHLCVWriter(path, "60") as w:
             for hour in hours:
                 v = float(hour + 1)
-                w.write(OHLCV(timestamp=_T0 + hour * 3600,
+                w.write(OHLCV(timestamp=_T0 + hour * _HOUR,
                               open=v, high=v, low=v, close=v, volume=1.0))
         SymInfo(prefix="E", description="d", ticker="GHTF", currency="USD", period="60",
                 type="crypto", mintick=0.01, pricescale=100, minmove=1, pointvalue=1,
@@ -169,14 +172,14 @@ def __test_load_htf_bar_opens_gappy_vs_dense_intraday__(log):
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        # Gappy: real bars at hours 0,1,2,3,6 → fills at 4,5 in the stored file.
+        # Gappy: bars at hours 0,1,2,3,6 only → the file does not tile the grid.
         gappy = _state()
         load_htf_bar_opens(gappy, _feed(tmp, "gappy", [0, 1, 2, 3, 6]))
-        assert gappy.bar_opens == [_T0 * 1000 + h * 3600_000 for h in (0, 1, 2, 3, 6)], \
-            f"gappy bar_opens={gappy.bar_opens} (must be the 5 real opens, fills excluded)"
+        assert gappy.bar_opens == [_T0 + h * _HOUR for h in (0, 1, 2, 3, 6)], \
+            f"gappy bar_opens={gappy.bar_opens} (must be the 5 real opens)"
         assert gappy.bar_opens_multiperiod is False, "gappy intraday must use the single-period clamp"
 
-        # Dense: a bar every hour → no fills → no-op (arithmetic grid stays correct).
+        # Dense: a bar every hour → the grid tiles → no-op (arithmetic grid is right).
         dense = _state()
         load_htf_bar_opens(dense, _feed(tmp, "dense", list(range(8))))
         assert dense.bar_opens is None, f"dense feed must stay a no-op (bar_opens={dense.bar_opens})"
@@ -186,4 +189,4 @@ def __test_load_htf_bar_opens_gappy_vs_dense_intraday__(log):
         load_htf_bar_opens(ltf, _feed(tmp, "ltf", [0, 1, 2, 3, 6]))
         assert ltf.bar_opens is None, f"LTF must stay a no-op (bar_opens={ltf.bar_opens})"
 
-    log.info("load_htf_bar_opens arms the clamp for gappy intraday only")
+    log.info("load_htf_bar_opens arms the clamp for a non-tiling intraday feed only")

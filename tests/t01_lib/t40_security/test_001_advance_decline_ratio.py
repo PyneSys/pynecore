@@ -25,10 +25,14 @@ def __test_advance_decline_ratio__(csv_reader, runner, dict_comparator, log):
     # TV forward-fills from previous full trading day on half-day sessions
     # (July 3, Black Friday, Christmas Eve). Our implementation uses actual data.
     # See: docs/pynecore/request_security/research.md §12
+    # Bar timestamps are Unix milliseconds, so the exclusions are given in seconds
+    # and scaled once here.
     half_day_ts = {
-        1562160600, 1575037800, 1577197800, 1637937000, 1669386600,
-        1688391000, 1700836200, 1720013400, 1732890600, 1735050600,
-        1751549400, 1764340200, 1766586600,
+        second * 1000 for second in (
+            1562160600, 1575037800, 1577197800, 1637937000, 1669386600,
+            1688391000, 1700836200, 1720013400, 1732890600, 1735050600,
+            1751549400, 1764340200, 1766586600,
+        )
     }
 
     with csv_reader('advance_decline_ratio.csv', subdir="data") as cr:

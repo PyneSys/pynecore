@@ -20,26 +20,28 @@ def main():
 
 
 # --- Shared geometry ---------------------------------------------------------
-# Chart bars run at 300s (default test syminfo period "5"); each returns the
-# intrabars of its OWN period ``[T, T+tf)``. The LTF feed is 60s. Each intrabar
-# carries DISTINCT O/H/L/C built from a base value ``b``: low=b, open=b+1000,
-# close=b+2000, high=b+3000 (a valid low<=open<=close<=high ordering), so the
-# per-column sums are b-sum offset by size*{0,1000,2000,3000}.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
+# Every timestamp here is Unix MILLISECONDS. Chart bars run at 5 minutes (default
+# test syminfo period "5"); each returns the intrabars of its OWN period
+# ``[T, T+tf)``. The LTF feed is 1 minute. Each intrabar carries DISTINCT O/H/L/C
+# built from a base value ``b``: low=b, open=b+1000, close=b+2000, high=b+3000 (a
+# valid low<=open<=close<=high ordering), so the per-column sums are b-sum offset
+# by size*{0,1000,2000,3000}.
+_SEC = 1000  # milliseconds in a second
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300 * _SEC
 
 
 def _write_ltf(tmp_dir, bars):
-    """Write a 1-minute LTF feed from ``(timestamp_s, base)`` pairs, expanding
+    """Write a 1-minute LTF feed from ``(timestamp_ms, base)`` pairs, expanding
     each base into distinct O/H/L/C (+ a 24/7 UTC ``.toml`` sidecar the
     subprocess loads on startup); return the path."""
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_LTFSYM_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for ts, b in bars:
             b = float(b)
             w.write(OHLCV(timestamp=ts, open=b + 1000.0, high=b + 3000.0,
@@ -60,7 +62,7 @@ def _write_ltf(tmp_dir, bars):
 
 
 def _chart_bars(n):
-    """``n`` chart bars at 300s; OHLCV body is irrelevant to the LTF result."""
+    """``n`` 5-minute chart bars; OHLCV body is irrelevant to the LTF result."""
     from pynecore.types.ohlcv import OHLCV
     return [
         OHLCV(timestamp=_TS0 + i * _CHART_STEP,
@@ -122,8 +124,9 @@ def __test_ltf_ohlcv_tuple__(runner, log):
     # --- Trailing partial period at EOF: every chart bar has intrabars, so all
     # four columns are populated and the per-column offsets are checked.
     rows = _run(runner, 3,
-                [(_TS0 + j * 60, j + 1) for j in range(10)]            # bars 0,1: base 1..10
-                + [(_TS0 + 600 + k * 60, 11 + k) for k in range(3)])    # bar 2: base 11,12,13
+                [(_TS0 + j * 60 * _SEC, j + 1) for j in range(10)]  # bars 0,1: base 1..10
+                # bar 2: base 11,12,13
+                + [(_TS0 + (600 + k * 60) * _SEC, 11 + k) for k in range(3)])
     # bar 0 [0,300): base 1..5 -> sum 15 ; bar 1 [300,600): base 6..10 -> sum 40 ;
     # bar 2 [600,900): base 11,12,13 -> sum 36.
     _assert(rows, [5, 5, 3], [15, 40, 36])
@@ -131,9 +134,9 @@ def __test_ltf_ohlcv_tuple__(runner, log):
 
     # --- Empty window: a chart bar with no intrabars yields four empty arrays
     # (na sums), proving the column split survives the no-data path too.
-    # Feed opens at TS0+720 (inside chart bar 2 = [600, 900)); bars 0,1 and the
+    # Feed opens at TS0+720s (inside chart bar 2 = [600s, 900s)); bars 0,1 and the
     # trailing bar 4 see no intrabars.
-    rows = _run(runner, 5, [(_TS0 + 720 + j * 60, j + 1) for j in range(8)])
+    rows = _run(runner, 5, [(_TS0 + (720 + j * 60) * _SEC, j + 1) for j in range(8)])
     # bar 2 [600,900): 720,780,840 -> base 1,2,3 sum 6 ;
     # bar 3 [900,1200): 900..1140 -> base 4..8 sum 30 ; bar 4: empty.
     _assert(rows, [0, 0, 3, 5, 0], [None, None, 6, 30, None])

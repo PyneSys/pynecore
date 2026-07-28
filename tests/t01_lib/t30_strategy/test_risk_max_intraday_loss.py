@@ -59,15 +59,15 @@ def __test_max_intraday_loss_halts_within_day__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='60')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC — start of day, hourly bars
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (ms) — start of day, hourly bars
 
     # Day 1, hourly bars. Position opens at bar 1, breaches loss limit on bar 3.
     bars = [
-        OHLCV(timestamp=base_ts + 0 * 3600, open=100.0, high=100.0, low=100.0, close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * 3600, open=100.0, high=100.5, low=99.5, close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * 3600, open=100.0, high=100.0, low=95.0, close=95.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * 3600, open=95.0, high=95.0, low=88.0, close=88.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * 3600, open=88.0, high=92.0, low=88.0, close=92.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 0 * 3_600_000, open=100.0, high=100.0, low=100.0, close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 1 * 3_600_000, open=100.0, high=100.5, low=99.5, close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 2 * 3_600_000, open=100.0, high=100.0, low=95.0, close=95.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 3 * 3_600_000, open=95.0, high=95.0, low=88.0, close=88.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 4 * 3_600_000, open=88.0, high=92.0, low=88.0, close=92.0, volume=100.0),
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), syminfo)

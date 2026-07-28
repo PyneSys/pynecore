@@ -123,8 +123,8 @@ def main(
 
     # Create demo.ohlcv file only if we created the workdir in this run or recreate_demo is True
     if not workdir_existed or recreate_demo:
-        from datetime import datetime, timedelta, time as dt_time
-        from ...core.ohlcv_file import OHLCVWriter
+        from datetime import datetime, timedelta, time as dt_time, UTC
+        from ...core.ohlcv import OHLCVWriter
         from ...core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
         from ...types.ohlcv import OHLCV
         import random
@@ -185,18 +185,21 @@ def main(
             toml_path = demo_file.with_suffix(".toml")
             syminfo.save_toml(toml_path)
 
-            # Generate synthetic OHLCV data (2000 candles) with random walk
-            start_time = datetime(2020, 1, 1, 0, 0, 0)
+            # Generate synthetic OHLCV data (2000 candles) with random walk.
+            # The anchor is UTC so the daily grid is an exact 86400000 ms step
+            # on every machine, matching the "1D" period declared below.
+            start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
             base_price = 100.0
 
             # Use fixed seed for reproducibility
             random.seed(42)
 
-            with OHLCVWriter(demo_file) as writer:
+            with OHLCVWriter(demo_file, syminfo.period) as writer:
                 current_price = base_price
 
                 for i in range(2000):
-                    timestamp = int((start_time + timedelta(days=i)).timestamp())
+                    # OHLCV timestamps are Unix milliseconds.
+                    timestamp = int((start_time + timedelta(days=i)).timestamp() * 1000)
 
                     # Random walk with slight upward bias
                     change_percent = random.gauss(0.0002, 0.02)  # 0.02% mean, 2% std dev

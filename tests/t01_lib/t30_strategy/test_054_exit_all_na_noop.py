@@ -73,7 +73,7 @@ def __test_all_na_exit_is_noop_not_market_close__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
 
     rows = [
         # open,  high,   low,   close
@@ -84,7 +84,7 @@ def __test_all_na_exit_is_noop_not_market_close__(script_path, module_key):
         (110.0, 110.5, 109.5, 110.0),  # bar 4 - tail
     ]
     bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=o, high=h, low=l, close=c, volume=100.0)
+        OHLCV(timestamp=base_ts + i * 60_000, open=o, high=h, low=l, close=c, volume=100.0)
         for i, (o, h, l, c) in enumerate(rows)
     ]
 

@@ -197,22 +197,23 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.hlcc4 = (h + lo + 2 * c) / 4.0
 
     # ``fromtimestamp(ts, tz)`` converts straight to the exchange timezone (same
-    # instant as a UTC roundtrip), and the epoch milliseconds come directly from
-    # the raw timestamp — no astimezone/timestamp C calls per bar.
-    lib._datetime = datetime.fromtimestamp(ohlcv.timestamp, tz)
-    lib._time = t = int(ohlcv.timestamp * 1000)  # PineScript representation of time
+    # instant as a UTC roundtrip), and the epoch milliseconds are the raw
+    # timestamp itself — no astimezone/timestamp C calls per bar.
+    lib._time = t = ohlcv.timestamp  # PineScript representation of time
+    lib._datetime = datetime.fromtimestamp(t / 1000, tz)
     # Historical runs anchor ``last_bar_time`` to the chart's final bar (Pine
     # semantics — the whole history is known up front); live updates pass
     # ``None`` so it tracks the current (realtime) bar, which IS the last bar.
     lib.last_bar_time = t if last_bar_time is None else last_bar_time
 
     # Multi-period scheduled-grid tracker (lib._dg_*): one compare per bar,
-    # the roll path runs at most once per trading day
-    if ohlcv.timestamp >= lib._dg_next_roll:
-        lib._dg_on_roll(ohlcv.timestamp)
+    # the roll path runs at most once per trading day. It works in epoch seconds.
+    ts_sec = t // 1000
+    if ts_sec >= lib._dg_next_roll:
+        lib._dg_on_roll(ts_sec)
     # Remember this bar so the next roll can measure the day it closes (the
     # holiday half-day fold needs the previous day's last bar end).
-    lib._dg_last_ts = ohlcv.timestamp
+    lib._dg_last_ts = ts_sec
 
 
 # noinspection PyUnusedLocal
@@ -284,6 +285,55 @@ def _reset_lib_vars():
     request._reset_request_state()
 
 
+def _try_in_seconds(period: str | None) -> int | None:
+    """Convert a TradingView period to seconds, or ``None`` when unparseable.
+
+    :param period: Period in TradingView notation, or ``None``.
+    :return: The period in seconds, or ``None``.
+    """
+    from ..lib.timeframe import in_seconds
+
+    if not period:
+        return None
+    try:
+        return in_seconds(period)
+    except (ValueError, AssertionError):
+        return None
+
+
+def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | None:
+    """Read an OHLCV feed's period in seconds from the file itself.
+
+    The file header owns the period: the same timestamps cannot mean a different
+    resolution just because a sidecar says so. When the sidecar declares one too,
+    a disagreement means the sidecar is stale and is reported rather than silently
+    winning. A legacy file carries no header period, so there the sidecar answers,
+    and failing that the first two bar timestamps do.
+
+    :param path: Path to the ``.ohlcv`` feed.
+    :param declared: ``period`` from the sibling ``.toml``, when it has one.
+    :return: The feed's period in seconds, or ``None`` when it cannot be told.
+    :raises ValueError: If ``declared`` disagrees with the file header.
+    """
+    from .ohlcv import OHLCVReader
+
+    declared_sec = _try_in_seconds(declared)
+    with OHLCVReader(path) as reader:
+        header_sec = _try_in_seconds(reader.period)
+        if header_sec is not None:
+            if declared_sec is not None and declared_sec != header_sec:
+                raise ValueError(
+                    f"Stale syminfo for {path.name}: TOML period {declared!r} does not "
+                    f"match the period {reader.period!r} declared by the data file"
+                )
+            return header_sec
+        if declared_sec is not None:
+            return declared_sec
+        if reader.size < 2:
+            return None
+        return (reader.read(1).timestamp - reader.read(0).timestamp) // 1000
+
+
 def _resample_finer_security_feed(data_path: str, target_tf: str,
                                   tmp_dir_holder: 'list[str]') -> str:
     """Pre-resample a finer ``--security`` base feed to the security timeframe.
@@ -307,7 +357,6 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     import hashlib
     import tempfile
     from .aggregator import aggregate_ohlcv
-    from .ohlcv_file import OHLCVReader
     from .datetime import parse_timezone
     from ..lib.timeframe import in_seconds
 
@@ -321,24 +370,12 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     except (ValueError, AssertionError):
         return data_path
     si = SymInfo.load_toml(toml_path)
-    # Decide the source resolution from the DECLARED sidecar period, not the empirical
+    # Decide the source resolution from the DECLARED period, not the empirical
     # first-bar delta. An at-resolution feed whose first two bars are shorter than the
     # nominal period — a monthly feed's 28-day Feb->Mar gap, or a session-bounded
     # intraday feed — would otherwise look "finer" than ``target_tf`` and get needlessly
-    # resampled, inserting synthetic gap-fill bars that corrupt the security history.
-    # ``period`` is authoritative (it already drives ``source_tf`` for the aggregator);
-    # fall back to the measured interval only when it is missing/unparseable.
-    source_sec: int | None
-    if si.period:
-        try:
-            source_sec = in_seconds(si.period)
-        except (ValueError, AssertionError):
-            source_sec = None
-    else:
-        source_sec = None
-    if source_sec is None:
-        with OHLCVReader(src) as reader:
-            source_sec = reader.interval
+    # resampled, inserting aggregate bars that corrupt the security history.
+    source_sec = _measure_feed_period_sec(src, si.period)
     if source_sec is None or source_sec >= target_sec:
         # Feed already at (or coarser than) the security resolution: the child
         # reads the period bar directly, no aggregation needed.
@@ -375,8 +412,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         # Keep the original feed and drop the empty temp so the reuse guard above
         # never returns it later. (A single-record source does NOT reach here:
         # ``aggregate_ohlcv`` emits its lone bar floored onto the target grid, which
-        # the child's ``size == 1`` ``load_htf_bar_opens`` path then confirms at the
-        # period boundary.)
+        # ``load_htf_bar_opens`` then confirms at the period boundary.)
         out.unlink(missing_ok=True)
         return data_path
     # The resampled feed IS the security timeframe; the cloned sidecar keeps every

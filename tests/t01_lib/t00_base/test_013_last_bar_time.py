@@ -15,9 +15,10 @@ def main():
     plot(1 if time == chart.right_visible_bar_time else 0, "vis")
 
 
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to the 5-minute grid
-_STEP = 300  # conftest syminfo period is "5" (5-minute bars)
-_VISIBLE_SPAN_MS = 20 * _STEP * 1000  # chart._visible_bars bars back from the right edge
+# Every timestamp here is Unix MILLISECONDS.
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5-minute grid
+_STEP = 300_000  # conftest syminfo period is "5" (5-minute bars)
+_VISIBLE_SPAN_MS = 20 * _STEP  # chart._visible_bars bars back from the right edge
 
 
 def _bars(n):
@@ -38,7 +39,7 @@ def __test_last_bar_time_anchored__(script_path, module_key, syminfo):
     does from the data window), every bar sees the run's FINAL bar time, the visible
     range hangs off it, and ``time == chart.right_visible_bar_time`` is true only on
     the final bar — Pine's fixed viewport on historical bars."""
-    final_ms = (_TS0 + 3 * _STEP) * 1000
+    final_ms = _TS0 + 3 * _STEP
     r = _make_runner(script_path, module_key, syminfo, _bars(4),
                      last_bar_index=3, last_bar_time=final_ms)
 
@@ -55,7 +56,7 @@ def __test_last_bar_time_tracking_default__(script_path, module_key, syminfo):
     r = _make_runner(script_path, module_key, syminfo, _bars(3))
 
     rows = [dict(_plot) for _, _plot in r.run_iter()]
-    times = [(_TS0 + i * _STEP) * 1000 for i in range(3)]
+    times = [_TS0 + i * _STEP for i in range(3)]
     assert [row["lbt"] for row in rows] == times
     assert [row["rvbt"] for row in rows] == times
     assert [row["vis"] for row in rows] == [1, 1, 1]

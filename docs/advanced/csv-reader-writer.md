@@ -5,7 +5,7 @@ title: "Fast CSV Reader/Writer"
 description: "High-performance CSV processing with multithreaded writing and memory mapping"
 icon: "table_chart"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Advanced", "Data Handling"]
@@ -110,7 +110,7 @@ with CSVWriter(Path("market_data.csv"),
 
     # Write OHLCV records
     writer.write_ohlcv(OHLCV(
-        timestamp=1609459200,
+        timestamp=1609459200000,
         open=100.0,
         high=110.0,
         low=90.0,
@@ -165,8 +165,8 @@ from pathlib import Path
 
 # Read a specific time range
 with CSVReader(Path("market_data.csv")) as reader:
-    start_time = 1609459200  # Unix timestamp
-    end_time = 1609459800    # Unix timestamp
+    start_time = 1609459200000  # Unix milliseconds
+    end_time = 1609459800000    # Unix milliseconds
 
     for candle in reader.read_from(start_time, end_time):
         print(f"Time: {candle.timestamp}, Close: {candle.close}")
@@ -233,7 +233,7 @@ The CSVWriter is designed with thread safety in mind:
 
 When working with financial data in PyneCore, you have two main options:
 
-### Binary OHLCV Format (ohlcv_file.py)
+### Binary OHLCV Format (ohlcv.py)
 - **Pros**: Maximum performance, compact storage, direct random access
 - **Cons**: Specialized format, less human-readable, fixed schema
 

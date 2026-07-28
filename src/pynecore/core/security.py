@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
     from multiprocessing.synchronize import Event as EventType, Lock as LockType
     from typing import Callable
+    from .ohlcv import OHLCVReader
     from .resampler import Resampler
     from .htf_aggregator import HTFAggregator
     from .syminfo import SymInfo, SymInfoSession, SymInfoInterval
@@ -1353,6 +1354,35 @@ def _dated_session_bar_closes(
     return closes
 
 
+def _is_dense_feed(reader: OHLCVReader, real_bar_count: int, period_sec: int) -> bool:
+    """
+    Decide whether a feed's real bars tile the requested timeframe grid.
+
+    A feed is dense only when its bars sit exactly one period apart. The row
+    count alone is not enough: a session-spaced feed whose bars are wider than
+    the period (e.g. a gap-free, 24h-spaced 720-minute night future) has no gap
+    fills, yet its bars do NOT tile the period grid and must ride the
+    session-close path. A file with fewer than two bars has no spacing to
+    contradict the grid and stays dense.
+
+    A file declaring its own period and density answers directly; a legacy file
+    declares neither, so the spacing is measured from its first two records —
+    which is also where its gap fills show up as a shorter real-bar count.
+
+    :param reader: Open reader of the child's feed.
+    :param real_bar_count: Number of real (non gap-fill) bars read from the feed.
+    :param period_sec: The requested timeframe in seconds.
+    :return: Whether the arithmetic grid already matches the feed.
+    """
+    from ..lib import timeframe as tf_module
+    if reader.size < 2:
+        return True
+    if reader.dense is not None and reader.period is not None:
+        return reader.dense and tf_module.in_seconds(reader.period) == period_sec
+    return (real_bar_count == reader.size
+            and reader.read(1).timestamp - reader.read(0).timestamp == period_sec * 1000)
+
+
 def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     """
     Load the child's real bar opens for HTF confirmation against the actual feed.
@@ -1367,18 +1397,16 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
       chart bar landing on a day with no real child bar would advance the
       subprocess into an empty window — writing ``na`` and destroying the
       ``gaps_off`` (TV default) forward-fill.
-    * Gappy intraday HTF: ``OHLCVWriter`` forward-fills a session-gapped futures
-      feed (e.g. a 720-minute HTF on a 3-session palm-oil contract) to a
-      continuous grid, but the security child reads only the real bars
-      (gap-compacted, see ``security_process``). The grid would then confirm
-      phantom periods on the fills' timestamps. Dense intraday feeds keep the
-      cheaper arithmetic grid (this stays a no-op for them); LTF contexts run
-      their own intrabar machinery, not HTF confirmation.
+    * Gappy intraday HTF: a session-gapped futures feed (e.g. a 720-minute HTF on
+      a 3-session palm-oil contract) has no bar over its non-trading spans, so the
+      grid would confirm periods the child never reaches. Dense intraday feeds
+      keep the cheaper arithmetic grid (this stays a no-op for them); LTF contexts
+      run their own intrabar machinery, not HTF confirmation.
 
     A gappy SAME-TF cross-symbol feed (a session-bounded symbol requested at the
-    chart's own TF on a 24/7 chart) rides the same intraday path: the child is
-    gap-compacted, and ``_get_confirmed_time`` clamps the chart bar time to
-    these opens so gap bars confirm nothing new.
+    chart's own TF on a 24/7 chart) rides the same intraday path:
+    ``_get_confirmed_time`` clamps the chart bar time to these opens so gap bars
+    confirm nothing new.
 
     Riding the real opens (clamp for single-period / intraday, walk for
     multi-period D/W/M) makes ``new_period`` fire only on real bars: between them
@@ -1391,7 +1419,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     """
     # Local import: ``core`` ↔ ``lib`` would otherwise form an import cycle.
     from ..lib import timeframe as tf_module
-    from .ohlcv_file import OHLCVReader
+    from .ohlcv import OHLCVReader
     from .resampler import grid_mode, overnight_opens, trading_day
     from .syminfo import SymInfo
     # noinspection PyProtectedMember
@@ -1411,16 +1439,8 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
             start_ts = reader.start_timestamp
             if start_ts is None:
                 return
-            opens = [candle.timestamp * 1000 for candle in reader.read_from(start_ts)]
-            # A feed is dense only when its real bars tile the timeframe grid (file
-            # interval == period). The row count alone is not enough: a session-
-            # spaced feed whose bars sit wider than the period (e.g. a gap-free,
-            # 24h-spaced 720-minute night future) has no gap fills, so
-            # ``len(opens) == reader.size`` holds, yet its bars do NOT tile the
-            # period grid and must still ride the session-close path below. A
-            # single-record file has no interval to compare, so it keeps the dense
-            # fast path as before.
-            if len(opens) == reader.size and reader.interval in (None, period_sec):
+            opens = [candle.timestamp for candle in reader.read_from(start_ts)]
+            if _is_dense_feed(reader, len(opens), period_sec):
                 return  # dense feed: the arithmetic grid is already correct
         # Gappy fixed-span intraday HTF: keep the arithmetic (fixed-span) grid for
         # the close instant, but CLAMP it to the latest real open so an empty
@@ -1434,19 +1454,15 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # and only *clamps* to these opens — see ``_get_confirmed_time``.
         state.bar_opens_multiperiod = multiplier > 1
         with OHLCVReader(data_path) as reader:
-            if reader.size == 1:
-                # A single-record feed has no derivable interval, so
-                # ``start_timestamp`` stays ``None`` and ``read_from`` bails —
-                # ``opens`` would be empty and ``_get_confirmed_time`` would then
-                # never confirm the lone bar (the child reads ``na`` forever).
-                # This is reachable when a finer base feed spans exactly one
-                # requested D/W/M period and resamples to a single aggregate.
-                # Read the one bar directly so its open still anchors the clamp.
-                opens = [reader.read(0).timestamp * 1000]
-            else:
-                start_ts = reader.start_timestamp
-                opens = ([] if start_ts is None else
-                         [candle.timestamp * 1000 for candle in reader.read_from(start_ts)])
+            start_ts = reader.start_timestamp
+            opens = ([] if start_ts is None else
+                     [candle.timestamp for candle in reader.read_from(start_ts)])
+            if not opens and reader.size == 1:
+                # The lone record is a legacy phantom gap fill, which range reads
+                # skip — ``opens`` would stay empty and ``_get_confirmed_time``
+                # would never confirm the bar (the child reads ``na`` forever).
+                # Read it directly so its open still anchors the clamp.
+                opens = [reader.read(0).timestamp]
 
     state.bar_opens = opens
     state.bar_ptr = -1
@@ -1542,10 +1558,9 @@ def load_ltf_first_ms(state: SecurityState, data_path: str) -> None:
     """
     if not state.is_ltf and not state.plain_ltf:
         return
-    from .ohlcv_file import OHLCVReader
+    from .ohlcv import OHLCVReader
     with OHLCVReader(data_path) as reader:
-        start_ts = reader.start_timestamp
-    state.ltf_first_ms = None if start_ts is None else int(start_ts * 1000)
+        state.ltf_first_ms = reader.start_timestamp
 
 
 def setup_security_states(

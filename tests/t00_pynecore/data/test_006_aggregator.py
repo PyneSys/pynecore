@@ -6,7 +6,8 @@ import tempfile
 from pathlib import Path
 
 from pynecore.core.aggregator import validate_aggregation, aggregate_ohlcv, _merge_candles
-from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
+from pynecore.core.ohlcv import OHLCVWriter
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -14,9 +15,9 @@ def main():
     pass
 
 
-def _create_ohlcv_file(path: Path, candles: list[OHLCV]) -> None:
-    """Helper to write candles into an .ohlcv file."""
-    with OHLCVWriter(path, truncate=True) as writer:
+def _create_ohlcv_file(path: Path, candles: list[OHLCV], period: str) -> None:
+    """Helper to write candles into an .ohlcv file with its declared period."""
+    with OHLCVWriter(path, period, truncate=True) as writer:
         for c in candles:
             writer.write(c)
 
@@ -66,13 +67,13 @@ def __test_validate_aggregation_not_divisible_fails__():
 def __test_merge_candles__():
     """Merge follows OHLCV rules: O=first, H=max, L=min, C=last, V=sum."""
     candles = [
-        OHLCV(timestamp=1000, open=10.0, high=15.0, low=8.0, close=12.0, volume=100.0),
-        OHLCV(timestamp=1060, open=12.0, high=18.0, low=11.0, close=14.0, volume=200.0),
-        OHLCV(timestamp=1120, open=14.0, high=16.0, low=9.0, close=13.0, volume=150.0),
+        OHLCV(timestamp=60_000, open=10.0, high=15.0, low=8.0, close=12.0, volume=100.0),
+        OHLCV(timestamp=120_000, open=12.0, high=18.0, low=11.0, close=14.0, volume=200.0),
+        OHLCV(timestamp=180_000, open=14.0, high=16.0, low=9.0, close=13.0, volume=150.0),
     ]
-    merged = _merge_candles(candles, bar_time=1000)
+    merged = _merge_candles(candles, bar_time=60_000)
 
-    assert merged.timestamp == 1000
+    assert merged.timestamp == 60_000
     assert merged.open == 10.0
     assert merged.high == 18.0
     assert merged.low == 8.0
@@ -89,10 +90,10 @@ def __test_aggregate_5min_to_15min__(tmp_path):
 
     # Create 6 candles of 5-minute data (= 30 minutes = two 15-min bars)
     # Timestamps aligned to 5-min boundaries
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC (Monday)
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (Monday)
     candles = []
     for i in range(6):
-        ts = base_ts + i * 300  # 5 min = 300 sec
+        ts = base_ts + i * 300_000  # 5 min = 300 000 ms
         candles.append(OHLCV(
             timestamp=ts,
             open=100.0 + i,
@@ -102,7 +103,7 @@ def __test_aggregate_5min_to_15min__(tmp_path):
             volume=1000.0 + i * 10,
         ))
 
-    _create_ohlcv_file(source, candles)
+    _create_ohlcv_file(source, candles, "5")
     src_count, tgt_count = aggregate_ohlcv(source, target, "15")
 
     assert src_count == 6
@@ -132,8 +133,8 @@ def __test_aggregate_daily_to_weekly__(tmp_path):
     target = tmp_path / "test_1W.ohlcv"
 
     # 2024-01-01 is Monday — create 10 days (= 1 full week + 3 days)
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC (Monday)
-    day = 86400
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (Monday)
+    day = 86_400_000
     candles = []
     for i in range(10):
         candles.append(OHLCV(
@@ -145,7 +146,7 @@ def __test_aggregate_daily_to_weekly__(tmp_path):
             volume=50000.0 + i * 100,
         ))
 
-    _create_ohlcv_file(source, candles)
+    _create_ohlcv_file(source, candles, "1D")
     src_count, tgt_count = aggregate_ohlcv(source, target, "1W")
 
     assert src_count == 10
@@ -171,20 +172,21 @@ def __test_aggregate_preserves_high_low__(tmp_path):
     source = tmp_path / "test_src.ohlcv"
     target = tmp_path / "test_tgt.ohlcv"
 
-    # Need at least 2 target bars (OHLCVReader requires 2+ candles for interval)
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    # Two target bars, so both the merge and the bar boundary are exercised
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC
+    step = 300_000  # 5 min
     candles = [
         # First 15-min bar: extreme high in candle 1, extreme low in candle 2
-        OHLCV(timestamp=base_ts,       open=100.0, high=110.0, low=90.0,  close=105.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 300,  open=105.0, high=120.0, low=95.0,  close=115.0, volume=200.0),
-        OHLCV(timestamp=base_ts + 600,  open=115.0, high=112.0, low=85.0,  close=100.0, volume=150.0),
+        OHLCV(timestamp=base_ts,            open=100.0, high=110.0, low=90.0, close=105.0, volume=100.0),
+        OHLCV(timestamp=base_ts + step,     open=105.0, high=120.0, low=95.0, close=115.0, volume=200.0),
+        OHLCV(timestamp=base_ts + 2 * step, open=115.0, high=116.0, low=85.0, close=100.0, volume=150.0),
         # Second 15-min bar
-        OHLCV(timestamp=base_ts + 900,  open=100.0, high=105.0, low=92.0,  close=98.0, volume=80.0),
-        OHLCV(timestamp=base_ts + 1200, open=98.0,  high=130.0, low=88.0,  close=125.0, volume=300.0),
-        OHLCV(timestamp=base_ts + 1500, open=125.0, high=126.0, low=91.0,  close=95.0, volume=120.0),
+        OHLCV(timestamp=base_ts + 3 * step, open=100.0, high=105.0, low=92.0, close=98.0, volume=80.0),
+        OHLCV(timestamp=base_ts + 4 * step, open=98.0, high=130.0, low=88.0, close=125.0, volume=300.0),
+        OHLCV(timestamp=base_ts + 5 * step, open=125.0, high=126.0, low=91.0, close=95.0, volume=120.0),
     ]
 
-    _create_ohlcv_file(source, candles)
+    _create_ohlcv_file(source, candles, "5")
     aggregate_ohlcv(source, target, "15")
 
     result = _read_all(target)
@@ -208,7 +210,7 @@ def __test_aggregate_session_anchored__():
     ny = ZoneInfo("America/New_York")
 
     def ts(h: int, mi: int) -> int:
-        return int(datetime(2024, 1, 17, h, mi, tzinfo=ny).timestamp())
+        return int(datetime(2024, 1, 17, h, mi, tzinfo=ny).timestamp()) * 1000
 
     # 30m source candles across a 09:30-opening session.
     candles = [
@@ -222,7 +224,7 @@ def __test_aggregate_session_anchored__():
     with tempfile.TemporaryDirectory() as tmp:
         source = Path(tmp) / "src.ohlcv"
         target = Path(tmp) / "tgt.ohlcv"
-        _create_ohlcv_file(source, candles)
+        _create_ohlcv_file(source, candles, "30")
         aggregate_ohlcv(source, target, "60", tz=ny, session_starts=session_starts)
         result = _read_all(target)
 
@@ -245,7 +247,7 @@ def __test_aggregate_observed_holiday_grouping__():
 
     def open_ts(trading_day: date) -> int:
         prev = trading_day - timedelta(days=1)
-        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp())
+        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp()) * 1000
 
     # Two weeks of daily bars; Mon Jan 13 2025 is a holiday (no bar)
     days = [date(2025, 1, d) for d in (6, 7, 8, 9, 10, 14, 15, 16, 17)]
@@ -258,7 +260,7 @@ def __test_aggregate_observed_holiday_grouping__():
     with tempfile.TemporaryDirectory() as tmp:
         source = Path(tmp) / "src.ohlcv"
         target = Path(tmp) / "tgt.ohlcv"
-        _create_ohlcv_file(source, candles)
+        _create_ohlcv_file(source, candles, "1D")
         aggregate_ohlcv(source, target, "2D", tz=ny, session_starts=starts,
                         opening_hours=hours, sym_type='futures', source_tf='1D')
         result = _read_all(target)
@@ -283,12 +285,11 @@ def __test_aggregate_observed_holiday_grouping__():
 def __test_aggregate_single_record_floors_to_period__(tmp_path):
     """A one-record source aggregates to ONE bar floored onto the period grid.
 
-    A single-record file has no derivable interval, so ``start_timestamp`` is None
-    and ``read_from`` yields nothing — but that lone bar IS a whole target period
-    and must be emitted with a period-boundary timestamp, not the raw sub-bar
-    instant. Without this, a finer one-period ``--security`` feed would expose a
-    daily bar stamped mid-day, shifting single-period D/W/M confirmation and
-    ``request.security(.., time)`` by up to a full period (issue #70 edge case).
+    That lone bar IS a whole target period and must be emitted with a
+    period-boundary timestamp, not the raw sub-bar instant. Without this, a finer
+    one-period ``--security`` feed would expose a daily bar stamped mid-day,
+    shifting single-period D/W/M confirmation and ``request.security(.., time)``
+    by up to a full period (issue #70 edge case).
     """
     from datetime import timezone
 
@@ -296,10 +297,10 @@ def __test_aggregate_single_record_floors_to_period__(tmp_path):
     target = tmp_path / "one_1D.ohlcv"
 
     # A single 15-minute bar at 2024-01-02 14:30 UTC (mid-day, NOT civil midnight)
-    raw_ts = 1704205800  # 2024-01-02 14:30:00 UTC
+    raw_ts = 1_704_205_800_000  # 2024-01-02 14:30:00 UTC
     _create_ohlcv_file(source, [
         OHLCV(timestamp=raw_ts, open=100.0, high=110.0, low=90.0, close=105.0, volume=7.0),
-    ])
+    ], "15")
 
     # The lone bar floors via the SAME ``get_bar_time`` call as the multi-bar loop,
     # so it is consistent with a normal feed's stamping; pin UTC for a clean
@@ -310,12 +311,11 @@ def __test_aggregate_single_record_floors_to_period__(tmp_path):
     assert tgt_count == 1
 
     # Output: exactly one bar, stamped at the civil daily open (00:00 UTC), with
-    # the lone bar's OHLCV preserved. ``_read_all`` cannot read a one-record file
-    # (its own ``read_from`` needs a derivable interval), so read by index.
+    # the lone bar's OHLCV preserved.
     with OHLCVReader(target) as reader:
         assert reader.size == 1
         bar = reader.read(0)
-    assert bar.timestamp == 1704153600  # 2024-01-02 00:00:00 UTC
+    assert bar.timestamp == 1_704_153_600_000  # 2024-01-02 00:00:00 UTC
     assert bar.open == pytest.approx(100.0, rel=1e-5)
     assert bar.high == pytest.approx(110.0, rel=1e-5)
     assert bar.low == pytest.approx(90.0, rel=1e-5)
@@ -328,7 +328,7 @@ def __test_aggregate_empty_source_stays_empty__(tmp_path):
     must NOT fire for an empty file."""
     source = tmp_path / "empty.ohlcv"
     target = tmp_path / "empty_1D.ohlcv"
-    _create_ohlcv_file(source, [])
+    _create_ohlcv_file(source, [], "15")
 
     src_count, tgt_count = aggregate_ohlcv(source, target, "1D", source_tf="15")
     assert src_count == 0

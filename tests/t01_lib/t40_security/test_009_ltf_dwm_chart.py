@@ -22,23 +22,24 @@ def main():
 # primary proof; the America/New_York case proves the civil next-open is built in
 # the exchange timezone (correct across the spring-forward DST transition, where
 # the local day is only 23 hours).
-_HOUR = 3600
+# Every timestamp here is Unix MILLISECONDS.
+_HOUR = 3_600_000
 _LTF_TF = "60"
 
 
 def _write_ltf(tmp_dir, bars):
-    """Write a 1-hour LTF feed from ``(timestamp_s, close)`` pairs (+ a 24/7 UTC
+    """Write a 1-hour LTF feed from ``(timestamp_ms, close)`` pairs (+ a 24/7 UTC
     ``.toml`` sidecar the subprocess loads on startup); return the path. The LTF
     feed timezone is irrelevant to the window (the parent drives ``target_time``);
     only the bar opens matter.
     """
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_LTFSYM_60.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "60") as w:
         for ts, c in bars:
             c = float(c)
             w.write(OHLCV(timestamp=ts, open=c, high=c, low=c, close=c, volume=1.0))
@@ -58,8 +59,8 @@ def _write_ltf(tmp_dir, bars):
 
 
 def _chart_bars(timestamps):
-    """Daily chart bars at the given epoch-second opens; OHLCV body is irrelevant
-    to the LTF result.
+    """Daily chart bars at the given epoch-millisecond opens; OHLCV body is
+    irrelevant to the LTF result.
     """
     from pynecore.types.ohlcv import OHLCV
     return [
@@ -123,7 +124,7 @@ def __test_ltf_dwm_chart_window__(runner, log):
     # gets hours 0..23 (24 bars, sum 300), day 1 hours 24..47 (24 bars, sum 876),
     # day 2 the partial tail hours 48..52 (5 bars, sum 255).
     utc = ZoneInfo("UTC")
-    ts0 = int(datetime(2025, 1, 1, tzinfo=utc).timestamp())
+    ts0 = int(datetime(2025, 1, 1, tzinfo=utc).timestamp()) * 1000
     chart_opens = [ts0 + d * 24 * _HOUR for d in range(3)]
     ltf_bars = [(ts0 + h * _HOUR, h + 1) for h in range(53)]
     rows = _run(runner, "UTC", chart_opens, ltf_bars)
@@ -138,7 +139,7 @@ def __test_ltf_dwm_chart_window__(runner, log):
     # bars from Mar 8 00:00 NY (closes 1..51): Mar 8 -> 24 (sum 300), Mar 9 -> 23
     # (sum 828), Mar 10 -> the 4-bar tail (sum 198).
     ny = ZoneInfo("America/New_York")
-    chart_opens = [int(datetime(2025, 3, d, tzinfo=ny).timestamp()) for d in (8, 9, 10)]
+    chart_opens = [int(datetime(2025, 3, d, tzinfo=ny).timestamp()) * 1000 for d in (8, 9, 10)]
     ltf_start = chart_opens[0]
     ltf_bars = [(ltf_start + h * _HOUR, h + 1) for h in range(51)]
     rows = _run(runner, "America/New_York", chart_opens, ltf_bars)

@@ -1,19 +1,26 @@
 """
-Binary OHLCV must not be mistaken for a text file.
+Legacy v1 OHLCV files must not be mistaken for text files.
 
-``OHLCVReader.open`` refuses a CSV saved under an ``.ohlcv`` name. The check used
-to read 32 bytes and reject anything that decoded as ASCII — but a perfectly
-valid record decodes as ASCII too whenever every one of its bytes falls below
+A v1 file carries no magic bytes, so ``OHLCVReader.open`` falls back to the legacy
+reader for anything that is not v2, and only that reader runs the text probe. The
+probe used to read 32 bytes and reject whatever decoded as ASCII — but a perfectly
+valid v1 record decodes as ASCII too whenever every one of its bytes falls below
 0x80, which is ordinary for a small price with no volume. A BIST:PGSUS hourly
-export hit exactly that and became unreadable. A record file is always a whole
-number of ``RECORD_SIZE`` records, so the length is what settles it.
+export hit exactly that and became unreadable. A v1 file is always a whole number
+of ``RECORD_SIZE`` records, so the length is what settles it.
+
+The v1 writer is gone, so the fixtures below hand-pack v1 records. That is why this
+module imports the v1 format constants from ``pynecore.core.ohlcv_legacy`` — a
+licence reserved for the v1 backward-compatibility tests, never for production,
+plugin or example code.
 """
 import struct
 from pathlib import Path
 
 import pytest
 
-from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter, RECORD_SIZE, STRUCT_FORMAT
+from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv_legacy import RECORD_SIZE, STRUCT_FORMAT
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -31,7 +38,7 @@ def __test_all_ascii_records_are_readable__(tmp_path: Path, log):
 
     with OHLCVReader(str(path)) as reader:
         assert reader.size == 3
-        assert reader.start_timestamp == ts
+        assert reader.start_timestamp == ts * 1000
 
 
 def __test_csv_under_ohlcv_name_still_rejected__(tmp_path: Path, log):
@@ -47,11 +54,11 @@ def __test_csv_under_ohlcv_name_still_rejected__(tmp_path: Path, log):
 
 
 def __test_written_file_round_trips__(tmp_path: Path, log):
-    """The writer's own output always reads back — the guard never fires on it"""
+    """A freshly written v2 file is magic-dispatched, so the probe never sees it"""
     path = tmp_path / "written.ohlcv"
-    with OHLCVWriter(path, truncate=True) as writer:
+    with OHLCVWriter(path, "60", truncate=True) as writer:
         for i in range(4):
-            writer.write(OHLCV(1735689600 + i * 3600, 0.0, 0.0, 0.0, 0.0, 0.0))
+            writer.write(OHLCV(1_735_689_600_000 + i * 3_600_000, 0.0, 0.0, 0.0, 0.0, 0.0))
 
     with OHLCVReader(str(path)) as reader:
         assert reader.size == 4

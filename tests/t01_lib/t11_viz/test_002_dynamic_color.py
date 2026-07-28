@@ -25,9 +25,9 @@ def __test_dynamic_color__(runner):
     from pynecore import lib
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200
+    base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [(100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(6)]
-    bars = [OHLCV(timestamp=base + i * 300, open=o, high=h, low=l, close=c, volume=100.0)
+    bars = [OHLCV(timestamp=base + i * 300_000, open=o, high=h, low=l, close=c, volume=100.0)
             for i, (o, h, l, c) in enumerate(rows)]
 
     dyn_snaps: list[dict] = []

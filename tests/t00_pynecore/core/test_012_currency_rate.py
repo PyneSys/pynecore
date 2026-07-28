@@ -1,13 +1,13 @@
 """
 @pyne
 """
-import struct
 import tempfile
 from math import isnan
 from pathlib import Path
 
 from pynecore.core.currency import CurrencyRateProvider
-from pynecore.core.ohlcv_file import RECORD_SIZE
+from pynecore.core.ohlcv import OHLCVWriter
+from pynecore.types.ohlcv import OHLCV
 
 
 def _create_test_ohlcv(dir_path: Path, name: str, bars: list[tuple[int, float]],
@@ -15,17 +15,17 @@ def _create_test_ohlcv(dir_path: Path, name: str, bars: list[tuple[int, float]],
     """
     Create a test OHLCV binary file + TOML in the given directory.
 
-    :param bars: List of (timestamp, close) tuples
+    :param bars: List of (timestamp, close) tuples, timestamps in UNIX seconds
     :return: Path string to the OHLCV file (without extension for security_data key)
     """
     base_path = dir_path / name
     ohlcv_path = base_path.with_suffix('.ohlcv')
     toml_path = base_path.with_suffix('.toml')
 
-    # Write binary OHLCV: Ifffff = timestamp, open, high, low, close, volume
-    with open(ohlcv_path, 'wb') as f:
+    # OHLCV files store milliseconds, while get_rate() takes seconds.
+    with OHLCVWriter(ohlcv_path, period, truncate=True) as writer:
         for ts, close in bars:
-            f.write(struct.pack('Ifffff', ts, close, close, close, close, 100.0))
+            writer.write(OHLCV(ts * 1000, close, close, close, close, 100.0))
 
     # Write minimal TOML
     toml_content = f"""[symbol]

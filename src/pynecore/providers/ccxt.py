@@ -535,8 +535,10 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                     tf += timedelta(days=1)
 
                 for r in res:
-                    t = int(r[0] / 1000)
-                    dt = datetime.fromtimestamp(t, UTC).replace(tzinfo=None)
+                    # CCXT candle timestamps are Unix milliseconds, which is
+                    # also the OHLCV storage unit — no rescaling.
+                    t = int(r[0])
+                    dt = datetime.fromtimestamp(t / 1000, UTC).replace(tzinfo=None)
                     if dt > tt:
                         raise StopIteration
 
@@ -639,7 +641,8 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         while True:
             candles = await self._async_client.watch_ohlcv(symbol, xchg_tf)
             last = candles[-1]
-            timestamp = int(last[0] / 1000)
+            # CCXT streams Unix millisecond timestamps, the OHLCV storage unit.
+            timestamp = int(last[0])
 
             current_ohlcv = OHLCV(
                 timestamp=timestamp,

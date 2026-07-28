@@ -69,7 +69,7 @@ def __test_extra_fields_series_history__(script_path, module_key, syminfo, csv_r
 def __test_extra_fields_sidecar_generation__():
     """ DataConverter generates .extra.csv sidecar for CSV with extra columns """
     from pynecore.core.data_converter import DataConverter
-    from pynecore.core.ohlcv_file import OHLCVReader
+    from pynecore.core.ohlcv import OHLCVReader
 
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = Path(tmpdir) / "test.csv"

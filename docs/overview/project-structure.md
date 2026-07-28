@@ -5,7 +5,7 @@ title: "Project Structure"
 description: "Overview of the PyneCore project structure and architecture"
 icon: "account_tree"
 date: "2025-04-03"
-lastmod: "2026-03-18"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Overview", "Architecture"]
@@ -50,7 +50,7 @@ The heart of the PyneCore system, implementing the fundamental data structures a
 - **Series Implementation** (`series.py`): Circular buffer-based data structure that emulates Pine Script's series behavior (~490k ops/sec)
 - **Script Runner** (`script_runner.py`): Executes Pyne code bar-by-bar, handles strategy simulation lifecycle
 - **Import Hook System** (`import_hook.py`): Allows Python to process `@pyne` scripts with AST transformations
-- **Data Handling** (`ohlcv_file.py`, `csv_file.py`, `data_converter.py`): OHLCV reading/writing, CSV conversion with extra fields support
+- **Data Handling** (`ohlcv.py`, `csv_file.py`, `data_converter.py`): OHLCV reading/writing through the single `ohlcv.py` entry point (older files are read transparently behind it by `ohlcv_legacy.py`, which is never imported directly), and CSV conversion with extra fields
 - **Aggregator** (`aggregator.py`): Timeframe aggregation (e.g. 1m → 1H → 1D)
 - **Resampler** (`resampler.py`): Bar time calculation with timezone-aware calendar alignment
 - **Overload Dispatch** (`overload.py`): Pine Script-compatible function overloading system

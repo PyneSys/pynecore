@@ -38,9 +38,10 @@ def _ms(month, day, hour):
     return int(datetime(2026, month, day, hour, 0, tzinfo=UTC).timestamp() * 1000)
 
 
-def _opens_sec(days):
-    """Epoch seconds of a 21:00 UTC night-session open on each given date."""
-    return [int(datetime(d.year, d.month, d.day, 21, 0, tzinfo=UTC).timestamp()) for d in days]
+def _opens_ms(days):
+    """Epoch milliseconds of a 21:00 UTC night-session open on each given date."""
+    return [int(datetime(d.year, d.month, d.day, 21, 0, tzinfo=UTC).timestamp()) * 1000
+            for d in days]
 
 
 def _night_variant(effective_from, end_t):
@@ -89,12 +90,12 @@ def _state():
 
 def _load(tmp_dir, name, syminfo, days):
     """Write a gappy night-session feed (+ its ``.toml``), run ``load_htf_bar_opens``."""
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.security import load_htf_bar_opens
     from pynecore.types.ohlcv import OHLCV
     path = tmp_dir / f"{name}.ohlcv"
-    with OHLCVWriter(path) as w:
-        for ts in _opens_sec(days):
+    with OHLCVWriter(path, "720") as w:
+        for ts in _opens_ms(days):
             w.write(OHLCV(timestamp=ts, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0))
     syminfo.save_toml(path.with_suffix(".toml"))
     state = _state()

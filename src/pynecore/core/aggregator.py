@@ -11,7 +11,8 @@ from datetime import timezone as dt_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .ohlcv_file import OHLCVReader, OHLCVWriter
+from .ohlcv import OHLCVWriter
+from .ohlcv import OHLCVReader
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
@@ -48,7 +49,7 @@ def _merge_candles(candles: list[OHLCV], bar_time: int) -> OHLCV:
     Merge a window of candles into a single aggregated candle.
 
     :param candles: Non-empty list of OHLCV candles belonging to the same bar
-    :param bar_time: Aligned bar opening timestamp in seconds
+    :param bar_time: Aligned bar opening timestamp in milliseconds
     :return: Aggregated OHLCV candle
     """
     return OHLCV(
@@ -101,6 +102,8 @@ def aggregate_ohlcv(
     """
     # noinspection PyProtectedMember
     modifier, multiplier = _process_tf(target_tf)
+    # The written file declares its period with an explicit multiplier ('D' -> '1D').
+    target_period = f"{multiplier}{modifier}" if modifier else str(multiplier)
     mode = grid_mode(sym_type, opening_hours)
 
     src_off = 0
@@ -123,42 +126,25 @@ def aggregate_ohlcv(
 
     source_count = 0
     target_count = 0
+    src_off_ms = src_off * 1000
 
     with OHLCVReader(source_path) as reader:
-        with OHLCVWriter(target_path, truncate=True) as writer:
+        with OHLCVWriter(target_path, target_period, truncate=True) as writer:
             window: list[OHLCV] = []
             current_bar_time: int | None = None
 
             start_ts = reader.start_timestamp
             if start_ts is None:
-                if reader.size == 1:
-                    # A single-record source has no derivable interval (the reader
-                    # needs two timestamps to infer one), so ``start_timestamp`` is
-                    # None and ``read_from`` yields nothing — yet that lone bar IS a
-                    # whole target period and must be emitted. Floor its timestamp
-                    # onto the target grid (exactly as the loop below does) so HTF
-                    # confirmation (the ``bar_opens`` clamp) and
-                    # ``request.security(.., time)`` see the period boundary, not the
-                    # raw sub-bar instant.
-                    only = reader.read(0)
-                    only_bar_time = resampler.get_bar_time(
-                        (only.timestamp + src_off) * 1000, tz=tz,
-                        session_starts=session_starts,
-                        opening_hours=opening_hours, mode=mode) // 1000
-                    writer.write(_merge_candles([only], only_bar_time))
-                    return 1, 1
                 return 0, 0
 
             for candle in reader.read_from(start_ts):
                 source_count += 1
 
-                # Resampler works in ms, OHLCV timestamps are in seconds.
                 # src_off resolves multi-period bars by their last instant.
-                bar_time_ms = resampler.get_bar_time(
-                    (candle.timestamp + src_off) * 1000, tz=tz,
+                bar_time = resampler.get_bar_time(
+                    candle.timestamp + src_off_ms, tz=tz,
                     session_starts=session_starts,
                     opening_hours=opening_hours, mode=mode)
-                bar_time = bar_time_ms // 1000
 
                 if current_bar_time is not None and bar_time != current_bar_time:
                     # New bar boundary — flush the window
@@ -222,7 +208,7 @@ def _aggregate_observed(
     target_count = 0
 
     with OHLCVReader(source_path) as reader:
-        with OHLCVWriter(target_path, truncate=True) as writer:
+        with OHLCVWriter(target_path, f"{multiplier}{modifier}", truncate=True) as writer:
             window: list[OHLCV] = []
             window_start: int | None = None
             group_key: tuple | None = None
@@ -234,8 +220,10 @@ def _aggregate_observed(
 
             for candle in reader.read_from(start_ts):
                 source_count += 1
-                td = trading_day(candle.timestamp + src_off, tz, on)
-                bar_end = candle.timestamp + src_off + 1 if fold else None
+                # The trading-day calendar works in seconds, OHLCV timestamps in ms.
+                ts_sec = candle.timestamp // 1000
+                td = trading_day(ts_sec + src_off, tz, on)
+                bar_end = ts_sec + src_off + 1 if fold else None
                 counter.ordinal(td, bar_end)
                 key = counter.key(modifier, multiplier)
 

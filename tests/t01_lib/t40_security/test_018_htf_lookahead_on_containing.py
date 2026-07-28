@@ -26,7 +26,9 @@ def main():
 
 # Dense hourly 24/7 feed on the day grid. ``close = (day + 1) * 1000 + hour`` so
 # every day's final (h23) close is distinct: day ``d`` closes at ``(d+1)*1000+23``.
-_T0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to the day grid
+# Every timestamp here is Unix MILLISECONDS.
+_T0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the day grid
+_HOUR = 3_600_000
 _N_DAYS = 6
 
 
@@ -44,19 +46,19 @@ def _bars():
     for day in range(_N_DAYS):
         for hour in range(24):
             c = _close(day, hour)
-            out.append(OHLCV(timestamp=_T0 + (day * 24 + hour) * 3600,
+            out.append(OHLCV(timestamp=_T0 + (day * 24 + hour) * _HOUR,
                              open=c, high=c, low=c, close=c, volume=1.0))
     return out
 
 
 def _write_feed(tmp_dir):
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "FEED.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "60") as w:
         for bar in _bars():
             w.write(bar)
     SymInfo(
@@ -97,7 +99,7 @@ def __test_htf_lookahead_on_steps_into_containing_period__(runner, log):
         r = runner(_bars(), syminfo_override={"period": "60"},
                    security_data={"D": feed})
         for candle, pv in r.run_iter():
-            mins = (candle.timestamp - _T0) // 60
+            mins = (candle.timestamp - _T0) // 60_000
             day = mins // (60 * 24)
             hour = (mins // 60) % 24
             rows[(day, hour)] = (pv.get("prev_on"), pv.get("cur_on"), pv.get("prev_off"))

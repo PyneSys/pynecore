@@ -14,23 +14,26 @@ def main():
 
 
 # --- Shared geometry ---------------------------------------------------------
-# Chart bars run at 300s (the default test syminfo period "5"); each chart bar
-# returns the intrabars of its OWN period ``[T, T+tf)``. The LTF feed is 60s.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
+# Every timestamp here is Unix MILLISECONDS. Chart bars run at 5 minutes (the
+# default test syminfo period "5"); each chart bar returns the intrabars of its
+# OWN period ``[T, T+tf)``. The LTF feed is 1 minute. Offsets inside the tests
+# are written as ``<seconds> * _SEC`` so they read against the bar geometry.
+_SEC = 1000  # milliseconds in a second
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300 * _SEC
 
 
 def _write_ltf(tmp_dir, bars):
-    """Write a 1-minute LTF feed from ``(timestamp_s, close)`` pairs (+ a 24/7
+    """Write a 1-minute LTF feed from ``(timestamp_ms, close)`` pairs (+ a 24/7
     UTC ``.toml`` sidecar the subprocess loads on startup); return the path.
     """
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_LTFSYM_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for ts, c in bars:
             c = float(c)
             w.write(OHLCV(timestamp=ts, open=c, high=c, low=c, close=c, volume=1.0))
@@ -50,7 +53,7 @@ def _write_ltf(tmp_dir, bars):
 
 
 def _chart_bars(n):
-    """``n`` chart bars at 300s; OHLCV body is irrelevant to the LTF result."""
+    """``n`` 5-minute chart bars; OHLCV body is irrelevant to the LTF result."""
     from pynecore.types.ohlcv import OHLCV
     return [
         OHLCV(timestamp=_TS0 + i * _CHART_STEP,
@@ -104,8 +107,8 @@ def __test_ltf_window_edges__(runner, log):
     # --- Partial first period: the feed begins partway through a chart bar, so
     # that boundary bar gets a PARTIAL array (not skipped). The old
     # open-as-target predicate wrongly skipped it (chart open < feed first open).
-    # Feed opens at TS0+720 (inside chart bar 2 = [600, 900)), step 60, closes 1..8.
-    rows = _run(runner, 5, [(_TS0 + 720 + j * 60, j + 1) for j in range(8)])
+    # Feed opens at TS0+720s (inside chart bar 2 = [600s, 900s)), step 60s, closes 1..8.
+    rows = _run(runner, 5, [(_TS0 + (720 + j * 60) * _SEC, j + 1) for j in range(8)])
     # bar 2 [600,900): 720,780,840 -> 1,2,3 ; bar 3 [900,1200): 900..1140 -> 4..8 ;
     # bar 4 [1200,1500): feed already ended -> empty (signalled, not skipped).
     _assert(rows, [0, 0, 3, 5, 0], [None, None, 6, 30, None])
@@ -114,8 +117,8 @@ def __test_ltf_window_edges__(runner, log):
     # --- Boundary exclusivity: an LTF bar opening exactly at a chart bar's open
     # ``T`` belongs to the bar STARTING at ``T`` (``[T, T+tf)``), never the
     # previous bar ending at ``T``. Distinguishes ``[T, T+tf)`` from ``(T-tf, T]``.
-    # LTF bars exactly on chart boundaries: TS0+300 (bar 1 open), TS0+600 (bar 2 open).
-    rows = _run(runner, 3, [(_TS0 + 300, 10), (_TS0 + 600, 20)])
+    # LTF bars exactly on chart boundaries: TS0+300s (bar 1 open), TS0+600s (bar 2 open).
+    rows = _run(runner, 3, [(_TS0 + 300 * _SEC, 10), (_TS0 + 600 * _SEC, 20)])
     # bar 0 [0,300): skipped ; bar 1 [300,600): open 300 only (600 excluded) ;
     # bar 2 [600,900): open 600.
     _assert(rows, [0, 1, 1], [None, 10, 20])
@@ -125,19 +128,19 @@ def __test_ltf_window_edges__(runner, log):
     # remaining intrabar even when its period extends past the feed's end (no
     # next bar to consume them). The old code dropped this trailing period.
     rows = _run(runner, 3,
-                [(_TS0 + j * 60, j + 1) for j in range(10)]          # bars 0,1: 1..10
-                + [(_TS0 + 600 + k * 60, 11 + k) for k in range(3)])  # bar 2: 600,660,720 -> 11,12,13
+                [(_TS0 + j * 60 * _SEC, j + 1) for j in range(10)]  # bars 0,1: 1..10
+                # bar 2: 600s,660s,720s -> 11,12,13
+                + [(_TS0 + (600 + k * 60) * _SEC, 11 + k) for k in range(3)])
     _assert(rows, [5, 5, 3], [15, 40, 36])
     log.info("LTF trailing-partial-at-eof window correct")
 
-    # --- Source gap is forward-filled: a stored ``.ohlcv`` cannot represent
-    # missing intrabars (the writer fills gaps with the prior close), so a chart
-    # bar spanning a source gap still gets a full, correctly-windowed array of
-    # flat intrabars rather than an empty one. The window itself stays right.
+    # --- Source gap stays a gap: the store holds only real bars, so a chart bar
+    # spanning a hole in the feed collects an EMPTY array instead of a run of
+    # phantom flat intrabars. The bars around the hole keep their own windows.
     rows = _run(runner, 4,
-                [(_TS0 + j * 60, j + 1) for j in range(10)]           # bars 0,1: 1..10
-                + [(_TS0 + 900 + k * 60, 11 + k) for k in range(5)])  # bar 3: 900.. -> 11..15
-    # bar 2 [600,900): 600,660,720,780,840 forward-filled with the prior close 10
-    # -> 5 intrabars, sum 50.
-    _assert(rows, [5, 5, 5, 5], [15, 40, 50, 65])
-    log.info("LTF source-gap forward-filled and windowed correctly")
+                [(_TS0 + j * 60 * _SEC, j + 1) for j in range(10)]  # bars 0,1: 1..10
+                # bar 3: 900s.. -> 11..15
+                + [(_TS0 + (900 + k * 60) * _SEC, 11 + k) for k in range(5)])
+    # bar 2 [600,900): the feed holds nothing there -> 0 intrabars, na sum.
+    _assert(rows, [5, 5, 0, 5], [15, 40, None, 65])
+    log.info("LTF source gap yields an empty window, neighbours unaffected")

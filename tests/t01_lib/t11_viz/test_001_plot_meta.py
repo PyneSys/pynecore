@@ -30,7 +30,7 @@ def __test_plot_meta__(runner):
     from pynecore.core import viz
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200  # 2024-01-01 00:00:00 UTC
+    base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [
         (100.0, 101.0, 99.0, 100.5),
         (100.5, 101.5, 99.5, 101.0),
@@ -39,7 +39,7 @@ def __test_plot_meta__(runner):
         (102.0, 103.0, 101.0, 102.5),
         (102.5, 103.5, 101.5, 103.0),
     ]
-    bars = [OHLCV(timestamp=base + i * 300, open=o, high=h, low=l, close=c, volume=100.0)
+    bars = [OHLCV(timestamp=base + i * 300_000, open=o, high=h, low=l, close=c, volume=100.0)
             for i, (o, h, l, c) in enumerate(rows)]
 
     per_bar: list[dict] = []

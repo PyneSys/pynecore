@@ -2,7 +2,7 @@ from typing import NamedTuple, Any
 
 
 class OHLCV(NamedTuple):
-    timestamp: int  # Unix timestamp in seconds
+    timestamp: int  # Unix timestamp in milliseconds
     open: float
     high: float
     low: float

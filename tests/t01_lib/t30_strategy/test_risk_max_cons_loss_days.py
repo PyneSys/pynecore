@@ -63,8 +63,8 @@ def __test_max_cons_loss_days_halts_after_three_losing_days__(script_path, modul
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1D')
-    day_seconds = 24 * 3600
-    base_ts = 1704067200  # 2024-01-01 UTC
+    day_ms = 24 * 3600 * 1000
+    base_ts = 1_704_067_200_000  # 2024-01-01 UTC, in ms
 
     # Day 0 — entry placed, fills at day-1 open at price 100.
     # Day 1..3 — price rises 100 → 110 → 120 → 130; each day's equity is
@@ -74,15 +74,15 @@ def __test_max_cons_loss_days_halts_after_three_losing_days__(script_path, modul
     # strategy stays flat, so a further day rollover would (correctly) reset
     # the counter and obscure the breach assertion.
     bars = [
-        OHLCV(timestamp=base_ts + 0 * day_seconds,
+        OHLCV(timestamp=base_ts + 0 * day_ms,
               open=100.0, high=100.5, low=99.5, close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * day_seconds,
+        OHLCV(timestamp=base_ts + 1 * day_ms,
               open=100.0, high=110.0, low=99.0, close=110.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * day_seconds,
+        OHLCV(timestamp=base_ts + 2 * day_ms,
               open=110.0, high=120.0, low=109.0, close=120.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * day_seconds,
+        OHLCV(timestamp=base_ts + 3 * day_ms,
               open=120.0, high=130.0, low=119.0, close=130.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * day_seconds,
+        OHLCV(timestamp=base_ts + 4 * day_ms,
               open=130.0, high=140.0, low=129.0, close=140.0, volume=100.0),
     ]
 

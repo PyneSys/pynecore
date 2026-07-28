@@ -69,18 +69,18 @@ def __test_qty_percent_leg_not_resurrected__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
 
     # Entry fills at bar 1 open=100 (avg=100 -> limit 105, stop 95).
     # Bar 2 high 106 -> HALF_TP fills 1 lot. Bars 3-5 stay above 105 and well
     # above the stop, so a correct sticky bracket fires nothing more.
     bars = [
-        OHLCV(timestamp=base_ts + 0 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * 60, open=101.0, high=106.0, low=100.5, close=105.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * 60, open=106.0, high=107.0, low=105.5, close=106.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * 60, open=106.0, high=108.0, low=105.5, close=107.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 5 * 60, open=106.0, high=108.0, low=105.5, close=107.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 0 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 1 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 2 * 60_000, open=101.0, high=106.0, low=100.5, close=105.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 3 * 60_000, open=106.0, high=107.0, low=105.5, close=106.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 4 * 60_000, open=106.0, high=108.0, low=105.5, close=107.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 5 * 60_000, open=106.0, high=108.0, low=105.5, close=107.0, volume=100.0),
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), syminfo)
@@ -112,16 +112,16 @@ def __test_no_qty_rest_leg_closes_only_its_slice__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
 
     # Entry fills at bar 1 open=100 (stop 95, limit 105). Bar 2 low 94 hits the
     # stop first; REST_SL must close 1 lot, leaving HALF_TP's 1 lot open.
     bars = [
-        OHLCV(timestamp=base_ts + 0 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * 60, open=99.0,  high=99.5,  low=94.0,  close=95.0,  volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * 60, open=95.0,  high=96.0,  low=94.5,  close=95.5,  volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * 60, open=95.0,  high=96.0,  low=94.5,  close=95.5,  volume=100.0),
+        OHLCV(timestamp=base_ts + 0 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 1 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 2 * 60_000, open=99.0,  high=99.5,  low=94.0,  close=95.0,  volume=100.0),
+        OHLCV(timestamp=base_ts + 3 * 60_000, open=95.0,  high=96.0,  low=94.5,  close=95.5,  volume=100.0),
+        OHLCV(timestamp=base_ts + 4 * 60_000, open=95.0,  high=96.0,  low=94.5,  close=95.5,  volume=100.0),
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), syminfo)

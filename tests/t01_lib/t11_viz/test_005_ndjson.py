@@ -23,9 +23,9 @@ def __test_ndjson__(runner, tmp_path):
     from pynecore.core.viz import color_str
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200
+    base = 1_704_067_200_000  # 2024-01-01 UTC, in ms
     rows = [(100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(4)]
-    bars = [OHLCV(timestamp=base + i * 300, open=o, high=h, low=l, close=c, volume=100.0)
+    bars = [OHLCV(timestamp=base + i * 300_000, open=o, high=h, low=l, close=c, volume=100.0)
             for i, (o, h, l, c) in enumerate(rows)]
 
     out = tmp_path / "viz.ndjson"
@@ -70,7 +70,7 @@ def __test_ndjson__(runner, tmp_path):
     bar_recs = [lines[i] for i in bar_idx]
     for i, rec in enumerate(bar_recs):
         assert rec["i"] == i
-        assert rec["time"] == (base + i * 300) * 1000
+        assert rec["time"] == base + i * 300_000
         assert rec["v"]["c"] == rows[i][3]
         assert rec["v"]["o"] == rows[i][0]
 

@@ -19,7 +19,7 @@ from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
 from ...core.download_runner import (download_to_file, ConflictAction, DownloadConflict,
                                      DownloadPlan, DownloadProgress, DownloadError)
-from ...core.ohlcv_file import OHLCVReader
+from ...core.ohlcv import OHLCVReader
 from ...core.aggregator import validate_aggregation, aggregate_ohlcv
 from ...core.syminfo import SymInfo
 

@@ -23,13 +23,13 @@ PERIOD_END = T + TF
 
 @dataclass
 class _Bar:
-    """Minimal intrabar: an open time (seconds) and the value its run yields."""
-    timestamp: int          # seconds
+    """Minimal intrabar: an open time (milliseconds) and the value its run yields."""
+    timestamp: int          # Unix milliseconds
     value: float
 
     @staticmethod
     def at(ms: int, value: float) -> "_Bar":
-        return _Bar(timestamp=ms // 1000, value=value)
+        return _Bar(timestamp=ms, value=value)
 
 
 class _Harness:

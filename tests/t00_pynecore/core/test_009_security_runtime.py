@@ -340,11 +340,11 @@ def __test_ltf_htf_protocol_no_flush__(log):
 
 def __test_chart_protocol_currency_conversion__(log):
     """Chart protocol: currency_conversions multiplies read result by exchange rate"""
-    import struct
     import tempfile
     from pathlib import Path
     from pynecore.core.currency import CurrencyRateProvider
-    from pynecore.core.ohlcv_file import RECORD_SIZE
+    from pynecore.core.ohlcv import OHLCVWriter
+    from pynecore.types.ohlcv import OHLCV
 
     sec_ids = ["sec_cur"]
     sb = SyncBlock(sec_ids)
@@ -360,8 +360,9 @@ def __test_chart_protocol_currency_conversion__(log):
         toml_path = tmpdir / "EURUSD.toml"
 
         # Write OHLCV with close=1.085 at timestamp matching lib._time
-        with open(ohlcv_path, 'wb') as f:
-            f.write(struct.pack('Ifffff', 1000, 1.085, 1.09, 1.08, 1.085, 100.0))
+        # (OHLCV timestamps are milliseconds, lib._datetime below is 1000 seconds)
+        with OHLCVWriter(ohlcv_path, "1D", truncate=True) as writer:
+            writer.write(OHLCV(1_000_000, 1.085, 1.09, 1.08, 1.085, 100.0))
 
         toml_path.write_text(
             '[symbol]\nprefix = "TEST"\ndescription = "EURUSD"\nticker = "EURUSD"\n'

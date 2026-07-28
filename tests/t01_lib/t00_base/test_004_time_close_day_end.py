@@ -19,7 +19,7 @@ def _bars(isos):
     from pynecore.types.ohlcv import OHLCV
     out = []
     for iso in isos:
-        ts = int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp())
+        ts = int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp()) * 1000
         out.append(OHLCV(timestamp=ts, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0))
     return out
 

@@ -13,9 +13,9 @@ def main():
 
 def __test_groups_sub_bars_into_windows__():
     """6 x 1-minute bars should produce 2 x 3-minute windows."""
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (ms)
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0 + i, high=102.0 + i,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0 + i, high=102.0 + i,
               low=99.0 + i, close=101.0 + i, volume=10.0)
         for i in range(6)
     ]
@@ -29,11 +29,11 @@ def __test_groups_sub_bars_into_windows__():
 
 def __test_aggregation_within_window__():
     """Aggregated OHLCV follows standard rules: O=first, H=max, L=min, C=last, V=sum."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
         OHLCV(timestamp=base_ts,      open=100.0, high=110.0, low=95.0,  close=105.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 60, open=105.0, high=115.0, low=98.0,  close=108.0, volume=200.0),
-        OHLCV(timestamp=base_ts + 120, open=108.0, high=112.0, low=90.0, close=103.0, volume=150.0),
+        OHLCV(timestamp=base_ts + 60_000, open=105.0, high=115.0, low=98.0,  close=108.0, volume=200.0),
+        OHLCV(timestamp=base_ts + 120_000, open=108.0, high=112.0, low=90.0, close=103.0, volume=150.0),
     ]
 
     windows = list(BarMagnifier(sub_bars, '3', tz=None))
@@ -49,9 +49,9 @@ def __test_aggregation_within_window__():
 
 def __test_last_window_flag__():
     """Only the last window should have is_last_window=True."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0, high=101.0,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=101.0,
               low=99.0, close=100.0, volume=10.0)
         for i in range(9)
     ]
@@ -66,9 +66,9 @@ def __test_last_window_flag__():
 
 def __test_single_window__():
     """A single window should be both first and last."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0, high=101.0,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=101.0,
               low=99.0, close=100.0, volume=10.0)
         for i in range(3)
     ]
@@ -82,10 +82,10 @@ def __test_single_window__():
 
 def __test_partial_last_window__():
     """If data doesn't fill the last window, it should still be emitted."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     # 4 bars = one full 3-min window + one partial window with 1 bar
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0, high=101.0,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=101.0,
               low=99.0, close=100.0, volume=10.0)
         for i in range(4)
     ]
@@ -100,9 +100,9 @@ def __test_partial_last_window__():
 
 def __test_sub_bars_preserved_in_order__():
     """Sub-bars within each window should maintain their original order."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0 + i, high=101.0 + i,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0 + i, high=101.0 + i,
               low=99.0 + i, close=100.5 + i, volume=10.0 + i)
         for i in range(6)
     ]
@@ -124,9 +124,9 @@ def __test_aggregated_timestamp_is_bar_boundary__():
     """Aggregated candle timestamp should be the bar boundary, not the first sub-bar's."""
     # Start at a non-boundary: 00:01:00, with 3-min chart TF
     # Bar boundary for 3-min at 00:01:00 is 00:00:00
-    base_ts = 1704067200  # already at boundary (00:00:00 UTC)
+    base_ts = 1_704_067_200_000  # already at boundary (00:00:00 UTC, ms)
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0, high=101.0,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=101.0,
               low=99.0, close=100.0, volume=10.0)
         for i in range(3)
     ]
@@ -141,9 +141,9 @@ def __test_aggregated_timestamp_is_bar_boundary__():
 
 def __test_1min_to_5min__():
     """Standard use case: 1-minute data grouped into 5-minute bars."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=1.1000 + i * 0.0001,
+        OHLCV(timestamp=base_ts + i * 60_000, open=1.1000 + i * 0.0001,
               high=1.1010 + i * 0.0001, low=1.0990 + i * 0.0001,
               close=1.1005 + i * 0.0001, volume=100.0)
         for i in range(10)
@@ -165,9 +165,9 @@ def __test_1min_to_5min__():
 
 def __test_1min_to_60min__():
     """The primary bar magnifier use case: 1-minute to 60-minute."""
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000
     sub_bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0, high=100.0 + (i % 10),
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=100.0 + (i % 10),
               low=100.0 - (i % 5), close=100.0, volume=10.0)
         for i in range(120)
     ]
@@ -192,7 +192,7 @@ def __test_magnifier_observed_multiperiod__():
 
     def open_ts(trading_day: date) -> int:
         prev = trading_day - timedelta(days=1)
-        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp())
+        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp()) * 1000
 
     # Two weeks of daily sub-bars; Mon Jan 13 2025 is a holiday (no bar)
     days = [date(2025, 1, d) for d in (6, 7, 8, 9, 10, 14, 15, 16, 17)]

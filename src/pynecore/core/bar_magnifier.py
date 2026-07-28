@@ -102,24 +102,25 @@ class BarMagnifier:
 
     def _key_and_stamp(self, candle: OHLCV) -> tuple[object, int]:
         """
-        Grouping key and window-opening timestamp (seconds) for a sub-bar.
+        Grouping key and window-opening timestamp (milliseconds) for a sub-bar.
 
         For 'observed' multi-period grids the key counts the actual trading
         days and the window is stamped by its first sub-bar; everything else
         uses the scheduled-grid bar time as both.
         """
         if self._counter is not None:
-            td = trading_day(candle.timestamp + self._src_off, self._tz, self._overnight)
-            bar_end = candle.timestamp + self._src_off + 1 if self._fold else None
+            # The trading-day calendar works in seconds, OHLCV timestamps in ms.
+            ts_sec = candle.timestamp // 1000
+            td = trading_day(ts_sec + self._src_off, self._tz, self._overnight)
+            bar_end = ts_sec + self._src_off + 1 if self._fold else None
             self._counter.ordinal(td, bar_end)
             key = self._counter.key(self._modifier, self._multiplier)
             return key, candle.timestamp
 
-        bar_time_ms = self._resampler.get_bar_time(
-            (candle.timestamp + self._src_off) * 1000, tz=self._tz,
+        bar_time = self._resampler.get_bar_time(
+            candle.timestamp + self._src_off * 1000, tz=self._tz,
             session_starts=self._session_starts,
             opening_hours=self._opening_hours, mode=self._mode)
-        bar_time = bar_time_ms // 1000
         return bar_time, bar_time
 
     def __iter__(self) -> Iterator[MagnifiedWindow]:

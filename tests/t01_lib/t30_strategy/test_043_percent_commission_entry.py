@@ -31,10 +31,10 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
 
     sys.modules.pop(module_key, None)
 
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     bars = [
         OHLCV(
-            timestamp=base_ts + 0 * 60,
+            timestamp=base_ts + 0 * 60_000,
             open=100.0,
             high=100.0,
             low=100.0,
@@ -42,7 +42,7 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
             volume=1.0,
         ),
         OHLCV(
-            timestamp=base_ts + 1 * 60,
+            timestamp=base_ts + 1 * 60_000,
             open=50000.0,
             high=50000.0,
             low=50000.0,
@@ -50,7 +50,7 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
             volume=1.0,
         ),
         OHLCV(
-            timestamp=base_ts + 2 * 60,
+            timestamp=base_ts + 2 * 60_000,
             open=50000.0,
             high=51000.0,
             low=50000.0,
@@ -58,7 +58,7 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
             volume=1.0,
         ),
         OHLCV(
-            timestamp=base_ts + 3 * 60,
+            timestamp=base_ts + 3 * 60_000,
             open=51000.0,
             high=51000.0,
             low=51000.0,
@@ -66,7 +66,7 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
             volume=1.0,
         ),
         OHLCV(
-            timestamp=base_ts + 4 * 60,
+            timestamp=base_ts + 4 * 60_000,
             open=51000.0,
             high=51000.0,
             low=51000.0,

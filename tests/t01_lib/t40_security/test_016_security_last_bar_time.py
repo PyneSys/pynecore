@@ -10,20 +10,21 @@ def main():
     plot(htf_lbt, "htf_lbt")
 
 
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to the 300s and 900s grids
-_CHART_STEP = 300
-_HTF_STEP = 900
+# Every timestamp here is Unix MILLISECONDS.
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 15m grids
+_CHART_STEP = 300_000  # 5 minutes
+_HTF_STEP = 900_000  # 15 minutes
 
 
 def _write_htf(tmp_dir, timestamps):
     """Write a 15-minute security feed plus its ``.toml`` sidecar; return the path."""
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_HTFSYM_15.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "15") as w:
         for ts in timestamps:
             w.write(OHLCV(timestamp=ts, open=1.0, high=2.0, low=0.5, close=1.5, volume=1.0))
 
@@ -60,7 +61,7 @@ def __test_security_last_bar_time_anchored__(runner, log):
 
     with tempfile.TemporaryDirectory() as td:
         htf_path = _write_htf(Path(td), [_TS0, _TS0 + _HTF_STEP])
-        file_final_ms = (_TS0 + _HTF_STEP) * 1000
+        file_final_ms = _TS0 + _HTF_STEP
 
         rows = []
         r = runner(_chart_bars(8), security_data={"EXCH:HTFSYM:15": htf_path})

@@ -5,7 +5,7 @@ title: "Integration Patterns"
 description: "Real-world patterns for integrating PyneCore into trading systems"
 icon: "hub"
 date: "2025-03-31"
-lastmod: "2026-03-17"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Programmatic", "Integration"]
@@ -34,7 +34,7 @@ def dataframe_to_ohlcv(df: pd.DataFrame) -> list[OHLCV]:
     """Convert a pandas DataFrame to a list of OHLCV objects."""
     return [
         OHLCV(
-            timestamp=int(row.Index.timestamp()),
+            timestamp=int(row.Index.timestamp() * 1000),
             open=float(row.open), high=float(row.high),
             low=float(row.low), close=float(row.close),
             volume=float(row.volume),
@@ -131,7 +131,7 @@ def live_candles(symbol, timeframe, warmup=200):
     raw = exchange.fetch_ohlcv(symbol, timeframe, limit=warmup)
     for bar in raw:
         yield OHLCV(
-            timestamp=bar[0] // 1000,
+            timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
             open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5],
         )
 
@@ -144,7 +144,7 @@ def live_candles(symbol, timeframe, warmup=200):
             if bar[0] > last_ts:
                 last_ts = bar[0]
                 yield OHLCV(
-                    timestamp=bar[0] // 1000,
+                    timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
                     open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5],
                 )
 

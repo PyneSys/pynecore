@@ -4,18 +4,26 @@ Automatic data file to OHLCV conversion functionality.
 This module provides automatic detection and conversion of CSV, TXT, and JSON files
 to OHLCV format when needed, eliminating the manual step of running pyne data convert.
 """
-from __future__ import annotations
-
 import csv
 import json
-from enum import Enum
+import os
 from datetime import time
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pynecore.core.ohlcv_file import OHLCVWriter, OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
+from pynecore.lib.timeframe import in_seconds
+from pynecore.core.ohlcv_importers import (
+    infer_csv_period,
+    infer_json_period,
+    infer_txt_period,
+    load_from_csv,
+    load_from_json,
+    load_from_txt,
+)
 from pynecore.utils.file_utils import copy_mtime, is_updated
-from ..lib.timeframe import from_seconds
+
 from .syminfo import SymInfo, SymInfoInterval, SymInfoSession, default_mincontract
 
 
@@ -27,6 +35,84 @@ class DataFormatError(Exception):
 class ConversionError(Exception):
     """Raised when conversion fails."""
     pass
+
+
+def _same_period(left: str, right: str) -> bool:
+    """
+    Compare two TradingView timeframes by meaning rather than by spelling.
+
+    ``D`` and ``1D`` (or ``60`` written either way) denote the same timeframe, so a
+    hand-written TOML must not be reported as conflicting with the inferred period.
+
+    :param left: First timeframe string.
+    :param right: Second timeframe string.
+    :return: True if both denote the same timeframe.
+    """
+    if left == right:
+        return True
+    try:
+        return in_seconds(left) == in_seconds(right)
+    except (AssertionError, ValueError):
+        return False
+
+
+def _publish_conversion(
+        temp_ohlcv_path: Path,
+        temp_extra_path: Path,
+        ohlcv_path: Path,
+        extra_csv_path: Path,
+) -> None:
+    """
+    Move a finished conversion over the previous one, restoring it if a move fails.
+
+    The binary and its extra-field sidecar must be published together: the reader
+    demands exactly one sidecar row per record, so a fresh binary left next to the
+    previous sidecar (or the other way round) makes the whole dataset unreadable.
+    Both destinations are vacated before anything is published, and every move —
+    the vacating renames included — is covered by the same rollback. Renaming an
+    existing file aside is exactly what fails when it is still held open by another
+    process, so the second one can fail after the first has already been moved; that
+    failure must put the first one back rather than leave the previous dataset
+    reachable only under its internal ``.replaced`` name.
+
+    :param temp_ohlcv_path: Freshly converted binary file.
+    :param temp_extra_path: Freshly converted sidecar, which need not exist.
+    :param ohlcv_path: Destination of the binary file.
+    :param extra_csv_path: Destination of the sidecar.
+    """
+    saved: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for destination in (ohlcv_path, extra_csv_path):
+            if destination.exists():
+                saved_path = destination.with_name(destination.name + ".replaced")
+                os.replace(destination, saved_path)
+                saved.append((saved_path, destination))
+        os.replace(temp_ohlcv_path, ohlcv_path)
+        published.append(ohlcv_path)
+        if temp_extra_path.exists():
+            os.replace(temp_extra_path, extra_csv_path)
+            published.append(extra_csv_path)
+    except OSError:
+        # Only what this call actually published is removed. Blindly clearing both
+        # destinations would delete an original that the backup loop never got to
+        # move aside.
+        for destination in published:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for saved_path, destination in saved:
+            try:
+                os.replace(saved_path, destination)
+            except OSError:
+                pass
+        raise
+    for saved_path, _ in saved:
+        try:
+            saved_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class SupportedFormats(Enum):
@@ -127,67 +213,92 @@ class DataConverter:
         analyzed_tick_size = None
         analyzed_price_scale = None
         analyzed_min_move = None
-        detected_timeframe = None
+        detected_timeframe: str
 
-        # Check if TOML exists and load timezone from it
-        # This ensures user modifications to TOML are preserved
-        # Note: force parameter applies only to OHLCV regeneration, NOT to TOML
+        # Existing TOML values remain user-owned except for period, which must match
+        # the period declared by the newly generated binary file.
         toml_path = file_path.with_suffix('.toml')
+        extra_csv_path = file_path.with_suffix('.extra.csv')
+        # The conversion is built next to the destination and moved into place only
+        # once it is complete. Writing straight to the destination would empty the
+        # previously converted file the moment the writer opens it, so a malformed
+        # source row or an I/O error halfway through would destroy the last usable
+        # output. The temporary names share the destination's stem so the writer
+        # derives its own sidecar next to them, not over the real one.
+        temp_ohlcv_path = ohlcv_path.with_name(f"{ohlcv_path.stem}.converting{ohlcv_path.suffix}")
+        temp_extra_path = temp_ohlcv_path.with_suffix('.extra.csv')
         skip_toml_generation = False
+        existing_period: str | None = None
+        writer_mintick: float | None = None
 
         if toml_path.exists():
             # noinspection PyBroadException
             try:
-                # Load existing TOML to preserve user modifications
                 existing_syminfo = SymInfo.load_toml(toml_path)
-                timezone = existing_syminfo.timezone  # Use TOML timezone for conversion
-                skip_toml_generation = True  # Don't regenerate TOML (user may have edited it)
+                timezone = existing_syminfo.timezone
+                existing_period = existing_syminfo.period
+                writer_mintick = existing_syminfo.mintick
+                skip_toml_generation = True
             except Exception:
-                # If TOML is corrupted, continue with provided/default timezone
+                # If TOML is corrupted, continue with provided/default values.
                 pass
         elif timezone == "UTC" and detected_format == 'csv':
-            # If no TOML exists and using default UTC, try to detect timezone from CSV
             detected_tz = self._detect_timezone_from_csv(file_path)
             if detected_tz:
                 timezone = detected_tz
 
         try:
-            # Perform conversion directly to target file with truncate to clear existing data
-            with OHLCVWriter(ohlcv_path, truncate=True) as ohlcv_writer:
-                if detected_format == 'csv':
-                    ohlcv_writer.load_from_csv(file_path, tz=timezone)
-                elif detected_format == 'json':
-                    ohlcv_writer.load_from_json(file_path, tz=timezone)
-                elif detected_format == 'txt':
-                    ohlcv_writer.load_from_txt(file_path, tz=timezone)
-                else:
-                    raise ConversionError(f"Unsupported format for conversion: {detected_format}")
+            if detected_format == 'csv':
+                detected_timeframe = infer_csv_period(file_path, tz=timezone)
+            elif detected_format == 'json':
+                detected_timeframe = infer_json_period(file_path, tz=timezone)
+            elif detected_format == 'txt':
+                detected_timeframe = infer_txt_period(file_path, tz=timezone)
+            else:
+                raise ConversionError(f"Unsupported format for conversion: {detected_format}")
 
-                # Get timeframe directly from writer
-                interval = ohlcv_writer.interval
-                if interval is None:
-                    raise ConversionError("Cannot determine timeframe from OHLCV file (less than 2 records)")
-                try:
-                    detected_timeframe = from_seconds(interval)
-                except (ValueError, AssertionError):
+            if existing_period is not None:
+                toml_period: str = existing_period
+                if not _same_period(toml_period, detected_timeframe):
                     raise ConversionError(
-                        f"Cannot convert interval {ohlcv_writer.interval} seconds to valid timeframe")
+                        f"TOML period '{toml_period}' does not match source period "
+                        f"'{detected_timeframe}'"
+                    )
 
-                # Get analyzed tick size data from writer
+            with OHLCVWriter(
+                temp_ohlcv_path,
+                detected_timeframe,
+                mintick=writer_mintick,
+                truncate=True,
+                timezone=timezone,
+            ) as ohlcv_writer:
+                if detected_format == 'csv':
+                    load_from_csv(
+                        ohlcv_writer,
+                        file_path,
+                        tz=timezone,
+                        extra_csv_path=temp_extra_path,
+                    )
+                elif detected_format == 'json':
+                    load_from_json(ohlcv_writer, file_path, tz=timezone)
+                else:
+                    load_from_txt(
+                        ohlcv_writer,
+                        file_path,
+                        tz=timezone,
+                        extra_csv_path=temp_extra_path,
+                    )
+
                 analyzed_tick_size = ohlcv_writer.analyzed_tick_size
                 analyzed_price_scale = ohlcv_writer.analyzed_price_scale
                 analyzed_min_move = ohlcv_writer.analyzed_min_move
 
-            # Copy modification time from source to maintain freshness
-            copy_mtime(file_path, ohlcv_path)
+            # The conversion is complete: publish it over the previous one.
+            _publish_conversion(temp_ohlcv_path, temp_extra_path, ohlcv_path, extra_csv_path)
 
-            # Generate extra fields sidecar CSV if source has extra columns
-            extra_csv_path = file_path.with_suffix('.extra.csv')
-            if detected_format in ('csv', 'txt'):
-                self._generate_extra_csv(file_path, ohlcv_path, extra_csv_path,
-                                         detected_format == 'txt')
-                if extra_csv_path.exists():
-                    copy_mtime(file_path, extra_csv_path)
+            copy_mtime(file_path, ohlcv_path)
+            if extra_csv_path.exists():
+                copy_mtime(file_path, extra_csv_path)
 
             # Generate TOML symbol info file if needed and not already loaded
             # skip_toml_generation is set earlier if TOML already exists (line 129-134)
@@ -262,99 +373,14 @@ class DataConverter:
                     pass
 
         except Exception as e:
-            # Clean up output files on error
-            for cleanup_path in (ohlcv_path, file_path.with_suffix('.extra.csv')):
-                if cleanup_path.exists():
-                    try:
-                        cleanup_path.unlink()
-                    except OSError:
-                        pass
+            # Only this attempt's half-written temporaries are removed; the
+            # previously converted files were never touched and stay usable.
+            for cleanup_path in (temp_ohlcv_path, temp_extra_path):
+                try:
+                    cleanup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise ConversionError(f"Failed to convert {file_path}: {e}") from e
-
-    # Column names that are part of standard OHLCV data (not extra fields).
-    # ts_event / ts_recv are Databento's timestamp column names.
-    _OHLCV_COLUMNS = {
-        'timestamp', 'time', 'date', 'datetime', 'ts_event', 'ts_recv',
-        'open', 'high', 'low', 'close', 'volume',
-    }
-
-    def _generate_extra_csv(
-            self,
-            source_path: Path,
-            ohlcv_path: Path,
-            extra_csv_path: Path,
-            is_txt: bool = False
-    ) -> None:
-        """
-        Generate a sidecar .extra.csv file with non-OHLCV columns from the source data.
-        The sidecar is position-aligned with the binary OHLCV file (including gap-filled rows).
-
-        :param source_path: Path to the original CSV/TXT file
-        :param ohlcv_path: Path to the generated binary OHLCV file
-        :param extra_csv_path: Path for the output sidecar CSV
-        :param is_txt: True if source is TXT format (auto-detect delimiter)
-        """
-        # Detect delimiter for TXT files
-        delimiter = ','
-        if is_txt:
-            with open(source_path, 'r') as f:
-                first_line = f.readline().strip()
-                for delim in ['\t', ';', '|']:
-                    if delim in first_line:
-                        delimiter = delim
-                        break
-
-        # Read source headers and identify extra columns
-        with open(source_path, 'r', newline='') as f:
-            reader = csv.reader(f, delimiter=delimiter)
-            raw_headers = next(reader, None)
-            if not raw_headers:
-                return
-
-            headers_lower = [h.lower().strip() for h in raw_headers]
-            extra_indices = [
-                i for i, h in enumerate(headers_lower)
-                if h not in self._OHLCV_COLUMNS
-            ]
-
-            if not extra_indices:
-                return
-
-            extra_headers = [raw_headers[i].strip() for i in extra_indices]
-
-            # Collect extra values from all source rows (in order)
-            source_extra_rows: list[list[str]] = []
-            for row in reader:
-                if is_txt:
-                    row = [field.strip() for field in row]
-                extra_row = [row[i] if i < len(row) else '' for i in extra_indices]
-                source_extra_rows.append(extra_row)
-
-        if not source_extra_rows:
-            return
-
-        # Align with OHLCV binary (which may have gap-filled rows)
-        with OHLCVReader(ohlcv_path) as ohlcv_reader:
-            total_positions = ohlcv_reader.size
-            empty_row = [''] * len(extra_headers)
-            source_idx = 0
-
-            with open(extra_csv_path, 'w', newline='') as out_f:
-                writer = csv.writer(out_f)
-                writer.writerow(extra_headers)
-
-                for pos in range(total_positions):
-                    ohlcv = ohlcv_reader.read(pos)
-                    if ohlcv.volume < 0:
-                        # Gap-filled row — write empty values
-                        writer.writerow(empty_row)
-                    else:
-                        # Real data row — consume next source row
-                        if source_idx < len(source_extra_rows):
-                            writer.writerow(source_extra_rows[source_idx])
-                            source_idx += 1
-                        else:
-                            writer.writerow(empty_row)
 
     @staticmethod
     def detect_format(file_path: Path) -> Literal['csv', 'txt', 'json', 'ohlcv', 'unknown']:
@@ -369,14 +395,12 @@ class DataConverter:
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        # First check if it's a valid OHLCV file (binary format)
-        try:
-            with OHLCVReader(file_path):
-                # If we can open it successfully, it's a valid OHLCV file
-                return 'ohlcv'
-        except (ValueError, OSError, IOError):
-            # Not a valid OHLCV file, detect by content
-            pass
+        if file_path.suffix.lower() == '.ohlcv':
+            try:
+                with OHLCVReader(file_path):
+                    return 'ohlcv'
+            except (ValueError, OSError, IOError):
+                return 'unknown'
 
         # Detect text-based formats by content
         try:

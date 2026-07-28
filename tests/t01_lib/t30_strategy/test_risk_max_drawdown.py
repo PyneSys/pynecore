@@ -67,7 +67,7 @@ def __test_max_drawdown_halts_and_blocks_re_entry__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
 
     # Bar 0: signal       — entry queued
     # Bar 1: entry fills at open=100; price wobbles around 100
@@ -75,12 +75,12 @@ def __test_max_drawdown_halts_and_blocks_re_entry__(script_path, module_key):
     # Bar 3: price recovers, but position already closed, halt set
     # Bar 4: re-entry attempt — must be suppressed
     bars = [
-        OHLCV(timestamp=base_ts + 0 * 60, open=100.0, high=100.5, low=99.5, close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * 60, open=100.0, high=101.0, low=99.0, close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * 60, open=100.0, high=100.5, low=80.0, close=80.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * 60, open=80.0, high=85.0, low=80.0, close=85.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * 60, open=85.0, high=90.0, low=84.0, close=88.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 5 * 60, open=88.0, high=92.0, low=87.0, close=90.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 0 * 60_000, open=100.0, high=100.5, low=99.5, close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 1 * 60_000, open=100.0, high=101.0, low=99.0, close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 2 * 60_000, open=100.0, high=100.5, low=80.0, close=80.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 3 * 60_000, open=80.0, high=85.0, low=80.0, close=85.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 4 * 60_000, open=85.0, high=90.0, low=84.0, close=88.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 5 * 60_000, open=88.0, high=92.0, low=87.0, close=90.0, volume=100.0),
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), syminfo)

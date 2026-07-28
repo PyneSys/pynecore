@@ -18,11 +18,12 @@ def main():
 
 
 # --- Geometry ----------------------------------------------------------------
-# Chart bars run at 300s (the default test syminfo period "5"); the LTF feed is
-# 60s, so every chart bar's period [T, T+300) holds exactly 5 LTF intrabars.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
-_LTF_STEP = 60
+# Every timestamp here is Unix MILLISECONDS. Chart bars run at 5 minutes (the
+# default test syminfo period "5"); the LTF feed is 1 minute, so every chart
+# bar's period [T, T+5min) holds exactly 5 LTF intrabars.
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300_000  # 5 minutes
+_LTF_STEP = 60_000  # 1 minute
 _N_HIST = 3        # historical (warmup) chart bars
 _N_LIVE = 2        # live chart bars after LIVE_TRANSITION
 _LTF_PER_BAR = _CHART_STEP // _LTF_STEP  # 5
@@ -123,7 +124,7 @@ def __test_live_ltf_e2e_warmup_and_closed_windows__(script_path, module_key, sym
             timeframe="1",
             config=ReplayConfig(fixture_path=str(fixture_path)),
             syminfo=_ltf_syminfo(),
-            time_from=datetime.fromtimestamp(_TS0, UTC),
+            time_from=datetime.fromtimestamp(_TS0 / 1000, UTC),
         )
         security_data = {"EXCH:LTFSYM:1": ps}
 

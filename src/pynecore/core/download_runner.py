@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 from .download_info import write_download_provider
-from .ohlcv_file import OHLCVWriter
+from .ohlcv import OHLCVWriter
 from .plugin.provider import ProviderPlugin
 from .syminfo import SymInfo
 
@@ -151,13 +151,18 @@ def download_to_file(
         ``'abort'``.
     """
     assert provider.ohlcv_path is not None
+    assert provider.ohlcv_file is not None
     ohlcv_path = provider.ohlcv_path
 
-    with provider as ohlcv_writer:
-        if truncate:
-            ohlcv_writer.seek(0)
-            ohlcv_writer.truncate()
+    if truncate:
+        # Replace the writer rather than opening the existing file and emptying it
+        # afterwards: opening for append accepts only the current format, so a file
+        # left over from an older format could never be replaced by a download.
+        provider.ohlcv_file = OHLCVWriter(
+            ohlcv_path, provider.ohlcv_file.period, truncate=True,
+        )
 
+    with provider as ohlcv_writer:
         resolved_from, fetch_all = _resolve_from(provider, time_from, ohlcv_writer)
 
         # The rest of the flow works with naive UTC datetimes
@@ -183,7 +188,6 @@ def download_to_file(
                     raise DownloadConflictError(conflict)
                 if action != 'truncate':
                     raise ValueError(f"Invalid conflict action: {action!r}")
-                ohlcv_writer.seek(0)
                 ohlcv_writer.truncate()
 
         # Persist the symbol info and the originating provider string BEFORE the
@@ -219,8 +223,15 @@ def download_to_file(
         cb = cb_progress if (progress_cb is not None and not fetch_all) else None
 
         size_before = ohlcv_writer.size
-        provider.download_ohlcv(resolved_from, resolved_to, on_progress=cb,
-                                limit=chunk_size, with_extra=extra_data)
+        # Everything up to here is already stored; a continuation asks for a window
+        # that overlaps it on purpose, so the overlap must be dropped rather than
+        # rejected as a duplicate timestamp.
+        provider.resume_timestamp = ohlcv_writer.end_timestamp
+        try:
+            provider.download_ohlcv(resolved_from, resolved_to, on_progress=cb,
+                                    limit=chunk_size, with_extra=extra_data)
+        finally:
+            provider.resume_timestamp = None
         bars_written = ohlcv_writer.size - size_before
 
         # Refine the heuristic mincontract from the downloaded volume data
@@ -253,10 +264,17 @@ def _resolve_from(provider: ProviderPlugin, time_from: datetime | str,
     assert time_from == "continue", f"Unexpected from value: {time_from!r}"
 
     end_ts = ohlcv_writer.end_timestamp
-    interval = ohlcv_writer.interval
-    if end_ts and interval:  # Resume from last download
-        # One interval ahead, otherwise the last bar would be downloaded again
-        return datetime.fromtimestamp(end_ts, UTC) + timedelta(seconds=interval), False
+    if end_ts:  # Resume from last download
+        # The last stored bar itself, never one period past it: the next bar's
+        # opening instant is not a fixed distance away. Calendar months vary in
+        # length, and a series aligned to an exchange's local midnight moves an
+        # hour *backwards* in UTC at a daylight-saving transition, so a period-wide
+        # jump would ask past the next candle and leave a permanent hole. Not even
+        # a second is added, because a provider is free to read the start as an
+        # exclusive bound and would then drop the very next bar; asking for the
+        # stored instant is safe either way, and the overlap the provider serves
+        # from inside the stored range is dropped by ``save_ohlcv_data``.
+        return datetime.fromtimestamp(end_ts / 1000, UTC), False
     if provider.fetch_all_by_default:
         return datetime.fromtimestamp(0, UTC), True
     return datetime.now(UTC) - timedelta(days=365), False

@@ -34,14 +34,14 @@ def __test_plot_family__(runner):
     from pynecore.types.na import isna_num
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200
+    base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [
         (100.0, 101.0, 99.0, 100.5),  # close > open -> 1
         (101.0, 101.5, 100.0, 100.5),  # close < open -> 0
         (100.5, 102.0, 100.0, 101.5),  # close > open -> 1
         (101.5, 102.0, 101.0, 101.0),  # close < open -> 0
     ]
-    bars = [OHLCV(timestamp=base + i * 300, open=o, high=h, low=l, close=c, volume=100.0)
+    bars = [OHLCV(timestamp=base + i * 300_000, open=o, high=h, low=l, close=c, volume=100.0)
             for i, (o, h, l, c) in enumerate(rows)]
 
     per_bar: list[dict] = []

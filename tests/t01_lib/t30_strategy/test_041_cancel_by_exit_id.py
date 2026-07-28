@@ -63,7 +63,7 @@ def __test_cancel_by_exit_id_removes_only_tp1__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
 
     # Bar 0: entry signal (fills at bar 1 open)
     # Bar 1: entry fills at 100, both exits placed
@@ -71,12 +71,12 @@ def __test_cancel_by_exit_id_removes_only_tp1__(script_path, module_key):
     # Bar 3: high=115 — TP1 would fire here if not cancelled (limit 110)
     # Bar 4: high=125 — TP2 fires (limit 120)
     bars = [
-        OHLCV(timestamp=base_ts + 0 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 1 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 2 * 60, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 3 * 60, open=100.0, high=115.0, low=100.0, close=115.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 4 * 60, open=115.0, high=125.0, low=115.0, close=125.0, volume=100.0),
-        OHLCV(timestamp=base_ts + 5 * 60, open=125.0, high=125.5, low=124.5, close=125.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 0 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 1 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 2 * 60_000, open=100.0, high=100.5, low=99.5,  close=100.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 3 * 60_000, open=100.0, high=115.0, low=100.0, close=115.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 4 * 60_000, open=115.0, high=125.0, low=115.0, close=125.0, volume=100.0),
+        OHLCV(timestamp=base_ts + 5 * 60_000, open=125.0, high=125.5, low=124.5, close=125.0, volume=100.0),
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), syminfo)

@@ -5,7 +5,7 @@ title: "ScriptRunner API"
 description: "Running PyneCore scripts programmatically from Python"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-03-17"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Programmatic", "API"]
@@ -37,8 +37,8 @@ syminfo = SymInfo(
 )
 
 candles = [
-    OHLCV(timestamp=1704067200, open=42000, high=42500, low=41800, close=42300, volume=1000),
-    OHLCV(timestamp=1704070800, open=42300, high=42800, low=42100, close=42600, volume=1200),
+    OHLCV(timestamp=1704067200000, open=42000, high=42500, low=41800, close=42300, volume=1000),
+    OHLCV(timestamp=1704070800000, open=42300, high=42800, low=42100, close=42600, volume=1200),
     # ... more bars
 ]
 
@@ -288,7 +288,7 @@ ordinal-id semantics, journal mode, and the live `lib._plot_meta` / `lib._viz_dy
 from pathlib import Path
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.core.data_converter import DataConverter
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.core.syminfo import SymInfo
 
 # Convert CSV data to OHLCV format

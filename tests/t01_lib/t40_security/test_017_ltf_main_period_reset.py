@@ -26,25 +26,27 @@ def main():
     plot(v, "acc")
 
 
-# Chart runs at the default test period "5" (300s); the LTF feed is 60s, so each
+# Chart runs at the default test period "5"; the LTF feed is 1 minute, so each
 # chart bar contains exactly five 1-minute intrabars. Intrabar volumes cycle
 # 1,2,3,4,5 within each chart bar, so the per-bar SUM is 15 and the LAST intrabar
 # alone is 5 -- a value that cleanly separates the correct sum from the bug.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
+# Every timestamp here is Unix MILLISECONDS.
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300_000  # 5 minutes
+_LTF_STEP = 60_000  # 1 minute
 
 
 def _write_ltf(tmp_dir, n_chart_bars):
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "TEST_LMPR_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for j in range(n_chart_bars * 5):
             vol = float(j % 5 + 1)  # 1,2,3,4,5 within each chart bar
-            w.write(OHLCV(timestamp=_TS0 + j * 60,
+            w.write(OHLCV(timestamp=_TS0 + j * _LTF_STEP,
                           open=100.0, high=100.0, low=100.0, close=100.0, volume=vol))
     SymInfo(
         prefix="EXCH", description="LMPR", ticker="LMPR",

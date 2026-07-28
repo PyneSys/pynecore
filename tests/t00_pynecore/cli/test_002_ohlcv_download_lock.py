@@ -19,7 +19,8 @@ from pynecore.cli.commands.run import (
     _atomic_ohlcv_download_target,
     _ohlcv_download_lock,
 )
-from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv import OHLCVWriter
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -89,9 +90,10 @@ def __test_atomic_download_keeps_canonical_file_complete_during_rewrite__(
 ):
     """A reader sees the prior complete file while a sibling rewrites privately."""
     path = tmp_path / "prov_SYM_1.ohlcv"
-    provider = SimpleNamespace(ohlcv_path=path, ohlcv_file=OHLCVWriter(path))
-    first = OHLCV(1_700_000_000, 1.0, 2.0, 0.5, 1.5, 10.0)
-    second = OHLCV(1_700_000_060, 1.5, 2.5, 1.0, 2.0, 11.0)
+    provider = SimpleNamespace(ohlcv_path=path, ohlcv_file=OHLCVWriter(path, "1"))
+    # One-minute bars, Unix milliseconds — the unit the OHLCV API speaks throughout.
+    first = OHLCV(1_700_000_040_000, 1.0, 2.0, 0.5, 1.5, 10.0)
+    second = OHLCV(1_700_000_100_000, 1.5, 2.5, 1.0, 2.0, 11.0)
     with _atomic_ohlcv_download_target(provider):
         with provider.ohlcv_file as writer:
             writer.write(first)
@@ -101,11 +103,10 @@ def __test_atomic_download_keeps_canonical_file_complete_during_rewrite__(
 
     def rewrite():
         sibling = SimpleNamespace(
-            ohlcv_path=path, ohlcv_file=OHLCVWriter(path)
+            ohlcv_path=path, ohlcv_file=OHLCVWriter(path, "1")
         )
         with _atomic_ohlcv_download_target(sibling):
             with sibling.ohlcv_file as writer:
-                writer.seek(0)
                 writer.truncate()
                 private_truncated.set()
                 assert allow_publish.wait(timeout=5.0)

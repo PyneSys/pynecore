@@ -142,8 +142,9 @@ class CSVWriter:
 
                 # OHLCV data
                 if cmd == WRITE_OHLCV:
+                    # OHLCV timestamps are Unix milliseconds.
                     if self._timestamp_as_iso:
-                        row.append(datetime.fromtimestamp(data.timestamp, UTC).isoformat())
+                        row.append(datetime.fromtimestamp(data.timestamp / 1000, UTC).isoformat())
                     else:
                         row.append(str(data.timestamp))
 
@@ -467,14 +468,19 @@ class CSVReader:
             if not row:  # Skip empty rows
                 continue
 
-            # Parse timestamp
+            # Parse timestamp into Unix milliseconds, the OHLCV timestamp unit
             time_field = row[fi['time']]
             if time_field.isdigit():
+                # Numeric exports carry either seconds or milliseconds; the decimal
+                # width separates them (10 digits of seconds reach the year 2286,
+                # while 10 digits of milliseconds would still be in 1970)
                 timestamp = int(time_field)
+                if len(time_field) <= 10:
+                    timestamp *= 1000
             else:
                 try:
                     dt = datetime.fromisoformat(time_field).astimezone(UTC)
-                    timestamp = int(dt.timestamp())
+                    timestamp = round(dt.timestamp() * 1000)
                 except ValueError:
                     raise ValueError(f"Invalid time format: {time_field}")
 

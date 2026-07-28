@@ -19,11 +19,14 @@ def main():
 
 
 # --- Synthetic feed geometry -------------------------------------------------
-# Chart: 10 bars at 300s (the default test syminfo period "5"), opens TS0+i*300.
-# 1-minute feed: 50 bars, opens TS0+j*60, close = j+1 (covers every chart bar).
-# 15-minute feed: 3 bars, opens TS0+k*900, close = 100+k.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC
-_CHART_STEP = 300
+# Every timestamp here is Unix MILLISECONDS.
+# Chart: 10 bars of 5 minutes (the default test syminfo period "5"), opens
+#        _TS0 + i * _CHART_STEP.
+# 1-minute feed: 50 bars, opens _TS0 + j * 1 minute, close = j+1 (covers every
+#        chart bar).
+# 15-minute feed: 3 bars, opens _TS0 + k * 15 minutes, close = 100+k.
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC
+_CHART_STEP = 300_000  # 5 minutes
 
 # tf="1" is a plain-LTF context: the bar's LAST intrabar close = 5*(i+1).
 _EXPECTED_A = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
@@ -34,11 +37,11 @@ _EXPECTED_A = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
 _EXPECTED_B = [None, None, 100.0, 100.0, 100.0, 101.0, 101.0, 101.0, 102.0, 102.0]
 
 
-def _write_feed(path, step, closes, first_ts=_TS0):
-    from pynecore.core.ohlcv_file import OHLCVWriter
+def _write_feed(path, period, step, closes, first_ts=_TS0):
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.types.ohlcv import OHLCV
 
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, period) as w:
         for j, c in enumerate(closes):
             w.write(OHLCV(
                 timestamp=first_ts + j * step,
@@ -101,10 +104,10 @@ def __test_per_call_site_contexts__(runner, log):
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         p1 = td / "EXCH_LTFSYM_1.ohlcv"
-        _write_feed(p1, 60, [j + 1 for j in range(50)])
+        _write_feed(p1, "1", 60_000, [j + 1 for j in range(50)])
         _write_syminfo(p1, "1")
         p15 = td / "EXCH_LTFSYM_15.ohlcv"
-        _write_feed(p15, 900, [100 + k for k in range(3)])
+        _write_feed(p15, "15", 900_000, [100 + k for k in range(3)])
         _write_syminfo(p15, "15")
 
         r = runner(_chart_bars(), security_data={

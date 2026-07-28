@@ -50,7 +50,7 @@ def __test_cash_per_contract_charges_both_legs__(script_path, module_key):
     import sys
     from pathlib import Path
 
-    from pynecore.core.ohlcv_file import OHLCVReader
+    from pynecore.core.ohlcv import OHLCVReader
     from pynecore.core.script_runner import ScriptRunner
     from pynecore.core.syminfo import SymInfo
 

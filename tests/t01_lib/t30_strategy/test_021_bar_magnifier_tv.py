@@ -43,7 +43,7 @@ def __test_bar_magnifier_matches_tradingview__(script_path, module_key, csv_read
     """
     import sys
     from pathlib import Path
-    from pynecore.core.ohlcv_file import OHLCVReader
+    from pynecore.core.ohlcv import OHLCVReader
     from pynecore.core.script_runner import ScriptRunner
     from pynecore.core.syminfo import SymInfo
 

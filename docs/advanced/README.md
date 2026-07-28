@@ -5,7 +5,7 @@ title: "Advanced"
 description: "Advanced topics and features of PyneCore"
 icon: "psychology"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Advanced"]
@@ -21,9 +21,9 @@ Advanced topics and features of PyneCore
 
 - [AST Transformations](./ast-transformations.md) - How PyneCore transforms Python code
 - [Function Isolation](./function-isolation.md) - Function isolation implementation
-- [OHLCV Reader/Writer](./ohlcv-reader-writer.md) - OHLCV data handling
+- [OHLCV Reader/Writer](./ohlcv-reader-writer.md) - Self-describing binary OHLCV format, reader and writer API
 - [CSV Reader/Writer](./csv-reader-writer.md) - Fast CSV processing
-- [Extra Fields](./extra-fields.md) - Custom CSV columns beyond OHLCV in scripts
+- [Extra Fields](./extra-fields.md) - Extra per-bar columns beyond OHLCV in scripts
 - [request.security() Internals](./request-security-internals.md) - Multiprocessing architecture, AST transformation, shared memory
 - [Bar Magnifier](./bar-magnifier.md) - Accurate intrabar order fills using lower-timeframe data
 - [Live Mode](./live-mode.md) - Real-time streaming with intra-bar updates and paper trading

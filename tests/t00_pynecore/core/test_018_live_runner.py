@@ -489,7 +489,7 @@ def __test_live_generator_synthesises_idle_bars_at_tf_boundary__():
     1-minute TF intervals + grace) — the watchdog therefore fires on
     the very first iteration and immediately catches up.
     """
-    base_ts = int(time.time()) - 200
+    base_ts = (int(time.time()) - 200) * 1000
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
     provider = _IdleAfterFirstBar(updates)
 
@@ -512,9 +512,9 @@ def __test_live_generator_synthesises_idle_bars_at_tf_boundary__():
     # baseline by one TF per emission; each filler carries the previous
     # close as O=H=L=C and zero volume.
     for i in range(1, 3):
-        assert bars[i].timestamp == base_ts + 60 * i, (
+        assert bars[i].timestamp == base_ts + 60_000 * i, (
             f"synth bar {i} timestamp {bars[i].timestamp} "
-            f"!= expected {base_ts + 60 * i}"
+            f"!= expected {base_ts + 60_000 * i}"
         )
         assert bars[i].open == 100.0
         assert bars[i].high == 100.0
@@ -550,12 +550,12 @@ def __test_live_generator_drops_late_real_bar_for_already_synthesised_boundary__
     Drop the real one: the synth's flat values are now the authoritative
     live record for that minute.
     """
-    base_ts = int(time.time()) - 200
+    base_ts = (int(time.time()) - 200) * 1000
     updates = [
         _make_ohlcv(base_ts, is_closed=True, close=100.0),
-        # Late real bar arrives at base_ts + 60 — same boundary the
+        # Late real bar arrives one TF later — same boundary the
         # watchdog will synthesise while we sleep below.
-        _make_ohlcv(base_ts + 60, is_closed=True, close=999.0),
+        _make_ohlcv(base_ts + 60_000, is_closed=True, close=999.0),
     ]
     provider = _LateBarAfterIdle(updates, block_seconds=0.3)
 
@@ -575,7 +575,7 @@ def __test_live_generator_drops_late_real_bar_for_already_synthesised_boundary__
     assert bars[0].close == 100.0
     # Second bar must be the synth (V=0, close=100), NOT the late real
     # bar with close=999. The late one was dropped by the dedup.
-    assert bars[1].timestamp == base_ts + 60
+    assert bars[1].timestamp == base_ts + 60_000
     assert bars[1].volume == 0.0
     assert bars[1].close == 100.0
 
@@ -682,7 +682,7 @@ def __test_synth_gate_suppresses_synth_during_known_closed_window__():
     """When syminfo.opening_hours says market closed, no idle synth is emitted.
 
     Setup: a SymInfo with a single 5-minute weekday interval anchored
-    12 hours away from ``synth_ts`` (computed from ``base_ts + 60``).
+    12 hours away from ``synth_ts`` (one timeframe past ``base_ts``).
     Pinning the open interval to ``synth_ts``'s opposite half-day keeps
     the test deterministic regardless of wall-clock time, while still
     exercising the closed-window gate for the slot the watchdog tries
@@ -692,9 +692,9 @@ def __test_synth_gate_suppresses_synth_during_known_closed_window__():
     from pynecore.core.syminfo import SymInfoInterval
     from datetime import datetime as ddatetime, time as dtime, timedelta, UTC
 
-    base_ts = int(time.time()) - 200
-    synth_ts = base_ts + 60
-    synth_dt = ddatetime.fromtimestamp(synth_ts, tz=UTC)
+    base_ts = (int(time.time()) - 200) * 1000
+    synth_ts = base_ts + 60_000
+    synth_dt = ddatetime.fromtimestamp(synth_ts / 1000, tz=UTC)
     open_dt = synth_dt + timedelta(hours=12)
     open_time = dtime(open_dt.hour, open_dt.minute, 0)
     close_dt = open_dt + timedelta(minutes=5)
@@ -738,7 +738,7 @@ def __test_synth_gate_passthrough_when_opening_hours_empty__():
     """
     syminfo = _make_syminfo([], timezone="UTC")
 
-    base_ts = int(time.time()) - 200
+    base_ts = (int(time.time()) - 200) * 1000
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
     provider = _IdleAfterFirstBar(updates)
 
@@ -758,8 +758,8 @@ def __test_synth_gate_passthrough_when_opening_hours_empty__():
     assert bars[0].volume == 1000.0
     assert bars[1].volume == 0.0
     assert bars[2].volume == 0.0
-    assert bars[1].timestamp == base_ts + 60
-    assert bars[2].timestamp == base_ts + 120
+    assert bars[1].timestamp == base_ts + 60_000
+    assert bars[2].timestamp == base_ts + 120_000
 
 
 # --- Feed-liveness watchdog tests ---
@@ -818,7 +818,7 @@ def __test_feed_staleness_watchdog_forces_reconnect__():
     drive ``connect()`` again within the test's few-second budget without
     the provider ever raising a ConnectionError.
     """
-    base_ts = int(time.time()) - 30
+    base_ts = (int(time.time()) - 30) * 1000
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
     provider = _SilentFeedProvider(updates, stop_after_connects=2)
     provider.feed_timeout_bars = 1
@@ -849,7 +849,7 @@ def __test_feed_staleness_watchdog_disabled_with_none__():
     the test at ~2 s of wall clock — well past the ~1 s staleness
     threshold the positive test reconnects under.
     """
-    base_ts = int(time.time()) - 200
+    base_ts = (int(time.time()) - 200) * 1000
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
     provider = _SilentFeedProvider(updates, max_idle_calls=40)
     provider.feed_timeout_bars = None
@@ -927,7 +927,7 @@ def __test_feed_staleness_fires_when_slot_pinned_in_closed_window__():
 
     # The synth slot (base_ts + 1s) lies ~79 s before the session window
     # opens -> calendar-closed, while wall-clock "now" is in-session.
-    base_ts = int(time.time()) - 140
+    base_ts = (int(time.time()) - 140) * 1000
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0)]
     provider = _SilentFeedProvider(updates, stop_after_connects=2)
     provider.feed_timeout_bars = 1
@@ -970,8 +970,8 @@ def __test_idle_watchdog_finalises_forming_bar_with_real_data__():
     bar at the forming slot with the forming bar's own OHLCV/volume, NOT
     a frozen V=0 filler at the previous close.
     """
-    base_ts = int(time.time()) - 200
-    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+    base_ts = (int(time.time()) - 200) * 1000
+    forming = OHLCV(timestamp=base_ts + 60_000, open=100.0, high=106.0,
                     low=99.0, close=105.0, volume=500.0, is_closed=False)
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0), forming]
     provider = _IdleAfterFirstBar(updates)
@@ -985,12 +985,12 @@ def __test_idle_watchdog_finalises_forming_bar_with_real_data__():
         if not seen_transition:
             continue
         bars.append(item)
-        if any(b.timestamp == base_ts + 60 and b.is_closed for b in bars):
+        if any(b.timestamp == base_ts + 60_000 and b.is_closed for b in bars):
             break
         if len(bars) >= 8:
             break
 
-    finalised = [b for b in bars if b.timestamp == base_ts + 60 and b.is_closed]
+    finalised = [b for b in bars if b.timestamp == base_ts + 60_000 and b.is_closed]
     assert len(finalised) == 1, (
         f"expected one finalised closed bar at the forming slot, "
         f"got {len(finalised)}"
@@ -1033,10 +1033,10 @@ def __test_late_real_close_dropped_after_forming_finalisation__():
     consumer keeps exactly one closed bar for the slot — the real forming
     data, not the late conflicting close.
     """
-    base_ts = int(time.time()) - 200
-    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+    base_ts = (int(time.time()) - 200) * 1000
+    forming = OHLCV(timestamp=base_ts + 60_000, open=100.0, high=106.0,
                     low=99.0, close=105.0, volume=500.0, is_closed=False)
-    late_close = OHLCV(timestamp=base_ts + 60, open=100.0, high=200.0,
+    late_close = OHLCV(timestamp=base_ts + 60_000, open=100.0, high=200.0,
                        low=50.0, close=999.0, volume=777.0, is_closed=True)
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0),
                forming, late_close]
@@ -1055,7 +1055,7 @@ def __test_late_real_close_dropped_after_forming_finalisation__():
             break
 
     closed_at_slot = [b for b in bars
-                      if b.timestamp == base_ts + 60 and b.is_closed]
+                      if b.timestamp == base_ts + 60_000 and b.is_closed]
     assert len(closed_at_slot) == 1, (
         f"late real close must be dropped; got {len(closed_at_slot)} "
         f"closed bars at the slot"
@@ -1073,8 +1073,8 @@ def __test_forming_bar_finalised_even_when_soft_cap_drops_queue_updates__():
     with the forming bar's real OHLCV, because finalisation state is
     tracked BEFORE the cap, not via queue admission.
     """
-    base_ts = int(time.time()) - 200
-    forming = OHLCV(timestamp=base_ts + 60, open=100.0, high=106.0,
+    base_ts = (int(time.time()) - 200) * 1000
+    forming = OHLCV(timestamp=base_ts + 60_000, open=100.0, high=106.0,
                     low=99.0, close=105.0, volume=500.0, is_closed=False)
     updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0), forming]
     provider = _IdleAfterFirstBar(updates)
@@ -1092,7 +1092,7 @@ def __test_forming_bar_finalised_even_when_soft_cap_drops_queue_updates__():
             if not seen_transition:
                 continue
             bars.append(item)
-            if any(b.timestamp == base_ts + 60 and b.is_closed for b in bars):
+            if any(b.timestamp == base_ts + 60_000 and b.is_closed for b in bars):
                 break
             if len(bars) >= 8:
                 break
@@ -1104,7 +1104,7 @@ def __test_forming_bar_finalised_even_when_soft_cap_drops_queue_updates__():
         "soft cap=0 must drop all intra-bar (forming) updates from the queue"
     )
     # ...but the watchdog still finalised the slot with real data.
-    finalised = [b for b in bars if b.timestamp == base_ts + 60 and b.is_closed]
+    finalised = [b for b in bars if b.timestamp == base_ts + 60_000 and b.is_closed]
     assert len(finalised) == 1
     assert finalised[0].close == 105.0
     assert finalised[0].volume == 500.0
@@ -1123,12 +1123,12 @@ def __test_forming_finalised_at_session_end_then_next_slot_skipped__():
     from pynecore.core.syminfo import SymInfoInterval
     from datetime import datetime as ddatetime, time as dtime, UTC
 
-    base_ts = int(time.time()) - 260
-    synth_ts = base_ts + 60  # last in-session slot start
+    base_ts = (int(time.time()) - 260) * 1000
+    synth_ts = base_ts + 60_000  # last in-session slot start
     # Session ends exactly at the slot boundary after ``synth_ts`` so
-    # [synth_ts, synth_ts+60) is in-session and [synth_ts+60, +120) is not.
-    start_dt = ddatetime.fromtimestamp(synth_ts - 1800, tz=UTC)
-    end_dt = ddatetime.fromtimestamp(synth_ts + 60, tz=UTC)
+    # [synth_ts, synth_ts+60s) is in-session and [synth_ts+60s, +120s) is not.
+    start_dt = ddatetime.fromtimestamp((synth_ts - 1_800_000) / 1000, tz=UTC)
+    end_dt = ddatetime.fromtimestamp((synth_ts + 60_000) / 1000, tz=UTC)
     start_t = dtime(start_dt.hour, start_dt.minute, start_dt.second)
     end_t = dtime(end_dt.hour, end_dt.minute, end_dt.second)
     if start_dt.date() == end_dt.date():
@@ -1168,7 +1168,7 @@ def __test_forming_finalised_at_session_end_then_next_slot_skipped__():
     assert finalised[0].close == 105.0
     assert finalised[0].volume == 500.0
     # The slot past the session end must not be emitted at all.
-    assert all(b.timestamp != synth_ts + 60 for b in bars), (
+    assert all(b.timestamp != synth_ts + 60_000 for b in bars), (
         "the out-of-session slot must be neither finalised nor synthesised"
     )
     # No frozen V=0 synth was produced — the only closed-bar fill was the

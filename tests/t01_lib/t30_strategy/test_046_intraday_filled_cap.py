@@ -69,11 +69,11 @@ def __test_reversal_counts_once_and_caps_close__(script_path, module_key):
     sys.modules.pop(module_key, None)
 
     syminfo = _make_syminfo(period='1')
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC — every bar stays in this day
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC (ms) — every bar stays in this day
 
     # Ten one-minute bars, all on the same UTC day so the counter never resets.
     bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=100.0 + i, high=101.0 + i,
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0 + i, high=101.0 + i,
               low=99.0 + i, close=100.5 + i, volume=100.0)
         for i in range(10)
     ]

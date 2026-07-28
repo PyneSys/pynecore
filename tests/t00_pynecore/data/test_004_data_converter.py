@@ -311,6 +311,50 @@ def __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path):
     assert syminfo.prefix == "DATABENTO"
 
 
+def __test_convert_to_ohlcv_restores_originals_when_backup_fails__(tmp_path, monkeypatch):
+    """A failed vacating rename leaves the previously converted pair fully in place.
+
+    Both destinations are renamed aside before anything is published. If the second
+    of those renames fails — the sidecar is held open elsewhere — the first one must
+    be put back, otherwise the good binary survives only under its internal
+    ``.replaced`` name and the conversion silently destroys the last usable output.
+    """
+    from pynecore.core import data_converter as data_converter_module
+
+    csv_path = tmp_path / "backup_failure.csv"
+    csv_path.write_text(
+        "time,open,high,low,close,volume,sig\n"
+        "2024-01-01 00:00:00,10,11,9,10.5,100,1\n"
+        "2024-01-01 00:01:00,10.5,11.5,10,11,110,2\n"
+        "2024-01-01 00:02:00,11,12,10.5,11.5,120,3\n"
+    )
+    ohlcv_path = csv_path.with_suffix('.ohlcv')
+    extra_path = csv_path.with_suffix('.extra.csv')
+
+    converter = DataConverter()
+    converter.convert_to_ohlcv(csv_path, symbol="TEST")
+    assert ohlcv_path.exists() and extra_path.exists()
+    good_binary = ohlcv_path.read_bytes()
+    good_sidecar = extra_path.read_text()
+
+    real_replace = data_converter_module.os.replace
+
+    def failing_replace(source, destination, *args, **kwargs):
+        if str(destination).endswith(".extra.csv.replaced"):
+            raise PermissionError("sidecar is held open by another process")
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(data_converter_module.os, "replace", failing_replace)
+    with pytest.raises(Exception):
+        converter.convert_to_ohlcv(csv_path, symbol="TEST", force=True)
+    monkeypatch.undo()
+
+    assert ohlcv_path.read_bytes() == good_binary
+    assert extra_path.read_text() == good_sidecar
+    assert list(tmp_path.glob("*.replaced")) == []
+    assert list(tmp_path.glob("*.converting.*")) == []
+
+
 # Test runner functions that pytest will find
 def test_symbol_provider_detection_ccxt():
     __test_symbol_provider_detection_ccxt__()

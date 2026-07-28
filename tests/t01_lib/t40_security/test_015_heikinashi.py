@@ -29,10 +29,10 @@ def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
     from pynecore import lib
     from pynecore.types.na import NA
     from pynecore.types.ohlcv import OHLCV
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
 
-    # Deterministic 5-minute feed (matches the syminfo fixture period)
-    base_ts = int(datetime(2025, 1, 1, tzinfo=UTC).timestamp())
+    # Deterministic 5-minute feed (matches the syminfo fixture period), in ms
+    base_ts = int(datetime(2025, 1, 1, tzinfo=UTC).timestamp()) * 1000
     ohlc = [
         (100.0, 105.0, 99.0, 104.0),
         (104.0, 108.0, 103.0, 106.0),
@@ -43,12 +43,12 @@ def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
         (108.0, 109.0, 104.0, 105.0),
         (105.0, 106.0, 100.0, 101.0),
     ]
-    bars = [OHLCV(timestamp=base_ts + i * 300, open=o, high=h, low=lo, close=c, volume=1000.0)
+    bars = [OHLCV(timestamp=base_ts + i * 300_000, open=o, high=h, low=lo, close=c, volume=1000.0)
             for i, (o, h, lo, c) in enumerate(ohlc)]
 
     # Write the source feed + syminfo sidecar the security child loads
     src = tmp_path / "ha_src.ohlcv"
-    with OHLCVWriter(src) as w:
+    with OHLCVWriter(src, syminfo.period) as w:
         for b in bars:
             w.write(b)
     syminfo.save_toml(src.with_suffix('.toml'))

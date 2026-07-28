@@ -15,15 +15,18 @@ def main():
 
 
 # --- Synthetic feed geometry -------------------------------------------------
-# Chart: 10 bars at 300s (the default test syminfo period "5"), opens TS0+i*300.
-# LTF:   25 bars at 60s, opens TS0+1500+j*60 (j=0..24), close = j+1.
+# Every timestamp here is Unix MILLISECONDS — the unit the OHLCV API speaks.
+# Chart: 10 bars of 5 minutes (the default test syminfo period "5"), opens
+#        _TS0 + i * _CHART_STEP.
+# LTF:   25 bars of 1 minute, opens _LTF_FIRST + j * _LTF_STEP (j=0..24),
+#        close = j+1.
 # The LTF feed's first open lands exactly on chart bar 5, so chart bars 0..4
 # open strictly before it (prefix → skip → empty array) and bar 5 is the first
 # bar that can contain an intrabar.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
-_LTF_STEP = 60
-_LTF_FIRST = _TS0 + 1500  # == chart bar 5 open
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300_000  # 5 minutes
+_LTF_STEP = 60_000  # 1 minute
+_LTF_FIRST = _TS0 + 5 * _CHART_STEP  # == chart bar 5 open
 
 # Each chart bar returns the intrabars of its OWN period ``[T, T+tf)`` (matching
 # TradingView): chart bar 5 collects LTF j=0..4, bar 6 j=5..9, and so on, so all
@@ -39,12 +42,12 @@ def _build_ltf_file(tmp_path):
     subprocess loads on startup) and return the ``.ohlcv`` path.
     """
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_path / "EXCH_LTFSYM_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for j in range(25):
             c = float(j + 1)
             w.write(OHLCV(
@@ -113,7 +116,7 @@ def __test_load_ltf_first_ms__(tmp_path):
         resampler=None, tz=ZoneInfo("UTC"), is_ltf=True,
     )
     load_ltf_first_ms(ltf_state, data_path)
-    assert ltf_state.ltf_first_ms == _LTF_FIRST * 1000
+    assert ltf_state.ltf_first_ms == _LTF_FIRST
 
     # Non-LTF context: must remain disabled (None) so HTF/same-TF paths are
     # never affected by the prefix-skip.
@@ -126,9 +129,9 @@ def __test_load_ltf_first_ms__(tmp_path):
 
     # Empty feed (no first bar): the optimization cleanly disables itself
     # (ltf_first_ms stays None) instead of skipping every chart bar.
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     empty_path = str(tmp_path / "empty.ohlcv")
-    with OHLCVWriter(empty_path):
+    with OHLCVWriter(empty_path, "1"):
         pass
     empty_state = SecurityState(
         sec_id="s", timeframe="1", gaps_on=False, same_timeframe=False,
@@ -188,7 +191,7 @@ def __test_ltf_prefix_skip__(runner, monkeypatch, log):
     # period-end target is kept, so the table is unchanged. Both runs matching it
     # is the equivalence proof.
     def _force_no_skip(state, _path):
-        state.ltf_first_ms = _TS0 * 1000
+        state.ltf_first_ms = _TS0
 
     monkeypatch.setattr(sec_mod, "load_ltf_first_ms", _force_no_skip)
     unoptimised = _run_collect(runner)

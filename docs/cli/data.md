@@ -5,7 +5,7 @@ title: "Data Management"
 description: "Managing OHLCV data with the PyneCore CLI"
 icon: "database"
 date: "2025-04-03"
-lastmod: "2025-04-03"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Usage", "CLI", "Data Handling"]
@@ -83,6 +83,7 @@ To see which providers are installed, run `pyne plugin list` (provider plugins a
 - `--force-save-info`, `-fi`: Force save symbol information
 - `--truncate`, `-tr`: Truncate file before downloading (all data will be lost)
 - `--chunk-size`, `-cs`: Bars per API request (overrides the provider's automatic limit)
+- `--extra-data`, `-ed`: Also download the provider's extra per-bar fields (ask/bid/spread) into a `.extra.csv` sidecar; off by default, ignored by providers that have none (see [Extra Fields](../advanced/extra-fields.md))
 - `--symbol`, `-s` / `--timeframe`, `-tf`: Supply the symbol/timeframe separately instead of writing them into the provider string (see [Alternative form](#alternative-separate-provider-symbol-and-timeframe))
 
 ### Interactive Symbol Browser
@@ -336,8 +337,9 @@ PyneCore uses a structured approach to store OHLCV data:
 
 Data files are stored in the `workdir/data/` directory with standardized naming:
 ```
-<provider>_<symbol>_<timeframe>.ohlcv   # OHLCV data file
-<provider>_<symbol>_<timeframe>.toml    # Symbol information file
+<provider>_<symbol>_<timeframe>.ohlcv       # OHLCV data file
+<provider>_<symbol>_<timeframe>.toml        # Symbol information file
+<provider>_<symbol>_<timeframe>.extra.csv   # Extra per-bar fields (only if there are any)
 ```
 
 For example:
@@ -348,11 +350,13 @@ ccxt_BINANCE_BTC_USDT_1D.toml
 
 ### OHLCV File Format
 
-The `.ohlcv` format is a binary format optimized for:
+The `.ohlcv` format is a self-describing binary format optimized for:
 - Fast reading and writing
 - Compact storage
 - Efficient bar-by-bar access
 - Support for time range queries
+
+Its header declares the timeframe, the column layout, the record count and the first and last timestamp, so those questions are answered without scanning the data. Only real bars are stored — a missing interval produces no record — and every timestamp is Unix milliseconds. Details are in [OHLCV Reader/Writer](../advanced/ohlcv-reader-writer.md).
 
 When converted to CSV, the format has the following columns:
 ```

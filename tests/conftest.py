@@ -326,7 +326,7 @@ def dummy_ohlcv_iter():
     from itertools import cycle
 
     ohlcv = OHLCV(
-        timestamp=int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp()),
+        timestamp=int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp()) * 1000,
         open=1.0,
         high=2.0,
         low=0.5,

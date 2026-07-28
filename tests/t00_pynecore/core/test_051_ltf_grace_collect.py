@@ -25,8 +25,9 @@ _GRACE = 15.0
 
 
 def _bar(open_ms: int) -> OHLCV:
-    """An OHLCV at ``open_ms`` (ms); the loop only reads ``timestamp`` (seconds)."""
-    return OHLCV(timestamp=open_ms // 1000, open=0.0, high=0.0, low=0.0,
+    """An OHLCV at ``open_ms``; the loop compares ``timestamp`` against the
+    millisecond period bounds, so the bar carries milliseconds too."""
+    return OHLCV(timestamp=open_ms, open=0.0, high=0.0, low=0.0,
                  close=0.0, volume=0.0)
 
 

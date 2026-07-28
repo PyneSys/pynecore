@@ -23,24 +23,26 @@ def main():
 
 
 # --- Shared geometry ---------------------------------------------------------
-# Same layout as test_011: 300s chart bars, 60s LTF feed, each intrabar's close
-# is ``base + 2000`` — so per chart bar ``sum(up) = base_sum + size * 2001`` and
+# Every timestamp here is Unix MILLISECONDS. Same layout as test_011: 5-minute
+# chart bars, 1-minute LTF feed, each intrabar's close is ``base + 2000`` — so per
+# chart bar ``sum(up) = base_sum + size * 2001`` and
 # ``sum(dn) = base_sum + size * 1999``.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to both the 300s and 60s grids
-_CHART_STEP = 300
+_SEC = 1000  # milliseconds in a second
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the 5m and 1m grids
+_CHART_STEP = 300 * _SEC
 
 
 def _write_ltf(tmp_dir, bars):
-    """Write a 1-minute LTF feed from ``(timestamp_s, base)`` pairs (close is
+    """Write a 1-minute LTF feed from ``(timestamp_ms, base)`` pairs (close is
     ``base + 2000``, matching test_011's O/H/L/C spread), plus the ``.toml``
     sidecar the subprocess loads on startup; return the path."""
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "EXCH_LTFSYM_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for ts, b in bars:
             b = float(b)
             w.write(OHLCV(timestamp=ts, open=b + 1000.0, high=b + 3000.0,
@@ -61,7 +63,7 @@ def _write_ltf(tmp_dir, bars):
 
 
 def _chart_bars(n):
-    """``n`` chart bars at 300s; OHLCV body is irrelevant to the LTF result."""
+    """``n`` 5-minute chart bars; OHLCV body is irrelevant to the LTF result."""
     from pynecore.types.ohlcv import OHLCV
     return [
         OHLCV(timestamp=_TS0 + i * _CHART_STEP,
@@ -81,8 +83,9 @@ def __test_ltf_opaque_tuple__(runner, log):
     with tempfile.TemporaryDirectory() as td:
         ltf_path = _write_ltf(
             Path(td),
-            [(_TS0 + j * 60, j + 1) for j in range(10)]           # bars 0,1: base 1..10
-            + [(_TS0 + 600 + k * 60, 11 + k) for k in range(3)])  # bar 2: base 11,12,13
+            [(_TS0 + j * 60 * _SEC, j + 1) for j in range(10)]  # bars 0,1: base 1..10
+            # bar 2: base 11,12,13
+            + [(_TS0 + (600 + k * 60) * _SEC, 11 + k) for k in range(3)])
         rows = []
         r = runner(_chart_bars(4), security_data={"EXCH:LTFSYM:1": ltf_path})
         for _candle, pv in r.run_iter():

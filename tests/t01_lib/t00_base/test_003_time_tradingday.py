@@ -21,7 +21,7 @@ def __test_time_tradingday__(runner, log):
         return int(datetime(year, month, day, tzinfo=UTC).timestamp() * 1000)
 
     def bar(iso: str) -> OHLCV:
-        ts = int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp())
+        ts = int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp()) * 1000
         return OHLCV(timestamp=ts, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0)
 
     # Forex-style symbol: exchange timezone New York, a 24h session that opens at

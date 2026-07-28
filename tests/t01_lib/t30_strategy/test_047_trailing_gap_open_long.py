@@ -66,7 +66,7 @@ def __test_gap_open_long_fills_at_open__(script_path, module_key):
 
     sys.modules.pop(module_key, None)
 
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [
         # open,   high,   low,    close
         (100.00, 100.00, 100.00, 100.00),  # bar 0 - entry signal
@@ -75,7 +75,7 @@ def __test_gap_open_long_fills_at_open__(script_path, module_key):
         (100.50, 100.70, 100.40, 100.60),  # bar 3 - tail
     ]
     bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=o, high=h, low=l, close=c, volume=100.0)
+        OHLCV(timestamp=base_ts + i * 60_000, open=o, high=h, low=l, close=c, volume=100.0)
         for i, (o, h, l, c) in enumerate(rows)
     ]
 

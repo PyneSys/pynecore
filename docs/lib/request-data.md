@@ -5,7 +5,7 @@ title: "request.currency_rate() & Corporate Events"
 description: "Currency conversion rates and corporate event data (dividends, splits, earnings) in PyneCore"
 icon: "currency_exchange"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Library", "API Reference"]
@@ -75,11 +75,11 @@ currency pairs are detected from TOML metadata:
 ```python
 from pathlib import Path
 from pynecore.core.script_runner import ScriptRunner
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.core.syminfo import SymInfo
 
 syminfo = SymInfo.load_toml("workdir/data/BTCUSDT_4h.toml")
-reader = OHLCVReader("workdir/data/BTCUSDT_4h")
+reader = OHLCVReader("workdir/data/BTCUSDT_4h.ohlcv")
 reader.open()
 
 runner = ScriptRunner(

@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from ..app import app, app_state
-from ...core.ohlcv_file import OHLCVReader
+from ...core.ohlcv import OHLCVReader
 from ...core.syminfo import SymInfo
 from ...core.script_runner import ScriptRunner
 

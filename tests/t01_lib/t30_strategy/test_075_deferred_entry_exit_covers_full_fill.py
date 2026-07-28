@@ -78,7 +78,7 @@ def __test_deferred_entry_closed_in_one_trade__(script_path, module_key):
 
     sys.modules.pop(module_key, None)
 
-    base_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [
         # open,   high,   low,    close
         (110.00, 110.00, 110.00, 110.00),  # bar 0 - entry+exit signal; estimate at 110
@@ -89,7 +89,7 @@ def __test_deferred_entry_closed_in_one_trade__(script_path, module_key):
         (205.00, 205.00, 205.00, 205.00),  # bar 5 - tail
     ]
     bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=o, high=h, low=l, close=c, volume=100.0)
+        OHLCV(timestamp=base_ts + i * 60_000, open=o, high=h, low=l, close=c, volume=100.0)
         for i, (o, h, l, c) in enumerate(rows)
     ]
 

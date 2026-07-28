@@ -25,7 +25,7 @@ from ..app import app, app_state
 from ..pluggable import PluggableCommand
 
 from ...utils.rich.date_column import DateColumn
-from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.aggregator import validate_aggregation
 from pynecore.lib.log import logger as pyne_logger
@@ -465,9 +465,9 @@ class _ProviderData:
         self.syminfo = syminfo
         self.provider_instance = provider_instance
         self.parsed_string: ProviderString = parsed_string
-        # Exact start timestamp that yields exactly the requested bar
-        # count in ``-N bars`` mode — None when the caller should use
-        # the file's natural start (date/days mode, no bar target).
+        # Exact start timestamp (Unix milliseconds) that yields exactly the
+        # requested bar count in ``-N bars`` mode — None when the caller should
+        # use the file's natural start (date/days mode, no bar target).
         self.time_from_ts = time_from_ts
 
 
@@ -608,9 +608,9 @@ def _ohlcv_download_lock(ohlcv_path: Path | None):
     """Serialize the shared-OHLCV download/rewrite across concurrent processes.
 
     Two runs on the same ``(provider, symbol, timeframe)`` share one
-    ``.ohlcv`` file. The warmup download ``seek(0)``-truncates and rewrites it;
-    a second process reading (or truncating) that file at the same instant sees
-    a half-written or empty file. An OS advisory lock on a sidecar ``.lock``
+    ``.ohlcv`` file. The warmup download truncates and rewrites it; a second
+    process reading (or truncating) that file at the same instant sees a
+    half-written or empty file. An OS advisory lock on a sidecar ``.lock``
     next to the ``.ohlcv`` makes the second process block in the kernel until
     the first finishes, then read a complete file.
 
@@ -646,6 +646,11 @@ def _atomic_ohlcv_download_target(provider: Any):
     The sidecar lock serializes publishers, while the temporary file keeps the
     canonical path complete for readers during the entire rewrite. The
     provider's original path and unopened writer are restored before return.
+
+    The private writer declares the same period as the provider's own writer,
+    so the published file carries the timeframe the provider was built for.
+    ``truncate=True`` turns the empty file ``mkstemp`` reserved into a valid
+    empty OHLCV file instead of an unwritable zero-byte one.
     """
     final_path = provider.ohlcv_path
     if final_path is None:
@@ -661,7 +666,9 @@ def _atomic_ohlcv_download_target(provider: Any):
     try:
         with _ohlcv_download_lock(final_path):
             provider.ohlcv_path = temp_path
-            provider.ohlcv_file = OHLCVWriter(temp_path)
+            provider.ohlcv_file = OHLCVWriter(
+                temp_path, original_writer.period, truncate=True,
+            )
             try:
                 yield
                 os.replace(temp_path, final_path)
@@ -781,7 +788,6 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
         with _atomic_ohlcv_download_target(provider_instance):
             for attempt in range(max_retries + 1):
                 with provider_instance as ohlcv_writer:
-                    ohlcv_writer.seek(0)
                     ohlcv_writer.truncate()
 
                     time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
@@ -803,14 +809,14 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                 if bar_count is None:
                     break
 
-                # Collect real (``volume >= 0``) bar timestamps in the requested
-                # range — gap-fill rows (``volume == -1``) emitted by the OHLCV
-                # writer don't count against the target.
-                window_from_ts = int(time_from_dt.timestamp())
-                window_to_ts = int(time_to_dt.timestamp())
+                # Collect the real bar timestamps in the requested range. The
+                # reader speaks Unix milliseconds and serves only real bars, so
+                # the count is the venue's own coverage.
+                window_from_ts = int(time_from_dt.timestamp() * 1000)
+                window_to_ts = int(time_to_dt.timestamp() * 1000)
                 with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
                     real_ts = [b.timestamp for b in r.read_from(
-                        window_from_ts, window_to_ts, skip_gaps=True,
+                        window_from_ts, window_to_ts,
                     )]
                 real_bars = len(real_ts)
                 oldest_ts = min(real_ts) if real_ts else None
@@ -827,15 +833,22 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                 )
 
                 if horizon_reached or attempt == max_retries:
+                    # The coverage report walks the session calendar, whose
+                    # resolution is one second (``is_in_session``), so the
+                    # millisecond bar timestamps are stepped down here — the
+                    # single place where the two units meet.
+                    grid_ts = [ts // 1000 for ts in real_ts]
                     missing_slots = _missing_slots(
-                        real_ts, window_from_ts, window_to_ts, int(tf_seconds),
+                        grid_ts, window_from_ts // 1000, window_to_ts // 1000,
+                        int(tf_seconds),
                     )
                     in_session, closed = _classify_missing_slots(
                         missing_slots, syminfo, int(tf_seconds),
                     )
                     secho(
                         _format_missing_report(
-                            bar_count, real_bars, oldest_ts,
+                            bar_count, real_bars,
+                            None if oldest_ts is None else oldest_ts // 1000,
                             in_session, closed, int(tf_seconds), horizon_reached,
                         ),
                         fg=colors.YELLOW,
@@ -855,7 +868,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                 anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
                 missing = bar_count - real_bars
                 candidate = (
-                    datetime.fromtimestamp(anchor_ts, UTC).replace(tzinfo=None)
+                    datetime.fromtimestamp(anchor_ts / 1000, UTC).replace(tzinfo=None)
                     - timedelta(seconds=tf_seconds * (missing + 10))
                     - timedelta(days=3)
                 )
@@ -872,7 +885,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
             if bar_count is not None:
                 with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
                     real_ts = [b.timestamp for b in r.read_from(
-                        0, int(time_to_dt.timestamp()), skip_gaps=True,
+                        0, int(time_to_dt.timestamp() * 1000),
                     )]
                 if len(real_ts) >= bar_count:
                     exact_from_ts = real_ts[-bar_count]
@@ -1301,6 +1314,10 @@ def run(
     # Validate and process --timeframe option
     magnifier_mode = False
     magnifier_source_tf: str | None = None
+    # ``syminfo.period`` is the CHART timeframe from here on — the magnifier path
+    # below deliberately overwrites it. Keep the data file's own declared period so
+    # it can still be checked against the file header once the reader is open.
+    data_file_period = syminfo.period
     if timeframe:
         chart_tf: str = timeframe.upper()
         try:
@@ -1324,6 +1341,21 @@ def run(
 
     # --- Open data and run ---
     with OHLCVReader(data_path) as reader:
+        # The file header owns the data's period; a sidecar that disagrees is
+        # stale and would silently drive the magnifier / aggregation decisions off
+        # the wrong resolution. Legacy files declare no header period.
+        if reader.period is not None and data_file_period:
+            try:
+                header_sec = in_seconds(reader.period)
+                toml_sec = in_seconds(data_file_period)
+            except (ValueError, AssertionError):
+                header_sec = toml_sec = None
+            if header_sec is not None and header_sec != toml_sec:
+                secho(f"Stale syminfo: TOML period '{data_file_period}' does not match "
+                      f"the period '{reader.period}' declared by {data_path.name}.",
+                      fg="red", err=True)
+                raise Exit(1)
+
         # Parse time range
         time_from_dt = _parse_time_value(time_from) if time_from and not provider_mode else None
         time_to_dt = _parse_time_value(time_to) if time_to else None
@@ -1333,7 +1365,7 @@ def run(
             # real bar; otherwise use the file's natural start.
             if provider_data is not None and provider_data.time_from_ts is not None:
                 time_from_dt = datetime.fromtimestamp(
-                    provider_data.time_from_ts, UTC,
+                    provider_data.time_from_ts / 1000, UTC,
                 )
             else:
                 time_from_dt = reader.start_datetime
@@ -1341,8 +1373,10 @@ def run(
             time_to_dt = reader.end_datetime
 
         assert isinstance(time_from_dt, datetime) and isinstance(time_to_dt, datetime)
-        time_from_ts = int(time_from_dt.timestamp())
-        time_to_ts = int(time_to_dt.timestamp())
+        # The reader window and the live-stream dedup boundary are both in the
+        # OHLCV unit, Unix milliseconds.
+        time_from_ts = int(time_from_dt.timestamp() * 1000)
+        time_to_ts = int(time_to_dt.timestamp() * 1000)
 
         # Remove timezone for display purposes
         time_from_display = time_from_dt.replace(tzinfo=None)
@@ -1353,16 +1387,22 @@ def run(
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
         # Pine anchors ``last_bar_time`` on historical bars to the chart's final
-        # bar, known up front from the data window. Scan back over the writer's
-        # gap-fill tail (``volume == -1`` records; ``not (volume < 0)`` keeps
-        # NaN-volume real bars) for the last real bar of the window.
+        # bar, known up front from the data window. Positional reads also serve
+        # the phantom gap records LEGACY files may hold (``volume == -1``;
+        # ``not (volume < 0)`` keeps NaN-volume real bars), so scan back over
+        # that tail for the last real bar of the window. A file that declares its
+        # own period stores real bars only, so its negative volume is the
+        # source's own value. Both the record and ``last_bar_time`` are Unix
+        # milliseconds.
+        skip_phantom_tail = reader.period is None
         last_bar_time = None
         start_pos, end_pos = reader.get_positions(time_from_ts, time_to_ts)
         for pos in range(end_pos - 1, start_pos - 1, -1):
             window_tail_bar = reader.read(pos)
-            if not (window_tail_bar.volume < 0):
-                last_bar_time = int(window_tail_bar.timestamp * 1000)
-                break
+            if skip_phantom_tail and window_tail_bar.volume < 0:
+                continue
+            last_bar_time = int(window_tail_bar.timestamp)
+            break
         magnifier_iter = None
         if magnifier_mode:
             # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)

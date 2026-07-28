@@ -20,14 +20,17 @@ def main():
 
 
 # --- Synthetic feed geometry -------------------------------------------------
-# Chart: 10 bars at 300s (the default test syminfo period "5"), opens TS0+i*300.
-# LTF:   25 bars at 60s, opens TS0+1500+j*60 (j=0..24), close = j+1.
+# Every timestamp here is Unix MILLISECONDS.
+# Chart: 10 bars of 5 minutes (the default test syminfo period "5"), opens
+#        _TS0 + i * _CHART_STEP.
+# LTF:   25 bars of 1 minute, opens _LTF_FIRST + j * _LTF_STEP (j=0..24),
+#        close = j+1.
 # The LTF feed's first open lands exactly on chart bar 5, so chart bars 0..4
 # precede the series entirely (na), and bars 5..9 contain 5 intrabars each.
-_TS0 = 1735689600  # 2025-01-01T00:00:00 UTC
-_CHART_STEP = 300
-_LTF_STEP = 60
-_LTF_FIRST = _TS0 + 1500  # == chart bar 5 open
+_TS0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC
+_CHART_STEP = 300_000  # 5 minutes
+_LTF_STEP = 60_000  # 1 minute
+_LTF_FIRST = _TS0 + 5 * _CHART_STEP  # == chart bar 5 open
 
 # lookahead_off -> the bar's LAST intrabar: closes 5, 10, 15, 20, 25.
 _EXPECTED_LAST = [None, None, None, None, None, 5.0, 10.0, 15.0, 20.0, 25.0]
@@ -40,12 +43,12 @@ _EXPECTED_SMA = [None, None, None, None, None, 4.5, 9.5, 14.5, 19.5, 24.5]
 
 def _build_ltf_file(tmp_path):
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_path / "EXCH_LTFSYM_1.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "1") as w:
         for j in range(25):
             c = float(j + 1)
             w.write(OHLCV(

@@ -87,7 +87,7 @@ def __test_ccxt_real_data_download__(tmp_path):
     from pathlib import Path
     from datetime import datetime, UTC, timedelta
     from pynecore.providers.ccxt import CCXTProvider
-    from pynecore.core.ohlcv_file import OHLCVReader
+    from pynecore.core.ohlcv import OHLCVReader
     from pynecore.cli.app import app_state
 
     # Disable debug logging to reduce output noise
@@ -188,7 +188,7 @@ def __test_ccxt_real_data_download__(tmp_path):
         for candle in candles:
             candle_data.append({
                 "timestamp": candle.timestamp,
-                "datetime": datetime.fromtimestamp(candle.timestamp, UTC).isoformat(),
+                "datetime": datetime.fromtimestamp(candle.timestamp / 1000, UTC).isoformat(),
                 "open": float(candle.open),
                 "high": float(candle.high),
                 "low": float(candle.low),
@@ -225,7 +225,8 @@ def __test_ccxt_real_data_download__(tmp_path):
         # Check that we have the correct interval for daily timeframe
         if len(candles) >= 2:
             interval = candles[1].timestamp - candles[0].timestamp
-            assert 86000 <= interval <= 86800, f"Interval {interval} is not approximately 24 hours (86400 seconds)"
+            assert 86_000_000 <= interval <= 86_800_000, \
+                f"Interval {interval} is not approximately 24 hours (86 400 000 ms)"
 
     else:
         # We have reference data, compare the downloaded data with it

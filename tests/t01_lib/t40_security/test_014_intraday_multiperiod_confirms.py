@@ -38,7 +38,9 @@ def main():
 # period's true high/low fall on NON-last bars — distinguishing a real aggregate
 # (max/min over the period) from a single exposed sub-bar. Calendar grid, year
 # reset from 2025-01-01: 3D -> [0,1,2][3,4,5][6,7,8]; 5D -> [0..4][5..8].
-_T0 = 1735689600  # 2025-01-01T00:00:00 UTC, aligned to the day grid
+# Every timestamp here is Unix MILLISECONDS.
+_T0 = 1_735_689_600_000  # 2025-01-01T00:00:00 UTC, aligned to the day grid
+_HOUR = 3_600_000
 _N_DAYS = 9
 
 
@@ -56,16 +58,16 @@ def _ohlc(day, hour):
 def _write_feed(tmp_dir):
     """Write the hourly 24/7 feed (+ a 24/7 UTC ``.toml``); return the path."""
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
 
     path = tmp_dir / "FEED.ohlcv"
-    with OHLCVWriter(path) as w:
+    with OHLCVWriter(path, "60") as w:
         for day in range(_N_DAYS):
             for hour in range(24):
                 o, hi, lo, c = _ohlc(day, hour)
-                w.write(OHLCV(timestamp=_T0 + (day * 24 + hour) * 3600,
+                w.write(OHLCV(timestamp=_T0 + (day * 24 + hour) * _HOUR,
                               open=o, high=hi, low=lo, close=c, volume=1.0))
     SymInfo(
         prefix="EXCH", description="Multi-period", ticker="IMPC",
@@ -86,7 +88,7 @@ def _chart_bars():
     for day in range(_N_DAYS):
         for hour in range(24):
             o, hi, lo, c = _ohlc(day, hour)
-            out.append(OHLCV(timestamp=_T0 + (day * 24 + hour) * 3600,
+            out.append(OHLCV(timestamp=_T0 + (day * 24 + hour) * _HOUR,
                              open=o, high=hi, low=lo, close=c, volume=1.0))
     return out
 
@@ -116,7 +118,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
         feed = _write_feed(Path(td))
         r = runner(_chart_bars(), syminfo_override={"period": "60"}, security_data={"D": feed, "3D": feed, "5D": feed})
         for candle, pv in r.run_iter():
-            mins = (candle.timestamp - _T0) // 60
+            mins = (candle.timestamp - _T0) // 60_000
             rows[(mins // (60 * 24), (mins // 60) % 24)] = (
                 candle.close, pv.get("o3"), pv.get("h3"),
                 pv.get("l3"), pv.get("c3"), pv.get("cd"), pv.get("c5"))
@@ -222,7 +224,8 @@ def __test_resample_finer_security_feed_aggregates_to_period_bars__(log):
     import tempfile
     from pathlib import Path
     from datetime import time
-    from pynecore.core.ohlcv_file import OHLCVReader, OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVWriter
+    from pynecore.core.ohlcv import OHLCVReader
     from pynecore.core.script_runner import _resample_finer_security_feed
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
     from pynecore.types.ohlcv import OHLCV
@@ -230,11 +233,11 @@ def __test_resample_finer_security_feed_aggregates_to_period_bars__(log):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         path = tmp / "FEED.ohlcv"
-        with OHLCVWriter(path) as w:
+        with OHLCVWriter(path, "60") as w:
             for day in range(9):
                 for hour in range(24):
                     o, hi, lo, c = _ohlc(day, hour)
-                    w.write(OHLCV(timestamp=_T0 + (day * 24 + hour) * 3600,
+                    w.write(OHLCV(timestamp=_T0 + (day * 24 + hour) * _HOUR,
                                   open=o, high=hi, low=lo, close=c, volume=1.0))
         SymInfo(prefix="E", description="d", ticker="MP", currency="USD", period="60",
                 type="crypto", mintick=0.01, pricescale=100, minmove=1, pointvalue=1,

@@ -245,7 +245,7 @@ def _run_rate_source_loop(
                 bar = bar_buffer[current_bar]
                 # A UTC->tz datetime roundtrip preserves the instant, so the
                 # raw timestamp is already the answer
-                bar_time_ms = int(bar.timestamp * 1000)
+                bar_time_ms = bar.timestamp
                 if bar_time_ms > target_time:
                     break
                 last_close = float(bar.close)
@@ -330,13 +330,13 @@ def _collect_in_period_intrabars(
     while True:
         while next_idx < len(bar_buffer):
             _b = bar_buffer[next_idx]
-            if int(_b.timestamp * 1000) >= period_end_exclusive:
+            if _b.timestamp >= period_end_exclusive:
                 break
             collected.append(_b)
             next_idx += 1
         if chart_developing:
             break
-        if collected and int(collected[-1].timestamp * 1000) >= final_open:
+        if collected and collected[-1].timestamp >= final_open:
             break
         # A bar beyond this period is already buffered: the stream has advanced
         # past the period end, so the final in-period intrabar is genuinely
@@ -567,7 +567,7 @@ def security_process_main(
     else:
         # File mode (backtest, same-symbol live with HTF aggregator).
         ohlcv_path = data_source
-        from .ohlcv_file import OHLCVReader
+        from .ohlcv import OHLCVReader
         reader = OHLCVReader(ohlcv_path)
         reader.open()
 
@@ -575,33 +575,39 @@ def security_process_main(
         toml_path = ohlcv_base.with_suffix('.toml')
         syminfo = SymInfo.load_toml(toml_path)
 
-    # Gap-compacted bar view for HTF security contexts. ``OHLCVWriter``
-    # forward-fills non-trading session/calendar gaps with ``volume == -1`` flat
-    # bars, so a session-gapped intraday feed (e.g. a 720-minute HTF on Bursa palm
-    # oil) becomes a continuous 24h grid, and a weekday-only D/W/M feed grows
-    # synthetic weekend/holiday bars. The chart side drops these via
-    # ``read_from(skip_gaps=True)`` (and ``bar_opens`` rides the real opens only);
-    # the security child must too. Otherwise the child re-runs ``main()`` over the
-    # phantom bars: bar-count history reads (``ta.highest``/``ta.lowest``/``[n]``)
-    # span fewer real periods than TradingView, and stateful series like
-    # ``ta.sma(close, 3)`` accumulate the flat fill bars (a Friday->Monday daily
-    # gap would otherwise average two synthetic weekend closes). TradingView builds
-    # its HTF series from real bars only. LTF keeps the fills (its intrabar windows
-    # are intentionally continuous). Same-TF cross-symbol compacts too: a
-    # session-bounded feed on a 24/7 chart (TVC:US10Y on BINANCE:BTCUSDT) would
-    # otherwise run stateful indicators (``ta.ema``) over thousands of flat
-    # weekend/overnight fills, dragging their state toward the last close while
-    # TradingView's are frozen between real bars. The chart side pairs this with
-    # the ``bar_opens`` clamp in ``_get_confirmed_time``: in a gap nothing new is
-    # confirmed, so the prior real value forward-fills (TV ``gaps_off``) instead
-    # of the child advancing into an empty window and writing ``na``.
-    # ``None`` = no compaction (no gaps, or LTF).
+    # Gap-compacted bar view for HTF security contexts on a LEGACY feed. That
+    # format cannot express a gap, so non-trading session/calendar gaps were
+    # forward-filled with ``volume == -1`` flat bars: a session-gapped intraday
+    # feed (e.g. a 720-minute HTF on Bursa palm oil) became a continuous 24h grid,
+    # and a weekday-only D/W/M feed grew synthetic weekend/holiday bars. The chart
+    # side drops these via ``read_from(skip_gaps=True)`` (and ``bar_opens`` rides
+    # the real opens only); the security child must too. Otherwise the child
+    # re-runs ``main()`` over the phantom bars: bar-count history reads
+    # (``ta.highest``/``ta.lowest``/``[n]``) span fewer real periods than
+    # TradingView, and stateful series like ``ta.sma(close, 3)`` accumulate the
+    # flat fill bars (a Friday->Monday daily gap would otherwise average two
+    # synthetic weekend closes). TradingView builds its HTF series from real bars
+    # only. LTF keeps the fills (its intrabar windows are intentionally
+    # continuous). Same-TF cross-symbol compacts too: a session-bounded feed on a
+    # 24/7 chart (TVC:US10Y on BINANCE:BTCUSDT) would otherwise run stateful
+    # indicators (``ta.ema``) over thousands of flat weekend/overnight fills,
+    # dragging their state toward the last close while TradingView's are frozen
+    # between real bars. The chart side pairs this with the ``bar_opens`` clamp in
+    # ``_get_confirmed_time``: in a gap nothing new is confirmed, so the prior real
+    # value forward-fills (TV ``gaps_off``) instead of the child advancing into an
+    # empty window and writing ``na``. A file that declares its own period stores
+    # real bars only, so it is never scanned. ``None`` = no compaction.
+    # Only a legacy feed can hold phantom gap records; the current format stores
+    # real bars only, so a negative volume there is the source's own value and
+    # must be left alone.
+    is_legacy_feed = reader is not None and reader.period is None
+
     real_index_map: list[int] | None = None
-    if reader is not None and not is_ltf:
+    if reader is not None and is_legacy_feed and not is_ltf:
         from pynecore.lib.timeframe import in_seconds
         if in_seconds(syminfo.period) > 0:
             # Mirror ``read_from(skip_gaps=True)`` exactly: a gap is ``volume < 0``
-            # (the writer's -1 fill). ``>= 0`` would also drop NaN-volume real bars
+            # (the legacy -1 fill). ``>= 0`` would also drop NaN-volume real bars
             # (no-volume instruments import as ``volume == na``), which the reader keeps.
             rim = [i for i in range(reader.size) if not (reader.read(i).volume < 0)]
             if len(rim) != reader.size:
@@ -748,10 +754,10 @@ def security_process_main(
         _ha_pending: 'list[float | None]' = [None, None]
 
         def _ha_apply(_b: OHLCV) -> OHLCV:
-            if _b.volume < 0:
-                # Gap-fill bar: forward-fill the last HA close flat and do NOT
-                # advance the recurrence (mirrors the removed feed transform's
-                # ``volume < 0`` skip + the writer's gap re-fill).
+            if is_legacy_feed and _b.volume < 0:
+                # Legacy gap-fill bar: forward-fill the last HA close flat and do
+                # NOT advance the recurrence (mirrors the removed feed transform's
+                # ``volume < 0`` skip).
                 _fill = _ha_root[1] if _ha_root[1] is not None else _b.close
                 _ha_pending[0], _ha_pending[1] = _ha_root[0], _ha_root[1]
                 return _b._replace(open=_fill, high=_fill, low=_fill, close=_fill)
@@ -889,7 +895,7 @@ def security_process_main(
                 rest_warmup_tail_ts is not None
                 and bar_buffer[-1].timestamp > rest_warmup_tail_ts) and (
                 not bar_buffer[-1].is_closed
-                or int(bar_buffer[-1].timestamp * 1000) + ltf_span_ms > warmup_horizon_ms):
+                or bar_buffer[-1].timestamp + ltf_span_ms > warmup_horizon_ms):
             bar_buffer.pop()
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
 
@@ -970,10 +976,10 @@ def security_process_main(
                 # (e.g. a late forming update for an already-closed intrabar)
                 # would otherwise allocate a spurious new bar_index.
                 _last_collected_ms = (
-                    int(collected[-1].timestamp * 1000) if collected else period_start - 1
+                    collected[-1].timestamp if collected else period_start - 1
                 )
                 if _dev is not None:
-                    _dev_ms = int(_dev.timestamp * 1000)
+                    _dev_ms = _dev.timestamp
                     if _last_collected_ms < _dev_ms < period_end_exclusive:
                         developing_bar = _dev
                     else:
@@ -990,18 +996,21 @@ def security_process_main(
 
     # Fixed ``last_bar_time`` anchor for file-backed (historical) runs: Pine
     # fixes it to the security series' final bar, known up front from the
-    # static file. Scan back over the writer's gap-fill tail (``volume == -1``
-    # records; ``not (volume < 0)`` keeps NaN-volume real bars) — a no-op when
-    # ``real_index_map`` already compacted the gaps away. Streamer-fed (live)
-    # contexts keep the per-bar value from ``_set_lib_properties``: the
-    # realtime bar IS the last bar there.
+    # static file. On a legacy feed, scan back over its gap-fill tail
+    # (``volume == -1`` records; ``not (volume < 0)`` keeps NaN-volume real
+    # bars) — a no-op when ``real_index_map`` already compacted the gaps away.
+    # Streamer-fed (live) contexts keep the per-bar value from
+    # ``_set_lib_properties``: the realtime bar IS the last bar there.
     file_last_bar_time_ms = 0
     if reader is not None:
         for _pos in range(_current_total() - 1, -1, -1):
             _tail_bar = _read_bar(_pos)
-            if _tail_bar is not None and not (_tail_bar.volume < 0):
-                file_last_bar_time_ms = int(_tail_bar.timestamp * 1000)
-                break
+            if _tail_bar is None:
+                continue
+            if is_legacy_feed and _tail_bar.volume < 0:
+                continue
+            file_last_bar_time_ms = _tail_bar.timestamp
+            break
 
     try:
         current_bar = 0
@@ -1034,9 +1043,8 @@ def security_process_main(
                 dev_open, dev_high, dev_low, dev_close, dev_volume, dev_time_ms = (
                     sync_block.get_developing_bar(sec_id)
                 )
-                dev_ts_sec = dev_time_ms // 1000
                 ohlcv = OHLCV(
-                    timestamp=dev_ts_sec,
+                    timestamp=dev_time_ms,
                     open=dev_open, high=dev_high, low=dev_low,
                     close=dev_close, volume=dev_volume,
                 )
@@ -1091,9 +1099,8 @@ def security_process_main(
                 dev_open, dev_high, dev_low, dev_close, dev_volume, dev_time_ms = (
                     sync_block.get_developing_bar(sec_id)
                 )
-                ts_sec = dev_time_ms // 1000
                 ohlcv = OHLCV(
-                    timestamp=ts_sec,
+                    timestamp=dev_time_ms,
                     open=dev_open, high=dev_high, low=dev_low,
                     close=dev_close, volume=dev_volume,
                 )
@@ -1194,7 +1201,7 @@ def security_process_main(
                     break
                 # A UTC->tz datetime roundtrip preserves the instant, so the
                 # raw timestamp is already the answer
-                bar_time_ms = int(ohlcv_file_bar.timestamp * 1000)
+                bar_time_ms = ohlcv_file_bar.timestamp
                 if bar_time_ms > target_time:
                     break
 

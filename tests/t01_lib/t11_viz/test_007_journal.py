@@ -28,8 +28,8 @@ def __test_journal__(runner, tmp_path):
     import json
     from pynecore.types.ohlcv import OHLCV
 
-    base = 1704067200
-    bars = [OHLCV(timestamp=base + i * 300, open=100.0, high=101.0, low=99.0,
+    base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
+    bars = [OHLCV(timestamp=base + i * 300_000, open=100.0, high=101.0, low=99.0,
                   close=100.5, volume=100.0) for i in range(6)]
 
     out = tmp_path / "journal.ndjson"

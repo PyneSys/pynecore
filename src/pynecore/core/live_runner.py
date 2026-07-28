@@ -493,6 +493,9 @@ def live_ohlcv_generator(
     # framework, not in each plugin, so providers stay free of bar-rhythm
     # bookkeeping — they only emit when their feed pushes a real bar.
     tf_seconds = max(1, int(in_seconds(timeframe)))
+    # OHLCV timestamps are Unix milliseconds, so every deadline compared
+    # against a bar timestamp is computed on the millisecond axis.
+    tf_ms = tf_seconds * 1000
     # Grace past close before declaring a bar missed. The minimum is set
     # to 15s so plugins that recover dropped WS bars via REST have a
     # realistic window to fetch and inject the missing bar before this
@@ -501,6 +504,7 @@ def live_ohlcv_generator(
     # detect, fetch and inject. The cap (30s) keeps longer TFs from
     # sitting on idle gaps too long.
     bar_grace = max(15.0, min(tf_seconds * 0.5, 30.0))
+    bar_grace_ms = bar_grace * 1000.0
 
     # Feed-liveness watchdog threshold: how long ``watch_ohlcv`` may stay
     # silent during an open session before the feed is declared dead and a
@@ -528,21 +532,24 @@ def live_ohlcv_generator(
         and _sym_tz is not None
     )
 
-    def _market_open_at(epoch_ts: float) -> bool:
+    def _market_open_at(epoch_ms: float) -> bool:
         """Slot-aware "is this bar slot in-session?" check.
 
-        Returns True iff the candle ``[epoch_ts, epoch_ts+tf)`` overlaps
+        Returns True iff the candle ``[epoch_ms, epoch_ms+tf)`` overlaps
         any ``opening_hours`` interval (or unconditionally True for the
         24/7 fallback when the symbol has no calendar). Use this for
         bar-synth decisions and any other slot-aware logic — for the
         point-in-time "is the market open right now?" question use
         :func:`_market_open_now` instead, which does not extend the
         instant by one timeframe.
+
+        :param epoch_ms: Bar slot start time in Unix milliseconds, the unit
+                         every OHLCV timestamp carries.
         """
         if not _has_calendar:
             return True
         assert syminfo is not None and _sym_tz is not None
-        local_dt = datetime.fromtimestamp(epoch_ts, tz=_sym_tz)
+        local_dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=_sym_tz)
         return is_in_session(syminfo.opening_hours, local_dt, tf_seconds)
 
     def _market_open_now() -> bool:
@@ -843,10 +850,12 @@ def live_ohlcv_generator(
                 # deadline falls sooner, shorten the wait so synthesis
                 # fires promptly when the WS goes idle.
                 if last_closed_bar is not None:
-                    boundary_deadline = (
-                        last_closed_bar.timestamp + 2 * tf_seconds + bar_grace
+                    boundary_deadline_ms = (
+                        last_closed_bar.timestamp + 2 * tf_ms + bar_grace_ms
                     )
-                    boundary_remaining = boundary_deadline - time.time()
+                    boundary_remaining = (
+                        boundary_deadline_ms - time.time() * 1000.0
+                    ) / 1000.0
                 else:
                     boundary_remaining = float("inf")
                 effective_timeout = min(2.0, max(0.05, boundary_remaining))
@@ -969,10 +978,10 @@ def live_ohlcv_generator(
                     # against ``time.time()`` and either fills the next
                     # gap or waits for a real push.
                     if (last_closed_bar is not None
-                            and time.time()
+                            and time.time() * 1000.0
                             >= last_closed_bar.timestamp
-                            + 2 * tf_seconds + bar_grace):
-                        synth_ts = last_closed_bar.timestamp + tf_seconds
+                            + 2 * tf_ms + bar_grace_ms):
+                        synth_ts = last_closed_bar.timestamp + tf_ms
                         # Session-gate: never synthesise a bar for a slot
                         # that the symbol's opening_hours calendar marks
                         # as closed. Without this gate the framework would

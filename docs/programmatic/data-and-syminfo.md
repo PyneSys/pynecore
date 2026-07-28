@@ -5,7 +5,7 @@ title: "Data & SymInfo"
 description: "Loading and creating OHLCV data and symbol information for programmatic use"
 icon: "database"
 date: "2025-03-31"
-lastmod: "2026-03-17"
+lastmod: "2026-07-28"
 draft: false
 toc: true
 categories: ["Programmatic", "Data"]
@@ -28,7 +28,7 @@ Every candle in PyneCore is an `OHLCV` namedtuple:
 from pynecore.types.ohlcv import OHLCV
 
 candle = OHLCV(
-    timestamp=1704067200,   # Unix epoch in SECONDS (not milliseconds!)
+    timestamp=1704067200000,   # Unix epoch in MILLISECONDS
     open=42000.0,
     high=42500.0,
     low=41800.0,
@@ -37,8 +37,9 @@ candle = OHLCV(
 )
 ```
 
-> **Important:** Timestamps are in **seconds**. Many exchange APIs (CCXT, Binance) return
-> milliseconds — divide by 1000.
+> **Important:** Timestamps are in **milliseconds**. Most exchange APIs (CCXT, Binance) already
+> return milliseconds, so pass them through unchanged. A source that reports seconds must be
+> multiplied by 1000.
 
 ### Option 1: From a CSV File
 
@@ -47,7 +48,7 @@ Use `DataConverter` to convert CSV data to PyneCore's binary OHLCV format:
 ```python
 from pathlib import Path
 from pynecore.core.data_converter import DataConverter
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 
 csv_path = Path("data/BTCUSD_1h.csv")
 
@@ -78,7 +79,7 @@ def fetch_from_api():
     response = requests.get("https://api.exchange.com/ohlcv/BTCUSD/1h")
     for bar in response.json():
         yield OHLCV(
-            timestamp=bar["time"],           # must be seconds
+            timestamp=bar["time"],           # must be milliseconds
             open=bar["o"], high=bar["h"],
             low=bar["l"], close=bar["c"],
             volume=bar["v"],
@@ -88,7 +89,7 @@ def fetch_from_api():
 def from_dataframe(df):
     for row in df.itertuples():
         yield OHLCV(
-            timestamp=int(row.Index.timestamp()),
+            timestamp=int(row.Index.timestamp() * 1000),
             open=row.open, high=row.high,
             low=row.low, close=row.close,
             volume=row.volume,
@@ -115,7 +116,7 @@ raw = exchange.fetch_ohlcv("BTC/USDT", "1h", limit=200)
 
 candles = [
     OHLCV(
-        timestamp=bar[0] // 1000,  # CCXT returns milliseconds!
+        timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
         open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5],
     )
     for bar in raw

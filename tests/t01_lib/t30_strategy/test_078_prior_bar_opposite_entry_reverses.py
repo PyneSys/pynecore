@@ -60,10 +60,10 @@ def __test_prior_bar_opposite_entry_reverses__(script_path, module_key):
 
     sys.modules.pop(module_key, None)
 
-    base_ts = 1704067200
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [(100.0, 100.0, 100.0, 100.0) for _ in range(6)]
     bars = [
-        OHLCV(timestamp=base_ts + i * 60, open=o, high=h, low=l, close=c, volume=100.0)
+        OHLCV(timestamp=base_ts + i * 60_000, open=o, high=h, low=l, close=c, volume=100.0)
         for i, (o, h, l, c) in enumerate(rows)
     ]
 
