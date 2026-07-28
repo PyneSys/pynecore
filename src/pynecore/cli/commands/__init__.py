@@ -190,34 +190,57 @@ def main(
             # on every machine, matching the "1D" period declared below.
             start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
             base_price = 100.0
+            base_volatility = 0.015  # Long-run standard deviation of the daily return
 
             # Use fixed seed for reproducibility
             random.seed(42)
 
             with OHLCVWriter(demo_file, syminfo.period) as writer:
-                current_price = base_price
+                close_price = base_price
+                volatility = base_volatility
+                bar_return = 0.0
+                trend = 0.0
 
                 for i in range(2000):
+                    bar_time = start_time + timedelta(days=i)
                     # OHLCV timestamps are Unix milliseconds.
-                    timestamp = int((start_time + timedelta(days=i)).timestamp() * 1000)
+                    timestamp = int(bar_time.timestamp() * 1000)
 
-                    # Random walk with slight upward bias
-                    change_percent = random.gauss(0.0002, 0.02)  # 0.02% mean, 2% std dev
-                    current_price *= (1 + change_percent)
+                    # Volatility clusters: it decays back towards the base level but is
+                    # pushed up by the previous move, so calm and turbulent stretches alternate
+                    volatility = min(0.85 * volatility + 0.07 * base_volatility
+                                     + 0.10 * abs(bar_return), 4 * base_volatility)
+                    # Slowly drifting trend component, giving multi-month up and down legs
+                    trend = 0.98 * trend + random.gauss(0.0, 0.0006)
 
-                    # Generate OHLC with some volatility
-                    daily_volatility = random.uniform(0.01, 0.03)
+                    # A 24/7 asset normally opens where the previous bar closed,
+                    # a gap is a rare event
+                    open_price = close_price
+                    if random.random() < 0.02:
+                        open_price *= 1 + random.gauss(0.0, 0.012)
 
-                    open_price = current_price
-                    high_price = open_price * (1 + daily_volatility * random.random())
-                    low_price = open_price * (1 - daily_volatility * random.random())
-                    close_price = low_price + (high_price - low_price) * random.random()
+                    # The move happens inside the bar, between its open and close
+                    bar_return = random.gauss(0.0012 + trend, volatility)
+                    close_price = open_price * (1 + bar_return)
 
-                    # Update current price for next candle
-                    current_price = close_price
+                    # Wicks extend beyond the body, so the range always contains it
+                    body_high = max(open_price, close_price)
+                    body_low = min(open_price, close_price)
+                    high_price = body_high * (1 + abs(random.gauss(0.0, 0.5)) * volatility)
+                    low_price = body_low * (1 - abs(random.gauss(0.0, 0.5)) * volatility)
 
-                    # Volume with some randomness
-                    volume = 1000000 * (1 + random.uniform(-0.5, 1.0))
+                    # Prices sit on the mintick grid declared in the .toml. Rounding is
+                    # monotonic, so it cannot invalidate the OHLC ordering.
+                    open_price = round(open_price / syminfo.mintick) * syminfo.mintick
+                    high_price = round(high_price / syminfo.mintick) * syminfo.mintick
+                    low_price = round(low_price / syminfo.mintick) * syminfo.mintick
+                    close_price = round(close_price / syminfo.mintick) * syminfo.mintick
+
+                    # Wide-range bars trade more, weekends are quieter even on a 24/7 market
+                    bar_range = (high_price - low_price) / open_price
+                    volume = 1_000_000 * (0.5 + 35 * bar_range) * random.uniform(0.75, 1.25)
+                    if bar_time.weekday() >= 5:
+                        volume *= 0.7
 
                     ohlcv = OHLCV(
                         timestamp=timestamp,
