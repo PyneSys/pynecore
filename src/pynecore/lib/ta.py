@@ -1798,7 +1798,8 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     :return: The Stochastic Oscillator of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if (isinstance(source, NA) or source != source) or (isinstance(high, NA) or high != high) or (isinstance(low, NA) or low != low):
+    if (isinstance(source, NA) or source != source) or (isinstance(high, NA) or high != high) or (
+            isinstance(low, NA) or low != low):
         return na_float
     length = int(length)
 
@@ -1847,7 +1848,8 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
         return 0.0, 1
 
     if (isinstance(src, NA) or src != src) or (isinstance(atr_val, NA) or atr_val != atr_val):
-        return na_float, prev_direction if not (isinstance(prev_direction, NA) or prev_direction != prev_direction) else 1
+        return na_float, prev_direction if not (
+                    isinstance(prev_direction, NA) or prev_direction != prev_direction) else 1
 
     # Calculate bands
     upper = src + factor * atr_val
@@ -1952,7 +1954,8 @@ def tsi(source: Series[float], short_length: int, long_length: int) -> PyneFloat
     momentum_ema = ema(momentum, long_length)
     abs_momentum_ema = ema(abs(momentum), long_length)
 
-    if (isinstance(momentum_ema, NA) or momentum_ema != momentum_ema) or (isinstance(abs_momentum_ema, NA) or abs_momentum_ema != abs_momentum_ema):
+    if (isinstance(momentum_ema, NA) or momentum_ema != momentum_ema) or (
+            isinstance(abs_momentum_ema, NA) or abs_momentum_ema != abs_momentum_ema):
         return na_float
 
     # Second smooth
