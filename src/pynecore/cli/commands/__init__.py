@@ -195,7 +195,8 @@ def main(
             # Use fixed seed for reproducibility
             random.seed(42)
 
-            with OHLCVWriter(demo_file, syminfo.period) as writer:
+            with OHLCVWriter(demo_file, syminfo.period,
+                             minmove=syminfo.minmove, pricescale=syminfo.pricescale) as writer:
                 close_price = base_price
                 volatility = base_volatility
                 bar_return = 0.0

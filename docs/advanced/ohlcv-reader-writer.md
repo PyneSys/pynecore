@@ -71,7 +71,7 @@ The magic is `\x89PYN\r\n\x1a\n` and occupies the first eight bytes of the fixed
 |--------|-----------------|---------|-----------------------------------------------------------|
 | 0      | magic           | 8 bytes | `\x89PYN\r\n\x1a\n`                                       |
 | 8      | version_major   | uint16  | `2`                                                       |
-| 10     | version_minor   | uint16  | `0`                                                       |
+| 10     | version_minor   | uint16  | `1`; readers accept any equal or older minor              |
 | 12     | header_size     | uint32  | `64 + 24 * column_count` (208 for the standard profile)   |
 | 16     | record_size     | uint32  | Packed record size in bytes (36 for the standard profile) |
 | 20     | column_count    | uint16  | Number of descriptors that follow                         |
@@ -82,7 +82,8 @@ The magic is `\x89PYN\r\n\x1a\n` and occupies the first eight bytes of the fixed
 | 48     | interval_value  | uint32  | Timeframe multiplier                                      |
 | 52     | interval_unit   | uint8   | 1=second, 2=minute, 3=hour, 4=day, 5=week, 6=month        |
 | 53     | padding         | 3 bytes | Alignment                                                 |
-| 56     | reserved        | 8 bytes | Reserved for future use                                   |
+| 56     | minmove         | uint32  | Tick-grid numerator (minor >= 1); `0` = grid unknown      |
+| 60     | pricescale      | uint32  | Tick-grid denominator; zero exactly when `minmove` is     |
 
 Opening a file validates all of it: the magic, the version, the flag bits, that `header_size` matches `column_count`, that `record_count` records actually fit in the file, and that `first_timestamp` and `last_timestamp` equal the timestamps physically stored in the first and last committed record. A header that disagrees with its own data is rejected rather than trusted.
 
@@ -126,18 +127,28 @@ This is what makes the compact layout lossless in practice: the encoding puts th
 
 ### Promotion to float64
 
-The writer does not have to take the previous section on trust. Give it the instrument's tick size and it checks the claim against every bar it stores:
+The writer does not have to take the previous section on trust. Give it the instrument's tick grid and it checks the claim against every bar it stores:
 
 ```python
-with OHLCVWriter(file_path, "1", mintick=0.01) as writer:
+with OHLCVWriter(file_path, "1", minmove=1, pricescale=100) as writer:
     ...
 ```
 
-Each float32 delta column is measured on each bar: the float32 resolution at that delta value must be smaller than half a tick. A column that fails is **promoted** to an absolute float64 for the whole file. If the failure happens on the very first bar, only the header and descriptors are rewritten; later, the file is rebuilt into a temporary file and atomically renamed into place, after which appending continues normally. With all three price columns promoted, the record grows from 36 to 48 bytes.
+The pair declares the grid as `mintick = minmove / pricescale` — the same two integers TradingView's symbol info uses, so fractional grids like `25/1000` (0.025) or `1/32` are exact. Each float32 delta column is measured on each bar against two criteria: the float32 resolution at that delta value must be smaller than half a tick, and the price itself must be an exact grid multiple. A column that fails either is **promoted** to an absolute float64 for the whole file. If the failure happens on the very first bar, only the header and descriptors are rewritten; later, the file is rebuilt into a temporary file and atomically renamed into place, after which appending continues normally. With all three price columns promoted, the record grows from 36 to 48 bytes.
 
-Without `mintick` there is nothing to measure against, and float32 deltas are kept: no instrument in the measured corpus loses half a tick to them, and promoting on absence alone would inflate every file by a third.
+Without a declared grid there is nothing to measure against, and float32 deltas are kept: no instrument in the measured corpus loses half a tick to them, and promoting on absence alone would inflate every file by a third.
+
+Providers usually build their writer before the symbol info exists, so the grid can also be declared later with `set_tick_info(minmove, pricescale)`; the download flow injects it there before the first bar is appended. When a writer opens an existing file without its own grid, it adopts the one stored in the header.
 
 NaN is preserved exactly. Delta columns store a canonical NaN rather than a difference, so a missing high or close survives a round trip instead of turning into a number.
+
+### Read-Time Grid Snapping
+
+Since minor version 1 the header carries the tick grid itself, and the reader uses it to undo the float32 rounding entirely. A delta-decoded price is off its true value by at most half an ulp of the stored delta — orders of magnitude less than half a tick. If the decoded value lies within that error bound of a grid point, the true value can only be that grid point, and the reader returns it at full float64 precision: `65399.99` comes back as `65399.99`, not `65399.990000000224`.
+
+The writer-side promotion is what makes this safe for every record written under the declared grid: a price that is legitimately off-grid — split-adjusted history, for instance — is never stored as a float32 delta in the first place, so it comes back as the exact float64 it was written as and the snap never touches it. Such a float32 delta can only encode a true grid multiple, and snapping it merely removes the float32 noise.
+
+A grid can also be declared after records were written — the data converter stamps its analyzed grid once the load finishes, and a continued download stamps the symbol info's grid onto a file that started without one. Those earlier records were never grid-checked, but the snap cannot corrupt them either: it only moves a value that already lies within the float32 error bound of a grid point, so any movement is capped at the encoding noise the delta storage introduced in the first place. A read through a late-declared grid is never worse than the gridless read; it just cannot promise the exact-restoration guarantee that write-time checking gives. Files with a zeroed grid (all minor-0 files) read exactly as before.
 
 ### The Committed Extent
 
@@ -185,7 +196,7 @@ from pynecore.types.ohlcv import OHLCV
 file_path = Path("example.ohlcv")
 
 # Writing OHLCV data - the timeframe is required and timestamps are milliseconds
-with OHLCVWriter(file_path, "1", mintick=0.01) as writer:
+with OHLCVWriter(file_path, "1", minmove=1, pricescale=100) as writer:
     writer.write(OHLCV(timestamp=1609459200000, open=100.0, high=110.0,
                        low=90.0, close=105.0, volume=1000.0))
     writer.write(OHLCV(timestamp=1609459260000, open=105.0, high=115.0,

@@ -13,9 +13,10 @@ from datetime import UTC, datetime, time, timedelta, timezone as fixed_timezone,
 from math import gcd as math_gcd
 from pathlib import Path
 from types import TracebackType
-from typing import IO, BinaryIO, Iterator, NamedTuple, Protocol
+from typing import IO, Any, BinaryIO, Iterator, NamedTuple, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pynecore.core._file_io import open_shared_binary, replace_file
 from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
 from pynecore.core.syminfo import SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
@@ -24,7 +25,7 @@ __all__ = ["OHLCVWriter", "OHLCVReader", "parse_timezone_name", "record_count"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
-_VERSION_MINOR = 0
+_VERSION_MINOR = 1
 _FIXED_HEADER_SIZE = 64
 _DENSE_FLAG = 0x0001
 _SUPPORTED_FLAGS = _DENSE_FLAG
@@ -34,7 +35,10 @@ _CUSTOM_ROLE = 255
 
 _TIMEZONE_OFFSET = re.compile(r"(UTC|GMT)?([+-])(\d{1,2}):?(\d{2})?", re.IGNORECASE)
 
-_HEADER = struct.Struct("<8sHHIIHHQqqIB3x8x")
+# Since minor 1 the trailing eight reserved bytes carry the tick grid as a
+# ``minmove:u32 + pricescale:u32`` pair (mintick = minmove / pricescale); minor 0
+# files left them zeroed, which reads back as "grid unknown" without branching.
+_HEADER = struct.Struct("<8sHHIIHHQqqIB3xII")
 _DESCRIPTOR = struct.Struct("<BBBxH18s")
 _DTYPE_FORMAT = {2: "q", 5: "f", 6: "d"}
 _DTYPE_SIZE = {2: 8, 5: 4, 6: 8}
@@ -61,6 +65,18 @@ _DELTA_CANDIDATE_ROLES = (_ROLE_HIGH, _ROLE_LOW, _ROLE_CLOSE)
 _CANONICAL_NAN32 = struct.unpack("<f", bytes.fromhex("0000c07f"))[0]
 _CANONICAL_NAN64 = struct.unpack("<d", bytes.fromhex("000000000000f87f"))[0]
 
+# Read-time grid-snap tolerance: an f32 delta is off by at most half its ulp
+# (<= |delta| * 2^-24) and the f64 base+delta addition by half an ulp of the sum
+# (<= |sum| * 2^-53); both bounds are doubled for margin.
+_F32_SNAP_REL = 2.0 ** -23
+_F64_SNAP_REL = 2.0 ** -52
+
+# Write-time on-grid tolerance: a value that is a true grid multiple deviates from
+# the recomputed grid point only by f64 rounding of the scale multiplication and
+# division (a few ulps); anything farther is genuinely off-grid and must be stored
+# as absolute f64 so read-time snapping can never move it.
+_F64_GRID_REL = 2.0 ** -48
+
 _QTY_STEP_MIN_SAMPLES = 100
 _QTY_STEP_MAX_DECIMALS = 8
 
@@ -83,6 +99,8 @@ class _Layout(NamedTuple):
     last_timestamp: int
     interval_value: int
     interval_unit: int
+    minmove: int
+    pricescale: int
 
 
 class _WritableBinary(Protocol):
@@ -93,6 +111,44 @@ class _WritableBinary(Protocol):
 class _RowWriter(Protocol):
     def writerow(self, row: list[str], /) -> object:
         """Write one CSV row."""
+
+
+_HAS_POSITIONAL_IO = hasattr(os, "pread") and hasattr(os, "pwrite")
+
+
+def _pread(file_descriptor: int, size: int, offset: int) -> bytes:
+    """Read up to ``size`` bytes from an absolute file offset.
+
+    ``os.pread`` is POSIX-only; Windows gets the same result by seeking first. Every
+    OHLCV access is positional, so the shared descriptor offset carries no meaning
+    and moving it is safe.
+
+    :param file_descriptor: Descriptor to read from.
+    :param size: Number of bytes to read.
+    :param offset: Absolute byte offset to read from.
+    :return: Bytes read, shorter than ``size`` at end of file.
+    """
+    if _HAS_POSITIONAL_IO:
+        return os.pread(file_descriptor, size, offset)
+    os.lseek(file_descriptor, offset, os.SEEK_SET)
+    return os.read(file_descriptor, size)
+
+
+def _pwrite(file_descriptor: int, data: bytes, offset: int) -> int:
+    """Write bytes at an absolute file offset.
+
+    The Windows counterpart of :func:`_pread`: without ``os.pwrite`` the descriptor is
+    positioned explicitly before the write.
+
+    :param file_descriptor: Descriptor to write to.
+    :param data: Bytes to write.
+    :param offset: Absolute byte offset to write at.
+    :return: Number of bytes accepted, which may be short.
+    """
+    if _HAS_POSITIONAL_IO:
+        return os.pwrite(file_descriptor, data, offset)
+    os.lseek(file_descriptor, offset, os.SEEK_SET)
+    return os.write(file_descriptor, data)
 
 
 def _extra_sidecar_path(path: str | Path) -> Path:
@@ -271,11 +327,13 @@ def _record_struct(columns: tuple[_Column, ...]) -> struct.Struct:
 def _build_header(
     columns: tuple[_Column, ...],
     flags: int,
-    record_count: int,
+    record_total: int,
     first_timestamp: int,
     last_timestamp: int,
     interval_value: int,
     interval_unit: int,
+    minmove: int,
+    pricescale: int,
 ) -> bytes:
     header_size = _FIXED_HEADER_SIZE + _DESCRIPTOR.size * len(columns)
     record_size = sum(_DTYPE_SIZE[column.dtype] for column in columns)
@@ -287,11 +345,13 @@ def _build_header(
         record_size,
         len(columns),
         flags,
-        record_count,
+        record_total,
         first_timestamp,
         last_timestamp,
         interval_value,
         interval_unit,
+        minmove,
+        pricescale,
     )
 
 
@@ -356,9 +416,9 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
     if file_size < _FIXED_HEADER_SIZE:
         raise ValueError("File is too short to contain an OHLCV v2 header")
     if magic is None:
-        raw_header = os.pread(file.fileno(), _FIXED_HEADER_SIZE, 0)
+        raw_header = _pread(file.fileno(), _FIXED_HEADER_SIZE, 0)
     else:
-        raw_header = magic + os.pread(
+        raw_header = magic + _pread(
             file.fileno(), _FIXED_HEADER_SIZE - len(_MAGIC), len(_MAGIC)
         )
     if len(raw_header) != _FIXED_HEADER_SIZE:
@@ -372,19 +432,23 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
         record_size,
         column_count,
         flags,
-        record_count,
+        record_total,
         first_timestamp,
         last_timestamp,
         interval_value,
         interval_unit,
+        minmove,
+        pricescale,
     ) = _HEADER.unpack(raw_header)
 
     if magic != _MAGIC:
         raise ValueError("Invalid OHLCV v2 magic; the file is not in v2 format")
     if version_major != _VERSION_MAJOR:
         raise ValueError(f"Unsupported OHLCV major version: {version_major}")
-    if version_minor != _VERSION_MINOR:
+    if version_minor > _VERSION_MINOR:
         raise ValueError(f"Unsupported OHLCV minor version: {version_minor}")
+    if (minmove == 0) != (pricescale == 0):
+        raise ValueError("OHLCV minmove and pricescale must be zero or positive together")
     if flags & ~_SUPPORTED_FLAGS:
         raise ValueError(f"Unsupported OHLCV header flags: 0x{flags:04x}")
     if column_count == 0:
@@ -401,7 +465,7 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
     if file_size < header_size:
         raise ValueError("OHLCV file is shorter than its declared header")
 
-    raw_descriptors = os.pread(file.fileno(), column_count * _DESCRIPTOR.size, _FIXED_HEADER_SIZE)
+    raw_descriptors = _pread(file.fileno(), column_count * _DESCRIPTOR.size, _FIXED_HEADER_SIZE)
     if len(raw_descriptors) != column_count * _DESCRIPTOR.size:
         raise ValueError("Incomplete OHLCV descriptor block")
     columns: list[_Column] = []
@@ -412,25 +476,25 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
     column_tuple = tuple(columns)
     _validate_columns(column_tuple, record_size)
 
-    committed_end = header_size + record_count * record_size
+    committed_end = header_size + record_total * record_size
     if committed_end < header_size or committed_end > file_size:
         raise ValueError("OHLCV file is missing data committed by record_count")
 
     timestamp_column = next(column for column in column_tuple if column.role == _ROLE_TIMESTAMP)
     timestamp_struct = struct.Struct("<q")
-    if record_count == 0:
+    if record_total == 0:
         if first_timestamp != 0 or last_timestamp != 0:
             raise ValueError("Empty OHLCV files must have zero first and last timestamps")
         if flags & _DENSE_FLAG:
             raise ValueError("Empty OHLCV files cannot be marked DENSE")
     else:
         first_offset = header_size + timestamp_column.byte_offset
-        last_offset = header_size + (record_count - 1) * record_size + timestamp_column.byte_offset
-        actual_first = timestamp_struct.unpack(os.pread(file.fileno(), 8, first_offset))[0]
-        actual_last = timestamp_struct.unpack(os.pread(file.fileno(), 8, last_offset))[0]
+        last_offset = header_size + (record_total - 1) * record_size + timestamp_column.byte_offset
+        actual_first = timestamp_struct.unpack(_pread(file.fileno(), 8, first_offset))[0]
+        actual_last = timestamp_struct.unpack(_pread(file.fileno(), 8, last_offset))[0]
         if first_timestamp != actual_first or last_timestamp != actual_last:
             raise ValueError("OHLCV header timestamps do not match the committed records")
-        if record_count == 1 and flags & _DENSE_FLAG:
+        if record_total == 1 and flags & _DENSE_FLAG:
             raise ValueError("A one-record OHLCV file cannot be marked DENSE")
 
     return _Layout(
@@ -438,11 +502,13 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
         record_size,
         column_tuple,
         flags,
-        record_count,
+        record_total,
         first_timestamp,
         last_timestamp,
         interval_value,
         interval_unit,
+        minmove,
+        pricescale,
     )
 
 
@@ -490,24 +556,52 @@ def _f32_resolution(value: float) -> float | None:
     return max(rounded - lower, upper - rounded)
 
 
-def _failing_delta_roles(candle: OHLCV, mintick: float | None) -> frozenset[int]:
-    """
-    Select the price columns whose f32 delta cannot resolve half a tick.
+def _validate_tick_grid(minmove: int | None, pricescale: int | None) -> tuple[int, int]:
+    """Normalize an optional tick-grid pair to its packed header form.
 
-    Without a tick size there is nothing to measure against, and f32 deltas are the
+    :param minmove: Tick-grid numerator, or ``None`` for an unknown grid.
+    :param pricescale: Tick-grid denominator, or ``None`` for an unknown grid.
+    :return: ``(minmove, pricescale)`` with ``(0, 0)`` meaning unknown.
+    :raises ValueError: If only one value is given or either is not positive.
+    """
+    if (minmove is None) != (pricescale is None):
+        raise ValueError("OHLCV minmove and pricescale must be given together")
+    if minmove is None or pricescale is None:
+        return 0, 0
+    if minmove <= 0 or pricescale <= 0:
+        raise ValueError("OHLCV minmove and pricescale must be positive")
+    if minmove >= 1 << 32 or pricescale >= 1 << 32:
+        raise ValueError("OHLCV minmove and pricescale must fit in 32 bits")
+    return minmove, pricescale
+
+
+def _failing_delta_roles(candle: OHLCV, minmove: int, pricescale: int) -> frozenset[int]:
+    """
+    Select the price columns that must not be stored as an f32 delta.
+
+    A role fails on either of two grounds. The f32 delta's resolution reaches half
+    a tick, so the stored value could land on a neighbouring grid point. Or the
+    price itself is off the declared tick grid — read-time snapping restores every
+    f32-delta value to the nearest grid point, so only values that truly are grid
+    multiples may be delta-encoded; off-grid prices (stale grids, split-adjusted
+    data) are stored as absolute f64 and come back untouched.
+
+    Without a tick grid there is nothing to measure against, and f32 deltas are the
     correct default: no tradable instrument in the measured corpus exceeds half a
     mintick with delta encoding, while promoting on absence would inflate the base
     profile from 36 to 48 bytes per record.
 
     :param candle: Bar the decision is measured on.
-    :param mintick: Tick size to verify against, or ``None`` to keep f32 deltas.
+    :param minmove: Tick-grid numerator, or zero for an unknown grid.
+    :param pricescale: Tick-grid denominator, or zero for an unknown grid.
     :return: Roles that must be stored as absolute f64.
     """
-    if mintick is None:
+    if pricescale == 0:
         return frozenset()
 
     failed: set[int] = set()
-    half_tick = mintick / 2.0
+    half_tick = minmove / pricescale / 2.0
+    grid_scale = pricescale / minmove
     for role, target in (
         (_ROLE_HIGH, candle.high),
         (_ROLE_LOW, candle.low),
@@ -521,10 +615,18 @@ def _failing_delta_roles(candle: OHLCV, mintick: float | None) -> frozenset[int]
         resolution = _f32_resolution(target - candle.open)
         if resolution is None or resolution >= half_tick:
             failed.add(role)
+            continue
+        snapped = round(target * grid_scale) * minmove / pricescale
+        if abs(snapped - target) > abs(target) * _F64_GRID_REL:
+            failed.add(role)
     return frozenset(failed)
 
 
 def _fsync_directory(path: Path) -> None:
+    # CPython does not expose a Windows directory handle that ``os.fsync`` accepts.
+    # The replacement file itself is synced before publication.
+    if os.name == "nt":
+        return
     directory_fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
@@ -544,7 +646,7 @@ def _write_all(file: _WritableBinary, data: bytes, message: str) -> None:
 def _pwrite_all(fd: int, data: bytes, offset: int, message: str) -> None:
     written = 0
     while written < len(data):
-        count = os.pwrite(fd, data[written:], offset + written)
+        count = _pwrite(fd, data[written:], offset + written)
         if count <= 0:
             raise OSError(message)
         written += count
@@ -569,7 +671,7 @@ def record_count(path: str | Path) -> int:
     :return: Number of records, or zero when the file holds no usable records.
     """
     try:
-        file = open(path, "rb", buffering=0)
+        file = open_shared_binary(path, "rb")
     except OSError:
         return 0
 
@@ -595,7 +697,8 @@ class OHLCVWriter:
 
     :param path: Target OHLCV file path.
     :param period: Declared nominal timeframe in TradingView format.
-    :param mintick: Positive tick size used to verify f32 delta resolution.
+    :param minmove: Tick-grid numerator stamped into the header (with ``pricescale``).
+    :param pricescale: Tick-grid denominator stamped into the header (with ``minmove``).
     :param truncate: Replace any existing file with a new empty v2 file.
     """
 
@@ -615,7 +718,8 @@ class OHLCVWriter:
         "_start_timestamp",
         "_last_timestamp",
         "_dense",
-        "_mintick",
+        "_minmove",
+        "_pricescale",
         "_price_changes",
         "_price_decimals",
         "_last_analyzed_close",
@@ -642,7 +746,8 @@ class OHLCVWriter:
         path: str | Path,
         period: str,
         *,
-        mintick: float | None = None,
+        minmove: int | None = None,
+        pricescale: int | None = None,
         truncate: bool = False,
         timezone: str = "UTC",
     ):
@@ -652,17 +757,22 @@ class OHLCVWriter:
         :class:`~pynecore.types.ohlcv.OHLCV` values and in the stored ``timestamp``
         field.
 
+        The ``minmove``/``pricescale`` pair declares the symbol's tick grid
+        (mintick = minmove / pricescale). It is stamped into the header for
+        read-time grid snapping and drives the half-tick f32-delta promotion
+        check. When omitted, an existing file's stored grid is kept.
+
         :param path: Target OHLCV file path.
         :param period: Declared nominal timeframe in TradingView format.
-        :param mintick: Optional positive tick size for initial f32-delta fallback selection.
+        :param minmove: Optional positive tick-grid numerator; requires ``pricescale``.
+        :param pricescale: Optional positive tick-grid denominator; requires ``minmove``.
         :param truncate: Replace any existing file with a new empty v2 file.
         :param timezone: IANA name of the symbol timezone the opening-hours analysis
             reports its weekday and hour intervals in. Unknown names fall back to UTC.
-        :raises ValueError: If ``period`` or ``mintick`` is invalid.
+        :raises ValueError: If ``period`` or the tick-grid pair is invalid.
         """
         canonical, interval_value, interval_unit = _parse_period(period)
-        if mintick is not None and (not math.isfinite(mintick) or mintick <= 0.0):
-            raise ValueError("OHLCV mintick must be finite and positive")
+        minmove, pricescale = _validate_tick_grid(minmove, pricescale)
         self.path = str(path)
         self._period = canonical
         self._interval_value = interval_value
@@ -678,7 +788,8 @@ class OHLCVWriter:
         self._start_timestamp: int | None = None
         self._last_timestamp: int | None = None
         self._dense = False
-        self._mintick = mintick
+        self._minmove = minmove
+        self._pricescale = pricescale
         self._price_changes: list[float] = []
         self._price_decimals: set[int] = set()
         self._last_analyzed_close: float | None = None
@@ -735,6 +846,62 @@ class OHLCVWriter:
         :return: Canonical file period.
         """
         return self._period
+
+    @property
+    def minmove(self) -> int | None:
+        """Return the declared tick-grid numerator.
+
+        :return: Positive numerator, or ``None`` for an unknown grid.
+        """
+        return self._minmove or None
+
+    @property
+    def pricescale(self) -> int | None:
+        """Return the declared tick-grid denominator.
+
+        :return: Positive denominator, or ``None`` for an unknown grid.
+        """
+        return self._pricescale or None
+
+    def set_tick_info(self, minmove: int | None, pricescale: int | None) -> None:
+        """Declare the symbol's tick grid after construction.
+
+        Providers build their writer before the symbol info is fetched, so the
+        download flow injects the grid here once it is known. The values drive
+        the half-tick f32-delta promotion check for subsequent appends and are
+        stamped into the header — immediately when the file is open, otherwise
+        by the next append. ``None``/``None`` leaves the current grid unchanged.
+
+        :param minmove: Positive tick-grid numerator; requires ``pricescale``.
+        :param pricescale: Positive tick-grid denominator; requires ``minmove``.
+        :raises ValueError: If the pair is invalid.
+        """
+        minmove, pricescale = _validate_tick_grid(minmove, pricescale)
+        if pricescale == 0:
+            return
+        changed = (minmove, pricescale) != (self._minmove, self._pricescale)
+        self._minmove = minmove
+        self._pricescale = pricescale
+        if changed and self._file is not None:
+            self._rewrite_header()
+
+    def _rewrite_header(self) -> None:
+        """Re-stamp the current header in place; counts and flags are unchanged."""
+        assert self._file is not None
+        header = _build_header(
+            self._columns,
+            _DENSE_FLAG if self._dense else 0,
+            self._size,
+            self._start_timestamp if self._start_timestamp is not None else 0,
+            self._last_timestamp if self._last_timestamp is not None else 0,
+            self._interval_value,
+            self._interval_unit,
+            self._minmove,
+            self._pricescale,
+        )
+        if _pwrite(self._file.fileno(), header, 0) != len(header):
+            raise OSError("Could not write the complete OHLCV header")
+        os.fsync(self._file.fileno())
 
     @property
     def start_timestamp(self) -> int | None:
@@ -843,7 +1010,7 @@ class OHLCVWriter:
         path_exists = path.exists()
         existing_magic: bytes | None = None
         if path_exists:
-            with open(path, "rb", buffering=0) as existing_file:
+            with open_shared_binary(path, "rb") as existing_file:
                 existing_magic = existing_file.read(len(_MAGIC))
             if existing_magic != _MAGIC and not self._truncate_requested:
                 raise ValueError(
@@ -852,7 +1019,7 @@ class OHLCVWriter:
                 )
 
         if self._truncate_requested or not path_exists:
-            file = open(path, "w+b", buffering=0)
+            file = open_shared_binary(path, "w+b")
             self._file = file
             try:
                 self._set_columns(_make_default_columns())
@@ -870,7 +1037,7 @@ class OHLCVWriter:
             self._truncate_requested = False
             return self
 
-        file = open(path, "r+b", buffering=0)
+        file = open_shared_binary(path, "r+b")
         self._file = file
         try:
             file_size = os.fstat(file.fileno()).st_size
@@ -894,6 +1061,9 @@ class OHLCVWriter:
             self._start_timestamp = layout.first_timestamp if layout.record_count else None
             self._last_timestamp = layout.last_timestamp if layout.record_count else None
             self._dense = bool(layout.flags & _DENSE_FLAG)
+            if self._pricescale == 0 and layout.pricescale:
+                self._minmove = layout.minmove
+                self._pricescale = layout.pricescale
             self._interval_value = layout.interval_value
             self._interval_unit = layout.interval_unit
             # The sidecar is adopted (and realigned when an interrupted append left
@@ -953,7 +1123,7 @@ class OHLCVWriter:
             if column.dtype == 5 and column.base == _ROLE_OPEN
         )
         old_count = self._size
-        promoted_roles = _failing_delta_roles(candle, self._mintick) & f32_roles
+        promoted_roles = _failing_delta_roles(candle, self._minmove, self._pricescale) & f32_roles
         if promoted_roles:
             if self._size == 0:
                 self._set_columns(_promote_columns(self._columns, promoted_roles))
@@ -975,7 +1145,7 @@ class OHLCVWriter:
 
         record = self._pack_record(candle)
         record_offset = self._header_size + old_count * self._record_size
-        if os.pwrite(self._file.fileno(), record, record_offset) != len(record):
+        if _pwrite(self._file.fileno(), record, record_offset) != len(record):
             raise OSError("Could not write the complete OHLCV record")
         os.fsync(self._file.fileno())
 
@@ -998,6 +1168,8 @@ class OHLCVWriter:
             self._last_timestamp if self._last_timestamp is not None else 0,
             self._interval_value,
             self._interval_unit,
+            self._minmove,
+            self._pricescale,
         )
         header = _build_header(
             self._columns,
@@ -1007,8 +1179,10 @@ class OHLCVWriter:
             candle.timestamp,
             self._interval_value,
             self._interval_unit,
+            self._minmove,
+            self._pricescale,
         )
-        if os.pwrite(self._file.fileno(), header, 0) != len(header):
+        if _pwrite(self._file.fileno(), header, 0) != len(header):
             _pwrite_all(
                 self._file.fileno(),
                 previous_header,
@@ -1115,7 +1289,7 @@ class OHLCVWriter:
                 writer.writerow(empty)
         self._extra_row_count = records
 
-    def _commit_extra_row(self, extra_fields: dict[str, object] | None, position: int) -> None:
+    def _commit_extra_row(self, extra_fields: dict[str, Any] | None, position: int) -> None:
         """Append the sidecar row of the record that is about to be published.
 
         The row is written while the binary still holds ``position`` records, so a
@@ -1218,7 +1392,8 @@ class OHLCVWriter:
             elif isinstance(value, float):
                 row.append(_format_extra_float(value))
             else:
-                row.append(str(value))
+                # PyCharm degrades a negatively narrowed Any to object here.
+                row.append(str(value))  # noqa
         self._extra_writer.writerow(row)
         self._extra_row_count += 1
         assert self._extra_file is not None
@@ -1585,10 +1760,12 @@ class OHLCVWriter:
             0,
             self._interval_value,
             self._interval_unit,
+            self._minmove,
+            self._pricescale,
         )
         descriptors = b"".join(_pack_descriptor(column) for column in self._columns)
         metadata = header + descriptors
-        if os.pwrite(self._file.fileno(), metadata, 0) != len(metadata):
+        if _pwrite(self._file.fileno(), metadata, 0) != len(metadata):
             raise OSError("Could not write the complete OHLCV header and schema")
         self._file.truncate(self._header_size)
         os.fsync(self._file.fileno())
@@ -1676,7 +1853,7 @@ class OHLCVWriter:
         promoted_columns = _promote_columns(self._columns, failed_roles)
         path = Path(self.path)
         temp_name: str | None = None
-        record_count = 0
+        record_total = 0
         first_timestamp = 0
         last_timestamp = 0
         expected_interval = (
@@ -1713,6 +1890,8 @@ class OHLCVWriter:
                         0,
                         self._interval_value,
                         self._interval_unit,
+                        self._minmove,
+                        self._pricescale,
                     )
                     descriptors = b"".join(
                         _pack_descriptor(column) for column in promoted_columns
@@ -1734,7 +1913,7 @@ class OHLCVWriter:
                     # publishes the new record.
                     with _V2OHLCVReader(self.path, load_extra_fields=False) as reader:
                         for item in reader:
-                            if record_count == 0:
+                            if record_total == 0:
                                 first_timestamp = item.timestamp
                             elif expected_interval is None or (
                                 item.timestamp - last_timestamp != expected_interval
@@ -1746,9 +1925,9 @@ class OHLCVWriter:
                                 "Could not write a complete replacement OHLCV record",
                             )
                             last_timestamp = item.timestamp
-                            record_count += 1
+                            record_total += 1
 
-                    if record_count == 0:
+                    if record_total == 0:
                         first_timestamp = candle.timestamp
                     elif expected_interval is None or (
                         candle.timestamp - last_timestamp != expected_interval
@@ -1760,21 +1939,23 @@ class OHLCVWriter:
                         "Could not write a complete replacement OHLCV record",
                     )
                     last_timestamp = candle.timestamp
-                    record_count += 1
-                    if record_count < 2:
+                    record_total += 1
+                    if record_total < 2:
                         dense = False
                     replacement.flush()
                     os.fsync(replacement.fileno())
                     final_header = _build_header(
                         promoted_columns,
                         _DENSE_FLAG if dense else 0,
-                        record_count,
+                        record_total,
                         first_timestamp,
                         last_timestamp,
                         self._interval_value,
                         self._interval_unit,
+                        self._minmove,
+                        self._pricescale,
                     )
-                    if os.pwrite(replacement.fileno(), final_header, 0) != len(final_header):
+                    if _pwrite(replacement.fileno(), final_header, 0) != len(final_header):
                         raise OSError("Could not publish the complete replacement OHLCV header")
                     os.fsync(replacement.fileno())
                 finally:
@@ -1783,20 +1964,20 @@ class OHLCVWriter:
                     self._record_struct = old_struct
 
             assert temp_name is not None
-            os.replace(temp_name, path)
+            old_file = self._file
+            replace_file(temp_name, path)
             temp_name = None
             self._rebuild_published = True
             try:
-                replacement_file = open(path, "r+b", buffering=0)
+                replacement_file = open_shared_binary(path, "r+b")
             except Exception:
-                self._file.close()
+                old_file.close()
                 self._file = None
                 raise
-            old_file = self._file
             self._file = replacement_file
             old_file.close()
             self._set_columns(promoted_columns)
-            self._size = record_count
+            self._size = record_total
             self._start_timestamp = first_timestamp
             self._last_timestamp = last_timestamp
             self._dense = dense
@@ -1827,6 +2008,11 @@ class _V2OHLCVReader:
         "_dense",
         "_start_timestamp",
         "_last_timestamp",
+        "_minmove",
+        "_pricescale",
+        "_snap_scale",
+        "_snap_minmove",
+        "_snap_pricescale",
         "_header_size",
         "_record_size",
         "_columns",
@@ -1862,6 +2048,11 @@ class _V2OHLCVReader:
         self._dense = False
         self._start_timestamp: int | None = None
         self._last_timestamp: int | None = None
+        self._minmove = 0
+        self._pricescale = 0
+        self._snap_scale = 0.0
+        self._snap_minmove = 1.0
+        self._snap_pricescale = 1.0
         self._header_size = 0
         self._record_size = 0
         self._columns: tuple[_Column, ...] = ()
@@ -1920,6 +2111,22 @@ class _V2OHLCVReader:
         return self._dense
 
     @property
+    def minmove(self) -> int | None:
+        """Return the header's tick-grid numerator.
+
+        :return: Positive numerator, or ``None`` for an unknown grid.
+        """
+        return self._minmove or None
+
+    @property
+    def pricescale(self) -> int | None:
+        """Return the header's tick-grid denominator.
+
+        :return: Positive denominator, or ``None`` for an unknown grid.
+        """
+        return self._pricescale or None
+
+    @property
     def start_timestamp(self) -> int | None:
         """Return the first committed timestamp in milliseconds.
 
@@ -1966,7 +2173,7 @@ class _V2OHLCVReader:
         """
         if self._file is not None:
             return self
-        file = open(self.path, "rb", buffering=0)
+        file = open_shared_binary(self.path, "rb")
         return self.open_file(file)
 
     def open_file(self, file: BinaryIO, magic: bytes | None = None) -> "_V2OHLCVReader":
@@ -2016,6 +2223,12 @@ class _V2OHLCVReader:
             self._dense = bool(layout.flags & _DENSE_FLAG)
             self._start_timestamp = layout.first_timestamp if layout.record_count else None
             self._last_timestamp = layout.last_timestamp if layout.record_count else None
+            self._minmove = layout.minmove
+            self._pricescale = layout.pricescale
+            if layout.pricescale:
+                self._snap_scale = layout.pricescale / layout.minmove
+                self._snap_minmove = float(layout.minmove)
+                self._snap_pricescale = float(layout.pricescale)
             self._load_extra_csv()
             committed_end = layout.header_size + layout.record_count * layout.record_size
             self._mmap = mmap.mmap(
@@ -2150,23 +2363,62 @@ class _V2OHLCVReader:
 
         open_value = values[role_indices[_ROLE_OPEN]]
 
+        # Delta-decoded prices carry f32 rounding noise of at most half an ulp of
+        # the stored delta. For records written under the declared grid the writer
+        # promotes every off-grid price to absolute f64 (see _failing_delta_roles),
+        # so their f32 deltas can only encode true grid multiples: snapping to the
+        # nearest grid point restores full precision, and legitimately off-grid
+        # prices (e.g. split-adjusted data) never reach this path. Records may
+        # also predate the grid (set_tick_info stamps it late on converted or
+        # continued files); their deltas were never grid-checked, but the snap
+        # tolerance below caps any movement at the f32 encoding noise those
+        # records already carry, so a snapped read is never worse than the
+        # gridless one. Values farther from the grid are left as decoded.
+        snap_scale = self._snap_scale
+        snap_minmove = self._snap_minmove
+        snap_pricescale = self._snap_pricescale
+
         high = values[role_indices[_ROLE_HIGH]]
         high_base_index = base_indices[_ROLE_HIGH]
         if high_base_index >= 0:
             high_base = values[high_base_index]
-            high = math.nan if math.isnan(high) or math.isnan(high_base) else high_base + high
+            if math.isnan(high) or math.isnan(high_base):
+                high = math.nan
+            else:
+                decoded = high_base + high
+                if snap_scale > 0.0:
+                    snapped = round(decoded * snap_scale) * snap_minmove / snap_pricescale
+                    if abs(snapped - decoded) <= abs(high) * _F32_SNAP_REL + abs(decoded) * _F64_SNAP_REL:
+                        decoded = snapped
+                high = decoded
 
         low = values[role_indices[_ROLE_LOW]]
         low_base_index = base_indices[_ROLE_LOW]
         if low_base_index >= 0:
             low_base = values[low_base_index]
-            low = math.nan if math.isnan(low) or math.isnan(low_base) else low_base + low
+            if math.isnan(low) or math.isnan(low_base):
+                low = math.nan
+            else:
+                decoded = low_base + low
+                if snap_scale > 0.0:
+                    snapped = round(decoded * snap_scale) * snap_minmove / snap_pricescale
+                    if abs(snapped - decoded) <= abs(low) * _F32_SNAP_REL + abs(decoded) * _F64_SNAP_REL:
+                        decoded = snapped
+                low = decoded
 
         close = values[role_indices[_ROLE_CLOSE]]
         close_base_index = base_indices[_ROLE_CLOSE]
         if close_base_index >= 0:
             close_base = values[close_base_index]
-            close = math.nan if math.isnan(close) or math.isnan(close_base) else close_base + close
+            if math.isnan(close) or math.isnan(close_base):
+                close = math.nan
+            else:
+                decoded = close_base + close
+                if snap_scale > 0.0:
+                    snapped = round(decoded * snap_scale) * snap_minmove / snap_pricescale
+                    if abs(snapped - decoded) <= abs(close) * _F32_SNAP_REL + abs(decoded) * _F64_SNAP_REL:
+                        decoded = snapped
+                close = decoded
 
         volume = values[role_indices[_ROLE_VOLUME]]
         volume_base_index = base_indices[_ROLE_VOLUME]
@@ -2391,6 +2643,24 @@ class OHLCVReader:
         return self._dense
 
     @property
+    def minmove(self) -> int | None:
+        """Return the declared tick-grid numerator.
+
+        :return: Positive numerator, or ``None`` for legacy v1 files or an unknown grid.
+        """
+        reader = self._reader
+        return reader.minmove if isinstance(reader, _V2OHLCVReader) else None
+
+    @property
+    def pricescale(self) -> int | None:
+        """Return the declared tick-grid denominator.
+
+        :return: Positive denominator, or ``None`` for legacy v1 files or an unknown grid.
+        """
+        reader = self._reader
+        return reader.pricescale if isinstance(reader, _V2OHLCVReader) else None
+
+    @property
     def start_timestamp(self) -> int | None:
         """Return the first timestamp in milliseconds.
 
@@ -2433,7 +2703,7 @@ class OHLCVReader:
         if self._opened:
             return self
 
-        file = open(self.path, "rb", buffering=0)
+        file = open_shared_binary(self.path, "rb")
         try:
             magic = file.read(len(_MAGIC))
         except Exception:

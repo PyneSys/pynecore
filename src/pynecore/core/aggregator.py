@@ -16,6 +16,7 @@ from .ohlcv import OHLCVReader
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
+# noinspection PyProtectedMember
 from ..lib.timeframe import in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
 
@@ -129,7 +130,8 @@ def aggregate_ohlcv(
     src_off_ms = src_off * 1000
 
     with OHLCVReader(source_path) as reader:
-        with OHLCVWriter(target_path, target_period, truncate=True) as writer:
+        with OHLCVWriter(target_path, target_period, truncate=True,
+                         minmove=reader.minmove, pricescale=reader.pricescale) as writer:
             window: list[OHLCV] = []
             current_bar_time: int | None = None
 
@@ -208,7 +210,8 @@ def _aggregate_observed(
     target_count = 0
 
     with OHLCVReader(source_path) as reader:
-        with OHLCVWriter(target_path, f"{multiplier}{modifier}", truncate=True) as writer:
+        with OHLCVWriter(target_path, f"{multiplier}{modifier}", truncate=True,
+                         minmove=reader.minmove, pricescale=reader.pricescale) as writer:
             window: list[OHLCV] = []
             window_start: int | None = None
             group_key: tuple | None = None
@@ -228,6 +231,8 @@ def _aggregate_observed(
                 key = counter.key(modifier, multiplier)
 
                 if group_key is not None and key != group_key:
+                    # A non-None group key means at least one bar was windowed.
+                    assert window_start is not None
                     writer.write(_merge_candles(window, window_start))
                     target_count += 1
                     window = []

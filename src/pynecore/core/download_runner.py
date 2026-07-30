@@ -151,15 +151,16 @@ def download_to_file(
         ``'abort'``.
     """
     assert provider.ohlcv_path is not None
-    assert provider.ohlcv_file is not None
     ohlcv_path = provider.ohlcv_path
+    bound_writer = provider.ohlcv_file
+    assert bound_writer is not None
 
     if truncate:
         # Replace the writer rather than opening the existing file and emptying it
         # afterwards: opening for append accepts only the current format, so a file
         # left over from an older format could never be replaced by a download.
         provider.ohlcv_file = OHLCVWriter(
-            ohlcv_path, provider.ohlcv_file.period, truncate=True,
+            ohlcv_path, bound_writer.period, truncate=True,
         )
 
     with provider as ohlcv_writer:
@@ -200,6 +201,11 @@ def download_to_file(
                 syminfo = provider.get_symbol_info()  # save_toml() side effect
             except Exception:
                 syminfo = None  # Symbol info is best-effort, don't block the download
+        if syminfo is not None and syminfo.minmove > 0 and syminfo.pricescale > 0:
+            # Providers build their writer before the symbol info exists, so the
+            # tick grid (header stamp + half-tick f32-delta promotion) is
+            # injected here, before the first bar is appended.
+            ohlcv_writer.set_tick_info(syminfo.minmove, syminfo.pricescale)
         if provider_string is not None:
             # No-op until the syminfo TOML exists; get_symbol_info() above (or the
             # caller) is what creates it.

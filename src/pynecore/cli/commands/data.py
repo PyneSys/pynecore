@@ -1,5 +1,5 @@
 import sys
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import TYPE_CHECKING, TypeAlias
 from pathlib import Path
 from enum import Enum
 from datetime import datetime, timedelta, UTC
@@ -84,7 +84,7 @@ def _resolve_provider_class(provider_name: str) -> type[ProviderPlugin]:
         raise ValueError(f"Unknown provider '{provider_name}'. Available providers: {names}")
     if not (isinstance(cls, type) and issubclass(cls, ProviderPlugin)):
         raise ValueError(f"Plugin '{provider_name}' is not a data provider.")
-    return cast(type[ProviderPlugin], cls)
+    return cls
 
 
 # Available output formats
@@ -312,8 +312,8 @@ def download(
             slist: list[str] = []
             tdir: Path | None = None
             with Progress(SpinnerColumn(), TextColumn("{task.description}"),
-                          transient=True) as progress:
-                progress.add_task(description="Fetching market data...", total=None)
+                          transient=True) as fetch_progress:
+                fetch_progress.add_task(description="Fetching market data...", total=None)
                 if sym is None:
                     inst: ProviderPlugin = provider_class(symbol=None, timeframe=timeframe,
                                                           config=config)
@@ -354,10 +354,6 @@ def download(
             )
             browser.run()
             return browser.go_back
-
-        provider_instance: ProviderPlugin | None = None
-        symbols_list: list[str] = []
-        tui_ohlcv_dir: Path | None = None
 
         # Multi-broker providers (CCXT, cTrader) need a broker chosen before a
         # symbol can be browsed. When none was given and we're interactive, drop

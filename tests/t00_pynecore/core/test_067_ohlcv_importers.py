@@ -1,8 +1,8 @@
 import json
-import os
 
 import pytest
 
+from pynecore.core import data_converter as data_converter_module
 from pynecore.core.data_converter import ConversionError, DataConverter
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, _LEGACY_RECORD_SIZE
 from pynecore.core.ohlcv_importers import (
@@ -170,16 +170,16 @@ def __test_data_converter_restores_previous_pair_when_publication_fails__(tmp_pa
         "1704067260,101,103,100,102,11,8\n"
         "1704067320,102,104,101,103,12,9\n"
     )
-    real_replace = os.replace
+    real_replace = data_converter_module.replace_file
 
-    def failing_replace(src, dst, **kwargs):
+    def failing_replace(src, dst):
         # Only the publication of the finished binary fails; the sidecar of the new
         # conversion has been moved into place by then.
         if str(src).endswith(".converting.ohlcv"):
             raise PermissionError("destination is held open")
-        return real_replace(src, dst, **kwargs)
+        real_replace(src, dst)
 
-    monkeypatch.setattr(os, "replace", failing_replace)
+    monkeypatch.setattr(data_converter_module, "replace_file", failing_replace)
     with pytest.raises(ConversionError):
         converter.convert_to_ohlcv(source_path, force=True, symbol="TEST", provider="TEST")
     monkeypatch.undo()

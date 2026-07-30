@@ -2,7 +2,6 @@
 
 import csv
 import json
-import os
 import re
 import tempfile
 from calendar import monthrange
@@ -13,6 +12,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import IO, Protocol, cast
 
+from pynecore.core._file_io import replace_file
 from pynecore.core.ohlcv import OHLCVWriter, parse_timezone_name
 from pynecore.types.ohlcv import OHLCV
 
@@ -99,7 +99,7 @@ class _ExtraSidecar:
             return
 
         assert self._temp_path is not None
-        os.replace(self._temp_path, self._path)
+        replace_file(self._temp_path, self._path)
         self._temp_path = None
 
     def write(self, row: list[str]) -> None:

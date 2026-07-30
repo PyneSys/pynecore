@@ -12,7 +12,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC, tzinfo
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pynecore.core.plugin import ProviderPlugin
 from zoneinfo import ZoneInfo
 
 from typer import Option, Argument, secho, Exit, colors
@@ -25,6 +28,8 @@ from ..app import app, app_state
 from ..pluggable import PluggableCommand
 
 from ...utils.rich.date_column import DateColumn
+# noinspection PyProtectedMember
+from pynecore.core._file_io import exclusive_file_lock, replace_file
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.aggregator import validate_aggregation
@@ -517,9 +522,10 @@ def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
     :param tf_seconds: Timeframe length in seconds.
     :return: ``(in_session, closed)`` timestamp lists.
     """
-    opening_hours = getattr(syminfo, 'opening_hours', None)
+    opening_hours = syminfo.opening_hours
     if not opening_hours:
         return list(missing), []
+    # noinspection PyBroadException
     try:
         tz = ZoneInfo(syminfo.timezone)
     except Exception:  # noqa: BLE001
@@ -597,12 +603,6 @@ def _format_missing_report(bar_count: int, real_bars: int, oldest_ts: int | None
     return '\n'.join(lines)
 
 
-try:
-    import fcntl as _fcntl
-except ImportError:  # pragma: no cover - non-POSIX (Windows) fallback
-    _fcntl = None  # type: ignore[assignment]
-
-
 @contextmanager
 def _ohlcv_download_lock(ohlcv_path: Path | None):
     """Serialize the shared-OHLCV download/rewrite across concurrent processes.
@@ -614,33 +614,25 @@ def _ohlcv_download_lock(ohlcv_path: Path | None):
     next to the ``.ohlcv`` makes the second process block in the kernel until
     the first finishes, then read a complete file.
 
-    The wait is an ``fcntl.flock`` kernel wait — event-driven, not a poll loop
-    or a sleep. When ``fcntl`` is unavailable (non-POSIX) or the path is unknown
-    the lock degrades to a no-op: correctness on the single-run path is
-    unaffected and the bot must never halt on a missing OS primitive.
+    POSIX uses ``fcntl.flock`` and Windows uses ``LockFileEx``. Both block in the
+    kernel rather than polling. A process-local lock also serializes separate file
+    handles opened by threads in the same process.
 
     :param ohlcv_path: The target ``.ohlcv`` path, or ``None`` (live/in-memory
         feeds with no shared file — nothing to serialize).
     """
-    if ohlcv_path is None or _fcntl is None:
+    if ohlcv_path is None:
         yield
         return
 
     lock_path = ohlcv_path.with_suffix(ohlcv_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(lock_path, "w")
-    try:
-        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
-    finally:
-        lock_file.close()
+    with exclusive_file_lock(lock_path):
+        yield
 
 
 @contextmanager
-def _atomic_ohlcv_download_target(provider: Any):
+def _atomic_ohlcv_download_target(provider: 'ProviderPlugin'):
     """Write one provider download privately, then atomically publish it.
 
     The sidecar lock serializes publishers, while the temporary file keeps the
@@ -663,6 +655,8 @@ def _atomic_ohlcv_download_target(provider: Any):
     os.close(fd)
     temp_path = Path(raw_temp_path)
     original_writer = provider.ohlcv_file
+    # A provider built with an ohlcv_path always has its writer set.
+    assert original_writer is not None
     try:
         with _ohlcv_download_lock(final_path):
             provider.ohlcv_path = temp_path
@@ -671,7 +665,7 @@ def _atomic_ohlcv_download_target(provider: Any):
             )
             try:
                 yield
-                os.replace(temp_path, final_path)
+                replace_file(temp_path, final_path)
             finally:
                 provider.ohlcv_path = final_path
                 provider.ohlcv_file = original_writer

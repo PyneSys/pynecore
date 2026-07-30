@@ -14,7 +14,7 @@ from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, record_count
 from pynecore.types.ohlcv import OHLCV
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
-_HEADER = struct.Struct("<8sHHIIHHQqqIB3x8x")
+_HEADER = struct.Struct("<8sHHIIHHQqqIB3xII")
 _DESCRIPTOR = struct.Struct("<BBBxH18s")
 _HEADER_SIZE = 64 + 6 * 24
 _DTYPE_SIZE = {2: 8, 5: 4, 6: 8}
@@ -25,14 +25,19 @@ def _write_candles(
     candles: list[OHLCV],
     period: str = "1",
     *,
-    mintick: float | None = None,
+    minmove: int | None = None,
+    pricescale: int | None = None,
 ) -> None:
-    with OHLCVWriter(path, period, mintick=mintick, truncate=True) as writer:
+    with OHLCVWriter(
+        path, period, minmove=minmove, pricescale=pricescale, truncate=True
+    ) as writer:
         for candle in candles:
             writer.write(candle)
 
 
-def _header(path: Path) -> tuple[bytes, int, int, int, int, int, int, int, int, int, int, int]:
+def _header(
+    path: Path,
+) -> tuple[bytes, int, int, int, int, int, int, int, int, int, int, int, int, int]:
     return _HEADER.unpack(path.read_bytes()[:64])
 
 
@@ -85,6 +90,8 @@ def _write_raw_file(
         last_timestamp,
         interval_value,
         interval_unit,
+        0,
+        0,
     )
     descriptors = b"".join(
         _DESCRIPTOR.pack(role, dtype, base, offset, name.encode("ascii").ljust(18, b"\0"))
@@ -136,6 +143,54 @@ def __test_default_profile_round_trip__(
             _assert_candle_close(actual, expected, mintick)
 
 
+def __test_grid_stamp_snaps_delta_prices_to_full_precision__(tmp_path: Path):
+    """A header tick grid restores on-grid f32-delta prices exactly; off-grid stays put."""
+    candles = [
+        OHLCV(1_735_689_600_000, 65_400.0, 65_412.34, 65_399.99, 65_401.01, 1.0),
+        OHLCV(1_735_689_660_000, 65_401.0, 65_402.5, 65_398.765432, 65_400.01, 1.0),
+    ]
+    gridded = tmp_path / "gridded.ohlcv"
+    _write_candles(gridded, candles, minmove=1, pricescale=100)
+    assert _header(gridded)[12:14] == (1, 100)
+    with OHLCVReader(gridded) as reader:
+        assert reader.minmove == 1
+        assert reader.pricescale == 100
+        first = reader.read(0)
+        assert (first.high, first.low, first.close) == (65_412.34, 65_399.99, 65_401.01)
+        second = reader.read(1)
+        # An off-grid price (split-adjusted style) must not be pulled onto the grid.
+        assert abs(second.low - 65_398.765432) < 0.001
+        assert abs(second.low - 65_398.77) > 0.004
+        assert second.close == 65_400.01
+
+    plain = tmp_path / "plain.ohlcv"
+    _write_candles(plain, candles[:1])
+    with OHLCVReader(plain) as reader:
+        assert reader.minmove is None
+        assert reader.pricescale is None
+        # Without a declared grid the f32 delta noise stays visible.
+        assert reader.read(0).low != 65_399.99
+
+
+def __test_set_tick_info_stamps_header_and_append_adopts_it__(tmp_path: Path):
+    """A late grid declaration re-stamps the open file and survives grid-less reopens."""
+    path = tmp_path / "late_grid.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(0, 65_400.0, 65_412.34, 65_399.99, 65_401.01, 1.0))
+        assert writer.minmove is None and writer.pricescale is None
+        writer.set_tick_info(1, 100)
+        writer.set_tick_info(None, None)
+    assert _header(path)[12:14] == (1, 100)
+    with OHLCVReader(path) as reader:
+        assert reader.read(0).low == 65_399.99
+
+    with OHLCVWriter(path, "1") as writer:
+        assert writer.minmove == 1
+        assert writer.pricescale == 100
+        writer.write(OHLCV(60_000, 65_401.0, 65_402.02, 65_400.0, 65_401.5, 1.0))
+    assert _header(path)[12:14] == (1, 100)
+
+
 def __test_byte_exact_default_layout__(tmp_path: Path):
     """Header, descriptors, and record bytes pin the little-endian packed wire layout."""
     path = tmp_path / "layout.ohlcv"
@@ -145,7 +200,7 @@ def __test_byte_exact_default_layout__(tmp_path: Path):
 
     assert raw[:8] == b"\x89PYN\r\n\x1a\n"
     assert raw[8:64] == bytes.fromhex(
-        "02000000d00000002400000006000000"
+        "02000100d00000002400000006000000"
         "0100000000000000e803000000000000"
         "e8030000000000000100000002000000"
         "0000000000000000"
@@ -402,7 +457,7 @@ def __test_f64_fallback_and_default_no_mintick_guard__(tmp_path: Path):
         1.0,
     )
     promoted_path = tmp_path / "promoted.ohlcv"
-    _write_candles(promoted_path, [candle], "1D", mintick=0.01)
+    _write_candles(promoted_path, [candle], "1D", minmove=1, pricescale=100)
     assert _record_size(promoted_path) == 48
     descriptors = [
         _DESCRIPTOR.unpack_from(promoted_path.read_bytes(), 64 + index * 24)
@@ -431,8 +486,8 @@ def __test_f64_fallback_and_default_no_mintick_guard__(tmp_path: Path):
 def __test_selective_promotion_uses_a_mixed_physical_layout__(tmp_path: Path):
     """Only failing price columns widen, preserving literal OHLCV field order."""
     path = tmp_path / "selective.ohlcv"
-    candle = OHLCV(0, 0.0, 1_000_000_000.0, -0.001, 0.001, 1.0)
-    _write_candles(path, [candle], mintick=0.01)
+    candle = OHLCV(0, 0.0, 1_000_000_000.0, -0.01, 0.01, 1.0)
+    _write_candles(path, [candle], minmove=1, pricescale=100)
 
     raw = path.read_bytes()
     descriptors = [_DESCRIPTOR.unpack_from(raw, 64 + index * 24) for index in range(6)]
@@ -447,7 +502,7 @@ def __test_selective_promotion_uses_a_mixed_physical_layout__(tmp_path: Path):
     ]
     assert raw[208:] == bytes.fromhex(
         "000000000000000000000000000000000000000065cdcd41"
-        "6f1283ba6f12833a000000000000f03f"
+        "0ad723bc0ad7233c000000000000f03f"
     )
     with OHLCVReader(path) as reader:
         _assert_candle_close(reader.read(0), candle, 0.01)
@@ -461,10 +516,10 @@ def __test_late_promotion_rebuilds_without_losing_data__(tmp_path: Path):
     second = OHLCV(60_000, 5_000_000_000_000.0, 5_001_000_000_000.0,
                    4_999_000_000_000.0, 5_000_500_000_000.0, 2.0)
 
-    with OHLCVWriter(path, "1", mintick=0.01, truncate=True) as writer:
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True) as writer:
         writer.write(first)
         assert _record_size(path) == 36
-    with OHLCVWriter(path, "1", mintick=0.01) as writer:
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100) as writer:
         writer.write(second)
         assert writer.size == 2
     assert _record_size(path) == 48
@@ -478,6 +533,85 @@ def __test_late_promotion_rebuilds_without_losing_data__(tmp_path: Path):
     with OHLCVWriter(path, "1") as writer:
         writer.write(third)
     assert _record_size(path) == 48
+
+
+def __test_late_promotion_preserves_an_open_reader_snapshot__(tmp_path: Path):
+    """A reader keeps the old inode while late promotion publishes a new one."""
+    path = tmp_path / "late_snapshot.ohlcv"
+    first = OHLCV(
+        0,
+        5_000_000_000_000.0,
+        5_000_000_000_000.1,
+        4_999_999_999_999.9,
+        5_000_000_000_000.05,
+        1.0,
+    )
+    second = OHLCV(
+        60_000,
+        5_000_000_000_000.0,
+        5_001_000_000_000.0,
+        4_999_000_000_000.0,
+        5_000_500_000_000.0,
+        2.0,
+    )
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True) as writer:
+        writer.write(first)
+        with OHLCVReader(path) as snapshot:
+            writer.write(second)
+            assert snapshot.size == 1
+            _assert_candle_close(snapshot.read(0), first, 0.01)
+            with OHLCVReader(path) as current:
+                assert current.size == 2
+                assert current.read(1) == second
+
+    assert _record_size(path) == 48
+
+
+def __test_failed_late_promotion_keeps_writer_open__(tmp_path: Path, monkeypatch):
+    """A pre-publication replace failure leaves the writer attached to the old file."""
+    path = tmp_path / "failed_late_replace.ohlcv"
+    first = OHLCV(
+        0,
+        5_000_000_000_000.0,
+        5_000_000_000_000.1,
+        4_999_999_999_999.9,
+        5_000_000_000_000.05,
+        1.0,
+    )
+    second = OHLCV(
+        60_000,
+        5_000_000_000_000.0,
+        5_001_000_000_000.0,
+        4_999_000_000_000.0,
+        5_000_500_000_000.0,
+        2.0,
+    )
+    third = OHLCV(
+        60_000,
+        5_000_000_000_000.0,
+        5_000_000_000_000.1,
+        4_999_999_999_999.9,
+        5_000_000_000_000.05,
+        3.0,
+    )
+    writer = OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True).open()
+    writer.write(first)
+
+    def fail_replace(source: str | Path, destination: str | Path) -> None:
+        raise PermissionError(f"injected replace failure: {source} -> {destination}")
+
+    monkeypatch.setattr(ohlcv, "replace_file", fail_replace)
+    with pytest.raises(PermissionError, match="injected replace failure"):
+        writer.write(second)
+    assert writer.size == 1
+    writer.write(third)
+    assert writer.size == 2
+    writer.close()
+
+    with OHLCVReader(path) as reader:
+        assert reader.size == 2
+        _assert_candle_close(reader.read(0), first, 0.01)
+        _assert_candle_close(reader.read(1), third, 0.01)
 
 
 def __test_late_promotion_keeps_extra_fields__(tmp_path: Path):
@@ -495,10 +629,10 @@ def __test_late_promotion_keeps_extra_fields__(tmp_path: Path):
                    4_999_000_000_000.0, 5_000_500_000_000.0, 2.0,
                    extra_fields={"sig": 2.5})
 
-    with OHLCVWriter(path, "1", mintick=0.01, truncate=True) as writer:
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True) as writer:
         writer.write(first)
         assert _record_size(path) == 36
-    with OHLCVWriter(path, "1", mintick=0.01) as writer:
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100) as writer:
         writer.write(second)
         assert writer.size == 2
     assert _record_size(path) == 48
@@ -519,7 +653,7 @@ def __test_promotion_retries_short_replacement_writes__(
                   4_999_999_999_999.9, 5_000_000_000_000.05, 1.0)
     second = OHLCV(60_000, 5_000_000_000_000.0, 5_001_000_000_000.0,
                    4_999_000_000_000.0, 5_000_500_000_000.0, 2.0)
-    _write_candles(path, [first], mintick=0.01)
+    _write_candles(path, [first], minmove=1, pricescale=100)
     real_named_temporary_file = ohlcv.tempfile.NamedTemporaryFile
 
     class ShortWriteProxy:
@@ -551,7 +685,7 @@ def __test_promotion_retries_short_replacement_writes__(
         return ShortWriteProxy(real_named_temporary_file(*args, **kwargs))
 
     monkeypatch.setattr(ohlcv.tempfile, "NamedTemporaryFile", short_named_temporary_file)
-    with OHLCVWriter(path, "1", mintick=0.01) as writer:
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100) as writer:
         writer.write(second)
         assert writer.size == 2
 
@@ -569,7 +703,7 @@ def __test_post_replace_failure_keeps_writer_on_current_inode__(tmp_path: Path, 
     second = OHLCV(60_000, 5_000_000_000_000.0, 5_001_000_000_000.0,
                    4_999_000_000_000.0, 5_000_500_000_000.0, 2.0)
     third = OHLCV(120_000, 10.0, 11.0, 9.0, 10.5, 3.0)
-    writer = OHLCVWriter(path, "1", mintick=0.01, truncate=True).open()
+    writer = OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True).open()
     writer.write(first)
 
     def fail_directory_fsync(directory: Path) -> None:
@@ -598,7 +732,7 @@ def __test_post_replace_failure_keeps_committed_extra_row__(tmp_path: Path, monk
                    4_999_000_000_000.0, 5_000_500_000_000.0, 2.0,
                    extra_fields={"tag": "two"})
     third = OHLCV(120_000, 10.0, 11.0, 9.0, 10.5, 3.0, extra_fields={"tag": "three"})
-    writer = OHLCVWriter(path, "1", mintick=0.01, truncate=True).open()
+    writer = OHLCVWriter(path, "1", minmove=1, pricescale=100, truncate=True).open()
     writer.write(first)
 
     def fail_directory_fsync(directory: Path) -> None:
@@ -619,16 +753,20 @@ def __test_post_replace_failure_keeps_committed_extra_row__(tmp_path: Path, monk
         assert reader.read(2).extra_fields == {"tag": "three"}
 
 
-def __test_period_and_mintick_validation__(tmp_path: Path):
-    """Periods canonicalize strictly and mintick must be finite and positive."""
+def __test_period_and_tick_grid_validation__(tmp_path: Path):
+    """Periods canonicalize strictly and the tick-grid pair is validated as a whole."""
     assert OHLCVWriter(tmp_path / "minutes", "001").period == "1"
     assert OHLCVWriter(tmp_path / "days", "01D").period == "1D"
     for period in ("", "0", "0D", "1H", "d", "D", "-1", "4294967296"):
         with pytest.raises(ValueError):
             OHLCVWriter(tmp_path / "invalid", period)
-    for mintick in (0.0, -1.0, math.inf, -math.inf, math.nan):
-        with pytest.raises(ValueError, match="finite and positive"):
-            OHLCVWriter(tmp_path / "invalid_tick", "1", mintick=mintick)
+    with pytest.raises(ValueError, match="given together"):
+        OHLCVWriter(tmp_path / "invalid_tick", "1", minmove=1)
+    with pytest.raises(ValueError, match="given together"):
+        OHLCVWriter(tmp_path / "invalid_tick", "1", pricescale=100)
+    for minmove, pricescale in ((0, 100), (1, 0), (-1, 100), (1, -100), (1 << 32, 100)):
+        with pytest.raises(ValueError, match="positive|32 bits"):
+            OHLCVWriter(tmp_path / "invalid_tick", "1", minmove=minmove, pricescale=pricescale)
 
 
 def __test_hour_interval_is_read_as_minutes__(tmp_path: Path):
@@ -931,7 +1069,8 @@ def __test_column_name_and_descriptor_validation__():
     [
         (0, b"BADMAGIC", "Invalid OHLCV v2 magic"),
         (8, struct.pack("<H", 3), "major version"),
-        (10, struct.pack("<H", 1), "minor version"),
+        (10, struct.pack("<H", 2), "minor version"),
+        (56, struct.pack("<I", 1), "zero or positive together"),
         (22, struct.pack("<H", 2), "header flags"),
         (20, struct.pack("<H", 0), "schema cannot be empty"),
         (12, struct.pack("<I", 64), "header_size"),
@@ -1020,7 +1159,6 @@ def __test_failed_initial_writer_open_closes_and_can_retry__(tmp_path: Path, mon
     monkeypatch.setattr(ohlcv.os, "fsync", fail_once)
     with pytest.raises(OSError, match="injected fsync failure"):
         writer.open()
-    assert writer._file is None
 
     assert writer.open() is writer
     writer.close()
@@ -1061,7 +1199,7 @@ def __test_record_and_header_publication_order__(tmp_path: Path, monkeypatch):
     path = tmp_path / "order.ohlcv"
     writer = OHLCVWriter(path, "1", truncate=True).open()
     events: list[str] = []
-    real_pwrite = os.pwrite
+    real_pwrite = ohlcv._pwrite
     real_fsync = os.fsync
 
     def tracking_pwrite(fd: int, data: bytes, offset: int) -> int:
@@ -1072,25 +1210,40 @@ def __test_record_and_header_publication_order__(tmp_path: Path, monkeypatch):
         events.append("fsync")
         real_fsync(fd)
 
-    monkeypatch.setattr(ohlcv.os, "pwrite", tracking_pwrite)
+    monkeypatch.setattr(ohlcv, "_pwrite", tracking_pwrite)
     monkeypatch.setattr(ohlcv.os, "fsync", tracking_fsync)
     writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0))
     assert events == ["record", "fsync", "header", "fsync"]
     writer.close()
 
 
+def __test_positional_io_fallback_round_trip__(tmp_path: Path, monkeypatch):
+    """The seek-based Windows fallback covers writing, probing, and reading."""
+    path = tmp_path / "positional_fallback.ohlcv"
+    candles = [
+        OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0),
+        OHLCV(60_000, 2.0, 3.0, 1.0, 2.5, 2.0),
+    ]
+    monkeypatch.setattr(ohlcv, "_HAS_POSITIONAL_IO", False)
+
+    _write_candles(path, candles)
+    assert record_count(path) == 2
+    with OHLCVReader(path) as reader:
+        assert list(reader) == candles
+
+
 def __test_short_record_write_is_never_published__(tmp_path: Path, monkeypatch):
     """A short record pwrite leaves both in-memory and on-disk record counts unchanged."""
     path = tmp_path / "short_record.ohlcv"
     writer = OHLCVWriter(path, "1", truncate=True).open()
-    real_pwrite = os.pwrite
+    real_pwrite = ohlcv._pwrite
 
     def short_record(fd: int, data: bytes, offset: int) -> int:
         if offset == _HEADER_SIZE:
             return len(data) - 1
         return real_pwrite(fd, data, offset)
 
-    monkeypatch.setattr(ohlcv.os, "pwrite", short_record)
+    monkeypatch.setattr(ohlcv, "_pwrite", short_record)
     with pytest.raises(OSError, match="complete OHLCV record"):
         writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0))
     assert writer.size == 0
@@ -1103,7 +1256,7 @@ def __test_short_header_write_leaves_record_as_uncommitted_tail__(tmp_path: Path
     """A short header pwrite cannot expose the already durable record bytes."""
     path = tmp_path / "short_header.ohlcv"
     writer = OHLCVWriter(path, "1", truncate=True).open()
-    real_pwrite = os.pwrite
+    real_pwrite = ohlcv._pwrite
 
     shortened = False
 
@@ -1114,7 +1267,7 @@ def __test_short_header_write_leaves_record_as_uncommitted_tail__(tmp_path: Path
             return real_pwrite(fd, data[:-1], offset)
         return real_pwrite(fd, data, offset)
 
-    monkeypatch.setattr(ohlcv.os, "pwrite", short_header)
+    monkeypatch.setattr(ohlcv, "_pwrite", short_header)
     with pytest.raises(OSError, match="complete OHLCV header"):
         writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0))
     assert writer.size == 0
@@ -1131,7 +1284,7 @@ def __test_partial_header_rollback_preserves_the_previous_commit__(tmp_path: Pat
     second = OHLCV(60_000, 2.0, 3.0, 1.0, 2.5, 2.0)
     _write_candles(path, [first])
     writer = OHLCVWriter(path, "1").open()
-    real_pwrite = os.pwrite
+    real_pwrite = ohlcv._pwrite
     shortened = False
 
     def short_header(fd: int, data: bytes, offset: int) -> int:
@@ -1141,7 +1294,7 @@ def __test_partial_header_rollback_preserves_the_previous_commit__(tmp_path: Pat
             return real_pwrite(fd, data[:32], offset)
         return real_pwrite(fd, data, offset)
 
-    monkeypatch.setattr(ohlcv.os, "pwrite", short_header)
+    monkeypatch.setattr(ohlcv, "_pwrite", short_header)
     with pytest.raises(OSError, match="complete OHLCV header"):
         writer.write(second)
     assert writer.size == 1
@@ -1163,27 +1316,38 @@ def __test_f32_resolution_and_promotion_boundaries__(tmp_path: Path):
     exactly_half_tick = OHLCV(0, 0.0, 1.0, -1.0, 1.0, 1.0)
     resolution = ohlcv._f32_resolution(1.0)
     assert resolution is not None
-    roles = ohlcv._failing_delta_roles(exactly_half_tick, resolution * 2)
+    # mintick == 2 * resolution, expressed as an exact power-of-two grid.
+    roles = ohlcv._failing_delta_roles(exactly_half_tick, 1, 1 << 22)
     assert roles == frozenset({2, 3, 4})
-    assert ohlcv._failing_delta_roles(exactly_half_tick, None) == frozenset()
+    assert ohlcv._failing_delta_roles(exactly_half_tick, 0, 0) == frozenset()
 
     stable_deltas = OHLCV(
         0,
         100_000.0,
         100_000.01,
         99_999.99,
-        100_000.005,
+        100_000.01,
         1.0,
     )
-    assert ohlcv._failing_delta_roles(stable_deltas, 0.01) == frozenset()
+    assert ohlcv._failing_delta_roles(stable_deltas, 1, 100) == frozenset()
     stable_path = tmp_path / "stable_deltas.ohlcv"
-    _write_candles(stable_path, [stable_deltas], mintick=0.01)
+    _write_candles(stable_path, [stable_deltas], minmove=1, pricescale=100)
     assert _record_size(stable_path) == 36
 
+    # An off-grid price promotes even when the f32 delta could resolve it: only
+    # exact grid multiples may pass through the read-time snap.
+    off_grid = OHLCV(0, 100_000.0, 100_000.01, 99_999.99, 100_000.005, 1.0)
+    assert ohlcv._failing_delta_roles(off_grid, 1, 100) == frozenset({4})
+    off_grid_path = tmp_path / "off_grid.ohlcv"
+    _write_candles(off_grid_path, [off_grid], minmove=1, pricescale=100)
+    assert _record_size(off_grid_path) == 40
+    with OHLCVReader(off_grid_path) as reader:
+        assert reader.read(0).close == 100_000.005
+
     nan_target = OHLCV(0, 1.0, math.nan, 0.0, 1.0, 1.0)
-    assert 2 not in ohlcv._failing_delta_roles(nan_target, 0.01)
+    assert 2 not in ohlcv._failing_delta_roles(nan_target, 1, 100)
     nan_open = OHLCV(0, math.nan, 2.0, math.nan, 1.0, 1.0)
-    assert ohlcv._failing_delta_roles(nan_open, 0.01) == frozenset({2, 4})
+    assert ohlcv._failing_delta_roles(nan_open, 1, 100) == frozenset({2, 4})
 
 
 def __test_public_reader_transparently_reads_legacy_v1__(tmp_path: Path):

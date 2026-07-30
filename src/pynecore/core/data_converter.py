@@ -6,12 +6,12 @@ to OHLCV format when needed, eliminating the manual step of running pyne data co
 """
 import csv
 import json
-import os
 from datetime import time
 from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+from pynecore.core._file_io import replace_file
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
 from pynecore.lib.timeframe import in_seconds
 from pynecore.core.ohlcv_importers import (
@@ -86,12 +86,12 @@ def _publish_conversion(
         for destination in (ohlcv_path, extra_csv_path):
             if destination.exists():
                 saved_path = destination.with_name(destination.name + ".replaced")
-                os.replace(destination, saved_path)
+                replace_file(destination, saved_path)
                 saved.append((saved_path, destination))
-        os.replace(temp_ohlcv_path, ohlcv_path)
+        replace_file(temp_ohlcv_path, ohlcv_path)
         published.append(ohlcv_path)
         if temp_extra_path.exists():
-            os.replace(temp_extra_path, extra_csv_path)
+            replace_file(temp_extra_path, extra_csv_path)
             published.append(extra_csv_path)
     except OSError:
         # Only what this call actually published is removed. Blindly clearing both
@@ -104,7 +104,7 @@ def _publish_conversion(
                 pass
         for saved_path, destination in saved:
             try:
-                os.replace(saved_path, destination)
+                replace_file(saved_path, destination)
             except OSError:
                 pass
         raise
@@ -229,7 +229,8 @@ class DataConverter:
         temp_extra_path = temp_ohlcv_path.with_suffix('.extra.csv')
         skip_toml_generation = False
         existing_period: str | None = None
-        writer_mintick: float | None = None
+        writer_minmove: int | None = None
+        writer_pricescale: int | None = None
 
         if toml_path.exists():
             # noinspection PyBroadException
@@ -237,7 +238,8 @@ class DataConverter:
                 existing_syminfo = SymInfo.load_toml(toml_path)
                 timezone = existing_syminfo.timezone
                 existing_period = existing_syminfo.period
-                writer_mintick = existing_syminfo.mintick
+                writer_minmove = existing_syminfo.minmove
+                writer_pricescale = existing_syminfo.pricescale
                 skip_toml_generation = True
             except Exception:
                 # If TOML is corrupted, continue with provided/default values.
@@ -268,7 +270,8 @@ class DataConverter:
             with OHLCVWriter(
                 temp_ohlcv_path,
                 detected_timeframe,
-                mintick=writer_mintick,
+                minmove=writer_minmove,
+                pricescale=writer_pricescale,
                 truncate=True,
                 timezone=timezone,
             ) as ohlcv_writer:
@@ -292,6 +295,15 @@ class DataConverter:
                 analyzed_tick_size = ohlcv_writer.analyzed_tick_size
                 analyzed_price_scale = ohlcv_writer.analyzed_price_scale
                 analyzed_min_move = ohlcv_writer.analyzed_min_move
+
+                # Without a syminfo TOML the converted file would carry no tick
+                # grid at all; the analyzed grid still enables read-time
+                # snapping, whose tolerance guard makes a misdetected grid
+                # harmless.
+                if writer_pricescale is None and analyzed_tick_size:
+                    detected_scale = analyzed_price_scale or int(round(1.0 / analyzed_tick_size))
+                    if detected_scale > 0:
+                        ohlcv_writer.set_tick_info(analyzed_min_move or 1, detected_scale)
 
             # The conversion is complete: publish it over the previous one.
             _publish_conversion(temp_ohlcv_path, temp_extra_path, ohlcv_path, extra_csv_path)

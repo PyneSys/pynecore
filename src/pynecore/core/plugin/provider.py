@@ -7,6 +7,7 @@ from datetime import datetime
 from pynecore.types.ohlcv import OHLCV
 from pynecore.core.syminfo import SymInfo, default_mincontract
 from pynecore.core.ohlcv import OHLCVWriter, OHLCVReader
+# noinspection PyProtectedMember
 from pynecore.lib.timeframe import _process_tf
 
 from . import Plugin, ConfigT
@@ -129,13 +130,14 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         self.xchg_timeframe = self.to_exchange_timeframe(timeframe) if timeframe else None
         if ohlcv_dir:
             assert symbol and timeframe
-            self.ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
+            ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
+            self.ohlcv_path: Path | None = ohlcv_path
             # The written file declares its period with an explicit multiplier
             # ('D' -> '1D'), so the same timeframe always maps to one file period.
             # noinspection PyProtectedMember
             modifier, multiplier = _process_tf(timeframe)
             period = f"{multiplier}{modifier}" if modifier else str(multiplier)
-            self.ohlcv_file = OHLCVWriter(self.ohlcv_path, period)
+            self.ohlcv_file: OHLCVWriter | None = OHLCVWriter(ohlcv_path, period)
         else:
             self.ohlcv_path = None
             self.ohlcv_file = None
@@ -191,8 +193,8 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         :param pine_key: Symbol as written in the Pine script.
         :return: Symbol in the format the plugin's exchange API expects.
         """
-        sm = getattr(self.config, 'symbol_map', None)
-        if sm and pine_key in sm:
+        sm = getattr(self.config, 'symbol_map', None) or {}
+        if pine_key in sm:
             return sm[pine_key]
         gm = self.global_symbol_map
         if gm:
@@ -349,4 +351,5 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
 
         :return: An OHLCVReader instance.
         """
-        return OHLCVReader(str(self.ohlcv_path))
+        assert self.ohlcv_path is not None
+        return OHLCVReader(self.ohlcv_path)

@@ -337,14 +337,14 @@ def __test_convert_to_ohlcv_restores_originals_when_backup_fails__(tmp_path, mon
     good_binary = ohlcv_path.read_bytes()
     good_sidecar = extra_path.read_text()
 
-    real_replace = data_converter_module.os.replace
+    real_replace = data_converter_module.replace_file
 
-    def failing_replace(source, destination, *args, **kwargs):
+    def failing_replace(source, destination):
         if str(destination).endswith(".extra.csv.replaced"):
             raise PermissionError("sidecar is held open by another process")
-        return real_replace(source, destination, *args, **kwargs)
+        real_replace(source, destination)
 
-    monkeypatch.setattr(data_converter_module.os, "replace", failing_replace)
+    monkeypatch.setattr(data_converter_module, "replace_file", failing_replace)
     with pytest.raises(Exception):
         converter.convert_to_ohlcv(csv_path, symbol="TEST", force=True)
     monkeypatch.undo()
