@@ -1108,15 +1108,19 @@ class SimPosition(PositionBase):
                         trade.size = 0.0
                     order.size -= size
 
-                    # Gross P/L and counters
-                    if closed_trade.profit == 0.0:
-                        self.eventrades += 1
-                    elif closed_trade.profit > 0.0:
-                        self.wintrades += 1
-                        self.grossprofit += closed_trade.profit
-                    else:
-                        self.losstrades += 1
-                        self.grossloss -= closed_trade.profit
+                    # Gross P/L and counters. Every commission mode classifies
+                    # win/loss on the after-fee profit: cash_per_order fees are
+                    # only apportioned in the delete block below, so its trades
+                    # are classified there once their final profit is known.
+                    if commission_type != _commission.cash_per_order:
+                        if closed_trade.profit == 0.0:
+                            self.eventrades += 1
+                        elif closed_trade.profit > 0.0:
+                            self.wintrades += 1
+                            self.grossprofit += closed_trade.profit
+                        else:
+                            self.losstrades += 1
+                            self.grossloss -= closed_trade.profit
 
                     # Average entry price
                     if self.size:
@@ -1185,6 +1189,29 @@ class SimPosition(PositionBase):
                     for trade in new_closed_trades:
                         commission = (commission_value * abs(trade.size)) / closed_trade_size
                         trade.commission += commission
+                        # The percent/cash_per_contract path subtracts the trade's
+                        # total commission (entry leg carried on the open trade +
+                        # exit leg) from its profit before profit_percent is
+                        # computed; the deferred cash_per_order split must do the
+                        # same, otherwise the trade list reports raw P&L while
+                        # netprofit already includes the fees.
+                        trade.profit -= trade.commission
+                        entry_value = abs(trade.size) * trade.entry_price * pv
+                        try:
+                            trade.profit_percent = (trade.profit / entry_value) * 100.0
+                        except ZeroDivisionError:
+                            trade.profit_percent = 0.0
+                        # Deferred Gross P/L and counters (skipped in the fill
+                        # loop above): classify on the after-fee profit, exactly
+                        # like the percent/cash_per_contract path does.
+                        if trade.profit == 0.0:
+                            self.eventrades += 1
+                        elif trade.profit > 0.0:
+                            self.wintrades += 1
+                            self.grossprofit += trade.profit
+                        else:
+                            self.losstrades += 1
+                            self.grossloss -= trade.profit
 
             self.new_closed_trades.extend(new_closed_trades)
 
