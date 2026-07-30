@@ -1,5 +1,10 @@
 from typing import Any, TypeVar, Generic, Type, Iterator
 
+# Under PyCharm this swaps float/int/bool for their enhanced (``[n]``-indexable)
+# subclasses, so the na singletons below type as Pyne values; under pyright the
+# wildcard resolves to the builtins and nothing changes.
+from pynecore.types.type_checker import *
+
 T = TypeVar('T')
 
 

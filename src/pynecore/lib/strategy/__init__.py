@@ -3469,7 +3469,7 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     :param qty: The quantity to round
     :return: The rounded quantity
     """
-    if (isinstance(qty, NA) or qty != qty):
+    if isinstance(qty, NA) or qty != qty:
         return na_float
     rfactor = syminfo._size_round_factor  # noqa
     # Floor to the lot step (1 / rfactor). The float64 product can land an exact
@@ -3516,7 +3516,7 @@ def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     :param direction: The direction of the price
     :return: The rounded price
     """
-    if (isinstance(price, NA) or price != price):
+    if isinstance(price, NA) or price != price:
         return na_float
     pricescale = syminfo.pricescale
     minmove = syminfo.minmove
@@ -3601,7 +3601,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
             # caps this to the residual position size before dispatch.
             bound_size = adopted_size
 
-    if (isinstance(qty, NA) or qty != qty):
+    if isinstance(qty, NA) or qty != qty:
         if not (isinstance(qty_percent, NA) or qty_percent != qty_percent):
             size = _size_round(-bound_size * (qty_percent * 0.01))
         else:
@@ -3964,12 +3964,12 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
 
-    if (isinstance(limit, NA) or limit != limit):
+    if isinstance(limit, NA) or limit != limit:
         limit = None
     elif limit is not None:
         # We need negative direction for entry limit orders - NOTE: it is tested
         limit = _price_round(limit, -direction_sign)
-    if (isinstance(stop, NA) or stop != stop):
+    if isinstance(stop, NA) or stop != stop:
         stop = None
     elif stop is not None:
         stop = _price_round(stop, direction_sign)
@@ -4440,11 +4440,11 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
 
-    if (isinstance(limit, NA) or limit != limit):
+    if isinstance(limit, NA) or limit != limit:
         limit = None
     elif limit is not None:
         limit = _price_round(limit, direction_sign)  # TODO: test this if the direction here is correct
-    if (isinstance(stop, NA) or stop != stop):
+    if isinstance(stop, NA) or stop != stop:
         stop = None
     elif stop is not None:
         stop = _price_round(stop, -direction_sign)  # TODO: test this if the direction here is correct
