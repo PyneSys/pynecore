@@ -2367,7 +2367,14 @@ class SimPosition(PositionBase):
         mintick = syminfo.mintick
         if equity >= 1e7 and mintick and mintick > 0:
             return math.floor(equity / mintick + 0.5) < math.floor(margin_needed / mintick)
-        return margin_needed - equity > abs(equity) * 1e-11
+        reject = margin_needed - equity > abs(equity) * 1e-11
+        import os as _os  # TEMP DEBUG (remove)
+        if _os.environ.get("PYNE_MARGIN_LOG"):
+            with open(_os.environ["PYNE_MARGIN_LOG"], "a") as _f:
+                _f.write(f"{lib.bar_index}\t{order.sign}\t{new_qty!r}\t{fill_price!r}\t"
+                         f"{margin_needed!r}\t{equity!r}\t"
+                         f"{margin_needed - equity!r}\t{'REJECT' if reject else 'fill'}\n")
+        return reject
 
     def _cancel_same_bar_reversal_closes(self, entry_order: Order) -> None:
         """
@@ -3726,10 +3733,12 @@ def _default_entry_qty(price: float) -> float:
     return money / unit_cost
 
 
-# Distance threshold (in ticks) of the big-money gate's down-step: an
-# inflated threshold landing on an even grid multiple steps down one grid
-# unit only when it cleared the inflated cost by more than this. Bracketed
-# in (0.0783, 0.1034) ticks on TV probes; 3/32 is the binary-exact candidate.
+# Distance threshold (in ticks) of the big-money gate's down-step in the
+# price >= 1e5 regime: an inflated threshold landing on an even grid
+# multiple steps down one grid unit only when it cleared the inflated cost
+# by more than this. Bracketed in (0.0783, 0.1034) ticks on TV probes;
+# 3/32 is the binary-exact candidate. Below price 1e5 the down-step has
+# no such guard (a probe filled 0.056 ticks below the even cell).
 _GATE_DOWN_STEP_DELTA = 0.09375
 
 
@@ -3738,7 +3747,7 @@ def _ceil_to_grid(value: float, grid: float) -> tuple[int, float]:
 
     ``value / grid`` alone can round across an integer near a grid point; the
     correction loops re-check with ``k * grid`` products, which are exact for
-    the tick grids (0.5, 5) and magnitudes (< 2^53) involved.
+    the tick grids (0.5, 5, 50) and magnitudes (< 2^53) involved.
 
     :param value: The value to quantize upward
     :param grid: The grid step
@@ -3752,20 +3761,23 @@ def _ceil_to_grid(value: float, grid: float) -> tuple[int, float]:
     return k, k * grid
 
 
-def _price_has_odd_f32_offset(price: float) -> bool:
-    """Whether ``price`` sits an odd number of float32-ULP/25 quanta above
-    its float32 lower neighbour, within seven quanta.
+def _price_f32_offset_k(price: float) -> int:
+    """The odd number of float32-ULP/25 quanta ``price`` sits above its
+    float32 lower neighbour, or 0 when the relationship does not hold.
 
     TV's big-money gate inflates its cost threshold only on bars whose close
-    has this float32 relationship (measured 38/38 on BINANCE:BTCUSDT 30m; in
-    the [2^16, 2^17) binade the quantum is 1/32 tick). A close exactly
-    representable in float32 (offset 0) does not inflate.
+    has this float32 relationship within seven quanta (measured 38/38 on
+    BINANCE:BTCUSDT 30m; in the [2^16, 2^17) binade the quantum is 1/32
+    tick). A close exactly representable in float32 (offset 0) does not
+    inflate. The quantum count feeds the membership predicate in
+    :func:`_gate_entry_lots` (only offsets small relative to the price
+    inflate), so the count itself is returned.
 
     :param price: The bar close driving the gate
-    :return: True when the odd-offset relationship holds
+    :return: The odd quantum count (1/3/5/7), or 0 when not an odd-offset bar
     """
     if price <= 0.0 or not math.isfinite(price):
-        return False
+        return 0
     f32 = struct.unpack('<f', struct.pack('<f', price))[0]
     bits = struct.unpack('<I', struct.pack('<f', f32))[0]
     if f32 > price:
@@ -3773,10 +3785,12 @@ def _price_has_odd_f32_offset(price: float) -> bool:
         f32 = struct.unpack('<f', struct.pack('<I', bits))[0]
     ulp = struct.unpack('<f', struct.pack('<I', bits + 1))[0] - f32
     if ulp <= 0.0 or not math.isfinite(ulp):
-        return False
+        return 0
     quanta = (price - f32) * 25.0 / ulp
     k = round(quanta)
-    return k % 2 == 1 and k <= 7 and abs(quanta - k) < 0.25
+    if k % 2 == 1 and k <= 7 and abs(quanta - k) < 0.25:
+        return k
+    return 0
 
 
 def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
@@ -3784,8 +3798,10 @@ def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
     """Judge an entry of ``lots`` lots against TV's big-money margin gate.
 
     From 1e9 cost ticks upward TV quantizes the order cost onto a tick grid
-    (0.5 tick, 5 ticks from 1e10 cost ticks) and compares the raw equity tick
-    count against the quantized threshold:
+    (0.5 tick, 5 ticks from 1e10 cost ticks, 50 ticks from 1e11 — decimal
+    decade steps; the 1e11 switch bracketed in (8.79e10, 1.2945e11] with the
+    binary 2^37 candidate refuted at 1.2945e11) and compares the raw equity
+    tick count against the quantized threshold:
 
     - equity >= threshold: the entry fills as sized;
     - equity below threshold but at least the plain grid ceiling of the cost
@@ -3793,15 +3809,21 @@ def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
     - equity below the plain grid ceiling: the parity of the grid multiple
       decides — even rejects, odd fills one lot less.
 
-    On odd-float32-offset bars (see :func:`_price_has_odd_f32_offset`) with
-    price >= 1e5 the threshold is the grid ceiling of the cost inflated by
-    2^-31 relative; an inflated threshold landing on an EVEN grid multiple
-    steps one grid unit down when it cleared the inflated cost by more than
-    ``_GATE_DOWN_STEP_DELTA`` (never below the plain ceiling, and not when
-    the cost sits exactly on the grid). Reverse-engineered on BINANCE:BTCUSDT
-    30m one-shot probes: 19,613 of 19,614 measurements reproduced, boundary
-    decade 21/22 (below C 1e5 rare inflated bars exist whose slope selector
-    is unmapped; they are treated as uninflated here).
+    On odd-float32-offset bars (see :func:`_price_f32_offset_k`) whose
+    offset is small relative to the price (offset / price < 3 * 2^-27,
+    i.e. 8 * k below 75 times the price's binary fraction) the threshold
+    is the grid ceiling of an inflated cost: the cost times (1 + 2^-31)
+    for closes >= 1e5, or the cost plus an absolute 5e-6 account currency
+    per contract for closes below 1e5. An inflated threshold landing on
+    an EVEN grid multiple steps one grid unit down (never below the plain
+    ceiling, and not when the cost sits exactly on the grid); in the
+    >= 1e5 regime the step additionally requires clearing the inflated
+    cost by more than ``_GATE_DOWN_STEP_DELTA``. Reverse-engineered on
+    BINANCE:BTCUSDT 30m one-shot probes: 19,613 of 19,614 measurements
+    reproduced at >= 1e5 (boundary decade 21/22), 378 of 378 in the
+    2026-07-30/31 sub-1e5 census (membership band edges bracketed at
+    k=5 close 69,826..69,980 and k=7 close 97,849..97,912; per-contract
+    inflation windows intersect in (4.9975e-6, 5.0555e-6]).
 
     :param equity_ticks: Raw equity tick count (equity / mintick)
     :param lots: Entry size in lot units
@@ -3813,13 +3835,26 @@ def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
         entry is rejected
     """
     cost = lots / rfactor * unit_cost / mintick
-    grid = 5.0 if cost >= 1e10 else 0.5
+    grid = 50.0 if cost >= 1e11 else 5.0 if cost >= 1e10 else 0.5
     k0, m0 = _ceil_to_grid(cost, grid)
     m_eff = m0
-    if price >= 1e5 and _price_has_odd_f32_offset(price):
-        inflated = cost * (1.0 + 2.0 ** -31)
+    k_off = _price_f32_offset_k(price)
+    # Membership: the threshold inflates only when the close's float32
+    # offset is small relative to the price — offset / price < 3 * 2^-27
+    # with offset = k * ulp32 / 25 reduces to the binade-free predicate
+    # 8 * k < 75 * frac, where price = frac * 2^exp (frac in [0.5, 1)).
+    # Magnitude: 2^-31 relative for closes >= 1e5; below 1e5 an absolute
+    # 5e-6 account currency per contract instead, and the down-step loses
+    # its delta guard (probe census 2026-07-30/31, 378/378 reproduced).
+    if k_off and 8.0 * k_off < 75.0 * math.frexp(price)[0]:
+        if price >= 1e5:
+            inflated = cost * (1.0 + 2.0 ** -31)
+            delta = _GATE_DOWN_STEP_DELTA
+        else:
+            inflated = cost + lots / rfactor * (5e-6 / mintick)
+            delta = 0.0
         k_eff, m_eff = _ceil_to_grid(inflated, grid)
-        if k_eff % 2 == 0 and m_eff - inflated > _GATE_DOWN_STEP_DELTA:
+        if k_eff % 2 == 0 and m_eff - inflated > delta:
             down = m_eff - grid
             if not (down == m0 == cost):
                 m_eff = max(m0, down)
@@ -3912,7 +3947,7 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
         return size
     money_ticks = money / mintick
     next_cost = (lots + 1) / rfactor * unit_cost / mintick
-    next_grid = 5.0 if next_cost >= 1e10 else 0.5
+    next_grid = 50.0 if next_cost >= 1e11 else 5.0 if next_cost >= 1e10 else 0.5
     _, next_m0 = _ceil_to_grid(next_cost, next_grid)
     if math.floor(money_ticks) >= next_m0 - next_grid:
         lots += 1
