@@ -15,10 +15,15 @@ zip-safe = false  # Critical for import hooks
 egg_info.egg_base = "build"
 
 [project]
-name = "pynesys-pynecore"
-version = "6.8.5" # PineVersion.Major.Minor
-description = "Python based Pine Script like runtime and API"
+# rubycell fork of PyneSys/pynecore, published under a distinct dist name to
+# avoid collision with the upstream `pynesys-pynecore`. The import package stays
+# `pynecore` so transpiler-generated code runs unchanged. Upstream authorship and
+# the Apache-2.0 NOTICE ("Powered by PyneSys") are retained per Section 4(d).
+name = "opencode-pyneruntime"
+version = "6.8.5" # PineVersion.Major.Minor — tracks upstream
+description = "PyneCore runtime (rubycell fork of PyneSys/pynecore) — Pine Script-like runtime and API"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
+maintainers = [{ name = "rubycell" }]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
