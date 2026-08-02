@@ -6,6 +6,11 @@ import math
 import statistics
 
 from ..utils.sequence_view import SequenceView
+# Pine's absolute comparison tolerance. Only the array operations MEASURED to
+# compare tolerantly use it (see core/pine_compare.py); ``binary_search``,
+# ``max``/``min``, ``mode``, ``median`` and the percentile functions were
+# measured bit-exact and must stay that way.
+from ..core.pine_compare import EPSILON as _EPSILON, equal as _equal
 
 from ..types.na import NA, na_float
 from ..types.color import Color
@@ -330,11 +335,19 @@ def includes(id: list[T], value: T) -> bool:
     """
     Returns true if the array contains the specified value, false otherwise.
 
+    The search is TOLERANT (measured on TradingView, probe m548): a float
+    within ``EPSILON`` of an element counts as present. ``binary_search`` is
+    bit-exact by contrast, so the two disagree on near-equal values — that is
+    TradingView's own behaviour, not an inconsistency to smooth over.
+
     :param id: Input array
     :param value: Value to search for
     :return: True if the array contains the specified value, false otherwise
     """
-    return value in id
+    for item in id:
+        if _equal(item, value):
+            return True
+    return False
 
 
 # noinspection PyShadowingBuiltins
@@ -342,14 +355,17 @@ def indexof(id: list[T], value: T) -> int:
     """
     Returns the index of the first occurrence of the specified value in the array.
 
+    The search is TOLERANT, like ``includes`` (measured on TradingView, probe
+    m548/m551).
+
     :param id: Input array
     :param value: Value to search for
     :return: Index of the first occurrence of the specified value in the array
     """
-    try:
-        return id.index(value)
-    except ValueError:
-        return -1
+    for i, item in enumerate(id):
+        if _equal(item, value):
+            return i
+    return -1
 
 
 # noinspection PyShadowingBuiltins
@@ -395,14 +411,17 @@ def lastindexof(id: list[T], value: T) -> int:
     """
     Returns the index of the last occurrence of the specified value in the array.
 
+    The search is TOLERANT, like ``indexof`` (measured on TradingView, probe
+    m551).
+
     :param id: Input array
     :param value: Value to search for
     :return: Index of the last occurrence of the specified value in the array
     """
-    try:
-        return len(id) - 1 - id[::-1].index(value)
-    except ValueError:
-        return -1
+    for i in builtins.range(len(id) - 1, -1, -1):
+        if _equal(id[i], value):
+            return i
+    return -1
 
 
 # noinspection PyShadowingBuiltins
@@ -761,8 +780,15 @@ def percentrank(id: list[Number], index: int) -> float:
     if isinstance(value, NA) or value != value:
         return na_float
 
-    # Count non-na elements less than or equal to the target value
-    count = builtins.sum(1 for x in id if not (isinstance(x, NA) or x != x) and x <= value)
+    # Count non-na elements less than or equal to the target value. The
+    # comparison is TOLERANT (measured on TradingView through ta.percentrank,
+    # probe m548: a window whose other values sit a sub-EPSILON step above the
+    # current one still ranks 100). The raw ``<=`` comes first because two
+    # equal infinities have a nan difference, which the tolerance band alone
+    # would reject.
+    count = builtins.sum(1 for x in id
+                         if not (isinstance(x, NA) or x != x)
+                         and (x <= value or x - value <= _EPSILON))
 
     # Calculate percentage
     return (count - 1) * 100 / (len(id) - 1)

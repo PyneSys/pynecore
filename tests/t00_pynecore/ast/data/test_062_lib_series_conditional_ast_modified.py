@@ -13,7 +13,7 @@ def main(__state·main__):
     def nested():
         value = __state·main__[0][1] if True else lib.low
         my_box: lib.box = lib.box(__state·main__[1][2] if False else lib.high)
-        result = __state·main__[3][3] if __state·main__[2][1] > 100 else lib.close
+        result = __state·main__[3][3] if 1e-10 < __state·main__[2][1] - 100 else lib.close
         return (value, my_box, result)
     res = nested()
     print(res)

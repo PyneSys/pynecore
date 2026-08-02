@@ -8,11 +8,13 @@ from pynecore.lib import script, log, bar_index, math, ta
 @script.indicator(title="Math Sum Flat Exact", shorttitle="math_sum_flat_exact")
 def main():
     # TV-parity regression on flat windows: TV's rolling sum carries residual
-    # rounding dust INTO a flat run (the zero window here displays ~-2.8e-14,
-    # not exact 0.0), yet the ``sma(sma(x, 3), 3)`` chain of a flat series
-    # still converges to ``k == d`` a few bars in (the TV Technical Ratings
-    # ``kStochRsi < dStochRsi`` idiom). The expected log is real TV output
-    # for this exact sequence (m466 probe, 2026-08-02).
+    # rounding dust INTO a flat run (the zero window here holds ~-2.8e-14, not
+    # exact 0.0), yet TV's own ``==`` still reports the window equal to zero —
+    # the dust sits far below the 1e-10 comparison tolerance. The two booleans
+    # therefore pin the accumulator and the operator semantics at once (the TV
+    # Technical Ratings ``kStochRsi < dStochRsi`` idiom lives on the same
+    # edge). Expected log: TV's own plotted comparison results for this exact
+    # sequence (m546 probe, 2026-08-02).
     v: Persistent[float] = 0.0
     if bar_index < 10:
         v = float(bar_index) * 7.3 + 0.1  # noisy warmup charges the residue

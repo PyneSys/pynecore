@@ -65,13 +65,18 @@ def _get_transform_pipeline_hash() -> str:
     Hashing the pipeline *contents* — this module plus every file under
     ``transformers/`` (``module_properties.json`` shapes the output yet has no
     bytecode of its own) — keeps the check deterministic and immune to file mtimes,
-    cache markers and read-only install locations.
+    cache markers and read-only install locations. Every file a transformer bakes a
+    value from must be hashed as well, or the constant could change while the
+    digest stays put; ``core/pine_compare.py`` (the comparison tolerance the
+    ``FloatToleranceTransformer`` emits as a literal) is such a file.
 
     :return: Hex digest pinning the transform pipeline.
     """
     global _transform_pipeline_hash
     if _transform_pipeline_hash is None:
-        files = [Path(__file__)]  # this module pins the transformer pipeline order
+        # This module pins the transformer pipeline order; ``pine_compare`` holds
+        # a constant the pipeline bakes into the emitted bytecode
+        files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
         transformers_dir = Path(__file__).parent.parent / "transformers"
         try:
             files.extend(transformers_dir.iterdir())
@@ -209,7 +214,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.input_transformer import InputTransformer
             from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
-            from pynecore.transformers.ne_guard import NeGuardTransformer
+            from pynecore.transformers.float_tolerance import FloatToleranceTransformer
             from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
             from pynecore.transformers.locations import fix_locations
 
@@ -250,10 +255,11 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = SafeDivisionTransformer().visit(transformed)
             # After SafeDivision so wrapped operands (safe_div calls) are bound
             # once by the walrus instead of evaluating twice. Only user/compiled
-            # scripts get the guard: pynecore's own lib modules use the raw
-            # ``x != x`` nan idiom deliberately, and wrapping it would invert it
+            # scripts get Pine's tolerant comparison semantics: pynecore's own
+            # lib modules implement the natively bit-exact builtins and use the
+            # raw ``x != x`` nan idiom, both of which the rewrite would break
             if not path.is_relative_to(Path(__file__).parent.parent):
-                transformed = NeGuardTransformer().visit(transformed)
+                transformed = FloatToleranceTransformer().visit(transformed)
             transformed = apply_layout(transformed, slot_layout)
 
             # Debugger-safe variant of ast.fix_missing_locations: synthetic

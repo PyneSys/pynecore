@@ -17,6 +17,9 @@ from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
 from ..core import safe_convert
+# Pine's absolute comparison tolerance. Only the builtins MEASURED to compare
+# tolerantly use it (see core/pine_compare.py); the bit-exact ones must not.
+from ..core.pine_compare import EPSILON as _EPSILON
 
 # We need to use this kind of import to make transformer work
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
@@ -283,6 +286,10 @@ def cmo(source: float, length: int) -> PyneFloat:
     """
     Calculate the Chande Momentum Oscillator (CMO) of the source series with the given length.
 
+    The momentum sign test is TOLERANT (measured on TradingView, probe m548):
+    a momentum below ``EPSILON`` in magnitude lands in the up bucket, so a
+    sub-tolerance zig-zag collapses both sums to zero and the result is na.
+
     :param source: The source series
     :param length: The length of the CMO
     :return: The Chande Momentum Oscillator (CMO) of the source series
@@ -290,9 +297,15 @@ def cmo(source: float, length: int) -> PyneFloat:
     momentum = change(source)
     if isinstance(momentum, NA) or momentum != momentum:
         return na_float
-    sum1 = lib_math.sum(momentum if momentum >= 0.0 else 0.0, length)
-    sum2 = lib_math.sum(0.0 if momentum >= 0.0 else -momentum, length)
-    return 100 * (sum1 - sum2) / (sum1 + sum2)
+    rising_momentum = momentum >= -_EPSILON
+    sum1 = lib_math.sum(momentum if rising_momentum else 0.0, length)
+    sum2 = lib_math.sum(0.0 if rising_momentum else -momentum, length)
+    total = sum1 + sum2
+    if total == 0.0:
+        # Both buckets empty (a flat window, or a sub-tolerance zig-zag that
+        # cancels): TradingView's 0/0 is nan, so the oscillator is na
+        return na_float
+    return 100 * (sum1 - sum2) / total
 
 
 # noinspection PyUnusedLocal,PyShadowingBuiltins
@@ -584,6 +597,9 @@ def falling(source: float, length: int) -> bool:
     """
     Test if the source series is now falling for length bars long.
 
+    The fall test is TOLERANT (measured on TradingView, probe m547): a step
+    smaller than ``EPSILON`` does not count as falling.
+
     :param source: The source series
     :param length: The length of the falling test
     :return: True if the source series is falling for length bars long
@@ -598,7 +614,7 @@ def falling(source: float, length: int) -> bool:
         last_val = source
         return False
 
-    if source < last_val:
+    if last_val - source > _EPSILON:
         counter += 1
     else:
         counter = 0
@@ -990,6 +1006,12 @@ def mfi(source: float, length: int) -> PyneFloat:
     """
     Calculate the Money Flow Index (MFI) of the source series with the given length.
 
+    The money-flow direction test is TOLERANT (measured on TradingView, probe
+    m548/m549): a price change below ``EPSILON`` in magnitude counts as neither
+    inflow nor outflow. TradingView also guards the empty case — with both
+    sums zero it returns 100, not na (probe m550, measured on an exactly flat
+    source where the tolerance plays no part).
+
     :param source: The source series
     :param length: The length of the MFI
     :return: The Money Flow Index (MFI) of the source series
@@ -1000,11 +1022,15 @@ def mfi(source: float, length: int) -> PyneFloat:
     length = int(length)
 
     chg = change(source)
-    upper = lib_math.sum(volume * (0.0 if not (isinstance(chg, NA) or chg != chg) and chg <= 0 else source), length)
-    lower = lib_math.sum(volume * (0.0 if not (isinstance(chg, NA) or chg != chg) and chg >= 0 else source), length)
+    chg_na = isinstance(chg, NA) or chg != chg
+    upper = lib_math.sum(volume * (0.0 if not chg_na and chg <= _EPSILON else source), length)
+    lower = lib_math.sum(volume * (0.0 if not chg_na and chg >= -_EPSILON else source), length)
     if (isinstance(upper, NA) or upper != upper) or (isinstance(lower, NA) or lower != lower):
         return na_float
-    return 100.0 - (100 * lower / (upper + lower))
+    total = upper + lower
+    if total == 0.0:
+        return 100.0
+    return 100.0 - (100 * lower / total)
 
 
 # noinspection PyShadowingBuiltins
@@ -1574,6 +1600,10 @@ def rising(source: float, length: int) -> bool:
     """
     Test if the source series is now rising for length bars long.
 
+    The rise test is TOLERANT (measured on TradingView, probe m547): a step
+    smaller than ``EPSILON`` does not count as rising, unlike ``ta.crossover``
+    or ``ta.highest``, which are bit-exact.
+
     :param source: The source series
     :param length: The length of the rising test
     :return: True if the source series is rising for length bars long
@@ -1588,7 +1618,7 @@ def rising(source: float, length: int) -> bool:
         last_val = source
         return False
 
-    if source > last_val:
+    if source - last_val > _EPSILON:
         counter += 1
     else:
         counter = 0

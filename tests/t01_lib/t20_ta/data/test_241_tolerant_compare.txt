@@ -1,0 +1,6 @@
+[2025-01-01T00:00:00.000-00:00]: rise false/false fall false/true prank 100/60 cmo NaN mfi 100 hi 0.995 hib -2 xover false
+[2025-01-01T00:00:00.000-00:00]: rise false/true fall false/false prank 100/100 cmo NaN mfi 100 hi 0.995 hib 0 xover true
+[2025-01-01T00:00:00.000-00:00]: rise false/false fall false/true prank 100/60 cmo NaN mfi 100 hi 0.995 hib -1 xover false
+[2025-01-01T00:00:00.000-00:00]: rise false/true fall false/false prank 100/60 cmo NaN mfi 100 hi 0.995 hib -2 xover false
+[2025-01-01T00:00:00.000-00:00]: rise false/false fall false/true prank 100/100 cmo NaN mfi 100 hi 0.995 hib 0 xover true
+[2025-01-01T00:00:00.000-00:00]: rise false/true fall false/false prank 100/60 cmo NaN mfi 100 hi 0.995 hib -1 xover false
