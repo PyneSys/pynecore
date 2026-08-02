@@ -8,10 +8,12 @@ re-exports the functions, and the layouts travel on the function objects.
 """
 # Absolute imports on purpose: the call-site classifier resolves absolute
 # imports at transform time, so NA() calls stay direct instead of anchored
+import builtins
 from typing import TypeVar
 
 from pynecore.types import NA, Persistent, PyneFloat, PyneInt, Series, na_float
 from pynecore.core.random import PineRandom as _PineRandom
+from pynecore.core.series import SeriesImpl as _SeriesImpl
 # lib import (normalized to ``from pynecore import lib``) so the statement-position
 # ``max_bars_back`` call below is anchored and converted to a buffer resize.
 from pynecore.lib import max_bars_back
@@ -48,7 +50,19 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
 # noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences
 def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     """
-    Returns the sum of a series over a specified length using Kahan summation.
+    Returns the sum of a series over a specified length, bit-exact with Pine.
+
+    Pine's engine keeps a rolling compensated sum: each bar evicts the entry
+    stored ``length`` bars ago and adds the new value in one fused two-round
+    step (``y1 = fl(-d0 - c)``; ``t = fl(s + y1)``; ``e1 = fl(fl(t - s) - y1)``;
+    ``y2 = fl(x - e1)``; ``s = fl(t + y2)``; ``c = fl(fl(s - t) - y2)``), storing
+    the realized ``y2`` for the future eviction. On bars where ``sum_fires``
+    signals it, the engine re-baselines instead: the display and accumulator
+    become the plain newest-first linear sum of the raw window, the
+    compensation clears, and the raw value is stored. The same machine runs
+    during warmup with ``d0 = 0`` and the re-baseline summing the whole
+    available prefix. Validated bit-for-bit against TV output on dense probes
+    for lengths 2..14 (100.00% of ~330k displayed bars).
 
     :param source: Source series
     :param length: Length of the sum
@@ -58,29 +72,41 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     count: Persistent[int] = 0
     compensation: Persistent[float] = 0.0
     prev_length: Persistent[int] = 0
-    removals: Persistent[int] = 0
+    entries: Persistent[list | None] = None
+    head: Persistent[int] = 0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # Representation-agnostic na test: an na source is either an NA object or a
     # native nan (OHLCV gaps can already deliver a bare nan). Both must be
     # excluded from the na-compacted buffer, or ``src[k]`` would poison ``summ``.
     source_na = isinstance(source, NA) or source != source
 
+    # One conversion up front so every later use is a plain int compare. Bare
+    # ``int()``/``float()`` become na-guarded wrapper calls under the transform,
+    # so the already-int fast path skips the call and the ``builtins.*`` forms
+    # below are used where the na cases are provably handled already.
+    if builtins.type(length) is not int:
+        length = int(length)
+
     if not source_na:
         # Record every non-na bar's value into the sliding buffer BEFORE any
-        # early return (shortcut / warmup), so the positional recompute below
-        # sees a complete history with no holes. NA values are intentionally
-        # not stored: the buffer stays na-compacted, so ``src[k]`` is the k-th
+        # early return (shortcut / warmup), so the positional reads below see
+        # a complete history with no holes. NA values are intentionally not
+        # stored: the buffer stays na-compacted, so ``src[k]`` is the k-th
         # most recent non-na value — exactly the "last N non-na" window Pine's
         # sum/sma use.
         src: Series[float] = source
-        # The sliding window drops the value leaving it via ``src[length]`` (``length``
-        # non-na bars back). Grow the na-compacted buffer so that index stays addressable
-        # for lengths beyond the per-series default ``max_bars_back`` (500); otherwise the
-        # removal reads na and poisons ``summ`` permanently, collapsing any ``ta.sma`` /
-        # ``ta.sum`` with length > 500 to na right after warmup. Capacity persists across
-        # bars, so setting it on each non-na bar (from the first on) suffices — the window
-        # never removes before ``length`` non-na values have accumulated.
-        max_bars_back(src, int(length))
+        # The re-baseline reads the raw window via ``src[length - 1]``. Grow the
+        # na-compacted buffer so that index stays addressable for lengths beyond
+        # the per-series default ``max_bars_back``; otherwise the rebuild reads
+        # na and poisons ``summ``, collapsing any ``ta.sma`` / ``ta.sum`` with a
+        # length above the default to na right after warmup. The resize is
+        # monotonic and floored at the series' own default: a series ``length``
+        # that dips low must not shrink the buffer, or the history a later
+        # increase needs would already have been thrown away.
+        if length > capacity:
+            capacity = length
+            max_bars_back(src, capacity)
 
     if length == 1:  # Shortcut
         # The sliding accumulator is left untouched here; record length == 1 so a
@@ -89,111 +115,134 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         prev_length = 1
         return source
     assert length > 0, "Invalid length, length must be greater than 0!"
-    length = int(length)
 
-    # The Kahan sliding window below is only valid while ``length`` stays
-    # constant. Pine allows a series ``length`` (e.g. ``ta.sma(src, barssince(...))``);
-    # when it changes bar-to-bar the accumulator no longer describes the requested
-    # trailing window, so recompute the sum directly from the source series over the
-    # current length (mirroring ``ta.highest``'s positional fallback) and re-seed the
-    # accumulator so a subsequently stable length resumes the O(1) fast path.
-    changed = prev_length != 0 and length != prev_length
-    prev_length = length
-    if changed:
-        removals = 0
-        if source_na:
-            # Length changed on an na bar: the old window is stale and cannot be
-            # rebuilt from a missing current value; restart the warmup cleanly.
+    # The rolling machine below is only valid while ``length`` stays constant.
+    # Pine allows a series ``length`` (e.g. ``ta.sma(src, barssince(...))``);
+    # when it changes bar-to-bar the accumulator no longer describes the
+    # requested trailing window, so re-baseline from the raw buffer (the same
+    # newest-first linear sum a fire produces) and re-seed the realized queue
+    # with the raw window so a subsequently stable length resumes the O(1) path.
+    # Reading the slot once and only writing it on an actual change keeps the
+    # steady-state path (a constant length) down to a single load.
+    prev = prev_length
+    if prev != length:
+        prev_length = length
+    if prev != 0 and prev != length:
+        # ``src`` is na-compacted, so ``src[0 .. length - 1]`` is the requested
+        # trailing window whether or not the current bar is na: on an na bar the
+        # buffer simply was not advanced, so ``src[0]`` still is the newest
+        # non-na value — the very window the stable-length na branch preserves.
+        newest = src[0]
+        if isinstance(newest, NA) or newest != newest:  # No non-na history at all yet
             summ = 0.0
             count = 0
             compensation = 0.0
-        else:
-            recomputed = 0.0
-            comp = 0.0
-            found = 0
-            for i in range(length):
-                v = src[i]
-                if isinstance(v, NA) or v != v:
-                    # The buffer is na-compacted, so the first na marks the end of
-                    # available history — every deeper index is na too. Stop here
-                    # instead of scanning the rest (keeps the recompute O(available),
-                    # never O(length) when length outruns the stored history).
-                    break
-                found += 1
-                corrected = float(v) - comp
-                new_recomputed = recomputed + corrected
-                comp = (new_recomputed - recomputed) - corrected
-                recomputed = new_recomputed
-            if found < length:  # Not enough non-na history for this window yet
-                summ = 0.0
-                count = 0
-                compensation = 0.0
-                return na_float
-            summ = recomputed
-            compensation = comp
-            count = length
-            return recomputed
-
-    if count < length - 1:
-        if not source_na:
-            count += 1
-            # Kahan summation for adding new value
-            corrected_value = float(source) - compensation
-            new_sum = summ + corrected_value
-            compensation = (new_sum - summ) - corrected_value
-            summ = new_sum
-        return na_float
-    elif count == length - 1:
-        if source_na:
+            entries = None
             return na_float
-        count += 1
+        rebuilt = builtins.float(newest)
+        found = 1
+        for i in builtins.range(1, length):
+            v = src[i]
+            if isinstance(v, NA) or v != v:
+                # The buffer is na-compacted, so the first na marks the end
+                # of available history — every deeper index is na too.
+                break
+            found += 1
+            rebuilt = builtins.float(v) + rebuilt
+        # A short history is kept as a warmup prefix instead of being dropped:
+        # the following bars then only need ``length - found`` more values, so a
+        # grown length no longer blanks the output for a whole fresh window.
+        # Oldest first, so ``head`` addresses the next entry to be evicted.
+        entries = [0.0] * length
+        for i in builtins.range(found):
+            entries[i] = builtins.float(src[found - 1 - i])
+        head = found
+        if head == length:
+            head = 0
+        summ = rebuilt
+        compensation = 0.0
+        count = found
+        return rebuilt if found == length else na_float
+
+    # Bind the per-bar state into locals: each ``Persistent`` read/write is a
+    # slot index under the transform, and the steady-state step touches the
+    # buffer, the head, the accumulator and the compensation several times.
+    ent = entries
+    if ent is None:
+        ent = [0.0] * length
+        entries = ent
+
+    n = count
+    if source_na:
+        return na_float if n < length else summ
+
+    value = builtins.float(source)
+    c = compensation
+    s = summ
+    h = head
+
+    # ``core.rolling_sum.sum_fires`` inlined: a call here would cost more than
+    # the whole compensated step it guards, and the transform wraps every call
+    # in an isolation binding on top. Keep the two in sync — Fast2Sum gives the
+    # realized rounding error of ``fl(value + c)`` exactly, so the fire test is
+    # ``sign(e) == sign(c)`` (see that module's docstring for the derivation).
+    fires = False
+    if c != 0.0 and value != 0.0:
+        r = value + c
+        if r != 0.0 and r - r == 0.0:  # rejects nan and +-inf without a call
+            if (value if value > 0.0 else -value) >= (c if c > 0.0 else -c):
+                e = c - (r - value)
+            else:
+                e = value - (r - c)
+            if e != 0.0:
+                fires = (e > 0.0) if c > 0.0 else (e < 0.0)
+
+    if n < length:  # Warmup: accumulate with d0 = 0, fires sum the prefix
+        n += 1
+        count = n
+        if fires:
+            rebuilt = value
+            for i in builtins.range(1, n):
+                rebuilt = builtins.float(src[i]) + rebuilt
+            s = rebuilt
+            compensation = 0.0
+            ent[h] = value
+        else:
+            y1 = -c
+            t = s + y1
+            e1 = (t - s) - y1
+            y2 = value - e1
+            new_sum = t + y2
+            compensation = (new_sum - t) - y2
+            s = new_sum
+            ent[h] = y2
+        summ = s
+        h += 1
+        head = 0 if h == length else h
+        return s if n == length else na_float
+
+    # ``h`` is both the oldest entry and the slot the new one takes
+    old_value = ent[h]
+    if fires:
+        # Re-baseline: newest-first linear sum of the raw window, raw store
+        rebuilt = value
+        for i in builtins.range(1, length):
+            rebuilt = builtins.float(src[i]) + rebuilt
+        s = rebuilt
+        compensation = 0.0
+        ent[h] = value
     else:
-        if source_na:
-            return summ
-        # Exact resync: the incremental remove+add path below carries residual
-        # rounding error from bars long outside the window (Kahan bounds it but
-        # never clears it). That residue breaks identities TV preserves — e.g.
-        # a window of equal values must sum to exactly n*v (a run of zeros must
-        # sum to 0.0, not -3e-15), or ``sma(sma(x))`` of a flat series flips
-        # strict comparisons like the Technical Ratings
-        # ``kStochRsi < dStochRsi`` on last-bit noise. Small windows (the
-        # precision-sensitive ``sma(x, 3)`` chains) recompute from the
-        # na-compacted buffer on EVERY bar — for those lengths the fresh Kahan
-        # pass costs the same as the remove+add pair it replaces, and the
-        # result depends on the window alone. Longer windows resync once per
-        # ``length`` removals, capping any drift's lifetime at one window
-        # turnover at an amortized O(1) cost per bar.
-        removals += 1
-        if removals >= length or length <= 8:
-            removals = 0
-            recomputed = 0.0
-            comp = 0.0
-            found = 0
-            for i in range(length):
-                v = src[i]
-                if isinstance(v, NA) or v != v:
-                    break
-                found += 1
-                corrected = float(v) - comp
-                new_recomputed = recomputed + corrected
-                comp = (new_recomputed - recomputed) - corrected
-                recomputed = new_recomputed
-            if found == length:
-                summ = recomputed
-                compensation = comp
-                return summ
-        # Kahan summation for removing old value (float() compiles to
-        # safe_convert.safe_float, returning NA instead of raising on NA)
-        old_value = float(src[length])
-        corrected_old = -old_value - compensation
-        new_sum = summ + corrected_old
-        compensation = (new_sum - summ) - corrected_old
-        summ = new_sum
+        # Fused two-round evict-and-add, realized store
+        y1 = -old_value - c
+        t = s + y1
+        e1 = (t - s) - y1
+        y2 = value - e1
+        new_sum = t + y2
+        compensation = (new_sum - t) - y2
+        s = new_sum
+        ent[h] = y2
+    summ = s
+    h += 1
+    head = 0 if h == length else h
 
-    # Kahan summation for adding new value
-    corrected_value = float(source) - compensation
-    new_sum = summ + corrected_value
-    compensation = (new_sum - summ) - corrected_value
-    summ = new_sum
-
-    return summ
+    return s

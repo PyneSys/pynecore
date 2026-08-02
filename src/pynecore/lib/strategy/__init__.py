@@ -2367,14 +2367,7 @@ class SimPosition(PositionBase):
         mintick = syminfo.mintick
         if equity >= 1e7 and mintick and mintick > 0:
             return math.floor(equity / mintick + 0.5) < math.floor(margin_needed / mintick)
-        reject = margin_needed - equity > abs(equity) * 1e-11
-        import os as _os  # TEMP DEBUG (remove)
-        if _os.environ.get("PYNE_MARGIN_LOG"):
-            with open(_os.environ["PYNE_MARGIN_LOG"], "a") as _f:
-                _f.write(f"{lib.bar_index}\t{order.sign}\t{new_qty!r}\t{fill_price!r}\t"
-                         f"{margin_needed!r}\t{equity!r}\t"
-                         f"{margin_needed - equity!r}\t{'REJECT' if reject else 'fill'}\n")
-        return reject
+        return margin_needed - equity > abs(equity) * 1e-11
 
     def _cancel_same_bar_reversal_closes(self, entry_order: Order) -> None:
         """

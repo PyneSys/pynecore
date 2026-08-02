@@ -2832,9 +2832,6 @@
     }
   },
   "lib.ta": {
-    "EPSILON": {
-      "type": "variable"
-    },
     "NA": {
       "type": "variable"
     },

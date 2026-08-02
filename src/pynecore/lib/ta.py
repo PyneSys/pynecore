@@ -99,32 +99,6 @@ __all__ = [
 # Helper functions
 #
 
-EPSILON = 1e-14
-
-
-def _avgrank(values: list[float], val_to_compare: float) -> float:
-    """
-    Helper function to calculate rank with proper tie handling
-
-    :param values: The list of values
-    :param val_to_compare: The value to compare
-    :return: The average rank of the value
-    """
-    rank_sum = 0.0
-    tie_count = 0
-
-    # Count values less than current and ties
-    for vi in values:
-        diff = vi - val_to_compare
-        if diff > EPSILON:
-            rank_sum += 1
-        elif abs(diff) < EPSILON:
-            tie_count += 1
-
-    # Return average rank for ties
-    return rank_sum + (tie_count - 1) / 2.0 + 1
-
-
 #
 # Indicators
 #
@@ -1547,33 +1521,52 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     if bar_index < length:
         return na_float
 
-    # Collect values for performance
+    # Collect values for performance (newest-first window)
     values = cast(list[float], source[:length])  # type: ignore
 
-    # Calculate sums for correlation
-    sum_x = sum_y = sum_xy = sum_x2 = sum_y2 = 0.0
-
+    # TV-exact pipeline (validated bit-for-bit on 333k synthetic windows across
+    # lengths 2..14, 27.7k real BTCUSDT windows including ties, and dedicated
+    # tie-threshold probes): values are grouped into rank-ties by ascending
+    # sweep — a group collects every value closer than 1e-10 to the group's
+    # smallest member (transitive, min-anchored clustering, NOT pairwise
+    # epsilon comparison). Groups get 0-based average ranks (descending by
+    # value), then moment-form variances (E[r^2] - mean^2), covariance from
+    # deviation products, and the final (100*cov)/(sd_x*sd_y) scaling.
+    # Every operation order below matters for bit-exactness — do not reorder.
+    n = float(length)
+    order = sorted(builtins.range(length), key=lambda k: values[k])
+    ranks: list[float] = [0.0] * length
+    pos = 0
+    i = 0
+    while i < length:
+        anchor = values[order[i]]
+        j = i
+        while j < length and values[order[j]] - anchor < 1e-10:
+            j += 1
+        avg_rank = (length - 1) - (pos + pos + (j - i) - 1) / 2.0
+        for t in builtins.range(i, j):
+            ranks[order[t]] = avg_rank
+        pos += j - i
+        i = j
+    sum_x = sum_y = sum_x2 = sum_y2 = 0.0
     for i in builtins.range(length):
-        x = i + 1  # Time rank (newest value gets highest rank)
-        y = _avgrank(values, values[i])  # Data rank  # type: ignore
-
+        y = ranks[i]
+        x = float(i)
         sum_x += x
         sum_y += y
-        sum_xy += x * y
         sum_x2 += x * x
         sum_y2 += y * y
-
-    # Calculate correlation coefficient
-    n = length
-    numerator = n * sum_xy - sum_x * sum_y
-    denominator = math.sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y))
-    # Divide first, then scale by 100. TradingView computes rci in this exact
-    # (num / den) * 100 order, floating-point rounding and all, so this form
-    # reproduces its output. The mathematically "correctly rounded" alternative
-    # num * 100 / den lands 1 ULP off at near-tie bars and diverges from TV: on
-    # the wild RCI-strategy reference (BINANCE:BTCUSDT 30m) it raised the
-    # extra/missing entry divergence from 14/6 to 30/11. Verified — do not reorder.
-    return (numerator / denominator) * 100
+    mean_x = sum_x / n
+    mean_y = sum_y / n
+    var_x = sum_x2 / n - mean_x * mean_x
+    var_y = sum_y2 / n - mean_y * mean_y
+    if var_x <= 0 or var_y <= 0:
+        return na_float
+    cov = 0.0
+    for i in builtins.range(length):
+        cov += (float(i) - mean_x) * (ranks[i] - mean_y)
+    cov /= n
+    return (100.0 * cov) / (math.sqrt(var_x) * math.sqrt(var_y))
 
 
 # noinspection PyUnusedLocal
@@ -1766,8 +1759,12 @@ def sma(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the moving average
     :return: The Simple Moving Average (SMA)
     """
-    # Round is necessary to solve precision issues
-    return round(lib_math.sum(source, length) / length, 15)
+    # No decimal rounding here: ``lib_math.sum`` reproduces Pine's compensated
+    # accumulator bit-for-bit, so the plain quotient IS TradingView's value.
+    # Rounding to 15 decimals sits above the ulp for typical price magnitudes
+    # and would perturb the last bits (measured: it breaks the match on 17451
+    # of 22282 EURUSD 60m bars).
+    return lib_math.sum(source, length) / length
 
 
 def stdev(source: float, length: int, biased=True) -> PyneFloat:

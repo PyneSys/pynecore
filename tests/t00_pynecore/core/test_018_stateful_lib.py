@@ -9,6 +9,8 @@ validation runs through the ``t01_lib`` behavior suites.
 """
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta, UTC
+from fractions import Fraction
+from math import isfinite
 
 from pynecore import lib
 from pynecore.core.instance_state import _make_state
@@ -108,10 +110,30 @@ def __test_math_random_instances_independent__():
 
 ### math.sum ###
 
+def _ref_fires(comp: float, x: float) -> bool:
+    """Exact-arithmetic (Fraction) re-baseline condition, written independently
+    of ``pynecore.core.rolling_sum`` so it doubles as its regression check:
+    fire iff the realized rounding error of ``fl(x + comp)`` has the opposite
+    sign to ``comp`` (ties are already resolved by round-half-even in the
+    float add; exact adds never fire)."""
+    if comp == 0.0 or x == 0.0 or not (isfinite(comp) and isfinite(x)):
+        return False
+    r = x + comp
+    if r == 0.0 or not isfinite(r):
+        return False
+    err = Fraction(r) - (Fraction(x) + Fraction(comp))
+    if err == 0:
+        return False
+    return (err < 0) if comp > 0.0 else (err > 0)
+
+
 def _ref_sum_factory():
-    """The pre-port manual algorithm on a plain list, as an independent
-    bit-exactness reference (NA values are skipped, never buffered)."""
+    """The manual TV rolling-sum machine on plain lists, as an independent
+    bit-exactness reference (NA values are skipped, never buffered): fused
+    two-round compensated evict-and-add, with exact-arithmetic re-baseline
+    detection and newest-first linear window rebuilds."""
     buf: list[float] = []
+    entries: list[float] = []
     summ, count, comp = 0.0, 0, 0.0
 
     def ref(source, length):
@@ -120,39 +142,51 @@ def _ref_sum_factory():
             return source
         length = int(length)
         isna = isinstance(source, NA) or source != source
-        if not isna:
-            buf.append(float(source))
-        if count < length - 1:
-            if not isna:
-                count += 1
-                corrected = float(source) - comp
-                new_sum = summ + corrected
-                comp = (new_sum - summ) - corrected
-                summ = new_sum
-            return NA(float)
-        elif count == length - 1:
-            if isna:
-                return NA(float)
+        if isna:
+            return summ if count >= length else NA(float)
+        x = float(source)
+        buf.append(x)
+        if count < length:  # Warmup: d0 = 0, fires sum the available prefix
             count += 1
+            if _ref_fires(comp, x):
+                acc = x
+                for v in buf[-count:-1][::-1]:
+                    acc = v + acc
+                summ, comp = acc, 0.0
+                entries.append(x)
+            else:
+                y1 = -comp
+                t = summ + y1
+                e1 = (t - summ) - y1
+                y2 = x - e1
+                new_sum = t + y2
+                comp = (new_sum - t) - y2
+                summ = new_sum
+                entries.append(y2)
+            return summ if count == length else NA(float)
+        old = entries.pop(0)
+        if _ref_fires(comp, x):
+            acc = x
+            for v in buf[-length:-1][::-1]:
+                acc = v + acc
+            summ, comp = acc, 0.0
+            entries.append(x)
         else:
-            if isna:
-                return summ
-            old = buf[-1 - length]
-            corrected_old = -old - comp
-            new_sum = summ + corrected_old
-            comp = (new_sum - summ) - corrected_old
+            y1 = -old - comp
+            t = summ + y1
+            e1 = (t - summ) - y1
+            y2 = x - e1
+            new_sum = t + y2
+            comp = (new_sum - t) - y2
             summ = new_sum
-        corrected = float(source) - comp
-        new_sum = summ + corrected
-        comp = (new_sum - summ) - corrected
-        summ = new_sum
+            entries.append(y2)
         return summ
 
     return ref
 
 
 def __test_math_sum_bit_exact__():
-    """ The port matches the manual Kahan algorithm bit for bit, with NA
+    """ The port matches the manual rolling-sum machine bit for bit, with NA
     values hitting the warmup, transition and steady branches """
     values = [1.1, 2.2, NA(float), 3.3, 0.1, NA(float), NA(float), 4.4, 1e-9, 5.5,
               0.3333333333, 7.7, NA(float), 8.8, 1e12, 0.0001, 9.9, 2.5, NA(float), 6.6]
@@ -176,6 +210,59 @@ def __test_math_sum_length_one_shortcut__():
     na_result = lib.math.sum(state, NA(float), 1)
     assert na_result != na_result  # the untouched na source is the native nan
     assert state[2] == 0  # the count slot stayed untouched
+
+
+def __test_math_sum_growing_length_keeps_history__():
+    """ Growing the length reuses the already buffered samples: the first full
+    window is reported as soon as ``length`` values exist, without a fresh
+    warmup gap """
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    results = []
+    with _bars() as next_bar:
+        for v, length in ((1.0, 2), (2.0, 2), (3.0, 5), (4.0, 5), (5.0, 5)):
+            results.append(lib.math.sum(state, v, length))
+            next_bar()
+    assert results[1] == 3.0  # length 2 window: 1 + 2
+    assert results[2] != results[2] or isinstance(results[2], NA)  # only 3 of 5
+    assert results[3] != results[3] or isinstance(results[3], NA)  # only 4 of 5
+    assert results[4] == 15.0  # 1 + 2 + 3 + 4 + 5, no spurious na gap
+
+
+def __test_math_sum_length_change_on_na_bar_keeps_window__():
+    """ A length change on an na bar rebuilds from the na-compacted buffer
+    instead of discarding a window that is already complete """
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    with _bars() as next_bar:
+        for v in (1.0, 2.0, 3.0, 4.0):
+            lib.math.sum(state, v, 2)
+            next_bar()
+        # Length grows to 3 on an na bar: 2 + 3 + 4 is available from history
+        assert lib.math.sum(state, NA(float), 3) == 9.0
+        next_bar()
+        assert lib.math.sum(state, 5.0, 3) == 12.0  # 3 + 4 + 5
+
+
+def __test_math_sum_growth_after_long_short_length_run__():
+    """ A long run at a short length must not shrink the buffer: a later growth
+    still finds the full trailing window in history """
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    with _bars() as next_bar:
+        for i in range(10):
+            lib.math.sum(state, float(i + 1), 2)
+            next_bar()
+        # 7 + 8 + 9 + 10 + 11 — all five values are still buffered
+        assert lib.math.sum(state, 11.0, 5) == 45.0
+
+
+def __test_math_sum_growth_on_na_bar_after_long_run__():
+    """ Same as above, but the growth lands on an na bar: the window is rebuilt
+    from the last five non-na values """
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    with _bars() as next_bar:
+        for i in range(10):
+            lib.math.sum(state, float(i + 1), 2)
+            next_bar()
+        assert lib.math.sum(state, NA(float), 5) == 40.0  # 6 + 7 + 8 + 9 + 10
 
 
 def __test_math_sum_instances_independent__():

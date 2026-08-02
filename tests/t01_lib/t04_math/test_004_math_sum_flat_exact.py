@@ -7,12 +7,12 @@ from pynecore.lib import script, log, bar_index, math, ta
 
 @script.indicator(title="Math Sum Flat Exact", shorttitle="math_sum_flat_exact")
 def main():
-    # Regression for the sliding-window drift class: the incremental Kahan
-    # remove+add path used to carry residual rounding error from bars long
-    # outside the window, so a window of equal values did not sum to exactly
-    # n*v (a run of zeros summed to ~-3e-15) and ``sma(sma(x, 3), 3)`` of a
-    # flat series flipped strict comparisons on last-bit noise (the TV
-    # Technical Ratings ``kStochRsi < dStochRsi`` idiom fired spuriously).
+    # TV-parity regression on flat windows: TV's rolling sum carries residual
+    # rounding dust INTO a flat run (the zero window here displays ~-2.8e-14,
+    # not exact 0.0), yet the ``sma(sma(x, 3), 3)`` chain of a flat series
+    # still converges to ``k == d`` a few bars in (the TV Technical Ratings
+    # ``kStochRsi < dStochRsi`` idiom). The expected log is real TV output
+    # for this exact sequence (m466 probe, 2026-08-02).
     v: Persistent[float] = 0.0
     if bar_index < 10:
         v = float(bar_index) * 7.3 + 0.1  # noisy warmup charges the residue
