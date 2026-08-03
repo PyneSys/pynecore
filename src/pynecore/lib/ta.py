@@ -252,16 +252,15 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     """
     Calculate a simple change with respect to the given bar offset.
 
-    The difference is exact: TradingView subtracts the raw doubles and does not
-    quantize the result (probe m554, measured at a base small enough for a
-    1e-15 step to be representable -- ``ta.change`` reproduced it bit for bit).
-    Dust below Pine's 1e-10 comparison tolerance is absorbed by the comparison
-    operators, not by this function.
-
     :param source: The source series
     :param length: The offset in bars
     :return: The change from source to source[length]
     """
+    # The difference is exact: TradingView subtracts the raw doubles and does not
+    # quantize the result (probe m554, measured at a base small enough for a 1e-15
+    # step to be representable -- ``ta.change`` reproduced it bit for bit). Dust
+    # below Pine's 1e-10 comparison tolerance is absorbed by the comparison
+    # operators, not by this function.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
     # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
@@ -286,9 +285,9 @@ def cmo(source: float, length: int) -> PyneFloat:
     """
     Calculate the Chande Momentum Oscillator (CMO) of the source series with the given length.
 
-    The momentum sign test is TOLERANT (measured on TradingView, probe m548):
-    a momentum below ``EPSILON`` in magnitude lands in the up bucket, so a
-    sub-tolerance zig-zag collapses both sums to zero and the result is na.
+    The momentum sign test is tolerant: a momentum below Pine's comparison tolerance
+    in magnitude lands in the up bucket, so a sub-tolerance zig-zag collapses both
+    sums to zero and the result is na.
 
     :param source: The source series
     :param length: The length of the CMO
@@ -297,6 +296,7 @@ def cmo(source: float, length: int) -> PyneFloat:
     momentum = change(source)
     if isinstance(momentum, NA) or momentum != momentum:
         return na_float
+    # Tolerant sign test, measured on TradingView (probe m548)
     rising_momentum = momentum >= -_EPSILON
     sum1 = lib_math.sum(momentum if rising_momentum else 0.0, length)
     sum2 = lib_math.sum(0.0 if rising_momentum else -momentum, length)
@@ -358,32 +358,23 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     """
     Calculate the correlation of the source series with the given length, bit-exact with Pine.
 
-    Measured law (probes m557, 27.8k bars each, real, synthetic and
-    catastrophic-cancellation sources, na gaps, lengths 1/2/3/5/14/20, every
-    displayed bar bit-identical): with the exact rolling-sum machine
-    ``s = math.sum(...)`` over ``source1``, ``source2``, their product and their
-    squares, and ``mx = sx / length``, ``my = sy / length``, TradingView computes
-
-    - ``cov = sxy / length - mx * my``
-    - ``vx = max(0, sx2 / length - mx * mx)``, likewise ``vy``, the same clamp
-      :func:`variance` uses
-    - ``cov / sqrt(vx * vy)``, a single square root over the product; taking two
-      separate roots differs by one ulp on roughly 40% of bars
-
-    A covariance within Pine's comparison tolerance of zero short-circuits the
-    whole thing to 0.0 -- measured on scaled-down sources: a pair correlated at
-    0.95 still reports 0.0 once its covariance is scaled below 1e-10, and the
-    switch sits exactly at that bound (0.0 up to 9.99999e-11, a real value from
-    1.00001e-10). That tolerance also decides the degenerate cases, where the
-    clamped variance product vanishes and the quotient would be na: constant
-    sources keep their na, while ``length == 1`` (both variances cancel exactly,
-    covariance included) is 0.0 from the very first bar.
+    A covariance within Pine's comparison tolerance of zero makes the result 0.0, even
+    for otherwise strongly correlated sources. The same tolerance decides the degenerate
+    cases: a constant source stays na, while ``length == 1`` is 0.0 from the first bar.
 
     :param source1: The first source series
     :param source2: The second source series
     :param length: The length of the correlation
     :return: The correlation of the source series
     """
+    # Measured law (probes m557, 27.8k bars each, real, synthetic and
+    # catastrophic-cancellation sources, na gaps, lengths 1/2/3/5/14/20, every
+    # displayed bar bit-identical): with the exact rolling-sum machine over both
+    # sources, their product and their squares, TradingView computes
+    #   cov = sxy / length - mx * my
+    #   vx  = max(0, sx2 / length - mx * mx), likewise vy -- the clamp ``variance`` uses
+    #   cov / sqrt(vx * vy), ONE square root over the product; two separate roots
+    #   differ by one ulp on roughly 40% of the bars.
     assert length > 0, "Length must be greater than 0"
     length = int(length)
 
@@ -402,9 +393,14 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     mx = sx / length
     my = sy / length
     cov = sxy / length - mx * my
+    # Measured on scaled-down sources: a pair correlated at 0.95 still reports 0.0
+    # once its covariance is scaled below the tolerance, and the switch sits exactly
+    # at that bound (0.0 up to 9.99999e-11, a real value from 1.00001e-10). This is
+    # also why ``length == 1`` is 0.0 -- there the covariance cancels exactly.
     if -_EPSILON <= cov <= _EPSILON:
         return 0.0
 
+    # A constant source clamps its variance to zero, so the quotient stays na
     var_product = (builtins.max(0.0, sx2 / length - mx * mx)
                    * builtins.max(0.0, sy2 / length - my * my))
     if var_product == 0.0:
@@ -481,15 +477,14 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     """
     Calculate the Mean Absolute Deviation (MAD) of the source series with the given length.
 
-    Bit-exact with Pine (measured, probes m556): TradingView computes the
-    plain newest-first loop ``sum(abs(source[i] - sma)) / length`` -- exactly
-    the shape below with the exact rolling-sum sma.
-
     :param source: The source series
     :param length: The length of the MAD calculation
     :param _mean: The mean value of the source series, if it is already calculated
     :return: The mean absolute deviation of the source series
     """
+    # Bit-exact with Pine (measured, probes m556): TradingView computes the plain
+    # newest-first loop ``sum(abs(source[i] - sma)) / length`` -- exactly the shape
+    # below with the exact rolling-sum sma.
     assert length > 0, "Invalid length, length must be greater than 0!"
     if length == 1:
         return 0.0
@@ -546,23 +541,20 @@ def ema(source: PyneFloat, length: int) -> PyneFloat:
     Calculate the Exponential Moving Average (EMA) of the source series with the given length,
     bit-exact with Pine.
 
-    Measured law (probes m558, 27.8k bars each, lengths 2/5/9/14/21/50/200, every
-    displayed bar bit-identical):
-
-    - ``alpha = 2 / (length + 1)``
-    - the step is ``prev + alpha * (source - prev)``; the algebraically equal
-      ``alpha * source + (1 - alpha) * prev`` drifts from TradingView on more than
-      half of the bars, and so does ``alpha * source + prev - alpha * prev``
-    - the seed is :func:`sma` over the same length, taken on the bar where that
-      sma first exists
-    - na bars are skipped whole: the output is na there and the state does not
-      advance, so the machine sees the last ``length`` non-na values -- the very
-      window the na-compacted :func:`sma` seeds it from
+    The average is seeded with :func:`sma` over the same length. na bars are skipped
+    whole: the result is na there and the state does not advance, so the average always
+    sees the last ``length`` non-na values.
 
     :param source: The source series
     :param length: The length of the EMA
     :return: The Exponential Moving Average (EMA) of the source series
     """
+    # Measured law (probes m558, 27.8k bars each, lengths 2/5/9/14/21/50/200, every
+    # displayed bar bit-identical): alpha = 2 / (length + 1) and the step is
+    # ``prev + alpha * (source - prev)``. The algebraically equal
+    # ``alpha * source + (1 - alpha) * prev`` drifts from TradingView on more than half
+    # of the bars, and so does ``alpha * source + prev - alpha * prev``. The seed is the
+    # na-compacted sma on the bar where that sma first exists.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
     if length == 1:  # Shortcut
@@ -589,8 +581,8 @@ def falling(source: float, length: int) -> bool:
     """
     Test if the source series is now falling for length bars long.
 
-    The fall test is TOLERANT (measured on TradingView, probe m547): a step
-    smaller than ``EPSILON`` does not count as falling.
+    The fall test is tolerant: a step smaller than Pine's comparison tolerance does
+    not count as falling.
 
     :param source: The source series
     :param length: The length of the falling test
@@ -606,6 +598,7 @@ def falling(source: float, length: int) -> bool:
         last_val = source
         return False
 
+    # Tolerant step test, measured on TradingView (probe m547)
     if last_val - source > _EPSILON:
         counter += 1
     else:
@@ -998,16 +991,17 @@ def mfi(source: float, length: int) -> PyneFloat:
     """
     Calculate the Money Flow Index (MFI) of the source series with the given length.
 
-    The money-flow direction test is TOLERANT (measured on TradingView, probe
-    m548/m549): a price change below ``EPSILON`` in magnitude counts as neither
-    inflow nor outflow. TradingView also guards the empty case — with both
-    sums zero it returns 100, not na (probe m550, measured on an exactly flat
-    source where the tolerance plays no part).
+    The money-flow direction test is tolerant: a price change below Pine's comparison
+    tolerance in magnitude counts as neither inflow nor outflow. With both sums zero
+    the result is 100, not na.
 
     :param source: The source series
     :param length: The length of the MFI
     :return: The Money Flow Index (MFI) of the source series
     """
+    # Tolerant direction test measured on TradingView (probes m548/m549); the empty
+    # case was measured separately (probe m550) on an exactly flat source, where the
+    # tolerance plays no part.
     assert length > 0, "Invalid length, length must be greater than 0!"
     if isinstance(source, NA) or source != source:
         return na_float
@@ -1142,12 +1136,8 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     """
     Calculates percentile using method of linear interpolation between the two nearest ranks.
 
-    The interpolation position ``pos = length * percentage / 100 + 0.5`` is
-    TradingView's own (probe m554: a percentage sweep over a window of four
-    separated values walks the ranks in exact half steps).
-
-    See ``percentile_nearest_rank`` for the one case TradingView does NOT
-    compute from the window alone.
+    See ``percentile_nearest_rank`` for the one case TradingView does NOT compute from
+    the window alone.
 
     :param source: The source series
     :param length: The length of the percentile
@@ -1194,7 +1184,10 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
         return na_float
 
     # The na elements of the window sort to the virtual end; n is the full
-    # window length, na included -- same semantics as the array form.
+    # window length, na included -- same semantics as the array form. The
+    # interpolation position ``pos = length * percentage / 100 + 0.5`` inside is
+    # TradingView's own (probe m554: a percentage sweep over a window of four
+    # separated values walks the ranks in exact half steps).
     return array._select_linear_interpolation(sorted_buf, length, percentage)
 
 
@@ -1204,24 +1197,12 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     """
     Calculates percentile using the nearest rank method.
 
-    The rank ``ceil(percentage * length / 100)`` over the ascending window is
-    TradingView's own (probe m552/m554, measured with a percentage sweep over
-    separated values).
-
-    KNOWN DIVERGENCE, deliberately not reproduced: once a window holds values
-    that differ by less than Pine's 1e-10 comparison tolerance, TradingView's
-    series percentiles stop being a function of the window at all. Probe m554
-    ran two series whose windows were element-for-element identical at the same
-    bar but reached that state through different histories, and the same
-    percentage returned different elements from each -- so the builtin carries
-    ordering state across bars rather than sorting the window. The array form
-    (``array.percentile_nearest_rank``) has no such state and matches this
-    implementation on every order of the same values (probe m551/m552).
-
-    Reproducing the stateful ordering would mean re-implementing TradingView's
-    internal buffer maintenance; the payoff is bounded by the tolerance itself,
-    since every candidate the ordering can pick is within 1e-10 of every other,
-    which is exactly the distance Pine's comparison operators ignore.
+    Known divergence, deliberately not reproduced: once a window holds values that
+    differ by less than Pine's comparison tolerance, TradingView's series percentiles
+    stop being a function of the window and may return a different element than this
+    implementation. Every candidate is within that tolerance of every other, so the
+    difference is bounded by the very distance Pine's comparison operators ignore. The
+    array form (``array.percentile_nearest_rank``) has no such behaviour.
 
     :param source: The source series
     :param length: The length of the percentile
@@ -1268,7 +1249,18 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
         return na_float
 
     # The na elements of the window sort to the virtual end; n is the full
-    # window length, na included -- same semantics as the array form.
+    # window length, na included -- same semantics as the array form. The rank
+    # ``ceil(percentage * length / 100)`` inside is TradingView's own (probes
+    # m552/m554, measured with a percentage sweep over separated values).
+    #
+    # The divergence in the docstring was measured with probe m554: two series whose
+    # windows were element-for-element identical at the same bar, but reached that
+    # state through different histories, returned different elements for the same
+    # percentage -- so the builtin carries ordering state across bars instead of
+    # sorting the window. The array form has no such state and matches this
+    # implementation on every order of the same values (probes m551/m552).
+    # Reproducing it would mean re-implementing TradingView's internal buffer
+    # maintenance for a payoff bounded by the comparison tolerance itself.
     return array._select_nearest_rank(sorted_buf, length, percentage)
 
 
@@ -1678,9 +1670,8 @@ def rising(source: float, length: int) -> bool:
     """
     Test if the source series is now rising for length bars long.
 
-    The rise test is TOLERANT (measured on TradingView, probe m547): a step
-    smaller than ``EPSILON`` does not count as rising, unlike ``ta.crossover``
-    or ``ta.highest``, which are bit-exact.
+    The rise test is tolerant: a step smaller than Pine's comparison tolerance does
+    not count as rising, unlike ``ta.crossover`` or ``ta.highest``, which are exact.
 
     :param source: The source series
     :param length: The length of the rising test
@@ -1696,6 +1687,7 @@ def rising(source: float, length: int) -> bool:
         last_val = source
         return False
 
+    # Tolerant step test, measured on TradingView (probe m547)
     if source - last_val > _EPSILON:
         counter += 1
     else:
@@ -1710,15 +1702,15 @@ def rma(source: PyneFloat, length: int) -> PyneFloat:
     Calculate the RMA (Running Moving Average, Wilder's smoothing) of the source series with
     the given length, bit-exact with Pine.
 
-    Measured law (probes m558): the step is ``(prev * (length - 1) + source) / length``. This
-    is NOT :func:`ema` with ``alpha = 1 / length``: both alpha shapes drift from TradingView on
-    the majority of bars, so rma runs its own machine. Seed, warmup bar and na handling are
-    :func:`ema`'s.
+    Seed, warmup bar and na handling are :func:`ema`'s.
 
     :param source: The source series
     :param length: The length of the RMA
     :return: The RMA of the source series
     """
+    # Measured law (probes m558): the step is ``(prev * (length - 1) + source) / length``.
+    # This is NOT ``ema`` with alpha = 1 / length -- both alpha shapes drift from
+    # TradingView on the majority of bars, so rma runs its own machine.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
     if length == 1:  # Shortcut
@@ -1795,18 +1787,17 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     Parabolic SAR (Stop and Reverse) - method devised by J. Welles Wilder, Jr.,
     to find potential reversals in the market price direction of traded goods.
 
-    The comparisons stay bit-exact. They cannot be measured directly -- the
-    builtin takes no source, so a sub-tolerance series cannot be fed into it --
-    but they were bounded instead: over 49k bars of BTCUSDT 30m and EURUSD 1m
-    the smallest non-zero ``|sar - low|`` / ``|sar - high|`` margin was 2.7e-8,
-    with zero margins in the (0, 1e-10) band (probe m555). Exact ties do occur
-    (72 bars), and those decide the same way under either rule.
-
     :param start: Starting value for acceleration factor
     :param inc: Acceleration factor increment
     :param max: Maximum acceleration factor value
     :return: SAR value for current bar
     """
+    # The comparisons below stay exact. They cannot be measured directly -- the builtin
+    # takes no source, so a sub-tolerance series cannot be fed into it -- but they were
+    # bounded instead: over 49k bars of BTCUSDT 30m and EURUSD 1m the smallest non-zero
+    # |sar - low| / |sar - high| margin was 2.7e-8, with zero margins in the (0, 1e-10)
+    # band (probe m555). Exact ties do occur (72 bars) and decide the same way under
+    # either rule.
     assert 0 < start <= max, "Start must be positive and not greater than max!"
     assert inc > 0, "Increment must be positive!"
     assert max <= 0.5, "Maximum cannot exceed 0.5!"
@@ -1909,17 +1900,16 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
     """
     Calculate the standard deviation of the source series with the given length.
 
-    Bit-exact with Pine: TradingView's stdev is exactly ``sqrt`` of its
-    variance on both the biased and unbiased path (measured, probes m556 --
-    27.8k bars per configuration, zero mismatches), and ``variance`` here
-    reproduces that machine bit-for-bit. The clamp inside ``variance`` also
-    matches TV: cancellation regimes floor at zero, so stdev is 0 there, not na.
+    Bit-exact with Pine: it is the square root of :func:`variance`, whose clamp applies
+    here too, so cancellation regimes give 0.0, not na.
 
     :param source: The source series
     :param length: The length of the standard deviation
     :param biased: Specifies whether the biased or unbiased standard deviation is calculated
     :return: The standard deviation of the source series
     """
+    # Measured (probes m556, 27.8k bars per configuration, zero mismatches):
+    # TradingView's stdev is exactly sqrt of its variance on both paths.
     try:
         return math.sqrt(variance(source, length, biased))
     except TypeError:
@@ -1967,16 +1957,15 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
     """
     Calculate Supertrend indicator.
 
-    The band comparisons stay bit-exact, bounded the same way as ``sar``: over
-    49k bars the smallest non-zero band-to-band margin was 1.5e-9 and the
-    smallest close-to-band margin 2.0e-5, with nothing in the (0, 1e-10) band
-    (probe m555). A sub-tolerance perturbation of a band could not flip a
-    direction decision either, since those margins stay four decades above it.
-
     :param factor: ATR multiplier
     :param atr_period: ATR period length
     :return: Tuple of (supertrend value, direction). Direction: 1=down, -1=up
     """
+    # The band comparisons below stay exact, bounded the same way as ``sar``: over 49k
+    # bars the smallest non-zero band-to-band margin was 1.5e-9 and the smallest
+    # close-to-band margin 2.0e-5, with nothing in the (0, 1e-10) band (probe m555). A
+    # sub-tolerance perturbation of a band could not flip a direction decision either,
+    # since those margins stay four decades above it.
     assert atr_period > 0, "Invalid ATR period, must be greater than 0!"
 
     # Store persistent state
@@ -2121,26 +2110,23 @@ def variance(source: Series[float],
     """
     Calculate the rolling variance of the source series, bit-exact with Pine.
 
-    Measured law (probes m556, 27.8k bars each, synthetic full-mantissa,
-    catastrophic-cancellation and real close sources, lengths 1/2/5/9/14/20,
-    every displayed bar bit-identical): with ``p = math.sum(source, length)``,
-    ``q = math.sum(source * source, length)`` (the exact rolling-sum machine)
-    and ``m = p / length``, TradingView computes
-
-    - biased:   ``max(0, q / length - m * m)``
-    - unbiased: ``max(0, q / (length - 1) - p * m / (length - 1))``
-
-    The unbiased subtraction is distributed over the division exactly as
-    written -- visible whenever ``length - 1`` is not a power of two. The
-    clamp is TradingView's own: under catastrophic cancellation the raw
-    expression goes negative and TV floors it at zero. An unbiased request
-    with ``length == 1`` divides by zero, which is na in Pine.
+    The result is clamped at zero, the way TradingView clamps it: under catastrophic
+    cancellation the raw expression goes negative and comes back as 0.0. An unbiased
+    variance with ``length == 1`` is na.
 
     :param source: The source series.
     :param length: The length of the rolling window.
     :param biased: If True, calculates biased variance; otherwise, calculates unbiased variance.
     :return: The variance of the source series.
     """
+    # Measured law (probes m556, 27.8k bars each, synthetic full-mantissa,
+    # catastrophic-cancellation and real close sources, lengths 1/2/5/9/14/20, every
+    # displayed bar bit-identical): with p = math.sum(source, length),
+    # q = math.sum(source * source, length) and m = p / length, TradingView computes
+    #   biased:   max(0, q / length - m * m)
+    #   unbiased: max(0, q / (length - 1) - p * m / (length - 1))
+    # The unbiased subtraction is distributed over the division exactly as written --
+    # visible whenever ``length - 1`` is not a power of two.
     assert length > 0, "Invalid length, must be > 0!"
     length = int(length)
 
@@ -2265,55 +2251,52 @@ def wad() -> PyneFloat:
 
 def wma(source: Series[float], length: int) -> PyneFloat:
     """
-    Calculate the Weighted Moving Average (WMA) of the source series with the given length.
+    Calculate the Weighted Moving Average (WMA) of the source series with the given length,
+    bit-exact with Pine.
+
+    Unlike the other rolling averages this one does not compact the window: an na bar
+    carries the previous value forward, so the average runs over the last ``length``
+    bars, not over the last ``length`` non-na values. The na bar itself returns na.
 
     :param source: The source series
     :param length: The length of the WMA
     :return: The WMA of the source series
     """
+    # Measured law (probes m560): Pine re-sums the whole window on every bar, OLDEST
+    # first, weighting ``source[i]`` with ``length - i`` and accumulating the weight sum
+    # in the same loop. The order matters: summing newest-first, or weighting with
+    # ``(length - i) * length`` the way the reference pseudocode does, drifts on more
+    # than half of the bars. Being a full re-sum this cannot be kept incremental -- an
+    # O(1) rolling update gives different last bits. The forward-filled window was
+    # measured on scattered, consecutive and leading gaps at every length.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
-    # Calculate denominator only once
-    denom: Persistent[float] = length * (length + 1) / 2
-
     count: Persistent[int] = 0
-    summ: Persistent[float] = 0.0
-    weighted_summ: Persistent[float] = 0.0
+    last: Persistent[float] = na_float
 
-    if isinstance(source, NA) or source != source:
-        # An NA bar leaves the window unchanged; hold the last full value
-        # (still NA while warming up)
-        return na_float if count < length else weighted_summ / denom
-
-    # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
-    # indexes past NA gaps to the true oldest value still inside the window.
-    # Reading the parameter directly would step back ``length`` *bars* and land
-    # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
-    src: Series[float] = source
-    # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
-    # beyond the per-series default max_bars_back (500); otherwise the window-drop
-    # read returns na and poisons ``summ`` permanently.
-    max_bars_back(src, int(length))
-
-    # Warming up phase — only non-NA samples advance the window
-    if count < length:
+    source_na = isinstance(source, NA) or source != source
+    if not source_na:
         count += 1
-        summ += source
-        weighted_summ += source * count
-        if count < length:
-            return na_float
+        last = builtins.float(source)
 
-    # Normal calculation phase
-    else:
-        old_summ = summ
-        # Substract the oldest value and add the newest value
-        summ -= src[length] - source
-        # Substract the oldest weighted value and add the newest weighted value
-        weighted_summ -= old_summ - length * source
+    # The forward-filled window must advance on every bar, na ones included.
+    ff: Series[float] = last
+    # Grow the buffer so the deepest read stays addressable for lengths beyond the
+    # per-series default max_bars_back (500), which would otherwise return na.
+    max_bars_back(ff, length)
 
-    val = weighted_summ / denom
-    return val  # type: ignore
+    if source_na or count < length:
+        return na_float
+
+    norm = 0.0
+    summ = 0.0
+    for i in builtins.range(length - 1, -1, -1):
+        weight = length - i
+        norm += weight
+        summ += ff[i] * weight
+
+    return summ / norm
 
 
 def wpr(length: int) -> PyneFloat:

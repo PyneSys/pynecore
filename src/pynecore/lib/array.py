@@ -335,15 +335,15 @@ def includes(id: list[T], value: T) -> bool:
     """
     Returns true if the array contains the specified value, false otherwise.
 
-    The search is TOLERANT (measured on TradingView, probe m548): a float
-    within ``EPSILON`` of an element counts as present. ``binary_search`` is
-    bit-exact by contrast, so the two disagree on near-equal values — that is
-    TradingView's own behaviour, not an inconsistency to smooth over.
+    The search is tolerant: a float within Pine's comparison tolerance of an element
+    counts as present. ``binary_search`` is exact by contrast, so the two disagree on
+    near-equal values — that is TradingView's own behaviour.
 
     :param id: Input array
     :param value: Value to search for
     :return: True if the array contains the specified value, false otherwise
     """
+    # Tolerance measured on TradingView (probe m548)
     for item in id:
         if _equal(item, value):
             return True
@@ -355,13 +355,13 @@ def indexof(id: list[T], value: T) -> int:
     """
     Returns the index of the first occurrence of the specified value in the array.
 
-    The search is TOLERANT, like ``includes`` (measured on TradingView, probe
-    m548/m551).
+    The search is tolerant, like ``includes``.
 
     :param id: Input array
     :param value: Value to search for
     :return: Index of the first occurrence of the specified value in the array
     """
+    # Tolerance measured on TradingView (probes m548/m551)
     for i, item in enumerate(id):
         if _equal(item, value):
             return i
@@ -411,13 +411,13 @@ def lastindexof(id: list[T], value: T) -> int:
     """
     Returns the index of the last occurrence of the specified value in the array.
 
-    The search is TOLERANT, like ``indexof`` (measured on TradingView, probe
-    m551).
+    The search is tolerant, like ``indexof``.
 
     :param id: Input array
     :param value: Value to search for
     :return: Index of the last occurrence of the specified value in the array
     """
+    # Tolerance measured on TradingView (probe m551)
     for i in builtins.range(len(id) - 1, -1, -1):
         if _equal(id[i], value):
             return i

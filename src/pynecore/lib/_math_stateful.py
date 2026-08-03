@@ -52,22 +52,23 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     """
     Returns the sum of a series over a specified length, bit-exact with Pine.
 
-    Pine's engine keeps a rolling compensated sum: each bar evicts the entry
-    stored ``length`` bars ago and adds the new value in one fused two-round
-    step (``y1 = fl(-d0 - c)``; ``t = fl(s + y1)``; ``e1 = fl(fl(t - s) - y1)``;
-    ``y2 = fl(x - e1)``; ``s = fl(t + y2)``; ``c = fl(fl(s - t) - y2)``), storing
-    the realized ``y2`` for the future eviction. On bars where ``sum_fires``
-    signals it, the engine re-baselines instead: the display and accumulator
-    become the plain newest-first linear sum of the raw window, the
-    compensation clears, and the raw value is stored. The same machine runs
-    during warmup with ``d0 = 0`` and the re-baseline summing the whole
-    available prefix. Validated bit-for-bit against TV output on dense probes
-    for lengths 2..14 (100.00% of ~330k displayed bars).
+    The window is na-compacted: an na bar returns na and is not stored, so the sum
+    always covers the last ``length`` non-na values.
 
     :param source: Source series
     :param length: Length of the sum
     :return: The sliding sum of the series
     """
+    # Pine's engine keeps a rolling compensated sum: each bar evicts the entry stored
+    # ``length`` bars ago and adds the new value in one fused two-round step
+    # (``y1 = fl(-d0 - c)``; ``t = fl(s + y1)``; ``e1 = fl(fl(t - s) - y1)``;
+    # ``y2 = fl(x - e1)``; ``s = fl(t + y2)``; ``c = fl(fl(s - t) - y2)``), storing the
+    # realized ``y2`` for the future eviction. On bars where ``sum_fires`` signals it,
+    # the engine re-baselines instead: the display and accumulator become the plain
+    # newest-first linear sum of the raw window, the compensation clears, and the raw
+    # value is stored. The same machine runs during warmup with ``d0 = 0`` and the
+    # re-baseline summing the whole available prefix. Validated bit-for-bit against TV
+    # output on dense probes for lengths 2..14 (100.00% of ~330k displayed bars).
     summ: Persistent[float] = 0.0
     count: Persistent[int] = 0
     compensation: Persistent[float] = 0.0
