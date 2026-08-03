@@ -5,7 +5,7 @@ from functools import lru_cache
 from math import isinf
 
 from datetime import datetime, UTC
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
 from ..types.na import NA, na_float
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
@@ -25,6 +25,44 @@ __all__ = ['contains', 'endswith', 'format', 'format_time', 'length', 'lower', '
 #
 # Private helper functions
 #
+
+# Enough digits for the integer part of any finite double (max ~1.8e308).
+_MAX_INT_DIGITS = 320
+
+
+def _round_digits(value: float, decimals: int, decimal_format: bool) -> str:
+    """
+    Round a positive value to the requested number of decimals, the way TradingView does.
+
+    Both formatters start from the digits Java's ``Double.toString`` produces -- the
+    shortest decimal that reads back as the same double -- not from the double's exact
+    binary expansion: ``str.tostring(0.1, '#.####################')`` is ``0.1``, not
+    ``0.10000000000000000555``. While that representation stays in plain notation
+    (``|value| >= 1e-3``) it never carries more than 16 fraction digits, so a mask asking
+    for more gets zeros; below 1e-3 ``Double.toString`` switches to exponential notation
+    and the cap is gone (measured: ``1e-17`` prints all 17 decimals).
+
+    ``str.tostring`` then rounds those digits half-up, while ``str.format`` is Java's
+    DecimalFormat, which breaks a tie on the exact value -- 2.675 is really 2.67499...,
+    so it rounds down where ``str.tostring`` rounds up.
+
+    :param value: The value to round (must be non-negative and finite)
+    :param decimals: Number of fraction digits the mask allows
+    :param decimal_format: True for ``str.format()``, False for ``str.tostring()``
+    :return: The rounded value in plain decimal notation
+    """
+    if value >= 1e-3:
+        decimals = min(decimals, 16)
+    if decimal_format:
+        d = Decimal(value)  # The double's exact value decides the ties
+        rounding = ROUND_HALF_EVEN
+    else:
+        d = Decimal(repr(value))  # Shortest round-trip digits, like Double.toString
+        rounding = ROUND_HALF_UP
+    with localcontext() as ctx:
+        ctx.prec = _MAX_INT_DIGITS + decimals
+        return f"{d.quantize(Decimal(1).scaleb(-decimals), rounding=rounding):f}"
+
 
 # noinspection PyProtectedMember
 def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###',
@@ -184,10 +222,10 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
     # Format the number
     if max_decimals == 0:
         # Integer format
-        result = str(int(round(value)))
+        result = _round_digits(value, 0, decimal_format)
     else:
         # Float format
-        formatted = f"{value:.{max_decimals}f}"
+        formatted = _round_digits(value, max_decimals, decimal_format)
         if required_decimals == 0:
             # Remove trailing zeros if all places are optional (#)
             formatted = formatted.rstrip('0').rstrip('.')
@@ -220,6 +258,11 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
             result = f"{int_part}.{result.split('.')[1]}"
         else:
             result = int_part
+    elif required_decimals > 0 and result.startswith('0.'):
+        # A mask with required decimals drops the integer part when it is zero and the
+        # pattern does not demand a digit there ('#.0' formats 0.5 as '.5'), the way Java's
+        # DecimalFormat does. An all-'#' mask keeps the zero ('#.#' gives '0.5').
+        result = result[1:]
 
     return prefix + result + suffix
 
