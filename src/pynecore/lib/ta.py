@@ -6,6 +6,7 @@ from typing import TypeVar, cast, TYPE_CHECKING
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
 
+import bisect
 import builtins
 import math
 import heapq
@@ -251,6 +252,12 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     """
     Calculate a simple change with respect to the given bar offset.
 
+    The difference is exact: TradingView subtracts the raw doubles and does not
+    quantize the result (probe m554, measured at a base small enough for a
+    1e-15 step to be representable -- ``ta.change`` reproduced it bit for bit).
+    Dust below Pine's 1e-10 comparison tolerance is absorbed by the comparison
+    operators, not by this function.
+
     :param source: The source series
     :param length: The offset in bars
     :return: The change from source to source[length]
@@ -261,13 +268,6 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     # per-series default max_bars_back (500); otherwise it reads na and the change is na.
     max_bars_back(source, length)
 
-    # We need to round to prevent problems caused by floating point precision
-    if isinstance(source, (float, int)):
-        # The cast is for pyright: it types round(float) as float, which is not
-        # assignable back to the TFIB-typed parameter; PyCharm resolves it to
-        # TFIB already.
-        # noinspection PyUnnecessaryCast
-        source = cast(TFIB, round(source, 14))
     prev_val = source[length]  # noqa
 
     if isinstance(source, NA) or source != source:
@@ -276,7 +276,7 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     if isinstance(prev_val, NA) or prev_val != prev_val:
         return NA(type(source))
     if isinstance(source, float):
-        return cast(TFIB, round(source - prev_val, 14))  # noqa
+        return cast(TFIB, source - prev_val)  # noqa
     if isinstance(source, int):
         return cast(TFIB, source - prev_val)  # noqa
     return source != prev_val
@@ -1144,11 +1144,19 @@ def obv() -> PyneFloat:
     return cum(volume * chg)
 
 
+# noinspection PyUnusedLocal,PyProtectedMember
 def percentile_linear_interpolation(source: Series[float], length: int, percentage: int | float) \
         -> PyneFloat:
     """
     Calculates percentile using method of linear interpolation between the two nearest ranks.
 
+    The interpolation position ``pos = length * percentage / 100 + 0.5`` is
+    TradingView's own (probe m554: a percentage sweep over a window of four
+    separated values walks the ranks in exact half steps).
+
+    See ``percentile_nearest_rank`` for the one case TradingView does NOT
+    compute from the window alone.
+
     :param source: The source series
     :param length: The length of the percentile
     :param percentage: The percentage of the percentile
@@ -1156,24 +1164,73 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
-    # The final slice reads ``length`` candles of history; grow the source
-    # buffer to fit it (the per-series default may be smaller). Done before the
-    # warmup guard so the oldest candles are kept from the first bar on.
+    # History is only read on a mid-run length change (window rebuild); keep
+    # the buffer large enough for that. Done before the warmup guard so the
+    # oldest candles are kept from the first bar on.
     max_bars_back(source, length)
+
+    # Rolling state: the chronological window plus its ascending-sorted
+    # numeric part, maintained incrementally (bisect insert/remove per bar
+    # instead of a full re-sort of the window).
+    window: Persistent[deque[float]] = deque()
+    sorted_buf: Persistent[list[float]] = []
+    prev_length: Persistent[int] = 0
+
+    if length != prev_length and prev_length != 0:
+        # ``length`` is a series value and changed: rebuild the window from
+        # the source history, oldest first, without the current bar (bars
+        # beyond the buffer come back as na).
+        rebuilt = []
+        for i in builtins.range(length - 1, 0, -1):
+            rebuilt.append(source[i])
+        window = deque(rebuilt)
+        sorted_buf = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), rebuilt))
+    prev_length = length
+
+    window.append(source)
+    if not (isinstance(source, NA) or source != source):
+        bisect.insort(sorted_buf, source)
+    if len(window) > length:
+        old = window.popleft()
+        if not (isinstance(old, NA) or old != old):
+            del sorted_buf[bisect.bisect_left(sorted_buf, old)]
+
     if isinstance(source, NA) or source != source:
         return na_float
 
     if bar_index < length - 1:
         return na_float
 
-    return array.percentile_linear_interpolation(source[:length], percentage)  # type: ignore
+    # The na elements of the window sort to the virtual end; n is the full
+    # window length, na included -- same semantics as the array form.
+    return array._select_linear_interpolation(sorted_buf, length, percentage)
 
 
+# noinspection PyUnusedLocal,PyProtectedMember
 def percentile_nearest_rank(source: Series[float], length: int, percentage: int | float) \
         -> PyneFloat:
     """
     Calculates percentile using the nearest rank method.
 
+    The rank ``ceil(percentage * length / 100)`` over the ascending window is
+    TradingView's own (probe m552/m554, measured with a percentage sweep over
+    separated values).
+
+    KNOWN DIVERGENCE, deliberately not reproduced: once a window holds values
+    that differ by less than Pine's 1e-10 comparison tolerance, TradingView's
+    series percentiles stop being a function of the window at all. Probe m554
+    ran two series whose windows were element-for-element identical at the same
+    bar but reached that state through different histories, and the same
+    percentage returned different elements from each -- so the builtin carries
+    ordering state across bars rather than sorting the window. The array form
+    (``array.percentile_nearest_rank``) has no such state and matches this
+    implementation on every order of the same values (probe m551/m552).
+
+    Reproducing the stateful ordering would mean re-implementing TradingView's
+    internal buffer maintenance; the payoff is bounded by the tolerance itself,
+    since every candidate the ordering can pick is within 1e-10 of every other,
+    which is exactly the distance Pine's comparison operators ignore.
+
     :param source: The source series
     :param length: The length of the percentile
     :param percentage: The percentage of the percentile
@@ -1181,17 +1238,46 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
-    # The final slice reads ``length`` candles of history; grow the source
-    # buffer to fit it (the per-series default may be smaller). Done before the
-    # warmup guard so the oldest candles are kept from the first bar on.
+    # History is only read on a mid-run length change (window rebuild); keep
+    # the buffer large enough for that. Done before the warmup guard so the
+    # oldest candles are kept from the first bar on.
     max_bars_back(source, length)
+
+    # Rolling state: the chronological window plus its ascending-sorted
+    # numeric part, maintained incrementally (bisect insert/remove per bar
+    # instead of a full re-sort of the window).
+    window: Persistent[deque[float]] = deque()
+    sorted_buf: Persistent[list[float]] = []
+    prev_length: Persistent[int] = 0
+
+    if length != prev_length and prev_length != 0:
+        # ``length`` is a series value and changed: rebuild the window from
+        # the source history, oldest first, without the current bar (bars
+        # beyond the buffer come back as na).
+        rebuilt = []
+        for i in builtins.range(length - 1, 0, -1):
+            rebuilt.append(source[i])
+        window = deque(rebuilt)
+        sorted_buf = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), rebuilt))
+    prev_length = length
+
+    window.append(source)
+    if not (isinstance(source, NA) or source != source):
+        bisect.insort(sorted_buf, source)
+    if len(window) > length:
+        old = window.popleft()
+        if not (isinstance(old, NA) or old != old):
+            del sorted_buf[bisect.bisect_left(sorted_buf, old)]
+
     if isinstance(source, NA) or source != source:
         return na_float
 
     if bar_index < length - 1:
         return na_float
 
-    return array.percentile_nearest_rank(source[:length], percentage)  # type: ignore
+    # The na elements of the window sort to the virtual end; n is the full
+    # window length, na included -- same semantics as the array form.
+    return array._select_nearest_rank(sorted_buf, length, percentage)
 
 
 def percentrank(source: Series[float], length: int) -> PyneFloat:
@@ -1694,6 +1780,13 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     Parabolic SAR (Stop and Reverse) - method devised by J. Welles Wilder, Jr.,
     to find potential reversals in the market price direction of traded goods.
 
+    The comparisons stay bit-exact. They cannot be measured directly -- the
+    builtin takes no source, so a sub-tolerance series cannot be fed into it --
+    but they were bounded instead: over 49k bars of BTCUSDT 30m and EURUSD 1m
+    the smallest non-zero ``|sar - low|`` / ``|sar - high|`` margin was 2.7e-8,
+    with zero margins in the (0, 1e-10) band (probe m555). Exact ties do occur
+    (72 bars), and those decide the same way under either rule.
+
     :param start: Starting value for acceleration factor
     :param inc: Acceleration factor increment
     :param max: Maximum acceleration factor value
@@ -1852,6 +1945,12 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
 def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt]:
     """
     Calculate Supertrend indicator.
+
+    The band comparisons stay bit-exact, bounded the same way as ``sar``: over
+    49k bars the smallest non-zero band-to-band margin was 1.5e-9 and the
+    smallest close-to-band margin 2.0e-5, with nothing in the (0, 1e-10) band
+    (probe m555). A sub-tolerance perturbation of a band could not flip a
+    direction decision either, since those margins stay four decades above it.
 
     :param factor: ATR multiplier
     :param atr_period: ATR period length

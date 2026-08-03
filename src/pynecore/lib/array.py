@@ -515,7 +515,7 @@ def _na_size(size: int | NA) -> int:
     if isinstance(size, NA) or size != size:
         return 0
     assert size >= 0, "Size must be >=0!"
-    return size
+    return int(size)
 
 
 # noinspection PyShadowingNames
@@ -664,6 +664,46 @@ def new_string(size: int | NA = 0, initial_value: str = NA(str)) -> list[str]:
     return [initial_value] * size
 
 
+def _select_linear_interpolation(non_na: list[float], n: int, percentage: float) -> float:
+    """
+    Selection half of :func:`percentile_linear_interpolation`, shared with the
+    rolling window implementation in ``ta``.
+
+    ``non_na`` is the ascending-sorted numeric part of a conceptual array of
+    ``n`` elements whose remaining ``n - len(non_na)`` na elements sort to the
+    end (as if they were the largest values).
+
+    :param non_na: Ascending-sorted numeric values
+    :param n: Total conceptual array length, na elements included
+    :param percentage: Percentile (0-100, not 0-1)
+    :return: Interpolated value at the given percentile, or na
+    :raises ValueError: If percentage is not in [0, 100]
+    """
+    if not (0 <= percentage <= 100):
+        raise ValueError("Percentage must be between 0 and 100")
+    m = len(non_na)
+
+    # 1-based interpolation position over the full length
+    pos = n * percentage / 100.0 + 0.5
+    # Snap to an exact integer rank when floating-point noise leaves us just shy
+    nearest = round(pos)
+    if builtins.abs(pos - nearest) < 1e-9:
+        pos = float(nearest)
+
+    if pos <= 1:
+        return non_na[0] if m > 0 else na_float
+    if pos >= n:
+        return non_na[-1] if m == n else na_float
+
+    lower = math.floor(pos)  # 1-based lower rank
+    frac = pos - lower
+    if frac == 0:
+        return non_na[lower - 1] if lower <= m else na_float
+    if m < n:
+        return na_float
+    return non_na[lower - 1] + frac * (non_na[lower] - non_na[lower - 1])
+
+
 # noinspection PyShadowingBuiltins,PyShadowingNames
 def percentile_linear_interpolation(id: list[float], percentage: float) -> float:
     """
@@ -688,35 +728,41 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     """
     if not id:
         raise ValueError("Input array is empty")
-    if not (0 <= percentage <= 100):
-        raise ValueError("Percentage must be between 0 and 100")
 
-    has_na = any(isinstance(v, NA) or v != v for v in id)
     # filter() instead of a comprehension: PyCharm mis-narrows `not isinstance`
     # inside comprehension conditions (elements would type as NA, not float)
     non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
-    sorted_arr = non_na + [na_float] * (len(id) - len(non_na))
-    n = len(id)
+    return _select_linear_interpolation(non_na, len(id), percentage)
 
-    # 1-based interpolation position over the full length
-    pos = n * percentage / 100.0 + 0.5
-    # Snap to an exact integer rank when floating-point noise leaves us just shy
-    nearest = round(pos)
-    if builtins.abs(pos - nearest) < 1e-9:
-        pos = float(nearest)
 
-    if pos <= 1:
-        return sorted_arr[0]
-    if pos >= n:
-        return sorted_arr[-1]
+def _select_nearest_rank(non_na: list[float], n: int, percentage: float) -> float:
+    """
+    Selection half of :func:`percentile_nearest_rank`, shared with the rolling
+    window implementation in ``ta``.
 
-    lower = math.floor(pos)  # 1-based lower rank
-    frac = pos - lower
-    if frac == 0:
-        return sorted_arr[lower - 1]
-    if has_na:
-        return na_float
-    return sorted_arr[lower - 1] + frac * (sorted_arr[lower] - sorted_arr[lower - 1])
+    ``non_na`` is the ascending-sorted numeric part of a conceptual array of
+    ``n`` elements whose remaining ``n - len(non_na)`` na elements sort to the
+    end (as if they were the largest values).
+
+    :param non_na: Ascending-sorted numeric values
+    :param n: Total conceptual array length, na elements included
+    :param percentage: Percentile (0-100)
+    :return: The value at the nearest rank, or na if the rank falls on a na
+             element
+    :raises ValueError: If percentage is not between 0 and 100
+    """
+    if not (0 <= percentage <= 100):
+        raise ValueError("Percentage must be between 0 and 100")
+    m = len(non_na)
+    if percentage == 0:
+        return non_na[0] if m > 0 else na_float
+
+    # Calculate the rank using the ceiling function as per the nearest rank method
+    rank = math.ceil(percentage * n / 100)
+    # Clamp rank to be within the valid range [1, n]
+    rank = builtins.max(1, builtins.min(rank, n))
+    # Adjust for 0-indexed array: return the (rank-1)th element
+    return non_na[rank - 1] if rank <= m else na_float
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -736,22 +782,10 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
     """
     if not id:
         raise ValueError("Input array is empty")
-    if not (0 <= percentage <= 100):
-        raise ValueError("Percentage must be between 0 and 100")
 
     # filter() instead of a comprehension: see percentile_linear_interpolation
     non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
-    sorted_arr = non_na + [na_float] * (len(id) - len(non_na))
-    n = len(id)
-    if percentage == 0:
-        return sorted_arr[0]
-
-    # Calculate the rank using the ceiling function as per the nearest rank method
-    rank = math.ceil(percentage * n / 100)
-    # Clamp rank to be within the valid range [1, n]
-    rank = builtins.max(1, builtins.min(rank, n))
-    # Adjust for 0-indexed array: return the (rank-1)th element
-    return sorted_arr[rank - 1]
+    return _select_nearest_rank(non_na, len(id), percentage)
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
