@@ -356,11 +356,28 @@ def cog(source: Series[float], length: int) -> PyneFloat:
 
 def correlation(source1: Series[float], source2: Series[float], length: int) -> PyneFloat:
     """
-    Calculate the correlation of the source series with the given length.
+    Calculate the correlation of the source series with the given length, bit-exact with Pine.
 
-    NOTE: It is about 7 digits accurate to the result of Pine Script's correlation function. There
-          are a lot of floating point operations, and even the order matters. I cannot found a
-          better matching calculation.
+    Measured law (probes m557, 27.8k bars each, real, synthetic and
+    catastrophic-cancellation sources, na gaps, lengths 1/2/3/5/14/20, every
+    displayed bar bit-identical): with the exact rolling-sum machine
+    ``s = math.sum(...)`` over ``source1``, ``source2``, their product and their
+    squares, and ``mx = sx / length``, ``my = sy / length``, TradingView computes
+
+    - ``cov = sxy / length - mx * my``
+    - ``vx = max(0, sx2 / length - mx * mx)``, likewise ``vy``, the same clamp
+      :func:`variance` uses
+    - ``cov / sqrt(vx * vy)``, a single square root over the product; taking two
+      separate roots differs by one ulp on roughly 40% of bars
+
+    A covariance within Pine's comparison tolerance of zero short-circuits the
+    whole thing to 0.0 -- measured on scaled-down sources: a pair correlated at
+    0.95 still reports 0.0 once its covariance is scaled below 1e-10, and the
+    switch sits exactly at that bound (0.0 up to 9.99999e-11, a real value from
+    1.00001e-10). That tolerance also decides the degenerate cases, where the
+    clamped variance product vanishes and the quotient would be na: constant
+    sources keep their na, while ``length == 1`` (both variances cancel exactly,
+    covariance included) is 0.0 from the very first bar.
 
     :param source1: The first source series
     :param source2: The second source series
@@ -369,75 +386,30 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     """
     assert length > 0, "Length must be greater than 0"
     length = int(length)
-    # Grow both buffers so ``source1/source2[length]`` stay addressable for lengths beyond
-    # the per-series default max_bars_back (500); otherwise the window-drop reads na and
-    # poisons the running sums permanently.
-    max_bars_back(source1, length)
-    max_bars_back(source2, length)
 
-    sum_x: Persistent[float] = 0.0
-    sum_y: Persistent[float] = 0.0
-    sum_xy: Persistent[float] = 0.0
-    sum_x2: Persistent[float] = 0.0
-    sum_y2: Persistent[float] = 0.0
-    count: Persistent[int] = 0
-    na_window: Persistent[int] = 0
-
-    cur_na = (isinstance(source1, NA) or source1 != source1) or (isinstance(source2, NA) or source2 != source2)
-
-    if count < length:
-        # Still filling the window; no bar leaves it yet.
-        if cur_na:
-            na_window += 1
-        else:
-            sum_x += source1
-            sum_y += source2
-            sum_xy += source1 * source2
-            sum_x2 += source1 * source1
-            sum_y2 += source2 * source2
-        count += 1
-        if count < length:
-            return na_float
-    else:
-        old1 = source1[length]
-        old2 = source2[length]
-        old_na = (isinstance(old1, NA) or old1 != old1) or (isinstance(old2, NA) or old2 != old2)
-        if not cur_na and not old_na:
-            # na-free fast path: same operations and order as before, to keep the
-            # documented ~7-digit match with Pine's correlation.
-            sum_x += source1 - old1
-            sum_y += source2 - old2
-            sum_xy += (source1 * source2) - (old1 * old2)
-            sum_x2 += (source1 * source1) - (old1 * old1)
-            sum_y2 += (source2 * source2) - (old2 * old2)
-        else:
-            # A na entered or left the window: keep the running sums over the
-            # valid bars only and track how many na sit in the window.
-            if cur_na:
-                na_window += 1
-            else:
-                sum_x += source1
-                sum_y += source2
-                sum_xy += source1 * source2
-                sum_x2 += source1 * source1
-                sum_y2 += source2 * source2
-            if old_na:
-                na_window -= 1
-            else:
-                sum_x -= old1
-                sum_y -= old2
-                sum_xy -= old1 * old2
-                sum_x2 -= old1 * old1
-                sum_y2 -= old2 * old2
-
-    if na_window:
+    # All five rolling machines must advance on every bar (na bars included), so
+    # they run before any early return.
+    sx = lib_math.sum(source1, length)
+    sy = lib_math.sum(source2, length)
+    sxy = lib_math.sum(source1 * source2, length)
+    sx2 = lib_math.sum(source1 * source1, length)
+    sy2 = lib_math.sum(source2 * source2, length)
+    if (isinstance(sx, NA) or sx != sx) or (isinstance(sy, NA) or sy != sy) \
+            or (isinstance(sxy, NA) or sxy != sxy) \
+            or (isinstance(sx2, NA) or sx2 != sx2) or (isinstance(sy2, NA) or sy2 != sy2):
         return na_float
-    try:
-        numerator = (length * sum_xy) - (sum_x * sum_y)
-        denominator = math.sqrt((length * sum_x2 - sum_x * sum_x) * (length * sum_y2 - sum_y * sum_y))
-        return numerator / denominator
-    except (ValueError, ZeroDivisionError):
+
+    mx = sx / length
+    my = sy / length
+    cov = sxy / length - mx * my
+    if -_EPSILON <= cov <= _EPSILON:
+        return 0.0
+
+    var_product = (builtins.max(0.0, sx2 / length - mx * mx)
+                   * builtins.max(0.0, sy2 / length - my * my))
+    if var_product == 0.0:
         return na_float
+    return cov / math.sqrt(var_product)
 
 
 def cross(source1: float, source2: float) -> PyneBool:
@@ -509,6 +481,10 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     """
     Calculate the Mean Absolute Deviation (MAD) of the source series with the given length.
 
+    Bit-exact with Pine (measured, probes m556): TradingView computes the
+    plain newest-first loop ``sum(abs(source[i] - sma)) / length`` -- exactly
+    the shape below with the exact rolling-sum sma.
+
     :param source: The source series
     :param length: The length of the MAD calculation
     :param _mean: The mean value of the source series, if it is already calculated
@@ -518,6 +494,9 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     if length == 1:
         return 0.0
     length = int(length)
+    # The loop below reads ``source[length - 1]``; grow the buffer so that index
+    # stays addressable for lengths beyond the per-series default max_bars_back.
+    max_bars_back(source, length)
 
     mean = _mean if _mean is not None else sma(source, length)
     if isinstance(mean, NA) or mean != mean:
@@ -1894,6 +1873,12 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
     """
     Calculate the standard deviation of the source series with the given length.
 
+    Bit-exact with Pine: TradingView's stdev is exactly ``sqrt`` of its
+    variance on both the biased and unbiased path (measured, probes m556 --
+    27.8k bars per configuration, zero mismatches), and ``variance`` here
+    reproduces that machine bit-for-bit. The clamp inside ``variance`` also
+    matches TV: cancellation regimes floor at zero, so stdev is 0 there, not na.
+
     :param source: The source series
     :param length: The length of the standard deviation
     :param biased: Specifies whether the biased or unbiased standard deviation is calculated
@@ -2098,7 +2083,22 @@ def variance(source: Series[float],
              length: int,
              biased: bool = True) -> PyneFloat:
     """
-    Calculate the rolling variance of the source series.
+    Calculate the rolling variance of the source series, bit-exact with Pine.
+
+    Measured law (probes m556, 27.8k bars each, synthetic full-mantissa,
+    catastrophic-cancellation and real close sources, lengths 1/2/5/9/14/20,
+    every displayed bar bit-identical): with ``p = math.sum(source, length)``,
+    ``q = math.sum(source * source, length)`` (the exact rolling-sum machine)
+    and ``m = p / length``, TradingView computes
+
+    - biased:   ``max(0, q / length - m * m)``
+    - unbiased: ``max(0, q / (length - 1) - p * m / (length - 1))``
+
+    The unbiased subtraction is distributed over the division exactly as
+    written -- visible whenever ``length - 1`` is not a power of two. The
+    clamp is TradingView's own: under catastrophic cancellation the raw
+    expression goes negative and TV floors it at zero. An unbiased request
+    with ``length == 1`` divides by zero, which is na in Pine.
 
     :param source: The source series.
     :param length: The length of the rolling window.
@@ -2107,74 +2107,21 @@ def variance(source: Series[float],
     """
     assert length > 0, "Invalid length, must be > 0!"
     length = int(length)
-    if length == 1:
-        return 0.0
-    # Grow the buffer so the decremental read ``source[length]`` stays addressable for
-    # lengths beyond the per-series default max_bars_back (500); otherwise it reads na and
-    # poisons the Welford accumulators permanently (feeds stdev/bb/bbw/kc). Runs before the
-    # na guard so the buffer keeps growing on na bars too, ahead of any wrap.
-    max_bars_back(source, length)
-    if isinstance(source, NA) or source != source:
+
+    # Both rolling machines must advance on every bar (na bars included), so
+    # they run before any early return.
+    p = lib_math.sum(source, length)
+    q = lib_math.sum(source * source, length)
+    if (isinstance(p, NA) or p != p) or (isinstance(q, NA) or q != q):
+        return na_float
+    if not biased and length == 1:
         return na_float
 
-    # Welford online recurrence with Pébay (2008) decremental step for sliding
-    # window. Avoids the catastrophic cancellation of the textbook
-    # `E[X²] - E[X]²` form by accumulating m2 (sum of squared deviations from
-    # the running mean) directly. Kahan compensation on `mean` and `m2`
-    # eliminates ULP-level drift across long add/remove sequences. The final
-    # `max(0.0, ...)` is a safety clamp for the rare case where decremental
-    # round-off lands one ULP below zero — `stdev()` calls `math.sqrt(var)`
-    # and would crash on a negative argument.
-    count: Persistent[int] = 0
-    mu: Persistent[float] = 0.0
-    mu_c: Persistent[float] = 0.0
-    m2: Persistent[float] = 0.0
-    m2_c: Persistent[float] = 0.0
-
-    # Add new sample (Welford incremental)
-    if count < length:
-        count += 1
-        n_after = count
-    else:
-        count += 1
-        n_after = length + 1  # transient: post-add, pre-remove
-
-    delta = source - mu
-    inc = delta / n_after
-    y = inc - mu_c
-    t = mu + y
-    mu_c = (t - mu) - y  # noqa - it is persistent
-    mu = t
-    m2_inc = delta * (source - mu)
-    y = m2_inc - m2_c
-    t = m2 + y
-    m2_c = (t - m2) - y  # noqa - it is persistent
-    m2 = t
-
-    if count < length:
-        return na_float
-
-    if count > length:
-        # Remove oldest sample (Welford decremental, Pébay 2008)
-        old_value = source[length]
-        delta = old_value - mu
-        dec = -delta / length
-        y = dec - mu_c
-        t = mu + y
-        mu_c = (t - mu) - y  # noqa - it is persistent
-        mu = t
-        m2_dec = -delta * (old_value - mu)
-        y = m2_dec - m2_c
-        t = m2 + y
-        m2_c = (t - m2) - y  # noqa - it is persistent
-        m2 = t
-
+    m = p / length
     if biased:
-        var = m2 / length
+        var = q / length - m * m
     else:
-        var = m2 / (length - 1)
-    # Safety clamp: decremental round-off can occasionally land 1 ULP below
-    # zero on long constant runs; stdev() would crash inside math.sqrt().
+        var = q / (length - 1) - p * m / (length - 1)
     return builtins.max(0.0, var)
 
 

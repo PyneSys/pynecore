@@ -16,6 +16,6 @@ def __test_correlation__(csv_reader, runner, dict_comparator, log):
     """ Correlation """
     with csv_reader('correlation.csv', subdir="data") as cr:
         for i, (candle, plot) in enumerate(runner(cr).run_iter()):
-            dict_comparator(plot, candle.extra_fields, abs_tol=1e-7)  # I cannot make it more precise
+            dict_comparator(plot, candle.extra_fields)
             if i > 150:
                 break

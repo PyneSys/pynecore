@@ -2874,6 +2874,9 @@
     "bbw": {
       "type": "variable"
     },
+    "bisect": {
+      "type": "variable"
+    },
     "builtins": {
       "type": "variable"
     },
