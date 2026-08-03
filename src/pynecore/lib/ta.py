@@ -541,14 +541,27 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFlo
     return p, m, adx
 
 
-def ema(source: PyneFloat, length: int, _alpha: float | None = None) -> PyneFloat:
+def ema(source: PyneFloat, length: int) -> PyneFloat:
     """
-    Calculate the Exponential Moving Average (EMA) of the source series with the given length.
+    Calculate the Exponential Moving Average (EMA) of the source series with the given length,
+    bit-exact with Pine.
+
+    Measured law (probes m558, 27.8k bars each, lengths 2/5/9/14/21/50/200, every
+    displayed bar bit-identical):
+
+    - ``alpha = 2 / (length + 1)``
+    - the step is ``prev + alpha * (source - prev)``; the algebraically equal
+      ``alpha * source + (1 - alpha) * prev`` drifts from TradingView on more than
+      half of the bars, and so does ``alpha * source + prev - alpha * prev``
+    - the seed is :func:`sma` over the same length, taken on the bar where that
+      sma first exists
+    - na bars are skipped whole: the output is na there and the state does not
+      advance, so the machine sees the last ``length`` non-na values -- the very
+      window the na-compacted :func:`sma` seeds it from
 
     :param source: The source series
     :param length: The length of the EMA
-    :param _alpha: The alpha value for EMA calculation (it is a private argument)
-    :return:
+    :return: The Exponential Moving Average (EMA) of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
@@ -558,7 +571,7 @@ def ema(source: PyneFloat, length: int, _alpha: float | None = None) -> PyneFloa
     if isinstance(source, NA) or source != source:
         return na_float
 
-    alpha: Persistent[float] = _alpha or (2 / (length + 1))
+    alpha: Persistent[float] = 2 / (length + 1)
     last_val: Persistent[float] = na_float
 
     # Use SMA at warming stage
@@ -567,7 +580,7 @@ def ema(source: PyneFloat, length: int, _alpha: float | None = None) -> PyneFloa
         return last_val
 
     # Warmed result
-    last_val = alpha * source + (1 - alpha) * last_val
+    last_val = last_val + alpha * (source - last_val)
     return last_val
 
 
@@ -1694,13 +1707,36 @@ def rising(source: float, length: int) -> bool:
 
 def rma(source: PyneFloat, length: int) -> PyneFloat:
     """
-    Calculate the RMA (Running Moving Average) of the source series with the given length.
+    Calculate the RMA (Running Moving Average, Wilder's smoothing) of the source series with
+    the given length, bit-exact with Pine.
+
+    Measured law (probes m558): the step is ``(prev * (length - 1) + source) / length``. This
+    is NOT :func:`ema` with ``alpha = 1 / length``: both alpha shapes drift from TradingView on
+    the majority of bars, so rma runs its own machine. Seed, warmup bar and na handling are
+    :func:`ema`'s.
 
     :param source: The source series
     :param length: The length of the RMA
     :return: The RMA of the source series
     """
-    return ema(source, length, 1 / length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
+    length = int(length)
+    if length == 1:  # Shortcut
+        return source
+
+    if isinstance(source, NA) or source != source:
+        return na_float
+
+    last_val: Persistent[float] = na_float
+
+    # Use SMA at warming stage
+    if isinstance(last_val, NA) or last_val != last_val:
+        last_val = sma(source, length)
+        return last_val
+
+    # Warmed result
+    last_val = (last_val * (length - 1) + source) / length
+    return last_val
 
 
 def roc(source: Series[float], length: int) -> PyneFloat:
