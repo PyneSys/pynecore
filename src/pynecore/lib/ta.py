@@ -1920,7 +1920,12 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
 def stoch(source: float | Series[float], high: float | Series[float], low: float | Series[float],
           length: int) -> PyneFloat:
     """
-    Calculate the Stochastic Oscillator of the source series with the given length.
+    Calculate the Stochastic Oscillator of the source series with the given length,
+    bit-exact with Pine.
+
+    The result is not clamped to ``[0, 100]``: a source that leaves the window range
+    of ``high``/``low`` scales freely beyond it, and rounding can push an in-range
+    source a hair above 100.
 
     :param source: The source series
     :param high: Series of high values
@@ -1942,14 +1947,15 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     if bar_index < length - 1:
         return na_float
 
-    dl_diff = source - lmin
-    hl_diff = hmax - lmin
-    if dl_diff < 0.0:
-        k = 0.0
-    else:
-        k = 100 * dl_diff / hl_diff
-        k = 100.0 if k > 100.0 else 0.0 if k < 0.0 else k
-    return k  # type: ignore
+    # Measured law (probes m561): the bare ratio with the multiplication done
+    # FIRST, and without any clamping. Feeding a source three ranges below the
+    # window low and three above it, TradingView reported the full -300..+400
+    # span, and every one of the 22289 bars matched ``(100 * dl) / hl`` bit for
+    # bit. That leading multiplication also rounds before the division, so a
+    # source sitting exactly on the window high can come out as
+    # 100.00000000000001 — clamping to 100.0 was the last divergence left in
+    # the stochastic RSI chain.
+    return 100 * (source - lmin) / (hmax - lmin)  # type: ignore
 
 
 # noinspection PyUnusedLocal,PyShadowingNames

@@ -42,12 +42,14 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
     return res
 
 
-# Three groups of IDE findings here are artifacts of the ``@pyne`` transform, not real
-# defects: ``Persistent`` assignments look dead because their value is read on the NEXT
-# bar, ``src`` looks possibly-unbound because it is a series whose storage outlives the
-# ``if`` that feeds it, and ``src[i]`` looks like subscripting a float because
-# ``Series[T]`` erases to ``T`` for the IDE.
-# noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences
+# The IDE findings here are artifacts of the ``@pyne`` transform, not real defects:
+# ``Persistent`` assignments look dead because their value is read on the NEXT bar,
+# ``src`` looks possibly-unbound because it is a series whose storage outlives the
+# ``if`` that feeds it, ``src[i]`` looks like subscripting a float because
+# ``Series[T]`` erases to ``T`` for the IDE, and assigning ``source`` to the series
+# looks type-unsafe because the ``source_na`` guard above it is a value test the
+# IDE cannot narrow by.
+# noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences,PyTypeChecker
 def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     """
     Returns the sum of a series over a specified length, bit-exact with Pine.
@@ -68,7 +70,9 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     # newest-first linear sum of the raw window, the compensation clears, and the raw
     # value is stored. The same machine runs during warmup with ``d0 = 0`` and the
     # re-baseline summing the whole available prefix. Validated bit-for-bit against TV
-    # output on dense probes for lengths 2..14 (100.00% of ~330k displayed bars).
+    # output on dense probes for lengths 2..14 (~330k displayed bars), on zero-gap
+    # block probes m562 (5599 independent blocks, lengths 3/4/5/8, every branch
+    # decision forced), and on real 22k-bar rsi/stoch/sma chains (probes m561/m562).
     summ: Persistent[float] = 0.0
     count: Persistent[int] = 0
     compensation: Persistent[float] = 0.0
@@ -184,19 +188,18 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
 
     # ``core.rolling_sum.sum_fires`` inlined: a call here would cost more than
     # the whole compensated step it guards, and the transform wraps every call
-    # in an isolation binding on top. Keep the two in sync — Fast2Sum gives the
-    # realized rounding error of ``fl(value + c)`` exactly, so the fire test is
-    # ``sign(e) == sign(c)`` (see that module's docstring for the derivation).
+    # in an isolation binding on top. Keep the two in sync — the fixed-order
+    # Fast2Sum residue of ``fl(value + |c|)`` is tested WITHOUT a magnitude
+    # swap, and the machine fires when it is positive (see that module's
+    # docstring for the derivation, the binade-edge reason the magnitude and
+    # not the signed ``c`` is shifted, and why the ``|c| > |x|`` residue stays
+    # deliberately inexact).
     fires = False
     if c != 0.0 and value != 0.0:
-        r = value + c
+        b = c if c > 0.0 else -c
+        r = value + b
         if r != 0.0 and r - r == 0.0:  # rejects nan and +-inf without a call
-            if (value if value > 0.0 else -value) >= (c if c > 0.0 else -c):
-                e = c - (r - value)
-            else:
-                e = value - (r - c)
-            if e != 0.0:
-                fires = (e > 0.0) if c > 0.0 else (e < 0.0)
+            fires = b - (r - value) > 0.0
 
     if n < length:  # Warmup: accumulate with d0 = 0, fires sum the prefix
         n += 1

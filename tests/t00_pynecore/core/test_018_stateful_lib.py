@@ -15,6 +15,7 @@ from math import isfinite
 from pynecore import lib
 from pynecore.core.instance_state import _make_state
 from pynecore.core.random import PineRandom
+from pynecore.core.rolling_sum import sum_fires
 from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
 from pynecore.lib import syminfo
 from pynecore.types.na import NA
@@ -112,19 +113,26 @@ def __test_math_random_instances_independent__():
 
 def _ref_fires(comp: float, x: float) -> bool:
     """Exact-arithmetic (Fraction) re-baseline condition, written independently
-    of ``pynecore.core.rolling_sum`` so it doubles as its regression check:
-    fire iff the realized rounding error of ``fl(x + comp)`` has the opposite
-    sign to ``comp`` (ties are already resolved by round-half-even in the
-    float add; exact adds never fire)."""
+    of ``pynecore.core.rolling_sum`` so it doubles as its regression check.
+
+    The engine shifts the incoming value by the compensation's MAGNITUDE and
+    tests the fixed-order Fast2Sum residue of that add, WITHOUT the usual
+    magnitude swap: fire iff ``fl(|c| - fl(fl(x + |c|) - x)) > 0``. Every
+    rounding step is re-derived here from rationals — ``float(Fraction)`` is
+    correctly rounded — so the oracle shares no float expression with the
+    production code."""
     if comp == 0.0 or x == 0.0 or not (isfinite(comp) and isfinite(x)):
         return False
-    r = x + comp
+    b = Fraction(-comp if comp < 0.0 else comp)
+    xf = Fraction(x)
+    try:
+        r = float(xf + b)  # fl(x + |c|)
+    except OverflowError:  # the add itself overflows to +-inf
+        return False
     if r == 0.0 or not isfinite(r):
         return False
-    err = Fraction(r) - (Fraction(x) + Fraction(comp))
-    if err == 0:
-        return False
-    return (err < 0) if comp > 0.0 else (err > 0)
+    d = float(Fraction(r) - xf)  # fl(fl(x + |c|) - x), inexact when |c| > |x|
+    return float(b - Fraction(d)) > 0.0
 
 
 def _ref_sum_factory():
@@ -183,6 +191,73 @@ def _ref_sum_factory():
         return summ
 
     return ref
+
+
+def _fire_rule_pairs():
+    """Deterministic ``(compensation, value)`` pairs spanning ~30 binades in
+    both signs — a plain LCG so the sweep is reproducible everywhere."""
+    s = 12345
+    for i in range(20000):
+        s = (s * 1103515245 + 12345) % (1 << 31)
+        c = (s / (1 << 31) - 0.5) * 10.0 ** (i % 27 - 24)
+        s = (s * 1103515245 + 12345) % (1 << 31)
+        x = (s / (1 << 31) - 0.5) * 10.0 ** (i % 13 - 7)
+        yield c, x
+
+
+def __test_rolling_sum_fire_rule_golden__():
+    """ Golden bars that separate the measured rule from its plausible
+    neighbours: the magnitude shift (a signed probe walks the finer downward
+    grid below a binade edge) and the missing Fast2Sum magnitude swap """
+    # (compensation, value, fires)
+    cases = [
+        # Negative compensation at a binade edge: shifting the signed value
+        # instead of its magnitude labels these bars the other way.
+        (-2.117582368135751e-22, 9.536743164062499e-07, True),
+        (-0.001055446444665531, 0.0009760761164057203, True),
+        (-1.5096162171497207, 1.3090738838615936e-06, False),
+        # |c| > |x|: the fixed-order residue is inexact, and that inexact
+        # value is what the engine tests — an exact 2Sum would fire here.
+        (55.99389814121456, 0.3611502021234201, False),
+        (-20.420464290753458, -6.986601940076164e-09, False),
+        (9.109360478429427e-07, -2.7167312094343507e-08, False),
+        # Degenerate operands never fire.
+        (0.0, 1.0, False),
+        (1.0, 0.0, False),
+        (float('nan'), 1.0, False),
+        (1e308, 1e308, False),
+    ]
+    for comp, value, want in cases:
+        assert sum_fires(comp, value) is want, (comp, value)
+        assert _ref_fires(comp, value) is want, (comp, value)
+
+
+def __test_rolling_sum_fire_rule_matches_exact_oracle__():
+    """ The float fire detector agrees with the exact-arithmetic oracle on a
+    dense deterministic sweep """
+    for comp, value in _fire_rule_pairs():
+        assert sum_fires(comp, value) == _ref_fires(comp, value), (comp, value)
+
+
+def __test_math_sum_inlined_fire_rule_matches_core__():
+    """ ``lib.math.sum`` inlines the fire test instead of calling
+    ``core.rolling_sum.sum_fires``; this window makes the two disagree on the
+    output bars if the inlined expression ever drifts from the core one """
+    values = [-1274720.6437522452, -3.341532690643485, 8.450734784875934,
+              2.050491000209509e-10, -1.9922460506784567, -1844830.279632077,
+              -2.9881426742597395, -1.3691775656187065e-06, -5.087091405520743e-06,
+              -5.499330175468724e-06, -5.198905520846737e-06, -2.0588158189627496e-09]
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    ref = _ref_sum_factory()
+    with _bars() as next_bar:
+        for v in values:
+            got = lib.math.sum(state, v, 3)
+            want = ref(v, 3)
+            if isinstance(want, NA) or want != want:
+                assert isinstance(got, NA) or got != got
+            else:
+                assert got == want
+            next_bar()
 
 
 def __test_math_sum_bit_exact__():
