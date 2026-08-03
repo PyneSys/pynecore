@@ -63,7 +63,7 @@ The heart of the PyneCore system, implementing the fundamental data structures a
 Python Abstract Syntax Tree (AST) transformers that modify Python code to behave like Pine Script:
 
 - **Series Transformations** (`series.py`): Convert Python operations to Series-aware operations
-- **Persistent Variables** (`persistent.py`, `persistent_series.py`): Implement bar-persistent variables with automatic Kahan summation for `+=`
+- **Persistent Variables** (`persistent.py`, `persistent_series.py`): Implement bar-persistent variables
 - **Function Isolation** (`function_isolation.py`): Create isolated function scopes with per-call state
 - **Import Management** (`import_normalizer.py`, `import_lifter.py`): Organize and normalize imports
 - **Library Series** (`lib_series.py`): Convert library attribute access to Series-aware operations

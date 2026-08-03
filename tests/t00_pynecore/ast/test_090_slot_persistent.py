@@ -70,8 +70,8 @@ def main(length):
     assert state == [5.0, True]
 
 
-def __test_kahan__():
-    """ += with non-literal value emits the exact Kahan sequence """
+def __test_add_assign__():
+    """ += accumulates naively on the slot, like TradingView does """
     ns, dump = _transform('''
 from pynecore import Persistent
 
@@ -81,20 +81,18 @@ def main(x):
     return p
 ''')
     layout = ns['__pyne_slot_layout__']['main']
-    assert layout['names'] == ('p', 'p·kahan')
-    assert layout['init'] == (0.0, 0.0)
+    assert layout['names'] == ('p',)
+    assert layout['init'] == (0.0,)
     state = _make_state(layout)
 
-    # reference implementation of the same algorithm
-    ref_sum = ref_comp = 0.0
+    # A compensated sum would swallow the 1.0 between the two 1e16 steps
+    ref = 0.0
     for value in [0.1] * 10 + [1e16, 1.0, -1e16]:
-        corrected = value - ref_comp
-        new_sum = ref_sum + corrected
-        ref_comp = (new_sum - ref_sum) - corrected
-        ref_sum = new_sum
-        assert ns['main'](state, value) == ref_sum
-    assert state == [ref_sum, ref_comp]
-    assert '__kahan_corrected__' in dump
+        ref = ref + value
+        assert ns['main'](state, value) == ref
+    assert state == [ref]
+    assert ref == 0.0  # the naive sum loses the 1.0, exactly like Pine's
+    assert '__state__[0] += x' in dump
 
 
 def __test_varip_layout__():

@@ -11,12 +11,9 @@ literal-index subscript:
 - non-literal initializers keep the lazy pattern: a value slot plus a flag
   slot and an ``if not __state__[flag]: ...`` guard at the declaration site,
 - reads/writes become ``__state__[N]``,
-- ``+=`` with a non-literal value keeps Kahan summation, emitted as a
-  four-statement sequence (a slot cannot be the target of a walrus, so the
-  legacy single-expression form does not carry over — statement position is
-  guaranteed because ``+=`` is always a statement); variables declared with
-  a ``str``/``bool`` element type skip Kahan (numeric error compensation
-  would crash string concatenation),
+- ``+=`` stays a plain augmented assignment on the slot: TradingView
+  accumulates with a naive running sum (measured on ``ta.cum`` and every
+  volume accumulator), so error compensation here would drift from it,
 - a walrus write to a persistent (expression position) is emitted through
   ``__state__.__setitem__`` inside a tuple expression, preserving the value.
 
@@ -44,11 +41,8 @@ class PersistentTransformer(ast.NodeTransformer):
         self.layout = layout
         self.scope_stack: list[str] = []
         self.current_scope: str = ''
-        # scope -> var name -> (value slot, flag slot or None, kahan slot or None)
+        # scope -> var name -> value slot
         self.var_slots: dict[str, dict[str, int]] = {}
-        self.kahan_slots: dict[str, dict[str, int]] = {}
-        # scope -> var name -> declared element type name (None when unknown)
-        self.var_types: dict[str, dict[str, str | None]] = {}
         self.persistent_declarations: dict[str, set[str]] = {}
         self.local_vars: dict[str, set[str]] = {}
 
@@ -110,13 +104,6 @@ class PersistentTransformer(ast.NodeTransformer):
         if isinstance(node, ast.Constant):
             return True
         return isinstance(node, ast.Name) and node.id == 'na'
-
-    @staticmethod
-    def _inner_type_name(annotation: ast.expr) -> str | None:
-        """Declared element type name of a ``Persistent[...]`` annotation."""
-        if isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Name):
-            return annotation.slice.id
-        return None
 
     # --- visitors --------------------------------------------------------
 
@@ -183,8 +170,6 @@ class PersistentTransformer(ast.NodeTransformer):
         var_name = node.target.id
         self.persistent_declarations[self.current_scope].add(var_name)
         self.local_vars[self.current_scope].add(var_name)
-        self.var_types.setdefault(self.current_scope, {})[var_name] = \
-            self._inner_type_name(node.annotation)
         varip = self._is_varip_type(node.annotation)
         scope_layout = self.layout.scope(self.current_scope)
 
@@ -233,58 +218,16 @@ class PersistentTransformer(ast.NodeTransformer):
         node.value = cast(ast.expr, self.visit(node.value))
         return node
 
-    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST | list[ast.stmt]:
-        """Slot-target augmented assignment; Kahan summation for non-literal ``+=``."""
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        """Slot-target augmented assignment."""
         if isinstance(node.target, ast.Name):
             found = self._lookup(node.target.id)
             if found:
                 scope, slot = found
-                if (isinstance(node.op, ast.Add) and not self._is_literal_or_na(node.value)
-                        # Kahan is numeric error compensation — a declared
-                        # str/bool element type concatenates/accumulates plain
-                        and self.var_types.get(scope, {}).get(node.target.id)
-                        not in ('str', 'bool')):
-                    return self._emit_kahan(scope, slot, node.target.id,
-                                            cast(ast.expr, self.visit(node.value)))
                 node.target = self._state_ref(scope, slot, ast.Store())
                 node.value = cast(ast.expr, self.visit(node.value))
                 return node
-        return cast(ast.AST, self.generic_visit(node))
-
-    def _emit_kahan(self, scope: str, slot: int, var_name: str,
-                    value: ast.expr) -> list[ast.stmt]:
-        """Emit the Kahan-summation statement sequence for ``var += value``."""
-        scope_kahans = self.kahan_slots.setdefault(scope, {})
-        comp = scope_kahans.get(var_name)
-        if comp is None:
-            scope_layout = self.layout.scope(scope)
-            comp = scope_kahans[var_name] = scope_layout.add_kahan(
-                var_name, varip=scope_layout.slots[slot].varip)
-
-        def var_ref(ctx: ast.expr_context) -> ast.Subscript:
-            return self._state_ref(scope, slot, ctx)
-
-        def comp_ref(ctx: ast.expr_context) -> ast.Subscript:
-            return self._state_ref(scope, comp, ctx)
-
-        corrected = ast.Name(id='__kahan_corrected__', ctx=ast.Load())
-        new_sum = ast.Name(id='__kahan_new_sum__', ctx=ast.Load())
-        return [
-            # __kahan_corrected__ = <value> - <comp>
-            ast.Assign(targets=[ast.Name(id='__kahan_corrected__', ctx=ast.Store())],
-                       value=ast.BinOp(left=value, op=ast.Sub(), right=comp_ref(ast.Load()))),
-            # __kahan_new_sum__ = <var> + __kahan_corrected__
-            ast.Assign(targets=[ast.Name(id='__kahan_new_sum__', ctx=ast.Store())],
-                       value=ast.BinOp(left=var_ref(ast.Load()), op=ast.Add(), right=corrected)),
-            # <comp> = (__kahan_new_sum__ - <var>) - __kahan_corrected__
-            ast.Assign(targets=[comp_ref(ast.Store())],
-                       value=ast.BinOp(
-                           left=ast.BinOp(left=new_sum, op=ast.Sub(),
-                                          right=var_ref(ast.Load())),
-                           op=ast.Sub(), right=corrected)),
-            # <var> = __kahan_new_sum__
-            ast.Assign(targets=[var_ref(ast.Store())], value=new_sum),
-        ]
+        return self.generic_visit(node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> ast.AST:
         """Walrus write to a persistent: route through ``__setitem__`` so the
@@ -309,7 +252,7 @@ class PersistentTransformer(ast.NodeTransformer):
                         ],
                         ctx=ast.Load()),
                     slice=ast.Constant(value=0), ctx=ast.Load())
-        return cast(ast.AST, self.generic_visit(node))
+        return self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         """Convert persistent references using scope-aware lookup."""

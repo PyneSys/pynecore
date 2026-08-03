@@ -11,8 +11,8 @@ def main():
     counter += 1
 
 
-def __test_kahan_summation__(ast_transformed_code, file_reader, log):
-    """ Kahan summation for += on Persistent float variables """
+def __test_persistent_add_assign__(ast_transformed_code, file_reader, log):
+    """ += on a Persistent stays a plain augmented assignment on its slot """
     try:
         assert ast_transformed_code == file_reader(subdir="data", suffix="_ast_modified.py")
     except AssertionError:

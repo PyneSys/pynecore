@@ -1,10 +1,9 @@
 """
 @pyne
 
-Regression script: a non-literal ``+=`` on a varip float allocates a Kahan
-compensation slot, and the companion must carry the varip flag too — a var
-rollback restoring the compensation while the sum survives would
-desynchronize the pair.
+Regression script: a ``+=`` accumulator declared varip must keep the varip
+flag on its slot, so a var rollback leaves it alone while the plain one is
+restored.
 """
 from pynecore import Persistent
 from pynecore.types import IBPersistent

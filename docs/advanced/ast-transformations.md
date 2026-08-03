@@ -52,7 +52,7 @@ PyneCore applies several key transformations to Python code to make it behave li
 9. **Closure Arguments Transformer** - Converts closure variables to function arguments
 10. **Unused Series Detector** - Removes unnecessary Series annotations for performance
 11. **Series Transformer** - Handles Series variables
-12. **Persistent Transformer** - Manages persistent variables (with automatic Kahan summation for `+=`)
+12. **Persistent Transformer** - Manages persistent variables
 13. **Function Isolation Transformer** - Ensures separate state for each function call
 14. **Input Transformer** - Processes input parameters
 15. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
@@ -64,7 +64,7 @@ Each transformation step modifies the Python AST to implement Pine Script behavi
 
 ## The Slot Layout
 
-The state-related transformers (Series, Persistent, Function Isolation) share one **module layout**: a table that assigns a **slot index** to every piece of per-instance state — persistent variables, series buffers, Kahan compensation values, and the state of isolated call sites. At the end of the chain this table is emitted into the module as a plain dict constant, and every state-carrying function gets:
+The state-related transformers (Series, Persistent, Function Isolation) share one **module layout**: a table that assigns a **slot index** to every piece of per-instance state — persistent variables, series buffers, and the state of isolated call sites. At the end of the chain this table is emitted into the module as a plain dict constant, and every state-carrying function gets:
 
 - a hidden first parameter (`__state__`) that receives its **state vector** — a plain Python list whose slots are addressed with literal int indexes, and
 - a `__pyne_layout__` attribute describing how to build such a vector (initial values, series slots, `varip` slots, child call sites).
@@ -430,17 +430,7 @@ Key aspects:
 - `IBPersistent` (varip) variables get their slot listed in the layout's `varip` tuple, which excludes them from the `var` rollback on intra-bar re-execution
 - Slot reads/writes are plain list indexing with literal indexes — the fastest state access Python offers
 
-**Kahan Summation**: The `+=` operator on Persistent float variables is automatically transformed into Kahan summation. This eliminates accumulated floating-point errors in running sums. The compensation value lives in a companion slot (`p·kahan`), which also follows the variable's `varip` flag so a rollback can never desynchronize the pair. To bypass Kahan summation, use `x = x + val` instead of `x += val`.
-
-```python
-__pyne_slot_layout__ = {'main': {'init': (0.0, 0.0), 'series': (), 'varip': (), 'children': (), 'names': ('cumulative', 'cumulative·kahan')}}
-
-def main(__state__):
-    __kahan_corrected__ = some_value - __state__[1]
-    __kahan_new_sum__ = __state__[0] + __kahan_corrected__
-    __state__[1] = __kahan_new_sum__ - __state__[0] - __kahan_corrected__
-    __state__[0] = __kahan_new_sum__
-```
+**Accumulation**: The `+=` operator stays a plain augmented assignment on the slot, so a running sum accumulates naively. That is deliberate: TradingView accumulates the same way (measured on `ta.cum` and every volume accumulator), and error compensation — a Kahan sum, for instance — would produce a mathematically better sum that no longer matches the reference.
 
 **Important Note**: The state-related transformers use the Unicode character `·` (middle dot, U+00B7) as the internal scope separator in slot names and call-site identifiers (e.g. `main·t·0`). This prevents conflicts when function names contain underscores. Avoid using the `·` character in function or variable names to prevent conflicts with the internal scoping system.
 
