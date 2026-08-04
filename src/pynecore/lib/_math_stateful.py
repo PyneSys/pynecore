@@ -52,7 +52,7 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
 # noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences,PyTypeChecker
 def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     """
-    Returns the sum of a series over a specified length, bit-exact with Pine.
+    Returns the sum of a series over a specified length.
 
     The window is na-compacted: an na bar returns na and is not stored, so the sum
     always covers the last ``length`` non-na values.

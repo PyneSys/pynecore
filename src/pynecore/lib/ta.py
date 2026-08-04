@@ -356,7 +356,7 @@ def cog(source: Series[float], length: int) -> PyneFloat:
 
 def correlation(source1: Series[float], source2: Series[float], length: int) -> PyneFloat:
     """
-    Calculate the correlation of the source series with the given length, bit-exact with Pine.
+    Calculate the correlation of the source series with the given length.
 
     A covariance within Pine's comparison tolerance of zero makes the result 0.0, even
     for otherwise strongly correlated sources. The same tolerance decides the degenerate
@@ -544,8 +544,7 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFlo
 
 def ema(source: PyneFloat, length: int) -> PyneFloat:
     """
-    Calculate the Exponential Moving Average (EMA) of the source series with the given length,
-    bit-exact with Pine.
+    Calculate the Exponential Moving Average (EMA) of the source series with the given length.
 
     The average is seeded with :func:`sma` over the same length. na bars are skipped
     whole: the result is na there and the state does not advance, so the average always
@@ -1736,7 +1735,7 @@ def rising(source: float, length: int) -> bool:
 def rma(source: PyneFloat, length: int) -> PyneFloat:
     """
     Calculate the RMA (Running Moving Average, Wilder's smoothing) of the source series with
-    the given length, bit-exact with Pine.
+    the given length.
 
     Seed, warmup bar and na handling are :func:`ema`'s.
 
@@ -1936,8 +1935,8 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
     """
     Calculate the standard deviation of the source series with the given length.
 
-    Bit-exact with Pine: it is the square root of :func:`variance`, whose clamp applies
-    here too, so cancellation regimes give 0.0, not na.
+    It is the square root of :func:`variance`, whose clamp applies here too, so
+    cancellation regimes give 0.0, not na.
 
     :param source: The source series
     :param length: The length of the standard deviation
@@ -1956,8 +1955,7 @@ def stdev(source: float, length: int, biased=True) -> PyneFloat:
 def stoch(source: float | Series[float], high: float | Series[float], low: float | Series[float],
           length: int) -> PyneFloat:
     """
-    Calculate the Stochastic Oscillator of the source series with the given length,
-    bit-exact with Pine.
+    Calculate the Stochastic Oscillator of the source series with the given length.
 
     The result is not clamped to ``[0, 100]``: a source that leaves the window range
     of ``high``/``low`` scales freely beyond it, and rounding can push an in-range
@@ -2150,7 +2148,7 @@ def variance(source: Series[float],
              length: int,
              biased: bool = True) -> PyneFloat:
     """
-    Calculate the rolling variance of the source series, bit-exact with Pine.
+    Calculate the rolling variance of the source series.
 
     The result is clamped at zero, the way TradingView clamps it: under catastrophic
     cancellation the raw expression goes negative and comes back as 0.0. An unbiased
@@ -2297,8 +2295,7 @@ def wad() -> PyneFloat:
 # noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def wma(source: Series[float], length: int) -> PyneFloat:
     """
-    Calculate the Weighted Moving Average (WMA) of the source series with the given length,
-    bit-exact with Pine.
+    Calculate the Weighted Moving Average (WMA) of the source series with the given length.
 
     Unlike the other rolling averages this one does not compact the window: an na bar
     carries the previous value forward, so the average runs over the last ``length``
