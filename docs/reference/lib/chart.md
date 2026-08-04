@@ -5,7 +5,7 @@ title: "chart"
 description: "Chart properties — type, colors, visible range"
 icon: "candlestick_chart"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-04"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -85,12 +85,32 @@ def main():
 
 **chart.left_visible_bar_time**
 - Type: `int`
-- The timestamp (in milliseconds since epoch) of the leftmost "visible" bar. In PyneCore this is a heuristic: `current_bar_time - 20 × timeframe_seconds`. There is no real viewport — the value approximates a 20-bar visible window ending at the current bar.
+- The timestamp (in milliseconds since epoch) of the leftmost "visible" bar. In PyneCore this is a heuristic: `last_bar_time - 20 × timeframe_seconds`. There is no real viewport — the value approximates a 20-bar window anchored at the dataset's last bar (or the current live bar).
 
 **chart.right_visible_bar_time**
 - Type: `int`
-- The timestamp (in milliseconds since epoch) of the rightmost "visible" bar. In PyneCore this is always the current bar's timestamp.
+- The timestamp (in milliseconds since epoch) of the rightmost "visible" bar. In PyneCore this is `last_bar_time`: the final historical bar during a backtest, or the current bar in live mode.
+
+### chart.point
+
+`chart.point` creates coordinate objects for `line`, `box`, `label`, and `polyline` APIs that
+accept point arguments. The consuming object's `xloc` determines whether the point's `index` or
+`time` coordinate is used.
+
+| Function | Parameters | Result |
+|----------|------------|--------|
+| `chart.point.new(time, index, price)` | Explicit UNIX time (milliseconds), bar index, and price | A point with both x coordinates |
+| `chart.point.now(price)` | Price | A point at the current bar's index and time |
+| `chart.point.from_index(index, price)` | Bar index and price | A point whose time is `na` |
+| `chart.point.from_time(time, price)` | UNIX time (milliseconds) and price | A point whose index is `na` |
+| `chart.point.copy(id)` | Existing point | An independent copy |
+
+```python
+p1 = chart.point.from_index(bar_index - 10, low)
+p2 = chart.point.now(high)
+trend = line.new(p1, p2)
+```
 
 ## Compatibility
 
-Chart type properties (`is_standard`, `is_renko`, etc.) are fully supported. Visible range properties (`left_visible_bar_time`, `right_visible_bar_time`) use a static heuristic (20-bar window at the current bar) since PyneCore has no graphical viewport. Scripts that rely on precise visible range detection may behave differently than on TradingView.
+Chart type properties (`is_standard`, `is_renko`, etc.) are fully supported. Visible range properties (`left_visible_bar_time`, `right_visible_bar_time`) use a static heuristic (20-bar window anchored at `last_bar_time`) since PyneCore has no graphical viewport. Scripts that rely on precise visible range detection may behave differently than on TradingView.

@@ -295,5 +295,5 @@ Now that you've created your first PyneCore script, you can:
 
 1. Learn how to [convert existing Pine Script code](./converting-from-pine.md) to PyneCore
 2. Explore the [core concepts](../overview/core-concepts.md) of PyneCore in depth
-3. Check out the [library documentation](../lib.md) for available functions and indicators
+3. Check out the [library documentation](../lib/) for available functions and indicators
 4. Dive into [advanced topics](../advanced/) for more technical details

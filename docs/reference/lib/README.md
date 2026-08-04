@@ -5,7 +5,7 @@ title: "Library"
 description: "PyneCore built-in library reference — functions, variables, and constants"
 icon: "library_books"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-04"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -15,8 +15,8 @@ tags: ["library", "functions", "variables", "constants", "ta", "math", "strategy
 
 # Library Reference
 
-Auto-generated reference for all PyneCore built-in library functions, variables, and
-constants. Each page covers one namespace and includes compatibility status.
+Reference for PyneCore built-in library functions, variables, and constants. Each page covers one
+namespace and includes compatibility status.
 
 ## Namespaces
 
@@ -41,6 +41,7 @@ constants. Each page covers one namespace and includes compatibility status.
 | [runtime](runtime.md)    | Runtime error handling                   |
 | [syminfo](syminfo.md)    | Symbol information                       |
 | [timeframe](timeframe.md)| Timeframe utilities                      |
+| [ticker](ticker.md)      | Ticker identifiers and chart types       |
 | [barstate](barstate.md)  | Bar state flags                          |
 | [chart](chart.md)        | Chart properties                         |
 | [session](session.md)    | Session information                      |
@@ -64,6 +65,7 @@ constants. Each page covers one namespace and includes compatibility status.
 | [adjustment](adjustment.md) | Dividend adjustment constants         |
 | [dividends](dividends.md)| Dividend data field constants            |
 | [earnings](earnings.md)  | Earnings data field constants            |
+| [splits](splits.md)      | Stock split data field constants         |
 | [xloc](xloc.md)          | X-axis location constants                |
 | [yloc](yloc.md)          | Y-axis location constants                |
 | [pivotpointtype](pivotpointtype.md) | Pivot point calculation types  |

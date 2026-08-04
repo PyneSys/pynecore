@@ -5,7 +5,7 @@ title: "request"
 description: "Data requests from other symbols and timeframes"
 icon: "cloud_download"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-04"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -50,7 +50,7 @@ Evaluates an expression from a specified symbol and timeframe.
 | timeframe | str | Timeframe as string (e.g., "60", "D", "W") |
 | expression | any | Expression to evaluate in the target context |
 | gaps | barmerge | Gap handling mode (`barmerge.gaps_off` or `barmerge.gaps_on`) |
-| lookahead | barmerge | Lookahead mode (only `barmerge.lookahead_off` supported) |
+| lookahead | barmerge | Alignment mode: `barmerge.lookahead_off`, `barmerge.lookahead_on`, or `barmerge.lookahead_last_closed` |
 | ignore_invalid_symbol | bool | Return `na` for invalid symbols instead of raising an error |
 | currency | str | Target currency — auto-converts result using `CurrencyRateProvider` |
 | calc_bars_count | int | Number of bars to calculate (not yet used) |
@@ -63,7 +63,18 @@ sma_value: float = request.security("EURUSD", "D", ta.sma(close, 50))  # Daily 5
 upper_band: float = request.security("SPY", "240", ta.highest(high, 14))  # Highest of last 14 bars
 ```
 
-**Note:** Fully implemented via the `SecurityTransformer`, which rewrites all calls into a multiprocessing protocol at compile time. The function itself is never called at runtime. Only `barmerge.lookahead_off` is supported (intentional safety constraint). Conditional calls and nested security requests are supported.
+**Lookahead behavior:** `barmerge.lookahead_off` (the default) and the PyneSys-native
+`barmerge.lookahead_last_closed` return closed security bars and are repaint-free. With
+`barmerge.lookahead_on`, same-symbol higher-timeframe requests use the containing higher-timeframe
+bar. In historical data, a bare value can therefore expose that completed bar's final value; use
+`close[1]` inside the expression when the intent is the prior closed bar. In live mode, the
+same-symbol higher-timeframe bar is aggregated from the chart data and is unconfirmed. A
+cross-symbol higher-timeframe request cannot build that developing bar, so it yields `na` until the
+period closes.
+
+**Implementation:** `SecurityTransformer` rewrites calls into the security execution protocol at
+compile time; the Python stub itself is not called by a transformed script. Conditional calls and
+nested security requests are supported.
 
 ### security_lower_tf()
 
@@ -176,13 +187,14 @@ Requests economic data such as GDP, inflation rate, or employment statistics.
 
 Requests data from Nasdaq Data Link (formerly Quandl).
 
-**Note:** Deprecated. Nasdaq Data Link no longer accepts QUANDL requests. This function is not supported.
+**Note:** Not implemented. The function raises `NotImplementedError`.
 
 ### seed()
 
 Requests data from user-maintained GitHub repositories (Pine Seeds).
 
-**Note:** Not supported. Pine Seeds feature was discontinued by TradingView.
+**Note:** Seed repositories are unavailable to PyneCore. The function returns `na`, allowing scripts
+that guard the result with `na()` to take their fallback path.
 
 ### footprint()
 
@@ -193,16 +205,21 @@ Requests volume footprint data for the current bar.
 | ticks_per_row | int | Number of ticks per footprint row |
 | va_percent | int | Value Area percentage |
 
-**Returns:** Footprint object with volume data.
+**Returns:** `Footprint | na`.
 
-**Note:** Not planned for PyneCore core. Footprint data requires Level 2 / tick-by-tick market data feeds that are not available from standard OHLCV sources. May be supported via provider plugins in the future. Raises `NotImplementedError`.
+**Note:** Footprint data requires Level 2 / tick-by-tick market data, which standard OHLCV files do
+not contain. PyneCore returns `na` so scripts can use their normal unavailable-data fallback.
 
 ## Compatibility Notes
 
-- **Fully implemented**: `request.security()`, `request.security_lower_tf()`, `request.currency_rate()`
+- **Implemented**: `request.security()`, `request.security_lower_tf()`, `request.currency_rate()`
 - **Partial support**: `request.dividends()`, `request.earnings()`, `request.splits()` — return `na` when `ignore_invalid_symbol=True`, raise `NotImplementedError` otherwise
-- **Not available**: `request.economic()`, `request.financial()`, `request.footprint()`, `request.quandl()`, `request.seed()`
+- **Unavailable data fallbacks**: `request.seed()` and `request.footprint()` return `na`.
+  `request.financial()` returns `na` only when `ignore_invalid_symbol=True`; otherwise it, along
+  with `request.economic()` and `request.quandl()`, raises `NotImplementedError`.
 - **Gap handling**: Both `barmerge.gaps_off` (forward-fill, default) and `barmerge.gaps_on` (return `na` between periods) are supported
 - **Currency conversion**: The `currency` parameter auto-converts results using `CurrencyRateProvider` when OHLCV metadata for the currency pair is available
-- **Safety constraint**: Only `barmerge.lookahead_off` is supported for `request.security()` — lookahead is deliberately disabled for production safety
+- **Lookahead modes**: `barmerge.lookahead_off`, `barmerge.lookahead_on`, and
+  `barmerge.lookahead_last_closed` are supported; their differing historical, live, and
+  cross-symbol behavior is described above.
 - **Data sources**: `request.security()` and `request.security_lower_tf()` require separate OHLCV data files per symbol/timeframe. `request.currency_rate()` uses OHLCV metadata to auto-detect currency pairs.

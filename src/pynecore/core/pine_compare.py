@@ -23,7 +23,7 @@ Two consumers share this definition:
 Hot per-bar paths inline the arithmetic instead of calling ``equal``: the call
 would cost more than the comparison it wraps.
 """
-__all__ = ['EPSILON', 'equal']
+__all__ = ['EPSILON', 'equal', 'lower_bound', 'upper_bound']
 
 EPSILON = 1e-10
 
@@ -51,3 +51,47 @@ def equal(a, b) -> bool:
         difference = a - b
         return -EPSILON <= difference <= EPSILON
     return False
+
+
+def lower_bound(values: list[float], x: float) -> int:
+    """
+    First slot of an ordered list that is not below ``x`` under Pine's comparison.
+
+    Neither bound may be expressed as a plain ``bisect`` over a shifted key
+    (``x - EPSILON``): the shift is itself rounded, which moves the decision on
+    operands sitting on the tolerance boundary, and a list ordered tolerantly is
+    not necessarily ordered exactly, so the shifted key would be compared against
+    an assumption that does not hold.
+
+    :param values: Tolerantly ordered values
+    :param x: The value to locate
+    :return: The insertion point in front of the values ``x`` ties with
+    """
+    lo = 0
+    hi = len(values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if values[mid] - x < -EPSILON:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def upper_bound(values: list[float], x: float) -> int:
+    """
+    First slot of an ordered list that is above ``x`` under Pine's comparison.
+
+    :param values: Tolerantly ordered values
+    :param x: The value to locate
+    :return: The insertion point behind the values ``x`` ties with
+    """
+    lo = 0
+    hi = len(values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x - values[mid] < -EPSILON:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo

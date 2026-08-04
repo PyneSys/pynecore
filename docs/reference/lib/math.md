@@ -5,7 +5,7 @@ title: "math"
 description: "Mathematical functions and constants"
 icon: "calculate"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-04"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -370,22 +370,6 @@ Converts an angle from radians to degrees.
 degrees: float = math.todegrees(math.pi)  # 180.0
 ```
 
-### random()
-
-Returns a pseudo-random value between a minimum and maximum. The sequence is deterministic if a seed is provided.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `min` | `float` or `int` (optional) | Lower bound (default: 0) |
-| `max` | `float` or `int` (optional) | Upper bound (default: 1) |
-| `seed` | `int` (optional) | Seed for reproducible randomness |
-
-**Returns:** `float` or `NA[float]`
-
-```python
-rand_val: float = math.random(0, 100)  # Random value between 0 and 100
-```
-
 ## Constants
 
 | Name | Value | Description |
@@ -397,4 +381,5 @@ rand_val: float = math.random(0, 100)  # Random value between 0 and 100
 
 ## Compatibility
 
-All 24 functions and 4 constants are fully implemented in PyneCore. All functions handle `NA` (not available) values correctly, returning `NA` if any input is `NA`.
+All 22 functions and 4 constants are implemented in PyneCore. Functions that accept `NA` propagate
+it according to their Pine-compatible semantics.
