@@ -26,7 +26,7 @@ from rich.text import Text
 from rich.console import Console
 
 from ..app import app, app_state
-from ...core.ohlcv_file import OHLCVReader
+from ...core.ohlcv import OHLCVReader
 from ...core.syminfo import SymInfo
 from ...core.script_runner import ScriptRunner
 from ...core.strategy_stats import StrategyStatistics
@@ -667,10 +667,11 @@ def optimize(
 
     # --- Pre-compute data parameters ---
     with OHLCVReader(data) as reader:
+        # Timestamps are int64 milliseconds since the v2 OHLCV format.
         start_ts = (reader.start_timestamp if not time_from
-                    else int(time_from.replace(tzinfo=None).timestamp()))
+                    else int(time_from.replace(tzinfo=None).timestamp() * 1000))
         end_ts = (reader.end_timestamp if not time_to
-                  else int(time_to.replace(tzinfo=None).timestamp()))
+                  else int(time_to.replace(tzinfo=None).timestamp() * 1000))
         size = reader.get_size(start_ts, end_ts)
 
     # --- Print summary ---
