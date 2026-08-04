@@ -50,6 +50,13 @@ class BrokerPosition(PositionBase):
         'eventrades', 'wintrades', 'losstrades',
         'closed_trades_count',
         'max_drawdown', 'max_runup', 'max_equity',
+        # Fork-parity drawdown family. ``strategy_stats.build_stats`` reads
+        # these off whatever position it is handed, and the sim ``Position``
+        # (lib/strategy) carries them — so a broker-mode run needs them too or
+        # stats raise AttributeError. Declared here, not yet computed: broker
+        # mode has no per-bar drawdown accumulation, so they stay 0.0.
+        'unrealized_max_drawdown', 'unrealized_max_drawdown_percent',
+        'real_max_drawdown', 'real_max_drawdown_percent',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
         # Per-evaluation set of close keys already seen this script run, so a
@@ -89,6 +96,13 @@ class BrokerPosition(PositionBase):
         self.closed_trades_count: int = 0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
+        # Fork-parity drawdown family — see the __slots__ note. Present so
+        # ``build_stats`` works in broker mode; left at 0.0 because broker mode
+        # does not run the sim's per-bar drawdown accumulation.
+        self.unrealized_max_drawdown: float = 0.0
+        self.unrealized_max_drawdown_percent: float = 0.0
+        self.real_max_drawdown: float = 0.0
+        self.real_max_drawdown_percent: float = 0.0
         # Mark-to-market peak equity, used by ``_peak_equity`` for the
         # ``max_drawdown(percent_of_equity)`` threshold. Updated on every
         # :meth:`update_unrealized_pnl` and :meth:`record_fill` call.

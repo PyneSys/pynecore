@@ -10,6 +10,8 @@ __pycache__/
 
 # Environments
 .env
+.env.*
+!.env.example
 venv/
 .venv/
 
@@ -53,3 +55,6 @@ uv.lock
 
 # Parked files awaiting deletion (recovery window, never committed)
 backup/
+
+# Editable-install build metadata
+*.egg-info/
