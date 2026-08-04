@@ -198,7 +198,7 @@ Returns a new string with the Nth occurrence of the target substring replaced by
 | source | str | The string to modify |
 | target | str | The substring to replace |
 | replacement | str | The replacement string |
-| occurence | int | Which occurrence to replace (0-based), default 0 |
+| occurrence | int | Which occurrence to replace (0-based), default 0 |
 
 **Returns:** `str`
 
