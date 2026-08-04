@@ -1,0 +1,35 @@
+//@version=6
+// Order-type test strategy 2/6 — Short, market entry on red candle
+// 
+// Red candle (close < open) -> market short. Green candle -> close().
+// 
+// Every position also closes via strategy.close() once open profit reaches
+// TAKE_PCT, provided the protective stop has not already fired. Entry and exit
+// comments carry the SIGNAL price; the trade CSV's own Price column carries the
+// actual FILL price, so comparing the two shows slippage and fill timing.
+
+// VN30F1M notional = price x 100,000 VND/point (~192.5m at 1925), and DNSE's
+// loan package quotes initialRate 0.1848 -> ~35.6m margin per contract.
+// initial_capital must clear that or every entry is rejected on margin.
+strategy("T2 Short, market entry on red candle", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+TAKE_PCT = 0.02   // close() once open profit reaches 2%
+
+isGreen = close > open
+isRed   = close < open
+flat    = strategy.position_size == 0
+short_  = strategy.position_size < 0
+
+if flat and isRed
+    strategy.entry("S", strategy.short, comment="E-mkt@" + str.tostring(close, format.mintick))
+
+if short_ and close <= strategy.position_avg_price * (1 - TAKE_PCT)
+    strategy.close("S", comment="TP@" + str.tostring(close, format.mintick))
+else if short_ and isGreen
+    strategy.close("S", comment="X-green@" + str.tostring(close, format.mintick))
+
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(strategy.position_avg_price, "avg", display=display.data_window)

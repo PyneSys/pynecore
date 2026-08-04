@@ -1,0 +1,1681 @@
+[
+ {
+  "method": "GET",
+  "path": "/accounts",
+  "query": null,
+  "status": 200,
+  "body": {
+   "name": "NGUYEN VAN A",
+   "custodyCode": "064C000000",
+   "investorId": "1000000000",
+   "accounts": [
+    {
+     "id": "0001000000",
+     "dealAccount": true,
+     "derivativeAccount": true,
+     "derivative": {
+      "status": "ACTIVE"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/balances",
+  "query": null,
+  "status": 200,
+  "body": {
+   "stock": {
+    "totalCash": 11000,
+    "availableCash": 11000,
+    "depositInterest": 0,
+    "totalDebt": 0,
+    "depositFeeAmount": 0,
+    "secureAmount": 0,
+    "orderSecured": 0,
+    "withdrawableCash": 11000,
+    "cashDividendReceiving": 0
+   },
+   "derivative": {
+    "pendingDepositWithdraw": 0,
+    "remainSecure": 441852412,
+    "usedSecure": 0,
+    "pendingSecure": 0,
+    "holdTaxAndFee": 100000,
+    "totalLoanDebt": 0
+   },
+   "bond": {
+    "totalValue": 0
+   },
+   "egg": {
+    "totalValue": 0
+   }
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/positions",
+  "query": {
+   "marketType": "DERIVATIVE"
+  },
+  "status": 200,
+  "body": {
+   "positions": [],
+   "pageIndex": 0,
+   "pageSize": 50,
+   "pageNumber": 0,
+   "total": 0
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/positions",
+  "query": {
+   "marketType": "STOCK"
+  },
+  "status": 200,
+  "body": {
+   "positions": []
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/orders",
+  "query": {
+   "marketType": "DERIVATIVE",
+   "orderCategory": "NORMAL"
+  },
+  "status": 200,
+  "body": {
+   "orders": []
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/orders",
+  "query": {
+   "marketType": "DERIVATIVE",
+   "orderCategory": "CONDITIONAL"
+  },
+  "status": 200,
+  "body": {
+   "orders": []
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/orders/history",
+  "query": {
+   "marketType": "DERIVATIVE"
+  },
+  "status": 400,
+  "body": {
+   "status": 400,
+   "code": "INVALID_INPUT",
+   "message": "from is required"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/loan-packages",
+  "query": {
+   "marketType": "DERIVATIVE"
+  },
+  "status": 200,
+  "body": {
+   "symbolType": "VN30F1M",
+   "marketType": "DERIVATIVE",
+   "loanPackages": [
+    {
+     "id": 1306,
+     "name": "NGUYEN VAN A",
+     "initialRate": 0.1848,
+     "maintenanceRate": 0.1771,
+     "liquidRate": 0.1735,
+     "tradingFee": {
+      "id": 3306,
+      "name": "NGUYEN VAN A",
+      "scope": "PRODUCT",
+      "channel": "ALL",
+      "schemaType": "PROGRESSIVE",
+      "createdDate": "2026-04-29T10:22:24.572111449Z",
+      "modifiedDate": "2026-04-29T10:22:24.572111449Z",
+      "progressTradingFee": [
+       {
+        "fromQuantity": 1,
+        "toQuantity": 99,
+        "fee": 1000.0
+       },
+       {
+        "fromQuantity": 100,
+        "toQuantity": 999,
+        "fee": 800.0
+       },
+       {
+        "fromQuantity": 1000,
+        "toQuantity": 1499,
+        "fee": 500.0
+       },
+       {
+        "fromQuantity": 1500,
+        "toQuantity": 9999999,
+        "fee": 300.0
+       }
+      ],
+      "progressDailyCloseTradingFee": [
+       {
+        "fromQuantity": 1,
+        "toQuantity": 99,
+        "fee": 1000.0
+       },
+       {
+        "fromQuantity": 100,
+        "toQuantity": 999,
+        "fee": 800.0
+       },
+       {
+        "fromQuantity": 1000,
+        "toQuantity": 1499,
+        "fee": 500.0
+       },
+       {
+        "fromQuantity": 1500,
+        "toQuantity": 9999999,
+        "fee": 300.0
+       }
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/loan-packages",
+  "query": {
+   "marketType": "STOCK"
+  },
+  "status": 400,
+  "body": {
+   "status": 400,
+   "code": "INVALID_INPUT",
+   "message": "symbol is required"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/ppse",
+  "query": {
+   "marketType": "DERIVATIVE",
+   "symbol": "41I1G8000",
+   "price": 1925,
+   "loanPackageId": 1306
+  },
+  "status": 200,
+  "body": {
+   "qmaxBuy": 12,
+   "qmaxSell": 12,
+   "price": 1925,
+   "pp0Buy": 441852412,
+   "pp0Sell": 441852412
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/instruments",
+  "query": {
+   "limit": 20
+  },
+  "status": 200,
+  "body": {
+   "data": [
+    {
+     "symbol": "41I1G8000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "VN30F1M",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN30 1 tháng",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I1G9000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "VN30F2M",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN30 2 tháng",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I1GC000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "VN30F1Q",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN30 1 quý",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I1H3000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "VN30F2Q",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN30 2 quý",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I2G8000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "V100F1M",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN100 1 tháng",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I2G9000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "V100F2M",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN100 2 tháng",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I2GC000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "V100F1Q",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN100 1 quý",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "41I2H3000",
+     "marketId": "DVX",
+     "securityGroupId": "FU",
+     "symbolType": "V100F2Q",
+     "listedDate": "",
+     "shortName": "HĐTL chỉ số VN100 2 quý",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "A32",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2018-10-23",
+     "shortName": "CTCP 32",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAA",
+     "marketId": "STO",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2016-11-25",
+     "shortName": "Nhựa An Phát Xanh",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAH",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2024-01-11",
+     "shortName": "Hợp Nhất",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAM",
+     "marketId": "STO",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2009-09-24",
+     "shortName": "Thủy sản Mekong",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAN",
+     "marketId": "STO",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2026-05-22",
+     "shortName": "Công ty Cổ phần Lương thực A An",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAS",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2020-07-23",
+     "shortName": "Chứng khoán SmartInvest",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAT",
+     "marketId": "STO",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2021-03-24",
+     "shortName": "Tiên Sơn Thanh Hóa",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "AAV",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2026-05-26",
+     "shortName": "AAV GROUP",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "ABB",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2020-12-28",
+     "shortName": "Ngân hàng An Bình",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "ABC",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2016-08-18",
+     "shortName": "Truyền thông VMG",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "ABI",
+     "marketId": "UPX",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2009-07-16",
+     "shortName": "Bảo hiểm Agribank",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    },
+    {
+     "symbol": "ABR",
+     "marketId": "STO",
+     "securityGroupId": "ST",
+     "symbolType": "",
+     "listedDate": "2022-03-03",
+     "shortName": "ĐT Nhãn Hiệu Việt",
+     "name": "NGUYEN VAN A",
+     "indexName": null
+    }
+   ],
+   "total": 3217,
+   "page": 1,
+   "pageSize": 20
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/41I1G8000/secdef",
+  "query": null,
+  "status": 200,
+  "body": [
+   {
+    "marketId": "DVX",
+    "boardId": "G1",
+    "isin": "VN41I1G80003",
+    "symbol": "41I1G8000",
+    "productGrpId": "FIO",
+    "securityGroupId": "FU",
+    "basicPrice": 1925,
+    "ceilingPrice": 2059.7,
+    "floorPrice": 1790.3,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2026-06-19T00:00:00Z",
+    "time": "2026-08-04 20:19:13.415"
+   },
+   {
+    "marketId": "DVX",
+    "boardId": "T1",
+    "isin": "VN41I1G80003",
+    "symbol": "41I1G8000",
+    "productGrpId": "FIO",
+    "securityGroupId": "FU",
+    "basicPrice": 1925,
+    "ceilingPrice": 2059.7,
+    "floorPrice": 1790.3,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2026-06-19T00:00:00Z",
+    "time": "2026-08-04 20:19:13.415"
+   }
+  ]
+ },
+ {
+  "method": "GET",
+  "path": "/price/HPG/secdef",
+  "query": null,
+  "status": 200,
+  "body": [
+   {
+    "marketId": "STO",
+    "boardId": "T6",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.455"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "T4",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.455"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "G1",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.454"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "T3",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.455"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "T1",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.454"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "G7",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.454"
+   },
+   {
+    "marketId": "STO",
+    "boardId": "G4",
+    "isin": "VN000000HPG4",
+    "symbol": "HPG",
+    "productGrpId": "STO",
+    "securityGroupId": "ST",
+    "basicPrice": 22.15,
+    "ceilingPrice": 23.7,
+    "floorPrice": 20.6,
+    "securityStatus": "UNSPECIFIED",
+    "symbolAdminStatusCode": "NRM",
+    "symbolTradingMethodStatusCode": "NRM",
+    "symbolTradingSanctionStatusCode": "NRM",
+    "finalTradeDate": null,
+    "listingDate": "2007-11-15T00:00:00Z",
+    "time": "2026-08-04 20:20:13.454"
+   }
+  ]
+ },
+ {
+  "method": "GET",
+  "path": "/price/HPG/close",
+  "query": null,
+  "status": 200,
+  "body": {
+   "prices": [
+    {
+     "marketId": "STO",
+     "boardId": "G1",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 22.15,
+     "time": "2026-08-04 14:45:02.923"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G4",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 14:45:01.143"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G7",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 09:00:00.095"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T1",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 14:45:00.090"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T6",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 15:00:00.789"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T3",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 15:00:00.398"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T4",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "closePrice": 0,
+     "time": "2026-08-04 14:45:00.513"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/HPG/quotes/latest",
+  "query": null,
+  "status": 200,
+  "body": {
+   "quotes": [
+    {
+     "marketId": "STO",
+     "boardId": "G1",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "bid": [
+      {
+       "price": 22.15,
+       "quantity": 42150
+      },
+      {
+       "price": 22.1,
+       "quantity": 91120
+      },
+      {
+       "price": 22.05,
+       "quantity": 70290
+      }
+     ],
+     "offer": [
+      {
+       "price": 22.2,
+       "quantity": 4490
+      },
+      {
+       "price": 22.25,
+       "quantity": 240
+      },
+      {
+       "price": 22.3,
+       "quantity": 12730
+      }
+     ],
+     "totalOfferQtty": 0,
+     "totalBidQtty": 0,
+     "time": "2026-08-04 14:45:02.923"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G4",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "bid": [
+      {
+       "price": 22.25,
+       "quantity": 1001
+      },
+      {
+       "price": 22.2,
+       "quantity": 2313
+      },
+      {
+       "price": 22.15,
+       "quantity": 1625
+      }
+     ],
+     "offer": [
+      {
+       "price": 22.3,
+       "quantity": 1848
+      },
+      {
+       "price": 22.35,
+       "quantity": 70
+      },
+      {
+       "price": 22.4,
+       "quantity": 1017
+      }
+     ],
+     "totalOfferQtty": 0,
+     "totalBidQtty": 0,
+     "time": "2026-08-04 14:45:01.143"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/HPG/trades/latest",
+  "query": null,
+  "status": 200,
+  "body": {
+   "trades": [
+    {
+     "marketId": "STO",
+     "boardId": "G1",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "matchPrice": 22.15,
+     "matchQtty": 30,
+     "side": "SELL",
+     "avgPrice": 22.263,
+     "totalVolumeTraded": 2269400,
+     "grossTradeAmount": 505.240065,
+     "highestPrice": 22.6,
+     "lowestPrice": 22.1,
+     "openPrice": 22.55,
+     "time": "2026-08-04 14:45:02.923"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G4",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "matchPrice": 22.25,
+     "matchQtty": 28,
+     "side": "SELL",
+     "avgPrice": 22.306,
+     "totalVolumeTraded": 45236,
+     "grossTradeAmount": 1.00902315,
+     "highestPrice": 22.6,
+     "lowestPrice": 22.15,
+     "openPrice": 22.55,
+     "time": "2026-08-04 14:45:01.143"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T1",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "matchPrice": 21.7,
+     "matchQtty": 7500,
+     "side": "SELL",
+     "avgPrice": 22.483,
+     "totalVolumeTraded": 263740,
+     "grossTradeAmount": 59.2974,
+     "highestPrice": 0,
+     "lowestPrice": 0,
+     "openPrice": 0,
+     "time": "2026-08-04 14:04:28.840"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T3",
+     "isin": "VN000000HPG4",
+     "symbol": "HPG",
+     "matchPrice": 21,
+     "matchQtty": 30000,
+     "side": "SELL",
+     "avgPrice": 21,
+     "totalVolumeTraded": 69600,
+     "grossTradeAmount": 14.616,
+     "highestPrice": 0,
+     "lowestPrice": 0,
+     "openPrice": 0,
+     "time": "2026-07-30 14:49:08.528"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/market/trading-session",
+  "query": null,
+  "status": 200,
+  "body": {
+   "tradingSessions": [
+    {
+     "marketId": "HCX",
+     "boardId": "G1",
+     "tscProdGrpId": "HCX",
+     "tradingSessionId": "99",
+     "eventId": "AC2",
+     "time": "2026-08-04 14:45:00.548"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G1",
+     "tscProdGrpId": "STO",
+     "tradingSessionId": "99",
+     "eventId": "AC2",
+     "time": "2026-08-04 14:45:00.335"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "G4",
+     "tscProdGrpId": "STO",
+     "tradingSessionId": "99",
+     "eventId": "AD2",
+     "time": "2026-08-04 14:45:00.333"
+    },
+    {
+     "marketId": "DVX",
+     "boardId": "G1",
+     "tscProdGrpId": "FIO",
+     "tradingSessionId": "99",
+     "eventId": "AC2",
+     "time": "2026-08-04 14:45:00.628"
+    },
+    {
+     "marketId": "DVX",
+     "boardId": "G1",
+     "tscProdGrpId": "FBX",
+     "tradingSessionId": "99",
+     "eventId": "AD2",
+     "time": "2026-08-04 14:45:00.622"
+    },
+    {
+     "marketId": "STX",
+     "boardId": "G4",
+     "tscProdGrpId": "STX",
+     "tradingSessionId": "99",
+     "eventId": "AD2",
+     "time": "2026-08-04 14:45:00.677"
+    },
+    {
+     "marketId": "DVX",
+     "boardId": "T1",
+     "tscProdGrpId": "FBX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 14:45:00.612"
+    },
+    {
+     "marketId": "DVX",
+     "boardId": "T1",
+     "tscProdGrpId": "FIO",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 14:45:00.619"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T1",
+     "tscProdGrpId": "STO",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.318"
+    },
+    {
+     "marketId": "UPX",
+     "boardId": "T4",
+     "tscProdGrpId": "UPX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.201"
+    },
+    {
+     "marketId": "UPX",
+     "boardId": "G4",
+     "tscProdGrpId": "UPX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.208"
+    },
+    {
+     "marketId": "UPX",
+     "boardId": "T1",
+     "tscProdGrpId": "UPX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.199"
+    },
+    {
+     "marketId": "STO",
+     "boardId": "T4",
+     "tscProdGrpId": "STO",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.328"
+    },
+    {
+     "marketId": "UPX",
+     "boardId": "G1",
+     "tscProdGrpId": "UPX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.214"
+    },
+    {
+     "marketId": "HCX",
+     "boardId": "T1",
+     "tscProdGrpId": "HCX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.518"
+    },
+    {
+     "marketId": "STX",
+     "boardId": "T1",
+     "tscProdGrpId": "STX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.662"
+    },
+    {
+     "marketId": "STX",
+     "boardId": "T4",
+     "tscProdGrpId": "STX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.673"
+    },
+    {
+     "marketId": "STX",
+     "boardId": "G1",
+     "tscProdGrpId": "STX",
+     "tradingSessionId": "99",
+     "eventId": "AB2",
+     "time": "2026-08-04 15:00:00.676"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/market/working-dates",
+  "query": null,
+  "status": 200,
+  "body": {
+   "workingDates": [
+    "2026-08-04",
+    "2026-08-05",
+    "2026-08-06",
+    "2026-08-07",
+    "2026-08-10",
+    "2026-08-11",
+    "2026-08-12",
+    "2026-08-13",
+    "2026-08-14",
+    "2026-08-17",
+    "2026-08-18",
+    "2026-08-19",
+    "2026-08-20",
+    "2026-08-21",
+    "2026-08-24",
+    "2026-08-25",
+    "2026-08-26",
+    "2026-08-27",
+    "2026-08-28",
+    "2026-09-03",
+    "2026-09-04",
+    "2026-09-07",
+    "2026-09-08",
+    "2026-09-09",
+    "2026-09-10",
+    "2026-09-11",
+    "2026-09-14",
+    "2026-09-15",
+    "2026-09-16",
+    "2026-09-17",
+    "2026-09-18",
+    "2026-09-21",
+    "2026-09-22",
+    "2026-09-23",
+    "2026-09-24",
+    "2026-09-25",
+    "2026-09-28",
+    "2026-09-29",
+    "2026-09-30",
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-05",
+    "2026-10-06",
+    "2026-10-07",
+    "2026-10-08",
+    "2026-10-09",
+    "2026-10-12",
+    "2026-10-13",
+    "2026-10-14",
+    "2026-10-15",
+    "2026-10-16",
+    "2026-10-19",
+    "2026-10-20",
+    "2026-10-21",
+    "2026-10-22",
+    "2026-10-23",
+    "2026-10-26",
+    "2026-10-27",
+    "2026-10-28",
+    "2026-10-29",
+    "2026-10-30",
+    "2026-11-02",
+    "2026-11-03",
+    "2026-11-04",
+    "2026-11-05",
+    "2026-11-06",
+    "2026-11-09",
+    "2026-11-10",
+    "2026-11-11",
+    "2026-11-12",
+    "2026-11-13",
+    "2026-11-16",
+    "2026-11-17",
+    "2026-11-18",
+    "2026-11-19",
+    "2026-11-20",
+    "2026-11-23",
+    "2026-11-25",
+    "2026-11-26",
+    "2026-11-27",
+    "2026-11-30",
+    "2026-12-01",
+    "2026-12-02",
+    "2026-12-03",
+    "2026-12-04",
+    "2026-12-07",
+    "2026-12-08",
+    "2026-12-09",
+    "2026-12-10",
+    "2026-12-11",
+    "2026-12-14",
+    "2026-12-15",
+    "2026-12-16",
+    "2026-12-17",
+    "2026-12-18",
+    "2026-12-21",
+    "2026-12-22",
+    "2026-12-23",
+    "2026-12-24",
+    "2026-12-25",
+    "2026-12-28",
+    "2026-12-29",
+    "2026-12-30",
+    "2026-12-31",
+    "2027-01-04",
+    "2027-01-05",
+    "2027-01-06",
+    "2027-01-07",
+    "2027-01-08",
+    "2027-01-11",
+    "2027-01-12",
+    "2027-01-13",
+    "2027-01-14",
+    "2027-01-15",
+    "2027-01-18",
+    "2027-01-19",
+    "2027-01-20",
+    "2027-01-21",
+    "2027-01-22",
+    "2027-01-25",
+    "2027-01-26",
+    "2027-01-27",
+    "2027-01-28",
+    "2027-01-29",
+    "2027-02-01",
+    "2027-02-02",
+    "2027-02-03",
+    "2027-02-04",
+    "2027-02-05",
+    "2027-02-08",
+    "2027-02-09",
+    "2027-02-10",
+    "2027-02-11",
+    "2027-02-12",
+    "2027-02-15",
+    "2027-02-16",
+    "2027-02-17",
+    "2027-02-18",
+    "2027-02-19",
+    "2027-02-22",
+    "2027-02-23",
+    "2027-02-24",
+    "2027-02-25",
+    "2027-02-26",
+    "2027-03-01",
+    "2027-03-02",
+    "2027-03-03",
+    "2027-03-04",
+    "2027-03-05",
+    "2027-03-08",
+    "2027-03-09",
+    "2027-03-10",
+    "2027-03-11",
+    "2027-03-12",
+    "2027-03-15",
+    "2027-03-16",
+    "2027-03-17",
+    "2027-03-18",
+    "2027-03-19",
+    "2027-03-22",
+    "2027-03-23",
+    "2027-03-24",
+    "2027-03-25",
+    "2027-03-26",
+    "2027-03-29",
+    "2027-03-30",
+    "2027-03-31",
+    "2027-04-01",
+    "2027-04-02",
+    "2027-04-05",
+    "2027-04-06",
+    "2027-04-07",
+    "2027-04-08",
+    "2027-04-09",
+    "2027-04-12",
+    "2027-04-13",
+    "2027-04-14",
+    "2027-04-15",
+    "2027-04-16",
+    "2027-04-19",
+    "2027-04-20",
+    "2027-04-21",
+    "2027-04-22",
+    "2027-04-23",
+    "2027-04-26",
+    "2027-04-27",
+    "2027-04-28",
+    "2027-04-29",
+    "2027-05-03",
+    "2027-05-04",
+    "2027-05-05",
+    "2027-05-06",
+    "2027-05-07",
+    "2027-05-10",
+    "2027-05-11",
+    "2027-05-12",
+    "2027-05-13",
+    "2027-05-14",
+    "2027-05-17",
+    "2027-05-18",
+    "2027-05-19",
+    "2027-05-20",
+    "2027-05-21",
+    "2027-05-24",
+    "2027-05-25",
+    "2027-05-26",
+    "2027-05-27",
+    "2027-05-28",
+    "2027-05-31",
+    "2027-06-01",
+    "2027-06-02",
+    "2027-06-03",
+    "2027-06-04",
+    "2027-06-07",
+    "2027-06-08",
+    "2027-06-09",
+    "2027-06-10",
+    "2027-06-11",
+    "2027-06-14",
+    "2027-06-15",
+    "2027-06-16",
+    "2027-06-17",
+    "2027-06-18",
+    "2027-06-21",
+    "2027-06-22",
+    "2027-06-23",
+    "2027-06-24",
+    "2027-06-25",
+    "2027-06-28",
+    "2027-06-29",
+    "2027-06-30",
+    "2027-07-01",
+    "2027-07-02",
+    "2027-07-05",
+    "2027-07-06",
+    "2027-07-07",
+    "2027-07-08",
+    "2027-07-09",
+    "2027-07-12",
+    "2027-07-13",
+    "2027-07-14",
+    "2027-07-15",
+    "2027-07-16",
+    "2027-07-19",
+    "2027-07-20",
+    "2027-07-21",
+    "2027-07-22",
+    "2027-07-23",
+    "2027-07-26",
+    "2027-07-27",
+    "2027-07-28",
+    "2027-07-29",
+    "2027-07-30",
+    "2027-08-02",
+    "2027-08-03",
+    "2027-08-04"
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/ohlc",
+  "query": {
+   "type": "DERIVATIVE",
+   "symbol": "VN30F1M",
+   "resolution": "15",
+   "from": 1785593977,
+   "to": 1785853177
+  },
+  "status": 200,
+  "body": {
+   "t": [
+    1785722400,
+    1785723300,
+    1785724200,
+    1785725100,
+    1785726000,
+    1785726900,
+    1785727800,
+    1785728700,
+    1785729600,
+    1785730500,
+    1785736800,
+    1785737700,
+    1785738600,
+    1785739500,
+    1785740400,
+    1785741300,
+    1785743100,
+    1785808800,
+    1785809700,
+    1785810600,
+    1785811500,
+    1785812400,
+    1785813300,
+    1785814200,
+    1785815100,
+    1785816000,
+    1785816900,
+    1785823200,
+    1785824100,
+    1785825000,
+    1785825900,
+    1785826800,
+    1785827700,
+    1785829500
+   ],
+   "o": [
+    1883,
+    1890,
+    1886.6,
+    1894,
+    1899.7,
+    1897,
+    1900.6,
+    1901.3,
+    1899,
+    1903.1,
+    1904.7,
+    1911.4,
+    1920.5,
+    1919.3,
+    1924,
+    1918.9,
+    1914,
+    1918,
+    1917.7,
+    1924,
+    1914,
+    1916.6,
+    1918.8,
+    1924.1,
+    1921.9,
+    1915.4,
+    1917.6,
+    1917.6,
+    1918.5,
+    1923.6,
+    1921.3,
+    1922.1,
+    1918.1,
+    1925
+   ],
+   "h": [
+    1891.9,
+    1892.5,
+    1894.3,
+    1904.8,
+    1902.8,
+    1901,
+    1904.6,
+    1902.8,
+    1906.7,
+    1906.3,
+    1913.5,
+    1922.5,
+    1923.9,
+    1925,
+    1924.5,
+    1923.9,
+    1914,
+    1922,
+    1926,
+    1924.8,
+    1917,
+    1919.3,
+    1925.6,
+    1924.7,
+    1922.4,
+    1919.2,
+    1920.5,
+    1921.4,
+    1924,
+    1925,
+    1924.5,
+    1924.9,
+    1924.7,
+    1925
+   ],
+   "l": [
+    1881.9,
+    1885.9,
+    1885,
+    1894,
+    1896.5,
+    1895.7,
+    1897.2,
+    1896.5,
+    1899,
+    1902.2,
+    1904.7,
+    1911.2,
+    1917.7,
+    1918.5,
+    1916.5,
+    1914.8,
+    1914,
+    1916.1,
+    1916,
+    1912.4,
+    1911,
+    1915.2,
+    1917.8,
+    1921,
+    1915.3,
+    1915.2,
+    1917,
+    1916.3,
+    1918.1,
+    1919.1,
+    1920.9,
+    1917.4,
+    1918,
+    1925
+   ],
+   "c": [
+    1889.8,
+    1886.7,
+    1894.2,
+    1899.7,
+    1897,
+    1900.9,
+    1901.3,
+    1899,
+    1903.1,
+    1904.7,
+    1911.6,
+    1920.5,
+    1919.1,
+    1923.7,
+    1918.6,
+    1916,
+    1914,
+    1917.7,
+    1924,
+    1914.3,
+    1916.9,
+    1918.6,
+    1924.1,
+    1921.7,
+    1915.5,
+    1917.6,
+    1917.7,
+    1918.5,
+    1924,
+    1921.4,
+    1922.1,
+    1918.1,
+    1922.9,
+    1925
+   ],
+   "v": [
+    20750,
+    13069,
+    11750,
+    19644,
+    6849,
+    6666,
+    9826,
+    6944,
+    11300,
+    6145,
+    13924,
+    19456,
+    11127,
+    11226,
+    13707,
+    17447,
+    5724,
+    14006,
+    16840,
+    20615,
+    12201,
+    9438,
+    13293,
+    7861,
+    10506,
+    7177,
+    5089,
+    7812,
+    10610,
+    13001,
+    7395,
+    15566,
+    14255,
+    4968
+   ],
+   "nextTime": 0
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/ohlc",
+  "query": {
+   "type": "STOCK",
+   "symbol": "HPG",
+   "resolution": "1D",
+   "from": 1783261177,
+   "to": 1785853177
+  },
+  "status": 200,
+  "body": {
+   "t": [
+    1783303200,
+    1783389600,
+    1783476000,
+    1783562400,
+    1783648800,
+    1783908000,
+    1783994400,
+    1784080800,
+    1784167200,
+    1784253600,
+    1784512800,
+    1784599200,
+    1784685600,
+    1784772000,
+    1784858400,
+    1785117600,
+    1785204000,
+    1785290400,
+    1785376800,
+    1785463200,
+    1785722400,
+    1785808800
+   ],
+   "o": [
+    23.4,
+    23.2,
+    23.15,
+    23.2,
+    23.2,
+    22.95,
+    22.3,
+    22.5,
+    22.3,
+    22.2,
+    21.75,
+    20.5,
+    20.9,
+    20.7,
+    20.7,
+    20.9,
+    20.15,
+    21.05,
+    21.65,
+    21.8,
+    21.7,
+    22.55
+   ],
+   "h": [
+    23.6,
+    23.25,
+    23.4,
+    23.25,
+    23.25,
+    22.95,
+    22.5,
+    22.6,
+    22.4,
+    22.35,
+    21.75,
+    21.15,
+    21.05,
+    21,
+    21,
+    21,
+    21,
+    21.65,
+    22.05,
+    21.85,
+    22.65,
+    22.6
+   ],
+   "l": [
+    23,
+    23,
+    23.05,
+    23.1,
+    22.95,
+    22.35,
+    22,
+    22.15,
+    21.8,
+    21.85,
+    20.5,
+    20.5,
+    20.5,
+    20.15,
+    20.6,
+    20.3,
+    20.1,
+    20.9,
+    21.5,
+    21.4,
+    21.65,
+    22.1
+   ],
+   "c": [
+    23.1,
+    23.1,
+    23.2,
+    23.2,
+    22.95,
+    22.4,
+    22.5,
+    22.4,
+    22.2,
+    21.85,
+    20.6,
+    20.8,
+    20.7,
+    20.8,
+    20.8,
+    20.35,
+    21,
+    21.65,
+    21.8,
+    21.7,
+    22.55,
+    22.15
+   ],
+   "v": [
+    21299300,
+    13839600,
+    12499500,
+    11643400,
+    11906800,
+    32309000,
+    22481900,
+    21464500,
+    22880600,
+    17006300,
+    53245200,
+    27198700,
+    43471900,
+    36967600,
+    17632000,
+    18166800,
+    29151700,
+    36250000,
+    29968000,
+    24111500,
+    44448000,
+    22694000
+   ],
+   "nextTime": 0
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/accounts/0001000000/orders/999999999",
+  "query": {
+   "marketType": "DERIVATIVE"
+  },
+  "status": 400,
+  "body": {
+   "status": 400,
+   "code": "RESOURCE_NOT_FOUND",
+   "message": "OrderRepository: cannot find object with id: 999999999"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/price/ohlc",
+  "query": {
+   "type": "DERIVATIVE",
+   "symbol": "VN30F2612",
+   "resolution": "15",
+   "from": 1785766777,
+   "to": 1785853177
+  },
+  "status": 400,
+  "body": {
+   "status": 400,
+   "code": "BAD_REQUEST",
+   "message": "invalid symbol"
+  }
+ }
+]

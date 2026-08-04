@@ -1,0 +1,38 @@
+//@version=6
+// Order-type test strategy 6/6 — Short, stop+limit entry and bracketed exit
+// 
+// Mirror of test 5. Entry uses BOTH stop and limit (two OCO legs, not a
+// stop-limit). Exit brackets with stop=high[1] and limit=avg*0.99.
+// 
+// Every position also closes via strategy.close() once open profit reaches
+// TAKE_PCT, provided the protective stop has not already fired. Entry and exit
+// comments carry the SIGNAL price; the trade CSV's own Price column carries the
+// actual FILL price, so comparing the two shows slippage and fill timing.
+
+// VN30F1M notional = price x 100,000 VND/point (~192.5m at 1925), and DNSE's
+// loan package quotes initialRate 0.1848 -> ~35.6m margin per contract.
+// initial_capital must clear that or every entry is rejected on margin.
+strategy("T6 Short, stop+limit entry and bracketed exit", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+TAKE_PCT = 0.02   // close() once open profit reaches 2%
+
+flat   = strategy.position_size == 0
+short_ = strategy.position_size < 0
+
+if flat
+    strategy.entry("S", strategy.short, stop=low[1], limit=low[1] * 0.999,
+                   comment="E-sl@" + str.tostring(low[1], format.mintick))
+
+if short_
+    strategy.exit("X", from_entry="S", stop=high[1],
+                  limit=strategy.position_avg_price * 0.99,
+                  comment_loss="SL@" + str.tostring(high[1], format.mintick),
+                  comment_profit="TPlim@" + str.tostring(strategy.position_avg_price * 0.99, format.mintick))
+    if close <= strategy.position_avg_price * (1 - TAKE_PCT)
+        strategy.close("S", comment="TP@" + str.tostring(close, format.mintick))
+
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(strategy.position_avg_price, "avg", display=display.data_window)
