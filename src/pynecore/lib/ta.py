@@ -832,10 +832,18 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
         sum_y = sum_y + y
         sum_xy = sum_xy + y * per
 
+    # The line is anchored one step short of the evaluation point: the intercept
+    # carries an extra ``+ slope`` and the shift is ``length - 1 - offset``. The
+    # algebraically equal ``intercept + slope * (length - offset)`` rounds
+    # differently and misses TradingView on a quarter to a half of the bars
+    # (probes m567/m568, eleven length/offset configurations over 22k bars each,
+    # zero mismatches this way). ``slope * sum_x / length`` is left to right --
+    # ``slope * (sum_x / length)`` costs another handful of bars.
     slope = (length * sum_xy - sum_x * sum_y) / denom
-    intercept = sum_y / length - slope * sum_x / length
+    average = sum_y / length
+    intercept = average - slope * sum_x / length + slope
 
-    val = intercept + slope * (length - offset)
+    val = intercept + slope * (length - 1 - offset)
     return val
 
 

@@ -1286,12 +1286,23 @@ class SimPosition(PositionBase):
             self.size += trade.size
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
-            # Average entry price
+            # Average entry price. Adding to a position re-weights the previous
+            # average instead of dividing the accumulated cost by the new size:
+            # the two are algebraically equal but round differently, and the
+            # blend is the form that stays bit-exact when a position is
+            # pyramided. ``entry_summ`` still carries the cost, which is what a
+            # partial close reduces.
             self.entry_summ += price * abs(order.size)
-            try:
-                self.avg_price = self.entry_summ / abs(self.size)
-            except ZeroDivisionError:
+            new_size = abs(self.size)
+            add_size = abs(order.size)
+            old_size = new_size - add_size
+            if new_size == 0.0:
                 self.avg_price = na_float
+            elif old_size == 0.0 or self.avg_price != self.avg_price:
+                self.avg_price = price
+            else:
+                weight = add_size / new_size
+                self.avg_price = self.avg_price * (1 - weight) + price * weight
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
             # Commission summ
