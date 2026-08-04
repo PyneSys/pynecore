@@ -55,12 +55,11 @@ def new(*args: Any, **kwargs: Any) -> Line:
     """
     Creates a new line object.
 
-    Two call shapes are accepted (Pine-compatible):
+    Two call shapes are accepted:
     - ``line.new(first_point, second_point, ...)`` where both arguments are ``chart.point`` objects.
     - ``line.new(x1, y1, x2, y2, ...)`` where ``x1`` / ``x2`` are bar index
       (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
-      and ``y1`` / ``y2`` are prices. Float ``x1`` / ``x2`` are truncated to int
-      to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
+      and ``y1`` / ``y2`` are prices. Float ``x1`` / ``x2`` are truncated to int.
 
     :param x1: Bar index / bar time of the first point (coordinate form)
     :param y1: Price of the first point (coordinate form)

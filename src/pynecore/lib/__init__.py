@@ -642,7 +642,7 @@ def fill(*args: Any, **kwargs: Any) -> None:
     """
     Fill the area between two plots or two hlines.
 
-    Three call shapes are accepted (Pine-compatible):
+    Three call shapes are accepted:
 
     - ``fill(plot1, plot2, color, title, editable, show_last, fillgaps, display)``
     - ``fill(hline1, hline2, color, title, editable, fillgaps, display)``
@@ -761,9 +761,8 @@ def is_na(source: Any = None) -> bool | NA:
     """
     Check if the source is NA.
 
-    Pine treats inf/-inf/nan floats as "na" for na() predicate purposes,
-    even though they participate in arithmetic/comparisons as normal IEEE-754
-    values. This matches that dual behavior.
+    inf/-inf/nan floats all count as na here, even though they participate in
+    arithmetic and comparisons as normal IEEE-754 values.
     """
     if source is None:
         return _na_none
@@ -787,8 +786,8 @@ def nz(source: Any, replacement: Any = 0) -> Any:
     """
     Replace NA values with a replacement value or 0 if not specified
 
-    Uses the na() predicate semantics for floats: inf/-inf/nan are all na
-    (TV-verified: ``nz(inf, -5)`` is ``-5``).
+    Uses the na() predicate semantics for floats: inf/-inf/nan are all na, so
+    ``nz(inf, -5)`` is ``-5``.
 
     :param source: The source value
     :param replacement: The replacement value, default is 0
@@ -1550,10 +1549,10 @@ def time_tradingday() -> PyneInt:
 
     For symbols whose session crosses midnight (e.g. forex and futures overnight
     sessions) a bar that reaches into the session start belongs to the next calendar
-    day's trading day, matching TradingView — including the boundary bar whose window
-    merely contains the open (a 17:00-18:00 bar for a 17:05 open). For symbols whose
-    session stays within a single calendar day (stocks, 24/7 crypto) it is simply
-    00:00 UTC of the bar's exchange-timezone date.
+    day's trading day — including the boundary bar whose window merely contains the
+    open (a 17:00-18:00 bar for a 17:05 open). For symbols whose session stays within
+    a single calendar day (stocks, 24/7 crypto) it is simply 00:00 UTC of the bar's
+    exchange-timezone date.
 
     :return: UNIX time in milliseconds of 00:00 UTC on the trading day's date
     """

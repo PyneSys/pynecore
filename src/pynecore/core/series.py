@@ -374,13 +374,12 @@ class ReadOnlySeriesView(Generic[T]):
         """
         Return the viewed values as a plain list ordered oldest to newest.
 
-        Hot-loop helper: window consumers (``ta.wma``, ``ta.linreg``) walk the
-        whole slice on every bar, where per-element ``__getitem__`` calls are
-        the dominant cost; handing the window over as at most two native list
-        slices removes that overhead entirely.
-
         :return: The values of the view, oldest first
         """
+        # Hot-loop helper: window consumers (``ta.wma``, ``ta.linreg``) walk the
+        # whole slice on every bar, where per-element ``__getitem__`` calls are
+        # the dominant cost; handing the window over as at most two native list
+        # slices removes that overhead entirely.
         # Slice with an explicit upper bound everywhere: the buffer list may be
         # physically longer than ``_capacity`` (a shrink through the
         # ``max_bars_back`` fast path keeps the old allocation), so an open-ended

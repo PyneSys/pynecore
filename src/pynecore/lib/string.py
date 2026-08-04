@@ -578,7 +578,7 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     :param separator: Separator string
     :return: New string consisting of the source string repeated the specified number of times,
              separated by the separator string. A na source or repeat count — and a repeat
-             count of zero — yields na (TV-verified); a na separator behaves as ''.
+             count of zero — yields na; a na separator behaves as ''.
     """
     # na-propagation (Pine): without this guard ``[source] * repeat`` with a na
     # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
@@ -689,7 +689,6 @@ def tonumber(string: str) -> PyneFloat:
 def tostring(value: int | float | str | bool | NA, format: str | Format = '#.##########') -> str:
     """
     Convert value to string with optional formatting.
-    Replicates Pine's str.tostring function.
 
     :param value: Value to convert (number, string, boolean or na)
     :param format: Format string like '#.##' or Format instance

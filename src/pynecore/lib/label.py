@@ -67,13 +67,12 @@ def new(*args: Any, **kwargs: Any) -> Label:
     """
     Creates a new label object.
 
-    Two call shapes are accepted (Pine-compatible):
+    Two call shapes are accepted:
     - ``label.new(point, text="", ...)`` where ``point`` is a ``chart.point`` object. In this
       form the second positional argument is the label ``text``.
     - ``label.new(x, y, text="", ...)`` where ``x`` is bar index (``xloc.bar_index``) or
       bar UNIX time in milliseconds (``xloc.bar_time``), and ``y`` is the price.
-      A float ``x`` is truncated to int to mirror Pine's implicit float-to-int
-      conversion on ``series int`` parameters.
+      A float ``x`` is truncated to int.
 
     :param x: Bar index / bar time of the label position (coordinate form)
     :param y: Price of the label position (coordinate form)

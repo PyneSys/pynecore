@@ -86,10 +86,9 @@ def _non_na(id: list[T]) -> list[T]:
     """
     Return the array's elements with na values removed.
 
-    TradingView's array math and statistics reductions ignore na elements and
-    reduce over the remaining values only, yielding na when none remain. Every
-    such reduction filters its input through this helper so their na handling
-    stays consistent with Pine.
+    The array math and statistics reductions ignore na elements and reduce over
+    the remaining values only, yielding na when none remain. Every such reduction
+    filters its input through this helper so their na handling stays consistent.
 
     :param id: Input array, possibly containing na elements
     :return: New list containing only the non-na elements, in original order
@@ -335,9 +334,9 @@ def includes(id: list[T], value: T) -> bool:
     """
     Returns true if the array contains the specified value, false otherwise.
 
-    The search is tolerant: a float within Pine's comparison tolerance of an element
-    counts as present. ``binary_search`` is exact by contrast, so the two disagree on
-    near-equal values — that is TradingView's own behaviour.
+    The search is tolerant: a float within the float comparison tolerance of an
+    element counts as present. ``binary_search`` is exact by contrast, so the two
+    disagree on near-equal values.
 
     :param id: Input array
     :param value: Value to search for
@@ -505,9 +504,8 @@ def _na_size(size: int | NA) -> int:
     """
     Normalize an array constructor ``size`` argument.
 
-    TradingView treats an ``na`` size (e.g. ``array.new<line>(na)``) as 0,
-    producing an empty array, so mirror that instead of failing. A genuinely
-    negative size is still rejected.
+    An ``na`` size (e.g. ``array.new<line>(na)``) is treated as 0 and produces an
+    empty array instead of failing. A genuinely negative size is still rejected.
 
     :param size: Requested array size, possibly ``na``
     :return: Non-negative integer size
@@ -701,13 +699,16 @@ def _select_linear_interpolation(non_na: list[float], n: int, percentage: float)
         return non_na[lower - 1] if lower <= m else na_float
     if m < n:
         return na_float
-    return non_na[lower - 1] + frac * (non_na[lower] - non_na[lower - 1])
+    # Weighted average of the two ranks, not the ``lo + frac * (hi - lo)`` form:
+    # the two are algebraically equal but round differently, and TradingView
+    # follows this one (probe m580, 22k bars, zero mismatches).
+    return non_na[lower - 1] * (1 - frac) + non_na[lower] * frac
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
 def percentile_linear_interpolation(id: list[float], percentage: float) -> float:
     """
-    Calculate the percentile value using linear interpolation, following TradingView's logic.
+    Calculate the percentile value using linear interpolation.
 
     Values are sorted ascending with na elements pushed to the end (as if they
     were the largest values). The interpolation position is 1-based over the full
@@ -715,11 +716,11 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     bounds.
 
     Without na the value is interpolated linearly between the two ranks
-    straddling ``pos``. TradingView diverges once the array holds any na element:
-    it then yields a value only for the low-end clamp or for a ``pos`` that lands
-    exactly on an integer rank, and returns na for every fractional position --
-    even when both neighbouring values are numeric. An exact rank falling in the
-    sorted-to-end na tail likewise yields na.
+    straddling ``pos``. Once the array holds any na element, only the low-end
+    clamp and a ``pos`` landing exactly on an integer rank yield a value; every
+    fractional position returns na, even when both neighbouring values are
+    numeric. An exact rank falling in the sorted-to-end na tail likewise yields
+    na.
 
     :param id: List of numeric values, possibly containing na elements
     :param percentage: Percentile (0-100, not 0-1)
@@ -770,9 +771,9 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
     """
     Calculate the nearest rank percentile without interpolation.
 
-    Matches TradingView: na elements are kept and sort to the end (as if they
-    were the largest values), so the full array length (na included) drives the
-    rank. A rank that lands on a na element yields na.
+    na elements are kept and sort to the end (as if they were the largest
+    values), so the full array length (na included) drives the rank. A rank that
+    lands on a na element yields na.
 
     :param id: List of numeric values
     :param percentage: Percentile (0-100)
@@ -794,9 +795,9 @@ def percentrank(id: list[Number], index: int) -> float:
     Returns the percentile rank of the element at the specified index.
     The percentile rank is the percentage of values less than or equal to the value at index.
 
-    Matches TradingView: na elements are ignored when counting values at or below
-    the target, but still count toward the array length. If the element at
-    ``index`` is itself na, the rank is na.
+    na elements are ignored when counting values at or below the target, but
+    still count toward the array length. If the element at ``index`` is itself
+    na, the rank is na.
 
     :param id: Input array
     :param index: Index of the element to calculate rank for
@@ -975,7 +976,7 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[in
 # noinspection PyShadowingBuiltins,PyShadowingNames
 def standardize(id: list[float | int]) -> list[float | int]:
     """
-    Standardizes the input array in a Pine Script-like manner:
+    Standardizes the input array:
       1) Uses a left-to-right summation for the mean (population mean).
       2) Uses a second pass for summing squared differences (population variance).
       3) Computes the population standard deviation (divisor = N).
@@ -985,7 +986,6 @@ def standardize(id: list[float | int]) -> list[float | int]:
              z > 1  -> 1,
              otherwise 0
          - If any element is float, the result is the continuous z-score value.
-    This version is bit-by-bit compatible with Pine Script's `standardize()` function.
 
     :param id: A list of numeric values (int or float).
     :return: A list containing the standardized values.

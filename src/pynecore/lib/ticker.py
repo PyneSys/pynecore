@@ -53,7 +53,7 @@ def new(prefix: str, ticker: str, session: str | None = None,
     Create a ticker identifier from an exchange prefix and a ticker name.
 
     The ``session``, ``adjustment``, ``backadjustment`` and ``settlement_as_close``
-    parameters are accepted for Pine compatibility but do not alter the identifier:
+    parameters are accepted but do not alter the identifier:
     PyneCore's data layer does not provide per-request session or adjustment variants
     of a feed.
 
@@ -78,7 +78,7 @@ def modify(tickerid: str, session: str | None = None, adjustment: str | None = N
     """
     Create a copy of a ticker identifier with modified session/adjustment settings.
 
-    The settings are accepted for Pine compatibility but do not alter the identifier:
+    The settings are accepted but do not alter the identifier:
     PyneCore's data layer does not provide per-request session or adjustment variants
     of a feed.
 

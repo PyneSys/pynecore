@@ -43,7 +43,7 @@ def plot(series: Any, title: str | None = None, color: Any = None, linewidth: in
     :param title: The title of the plot; if several plots share a title a number is appended
     :param color: Plot color; when it varies per bar it is recorded as a dynamic channel
     :param linewidth: Width of the plotted line in pixels
-    :param style: Plot style (``plot.style_*``); ``None`` means Pine's ``style_line``
+    :param style: Plot style (``plot.style_*``); ``None`` selects ``plot.style_line``
     :param trackprice: If true, a horizontal price line is shown at the last value
     :param histbase: Reference value for ``style_histogram``, ``style_columns`` and ``style_area``
     :param offset: Horizontal shift of the plot, in bars

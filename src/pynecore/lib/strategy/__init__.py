@@ -480,7 +480,7 @@ class PositionBase(ABC):
 
     Both backtest simulation (:class:`SimPosition`) and live broker trading
     (:class:`pynecore.core.broker.position.BrokerPosition`) subclass this.
-    The Pine Script API surface — ``strategy.position_size``,
+    The ``strategy.*`` API surface — ``strategy.position_size``,
     ``strategy.opentrades``, ``strategy.netprofit``, ``strategy.equity``,
     etc. — reads the attributes declared here, so concrete subclasses MUST
     initialize all of them in ``__init__``.
@@ -701,9 +701,8 @@ class SimPosition(PositionBase):
     """
     Backtest simulation of position and trade state.
 
-    Reproduces TradingView's strategy simulator faithfully: OHLC-based fill
-    detection, synthetic slippage, margin-call emulation, gap-through logic,
-    OCA reduce/cancel handling, trailing-stop tracking, etc.
+    Covers OHLC-based fill detection, synthetic slippage, margin-call emulation,
+    gap-through logic, OCA reduce/cancel handling, trailing-stop tracking, etc.
 
     Live broker trading uses :class:`BrokerPosition` instead — exchange fills
     override all of the simulator logic below.
@@ -2193,18 +2192,19 @@ class SimPosition(PositionBase):
     def process_deferred_margin_call(self):
         """
         Execute a deferred margin call (after the user script has run), then
-        re-check margin at the bar close the way TradingView does.
-        Called from script_runner after the user script's main() completes.
+        re-check margin at the bar close.
 
-        TV evaluates margin at every bar close and books the liquidation on
-        that bar at the close price; without this check the same liquidation
-        only fires at the next bar's open — one bar late, and at the open
-        price on gapped data (Hybrid 2026-05-07 02:00: TV trims 1.0 contract
-        at C=80898.0 on the 02:00 bar while the O/H/L walk points all pass
-        the margin comparison). Sized like the bar-open check in whole
-        contracts; every observed instance trimmed exactly 1.0 contract, so
-        the whole-contract choice is untested beyond that.
+        Called from script_runner after the user script's main() completes.
+        Liquidation is booked on the current bar at the close price, in whole
+        contracts.
         """
+        # Margin is evaluated at every bar close: without this check the same
+        # liquidation only fires at the next bar's open — one bar late, and at the
+        # open price on gapped data (Hybrid 2026-05-07 02:00: TV trims 1.0 contract
+        # at C=80898.0 on the 02:00 bar while the O/H/L walk points all pass the
+        # margin comparison). Sized like the bar-open check in whole contracts;
+        # every observed instance trimmed exactly 1.0 contract, so the
+        # whole-contract choice is untested beyond that.
         prev_count = len(self.new_closed_trades)
 
         if self._deferred_margin_call is not None:
@@ -3109,9 +3109,9 @@ class SimPosition(PositionBase):
         Optional post-script pass that fills current-bar-submitted orders at the bar's
         CLOSE — enabled by `script.process_orders_on_close=True`.
 
-        Pine semantics: when the flag is set, orders placed during the strategy's bar
-        calculation get an additional fill attempt at the bar close, instead of waiting
-        for the next bar's open. This covers BOTH:
+        When the flag is set, orders placed during the strategy's bar calculation get
+        an additional fill attempt at the bar close, instead of waiting for the next
+        bar's open. This covers BOTH:
           - Market orders: trivially executable at close.
           - Limit/stop orders: executable when the close has reached/crossed the trigger
             price. (Non-current-bar limit/stop orders already had their fair shake in
@@ -3121,11 +3121,11 @@ class SimPosition(PositionBase):
         `_process_at_bar_open` resolves them against the entry price. The close-pass
         materializes those into `limit` / `stop` first so the trigger check sees them.
 
-        Fill price in every case is `self.c` (Pine fills price-based orders "when their
-        limit or stop price is hit on the close" — no trigger-price snap on the close
-        pass). Slippage matches the rest of the engine: applied to market and
-        stop-triggered fills, NOT to limit-triggered fills (Pine guarantees limit
-        orders fill at the limit price or better). `filled_by_type` is set on the
+        Fill price in every case is `self.c` — price-based orders fill where their
+        limit or stop price is hit on the close, with no trigger-price snap on the
+        close pass. Slippage matches the rest of the engine: applied to market and
+        stop-triggered fills, NOT to limit-triggered fills, which are guaranteed to
+        fill at the limit price or better. `filled_by_type` is set on the
         triggering order so `_fill_order` can attach the right exit comment.
 
         Bookkeeping note: `_finalize_bar_pnl()` already ran in `process_orders()` for the
@@ -3362,15 +3362,11 @@ class SimPosition(PositionBase):
         Runs right AFTER the body (before the bar's output/equity bookkeeping), so
         the whole position stays coherent — fully open — for the rest of the bar and
         every ``strategy.*`` series (``position_size``, ``position_avg_price``,
-        ``netprofit``, ``equity``, ``opentrades`` …) reads its pre-close value.
-        This matches TradingView and PyneCore's own broker mode, where an immediate
-        close does not take effect until after the script.
+        ``netprofit``, ``equity``, ``opentrades`` …) reads its pre-close value —
+        the same as in broker mode, where an immediate close does not take effect
+        until after the script.
 
-        Per-order this mirrors the old inline path exactly (snapshot →
-        ``fill_order`` → ``_settle_close_pass_trades``); only the fill timing moved
-        from mid-body to just-after-body. The fill price is still ``self.c`` (the
-        bar close), which is unchanged between the body and this step, so exit
-        price / P&L / cumulative stats are bit-identical.
+        The fill price is ``self.c``, the bar close.
         """
         orders = self._deferred_immediate_closes
         if not orders:

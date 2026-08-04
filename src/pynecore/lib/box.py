@@ -51,13 +51,12 @@ def new(*args: Any, **kwargs: Any) -> Box:
     """
     Creates a new box object.
 
-    Two call shapes are accepted (Pine-compatible):
+    Two call shapes are accepted:
     - ``box.new(top_left, bottom_right, ...)`` where both arguments are ``chart.point`` objects
       (the top-left and bottom-right corners).
     - ``box.new(left, top, right, bottom, ...)`` where ``left`` / ``right`` are bar index
       (``xloc.bar_index``) or bar UNIX time in milliseconds (``xloc.bar_time``),
-      and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated
-      to int to mirror Pine's implicit float-to-int conversion on ``series int`` parameters.
+      and ``top`` / ``bottom`` are prices. Float ``left`` / ``right`` are truncated to int.
 
     :param left: Bar index / bar time of the left border (coordinate form)
     :param top: Price of the top border (coordinate form)

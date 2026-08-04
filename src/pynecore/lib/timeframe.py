@@ -126,7 +126,7 @@ def from_seconds(seconds: int) -> str:
     Convert seconds to a timeframe
 
     :param seconds: The seconds to convert
-    :return: The timeframe in TradingView format
+    :return: The timeframe string (e.g. ``"60"``, ``"1D"``)
     """
     if seconds % (60 * 60 * 24 * 7 * 4) == 0:
         return f"{seconds // (60 * 60 * 24 * 7 * 4)}M"
@@ -144,7 +144,7 @@ def in_seconds(timeframe: str | None = None) -> int:
     Convert the timeframe to seconds
 
     :param timeframe: The timeframe to convert. If not provided or an empty string,
-        uses the current chart timeframe (Pine treats ``""`` as the chart timeframe).
+        uses the current chart timeframe.
     :return: The timeframe in seconds
     :raises ValueError: If the timeframe is invalid
     """

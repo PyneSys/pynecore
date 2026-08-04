@@ -6,7 +6,6 @@ from typing import TypeVar, cast, TYPE_CHECKING
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
 
-import bisect
 import builtins
 import math
 import heapq
@@ -20,7 +19,8 @@ from pynecore.core.overload import overload
 from ..core import safe_convert
 # Pine's absolute comparison tolerance. Only the builtins MEASURED to compare
 # tolerantly use it (see core/pine_compare.py); the bit-exact ones must not.
-from ..core.pine_compare import EPSILON as _EPSILON
+from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_bound,
+                                 upper_bound as _tol_upper_bound)
 
 # We need to use this kind of import to make transformer work
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
@@ -285,9 +285,9 @@ def cmo(source: float, length: int) -> PyneFloat:
     """
     Calculate the Chande Momentum Oscillator (CMO) of the source series with the given length.
 
-    The momentum sign test is tolerant: a momentum below Pine's comparison tolerance
-    in magnitude lands in the up bucket, so a sub-tolerance zig-zag collapses both
-    sums to zero and the result is na.
+    The momentum sign test is tolerant: a momentum below the float comparison
+    tolerance in magnitude lands in the up bucket, so a sub-tolerance zig-zag
+    collapses both sums to zero and the result is na.
 
     :param source: The source series
     :param length: The length of the CMO
@@ -358,7 +358,7 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     """
     Calculate the correlation of the source series with the given length.
 
-    A covariance within Pine's comparison tolerance of zero makes the result 0.0, even
+    A covariance within the float comparison tolerance of zero makes the result 0.0, even
     for otherwise strongly correlated sources. The same tolerance decides the degenerate
     cases: a constant source stays na, while ``length == 1`` is 0.0 from the first bar.
 
@@ -586,8 +586,8 @@ def falling(source: float, length: int) -> bool:
     """
     Test if the source series is now falling for length bars long.
 
-    The fall test is tolerant: a step smaller than Pine's comparison tolerance does
-    not count as falling.
+    The fall test is tolerant: a step smaller than the float comparison tolerance
+    does not count as falling.
 
     :param source: The source series
     :param length: The length of the falling test
@@ -1017,9 +1017,9 @@ def mfi(source: float, length: int) -> PyneFloat:
     """
     Calculate the Money Flow Index (MFI) of the source series with the given length.
 
-    The money-flow direction test is tolerant: a price change below Pine's comparison
-    tolerance in magnitude counts as neither inflow nor outflow. With both sums zero
-    the result is 100, not na.
+    The money-flow direction test is tolerant: a price change below the float
+    comparison tolerance in magnitude counts as neither inflow nor outflow. With
+    both sums zero the result is 100, not na.
 
     :param source: The source series
     :param length: The length of the MFI
@@ -1171,9 +1171,6 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     """
     Calculates percentile using method of linear interpolation between the two nearest ranks.
 
-    See ``percentile_nearest_rank`` for the one case TradingView does NOT compute from
-    the window alone.
-
     :param source: The source series
     :param length: The length of the percentile
     :param percentage: The percentage of the percentile
@@ -1186,9 +1183,10 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # oldest candles are kept from the first bar on.
     max_bars_back(source, length)
 
-    # Rolling state: the chronological window plus its ascending-sorted
-    # numeric part, maintained incrementally (bisect insert/remove per bar
-    # instead of a full re-sort of the window).
+    # Rolling state and its tolerant ordering are ``percentile_nearest_rank``'s;
+    # see there for the measurement. Confirmed for this form too (probe m580, four
+    # length/percentage configurations, 22k bars each, zero mismatches), where an
+    # exact order misses TradingView on up to 44% of the bars.
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
     prev_length: Persistent[int] = 0
@@ -1196,21 +1194,26 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window from
         # the source history, oldest first, without the current bar (bars
-        # beyond the buffer come back as na).
+        # beyond the buffer come back as na). Replayed in arrival order so the
+        # ties land where a bar-by-bar fill would have put them.
         rebuilt = []
         for i in builtins.range(length - 1, 0, -1):
             rebuilt.append(source[i])
         window = deque(rebuilt)
-        sorted_buf = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), rebuilt))
+        sorted_buf = []
+        for v in rebuilt:
+            if not (isinstance(v, NA) or v != v):
+                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
     prev_length = length
 
     window.append(source)
     if not (isinstance(source, NA) or source != source):
-        bisect.insort(sorted_buf, source)
+        sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
     if len(window) > length:
         old = window.popleft()
         if not (isinstance(old, NA) or old != old):
-            del sorted_buf[bisect.bisect_left(sorted_buf, old)]
+            pos = _tol_upper_bound(sorted_buf, old) - 1
+            del sorted_buf[pos if pos > 0 else 0]
 
     if isinstance(source, NA) or source != source:
         return na_float
@@ -1232,13 +1235,6 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     """
     Calculates percentile using the nearest rank method.
 
-    Known divergence, deliberately not reproduced: once a window holds values that
-    differ by less than Pine's comparison tolerance, TradingView's series percentiles
-    stop being a function of the window and may return a different element than this
-    implementation. Every candidate is within that tolerance of every other, so the
-    difference is bounded by the very distance Pine's comparison operators ignore. The
-    array form (``array.percentile_nearest_rank``) has no such behaviour.
-
     :param source: The source series
     :param length: The length of the percentile
     :param percentage: The percentage of the percentile
@@ -1251,9 +1247,19 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # oldest candles are kept from the first bar on.
     max_bars_back(source, length)
 
-    # Rolling state: the chronological window plus its ascending-sorted
-    # numeric part, maintained incrementally (bisect insert/remove per bar
-    # instead of a full re-sort of the window).
+    # Rolling state: the chronological window plus its ascending-ordered numeric
+    # part, maintained incrementally (insert/remove per bar instead of a full
+    # re-sort of the window).
+    #
+    # Measured law (probes m577-m579, twelve length/percentage configurations over
+    # 22k bars each, zero mismatches): the order is the tolerant one, a new value
+    # goes in front of the values it ties with and an evicted value takes the last
+    # of its ties with it. That is what makes the builtin depend on the order the
+    # window was filled in and not only on its contents -- an exact order misses
+    # TradingView on up to 43% of the bars once the window holds ties. The window
+    # is where the divergence lives: a tie needs the two values to be within the
+    # comparison tolerance of each other, which a spacing sweep confirmed at the
+    # expected 1e-10 (1e-11 apart still ties, 1e-10 apart no longer does).
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
     prev_length: Persistent[int] = 0
@@ -1261,21 +1267,29 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window from
         # the source history, oldest first, without the current bar (bars
-        # beyond the buffer come back as na).
+        # beyond the buffer come back as na). Replayed in arrival order so the
+        # ties land where a bar-by-bar fill would have put them.
         rebuilt = []
         for i in builtins.range(length - 1, 0, -1):
             rebuilt.append(source[i])
         window = deque(rebuilt)
-        sorted_buf = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), rebuilt))
+        sorted_buf = []
+        for v in rebuilt:
+            if not (isinstance(v, NA) or v != v):
+                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
     prev_length = length
 
     window.append(source)
     if not (isinstance(source, NA) or source != source):
-        bisect.insort(sorted_buf, source)
+        sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
     if len(window) > length:
         old = window.popleft()
         if not (isinstance(old, NA) or old != old):
-            del sorted_buf[bisect.bisect_left(sorted_buf, old)]
+            # Tolerant equality is not transitive, so a long enough chain of ties
+            # can drift until nothing is left within tolerance of the evicted
+            # value; the first slot is then the closest match left.
+            pos = _tol_upper_bound(sorted_buf, old) - 1
+            del sorted_buf[pos if pos > 0 else 0]
 
     if isinstance(source, NA) or source != source:
         return na_float
@@ -1287,15 +1301,6 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # window length, na included -- same semantics as the array form. The rank
     # ``ceil(percentage * length / 100)`` inside is TradingView's own (probes
     # m552/m554, measured with a percentage sweep over separated values).
-    #
-    # The divergence in the docstring was measured with probe m554: two series whose
-    # windows were element-for-element identical at the same bar, but reached that
-    # state through different histories, returned different elements for the same
-    # percentage -- so the builtin carries ordering state across bars instead of
-    # sorting the window. The array form has no such state and matches this
-    # implementation on every order of the same values (probes m551/m552).
-    # Reproducing it would mean re-implementing TradingView's internal buffer
-    # maintenance for a payoff bounded by the comparison tolerance itself.
     return array._select_nearest_rank(sorted_buf, length, percentage)
 
 
@@ -1705,8 +1710,9 @@ def rising(source: float, length: int) -> bool:
     """
     Test if the source series is now rising for length bars long.
 
-    The rise test is tolerant: a step smaller than Pine's comparison tolerance does
-    not count as rising, unlike ``ta.crossover`` or ``ta.highest``, which are exact.
+    The rise test is tolerant: a step smaller than the float comparison tolerance
+    does not count as rising, unlike ``ta.crossover`` or ``ta.highest``, which are
+    exact.
 
     :param source: The source series
     :param length: The length of the rising test
@@ -2150,9 +2156,8 @@ def variance(source: Series[float],
     """
     Calculate the rolling variance of the source series.
 
-    The result is clamped at zero, the way TradingView clamps it: under catastrophic
-    cancellation the raw expression goes negative and comes back as 0.0. An unbiased
-    variance with ``length == 1`` is na.
+    The result is clamped at zero: under catastrophic cancellation the raw expression
+    goes negative and comes back as 0.0. An unbiased variance with ``length == 1`` is na.
 
     :param source: The source series.
     :param length: The length of the rolling window.
@@ -2217,9 +2222,9 @@ def vwap(source: Series[float] | None = None, anchor: bool | None = None,
     """
     Volume weighted average price.
 
-    Referenced bare (``ta.vwap``) this is the Pine built-in variable: the VWAP of
-    ``hlc3`` anchored to the session. Passing an explicit ``source`` selects the
-    function form ``ta.vwap(source)``.
+    Referenced bare (``ta.vwap``) this is the variable form: the VWAP of ``hlc3``
+    anchored to the session. Passing an explicit ``source`` selects the function
+    form ``ta.vwap(source)``.
 
     :param source: The source series; defaults to ``hlc3`` for the bare variable form
     :param anchor: The condition that triggers the reset of VWAP calculation

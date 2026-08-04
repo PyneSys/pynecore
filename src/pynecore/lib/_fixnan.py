@@ -20,9 +20,8 @@ def fixnan(source: Any) -> Any:
     Fix NA values by replacing them with the last non-NA value
 
     Hole detection is nan-only (``x != x``), deliberately NARROWER than the
-    ``na()`` predicate: TradingView's ``fixnan`` passes inf through as a
-    regular value (TV-verified) even though ``na(inf)`` is true. NA objects
-    (non-float na) are holes too.
+    ``na()`` predicate: inf passes through as a regular value even though
+    ``na(inf)`` is true. NA objects (non-float na) are holes too.
 
     :param source: The source value
     :return: The source value if it is not a nan-hole, otherwise the last such value

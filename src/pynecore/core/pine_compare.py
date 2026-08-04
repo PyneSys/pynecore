@@ -57,16 +57,15 @@ def lower_bound(values: list[float], x: float) -> int:
     """
     First slot of an ordered list that is not below ``x`` under Pine's comparison.
 
-    Neither bound may be expressed as a plain ``bisect`` over a shifted key
-    (``x - EPSILON``): the shift is itself rounded, which moves the decision on
-    operands sitting on the tolerance boundary, and a list ordered tolerantly is
-    not necessarily ordered exactly, so the shifted key would be compared against
-    an assumption that does not hold.
-
     :param values: Tolerantly ordered values
     :param x: The value to locate
     :return: The insertion point in front of the values ``x`` ties with
     """
+    # Neither bound may be expressed as a plain ``bisect`` over a shifted key
+    # (``x - EPSILON``): the shift is itself rounded, which moves the decision on
+    # operands sitting on the tolerance boundary, and a list ordered tolerantly is
+    # not necessarily ordered exactly, so the shifted key would rely on a
+    # precondition that does not hold.
     lo = 0
     hi = len(values)
     while lo < hi:
