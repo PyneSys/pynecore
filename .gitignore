@@ -50,3 +50,6 @@ MEMORY.md
 
 # Others
 uv.lock
+
+# Parked files awaiting deletion (recovery window, never committed)
+backup/
