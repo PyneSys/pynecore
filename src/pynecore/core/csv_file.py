@@ -39,7 +39,7 @@ class CSVWriter:
     def __init__(self, path: Path, *,
                  buffer_size: int = 32768,
                  queue_size: int = 4096,
-                 float_fmt: str = '.8g',
+                 float_fmt: str = '',
                  timestamp_as_iso: bool = True,
                  idle_time: float = 0.016,
                  dialect: Literal['lf', 'excel', 'excel-tab', 'unix'] = 'lf',
@@ -48,7 +48,11 @@ class CSVWriter:
         :param path: Output file path
         :param buffer_size: Internal buffer size in bytes
         :param queue_size: Size of the command queue
-        :param float_fmt: Format string for float values
+        :param float_fmt: Format string for float values. The default writes the
+                          shortest string that reads back as the same double, so
+                          the file loses nothing — the same choice TradingView's
+                          own export makes. A fixed digit count (``.8g``) would
+                          quantize every value on the way out.
         :param timestamp_as_iso: If True, timestamps will be written as ISO datetime strings
         :param idle_time: Idle time in seconds before flushing the buffer
         :param dialect: CSV dialect, one of 'excel', 'excel-tab', 'unix'

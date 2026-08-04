@@ -126,7 +126,8 @@ def benchmark(
                     iter(ohlcv_list),
                     syminfo,
                     last_bar_index=len(ohlcv_list) - 1,
-                    plot_path=None if no_output else app_state.output_dir / f"benchmark_{i}.csv"
+                    plot_path=None if no_output else app_state.output_dir / f"benchmark_{i}.csv",
+                    lossless_volume=reader.lossless_volume
                 )
 
                 import_time = time.perf_counter() - import_start

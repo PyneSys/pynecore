@@ -88,7 +88,8 @@ def run(script_file: str) -> None:
 
             runner = ScriptRunner(
                 script_path, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                plot_path=plot_path, strat_path=strat_path, trade_path=trade_path
+                plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
+                lossless_volume=reader.lossless_volume
             )
             runner.run()
 

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .ohlcv import OHLCVWriter
 from .ohlcv import OHLCVReader
+from .ohlcv import restore_f32_volume
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
@@ -45,21 +46,30 @@ def validate_aggregation(source_tf: str, target_tf: str) -> None:
         )
 
 
-def _merge_candles(candles: list[OHLCV], bar_time: int) -> OHLCV:
+def _merge_candles(candles: list[OHLCV], bar_time: int,
+                   restore_volume: bool = False) -> OHLCV:
     """
     Merge a window of candles into a single aggregated candle.
 
     :param candles: Non-empty list of OHLCV candles belonging to the same bar
     :param bar_time: Aligned bar opening timestamp in milliseconds
+    :param restore_volume: Whether the source volumes carry float32 storage
+               error that has to be undone before summing
     :return: Aggregated OHLCV candle
     """
+    # The target file stores volume as an absolute f64, so its values are read
+    # back as written — a consumer has no clean-up left to do. A legacy source
+    # therefore has to be restored HERE, per source bar (exactly what the chart
+    # does before summing), or the sum carries the float32 dust forever.
+    volumes = (restore_f32_volume(c.volume) for c in candles) if restore_volume \
+        else (c.volume for c in candles)
     return OHLCV(
         timestamp=bar_time,
         open=candles[0].open,
         high=max(c.high for c in candles),
         low=min(c.low for c in candles),
         close=candles[-1].close,
-        volume=sum(c.volume for c in candles),
+        volume=sum(volumes),
     )
 
 
@@ -134,6 +144,7 @@ def aggregate_ohlcv(
                          minmove=reader.minmove, pricescale=reader.pricescale) as writer:
             window: list[OHLCV] = []
             current_bar_time: int | None = None
+            restore_volume = not reader.lossless_volume
 
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -150,7 +161,7 @@ def aggregate_ohlcv(
 
                 if current_bar_time is not None and bar_time != current_bar_time:
                     # New bar boundary — flush the window
-                    writer.write(_merge_candles(window, current_bar_time))
+                    writer.write(_merge_candles(window, current_bar_time, restore_volume))
                     target_count += 1
                     window = []
 
@@ -159,7 +170,7 @@ def aggregate_ohlcv(
 
             # Flush last window
             if window and current_bar_time is not None:
-                writer.write(_merge_candles(window, current_bar_time))
+                writer.write(_merge_candles(window, current_bar_time, restore_volume))
                 target_count += 1
 
     return source_count, target_count
@@ -216,6 +227,7 @@ def _aggregate_observed(
             window_start: int | None = None
             group_key: tuple | None = None
             counter = ObservedDayCounter(tz, opening_hours, fold=fold)
+            restore_volume = not reader.lossless_volume
 
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -233,7 +245,7 @@ def _aggregate_observed(
                 if group_key is not None and key != group_key:
                     # A non-None group key means at least one bar was windowed.
                     assert window_start is not None
-                    writer.write(_merge_candles(window, window_start))
+                    writer.write(_merge_candles(window, window_start, restore_volume))
                     target_count += 1
                     window = []
                     window_start = None
@@ -244,7 +256,7 @@ def _aggregate_observed(
                 window.append(candle)
 
             if window and window_start is not None:
-                writer.write(_merge_candles(window, window_start))
+                writer.write(_merge_candles(window, window_start, restore_volume))
                 target_count += 1
 
     return source_count, target_count

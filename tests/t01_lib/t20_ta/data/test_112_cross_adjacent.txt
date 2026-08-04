@@ -1,0 +1,10 @@
+[2025-01-01T00:00:00.000-00:00]: a=-1 cross=true over=false under=true
+[2025-01-01T00:00:00.000-00:00]: a=1 cross=true over=true under=false
+[2025-01-01T00:00:00.000-00:00]: a=-1 cross=true over=false under=true
+[2025-01-01T00:00:00.000-00:00]: a=1 cross=true over=true under=false
+[2025-01-01T00:00:00.000-00:00]: a=-1 cross=true over=false under=true
+[2025-01-01T00:00:00.000-00:00]: a=1 cross=true over=true under=false
+[2025-01-01T00:00:00.000-00:00]: a=-1 cross=true over=false under=true
+[2025-01-01T00:00:00.000-00:00]: a=1 cross=true over=true under=false
+[2025-01-01T00:00:00.000-00:00]: a=-1 cross=true over=false under=true
+[2025-01-01T00:00:00.000-00:00]: a=1 cross=true over=true under=false

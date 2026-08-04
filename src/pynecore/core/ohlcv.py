@@ -21,7 +21,8 @@ from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
 from pynecore.core.syminfo import SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
-__all__ = ["OHLCVWriter", "OHLCVReader", "parse_timezone_name", "record_count"]
+__all__ = ["OHLCVWriter", "OHLCVReader", "parse_timezone_name", "record_count",
+           "restore_f32_volume"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
@@ -554,6 +555,34 @@ def _f32_resolution(value: float) -> float | None:
     if not (math.isfinite(lower) and math.isfinite(upper)):
         return None
     return max(rounded - lower, upper - rounded)
+
+
+def restore_f32_volume(volume: float) -> float:
+    """Clean float32 storage artifacts from a volume served by a legacy feed.
+
+    Data feeds serve volume as a short decimal (e.g. Binance BTCUSDT lot step
+    ``1e-5``: ``0.56881``), which has no exact binary float32 form — the value a
+    legacy file reads back is ``0.568809986...``, and the ~1e-7 per-bar dust
+    accumulates in every volume sum a consumer computes. Rounding restores the
+    original decimal exactly wherever float32 can vouch for it: keep the decimals
+    whose grid is no finer than the float32 ulp at this magnitude (from
+    ``frexp``: ulp = 2^(exp-24)), but never fewer than 5 (the finest common lot
+    grid at magnitudes where restoration is still exact).
+
+    Only call this on a value that really went through float32 storage — the
+    5-decimal floor is finer than the float32 grid above ~1000, so on a value
+    that kept full precision it does not clean anything, it truncates: a Binance
+    30m volume of ``9362.123462`` comes back as ``9362.12346``, and a session
+    VWAP built on it then diverges for the rest of the day.
+
+    :param volume: Volume as read back from storage.
+    :return: The feed's own decimal where float32 can vouch for it.
+    """
+    if volume == 0.0 or volume != volume:  # zero or na
+        return volume
+    ulp_exp = math.frexp(volume)[1] - 24  # float32 ulp = 2**ulp_exp
+    precision = max(5, math.floor(-ulp_exp * 0.30102999566398120))  # log10(2)
+    return round(volume, precision)
 
 
 def _validate_tick_grid(minmove: int | None, pricescale: int | None) -> tuple[int, int]:
@@ -2127,6 +2156,17 @@ class _V2OHLCVReader:
         return self._pricescale or None
 
     @property
+    def lossless_volume(self) -> bool:
+        """Return whether the volume column stores the feed value exactly.
+
+        :return: Whether volume is an absolute f64 column.
+        """
+        for column in self._columns:
+            if column.role == _ROLE_VOLUME:
+                return column.dtype == 6 and column.base == _ABSOLUTE_BASE
+        return False
+
+    @property
     def start_timestamp(self) -> int | None:
         """Return the first committed timestamp in milliseconds.
 
@@ -2659,6 +2699,19 @@ class OHLCVReader:
         """
         reader = self._reader
         return reader.pricescale if isinstance(reader, _V2OHLCVReader) else None
+
+    @property
+    def lossless_volume(self) -> bool:
+        """Return whether the volume column stores the feed value exactly.
+
+        A v2 file keeps volume as an absolute f64, so the value read back is the one
+        the feed served. Legacy v1 files pack every field into f32, where the stored
+        value carries sub-lot error a consumer has to clean up.
+
+        :return: Whether volume needs no storage clean-up.
+        """
+        reader = self._reader
+        return reader.lossless_volume if isinstance(reader, _V2OHLCVReader) else False
 
     @property
     def start_timestamp(self) -> int | None:

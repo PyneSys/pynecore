@@ -416,7 +416,13 @@ def cross(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed over the given series
     """
-    return crossover(source1, source2) or crossunder(source1, source2)
+    # Both halves carry their own Persistent relation to the previous bar, so both
+    # must run on every bar. A short-circuiting ``or`` would leave crossunder's
+    # relation stale on every bar crossover fires, and the crossunder on the next
+    # bar would then be missed.
+    crossed_over = crossover(source1, source2)
+    crossed_under = crossunder(source1, source2)
+    return crossed_over or crossed_under
 
 
 # noinspection PyUnusedLocal

@@ -5,7 +5,7 @@ import sys
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
-from math import log10, floor, frexp
+from math import log10, floor
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -16,6 +16,7 @@ from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
+from pynecore.core.ohlcv import restore_f32_volume
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
 from pynecore.core.viz import VizWriter
@@ -141,34 +142,11 @@ def _round_price(price: float, tick_decimals: int | None):
     return round(price, precision)
 
 
-def _round_volume(volume: float) -> float:
-    """
-    Clean float32 ``.ohlcv`` storage artifacts from a volume, mirroring
-    :func:`_round_price` for the volume field.
-
-    Data feeds serve volume as a short decimal (e.g. Binance BTCUSDT lot step
-    ``1e-5``: ``0.56881``), which has no exact binary float32 form — the raw
-    stored value reads back as ``0.568809986...``, and the ~1e-7 per-bar dust
-    accumulates in every volume sum a script computes. Rounding restores the
-    original decimal exactly wherever float32 can vouch for it: keep the
-    decimals whose grid is no finer than the float32 ulp at this magnitude
-    (from ``frexp``: ulp = 2^(exp-24)), but never fewer than 5 (the finest
-    common lot grid at magnitudes where restoration is still exact). Above
-    that magnitude the 5-decimal grid is finer than the float32 spacing, so
-    rounding adds nothing to the storage error; clean feed values (e.g.
-    integer share counts) pass through unchanged.
-    """
-    if volume == 0.0 or volume != volume:  # zero or na
-        return volume
-    ulp_exp = frexp(volume)[1] - 24  # float32 ulp = 2**ulp_exp
-    precision = max(5, floor(-ulp_exp * 0.30102999566398120))  # log10(2)
-    return round(volume, precision)
-
-
 # noinspection PyShadowingNames,PyUnusedLocal
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
                         round_decimals: int | None, last_bar_index: int | None = None,
-                        last_bar_time: int | None = None):
+                        last_bar_time: int | None = None,
+                        lossless_volume: bool = False):
     """
     Set lib properties from OHLCV
     """
@@ -183,7 +161,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.low = lo = _round_price(ohlcv.low, round_decimals)
     lib.close = c = _round_price(ohlcv.close, round_decimals)
 
-    lib.volume = _round_volume(ohlcv.volume)
+    lib.volume = ohlcv.volume if lossless_volume else restore_f32_volume(ohlcv.volume)
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
     # Pine's ``bid``/``ask`` only carry real values on the ``"1T"`` (tick) feed; on every
@@ -501,7 +479,7 @@ class ScriptRunner:
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
-                 '_round_decimals', '_config_dir', '_symbol_map',
+                 '_round_decimals', '_lossless_volume', '_config_dir', '_symbol_map',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -523,6 +501,7 @@ class ScriptRunner:
                  chart_provider_instance: Any = None,
                  time_from: datetime | None = None,
                  chart_data_path: Path | None = None,
+                 lossless_volume: bool = False,
                  config_dir: Path | None = None):
         """
         Initialize the script runner
@@ -574,6 +553,11 @@ class ScriptRunner:
                                  (tests, backtests) — the ``run_tag`` is then derived
                                  locally from the plugin's ``account_id``. Caller owns
                                  the lifecycle: ``close()`` on shutdown.
+        :param lossless_volume: Whether ``ohlcv_iter`` yields the feed's own volume,
+                                needing no float32 storage clean-up. Read from the
+                                chart feed's :attr:`OHLCVReader.lossless_volume`;
+                                leave false when the source is unknown, which keeps
+                                the clean-up on (see :func:`restore_f32_volume`)
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -822,6 +806,7 @@ class ScriptRunner:
         # ``None`` when the symbol carries no real mintick, so rounding falls
         # back to the magnitude-relative significant-digit heuristic.
         self._round_decimals = mintick_decimals(_mintick) if _mintick > 0 else None
+        self._lossless_volume = lossless_volume
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
@@ -830,9 +815,7 @@ class ScriptRunner:
         self.first_price: float | None = None
         self.last_price: float | None = None
 
-        self.plot_writer = CSVWriter(
-            plot_path, float_fmt=f".8g"
-        ) if plot_path else None
+        self.plot_writer = CSVWriter(plot_path) if plot_path else None
         # Visual data (plot styles + drawings) NDJSON writer. Journaling can also
         # run without a file: ``_viz_shadow`` drives the per-bar diff whose events
         # are handed to the ``viz_events`` callback (set by the caller).
@@ -1759,7 +1742,13 @@ class ScriptRunner:
                 if self.plot_writer and lib._plot_data:
                     ef = {} if bar_candle.extra_fields is None else dict(bar_candle.extra_fields)
                     ef.update(lib._plot_data)
-                    self.plot_writer.write_ohlcv(bar_candle._replace(extra_fields=ef))
+                    # Echo the bar the script actually saw: ``lib.open``… and
+                    # ``lib.volume`` are snapped off the float32 storage grid by
+                    # ``_round_price`` / ``restore_f32_volume``, so writing the raw candle
+                    # would show an input no bar was ever computed from.
+                    self.plot_writer.write_ohlcv(bar_candle._replace(
+                        open=lib.open, high=lib.high, low=lib.low, close=lib.close,
+                        volume=lib.volume, extra_fields=ef))
 
                 self._write_viz_bar(bar_candle)
 
@@ -1892,7 +1881,7 @@ class ScriptRunner:
                 # Update lib properties
                 _set_lib_properties(
                     candle, self.bar_index, self.tz, lib, self._round_decimals,
-                    self.last_bar_index, self.last_bar_time,
+                    self.last_bar_index, self.last_bar_time, self._lossless_volume,
                 )
 
                 # Store first price for buy & hold calculation
@@ -2034,7 +2023,8 @@ class ScriptRunner:
                     barstate.isconfirmed = bar_update.is_closed
                     barstate.isnew = is_new_bar
 
-                    _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals)
+                    _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals,
+                                        lossless_volume=self._lossless_volume)
 
                     if self.first_price is None:
                         self.first_price = lib.close  # type: ignore
@@ -2457,7 +2447,8 @@ class ScriptRunner:
             barstate.islast = window.is_last_window
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
-            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals)
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals,
+                                lossless_volume=self._lossless_volume)
 
             # Store first price for buy & hold calculation
             if self.first_price is None:

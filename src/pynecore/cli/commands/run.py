@@ -1404,6 +1404,7 @@ def run(
             ohlcv_iter = iter([])
         else:
             ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
+        lossless_volume = reader.lossless_volume
 
         # --broker implies --live.
         if broker:
@@ -1666,6 +1667,7 @@ def run(
                                           chart_provider_instance=chart_provider_instance,
                                           time_from=time_from_dt,
                                           chart_data_path=data_path,
+                                          lossless_volume=lossless_volume,
                                           config_dir=app_state.config_dir)
                 finally:
                     # Remove lib directory from Python path
