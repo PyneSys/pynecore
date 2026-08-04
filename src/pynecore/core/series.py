@@ -13,7 +13,9 @@ T = TypeVar('T')
 # Interned na sentinel of untyped series (element type unknown at transform
 # time). Hybrid guards (``isinstance(x, NA) or x != x``) treat it and the
 # native nan as the same na.
-_NA_UNTYPED: NA = NA(T)
+# The cast is needed because the NA stub's __new__ deliberately types as T (so
+# ``NA(X)`` flows anywhere an ``X`` is expected), which here would be a TypeVar.
+_NA_UNTYPED: NA = cast(NA, NA(T))
 
 
 class SeriesImpl(Generic[T]):
@@ -227,7 +229,7 @@ class SeriesImpl(Generic[T]):
     def __getitem__(self, key: slice) -> ReadOnlySeriesView[T]:
         ...
 
-    def __getitem__(self, key: int | slice) -> T | NA[T] | ReadOnlySeriesView[T]:
+    def __getitem__(self, key: int | float | NA | slice) -> T | NA[T] | ReadOnlySeriesView[T]:
         """
         Get item(s) using Pine indexing with slice support.
 
@@ -248,8 +250,11 @@ class SeriesImpl(Generic[T]):
             key = 0
 
         if isinstance(key, float):
-            # A native nan offset is an na offset -> current bar (int(nan) raises)
-            key = 0 if key != key else int(key)
+            # A native nan offset is an na offset -> current bar (int(nan) raises).
+            # The separate binding keeps the conversion on a plainly float-typed
+            # name; the IDE cannot narrow the reassigned union of ``key`` here.
+            f_key = key
+            key = 0 if f_key != f_key else int(f_key)
 
         if isinstance(key, int):
             # Pine: out-of-range subscript -> na (covers both negative and
@@ -364,6 +369,30 @@ class ReadOnlySeriesView(Generic[T]):
             if pos < 0:
                 pos += self._capacity
             yield self._buffer[pos]
+
+    def oldest_first(self) -> list[T | NA[T]]:
+        """
+        Return the viewed values as a plain list ordered oldest to newest.
+
+        Hot-loop helper: window consumers (``ta.wma``, ``ta.linreg``) walk the
+        whole slice on every bar, where per-element ``__getitem__`` calls are
+        the dominant cost; handing the window over as at most two native list
+        slices removes that overhead entirely.
+
+        :return: The values of the view, oldest first
+        """
+        # Slice with an explicit upper bound everywhere: the buffer list may be
+        # physically longer than ``_capacity`` (a shrink through the
+        # ``max_bars_back`` fast path keeps the old allocation), so an open-ended
+        # slice would run into the unused ``None`` tail.
+        cap = self._capacity
+        lo = self._write_pos - self._stop
+        hi = self._write_pos - self._start
+        if lo >= 0:
+            return self._buffer[lo:hi]
+        if hi <= 0:
+            return self._buffer[lo + cap:hi + cap]
+        return self._buffer[lo + cap:cap] + self._buffer[:hi]
 
     def __repr__(self) -> str:
         """Get string representation"""

@@ -473,6 +473,9 @@ def cum(source: Series[float | int]) -> PyneFloat:
     return var
 
 
+# The slice + ``oldest_first`` call on ``source`` looks ill-typed only because
+# ``Series[T]`` erases to ``T`` for the IDE; it is a series under the transform.
+# noinspection PyUnresolvedReferences,PyTypeChecker
 def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> PyneFloat:
     """
     Calculate the Mean Absolute Deviation (MAD) of the source series with the given length.
@@ -497,9 +500,12 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     if isinstance(mean, NA) or mean != mean:
         return na_float
 
+    # Newest-first walk over the raw window list: bit-identical to per-element
+    # ``source[i]`` reads, but the list walk is several times cheaper -- the
+    # ``__getitem__`` call, not the arithmetic, dominates here.
     summ = 0.0
-    for i in builtins.range(length):
-        summ += abs(source[i] - mean)
+    for y in builtins.reversed(source[0:length].oldest_first()):
+        summ += abs(y - mean)
 
     return summ / length
 
@@ -752,6 +758,10 @@ def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True
     return (h - l) / b
 
 
+# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
+# unused because they are read on the NEXT bar, and the slice + ``oldest_first`` call
+# on ``src`` look ill-typed because ``Series[T]`` erases to ``T`` for the IDE.
+# noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     """
     Computes the linear regression value of the source series over a given period.
@@ -761,56 +771,73 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     :param offset: Number of bars to shift the result
     :return: Linear regression value
     """
+    # TradingView recomputes the whole window every bar: its distance from the
+    # exact rational result stays flat over 22k bars (probe m567), while a rolling
+    # update of the two sums drifts to 1e-11 on the same data. The x-axis runs
+    # 1..length from the oldest bar, and the result is the line evaluated at
+    # ``length - offset``.
     assert length > 0, "Invalid length, must be greater than 0!"
     if length == 1:
         return source
     length = int(length)
-    window_size = length
 
-    # Precomputed constants for x-coordinates
-    sum_x = window_size * (window_size - 1) / 2.0
-    sum_x2 = (window_size - 1) * window_size * (2 * window_size - 1) / 6.0
-
-    # Persistent state variables
-    bar_count: Persistent[int] = 0
-    sum_y: Persistent[float] = 0.0  # Sum of source values in the window
-    sum_xy: Persistent[float] = 0.0  # Weighted sum: sum((window_size - 1 - i) * source[i])
+    count: Persistent[int] = 0
+    val: Persistent[float] = na_float
+    const_len: Persistent[int] = 0
+    sum_x: Persistent[float] = 0.0
+    denom: Persistent[float] = 0.0
 
     if isinstance(source, NA) or source != source:
-        if bar_count < window_size:
+        # An NA bar leaves the window unchanged; hold the last full value
+        # (still NA while warming up)
+        return na_float if count < length else val
+
+    # NA values are NOT stored in the buffer, only skipped, so ``src[i]`` is the
+    # i-th most recent non-NA value. Reading the parameter directly would step
+    # back whole *bars* and land inside an NA gap, poisoning the sums.
+    src: Series[float] = source
+    # Grow the na-compacted buffer so the oldest window slot stays addressable for
+    # lengths beyond the per-series default max_bars_back; otherwise the window
+    # read returns na and the whole regression collapses to na.
+    max_bars_back(src, length)
+
+    if count < length:
+        count += 1
+        if count < length:  # Not enough data yet
             return na_float
-        # An NA bar leaves the window unchanged; fall through to report the held value
-    else:
-        # NA values are NOT stored in the buffer, only skipped, so ``src[window_size]``
-        # indexes past NA gaps to the true oldest value still inside the window.
-        # Reading the parameter directly would step back ``window_size`` *bars* and
-        # land inside an NA gap, subtracting an NA that poisons ``sum_y`` forever.
-        src: Series[float] = source
 
-        # Warm-up phase: accumulate values until the window is full
-        if bar_count < window_size:
-            prev_sum_y = sum_y
-            sum_y = prev_sum_y + source
-            sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y
-            bar_count += 1
+    # The x-side sums depend only on ``length``; they are accumulated with the
+    # same sequential loop TV runs (so the cached floats are bit-identical to a
+    # per-bar recompute) but only when the length changes.
+    if const_len != length:
+        const_len = length
+        sx = 0.0
+        sx2 = 0.0
+        for i in builtins.range(1, length + 1):
+            per = builtins.float(i)
+            sx = sx + per
+            sx2 = sx2 + per * per
+        sum_x = sx
+        denom = length * sx2 - sx * sx
 
-            # Return NA until we have enough data
-            if bar_count < window_size:
-                return na_float
-        else:
-            # Rolling update: remove the oldest value when the window is full
-            dropped_value = src[window_size]
-            prev_sum_y = sum_y
-            sum_y = prev_sum_y + source - dropped_value
-            sum_xy = (window_size - 1) * source + sum_xy - prev_sum_y + dropped_value
+    # The y-side sums are a fresh oldest-first walk every bar. The window is
+    # taken as a raw list instead of per-element ``src[i]`` reads: the two are
+    # bit-identical (the accumulators are independent, so splitting the x and y
+    # sums does not change either sequence), but the list walk is several times
+    # cheaper -- the ``__getitem__`` call, not the arithmetic, dominates here.
+    sum_y = 0.0
+    sum_xy = 0.0
+    per = 0.0
+    for y in src[0:length].oldest_first():
+        per = per + 1.0
+        sum_y = sum_y + y
+        sum_xy = sum_xy + y * per
 
-    # Compute slope and intercept
-    denominator = window_size * sum_x2 - sum_x * sum_x
-    slope = (window_size * sum_xy - sum_x * sum_y) / denominator
-    intercept = (sum_y - slope * sum_x) / window_size
+    slope = (length * sum_xy - sum_x * sum_y) / denom
+    intercept = sum_y / length - slope * sum_x / length
 
-    # Compute final regression value
-    return intercept + slope * ((window_size - 1) - offset)
+    val = intercept + slope * (length - offset)
+    return val
 
 
 # noinspection PyUnusedLocal,DuplicatedCode
@@ -1013,10 +1040,19 @@ def mfi(source: float, length: int) -> PyneFloat:
     lower = lib_math.sum(volume * (0.0 if not chg_na and chg >= -_EPSILON else source), length)
     if (isinstance(upper, NA) or upper != upper) or (isinstance(lower, NA) or lower != lower):
         return na_float
-    total = upper + lower
-    if total == 0.0:
+    # A side made of pure accumulation dust counts as an exact zero: the rolling
+    # sums do not return to zero when their whole window is zero, and Pine's
+    # comparison tolerance swallows the residue (measured on probe m566).
+    if -_EPSILON <= upper <= _EPSILON:
+        upper = 0.0
+    if -_EPSILON <= lower <= _EPSILON:
+        lower = 0.0
+    if lower == 0.0:  # Includes the empty case, where the upper sum is zero too
         return 100.0
-    return 100.0 - (100 * lower / total)
+    # The money ratio is formed first and the whole result derived from it; the
+    # algebraically equal ``100 - 100 * lower / (upper + lower)`` rounds differently
+    # and misses TV on 38% of the bars.
+    return 100.0 - (100.0 / (1.0 + upper / lower))
 
 
 # noinspection PyShadowingBuiltins
@@ -2255,6 +2291,10 @@ def wad() -> PyneFloat:
     return cum(gain)
 
 
+# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
+# unused because they are read on the NEXT bar, and the slice + ``oldest_first`` call
+# on ``ff`` look ill-typed because ``Series[T]`` erases to ``T`` for the IDE.
+# noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def wma(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the Weighted Moving Average (WMA) of the source series with the given length,
@@ -2269,17 +2309,19 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     :return: The WMA of the source series
     """
     # Measured law (probes m560): Pine re-sums the whole window on every bar, OLDEST
-    # first, weighting ``source[i]`` with ``length - i`` and accumulating the weight sum
-    # in the same loop. The order matters: summing newest-first, or weighting with
-    # ``(length - i) * length`` the way the reference pseudocode does, drifts on more
-    # than half of the bars. Being a full re-sum this cannot be kept incremental -- an
-    # O(1) rolling update gives different last bits. The forward-filled window was
-    # measured on scattered, consecutive and leading gaps at every length.
+    # first, weighting ``source[i]`` with ``length - i``. The order matters: summing
+    # newest-first, or weighting with ``(length - i) * length`` the way the reference
+    # pseudocode does, drifts on more than half of the bars. Being a full re-sum this
+    # cannot be kept incremental -- an O(1) rolling update gives different last bits.
+    # The forward-filled window was measured on scattered, consecutive and leading
+    # gaps at every length.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
 
     count: Persistent[int] = 0
     last: Persistent[float] = na_float
+    const_len: Persistent[int] = 0
+    norm: Persistent[float] = 0.0
 
     source_na = isinstance(source, NA) or source != source
     if not source_na:
@@ -2295,12 +2337,24 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     if source_na or count < length:
         return na_float
 
-    norm = 0.0
+    # The weight sum depends only on ``length``; accumulated with the same
+    # sequential loop TV runs, but only when the length changes.
+    if const_len != length:
+        const_len = length
+        n = 0.0
+        for i in builtins.range(1, length + 1):
+            n = n + builtins.float(i)
+        norm = n
+
+    # Fresh oldest-first walk every bar over the raw window list: bit-identical
+    # to per-element ``ff[i]`` reads (the two accumulators are independent, so
+    # hoisting the weight sum does not change either sequence), but several
+    # times cheaper -- the ``__getitem__`` call dominates, not the arithmetic.
     summ = 0.0
-    for i in builtins.range(length - 1, -1, -1):
-        weight = length - i
-        norm += weight
-        summ += ff[i] * weight
+    weight = 0.0
+    for y in ff[0:length].oldest_first():
+        weight = weight + 1.0
+        summ = summ + y * weight
 
     return summ / norm
 
