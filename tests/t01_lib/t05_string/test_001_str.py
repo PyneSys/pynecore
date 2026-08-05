@@ -73,3 +73,29 @@ def __test_str_contains_na__():
     assert isinstance(_string.contains("Market Closes", NA(str)), NA)
     assert _string.contains("Market Closes", "Closes") is True
     assert _string.contains("Market Open", "Closes") is False
+
+
+def __test_str_replace_occurrence__():
+    """ str.replace picks the nth occurrence with an overlapping scan, keeps the source
+    when there is no nth one, and treats an empty target as an insertion point """
+    from pynecore.lib import string as _string
+    # The parameter is named the way Pine names it, so a compiled named argument binds
+    assert _string.replace("aXbXcXd", "X", "-", occurrence=1) == "aXb-cXd"
+    # Nth occurrence, 0-based (measured on TradingView)
+    assert _string.replace("aXbXcXd", "X", "-") == "a-bXcXd"
+    assert _string.replace("aXbXcXd", "X", "-", 0) == "a-bXcXd"
+    assert _string.replace("aXbXcXd", "X", "-", 2) == "aXbXc-d"
+    # There is no fourth X, so the source is returned unchanged
+    assert _string.replace("aXbXcXd", "X", "-", 3) == "aXbXcXd"
+    assert _string.replace("abc", "X", "-", 0) == "abc"
+    # Overlapping occurrences: "aa" starts at index 0, 1 and 2 of "aaaa"
+    assert _string.replace("aaaa", "aa", "-", 0) == "-aa"
+    assert _string.replace("aaaa", "aa", "-", 1) == "a-a"
+    assert _string.replace("aaaa", "aa", "-", 2) == "aa-"
+    assert _string.replace("aaaa", "aa", "-", 3) == "aaaa"
+    # An empty target inserts at the nth position, clamped to the end
+    assert _string.replace("abc", "", "-", 0) == "-abc"
+    assert _string.replace("abc", "", "-", 2) == "ab-c"
+    assert _string.replace("abc", "", "-", 3) == "abc-"
+    assert _string.replace("abc", "", "-", 4) == "abc-"
+    assert _string.replace("", "", "-", 1) == "-"

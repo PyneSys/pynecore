@@ -593,30 +593,41 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     return separator.join([source] * int(repeat))
 
 
-def replace(source: str, target: str, replacement: str, occurence=0) -> PyneStr:
+def replace(source: str, target: str, replacement: str, occurrence=0) -> PyneStr:
     """
-    Replaces the nth occurence of target string with the replacement string in the source string.
+    Replaces the nth occurrence of target string with the replacement string in the source string.
 
     :param source: Source string
     :param target: Target string
     :param replacement: Replacement string
-    :param occurence: Occurence to replace
-    :return: New string with the nth occurence of target string replaced with the replacement
+    :param occurrence: Occurrence to replace
+    :return: New string with the nth occurrence of target string replaced with the replacement
              string, or na if source or target is na.
     """
-    # na-propagation (Pine): a na source would flow through ``source.split``
-    # (NA.__getattr__ -> na) into ``target.join(na)``, whose sequence-protocol
-    # fallback never terminates — same trap as in ``repeat``/``contains``.
+    # na-propagation (Pine): a na source would reach ``source.find`` through
+    # ``NA.__getattr__``, which answers na to every attribute and turns the scan below
+    # into a silent non-result — same trap as in ``repeat``/``contains``.
     if isinstance(source, NA) or source is None or isinstance(target, NA) or target is None:
         return NA(str)
-    if occurence == 0:
-        return source.replace(target, replacement, 1)
-    a = source.split(target)
-    p1 = target.join(a[:occurence])
-    p2 = target.join(a[occurence:])
-    if p2 == "":
+    # A negative occurrence is a compile error on TradingView (CE10039), so it can only
+    # arrive from hand-written Pyne code; leaving the source untouched is the quiet option.
+    if occurrence < 0:
         return source
-    return p1 + replacement + p2
+    if not target:
+        # An empty target is an insertion point rather than a match: the replacement lands
+        # at the nth character position, clamped to the end of the source. Measured:
+        # replace("abc", "", "-", 2) == "ab-c" and replace("abc", "", "-", 4) == "abc-".
+        index = min(occurrence, len(source))
+    else:
+        # Occurrences are enumerated by an overlapping left-to-right scan, so "aa" occurs
+        # at index 0 AND 1 in "aaa" — a split-based walk would only see the first one.
+        # Measured: replace("aaa", "aa", "-", 1) == "a-".
+        index = -1
+        for _ in range(occurrence + 1):
+            index = source.find(target, index + 1)
+            if index < 0:
+                return source
+    return source[:index] + replacement + source[index + len(target):]
 
 
 def replace_all(source: str, target: str, replacement: str) -> str:
