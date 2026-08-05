@@ -1408,9 +1408,50 @@ def _d_bar_time(current_time_ms: int) -> int:
     return _trading_day_open_sec(td, _dbt_tz, _dbt_starts, _dbt_on) * 1000
 
 
+def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, multiplier: int,
+                        current_time_ms: int, steps: int) -> int:
+    """
+    Bar open time on a requested timeframe's grid, stepped back by whole grid bars.
+
+    :param resampler: Resampler of the requested timeframe
+    :param timeframe: The requested timeframe
+    :param modifier: Timeframe modifier ('', 'S', 'D', 'W' or 'M')
+    :param multiplier: Timeframe multiplier
+    :param current_time_ms: Chart bar open to resolve, in milliseconds
+    :param steps: Whole grid bars to step back; zero or less resolves without stepping
+    :return: Bar opening time in milliseconds
+    """
+    dwm = multiplier > 1 and modifier in ('D', 'W', 'M')
+    daily = multiplier == 1 and modifier == 'D'
+    if (dwm or daily) and steps <= 0:
+        # noinspection PyProtectedMember
+        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
+            # The chart's own bars are the requested grid
+            return current_time_ms
+    while True:
+        if dwm:
+            bar_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
+        elif daily:
+            # TradingView daily bars open at the trading day's session open
+            # (the previous evening for overnight markets), not at midnight
+            bar_time = _d_bar_time(current_time_ms)
+        else:
+            bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+        if steps <= 0:
+            return bar_time
+        steps -= 1
+        # The walk lands one instant before a resolved bar open rather than subtracting a
+        # nominal bar length, because a month is not a fixed span: taking in_seconds('M')
+        # (30.4375 days) off a bar early in the month reaches the month BEFORE the intended
+        # one. ``_dwm_bar_time`` and ``_d_bar_time`` resolve a chart bar by its own last
+        # instant, so the probe carries the same span back.
+        current_time_ms = bar_time - 1 - (_chart_span_off_ms() if dwm or daily else 0)
+
+
 @module_function_property
 def time(timeframe: str | None = None, session: str | int | None = None,
-         timezone: str | None = None, bars_back: int = 0) -> PyneInt:
+         timezone: str | None = None, bars_back: int = 0,
+         timeframe_bars_back: int = 0) -> PyneInt:
     """
     The time function returns the UNIX time of the current bar for the specified timeframe
     and session or NA if the time point is out of session.
@@ -1434,6 +1475,11 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
                      bars, negative values to the expected times of future bars. The offset
                      is computed on a continuous time grid (exact for 24/7 markets).
+    :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
+                     chart's, applied on top of ``bars_back``. Positive values walk the
+                     requested grid one bar at a time, so an uneven grid such as a monthly
+                     one steps exactly; negative values refer to bars that do not exist yet
+                     and use the nominal bar length.
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time(timeframe, bars_back) -- an int second argument is a bar offset
@@ -1457,30 +1503,19 @@ def time(timeframe: str | None = None, session: str | int | None = None,
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    if bars_back:
-        try:
-            current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
-        except (ValueError, AssertionError):
-            return NA(int)
     # noinspection PyProtectedMember
     modifier, multiplier = timeframe_module._process_tf(timeframe)
-    if modifier in ('D', 'W', 'M') and multiplier > 1:
-        # noinspection PyProtectedMember
-        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
-            # The chart's own bars are the requested grid
-            bar_time = current_time_ms
-        else:
-            bar_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
-    elif modifier == 'D':
-        # noinspection PyProtectedMember
-        if ('D', 1) == timeframe_module._process_tf(str(syminfo.period)):
-            bar_time = current_time_ms
-        else:
-            # TradingView daily bars open at the trading day's session open
-            # (the previous evening for overnight markets), not at midnight
-            bar_time = _d_bar_time(current_time_ms)
-    else:
-        bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+    if bars_back or timeframe_bars_back < 0:
+        try:
+            if bars_back:
+                current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+            if timeframe_bars_back < 0:
+                # A future bar has no grid to walk yet, so its nominal length is used
+                current_time_ms -= timeframe_bars_back * timeframe_module.in_seconds(timeframe) * 1000
+        except (ValueError, AssertionError):
+            return NA(int)
+    bar_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
+                                   current_time_ms, timeframe_bars_back)
 
     if session is None:
         # No session specified, return the bar time
@@ -1692,7 +1727,8 @@ def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
 
 @module_function_property
 def time_close(timeframe: str | None = None, session: str | int | None = None,
-               timezone: str | None = None, bars_back: int = 0) -> PyneInt:
+               timezone: str | None = None, bars_back: int = 0,
+               timeframe_bars_back: int = 0) -> PyneInt:
     """
     The time_close function returns the UNIX time of the current bar's close for the specified timeframe
     and session or NA if the time point is outside the session.
@@ -1716,6 +1752,11 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
                      bars, negative values to the expected times of future bars. The offset
                      is computed on a continuous time grid (exact for 24/7 markets).
+    :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
+                     chart's, applied on top of ``bars_back``. Positive values walk the
+                     requested grid one bar at a time, so an uneven grid such as a monthly
+                     one steps exactly; negative values refer to bars that do not exist yet
+                     and use the nominal bar length.
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time_close(timeframe, bars_back) -- an int second argument is a bar offset
@@ -1749,29 +1790,19 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    if bars_back:
-        try:
-            current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
-        except (ValueError, AssertionError):
-            return NA(int)
     # noinspection PyProtectedMember
     modifier, multiplier = timeframe_module._process_tf(timeframe)
-    if modifier in ('D', 'W', 'M') and multiplier > 1:
-        # noinspection PyProtectedMember
-        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
-            bar_start_time = current_time_ms
-        else:
-            bar_start_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
-    elif modifier == 'D':
-        # noinspection PyProtectedMember
-        if ('D', 1) == timeframe_module._process_tf(str(syminfo.period)):
-            bar_start_time = current_time_ms
-        else:
-            # TradingView daily bars open at the trading day's session open
-            # (the previous evening for overnight markets), not at midnight
-            bar_start_time = _d_bar_time(current_time_ms)
-    else:
-        bar_start_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+    if bars_back or timeframe_bars_back < 0:
+        try:
+            if bars_back:
+                current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+            if timeframe_bars_back < 0:
+                # A future bar has no grid to walk yet, so its nominal length is used
+                current_time_ms -= timeframe_bars_back * timeframe_module.in_seconds(timeframe) * 1000
+        except (ValueError, AssertionError):
+            return NA(int)
+    bar_start_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
+                                         current_time_ms, timeframe_bars_back)
 
     # Calculate bar close time by adding timeframe duration
     try:
