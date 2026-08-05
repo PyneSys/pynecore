@@ -5,7 +5,7 @@ title: "array"
 description: "Dynamic array operations"
 icon: "view_list"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -356,6 +356,21 @@ array and vice versa.
 | index_from | int | Start index, inclusive; `na` means 0 |
 | index_to | int | End index, exclusive; `na` means the array size |
 | **Returns** | array view | View of the selected elements |
+
+The view is writable: `push()`, `insert()`, `unshift()`, `remove()`, `pop()`, `shift()`,
+`clear()` and `concat()` on a slice change the original array as well, inside the slice's own
+bounds. Pushing to a slice therefore inserts at the slice end, not at the end of the original
+array, and `pop()` returns the slice's last element rather than the array's.
+
+A slice is a plain index range over the original array, not a reference to the elements it
+held when it was created. Mutating the original array shifts what the view shows instead of
+moving the view, and a view whose range reaches past a shrunken array reports only the
+elements that still exist — without raising, and without losing its range when the array
+grows back.
+
+`index_from` must address an existing element and `index_to` may reach one position past the
+last one, so `index_from == index_to` is a legal empty slice but a negative index, an index
+past the size, a reversed pair, or any slice of an empty array is an error.
 
 #### `reverse(id)`
 Reverses the order of elements in the array.

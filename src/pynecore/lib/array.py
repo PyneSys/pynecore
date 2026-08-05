@@ -203,7 +203,7 @@ def binary_search_rightmost(id: list[Any], val: Any) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def clear(id: list[Any]) -> None:
+def clear(id: list[Any] | SequenceView[Any]) -> None:
     """
     Removes all elements from the array.
 
@@ -213,7 +213,8 @@ def clear(id: list[Any]) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def concat(id1: list[T], id2: list[T]) -> list[T]:
+def concat(id1: list[T] | SequenceView[T], id2: list[T] | SequenceView[T]) \
+        -> list[T] | SequenceView[T]:
     """
     Concatenates two arrays into a single array.
 
@@ -408,7 +409,7 @@ def indexof(id: list[T], value: T) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def insert(id: list[T], index: int, value: T) -> None:
+def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     """
     Inserts the specified value at the specified index in the array.
 
@@ -932,7 +933,7 @@ def percentrank(id: list[Number], index: int) -> float:
 
 
 # noinspection PyShadowingBuiltins
-def pop(id: list[T]) -> T:
+def pop(id: list[T] | SequenceView[T]) -> T:
     """
     Removes the last element from the array and returns it.
 
@@ -943,7 +944,7 @@ def pop(id: list[T]) -> T:
 
 
 # noinspection PyShadowingBuiltins
-def push(id: list[T], value: T) -> None:
+def push(id: list[T] | SequenceView[T], value: T) -> None:
     """
     Appends the specified value to the end of the array.
 
@@ -968,7 +969,7 @@ def range(id: list[Number]) -> Number:
 
 
 # noinspection PyShadowingBuiltins
-def remove(id: list[T], index: int) -> T:
+def remove(id: list[T] | SequenceView[T], index: int) -> T:
     """
     Removes the element at the specified index from the array.
 
@@ -992,7 +993,7 @@ def remove(id: list[T], index: int) -> T:
 
 
 # noinspection PyShadowingBuiltins
-def reverse(id: list[T]) -> None:
+def reverse(id: list[T] | SequenceView[T]) -> None:
     """
     Reverses the order of the elements in the array.
 
@@ -1021,7 +1022,7 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def shift(id: list[T]) -> T:
+def shift(id: list[T] | SequenceView[T]) -> T:
     """
     Removes the first element from the array and returns it.
 
@@ -1043,18 +1044,26 @@ def size(id: list[Any] | SequenceView[Any]) -> int:
 
 
 # noinspection PyShadowingBuiltins
-def slice(id: list[T], index_from: int, index_to: int) -> SequenceView[T]:
+def slice(id: list[T] | SequenceView[T], index_from: int, index_to: int) -> SequenceView[T]:
     """
     The function creates a slice from an existing array. If an object from the slice changes, the
     changes are applied to both the new and the original arrays.
 
+    Adding to or removing from the slice changes the original array too, inside the
+    slice's own bounds: pushing to a slice inserts at the slice end rather than at the
+    end of the original array.
+
     An na ``index_from`` starts the slice at the beginning of the array and an na
     ``index_to`` ends it at the array size.
+
+    ``index_from`` must address an existing element and ``index_to`` may reach one
+    position past the last one; anything else is an error.
 
     :param id: Input array
     :param index_from: Index to start the sub-array from
     :param index_to: Index to end the sub-array at
     :return: Slice view of the original array
+    :raises ValueError: If the indices are out of range or start after each other
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     #   slice(a, na, 2)  -> 10,20        size 2
@@ -1062,6 +1071,23 @@ def slice(id: list[T], index_from: int, index_to: int) -> SequenceView[T]:
     #   slice(a, na, na) -> 10,20,30,40  size 4
     start = int(index_from) if index_from == index_from else 0  # is_na_arg
     stop = int(index_to) if index_to == index_to else len(id)  # is_na_arg
+
+    # Measured on TradingView (FX:EURUSD 240, array [10, 20, 30, 40]): invalid bounds
+    # HALT the script, they are not normalized into a clamped or empty slice.
+    #   slice(a, 0, 10) / slice(a, -1, 2) / slice(a, 0, -1) / slice(a, 4, 4) -> RE10045
+    #   slice(a, 3, 1)                                                      -> RE10044
+    #   slice(a, 1, 1) -> size 0, slice(a, 0, 4) -> size 4, slice(a, 3, 4) -> size 1
+    # So index_from addresses an element while index_to may equal the size, and equal
+    # indices are a legal empty slice. An EMPTY array is always an error, even with na
+    # indices: slice(array.new<int>(0), na, na) halts with RE10045 too.
+    n = len(id)
+    if not 0 <= start < n:
+        raise ValueError(f"Start index {start} is out of range, array size is {n}")
+    if not 0 <= stop <= n:
+        raise ValueError(f"End index {stop} is out of range, array size is {n}")
+    if start > stop:
+        raise ValueError(f"Start index {start} is greater than end index {stop}")
+
     return SequenceView(id)[start:stop]  # type: ignore
 
 
@@ -1090,7 +1116,8 @@ def _na_sorts_first(sample: Any) -> bool:
 
 
 # noinspection PyShadowingBuiltins
-def sort(id: list[int | float | str], order: _order.Order = _order.ascending) -> None:
+def sort(id: list[int | float | str] | SequenceView[int | float | str],
+         order: _order.Order = _order.ascending) -> None:
     """
     Sorts the elements in the array in ascending or descending order.
 
@@ -1210,7 +1237,7 @@ def sum(id: list[float | int]) -> float | int:
 
 
 # noinspection PyShadowingBuiltins
-def unshift(id: list[T], value: T) -> None:
+def unshift(id: list[T] | SequenceView[T], value: T) -> None:
     """
     Prepends the specified value to the beginning of the array.
 
