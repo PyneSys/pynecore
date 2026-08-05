@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..lib import color as _color, extend as _extend, xloc as _xloc
-from .base import StrLiteral
-from .na import NA
+from .base import Drawing, StrLiteral
 from .pine_types import PyneFloat, PyneInt
 
 
@@ -12,7 +11,7 @@ class LineEnum(StrLiteral):
 
 
 @dataclass(slots=True, eq=False)
-class Line:
+class Line(Drawing):
     # Required parameters - coordinates (``na`` when set from a chart.point that lacks the
     # corresponding coordinate for the active xloc)
     x1: PyneInt  # Bar index or UNIX time

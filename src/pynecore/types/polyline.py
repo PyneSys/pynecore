@@ -3,13 +3,14 @@ from typing import TYPE_CHECKING, Optional
 
 from ..lib import color as _color, xloc as _xloc
 from ..types.line import LineEnum
+from .base import Drawing
 
 if TYPE_CHECKING:
     from .chart import ChartPoint
 
 
 @dataclass(slots=True, eq=False)
-class Polyline:
+class Polyline(Drawing):
     # Array of chart.point objects for the drawing to sequentially connect
     points: list["ChartPoint"]
     

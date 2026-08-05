@@ -32,6 +32,14 @@ LAYOUT_PARENT = {
     'names': ('count', 'src', 'acc·0', 'acc·1', 'flag'),
 }
 
+# Two plain var slots: a drawing held directly and one held in a container
+LAYOUT_DRAWINGS = {
+    'init': (None, None),
+    'series': (),
+    'varip': (),
+    'children': (),
+}
+
 
 def _make_stateful(layout=LAYOUT_LEAF):
     """Create a state-carrying callee the way the transformer would emit it."""
@@ -225,6 +233,38 @@ def __test_root_var_snapshot__():
         assert root[1] is series     # series objects are not touched
     finally:
         discard_root('test·snap')
+
+
+def __test_root_var_snapshot_keeps_drawing_handles__():
+    """ A var-held drawing rolls back as the same registered object, not as a clone """
+    from pynecore.core import viz
+    from pynecore.lib import array, label
+
+    viz.reset_state()
+    root = create_root('test·snap·draw', LAYOUT_DRAWINGS)
+    try:
+        drawing = label.new(1, 10.0, "A")
+        root[0] = drawing
+        root[1] = array.new_label()
+        array.push(root[1], drawing)
+
+        snapshot = RootVarSnapshot(['test·snap·draw'])
+        snapshot.save()
+        root[0] = label.new(2, 20.0, "B")
+        array.clear(root[1])
+        snapshot.restore()
+
+        # A field-wise clone carries the SAME vid, sits in no registry and never
+        # reaches the chart, so the script would go on mutating an invisible object
+        # while the registered original went unreferenced.
+        assert root[0] is drawing
+        assert drawing in label._registry
+        # The container itself rolls back, but its elements stay handles.
+        assert len(root[1]) == 1
+        assert root[1][0] is drawing
+    finally:
+        discard_root('test·snap·draw')
+        viz.reset_state()
 
 
 def __test_root_var_snapshot_keys__():

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import TypeVar, Generic, Any, cast
-import copy
 from collections import Counter
 from .na import NA, na_float
 
@@ -119,10 +118,14 @@ class Matrix(Generic[T]):
         """
         Create a new matrix which is a copy of the original.
 
-        :return: A new matrix object containing a deep copy of this matrix.
+        :return: A new matrix object whose storage is independent while its elements
+                 stay the very same objects.
         """
+        # Pine's matrix.copy() is shallow, like array.copy(): only the row storage is
+        # new, so reference-type elements (drawings, chart points, UDT instances) stay
+        # shared and a mutation through the copy is visible on the original.
         new_matrix = Matrix(self.rows, self.cols)
-        new_matrix.data = copy.deepcopy(self.data)
+        new_matrix.data = [row.copy() for row in self.data]
         return new_matrix
 
     def det(self) -> float | int:

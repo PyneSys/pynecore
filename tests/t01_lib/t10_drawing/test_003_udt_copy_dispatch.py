@@ -9,7 +9,8 @@ import pytest
 
 from pynecore.core import viz
 from pynecore.core.pine_udt import udt_copy
-from pynecore.lib import box, chart, color, label, line, linefill, matrix, polyline, position, table
+from pynecore.lib import (array, box, chart, color, label, line, linefill, matrix, polyline,
+                          position, table)
 from pynecore.lib import map as map_lib
 from pynecore.types.label import Label
 from pynecore.types.na import NA
@@ -80,6 +81,60 @@ def __test_udt_copy_dispatches_on_the_runtime_type__():
             udt_copy(NA(Label), text="C")
     finally:
         viz.reset_state()
+
+
+def __test_container_copy_shares_its_drawing_handles__():
+    """Copying a container copies the container, never the drawings it holds.
+
+    Measured on TradingView: after ``mx2 = mx.copy()``, setting the text through
+    ``mx2.get(0, 0)`` changes the ORIGINAL label, and ``array.copy()`` behaves the
+    same. Cloning the elements would hand back drawings with duplicate vids that no
+    registry knows and the chart never shows.
+    """
+    viz.reset_state()
+    try:
+        src = label.new(1, 10.0, "A")
+
+        mx = matrix.new(1, 1, src)
+        mx_copy = matrix.copy(mx)
+        assert matrix.get(mx_copy, 0, 0) is src
+        label.set_text(matrix.get(mx_copy, 0, 0), "B")
+        assert src.text == "B"
+
+        arr = array.new_label()
+        array.push(arr, src)
+        assert array.get(array.copy(arr), 0) is src
+    finally:
+        viz.reset_state()
+
+
+def __test_matrix_copy_shares_every_reference_element__():
+    """``matrix.copy()`` is shallow for chart points and UDT instances too.
+
+    Pine's matrix.copy() gives back new row storage holding the very same elements, so
+    a mutation through the copy is visible on the original — the same contract
+    ``array.copy()`` already honours. Only the storage must be independent: writing a
+    whole cell of the copy must leave the original cell alone.
+    """
+    point = chart.point.new(0, 1, 1.0)
+    udt = _Point(1, 2)
+
+    mx = matrix.new(1, 2, point)
+    matrix.set(mx, 0, 1, udt)
+    mx_copy = matrix.copy(mx)
+
+    assert matrix.get(mx_copy, 0, 0) is point
+    assert matrix.get(mx_copy, 0, 1) is udt
+
+    matrix.get(mx_copy, 0, 0).price = 9.0
+    matrix.get(mx_copy, 0, 1).x = 9
+    assert point.price == 9.0
+    assert udt.x == 9
+
+    # The storage itself is independent: replacing a cell of the copy is not seen
+    # by the original.
+    matrix.set(mx_copy, 0, 0, None)
+    assert matrix.get(mx, 0, 0) is point
 
 
 def __test_udt_copy_refuses_the_drawings_pine_cannot_copy__():

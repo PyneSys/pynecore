@@ -84,6 +84,7 @@ from functools import partial
 
 from .pine_export import Exported
 from .series import SeriesImpl
+from ..types.base import Drawing
 from ..types.na import na_float as _NAN
 
 __all__ = [
@@ -359,15 +360,24 @@ def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
 
 
 def _copy_value(value: Any) -> Any:
-    """Copy a value for snapshot/restore: immutables as-is, dicts/lists by
-    deepcopy, dataclasses by ``replace``, everything else by shallow copy.
+    """Copy a value for snapshot/restore: immutables and drawings as-is,
+    dicts/lists by deepcopy, dataclasses by ``replace``, everything else by
+    shallow copy.
 
     :param value: Value to copy.
     :return: Copied (or immutable, as-is) value.
     """
     if isinstance(value, (int, float, bool, str, type(None))):
         return value
+    if isinstance(value, Drawing):
+        # A drawing is a handle on a registered chart object, so the value to roll
+        # back is the handle. Cloning it field by field detached the variable from
+        # the registry: the script kept mutating an object with a duplicate vid that
+        # never reached the chart, while the registered original went unreferenced.
+        return value
     if isinstance(value, (dict, list)):
+        # A container holding drawings is deep-copied too, but ``Drawing`` stops the
+        # recursion at its own handles, matching TradingView's container copies.
         return deepcopy(value)
     try:
         return dataclass_replace(value)  # type: ignore[type-var]

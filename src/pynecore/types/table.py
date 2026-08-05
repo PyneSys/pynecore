@@ -2,6 +2,7 @@ from typing import Optional, Dict, Tuple
 from dataclasses import dataclass, field
 
 from ..lib import (color as _color, position as _position, size as _size, text as _text, font as _font)
+from .base import Drawing
 
 
 @dataclass(slots=True)
@@ -28,7 +29,7 @@ class TableCell:
 
 
 @dataclass(slots=True, eq=False)
-class Table:
+class Table(Drawing):
     # Required parameters
     position: _position.Position  # Position of the table
     columns: int  # Number of columns
