@@ -42,7 +42,7 @@ def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color:
 
 
 # noinspection PyShadowingNames
-def rgb(r: int | float, g: int | float, b: int | float, transp: float = 0) -> Color: ...
+def rgb(red: int | float, green: int | float, blue: int | float, transp: float = 0) -> Color: ...
 
 
 def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA[float],

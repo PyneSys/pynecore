@@ -52,7 +52,7 @@ Returns true if the source string contains the substring, false otherwise.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | source | str | The string to search in |
-| str_ | str | The substring to search for |
+| str | str | The substring to search for |
 
 **Returns:** `bool`
 
@@ -68,7 +68,7 @@ Returns true if the source string ends with the specified substring, false other
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | source | str | The string to check |
-| str_ | str | The suffix to search for |
+| str | str | The suffix to search for |
 
 **Returns:** `bool`
 
@@ -100,8 +100,8 @@ Converts a timestamp into a string formatted according to the specified format s
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | time | int | Unix timestamp in milliseconds |
-| fmt | str \| None | Format string (e.g., "yyyy-MM-dd HH:mm:ss"), default None |
-| tz | str \| None | Timezone identifier (e.g., "America/New_York"), default None |
+| format | str \| None | Format string (e.g., "yyyy-MM-dd HH:mm:ss"), default None |
+| timezone | str \| None | Timezone identifier (e.g., "America/New_York"), default None |
 
 **Returns:** `str`
 
@@ -163,7 +163,7 @@ Returns the position of the first occurrence of the substring, or `na` if not fo
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | source | str | The string to search in |
-| str_ | str | The substring to find |
+| str | str | The substring to find |
 
 **Returns:** `int` (or `na` if not found)
 
@@ -247,7 +247,7 @@ Returns true if the source string starts with the specified substring, false oth
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | source | str | The string to check |
-| str_ | str | The prefix to search for |
+| str | str | The prefix to search for |
 
 **Returns:** `bool`
 

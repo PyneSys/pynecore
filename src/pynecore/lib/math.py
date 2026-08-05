@@ -37,40 +37,40 @@ def abs(number: TFI | NA[TFI]) -> PyneFloat:
     return builtins.abs(number)
 
 
-def acos(value: TFI | NA[TFI]) -> PyneFloat:
+def acos(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     Returns the arc cosine of a value.
 
-    :param value: A value.
+    :param angle: A value.
     :return: The arc cosine of the value.
     """
-    if isinstance(value, NA) or value != value:
+    if isinstance(angle, NA) or angle != angle:
         return na_float
-    return math.acos(value)
+    return math.acos(angle)
 
 
-def asin(value: TFI | NA[TFI]) -> PyneFloat:
+def asin(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     Returns the arc sine of a value.
 
-    :param value: A value.
+    :param angle: A value.
     :return: The arc sine of the value.
     """
-    if isinstance(value, NA) or value != value:
+    if isinstance(angle, NA) or angle != angle:
         return na_float
-    return math.asin(value)
+    return math.asin(angle)
 
 
-def atan(value: TFI | NA[TFI]) -> PyneFloat:
+def atan(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     Returns the arc tangent of a value.
 
-    :param value: A value.
+    :param angle: A value.
     :return: The arc tangent of the value.
     """
-    if isinstance(value, NA) or value != value:
+    if isinstance(angle, NA) or angle != angle:
         return na_float
-    return math.atan(value)
+    return math.atan(angle)
 
 
 def avg(*numbers: TFI | NA[TFI]) -> PyneFloat:
@@ -387,25 +387,25 @@ def tan(angle: TFI | NA[TFI]) -> PyneFloat:
     return math.tan(angle)
 
 
-def todegrees(angle: TFI | NA[TFI]) -> PyneFloat:
+def todegrees(radians: TFI | NA[TFI]) -> PyneFloat:
     """
     Converts an angle from radians to degrees.
 
-    :param angle: An angle in radians.
+    :param radians: An angle in radians.
     :return: The angle in degrees.
     """
-    if isinstance(angle, NA) or angle != angle:
+    if isinstance(radians, NA) or radians != radians:
         return na_float
-    return math.degrees(angle)
+    return math.degrees(radians)
 
 
-def toradians(angle: TFI | NA[TFI]) -> PyneFloat:
+def toradians(degrees: TFI | NA[TFI]) -> PyneFloat:
     """
     Converts an angle from degrees to radians.
 
-    :param angle: An angle in degrees.
+    :param degrees: An angle in degrees.
     :return: The angle in radians.
     """
-    if isinstance(angle, NA) or angle != angle:
+    if isinstance(degrees, NA) or degrees != degrees:
         return na_float
-    return math.radians(angle)
+    return math.radians(degrees)

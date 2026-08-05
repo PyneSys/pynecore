@@ -347,33 +347,35 @@ def _datatime_fmt_tv2py(fmt: str) -> str:
 # Exported functions
 #
 
-def contains(source: str | NA[str], str_: str | NA[str]) -> PyneBool:
+# noinspection PyShadowingBuiltins
+def contains(source: str | NA[str], str: str | NA[str]) -> PyneBool:
     """
     Returns true if the source string contains the str substring, false otherwise.
 
     :param source: Source string
-    :param str_: Substring to search for
+    :param str: Substring to search for
     :return: True if the source string contains the str substring, na if either
         argument is na.
     """
     # na-propagation (Pine): a na source/substring yields na, never a search.
-    # Without this guard ``str_ in na`` would loop forever, since NA.__getitem__
+    # Without this guard ``str in na`` would loop forever, since NA.__getitem__
     # returns self for every index and the ``in`` operator falls back to the
     # sequence protocol.
-    if isinstance(source, NA) or source is None or isinstance(str_, NA) or str_ is None:
+    if isinstance(source, NA) or source is None or isinstance(str, NA) or str is None:
         return NA(bool)
-    return str_ in source
+    return str in source
 
 
-def endswith(source: str, str_: str) -> bool:
+# noinspection PyShadowingBuiltins
+def endswith(source: str, str: str) -> bool:
     """
     Returns true if the source string ends with the substring specified in str, false otherwise.
 
     :param source: Source string
-    :param str_: Substring to search for
+    :param str: Substring to search for
     :return: True if the source string ends with the substring specified in str, false otherwise.
     """
-    return source.endswith(str_)
+    return source.endswith(str)
 
 
 # noinspection PyPep8Naming,PyShadowingBuiltins
@@ -469,15 +471,15 @@ def format(formatString: str, *args: Any) -> str:
     return re.sub(r'\{([^}]+)}', replace_field, formatString)
 
 
-# noinspection PyProtectedMember
-def format_time(time: int | NA[int], fmt: str | None = None,
-                tz: str | None = None) -> str:
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
+def format_time(time: int | NA[int], format: str | None = None,
+                timezone: str | None = None) -> str:
     """
     Format timestamp according to format string and timezone
 
     :param time: UNIX timestamp in milliseconds
-    :param fmt: Format string (Pine format)
-    :param tz: Timezone string (UTC±HHMM, GMT±HHMM or IANA name)
+    :param format: Format string (Pine format)
+    :param timezone: Timezone string (UTC±HHMM, GMT±HHMM or IANA name)
     :return: Formatted time string, or na when ``time`` is na
     """
     # na timestamp formats to na (Pine na-propagation)
@@ -485,13 +487,13 @@ def format_time(time: int | NA[int], fmt: str | None = None,
         return NA(str)
 
     # Default format
-    fmt: str = fmt if fmt else "yyyy-MM-ddTHH:mm:ssZ"
+    fmt = format if format else "yyyy-MM-ddTHH:mm:ssZ"
 
     # Convert timestamp to datetime
     dt = datetime.fromtimestamp(time / 1000, UTC)
 
     # Convert timezone using _parse_timezone
-    dt = dt.astimezone(_parse_timezone(tz or _syminfo.timezone))
+    dt = dt.astimezone(_parse_timezone(timezone or _syminfo.timezone))
 
     # Convert format and apply
     py_fmt = _datatime_fmt_tv2py(fmt)
@@ -553,15 +555,16 @@ def match(source: str, regex: str) -> str:
     return m.group()
 
 
-def pos(source: str, str_: str) -> PyneInt:
+# noinspection PyShadowingBuiltins
+def pos(source: str, str: str) -> PyneInt:
     """
     Returns the position of the first occurrence of the str string in the source string, 'na' otherwise.
 
     :param source: Source string
-    :param str_: Subtring to search for
+    :param str: Subtring to search for
     :return: Position of the first occurrence of the str string in the source string, 'na' otherwise.
     """
-    res = source.find(str_)
+    res = source.find(str)
     if res == -1:
         return NA(int)
     return res
@@ -653,15 +656,16 @@ def split(string: str, separator: str) -> list[str]:
     return string.split(separator)
 
 
-def startswith(source: str, str_: str) -> bool:
+# noinspection PyShadowingBuiltins
+def startswith(source: str, str: str) -> bool:
     """
     Returns true if the source string starts with the str substring, false otherwise.
 
     :param source: The source string
-    :param str_: The substring to search for
+    :param str: The substring to search for
     :return: True if the source string starts with the str substring, false otherwise
     """
-    return source.startswith(str_)
+    return source.startswith(str)
 
 
 def substring(source: str, begin_pos: int, end_pos: int | None = None) -> str:

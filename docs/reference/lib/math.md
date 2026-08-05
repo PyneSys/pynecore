@@ -306,7 +306,7 @@ Returns the arcsine (inverse sine) of a value in radians. The input must be in t
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `value` | `float` or `int` | A value in [-1, 1] |
+| `angle` | `float` or `int` | A value in [-1, 1] |
 
 **Returns:** `float` or `NA[float]` — angle in radians, range [-π/2, π/2]
 
@@ -320,7 +320,7 @@ Returns the arccosine (inverse cosine) of a value in radians. The input must be 
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `value` | `float` or `int` | A value in [-1, 1] |
+| `angle` | `float` or `int` | A value in [-1, 1] |
 
 **Returns:** `float` or `NA[float]` — angle in radians, range [0, π]
 
@@ -334,7 +334,7 @@ Returns the arctangent (inverse tangent) of a value in radians.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `value` | `float` or `int` | Any real number |
+| `angle` | `float` or `int` | Any real number |
 
 **Returns:** `float` or `NA[float]` — angle in radians, range [-π/2, π/2]
 

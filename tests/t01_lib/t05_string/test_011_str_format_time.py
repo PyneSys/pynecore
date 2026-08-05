@@ -35,3 +35,12 @@ def __test_str_format_time_na__():
     from pynecore.types.na import NA
     assert isinstance(_string.format_time(NA(int), "yyyy-MM-dd HH:mm"), NA)
     assert isinstance(_string.format_time(None), NA)
+
+
+def __test_str_format_time_pine_argument_names__():
+    """ str.format_time names its arguments ``format`` and ``timezone``, the way Pine does,
+    so a compiled named argument binds instead of raising TypeError """
+    from pynecore.lib import string as _string
+    assert _string.format_time(time=1640995200000, format="yyyy-MM-dd",
+                               timezone="UTC") == "2022-01-01"
+    assert _string.format_time(1640995200000, format="HH:mm", timezone="UTC+2") == "02:00"

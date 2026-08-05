@@ -557,8 +557,8 @@ def strat_equity_comparator() -> StratEquityComparatorProtocol:
 
         # Compare timestamps instead of string representations
         # This handles different timezone formats properly
-        trade_entry_str = string.format_time(trade.entry_time, "yyyy-MM-ddTHH:mm:ssZ", tz="UTC")
-        trade_exit_str = string.format_time(trade.exit_time, "yyyy-MM-ddTHH:mm:ssZ", tz="UTC")
+        trade_entry_str = string.format_time(trade.entry_time, "yyyy-MM-ddTHH:mm:ssZ", timezone="UTC")
+        trade_exit_str = string.format_time(trade.exit_time, "yyyy-MM-ddTHH:mm:ssZ", timezone="UTC")
 
         # Parse both timestamps and compare them
         trade_entry_dt = datetime.fromisoformat(trade_entry_str.replace('+0000', '+00:00'))

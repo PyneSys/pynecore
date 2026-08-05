@@ -84,16 +84,16 @@ def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color 
 
 
 # noinspection PyShadowingNames
-def rgb(r: int, g: int, b: int, transp: float = 0) -> Color:
+def rgb(red: int, green: int, blue: int, transp: float = 0) -> Color:
     """
     Return a new color with the given RGB values and transparency
 
-    :param r: Red value
-    :param g: Green value
-    :param b: Blue value
+    :param red: Red value
+    :param green: Green value
+    :param blue: Blue value
     :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
     """
-    return Color.rgb(r, g, b, transp)
+    return Color.rgb(red, green, blue, transp)
 
 
 def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA[float],

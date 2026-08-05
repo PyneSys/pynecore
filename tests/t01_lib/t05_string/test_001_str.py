@@ -99,3 +99,13 @@ def __test_str_replace_occurrence__():
     assert _string.replace("abc", "", "-", 3) == "abc-"
     assert _string.replace("abc", "", "-", 4) == "abc-"
     assert _string.replace("", "", "-", 1) == "-"
+
+
+# noinspection PyShadowingBuiltins
+def __test_str_substring_argument_is_named_str__():
+    """ str.contains/endswith/startswith/pos name their second argument ``str``, the way
+    Pine does, so a compiled named argument binds instead of raising TypeError """
+    from pynecore.lib import string as _string
+    assert _string.contains(source="Hello World!", str="World") is True
+    assert _string.endswith(source="Hello World!", str="!") is True
+    assert _string.startswith(source="Hello World!", str="Hello") is True

@@ -125,9 +125,9 @@ Creates a new color from RGB component values with optional transparency.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| r | int | Red value (0-255) |
-| g | int | Green value (0-255) |
-| b | int | Blue value (0-255) |
+| red | int | Red value (0-255) |
+| green | int | Green value (0-255) |
+| blue | int | Blue value (0-255) |
 | transp | float | Transparency percentage (0-100, default 0) |
 
 **Returns:** `Color` — Color with the specified RGB values and transparency
