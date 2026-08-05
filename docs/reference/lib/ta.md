@@ -160,7 +160,7 @@ Arnaud Legoux Moving Average. Uses Gaussian distribution as weights, providing a
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series to average |
+| `series` | float | Series to average |
 | `length` | int | Number of bars (must be > 0) |
 | `offset` | float | Offset parameter (0-1), default 0.85 |
 | `sigma` | float | Gaussian sigma, default 6.0 |
@@ -258,7 +258,7 @@ Chande Momentum Oscillator. Normalized momentum oscillator (-100 to +100).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series to analyze |
+| `series` | float | Series to analyze |
 | `length` | int | Period length (must be > 0) |
 
 **Returns:** float — CMO value.
@@ -396,7 +396,7 @@ Bollinger Bands. Returns middle band, upper band, and lower band (distance is mu
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series to analyze |
+| `series` | float | Series to analyze |
 | `length` | int | Period length (must be > 0) |
 | `mult` | float | Standard deviation multiplier (must be > 0) |
 
@@ -412,7 +412,7 @@ Bollinger Bands Width. Ratio of band width to middle band, expressed as percenta
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series to analyze |
+| `series` | float | Series to analyze |
 | `length` | int | Period length (must be > 0) |
 | `mult` | float | Standard deviation multiplier (must be > 0) |
 
@@ -428,7 +428,7 @@ Keltner Channels. Returns middle band, upper band, and lower band using ATR for 
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series for middle band |
+| `series` | float | Series for middle band |
 | `length` | int | Period length (must be > 0) |
 | `mult` | float | ATR multiplier (must be > 0) |
 | `useTrueRange` | bool | Use true range or high-low |
@@ -445,7 +445,7 @@ Keltner Channels Width. Ratio of KC width to middle band, expressed as percentag
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series for middle band |
+| `series` | float | Series for middle band |
 | `length` | int | Period length (must be > 0) |
 | `mult` | float | ATR multiplier (must be > 0) |
 | `useTrueRange` | bool | Use true range or high-low |
@@ -843,7 +843,7 @@ Money Flow Index. Volume-weighted oscillator similar to RSI (0-100).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `source` | float | Series to analyze |
+| `series` | float | Series to analyze |
 | `length` | int | Period length (must be > 0) |
 
 **Returns:** float — MFI value (0-100).

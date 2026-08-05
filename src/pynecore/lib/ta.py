@@ -125,7 +125,7 @@ def accdist() -> PyneFloat:
     return ad
 
 
-def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float = 6.0, floor=False) \
+def alma(series: Series[float], length: int, offset: float = 0.85, sigma: float = 6.0, floor=False) \
         -> PyneFloat:
     """
     Calculate the Arnaud Legoux Moving Average (ALMA) of the source series with the given length.
@@ -137,7 +137,7 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
               It means "apple tree" in Georgian.
               ...
 
-    :param source: The source series
+    :param series: The source series
     :param length: The length of the ALMA
     :param offset: The offset of the ALMA
     :param sigma: The sigma value of the ALMA
@@ -145,7 +145,7 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     :return: The ALMA of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA) or source != source:
+    if isinstance(series, NA) or series != series:
         return na_float
     length = int(length)
 
@@ -164,7 +164,7 @@ def alma(source: Series[float], length: int, offset: float = 0.85, sigma: float 
     # Vectorized calculation using dot product
     summ = 0.0
     for i, w in enumerate(weights):
-        summ += w * source[i]
+        summ += w * series[i]
     return summ / norm
 
 
@@ -196,11 +196,11 @@ def barssince(condition: bool) -> PyneInt:
     return counter
 
 
-def bb(source: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
+def bb(series: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
     """
     Calculate the Bollinger Bands (BB) of the source series with the given length and multiplier.
 
-    :param source: The source series
+    :param series: The source series
     :param length: The length of the BB
     :param mult: The multiplier of the BB
     :return: The Bollinger Bands (BB) of the source series
@@ -208,9 +208,9 @@ def bb(source: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFl
     assert length > 0, "Invalid length, length must be greater than 0!"
     assert mult > 0, "Invalid multiplier, multiplier must be greater than 0!"
 
-    std_dev = stdev(source, length)
+    std_dev = stdev(series, length)
 
-    middle = sma(source, length)
+    middle = sma(series, length)
 
     if isinstance(middle, NA) or middle != middle:
         return na_float, na_float, na_float
@@ -218,16 +218,16 @@ def bb(source: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFl
     return middle, middle + std_dev, middle - std_dev
 
 
-def bbw(source: float, length: int, mult: float | int) -> PyneFloat:
+def bbw(series: float, length: int, mult: float | int) -> PyneFloat:
     """
     Calculate the Bollinger Bands Width (BBW) of the source series with the given length and multiplier.
 
-    :param source: The source series
+    :param series: The source series
     :param length: The length of the BBW
     :param mult: The multiplier of the BBW
     :return: The Bollinger Bands Width (BBW) of the source series
     """
-    b, h, l = bb(source, length, mult)
+    b, h, l = bb(series, length, mult)
     if (isinstance(b, NA) or b != b) or b == 0.0:
         return na_float
     return ((h - l) / b) * 100
@@ -281,7 +281,7 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     return source != prev_val
 
 
-def cmo(source: float, length: int) -> PyneFloat:
+def cmo(series: float, length: int) -> PyneFloat:
     """
     Calculate the Chande Momentum Oscillator (CMO) of the source series with the given length.
 
@@ -289,11 +289,11 @@ def cmo(source: float, length: int) -> PyneFloat:
     tolerance in magnitude lands in the up bucket, so a sub-tolerance zig-zag
     collapses both sums to zero and the result is na.
 
-    :param source: The source series
+    :param series: The source series
     :param length: The length of the CMO
     :return: The Chande Momentum Oscillator (CMO) of the source series
     """
-    momentum = change(source)
+    momentum = change(series)
     if isinstance(momentum, NA) or momentum != momentum:
         return na_float
     # Tolerant sign test, measured on TradingView (probe m548)
@@ -1027,7 +1027,7 @@ def median(source: Series[TFI], length: int) -> TFI:
     return -heap_low[0] if isinstance(source, int) else (-heap_low[0] + heap_high[0]) / 2  # type: ignore
 
 
-def mfi(source: float, length: int) -> PyneFloat:
+def mfi(series: float, length: int) -> PyneFloat:
     """
     Calculate the Money Flow Index (MFI) of the source series with the given length.
 
@@ -1035,7 +1035,7 @@ def mfi(source: float, length: int) -> PyneFloat:
     comparison tolerance in magnitude counts as neither inflow nor outflow. With
     both sums zero the result is 100, not na.
 
-    :param source: The source series
+    :param series: The source series
     :param length: The length of the MFI
     :return: The Money Flow Index (MFI) of the source series
     """
@@ -1043,14 +1043,14 @@ def mfi(source: float, length: int) -> PyneFloat:
     # case was measured separately (probe m550) on an exactly flat source, where the
     # tolerance plays no part.
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if isinstance(source, NA) or source != source:
+    if isinstance(series, NA) or series != series:
         return na_float
     length = int(length)
 
-    chg = change(source)
+    chg = change(series)
     chg_na = isinstance(chg, NA) or chg != chg
-    upper = lib_math.sum(volume * (0.0 if not chg_na and chg <= _EPSILON else source), length)
-    lower = lib_math.sum(volume * (0.0 if not chg_na and chg >= -_EPSILON else source), length)
+    upper = lib_math.sum(volume * (0.0 if not chg_na and chg <= _EPSILON else series), length)
+    lower = lib_math.sum(volume * (0.0 if not chg_na and chg >= -_EPSILON else series), length)
     if (isinstance(upper, NA) or upper != upper) or (isinstance(lower, NA) or lower != lower):
         return na_float
     # A side made of pure accumulation dust counts as an exact zero: the rolling
@@ -2012,13 +2012,13 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     return 100 * (source - lmin) / (hmax - lmin)  # type: ignore
 
 
-# noinspection PyUnusedLocal,PyShadowingNames
-def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt]:
+# noinspection PyUnusedLocal,PyShadowingNames,PyPep8Naming
+def supertrend(factor: float | int, atrPeriod: int) -> tuple[PyneFloat, PyneInt]:
     """
     Calculate Supertrend indicator.
 
     :param factor: ATR multiplier
-    :param atr_period: ATR period length
+    :param atrPeriod: ATR period length
     :return: Tuple of (supertrend value, direction). Direction: 1=down, -1=up
     """
     # The band comparisons below stay exact, bounded the same way as ``sar``: over 49k
@@ -2026,7 +2026,7 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
     # close-to-band margin 2.0e-5, with nothing in the (0, 1e-10) band (probe m555). A
     # sub-tolerance perturbation of a band could not flip a direction decision either,
     # since those margins stay four decades above it.
-    assert atr_period > 0, "Invalid ATR period, must be greater than 0!"
+    assert atrPeriod > 0, "Invalid ATR period, must be greater than 0!"
 
     # Store persistent state
     prev_lower: Persistent[float] = na_float
@@ -2037,7 +2037,7 @@ def supertrend(factor: float | int, atr_period: int) -> tuple[PyneFloat, PyneInt
 
     # Calculate base values
     src = hl2
-    atr_val = atr(atr_period)
+    atr_val = atr(atrPeriod)
 
     # This is a strange bug in Pine Script, but we need to replicate it
     if bar_index == 0:
