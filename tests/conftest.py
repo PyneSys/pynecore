@@ -339,8 +339,9 @@ def dummy_ohlcv_iter():
 
 @pytest.fixture(scope="function")
 def runner(script_path, module_key, syminfo) -> RunnerProtocol:
-    # Remove module from sys.modules to be able to re-import it
-    del sys.modules[module_key]
+    # Remove module from sys.modules to be able to re-import it. A second runner test in
+    # the same file finds it already gone, so its absence is not an error.
+    sys.modules.pop(module_key, None)
 
     def _runner(ohlcv_iter: Iterable[OHLCV], syminfo_override: dict[str, Any] | None = None, *,
                 syminfo_path: Path | None = None,
