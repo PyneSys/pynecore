@@ -1148,6 +1148,9 @@
     "set_color": {
       "type": "variable"
     },
+    "set_point": {
+      "type": "variable"
+    },
     "set_size": {
       "type": "variable"
     },
@@ -1155,6 +1158,12 @@
       "type": "variable"
     },
     "set_text": {
+      "type": "variable"
+    },
+    "set_text_font_family": {
+      "type": "variable"
+    },
+    "set_text_formatting": {
       "type": "variable"
     },
     "set_textalign": {
@@ -1167,6 +1176,9 @@
       "type": "variable"
     },
     "set_x": {
+      "type": "variable"
+    },
+    "set_xloc": {
       "type": "variable"
     },
     "set_xy": {
