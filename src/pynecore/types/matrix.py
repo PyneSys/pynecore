@@ -72,7 +72,7 @@ class Matrix(Generic[T]):
         count = 0
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val):
+                if val == val:
                     total += val
                     count += 1
         return total / count if count > 0 else na_float
@@ -234,7 +234,7 @@ class Matrix(Generic[T]):
         max_val: float | int | None = None
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val):
+                if val == val:
                     if max_val is None or val > max_val:
                         max_val = val
         return max_val if max_val is not None else na_float
@@ -248,7 +248,7 @@ class Matrix(Generic[T]):
         min_val: float | int | None = None
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val):
+                if val == val:
                     if min_val is None or val < min_val:
                         min_val = val
         return min_val if min_val is not None else na_float
@@ -262,7 +262,7 @@ class Matrix(Generic[T]):
         values = []
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val):
+                if val == val:
                     values.append(val)
 
         if not values:
@@ -287,7 +287,7 @@ class Matrix(Generic[T]):
         values = []
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val):
+                if val == val:
                     values.append(val)
 
         if not values:
@@ -630,7 +630,7 @@ class Matrix(Generic[T]):
         """
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val) and val != 0 and val != 1:
+                if val == val and val != 0 and val != 1:
                     return False
         return True
 
@@ -688,7 +688,7 @@ class Matrix(Generic[T]):
         :return: True if matrix is stochastic, False otherwise.
         """
         for row in self.data:
-            row_sum = sum(val for val in row if not (isinstance(val, NA) or val != val))
+            row_sum = sum(val for val in row if val == val)
             if abs(row_sum - 1.0) > 1e-10:
                 return False
         return True
@@ -751,7 +751,7 @@ class Matrix(Generic[T]):
         """
         for row in self.data:
             for val in row:
-                if not (isinstance(val, NA) or val != val) and val != 0:
+                if val == val and val != 0:
                     return False
         return True
 

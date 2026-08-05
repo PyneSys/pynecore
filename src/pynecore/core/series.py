@@ -11,8 +11,7 @@ __all__ = ['SeriesImpl', 'inline_series']
 T = TypeVar('T')
 
 # Interned na sentinel of untyped series (element type unknown at transform
-# time). Hybrid guards (``isinstance(x, NA) or x != x``) treat it and the
-# native nan as the same na.
+# time). The ``not (x == x)`` guards treat it and the native nan as the same na.
 # The cast is needed because the NA stub's __new__ deliberately types as T (so
 # ``NA(X)`` flows anywhere an ``X`` is expected), which here would be a TypeVar.
 _NA_UNTYPED: NA = cast(NA, NA(T))

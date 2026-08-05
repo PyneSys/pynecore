@@ -20,7 +20,7 @@ def safe_div(a: PyneFloat, b: PyneFloat):
     @param b: The denominator.
     @return: a/b, raw inf/-inf/nan on zero denominator, or nan for na inputs.
     """
-    if isinstance(a, NA) or a != a or isinstance(b, NA) or b != b:
+    if not (a == a) or not (b == b):  # is_na_arg
         return _NAN
     try:
         return a / b

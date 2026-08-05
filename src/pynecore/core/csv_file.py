@@ -99,7 +99,7 @@ class CSVWriter:
             # Canonicalize na to Pine's "NaN". A native nan would format lowercase
             # ("nan") via fmt; an NA object formats as "NaN" already but we keep the
             # branch representation-agnostic so both map to the same token.
-            if isinstance(x, NA) or x != x:
+            if not (x == x):
                 return "NaN"
             return fmt.format(x)
 

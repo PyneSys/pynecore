@@ -84,7 +84,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     # Representation-agnostic na test: an na source is either an NA object or a
     # native nan (OHLCV gaps can already deliver a bare nan). Both must be
     # excluded from the na-compacted buffer, or ``src[k]`` would poison ``summ``.
-    source_na = isinstance(source, NA) or source != source
+    source_na = not (source == source)
 
     # One conversion up front so every later use is a plain int compare. Bare
     # ``int()``/``float()`` become na-guarded wrapper calls under the transform,
@@ -138,7 +138,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         # buffer simply was not advanced, so ``src[0]`` still is the newest
         # non-na value — the very window the stable-length na branch preserves.
         newest = src[0]
-        if isinstance(newest, NA) or newest != newest:  # No non-na history at all yet
+        if not (newest == newest):  # No non-na history at all yet
             summ = 0.0
             count = 0
             compensation = 0.0
@@ -148,7 +148,7 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         found = 1
         for i in builtins.range(1, length):
             v = src[i]
-            if isinstance(v, NA) or v != v:
+            if not (v == v):
                 # The buffer is na-compacted, so the first na marks the end
                 # of available history — every deeper index is na too.
                 break

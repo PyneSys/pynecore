@@ -92,7 +92,7 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
                            False for ``str.tostring()`` (chart number formatter)
     :return: Formatted string
     """
-    if isinstance(value, NA) or value is None or value != value:  # NA object or native nan
+    if value is None or not (value == value):  # None, NA object or native nan
         # DecimalFormat prints NaN bare; the chart formatter keeps percent's '%'
         return "NaN%" if fmt_type == _format.percent and not decimal_format else "NaN"
 

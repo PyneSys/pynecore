@@ -27,5 +27,5 @@ def fixnan(source: Any) -> Any:
     :return: The source value if it is not a nan-hole, otherwise the last such value
     """
     last_not_nan: Persistent[Any] = NA(None)
-    last_not_nan = last_not_nan if (isinstance(source, NA) or source != source) else source
+    last_not_nan = last_not_nan if not (source == source) else source  # is_na_arg
     return last_not_nan

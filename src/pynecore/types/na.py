@@ -23,7 +23,8 @@ def isna_num(x: Any) -> bool:
     TradingView, where ``na(inf)`` is ``true``.
 
     Cold paths only: never call this in a per-bar hot loop. Hot loops use the
-    inline idioms ``x != x`` (nan-only) or ``isinstance(x, NA) or x != x``.
+    inline idioms ``x != x`` (nan-only) or ``not (x == x)``, which catches both
+    representations because ``NA`` answers ``False`` to ``==`` as well as ``!=``.
 
     :param x: value to test
     :return: ``True`` if ``x`` is a numeric na, ``False`` otherwise
