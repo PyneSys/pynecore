@@ -5,7 +5,7 @@ title: "array"
 description: "Dynamic array operations"
 icon: "view_list"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -139,8 +139,8 @@ Returns the element at the specified index.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array |
-| index | int | Index of element |
-| **Returns** | any | Element at the index |
+| index | int | Index of element; a float is truncated to an integer |
+| **Returns** | any | Element at the index, or `na` when `index` is `na` |
 
 Example: `val: float = array.get(my_array, 0)  # first element`
 
@@ -178,8 +178,10 @@ Sets the element at the specified index.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array |
-| index | int | Index to set |
+| index | int | Index to set; a float is truncated to an integer |
 | value | any | New value |
+
+An `na` index is a no-op. A non-`na` index outside the array still raises an error.
 
 #### `push(id, value)`
 Appends an element to the end of the array.
@@ -223,8 +225,10 @@ Inserts an element at the specified index.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array |
-| index | int | Index to insert at |
+| index | int | Index to insert at; a float is truncated to an integer |
 | value | any | Element to insert |
+
+An `na` index appends the value to the end of the array.
 
 #### `remove(id, index)`
 Removes and returns the element at the specified index.
@@ -232,8 +236,10 @@ Removes and returns the element at the specified index.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array |
-| index | int | Index to remove |
-| **Returns** | any | Removed element |
+| index | int | Index to remove; a float is truncated to an integer |
+| **Returns** | any | Removed element, or `na` when `index` is `na` |
+
+An `na` index leaves the array unchanged.
 
 Example: `removed: float = array.remove(my_array, 2)  # element at index 2`
 
@@ -249,10 +255,12 @@ Fills a range of elements with a specified value.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| id | array | Input array |
+| id | array | Input array or slice view |
 | value | any | Value to fill with |
-| index_from | int | Start index (default 0) |
-| index_to | int | End index (optional) |
+| index_from | int | Start index, inclusive (default 0); `na` means 0 |
+| index_to | int | End index, exclusive (optional); `na` means the array size |
+
+Bounds are clamped to the existing array, so filling never changes its size.
 
 Example: `array.fill(my_array, 0.0, 5, 10)  # fill indices 5-9 with 0.0`
 
@@ -324,7 +332,10 @@ Creates a shallow copy of the array.
 | id | array | Input array |
 | **Returns** | array | Copy of the array |
 
-Example: `arr_copy: list[float] = array.copy(my_array)  # independent copy`
+The array storage is independent, but reference-type elements such as drawings and user-defined
+objects remain shared with the original array.
+
+Example: `arr_copy: list[float] = array.copy(my_array)  # independent array storage`
 
 #### `concat(id1, id2)`
 Merges the second array into the first and returns the first.
@@ -336,14 +347,15 @@ Merges the second array into the first and returns the first.
 | **Returns** | array | First array with merged elements |
 
 #### `slice(id, index_from, index_to)`
-Creates a shallow copy of a slice of the array.
+Creates a view of a slice of the array. Changes made through the view are visible in the original
+array and vice versa.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array |
-| index_from | int | Start index |
-| index_to | int | End index |
-| **Returns** | array | Sliced array |
+| index_from | int | Start index, inclusive; `na` means 0 |
+| index_to | int | End index, exclusive; `na` means the array size |
+| **Returns** | array view | View of the selected elements |
 
 #### `reverse(id)`
 Reverses the order of elements in the array.
@@ -359,6 +371,9 @@ Sorts the array in ascending or descending order.
 |-----------|------|-------------|
 | id | array | Input array |
 | order | order | Ascending or descending |
+
+In ascending order, `na` values sort after numeric values and before string values. Descending
+order reverses that result. `sort_indices()` follows the same ordering without changing the array.
 
 #### `sort_indices(id, order)`
 Returns indices that would sort the array without modifying the original.
@@ -402,23 +417,25 @@ Returns the average (mean) of all elements.
 
 Example: `average: float = array.avg(my_array)  # 5.0`
 
-#### `min(id)`
-Returns the smallest element.
+#### `min(id, nth)`
+Returns the smallest element or the element at the specified zero-based rank.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
-| **Returns** | number | Minimum value |
+| nth | int | Rank to return (default 0); `na` means 0 and a float is truncated |
+| **Returns** | number | Nth-smallest non-`na` value, or `na` when unavailable |
 
 Example: `smallest: float = array.min(my_array)  # 1.0`
 
-#### `max(id)`
-Returns the largest element.
+#### `max(id, nth)`
+Returns the largest element or the element at the specified zero-based rank.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
-| **Returns** | number | Maximum value |
+| nth | int | Rank to return (default 0); `na` means 0 and a float is truncated |
+| **Returns** | number | Nth-largest non-`na` value, or `na` when unavailable |
 
 Example: `largest: float = array.max(my_array)  # 10.0`
 
@@ -485,30 +502,32 @@ Returns an array of absolute values of each element.
 Example: `positives: list[float] = array.abs(my_array)  # all positive`
 
 #### `standardize(id)`
-Returns an array of standardized (z-score) values.
+Returns an array of standardized (z-score) values. `na` elements are excluded from the mean and
+population standard deviation and remain `na` in the result. Integer and float arrays use the same
+calculation. When all numeric elements are equal, each numeric result is `1.0`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
 | **Returns** | list[float] | Standardized array |
 
-#### `percentile_linear_interpolation(id, percentile)`
+#### `percentile_linear_interpolation(id, percentage)`
 Returns the value at the specified percentile using linear interpolation.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
-| percentile | float | Percentile (0-100) |
-| **Returns** | float | Value at percentile |
+| percentage | float | Percentage (0-100); `na` produces `na` |
+| **Returns** | float | Value at the percentile, or `na` for an empty array |
 
-#### `percentile_nearest_rank(id, percentile)`
+#### `percentile_nearest_rank(id, percentage)`
 Returns the value at the specified percentile using the nearest-rank method.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
-| percentile | float | Percentile (0-100) |
-| **Returns** | float | Value at percentile |
+| percentage | float | Percentage (0-100); `na` is treated as 0 |
+| **Returns** | float | Value at the percentile, or `na` for an empty array |
 
 #### `percentrank(id, index)`
 Returns the percentile rank of the element at the specified index.
@@ -516,8 +535,8 @@ Returns the percentile rank of the element at the specified index.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | array | Input array of numbers |
-| index | int | Element index |
-| **Returns** | float | Percentile rank |
+| index | int | Element index; `na` is treated as 0 and a float is truncated |
+| **Returns** | float | Percentile rank, or `na` for arrays shorter than two elements |
 
 ### Logic
 

@@ -5,7 +5,7 @@ title: "matrix"
 description: "Two-dimensional matrix operations"
 icon: "grid_on"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -58,16 +58,17 @@ m = matrix.new(3, 4, 0.0)  # 3×4 matrix filled with 0.0
 
 ### copy()
 
-Create an independent copy of an existing matrix.
+Create a copy of an existing matrix with independent row storage.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | matrix | Matrix to copy |
 
-**Returns:** New matrix object
+**Returns:** New matrix object. Reference-type elements such as drawings and user-defined objects
+remain shared with the original matrix.
 
 ```python
-m2 = matrix.copy(m1)  # m2 is independent from m1
+m2 = matrix.copy(m1)  # independent matrix storage, shared reference-type elements
 ```
 
 ## Dimensions and Properties
@@ -123,10 +124,10 @@ Retrieve an element at a specific row and column.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | matrix | Matrix object |
-| `row` | `int` | Row index (zero-based) |
-| `column` | `int` | Column index (zero-based) |
+| `row` | `int` | Row index (zero-based); a float is truncated to an integer |
+| `column` | `int` | Column index (zero-based); a float is truncated to an integer |
 
-**Returns:** Element value
+**Returns:** Element value, or element-typed `na` if either index is `na`.
 
 ```python
 val: float = matrix.get(m, 0, 1)  # 15.5
@@ -139,11 +140,13 @@ Set an element at a specific row and column.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | matrix | Matrix object |
-| `row` | `int` | Row index |
-| `column` | `int` | Column index |
+| `row` | `int` | Row index; a float is truncated to an integer |
+| `column` | `int` | Column index; a float is truncated to an integer |
 | `value` | element type | Value to assign |
 
 **Returns:** `None`
+
+If either index is `na`, the operation is a no-op.
 
 ```python
 matrix.set(m, 2, 3, 42.0)
@@ -177,9 +180,9 @@ Extract a row as a one-dimensional array.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | matrix | Matrix object |
-| `row` | `int` | Row index |
+| `row` | `int` | Row index; a float is truncated to an integer |
 
-**Returns:** `list` — Array of row values
+**Returns:** `list` — Array of row values, or an `na` array when `row` is `na`.
 
 ```python
 row_vals: list = matrix.row(m, 1)
@@ -192,9 +195,9 @@ Extract a column as a one-dimensional array.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | matrix | Matrix object |
-| `column` | `int` | Column index |
+| `column` | `int` | Column index; a float is truncated to an integer |
 
-**Returns:** `list` — Array of column values
+**Returns:** `list` — Array of column values, or an `na` array when `column` is `na`.
 
 ```python
 col_vals: list = matrix.col(m, 2)
@@ -787,6 +790,8 @@ m_kron = matrix.kron(m1, m2)
 
 - All matrix elements must be the same type
 - Matrix indices are zero-based
-- NA (not available) values are handled automatically—operations on NA return NA
+- Float-valued dimensions, indices, and powers are truncated to integers before use
+- NA (not available) values are handled automatically; operations on an NA matrix return NA or do
+  nothing, depending on whether the operation returns a value or mutates the matrix
 - Linear algebra functions (inv, eigenvalues, etc.) require square or compatible matrices
 - For very large matrices, performance depends on matrix size and operation complexity

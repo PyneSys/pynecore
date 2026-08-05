@@ -5,7 +5,7 @@ title: "box"
 description: "Chart boxes — create and modify rectangular drawings"
 icon: "check_box_outline_blank"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -109,7 +109,9 @@ b: box = box.new(
 
 ### box.copy()
 
-Creates a clone of an existing box object with all properties copied.
+Creates and registers a new box with the same properties as the source. The copy has its own
+identity, counts toward the box limit, and can be changed independently. Copying an `na` box
+returns `na`.
 
 | Parameter | Type |
 |-----------|------|

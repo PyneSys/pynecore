@@ -5,7 +5,7 @@ title: "line"
 description: "Chart lines — create and modify line drawings"
 icon: "timeline"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -80,7 +80,9 @@ Creates a new line object on the chart.
 
 ### line.copy()
 
-Clones an existing line object.
+Creates and registers a new line with the same properties as the source. The copy has its own
+identity, counts toward the line limit, and can be changed independently. Copying an `na` line
+returns `na`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|

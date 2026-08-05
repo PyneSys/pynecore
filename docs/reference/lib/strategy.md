@@ -5,7 +5,7 @@ title: "strategy"
 description: "Strategy order management — entry, exit, close, and order functions"
 icon: "trending_up"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -76,13 +76,13 @@ Create price-based exit orders (take-profit, stop-loss, or trailing stop). Modif
 | from_entry | str \| None | Entry id to exit (optional, exits from any entry if None) |
 | qty | float \| None | Exit quantity (optional) |
 | qty_percent | float \| None | Exit as % of position (optional) |
-| profit | float \| None | Take-profit in currency units (optional) |
+| profit | float \| None | Take-profit distance in ticks (optional) |
 | limit | float \| None | Limit price for take-profit (optional) |
-| loss | float \| None | Stop-loss in currency units (optional) |
+| loss | float \| None | Stop-loss distance in ticks (optional) |
 | stop | float \| None | Stop price for stop-loss (optional) |
-| trail_price | float \| None | Trailing stop price offset (optional) |
-| trail_points | float \| None | Trailing stop in points (optional) |
-| trail_offset | float \| None | Trailing offset (optional) |
+| trail_price | float \| None | Trailing-stop activation price (optional) |
+| trail_points | float \| None | Trailing-stop activation distance in ticks (optional) |
+| trail_offset | float \| None | Trailing-stop offset in ticks (optional) |
 | oca_name | str \| None | OCA group identifier (optional) |
 | comment | str \| None | Order comment (optional) |
 | comment_profit | str \| None | TP comment (optional) |
@@ -185,6 +185,9 @@ Returns: `None`
 ```python
 strategy.cancel_all()
 ```
+
+`disable_alert` is accepted for Pine compatibility. PyneCore currently records alert messages on
+orders but does not dispatch order-fill alerts, so the parameter has no additional runtime effect.
 
 ## Variables
 

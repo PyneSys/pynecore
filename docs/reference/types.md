@@ -5,7 +5,7 @@ title: "Type System"
 description: "PyneCore type system — primitives, annotations, collections, and special types"
 icon: "category"
 date: "2026-03-28"
-lastmod: "2026-04-05"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Types"]
@@ -81,7 +81,7 @@ def main():
     sma10: Series[float] = ta.sma(close, 10)
 
     # sma10 is na for the first 9 bars
-    if na(sma10):
+    if na(x=sma10):
         safe_value = 0.0
     else:
         safe_value = sma10
@@ -91,7 +91,8 @@ def main():
 ```
 
 Operations involving `na` propagate — `na + 1` results in `na`. In boolean contexts, `na`
-evaluates to `False`.
+evaluates to `False`. The predicate parameter is named `x`, so both `na(sma10)` and
+`na(x=sma10)` are valid.
 
 ## Type Annotations
 

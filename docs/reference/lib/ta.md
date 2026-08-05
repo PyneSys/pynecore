@@ -5,7 +5,7 @@ title: "ta"
 description: "Technical analysis indicators and functions"
 icon: "show_chart"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]

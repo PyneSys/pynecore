@@ -5,7 +5,7 @@ title: "str"
 description: "String manipulation functions"
 icon: "text_fields"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -20,7 +20,7 @@ The `str` namespace provides string manipulation functions for working with text
 ## Quick Example
 
 ```python
-from pynecore.lib import str as pstr, label, bar_index, high, close, script
+from pynecore.lib import string as pstr, label, bar_index, high, close, script
 
 @script.indicator(title="String Operations Demo", overlay=True)
 def main():
@@ -192,6 +192,9 @@ repeated: str = str.repeat("ab", 3, "-")  # "ab-ab-ab"
 ### replace()
 
 Returns a new string with the Nth occurrence of the target substring replaced by the replacement string.
+Occurrences are zero-based and found by an overlapping left-to-right scan. If the requested occurrence
+does not exist, the source is returned unchanged. An empty target inserts the replacement at the
+requested character position, clamped to the end of the string.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -231,13 +234,14 @@ Divides a string into an array of substrings using the specified separator.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | string | str | The string to split |
-| separator | str | The delimiter to split on |
+| separator | str | The delimiter to split on; an empty string splits into characters |
 
 **Returns:** `array<string>` (array ID)
 
 **Example:**
 ```python
 parts: list[str] = str.split("a,b,c", ",")  # ["a", "b", "c"]
+characters: list[str] = str.split("abc", "")  # ["a", "b", "c"]
 ```
 
 ### startswith()

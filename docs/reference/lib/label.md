@@ -5,7 +5,7 @@ title: "label"
 description: "Chart labels — create, modify, and style text labels"
 icon: "label"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -117,7 +117,9 @@ label.delete(id: label) → None
 
 ### label.copy()
 
-Clones a label object with all current properties.
+Creates and registers a new label with the same properties as the source. The copy has its own
+identity, counts toward the label limit, and can be changed independently. Copying an `na` label
+returns `na`.
 
 ```python
 lbl_copy: label = label.copy(id: label) → label

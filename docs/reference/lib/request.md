@@ -5,7 +5,7 @@ title: "request"
 description: "Data requests from other symbols and timeframes"
 icon: "cloud_download"
 date: "2026-03-28"
-lastmod: "2026-08-04"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]

@@ -5,7 +5,7 @@ title: "map"
 description: "Key-value map operations"
 icon: "map"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-05"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
