@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypeVar, Generic, Any, cast
+from typing import TypeVar, Generic, Any, Iterator, cast
 from collections import Counter
 from .na import NA, na_float
 
@@ -17,6 +17,18 @@ class Matrix(Generic[T]):
         self.rows = rows
         self.cols = cols
         self.data = [[initial_value for _ in range(cols)] for _ in range(rows)]
+
+    def __iter__(self) -> Iterator[list[Any]]:
+        """
+        Iterate over the rows of the matrix.
+
+        :return: An iterator over the row lists themselves, not over copies of them.
+        """
+        # Pine's ``for row in m`` hands back the row arrays of the matrix, so a
+        # write through the loop variable is visible in the matrix -- unlike
+        # ``matrix.row()``, which copies. The indexed ``for [i, row] in m`` form
+        # is an ``enumerate()`` over the same iterator.
+        return iter(self.data)
 
     @property
     def rows(self) -> int:
