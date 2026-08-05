@@ -757,23 +757,27 @@ def alertcondition(*_, **__):
 
 ### Other ###
 
-def is_na(source: Any = None) -> bool | NA:
+def is_na(x: Any = None) -> bool | NA:
     """
-    Check if the source is NA.
+    Check if the value is NA.
 
     inf/-inf/nan floats all count as na here, even though they participate in
     arithmetic and comparisons as normal IEEE-754 values.
+
+    :param x: The value to test, or a type to build an NA sentinel of
     """
-    if source is None:
+    # The parameter is named ``x`` because Pine accepts ``na(x = close)`` as a
+    # named argument, and the compiler emits Pine's own keyword verbatim.
+    if x is None:
         return _na_none
-    # If the source is a type or GenericAlias (like list[float]), return NA of that type
-    if isinstance(source, (type, GenericAlias)) and source is not NA:
+    # If the value is a type or GenericAlias (like list[float]), return NA of that type
+    if isinstance(x, (type, GenericAlias)) and x is not NA:
         # na.pyi deliberately types NA(x) as x itself (so na sentinels flow as
         # values in user scripts), which contradicts the honest annotation here
-        return NA(source)  # pyright: ignore[reportReturnType]
-    if isinstance(source, float):
-        return not _math.isfinite(source)
-    return isinstance(source, NA) or source is NA
+        return NA(x)  # pyright: ignore[reportReturnType]
+    if isinstance(x, float):
+        return not _math.isfinite(x)
+    return isinstance(x, NA) or x is NA
 
 
 # In Pine Script, na is both a property and a function; any narrower type than

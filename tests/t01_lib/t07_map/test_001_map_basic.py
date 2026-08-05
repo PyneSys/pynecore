@@ -90,3 +90,18 @@ def __test_map_basic__(runner, dummy_ohlcv_iter, file_reader, log_comparator):
     run_iter = runner(dummy_ohlcv_iter).run_iter()
     with log_comparator(tv_log_out):
         next(run_iter)
+
+
+def __test_map_put_all_id2__():
+    """ map.put_all names its second parameter the way Pine names it, so a compiled
+    named argument binds """
+    from pynecore.lib import map as _map
+    target = {"one": 1}
+    source = {"two": 2}
+    _map.put_all(id=target, id2=source)
+    assert target == {"one": 1, "two": 2}
+    # The source map is left untouched
+    assert source == {"two": 2}
+    # Existing keys are overwritten
+    _map.put_all(target, {"one": 100})
+    assert target["one"] == 100

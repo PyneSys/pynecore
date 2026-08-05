@@ -208,7 +208,7 @@ Adds all key-value pairs from another map into this map. If a key already exists
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | `dict` | The map to add pairs into |
-| `other` | `dict` | The map to copy pairs from |
+| `id2` | `dict` | The map to copy pairs from |
 
 **Returns:** None
 

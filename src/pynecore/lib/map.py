@@ -101,14 +101,14 @@ def put(id: dict, key: Any, value: TValue) -> TValue:
 
 
 # noinspection PyShadowingBuiltins
-def put_all(id: dict[TKey, TValue], other: dict[TKey, TValue]):
+def put_all(id: dict[TKey, TValue], id2: dict[TKey, TValue]):
     """
     Put all the key-value pairs from another map into this map.
 
     :param id: The map to put the key-value pairs in.
-    :param other: The map to put the key-value pairs from.
+    :param id2: The map to put the key-value pairs from.
     """
-    id.update(other)
+    id.update(id2)
 
 
 # noinspection PyShadowingBuiltins
