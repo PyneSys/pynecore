@@ -83,7 +83,8 @@ class DNSEProvider(ProviderPlugin[DNSEConfig]):
                                       base_url=self.config.base_url,
                                       api_version=self.config.api_version)
             import logging
-            logging.getLogger(__name__).info(self.announce_endpoints())
+            level = logging.INFO if not self.is_production else logging.WARNING
+            logging.getLogger(__name__).log(level, self.announce_endpoints())
         return self._client
 
     #: Official DNSE hosts. Anything else means a fake/local venue, which the
@@ -96,13 +97,19 @@ class DNSEProvider(ProviderPlugin[DNSEConfig]):
     def is_production(self) -> bool:
         """Whether both endpoints point at the real DNSE."""
         assert self.config is not None
-        return all(host in url for host, url in
+        # ANY production endpoint means production. `all()` would label a
+        # production-REST + localhost-WS config as a test venue while every
+        # order went to the real exchange — the exact mistake this guards.
+        return any(host in url for host, url in
                    zip(self.PRODUCTION_HOSTS, (self.config.base_url, self.config.ws_url)))
 
     def announce_endpoints(self) -> str:
         """One-line endpoint banner, logged before the first request."""
         assert self.config is not None
-        tag = "LIVE DNSE" if self.is_production else "TEST VENUE (not DNSE)"
+        mixed = (("openapi.dnse.com.vn" in self.config.base_url)
+                 != ("ws-openapi.dnse.com.vn" in self.config.ws_url))
+        tag = ("MIXED - PRODUCTION REST/WS + LOCAL" if mixed
+               else "LIVE DNSE" if self.is_production else "TEST VENUE (not DNSE)")
         return f"[{tag}] rest={self.config.base_url} ws={self.config.ws_url}"
 
     #: VN30F1M has a lunch break and a 14:45 close, so quiet stretches are
