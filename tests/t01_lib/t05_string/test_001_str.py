@@ -101,6 +101,21 @@ def __test_str_replace_occurrence__():
     assert _string.replace("", "", "-", 1) == "-"
 
 
+def __test_str_split_empty_separator__():
+    """ str.split with an empty separator splits into characters, while an empty source
+    still yields one empty piece """
+    from pynecore.lib import string as _string
+    # Measured on TradingView
+    assert _string.split("abc", "") == ["a", "b", "c"]
+    assert _string.split("héló", "") == ["h", "é", "l", "ó"]
+    # An empty source is one empty piece, not an empty array — same as any separator
+    assert _string.split("", "") == [""]
+    assert _string.split("", ",") == [""]
+    # A non-empty separator keeps its existing behaviour, which already matches
+    assert _string.split("a,b,,c", ",") == ["a", "b", "", "c"]
+    assert _string.split(",a,", ",") == ["", "a", ""]
+
+
 # noinspection PyShadowingBuiltins
 def __test_str_substring_argument_is_named_str__():
     """ str.contains/endswith/startswith/pos name their second argument ``str``, the way
@@ -109,3 +124,4 @@ def __test_str_substring_argument_is_named_str__():
     assert _string.contains(source="Hello World!", str="World") is True
     assert _string.endswith(source="Hello World!", str="!") is True
     assert _string.startswith(source="Hello World!", str="Hello") is True
+    assert _string.pos(source="Hello World!", str="World") == 6

@@ -653,6 +653,12 @@ def split(string: str, separator: str) -> list[str]:
     :param separator: Separator
     :return: Array of substrings
     """
+    if not separator:
+        # An empty separator splits into individual characters, but an empty source still
+        # yields one empty piece, exactly like every other separator does. Python raises
+        # "empty separator" for both. Measured: split("abc", "") == ["a", "b", "c"] and
+        # split("", "") == [""].
+        return list(string) or [""]
     return string.split(separator)
 
 
