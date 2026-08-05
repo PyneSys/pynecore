@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, MutableSequence, Iterator, cast, overload
+from typing import Any, TypeVar, Generic, Iterable, MutableSequence, Iterator, cast, overload
 
 T = TypeVar('T')
 
@@ -30,10 +30,25 @@ class SequenceView(Generic[T]):
         else:
             return self.sequence[self.range[key]]
 
-    def __setitem__(self, key: int | slice, value: T) -> None:
+    @overload
+    def __setitem__(self, key: int, value: T) -> None: ...
+
+    @overload
+    def __setitem__(self, key: slice, value: Iterable[T]) -> None: ...
+
+    def __setitem__(self, key: int | slice, value: Any) -> None:
         if isinstance(key, slice):
-            for i in self.range[key]:
-                self.sequence[i] = value
+            # Slice assignment takes one value PER position, like a list's does.
+            # Storing the iterable itself in every addressed slot instead turned
+            # array.fill(array.slice(a, 0, 2), 5) on [10, 20, 30, 40] into
+            # [[5, 5], [5, 5], 30, 40] -- nested lists written into the parent.
+            indices = self.range[key]
+            values = list(value)
+            if len(values) != len(indices):
+                raise ValueError(f"Cannot assign {len(values)} values "
+                                 f"to a view slice of size {len(indices)}")
+            for i, item in zip(indices, values):
+                self.sequence[i] = item
         else:
             self.sequence[self.range[key]] = value
 

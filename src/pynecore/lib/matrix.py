@@ -4,8 +4,20 @@ from typing import Any
 from ..core.module_property import module_property
 from ..types.matrix import Matrix
 from ..types.na import NA, na_float
+from . import array as _array
 
 _registry: list[Matrix] = []
+
+
+# noinspection PyShadowingBuiltins,PyProtectedMember
+def _na_element(id: Matrix) -> Any:
+    """
+    Return an na value matching the matrix's element type.
+
+    :param id: A matrix object
+    :return: na of the matrix's element type, typeless na for an empty matrix
+    """
+    return _array._na_element(id.data[0] if id.data else [])
 
 
 # noinspection PyShadowingNames
@@ -114,11 +126,16 @@ def col(id: Matrix | NA, column: int) -> list[Any] | NA:
     """
     Create a one-dimensional array from the elements of a matrix column.
 
+    An na index yields an na array, exactly like an na matrix does.
+
     :param id: A matrix object.
     :param column: Index of the required column.
-    :return: An array containing the column values.
+    :return: An array containing the column values, or na if the index is na.
     """
     if isinstance(id, NA):
+        return NA(list)
+    # Measured on TradingView: an na index hands back an na array; see ``row``.
+    if not (column == column):  # is_na_arg
         return NA(list)
     return id.col(column)
 
@@ -239,13 +256,21 @@ def get(id: Matrix | NA, row: int, column: int) -> Any | NA:
     """
     Return the element with the specified index of the matrix.
 
+    An na row or column index yields na and leaves the matrix untouched.
+
     :param id: A matrix object.
     :param row: Index of the required row.
     :param column: Index of the required column.
-    :return: The value at the specified position.
+    :return: The value at the specified position, or na if either index is na.
     """
     if isinstance(id, NA):
         return NA(object)
+    # Measured on TradingView (FX:EURUSD 240, bar 100, 2x2 float matrix):
+    # matrix.get(m, na, 0), (m, 0, na) and (m, na, na) all return NaN. Without
+    # this the na index reached list indexing and halted the script: an na never
+    # compares true against the bounds check, so it slipped straight through.
+    if not (row == row) or not (column == column):  # is_na_arg
+        return _na_element(id)
     return id.get(row, column)
 
 
@@ -571,11 +596,17 @@ def row(id: Matrix | NA, row: int) -> list[Any] | NA:
     """
     Create a one-dimensional array from the elements of a matrix row.
 
+    An na index yields an na array, exactly like an na matrix does.
+
     :param id: A matrix object.
     :param row: Index of the required row.
-    :return: An array containing the row values.
+    :return: An array containing the row values, or na if the index is na.
     """
     if isinstance(id, NA):
+        return NA(list)
+    # Measured on TradingView: matrix.row(m, na) hands back an na array -- the
+    # error only comes later, from the array function called on it (RE10052).
+    if not (row == row):  # is_na_arg
         return NA(list)
     return id.row(row)
 
@@ -598,12 +629,18 @@ def set(id: Matrix | NA, row: int, column: int, value: Any) -> None:
     """
     Assign value to the element at the specified row and column.
 
+    An na row or column index does nothing at all.
+
     :param id: A matrix object.
     :param row: The row index of the element to be modified.
     :param column: The column index of the element to be modified.
     :param value: The new value to be set.
     """
     if isinstance(id, NA):
+        return
+    # Measured on TradingView: matrix.set(m, na, 0, 5.0) leaves both the contents
+    # and the size of a 2x2 matrix untouched -- it is a no-op, not an error.
+    if not (row == row) or not (column == column):  # is_na_arg
         return
     id.set(row, column, value)
 

@@ -194,13 +194,37 @@ def __test_max_min_na_nth_is_zero__():
     assert array.min([10, 20, 30, 40], 1) == 20
 
 
-def __test_percentile_na_percentage_returns_na__():
-    """ An na percentage yields na instead of raising """
-    # UNMEASURED on TradingView: na is returned because it cannot halt a
-    # running script, which raising would.
+def __test_percentile_na_percentage__():
+    """ An na percentage counts as 0 for the nearest rank and yields na for the
+    interpolation """
+    # Measured on TradingView (FX:EURUSD 240, bar 100): nearest_rank answers an na
+    # percentage exactly like 0 does. The reversed array proves it is the smallest
+    # value and not the first element; an na element in the array does not change
+    # it either. The interpolation form yields na for the same argument.
     for na_index in NA_INDICES:
-        assert _is_na(array.percentile_nearest_rank([1.0, 2.0, 3.0], na_index))
+        assert array.percentile_nearest_rank([1.0, 2.0, 3.0], na_index) == 1.0
+        assert array.percentile_nearest_rank([4.0, 3.0, 2.0, 1.0], na_index) == 1.0
+        assert array.percentile_nearest_rank([4.0, 3.0, 2.0, 1.0, nan], na_index) == 1.0
         assert _is_na(array.percentile_linear_interpolation([1.0, 2.0, 3.0], na_index))
+
+
+def __test_percentile_empty_array_returns_na__():
+    """ An empty array yields na instead of raising """
+    # Measured on TradingView: percentile_nearest_rank(array.new<float>(0), 50)
+    # returns NaN and the script keeps running, and so does the interpolation
+    # form. Raising here halted a bot on an array not yet filled by warmup.
+    assert _is_na(array.percentile_nearest_rank([], 50))
+    assert _is_na(array.percentile_linear_interpolation([], 50))
+
+
+def __test_percentile_out_of_range_percentage_still_raises__():
+    """ A percentage outside [0, 100] is an error, na is not """
+    # Measured on TradingView: percentage 150 halts with RE10002, naming the
+    # [0..100] range -- so this one really is an error, unlike na.
+    with pytest.raises(ValueError):
+        array.percentile_nearest_rank([1.0, 2.0, 3.0], 150)
+    with pytest.raises(ValueError):
+        array.percentile_linear_interpolation([1.0, 2.0, 3.0], -50)
 
 
 def __test_valid_indices_unchanged__():

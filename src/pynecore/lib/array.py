@@ -82,38 +82,6 @@ __all__ = [
 
 
 # noinspection PyShadowingBuiltins
-def _non_na(id: list[T]) -> list[T]:
-    """
-    Return the array's elements with na values removed.
-
-    The array math and statistics reductions ignore na elements and reduce over
-    the remaining values only, yielding na when none remain. Every such reduction
-    filters its input through this helper so their na handling stays consistent.
-
-    :param id: Input array, possibly containing na elements
-    :return: New list containing only the non-na elements, in original order
-    """
-    return [i for i in id if not (isinstance(i, NA) or i != i)]
-
-
-def _is_na_arg(value: Any) -> bool:
-    """
-    Report whether an index-like argument is na.
-
-    Used by the array functions that take an index, a rank or a percentage, all
-    of which tolerate na instead of failing.
-
-    :param value: Argument to test
-    :return: True if the argument is na
-    """
-    # Both na representations reach these functions: an ``NA`` instance (a bare
-    # ``na``, or ``int()`` of an na float, which ``safe_int`` turns into
-    # ``NA(int)``) and a native ``nan`` float. Testing only one of them is
-    # measurably incomplete.
-    return isinstance(value, NA) or value != value
-
-
-# noinspection PyShadowingBuiltins
 def _na_element(id: list[Any] | SequenceView[Any]) -> Any:
     """
     Return an na value matching the array's element type.
@@ -128,7 +96,7 @@ def _na_element(id: list[Any] | SequenceView[Any]) -> Any:
     head = id[0]
     # An element that is already na carries the right type; ``type()`` of it
     # would be ``NA`` itself, and ``NA(NA)`` would be wrong.
-    if isinstance(head, NA) or head != head:
+    if not (head == head):
         return head
     return NA(builtins.type(head))
 
@@ -152,7 +120,7 @@ def avg(id: list[Number]) -> float:
     :param id: Input array
     :return: Average value of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
     return builtins.sum(a) / len(a)
@@ -280,7 +248,7 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
     """
     assert len(id1) == len(id2), "Input arrays must have the same length!"
     pairs = [(v1, v2) for v1, v2 in zip(id1, id2)
-             if not (isinstance(v1, NA) or v1 != v1 or isinstance(v2, NA) or v2 != v2)]
+             if v1 == v1 and v2 == v2]
     if not pairs:
         return na_float
     # Online (Welford) co-moment — matches TradingView bit-for-bit for both
@@ -315,13 +283,15 @@ def every(id: list[Any]) -> bool:
 
 
 # noinspection PyShadowingBuiltins
-def fill(id: list[T], value: T, index_from: int = 0, index_to: int | NA = NA(int)) -> None:
+def fill(id: list[T] | SequenceView[T], value: T,
+         index_from: int = 0, index_to: int | NA = NA(int)) -> None:
     """
     Fills the elements in the array with the specified value.
 
     An na ``index_from`` fills from the start of the array and an na ``index_to``
     fills to its end, instead of failing. Bounds outside the array address only
-    the part that exists, so the array size never changes.
+    the part that exists, so the array size never changes. A slice view fills the
+    addressed part of its parent, like every other write through a view.
 
     :param id: Input array
     :param value: Value to fill
@@ -342,8 +312,8 @@ def fill(id: list[T], value: T, index_from: int = 0, index_to: int | NA = NA(int
     # destroying live data is strictly worse than filling what exists.
     length = len(id)
     start, stop, _ = builtins.slice(
-        0 if _is_na_arg(index_from) else index_from,
-        length if _is_na_arg(index_to) else cast(int, index_to),
+        index_from if index_from == index_from else 0,  # is_na_arg
+        cast(int, index_to) if index_to == index_to else length,  # is_na_arg
     ).indices(length)
     id[start:stop] = [value] * (stop - start)
 
@@ -385,7 +355,7 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     :param index: Index of the element to return
     :return: Element at the specified index in the array, or na if the index is na
     """
-    if _is_na_arg(index):
+    if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   get([10, 20, 30, 40], na) -> NaN, array unchanged
         #   get(array.new_int(), na)  -> NaN, size 0
@@ -443,7 +413,7 @@ def insert(id: list[T], index: int, value: T) -> None:
     :param index: Index to insert the value at
     :param value: Value to insert
     """
-    if _is_na_arg(index):
+    if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   insert([10, 20, 30, 40], na, 77) -> 10,20,30,40,77
         #   insert(array.new_int(), na, 77)  -> 77
@@ -512,9 +482,9 @@ def max(id: list[Number], nth: int = 0) -> Number:
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     # max(a, na) -> 40, the same as nth = 0, while nth = 1 gives 30.
-    if _is_na_arg(nth):
+    if not (nth == nth):  # is_na_arg
         nth = 0
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return id[0] if id else NA(None)
     if nth == 0:
@@ -532,7 +502,7 @@ def median(id: list[Number]) -> float:
     :param id: Input array
     :return: Median value of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
     return statistics.median(a)
@@ -553,9 +523,9 @@ def min(id: list[Number], nth: int = 0) -> Number:
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     # min(a, na) -> 10, the same as nth = 0, while nth = 1 gives 20.
-    if _is_na_arg(nth):
+    if not (nth == nth):  # is_na_arg
         nth = 0
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return id[0] if id else NA(None)
     if nth == 0:
@@ -573,7 +543,7 @@ def mode(id: list[T]) -> T:
     :param id: Input array
     :return: Most frequently occurring element in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         # An all-na array still knows its element type through its na elements;
         # a truly empty one does not, so it gets a typeless na
@@ -592,7 +562,7 @@ def _na_size(size: int | NA) -> int:
     :param size: Requested array size, possibly ``na``
     :return: Non-negative integer size
     """
-    if isinstance(size, NA) or size != size:
+    if not (size == size):  # is_na_arg
         return 0
     assert size >= 0, "Size must be >=0!"
     return int(size)
@@ -756,10 +726,17 @@ def _select_linear_interpolation(non_na: list[float], n: int, percentage: float)
     :param non_na: Ascending-sorted numeric values
     :param n: Total conceptual array length, na elements included
     :param percentage: Percentile (0-100, not 0-1)
-    :return: Interpolated value at the given percentile, or na
+    :return: Interpolated value at the given percentile, or na if the percentage is na
     :raises ValueError: If percentage is not in [0, 100]
     """
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an na percentage yields na
+    # here, unlike the nearest-rank form, which answers it as 0. The guard lives in
+    # the shared selector so the array face and ``ta``'s rolling face agree.
+    if not (percentage == percentage):  # is_na_arg
+        return na_float
     if not (0 <= percentage <= 100):
+        # Measured: TradingView halts on a percentage outside [0, 100] (RE10002),
+        # so this is an error there too, not a tolerated na-like argument.
         raise ValueError("Percentage must be between 0 and 100")
     m = len(non_na)
 
@@ -804,23 +781,19 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     numeric. An exact rank falling in the sorted-to-end na tail likewise yields
     na. An na ``percentage`` yields na.
 
+    An empty array yields na, and so does an na ``percentage``.
+
     :param id: List of numeric values, possibly containing na elements
     :param percentage: Percentile (0-100, not 0-1)
     :return: Interpolated value at the given percentile, or na (see above)
-    :raises ValueError: If arr is empty or percentage is not in [0, 100]
+    :raises ValueError: If percentage is not in [0, 100]
     """
-    # An na percentage is UNMEASURED on TradingView. na is returned rather than
-    # raised so an na argument cannot halt a running script. The guard lives here
-    # and not in ``_select_linear_interpolation``, which ``ta`` also uses.
-    if _is_na_arg(percentage):
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns na
+    # and keeps running -- it is not the error an out-of-range percentage gets.
+    if not id:
         return na_float
 
-    if not id:
-        raise ValueError("Input array is empty")
-
-    # filter() instead of a comprehension: PyCharm mis-narrows `not isinstance`
-    # inside comprehension conditions (elements would type as NA, not float)
-    non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
+    non_na = sorted(v for v in id if v == v)  # non-na: na never equals itself
     return _select_linear_interpolation(non_na, len(id), percentage)
 
 
@@ -835,12 +808,19 @@ def _select_nearest_rank(non_na: list[float], n: int, percentage: float) -> floa
 
     :param non_na: Ascending-sorted numeric values
     :param n: Total conceptual array length, na elements included
-    :param percentage: Percentile (0-100)
+    :param percentage: Percentile (0-100), na counts as 0
     :return: The value at the nearest rank, or na if the rank falls on a na
              element
     :raises ValueError: If percentage is not between 0 and 100
     """
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an na percentage answers
+    # exactly what 0 answers -- the smallest value, on [4, 3, 2, 1] as well, so it
+    # really is the rank and not the first element. Holds for ``ta``'s rolling face
+    # too, where it tracked ta.lowest bar by bar.
+    if not (percentage == percentage):  # is_na_arg
+        percentage = 0
     if not (0 <= percentage <= 100):
+        # Measured: TradingView halts on a percentage outside [0, 100] (RE10002).
         raise ValueError("Percentage must be between 0 and 100")
     m = len(non_na)
     if percentage == 0:
@@ -861,25 +841,21 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
 
     na elements are kept and sort to the end (as if they were the largest
     values), so the full array length (na included) drives the rank. A rank that
-    lands on a na element yields na, and so does an na ``percentage``.
+    lands on a na element yields na, an na ``percentage`` counts as 0 and an empty
+    array yields na.
 
     :param id: List of numeric values
-    :param percentage: Percentile (0-100)
+    :param percentage: Percentile (0-100), na counts as 0
     :return: The value at the nearest rank for the specified percentile, or na
              if that rank falls on a na element
-    :raises ValueError: If arr is empty or percentage is not between 0 and 100
+    :raises ValueError: If percentage is not between 0 and 100
     """
-    # An na percentage is UNMEASURED on TradingView. na is returned rather than
-    # raised so an na argument cannot halt a running script. The guard lives here
-    # and not in ``_select_nearest_rank``, which ``ta`` also uses.
-    if _is_na_arg(percentage):
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns na
+    # and keeps running.
+    if not id:
         return na_float
 
-    if not id:
-        raise ValueError("Input array is empty")
-
-    # filter() instead of a comprehension: see percentile_linear_interpolation
-    non_na = sorted(filter(lambda v: not (isinstance(v, NA) or v != v), id))
+    non_na = sorted(v for v in id if v == v)  # non-na: na never equals itself
     return _select_nearest_rank(non_na, len(id), percentage)
 
 
@@ -904,7 +880,7 @@ def percentrank(id: list[Number], index: int) -> float:
     # Measured on TradingView (FX:EURUSD 240, bar 100): percentrank with an na
     # index returns 0 on [10, 20, 30, 40], exactly what index 0 returns; on the
     # reversed array both give 100, so it really is index 0 and not a fixed 0.
-    if _is_na_arg(index):
+    if not (index == index):  # is_na_arg
         index = 0
 
     # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns
@@ -927,7 +903,7 @@ def percentrank(id: list[Number], index: int) -> float:
 
     # Get value at index
     value = id[index]
-    if isinstance(value, NA) or value != value:
+    if not (value == value):
         return na_float
 
     # Count non-na elements less than or equal to the target value. The
@@ -937,8 +913,7 @@ def percentrank(id: list[Number], index: int) -> float:
     # equal infinities have a nan difference, which the tolerance band alone
     # would reject.
     count = builtins.sum(1 for x in id
-                         if not (isinstance(x, NA) or x != x)
-                         and (x <= value or x - value <= _EPSILON))
+                         if x == x and (x <= value or x - value <= _EPSILON))
 
     # Calculate percentage
     return (count - 1) * 100 / (len(id) - 1)
@@ -974,7 +949,7 @@ def range(id: list[Number]) -> Number:
     :param id: Input array
     :return: Range of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return id[0] if id else NA(None)
     return builtins.max(a) - builtins.min(a)
@@ -991,7 +966,7 @@ def remove(id: list[T], index: int) -> T:
     :param index: Index of the element to remove
     :return: The removed element, or na if the index is na
     """
-    if _is_na_arg(index):
+    if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   remove([10, 20, 30, 40], na) -> NaN, array unchanged
         #   remove(array.new_int(), na)  -> NaN, size 0
@@ -1024,7 +999,7 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     :param index: Index of the element to set
     :param value: Value to set
     """
-    if _is_na_arg(index):
+    if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   set([10, 20, 30, 40], na, 99) -> 10,20,30,40 size 4
         #   set(array.new_int(), na, 9)   -> size 0
@@ -1072,8 +1047,8 @@ def slice(id: list[T], index_from: int, index_to: int) -> SequenceView[T]:
     #   slice(a, na, 2)  -> 10,20        size 2
     #   slice(a, 1, na)  -> 20,30,40     size 3
     #   slice(a, na, na) -> 10,20,30,40  size 4
-    start = 0 if _is_na_arg(index_from) else int(index_from)
-    stop = len(id) if _is_na_arg(index_to) else int(index_to)
+    start = int(index_from) if index_from == index_from else 0  # is_na_arg
+    stop = int(index_to) if index_to == index_to else len(id)  # is_na_arg
     return SequenceView(id)[start:stop]  # type: ignore
 
 
@@ -1089,14 +1064,44 @@ def some(id: list[Any]) -> bool:
 
 
 # noinspection PyShadowingBuiltins
+def _na_sorts_first(sample: Any) -> bool:
+    """
+    Report whether na belongs at the front of the sorted result.
+
+    :param sample: Any non-na element of the array, None if it has none
+    :return: True for a string array, False for a numeric one
+    """
+    # Measured on TradingView (FX:EURUSD 240, bar 100): na sorts to the END of a
+    # numeric array (as the largest value) but to the FRONT of a string one.
+    return isinstance(sample, str)
+
+
+# noinspection PyShadowingBuiltins
 def sort(id: list[int | float | str], order: _order.Order = _order.ascending) -> None:
     """
     Sorts the elements in the array in ascending or descending order.
 
+    na elements sort to the end of a numeric array and to the front of a string
+    one; descending order is the ascending result reversed.
+
     :param id: Input array
     :param order: Order to sort the elements in
     """
-    id.sort(reverse=order == _order.descending)
+    # Python's own sort cannot express this: every comparison against na is False,
+    # so a single na element leaves neighbouring values in their original order --
+    # sort([30, na, 10]) did not sort at all. Measured on TradingView:
+    #   sort([30, 20, 10, na])            -> 10, 20, 30, na
+    #   sort([30, 20, 10, na], descending) -> na, 30, 20, 10
+    #   sort(["b", "a", na])              -> na, "a", "b"
+    non_na: list[Any] = []
+    nas: list[Any] = []
+    for value in id:
+        (non_na if value == value else nas).append(value)
+    non_na.sort()
+    ordered = nas + non_na if _na_sorts_first(non_na[0] if non_na else None) else non_na + nas
+    if order == _order.descending:
+        ordered.reverse()
+    id[:] = ordered
 
 
 # noinspection PyShadowingBuiltins
@@ -1105,11 +1110,22 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[in
     Returns an array of indices which, when used to index the original array, will access its elements
     in their sorted order. It does not modify the original array.
 
+    The indices of na elements go where ``sort`` would put the elements
+    themselves: to the end for a numeric array, to the front for a string one.
+
     :param id: Input array
     :param order: Order to sort the elements in
     :return: Array of indices to access the elements in their sorted order
     """
-    indices: list[int] = sorted(builtins.range(len(id)), key=id.__getitem__)  # type: ignore
+    # Measured on TradingView: sort_indices([na, na, 5, 1]) -> 3, 2, 0, 1, so the
+    # na indices keep their original relative order at the end of the result.
+    non_na: list[int] = []
+    nas: list[int] = []
+    for i, value in enumerate(id):
+        (non_na if value == value else nas).append(i)
+    non_na.sort(key=id.__getitem__)  # type: ignore[arg-type]
+    sample = id[non_na[0]] if non_na else None
+    indices = nas + non_na if _na_sorts_first(sample) else non_na + nas
     if order == _order.descending:
         indices.reverse()
     return indices
@@ -1118,45 +1134,31 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[in
 # noinspection PyShadowingBuiltins,PyShadowingNames
 def standardize(id: list[float | int]) -> list[float | int]:
     """
-    Standardizes the input array:
-      1) Uses a left-to-right summation for the mean (population mean).
-      2) Uses a second pass for summing squared differences (population variance).
-      3) Computes the population standard deviation (divisor = N).
-      4) Returns the z-score for each element.
-         - If all input elements are integers, it applies thresholding:
-             z < -1 -> -1,
-             z > 1  -> 1,
-             otherwise 0
-         - If any element is float, the result is the continuous z-score value.
+    Standardizes the input array: every element becomes its z-score against the
+    population mean and standard deviation.
 
-    :param id: A list of numeric values (int or float).
-    :return: A list containing the standardized values.
+    na elements are left out of both statistics and stay na in the result, so the
+    population divisor is the number of numeric elements. An array whose numeric
+    elements are all equal standardizes to 1.0, and one with no numeric element at
+    all to na.
+
+    :param id: A list of numeric values (int or float), possibly holding na
+    :return: A new list containing the standardized values
     """
-    n = len(id)
-    if n == 0:
-        # You can decide how you want to handle the empty list.
-        return []
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an int array standardizes
+    # exactly like the same values typed as float -- there is no -1/0/1
+    # thresholding -- and [1, 2, 3, na] gives the z-scores of [1, 2, 3] with na in
+    # the fourth slot, so the divisor is 3 and not 4.
+    values = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
+    if not values:
+        return [na_float] * len(id)
 
-    mean = statistics.mean(id)
-    stdev = math.sqrt(statistics.mean([(v - mean) ** 2 for v in id]))
+    # statistics.mean, like ``stdev`` above, so the two agree to the last bit
+    mean = statistics.mean(values)
+    stdev = math.sqrt(statistics.mean([(v - mean) ** 2 for v in values]))
     if stdev == 0:
-        # All elements are equal: TV's standardize() yields 1.0 for every element.
-        z_scores = [1.0 for _ in id]
-    else:
-        z_scores = [(v - mean) / stdev for v in id]
-
-    # If all values are integers, apply the thresholding to get -1, 0, or 1.
-    if all(isinstance(v, int) for v in id):
-        # Pine Script-style integer thresholding
-        return [
-            -1 if z < -1 else
-            1 if z > 1 else
-            0
-            for z in z_scores
-        ]
-
-    # Otherwise, return the continuous z-score values.
-    return z_scores
+        return [1.0 if v == v else na_float for v in id]
+    return [(v - mean) / stdev if v == v else na_float for v in id]
 
 
 # noinspection PyShadowingBuiltins
@@ -1169,7 +1171,7 @@ def stdev(id: list[Number], biased: bool = True) -> float:
                    unbiased standard deviation.
     :return: Standard deviation of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
     if len(a) < 2:
@@ -1188,7 +1190,7 @@ def sum(id: list[float | int]) -> float | int:
     :param id: Input array
     :return: Sum of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
     return builtins.sum(a)
@@ -1214,7 +1216,7 @@ def variance(id: list[Number], biased: bool = True) -> float:
     :param biased: If True, calculates the biased variance. If False, calculates the unbiased variance.
     :return: Variance of the elements in the array, or na if the array is empty
     """
-    a = _non_na(id)
+    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
     if len(a) < 2:

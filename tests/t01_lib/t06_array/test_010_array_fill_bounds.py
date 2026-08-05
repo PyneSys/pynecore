@@ -9,11 +9,14 @@ TypeError, so the destructive slice assignment underneath was never reached.
 These tests pin the size invariant for both the na and the plain-integer bounds.
 """
 from math import nan
+from typing import Any
 
 from pynecore.lib import array
 from pynecore.types.na import NA
 
-NA_INDICES = (NA(int), NA(None), nan)
+# Typed as Any because Pine declares these arguments `int`; na is what the
+# guards accept on top of that, not part of the declared parameter type.
+NA_INDICES: tuple[Any, ...] = (NA(int), NA(None), nan)
 
 
 def main():
@@ -58,6 +61,25 @@ def __test_fill_reversed_bounds_is_a_noop__():
     a = [10, 20, 30, 40]
     array.fill(a, 5, 3, 1)
     assert a == [10, 20, 30, 40]
+
+
+def __test_fill_through_a_slice_writes_plain_values_into_the_parent__():
+    """ Filling a slice view fills the addressed part of the parent, nothing else """
+    # Measured on TradingView: fill(slice(a, 0, 2), 5) on [10, 20, 30, 40] leaves
+    # the parent [5, 5, 30, 40] and the view [5, 5]. The view's slice assignment
+    # used to store the replacement LIST in every addressed slot, so the parent
+    # ended up holding nested lists -- [[5, 5], [5, 5], 30, 40].
+    a = [10, 20, 30, 40]
+    view = array.slice(a, 0, 2)
+    array.fill(view, 5)
+    assert a == [5, 5, 30, 40]
+    assert list(view) == [5, 5]
+
+    # The same through an na bound, which is what makes the whole view reachable
+    b = [10, 20, 30, 40]
+    tail = array.slice(b, 2, 4)
+    array.fill(tail, 7, NA(int), NA(int))
+    assert b == [10, 20, 7, 7]
 
 
 def __test_fill_in_range_bounds_unchanged__():
