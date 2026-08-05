@@ -130,6 +130,7 @@ Requests dividend data for a symbol.
 | gaps | barmerge | Gap handling mode |
 | lookahead | barmerge | Lookahead mode |
 | ignore_invalid_symbol | bool | Return `na` instead of raising error |
+| currency | str | Currency the returned values are converted to |
 
 **Returns:** Dividend value or `na`.
 
@@ -162,6 +163,7 @@ Requests earnings data for a symbol.
 | gaps | barmerge | Gap handling mode |
 | lookahead | barmerge | Lookahead mode |
 | ignore_invalid_symbol | bool | Return `na` instead of raising error |
+| currency | str | Currency the returned values are converted to |
 
 **Returns:** Earnings value or `na`.
 

@@ -3571,10 +3571,10 @@ def cancel_all():
     lib._script.position._cancel_all_orders()
 
 
-# noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames
+# noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames,PyUnusedLocal
 def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
           qty_percent: PyneFloat = na_float, alert_message: PyneStr = na_str,
-          immediately: bool = False):
+          immediately: bool = False, disable_alert: bool = False):
     """
     Creates an order to exit from the part of a position opened by entry orders with a specific identifier.
 
@@ -3585,6 +3585,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
                         quantity to close when an exit order fills
     :param alert_message: Custom text for the alert that fires when an order fills.
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
+    :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
     if lib._lib_semaphore or lib._strategy_suppressed:
         return
@@ -3655,8 +3656,9 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
         position._deferred_immediate_closes.append(order)
 
 
-# noinspection PyProtectedMember,PyShadowingNames
-def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immediately: bool = False):
+# noinspection PyProtectedMember,PyShadowingNames,PyUnusedLocal
+def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immediately: bool = False,
+              disable_alert: bool = False):
     """
     Creates an order to close an open position completely, regardless of the identifiers of the entry
     orders that opened or added to it.
@@ -3664,6 +3666,7 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     :param comment: Additional notes on the filled order
     :param alert_message: Custom text for the alert that fires when an order fills
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
+    :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
     if lib._lib_semaphore or lib._strategy_suppressed:
         return
@@ -3972,11 +3975,12 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
     return sign * granted / rfactor
 
 
-# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,DuplicatedCode
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode
 def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
-          comment: str | None = None, alert_message: str | None = None):
+          comment: str | None = None, alert_message: str | None = None,
+          disable_alert: bool = False):
     """
     Creates a new order to open or add to a position. If an order with the same id already exists
     and is unfilled, this command will modify that order.
@@ -3990,6 +3994,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param oca_type: The type of the order cancel/replace group
     :param comment: Additional notes on the filled order
     :param alert_message: Custom text for the alert that fires when an order fills
+    :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
     if lib._lib_semaphore or lib._strategy_suppressed:
         return

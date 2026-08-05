@@ -57,6 +57,7 @@ Create a new order to open or add to a position. Modifies existing unfilled orde
 | oca_type | int | OCA behavior type (optional) |
 | comment | str \| None | Order comment (optional) |
 | alert_message | str \| None | Alert message text (optional) |
+| disable_alert | bool | Suppress alerts if True (optional) |
 
 Returns: `None`
 
@@ -112,6 +113,7 @@ Exit a position opened by entries with a specific id. Closes the position immedi
 | qty_percent | float \| None | Partial close as % of position (optional) |
 | alert_message | str \| None | Alert text (optional) |
 | immediately | bool | Close at market immediately (optional) |
+| disable_alert | bool | Suppress alerts if True (optional) |
 
 Returns: `None`
 
@@ -129,6 +131,7 @@ Close the entire open position immediately at market price, regardless of entry 
 | comment | str \| None | Order comment (optional) |
 | alert_message | str \| None | Alert text (optional) |
 | immediately | bool | Close immediately (optional) |
+| disable_alert | bool | Suppress alerts if True (optional) |
 
 Returns: `None`
 

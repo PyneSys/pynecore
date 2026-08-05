@@ -126,7 +126,7 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
 # noinspection PyUnusedLocal
 def dividends(
         ticker=None, field=None, gaps=None, lookahead=None,
-        ignore_invalid_symbol=False,
+        ignore_invalid_symbol=False, currency=None,
 ) -> float:
     """
     Request dividend data for a symbol.
@@ -136,6 +136,7 @@ def dividends(
     :param gaps: Gap handling mode (barmerge.gaps_on/off)
     :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
     :param ignore_invalid_symbol: If True, return na instead of raising
+    :param currency: Currency the returned values are converted to
     :return: Dividend value or na
     :raises NotImplementedError: When ignore_invalid_symbol is False
     """
@@ -168,7 +169,7 @@ def splits(
 # noinspection PyUnusedLocal
 def earnings(
         ticker=None, field=None, gaps=None, lookahead=None,
-        ignore_invalid_symbol=False,
+        ignore_invalid_symbol=False, currency=None,
 ) -> float:
     """
     Request earnings data for a symbol.
@@ -178,6 +179,7 @@ def earnings(
     :param gaps: Gap handling mode (barmerge.gaps_on/off)
     :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
     :param ignore_invalid_symbol: If True, return na instead of raising
+    :param currency: Currency the returned values are converted to
     :return: Earnings value or na
     :raises NotImplementedError: When ignore_invalid_symbol is False
     """
