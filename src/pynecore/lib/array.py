@@ -96,6 +96,43 @@ def _non_na(id: list[T]) -> list[T]:
     return [i for i in id if not (isinstance(i, NA) or i != i)]
 
 
+def _is_na_arg(value: Any) -> bool:
+    """
+    Report whether an index-like argument is na.
+
+    Used by the array functions that take an index, a rank or a percentage, all
+    of which tolerate na instead of failing.
+
+    :param value: Argument to test
+    :return: True if the argument is na
+    """
+    # Both na representations reach these functions: an ``NA`` instance (a bare
+    # ``na``, or ``int()`` of an na float, which ``safe_int`` turns into
+    # ``NA(int)``) and a native ``nan`` float. Testing only one of them is
+    # measurably incomplete.
+    return isinstance(value, NA) or value != value
+
+
+# noinspection PyShadowingBuiltins
+def _na_element(id: list[Any] | SequenceView[Any]) -> Any:
+    """
+    Return an na value matching the array's element type.
+
+    An empty array has no knowable element type and yields a typeless na.
+
+    :param id: Input array
+    :return: na of the array's element type
+    """
+    if len(id) == 0:
+        return NA(None)
+    head = id[0]
+    # An element that is already na carries the right type; ``type()`` of it
+    # would be ``NA`` itself, and ``NA(NA)`` would be wrong.
+    if isinstance(head, NA) or head != head:
+        return head
+    return NA(builtins.type(head))
+
+
 # noinspection PyShadowingBuiltins
 def abs(id: list[int | float]) -> list[int | float]:
     """
@@ -282,14 +319,33 @@ def fill(id: list[T], value: T, index_from: int = 0, index_to: int | NA = NA(int
     """
     Fills the elements in the array with the specified value.
 
+    An na ``index_from`` fills from the start of the array and an na ``index_to``
+    fills to its end, instead of failing. Bounds outside the array address only
+    the part that exists, so the array size never changes.
+
     :param id: Input array
     :param value: Value to fill
     :param index_from: Index to start filling from
     :param index_to: Index to stop filling at
     """
-    if isinstance(index_to, NA):
-        index_to = len(id)
-    id[index_from:index_to] = [value] * (index_to - index_from)
+    # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
+    #   fill(a, 5, na, 2) -> 5,5,30,40      fill(a, 5, 1, na) -> 10,5,5,5
+    # ``index_to`` defaults to na, so this guard also implements Pine's
+    # "omitted index_to means the array size" default.
+    #
+    # ``slice.indices`` clamps both bounds into [0, size] the way Python's own
+    # slicing does. Without it the replacement list is sized from the REQUESTED
+    # span rather than the addressed one, and a bound outside the array silently
+    # resizes it: [10, 20, 30, 40] filled with index_to = 99 grew to 99 elements
+    # and with index_to = -1 shrank to a single element. TradingView halts on an
+    # out-of-range fill bound (RE10045), so no behaviour here is TV-exact, but
+    # destroying live data is strictly worse than filling what exists.
+    length = len(id)
+    start, stop, _ = builtins.slice(
+        0 if _is_na_arg(index_from) else index_from,
+        length if _is_na_arg(index_to) else cast(int, index_to),
+    ).indices(length)
+    id[start:stop] = [value] * (stop - start)
 
 
 # noinspection PyShadowingBuiltins
@@ -322,10 +378,19 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     """
     Returns the element at the specified index in the array.
 
+    An na index returns na and leaves the array untouched. An out-of-range
+    integer index still raises.
+
     :param id: Input array
     :param index: Index of the element to return
-    :return: Element at the specified index in the array
+    :return: Element at the specified index in the array, or na if the index is na
     """
+    if _is_na_arg(index):
+        # Measured on TradingView (FX:EURUSD 240, bar 100):
+        #   get([10, 20, 30, 40], na) -> NaN, array unchanged
+        #   get(array.new_int(), na)  -> NaN, size 0
+        # so an empty array is tolerated too: no bounds check is reached.
+        return cast(T, _na_element(id))
     return id[index]
 
 
@@ -372,15 +437,24 @@ def insert(id: list[T], index: int, value: T) -> None:
     """
     Inserts the specified value at the specified index in the array.
 
+    An na index appends the value at the end of the array.
+
     :param id: Input array
     :param index: Index to insert the value at
     :param value: Value to insert
     """
+    if _is_na_arg(index):
+        # Measured on TradingView (FX:EURUSD 240, bar 100):
+        #   insert([10, 20, 30, 40], na, 77) -> 10,20,30,40,77
+        #   insert(array.new_int(), na, 77)  -> 77
+        # i.e. na resolves to the array size, it is not clamped from 0.
+        id.append(value)
+        return
     id.insert(index, value)
 
 
 # noinspection PyShadowingBuiltins
-def join(id: list, separator: str) -> str:
+def join(id: list[Any] | SequenceView[Any], separator: str) -> str:
     """
     Concatenates the elements in the array into a single string, separated by the specified separator.
 
@@ -429,13 +503,17 @@ def max(id: list[Number], nth: int = 0) -> Number:
     Returns the maximum value in the array, or the nth largest value.
 
     na elements are ignored. ``nth`` is 0-based: 0 is the maximum, 1 the second
-    largest, and so on. Returns na if the array holds no non-na values or ``nth``
-    is out of range.
+    largest, and so on. An na ``nth`` is treated as 0. Returns na if the array
+    holds no non-na values or ``nth`` is out of range.
 
     :param id: Input array
     :param nth: Rank of the maximum to return (0 = maximum)
     :return: The nth largest value in the array, or na
     """
+    # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
+    # max(a, na) -> 40, the same as nth = 0, while nth = 1 gives 30.
+    if _is_na_arg(nth):
+        nth = 0
     a = _non_na(id)
     if not a:
         return id[0] if id else NA(None)
@@ -466,13 +544,17 @@ def min(id: list[Number], nth: int = 0) -> Number:
     Returns the minimum value in the array, or the nth smallest value.
 
     na elements are ignored. ``nth`` is 0-based: 0 is the minimum, 1 the second
-    smallest, and so on. Returns na if the array holds no non-na values or ``nth``
-    is out of range.
+    smallest, and so on. An na ``nth`` is treated as 0. Returns na if the array
+    holds no non-na values or ``nth`` is out of range.
 
     :param id: Input array
     :param nth: Rank of the minimum to return (0 = minimum)
     :return: The nth smallest value in the array, or na
     """
+    # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
+    # min(a, na) -> 10, the same as nth = 0, while nth = 1 gives 20.
+    if _is_na_arg(nth):
+        nth = 0
     a = _non_na(id)
     if not a:
         return id[0] if id else NA(None)
@@ -720,13 +802,19 @@ def percentile_linear_interpolation(id: list[float], percentage: float) -> float
     clamp and a ``pos`` landing exactly on an integer rank yield a value; every
     fractional position returns na, even when both neighbouring values are
     numeric. An exact rank falling in the sorted-to-end na tail likewise yields
-    na.
+    na. An na ``percentage`` yields na.
 
     :param id: List of numeric values, possibly containing na elements
     :param percentage: Percentile (0-100, not 0-1)
     :return: Interpolated value at the given percentile, or na (see above)
     :raises ValueError: If arr is empty or percentage is not in [0, 100]
     """
+    # An na percentage is UNMEASURED on TradingView. na is returned rather than
+    # raised so an na argument cannot halt a running script. The guard lives here
+    # and not in ``_select_linear_interpolation``, which ``ta`` also uses.
+    if _is_na_arg(percentage):
+        return na_float
+
     if not id:
         raise ValueError("Input array is empty")
 
@@ -773,7 +861,7 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
 
     na elements are kept and sort to the end (as if they were the largest
     values), so the full array length (na included) drives the rank. A rank that
-    lands on a na element yields na.
+    lands on a na element yields na, and so does an na ``percentage``.
 
     :param id: List of numeric values
     :param percentage: Percentile (0-100)
@@ -781,6 +869,12 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
              if that rank falls on a na element
     :raises ValueError: If arr is empty or percentage is not between 0 and 100
     """
+    # An na percentage is UNMEASURED on TradingView. na is returned rather than
+    # raised so an na argument cannot halt a running script. The guard lives here
+    # and not in ``_select_nearest_rank``, which ``ta`` also uses.
+    if _is_na_arg(percentage):
+        return na_float
+
     if not id:
         raise ValueError("Input array is empty")
 
@@ -799,16 +893,37 @@ def percentrank(id: list[Number], index: int) -> float:
     still count toward the array length. If the element at ``index`` is itself
     na, the rank is na.
 
+    An na index is treated as index 0. An array too short to have a rank
+    denominator (fewer than two elements) yields na.
+
     :param id: Input array
     :param index: Index of the element to calculate rank for
     :return: Percentile rank (0-100), or na if the element at index is na
-    :raises ValueError: If input array is empty or index is out of range
+    :raises ValueError: If the index is out of range
     """
+    # Measured on TradingView (FX:EURUSD 240, bar 100): percentrank with an na
+    # index returns 0 on [10, 20, 30, 40], exactly what index 0 returns; on the
+    # reversed array both give 100, so it really is index 0 and not a fixed 0.
+    if _is_na_arg(index):
+        index = 0
+
+    # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns
+    # na and keeps running, both for an na index and for index 0 -- it is not
+    # the out-of-bounds error an empty array gets from get/set/remove.
     if not id:
-        raise ValueError("Input array is empty")
+        return na_float
 
     if not 0 <= index < len(id):
+        # Measured on TradingView: percentrank([10, 20, 30, 40], -1) halts with
+        # RE10045, so an out-of-range index is an error here, unlike in
+        # get/set/remove/insert which accept negative indices.
         raise ValueError("Index out of range")
+
+    # Measured on TradingView (FX:EURUSD 240, bar 100): percentrank on a
+    # one-element array returns na for index 0 and for an na index. The rank
+    # formula below divides by ``len(id) - 1``, which is zero there.
+    if len(id) == 1:
+        return na_float
 
     # Get value at index
     value = id[index]
@@ -870,10 +985,21 @@ def remove(id: list[T], index: int) -> T:
     """
     Removes the element at the specified index from the array.
 
+    An na index removes nothing and returns na.
+
     :param id: Input array
     :param index: Index of the element to remove
-    :return: The removed element
+    :return: The removed element, or na if the index is na
     """
+    if _is_na_arg(index):
+        # Measured on TradingView (FX:EURUSD 240, bar 100):
+        #   remove([10, 20, 30, 40], na) -> NaN, array unchanged
+        #   remove(array.new_int(), na)  -> NaN, size 0
+        # TradingView diverges on string and user-defined-type arrays, where an
+        # na index is coerced to 0 and genuinely removes the head element. A
+        # PyneCore array is a plain list with no runtime element type, so that
+        # branch is not reproducible; the tolerant behaviour is used uniformly.
+        return cast(T, _na_element(id))
     return id.pop(index)
 
 
@@ -892,10 +1018,17 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     """
     Sets the value of the element at the specified index in the array.
 
+    An na index is a silent no-op.
+
     :param id: Input array
     :param index: Index of the element to set
     :param value: Value to set
     """
+    if _is_na_arg(index):
+        # Measured on TradingView (FX:EURUSD 240, bar 100):
+        #   set([10, 20, 30, 40], na, 99) -> 10,20,30,40 size 4
+        #   set(array.new_int(), na, 9)   -> size 0
+        return
     id[index] = value
 
 
@@ -927,12 +1060,21 @@ def slice(id: list[T], index_from: int, index_to: int) -> SequenceView[T]:
     The function creates a slice from an existing array. If an object from the slice changes, the
     changes are applied to both the new and the original arrays.
 
+    An na ``index_from`` starts the slice at the beginning of the array and an na
+    ``index_to`` ends it at the array size.
+
     :param id: Input array
     :param index_from: Index to start the sub-array from
     :param index_to: Index to end the sub-array at
     :return: Slice view of the original array
     """
-    return SequenceView(id)[int(index_from):int(index_to)]  # type: ignore
+    # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
+    #   slice(a, na, 2)  -> 10,20        size 2
+    #   slice(a, 1, na)  -> 20,30,40     size 3
+    #   slice(a, na, na) -> 10,20,30,40  size 4
+    start = 0 if _is_na_arg(index_from) else int(index_from)
+    stop = len(id) if _is_na_arg(index_to) else int(index_to)
+    return SequenceView(id)[start:stop]  # type: ignore
 
 
 # noinspection PyShadowingBuiltins
