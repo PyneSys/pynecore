@@ -312,8 +312,8 @@ def fill(id: list[T] | SequenceView[T], value: T,
     # destroying live data is strictly worse than filling what exists.
     length = len(id)
     start, stop, _ = builtins.slice(
-        index_from if index_from == index_from else 0,  # is_na_arg
-        cast(int, index_to) if index_to == index_to else length,  # is_na_arg
+        int(index_from) if index_from == index_from else 0,  # is_na_arg
+        int(cast(int, index_to)) if index_to == index_to else length,  # is_na_arg
     ).indices(length)
     id[start:stop] = [value] * (stop - start)
 
@@ -348,8 +348,8 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     """
     Returns the element at the specified index in the array.
 
-    An na index returns na and leaves the array untouched. An out-of-range
-    integer index still raises.
+    An na index returns na and leaves the array untouched. A float index is
+    truncated to an integer. An out-of-range integer index still raises.
 
     :param id: Input array
     :param index: Index of the element to return
@@ -361,7 +361,12 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
         #   get(array.new_int(), na)  -> NaN, size 0
         # so an empty array is tolerated too: no bounds check is reached.
         return cast(T, _na_element(id))
-    return id[index]
+    # TradingView rejects a float index while compiling, so a compiled script can
+    # never reach this with one. PyneCore does not always know the type, though,
+    # and an integer carried as a float (from a division, from math.round) is a
+    # legitimate index -- int() takes it instead of raising a TypeError that would
+    # stop the script. Every index-taking function here does the same.
+    return id[int(index)]
 
 
 # noinspection PyShadowingBuiltins
@@ -407,7 +412,8 @@ def insert(id: list[T], index: int, value: T) -> None:
     """
     Inserts the specified value at the specified index in the array.
 
-    An na index appends the value at the end of the array.
+    An na index appends the value at the end of the array, a float index is
+    truncated to an integer.
 
     :param id: Input array
     :param index: Index to insert the value at
@@ -420,7 +426,7 @@ def insert(id: list[T], index: int, value: T) -> None:
         # i.e. na resolves to the array size, it is not clamped from 0.
         id.append(value)
         return
-    id.insert(index, value)
+    id.insert(int(index), value)  # float-carried integer index, see get()
 
 
 # noinspection PyShadowingBuiltins
@@ -473,8 +479,9 @@ def max(id: list[Number], nth: int = 0) -> Number:
     Returns the maximum value in the array, or the nth largest value.
 
     na elements are ignored. ``nth`` is 0-based: 0 is the maximum, 1 the second
-    largest, and so on. An na ``nth`` is treated as 0. Returns na if the array
-    holds no non-na values or ``nth`` is out of range.
+    largest, and so on. An na ``nth`` is treated as 0 and a float one is
+    truncated to an integer. Returns na if the array holds no non-na values or
+    ``nth`` is out of range.
 
     :param id: Input array
     :param nth: Rank of the maximum to return (0 = maximum)
@@ -484,6 +491,7 @@ def max(id: list[Number], nth: int = 0) -> Number:
     # max(a, na) -> 40, the same as nth = 0, while nth = 1 gives 30.
     if not (nth == nth):  # is_na_arg
         nth = 0
+    nth = int(nth)  # float-carried integer rank, see get()
     a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return id[0] if id else NA(None)
@@ -514,8 +522,9 @@ def min(id: list[Number], nth: int = 0) -> Number:
     Returns the minimum value in the array, or the nth smallest value.
 
     na elements are ignored. ``nth`` is 0-based: 0 is the minimum, 1 the second
-    smallest, and so on. An na ``nth`` is treated as 0. Returns na if the array
-    holds no non-na values or ``nth`` is out of range.
+    smallest, and so on. An na ``nth`` is treated as 0 and a float one is
+    truncated to an integer. Returns na if the array holds no non-na values or
+    ``nth`` is out of range.
 
     :param id: Input array
     :param nth: Rank of the minimum to return (0 = minimum)
@@ -525,6 +534,7 @@ def min(id: list[Number], nth: int = 0) -> Number:
     # min(a, na) -> 10, the same as nth = 0, while nth = 1 gives 20.
     if not (nth == nth):  # is_na_arg
         nth = 0
+    nth = int(nth)  # float-carried integer rank, see get()
     a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return id[0] if id else NA(None)
@@ -869,8 +879,9 @@ def percentrank(id: list[Number], index: int) -> float:
     still count toward the array length. If the element at ``index`` is itself
     na, the rank is na.
 
-    An na index is treated as index 0. An array too short to have a rank
-    denominator (fewer than two elements) yields na.
+    An na index is treated as index 0 and a float index is truncated to an
+    integer. An array too short to have a rank denominator (fewer than two
+    elements) yields na.
 
     :param id: Input array
     :param index: Index of the element to calculate rank for
@@ -882,6 +893,7 @@ def percentrank(id: list[Number], index: int) -> float:
     # reversed array both give 100, so it really is index 0 and not a fixed 0.
     if not (index == index):  # is_na_arg
         index = 0
+    index = int(index)  # float-carried integer index, see get()
 
     # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns
     # na and keeps running, both for an na index and for index 0 -- it is not
@@ -960,7 +972,8 @@ def remove(id: list[T], index: int) -> T:
     """
     Removes the element at the specified index from the array.
 
-    An na index removes nothing and returns na.
+    An na index removes nothing and returns na, a float index is truncated to an
+    integer.
 
     :param id: Input array
     :param index: Index of the element to remove
@@ -975,7 +988,7 @@ def remove(id: list[T], index: int) -> T:
         # PyneCore array is a plain list with no runtime element type, so that
         # branch is not reproducible; the tolerant behaviour is used uniformly.
         return cast(T, _na_element(id))
-    return id.pop(index)
+    return id.pop(int(index))  # float-carried integer index, see get()
 
 
 # noinspection PyShadowingBuiltins
@@ -993,7 +1006,7 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     """
     Sets the value of the element at the specified index in the array.
 
-    An na index is a silent no-op.
+    An na index is a silent no-op, a float index is truncated to an integer.
 
     :param id: Input array
     :param index: Index of the element to set
@@ -1004,7 +1017,7 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
         #   set([10, 20, 30, 40], na, 99) -> 10,20,30,40 size 4
         #   set(array.new_int(), na, 9)   -> size 0
         return
-    id[index] = value
+    id[int(index)] = value  # float-carried integer index, see get()
 
 
 # noinspection PyShadowingBuiltins

@@ -36,7 +36,7 @@ def new(rows: int = 0, columns: int = 0, initial_value: Any = None) -> Matrix:
     if initial_value is None:
         initial_value = na_float
 
-    matrix_obj = Matrix(rows, columns, initial_value)
+    matrix_obj = Matrix(int(rows), int(columns), initial_value)
     _registry.append(matrix_obj)
     return matrix_obj
 
@@ -91,7 +91,7 @@ def add_row(id: Matrix | NA, row: int | None = None, array_id: list[Any] | None 
     """
     if isinstance(id, NA):
         return
-    id.add_row(row, array_id)
+    id.add_row(row if row is None else int(row), array_id)
 
 
 # noinspection PyShadowingBuiltins
@@ -105,7 +105,7 @@ def add_col(id: Matrix | NA, column: int | None = None, array_id: list[Any] | No
     """
     if isinstance(id, NA):
         return
-    id.add_col(column, array_id)
+    id.add_col(column if column is None else int(column), array_id)
 
 
 # noinspection PyShadowingBuiltins
@@ -137,7 +137,7 @@ def col(id: Matrix | NA, column: int) -> list[Any] | NA:
     # Measured on TradingView: an na index hands back an na array; see ``row``.
     if not (column == column):  # is_na_arg
         return NA(list)
-    return id.col(column)
+    return id.col(int(column))
 
 
 # noinspection PyShadowingBuiltins
@@ -248,7 +248,8 @@ def fill(id: Matrix | NA, value: Any, from_row: int = 0, to_row: int | None = No
     """
     if isinstance(id, NA):
         return
-    id.fill(value, from_row, to_row, from_column, to_column)
+    id.fill(value, int(from_row), to_row if to_row is None else int(to_row),
+            int(from_column), to_column if to_column is None else int(to_column))
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -271,7 +272,9 @@ def get(id: Matrix | NA, row: int, column: int) -> Any | NA:
     # compares true against the bounds check, so it slipped straight through.
     if not (row == row) or not (column == column):  # is_na_arg
         return _na_element(id)
-    return id.get(row, column)
+    # Every index here is truncated to an integer, so a float that carries one
+    # addresses the matrix instead of raising a TypeError; see ``array.get``.
+    return id.get(int(row), int(column))
 
 
 # noinspection PyShadowingBuiltins
@@ -521,7 +524,7 @@ def pow(id: Matrix | NA, power: int) -> Matrix | NA:
     """
     if isinstance(id, NA):
         return NA(Matrix)
-    return id.pow(power)
+    return id.pow(int(power))
 
 
 # noinspection PyShadowingBuiltins
@@ -548,7 +551,7 @@ def remove_col(id: Matrix | NA, column: int | None = None) -> list[Any] | NA:
     """
     if isinstance(id, NA):
         return NA(list)
-    return id.remove_col(column)
+    return id.remove_col(column if column is None else int(column))
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -562,7 +565,7 @@ def remove_row(id: Matrix | NA, row: int | None = None) -> list[Any] | NA:
     """
     if isinstance(id, NA):
         return NA(list)
-    return id.remove_row(row)
+    return id.remove_row(row if row is None else int(row))
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -576,7 +579,7 @@ def reshape(id: Matrix | NA, rows: int, columns: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.reshape(rows, columns)
+    id.reshape(int(rows), int(columns))
 
 
 # noinspection PyShadowingBuiltins
@@ -608,7 +611,7 @@ def row(id: Matrix | NA, row: int) -> list[Any] | NA:
     # error only comes later, from the array function called on it (RE10052).
     if not (row == row):  # is_na_arg
         return NA(list)
-    return id.row(row)
+    return id.row(int(row))
 
 
 # noinspection PyShadowingBuiltins
@@ -642,7 +645,7 @@ def set(id: Matrix | NA, row: int, column: int, value: Any) -> None:
     # and the size of a 2x2 matrix untouched -- it is a no-op, not an error.
     if not (row == row) or not (column == column):  # is_na_arg
         return
-    id.set(row, column, value)
+    id.set(int(row), int(column), value)
 
 
 # noinspection PyShadowingBuiltins
@@ -656,7 +659,7 @@ def sort(id: Matrix | NA, column: int = 0, order: str = 'ascending') -> None:
     """
     if isinstance(id, NA):
         return
-    id.sort(column, order)
+    id.sort(int(column), order)
 
 
 # noinspection PyShadowingBuiltins
@@ -674,7 +677,8 @@ def submatrix(id: Matrix | NA, from_row: int = 0, to_row: int | None = None,
     """
     if isinstance(id, NA):
         return NA(Matrix)
-    return id.submatrix(from_row, to_row, from_column, to_column)
+    return id.submatrix(int(from_row), to_row if to_row is None else int(to_row),
+                        int(from_column), to_column if to_column is None else int(to_column))
 
 
 # noinspection PyShadowingBuiltins
@@ -702,7 +706,7 @@ def swap_columns(id: Matrix | NA, column1: int, column2: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.swap_columns(column1, column2)
+    id.swap_columns(int(column1), int(column2))
 
 
 # noinspection PyShadowingBuiltins
@@ -716,7 +720,7 @@ def swap_rows(id: Matrix | NA, row1: int, row2: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.swap_rows(row1, row2)
+    id.swap_rows(int(row1), int(row2))
 
 
 # noinspection PyShadowingBuiltins
