@@ -270,6 +270,32 @@ def set_textalign(id: Label, textalign: _text.AlignEnum) -> None:
 
 
 # noinspection PyShadowingBuiltins
+def set_text_font_family(id: Label, text_font_family: _font.FontFamilyEnum) -> None:
+    """
+    Sets the font family of the label text
+
+    :param id: Label object
+    :param text_font_family: New font family, e.g. ``font.family_default``
+    """
+    if isinstance(id, NA):
+        return
+    id.text_font_family = text_font_family
+
+
+# noinspection PyShadowingBuiltins
+def set_text_formatting(id: Label, text_formatting: _text.FormatEnum) -> None:
+    """
+    Sets the formatting attributes the label applies to its text
+
+    :param id: Label object
+    :param text_formatting: New text formatting, e.g. ``text.format_bold``
+    """
+    if isinstance(id, NA):
+        return
+    id.text_formatting = text_formatting
+
+
+# noinspection PyShadowingBuiltins
 def set_tooltip(id: Label, tooltip: str) -> None:
     """
     Sets the label tooltip
@@ -321,6 +347,38 @@ def set_xy(id: Label, x: int, y: int | float) -> None:
         return
     id.x = x
     id.y = y
+
+
+# noinspection PyShadowingBuiltins
+def set_point(id: Label, point: ChartPoint) -> None:
+    """
+    Sets the location of the label to a chart point
+
+    :param id: Label object
+    :param point: Chart point providing the new position
+    """
+    if isinstance(id, NA):
+        return
+    if id.xloc == _xloc.bar_time:
+        id.x = point.time
+    else:  # xloc.bar_index
+        id.x = point.index
+    id.y = point.price
+
+
+# noinspection PyShadowingBuiltins
+def set_xloc(id: Label, x: int, xloc: _xloc.XLoc) -> None:
+    """
+    Sets x-location and a new bar index/time value
+
+    :param id: Label object
+    :param x: Bar index or bar time
+    :param xloc: New x-location value
+    """
+    if isinstance(id, NA):
+        return
+    id.x = x
+    id.xloc = xloc
 
 
 # noinspection PyShadowingBuiltins

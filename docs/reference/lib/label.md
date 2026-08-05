@@ -5,7 +5,7 @@ title: "label"
 description: "Chart labels — create, modify, and style text labels"
 icon: "label"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -231,6 +231,45 @@ Example:
 label.set_xy(lbl, bar_index + 1, high + 10)  # Move label
 ```
 
+### label.set_point()
+
+Sets the label position to a chart point. The x-coordinate is taken from the point field
+that matches the label's current xloc: `point.index` for `xloc.bar_index`, `point.time`
+for `xloc.bar_time`.
+
+```python
+label.set_point(id: label, point: chart.point) → None
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| id | label | Label object |
+| point | chart.point | Chart point providing the new position |
+
+Example:
+```python
+label.set_point(lbl, chart.point.from_index(bar_index, high))
+```
+
+### label.set_xloc()
+
+Sets the x-coordinate and the x-location mode of the label together.
+
+```python
+label.set_xloc(id: label, x: int, xloc: xloc) → None
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| id | label | Label object |
+| x | int | New bar index or UNIX timestamp (milliseconds) |
+| xloc | xloc | Mode: xloc.bar_index or xloc.bar_time |
+
+Example:
+```python
+label.set_xloc(lbl, time, xloc.bar_time)  # Switch to time-based positioning
+```
+
 ### label.set_color()
 
 Sets the border and arrow color of a label.
@@ -296,6 +335,32 @@ label.set_textalign(id: label, textalign: text_align) → None
 | id | label | Label object |
 | textalign | text_align | Alignment: text_align.left, text_align.center, or text_align.right |
 
+### label.set_text_font_family()
+
+Sets the font family used for the label text.
+
+```python
+label.set_text_font_family(id: label, text_font_family: font) → None
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| id | label | Label object |
+| text_font_family | font | Font family: font.family_default or font.family_monospace |
+
+### label.set_text_formatting()
+
+Sets the formatting attributes applied to the label text.
+
+```python
+label.set_text_formatting(id: label, text_formatting: text_format) → None
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| id | label | Label object |
+| text_formatting | text_format | Formatting: text.format_none, text.format_bold, or text.format_italic |
+
 ### label.set_tooltip()
 
 Sets the hover tooltip text for a label.
@@ -359,11 +424,3 @@ All label style constants for use with `label.new()` and `label.set_style()`:
 | label.style_square | Square shape |
 | label.style_diamond | Diamond shape |
 | label.style_text_outline | Text with outline |
-
-## Compatibility
-
-**Not yet implemented:**
-- `label.set_point()` — Not available
-- `label.set_text_font_family()` — Font family control not yet supported
-- `label.set_text_formatting()` — Text formatting (bold, italic) not yet supported
-- `label.set_xloc()` — Direct xloc changes not supported; use `label.new()` or `label.set_x()` instead
