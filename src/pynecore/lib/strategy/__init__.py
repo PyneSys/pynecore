@@ -4182,7 +4182,7 @@ def exit(id: str, from_entry: str = "",
          loss: PyneFloat = na_float, stop: PyneFloat = na_float,
          trail_price: PyneFloat = na_float, trail_points: PyneFloat = na_float,
          trail_offset: PyneFloat = na_float,
-         oca_name: PyneStr = na_str, oca_type: _oca.Oca | None = None,
+         oca_name: PyneStr = na_str,
          comment: PyneStr = na_str, comment_profit: PyneStr = na_str,
          comment_loss: PyneStr = na_str, comment_trailing: PyneStr = na_str,
          alert_message: PyneStr = na_str, alert_profit: PyneStr = na_str,
@@ -4203,7 +4203,6 @@ def exit(id: str, from_entry: str = "",
     :param trail_points: The trailing stop activation distance, expressed in ticks
     :param trail_offset: The trailing stop offset
     :param oca_name: The name of the order cancel/replace group
-    :param oca_type: The type of the order cancel/replace group
     :param comment: Additional notes on the filled order
     :param comment_profit: Additional notes on the filled order
     :param comment_loss: Additional notes on the filled order
@@ -4229,7 +4228,7 @@ def exit(id: str, from_entry: str = "",
 
     # noinspection PyProtectedMember,PyShadowingNames
     def _exit():
-        nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name, oca_type
+        nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name
 
         # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
         # Re-issuing it every bar updates its prices, but a leg that already fired
@@ -4319,17 +4318,12 @@ def exit(id: str, from_entry: str = "",
         if _trail_price is not None:
             _trail_price = _price_round(_trail_price, -direction)
 
-        # Default OCA settings for strategy.exit() - matches TradingView behavior
-        # If no oca_name is specified, create a default OCA reduce group
+        # Default OCA settings for strategy.exit() - matches TradingView behavior.
+        # Pine's strategy.exit() has no oca_type parameter: its legs always form a
+        # reduce group. If no oca_name is specified, create a default one.
         if isinstance(oca_name, NA):
             # Use a unique name based on the exit id and from_entry
             oca_name = f"__exit_{id}_{from_entry}_oca__"
-            # Default to reduce type (TradingView behavior)
-            oca_type = _oca.reduce
-        else:
-            # If oca_name is provided but no type, default to reduce
-            if oca_type is None:
-                oca_type = _oca.reduce
 
         # Add order
         order = Order(
@@ -4337,7 +4331,7 @@ def exit(id: str, from_entry: str = "",
             limit=_limit, stop=_stop,
             trail_price=_trail_price, trail_offset=_trail_offset,
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
-            oca_name=_na_to_none(oca_name), oca_type=oca_type,
+            oca_name=_na_to_none(oca_name), oca_type=_oca.reduce,
             comment=_na_to_none(comment),
             alert_message=_na_to_none(alert_message),
             comment_profit=_na_to_none(comment_profit),
