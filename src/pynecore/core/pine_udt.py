@@ -7,7 +7,10 @@ from ..utils.sequence_view import SequenceView
 from ..types import box as box_types
 from ..types import label as label_types
 from ..types import line as line_types
+from ..types import linefill as linefill_types
 from ..types import matrix as matrix_types
+from ..types import polyline as polyline_types
+from ..types import table as table_types
 from ..types.na import NA
 
 __all__ = ['udt', 'udt_copy']
@@ -31,11 +34,14 @@ T = TypeVar('T')
 #
 # ``chart.point`` is deliberately absent: it owns no registry, so ``replace`` is
 # already the correct copy for it, and only the fallback preserves ``**changes``.
-# ``linefill``/``polyline``/``table`` are absent because Pine has no copy for them:
-# TradingView rejects ``lf.copy()``, ``linefill.copy(lf)``, ``pl.copy()``,
-# ``polyline.copy(pl)`` and ``t.copy()`` at compile time with CE10271, so no valid
-# Pine reaches them. They do carry a vid, so the fallback would orphan them the same
-# way — there is simply no namespace copy to route them to.
+#
+# This table is NOT a narrower duplicate of ``pine_method._get_builtin_method``,
+# which resolves ANY method name on a receiver. This one answers a different
+# question — on which types copying is defined at all — and the answer is measured:
+# ``line``, ``label``, ``box``, ``matrix``, ``array`` and ``map`` receivers compile
+# on TradingView while ``linefill``, ``polyline`` and ``table`` are rejected, in the
+# method and the namespace-function form alike. Delegating would not even reach the
+# same answer: those three namespaces define no ``copy`` to look up.
 _BUILTIN_COPY: dict[type, Callable[[Any], Any]] = {
     label_types.Label: label.copy,
     line_types.Line: line.copy,
@@ -45,6 +51,16 @@ _BUILTIN_COPY: dict[type, Callable[[Any], Any]] = {
     SequenceView: array.copy,
     dict: map_lib.copy,
 }
+
+# Drawings Pine cannot copy. The compiler rejects a receiver it can type, but a
+# container element it cannot (``arr.get(0).copy()`` on an ``array<linefill>``)
+# arrives here. They are dataclasses carrying a vid, so the fallback below would
+# clone them into no registry and return a drawing that never reaches the chart.
+_UNCOPYABLE: frozenset[type] = frozenset({
+    linefill_types.LineFill,
+    polyline_types.Polyline,
+    table_types.Table,
+})
 
 
 def udt_copy(obj: Any, **changes: Any) -> Any:
@@ -58,22 +74,31 @@ def udt_copy(obj: Any, **changes: Any) -> Any:
     :param obj: The object to copy
     :param changes: Field values to override on the copy; user-defined types only
     :return: An independent copy of ``obj``, or ``obj`` itself when it is na
-    :raises TypeError: If field overrides are passed for a builtin object
+    :raises TypeError: If the object's type defines no copy, or if field overrides
+                       are passed for anything but a user-defined type
     """
+    obj_type = type(obj)
+    if obj_type in _UNCOPYABLE:
+        raise TypeError(f"{obj_type.__name__} has no copy method")
+    builtin = _BUILTIN_COPY.get(obj_type)
+    if builtin is not None:
+        if changes:
+            # Not expressible in Pine: the builtin ``.copy()`` takes no arguments, and
+            # only ``@udt``'s own ``copy`` forwards changes, which lands on the fallback
+            # below. Refuse rather than poke attributes on a registered chart object.
+            raise TypeError(f"{obj_type.__name__} copy takes no field overrides")
+        return builtin(obj)
     if isinstance(obj, NA):
+        if changes:
+            # An na holds no fields to override. Dropping them silently would answer a
+            # typo in hand-written Pyne with a plausible-looking na, so it is refused
+            # on the same footing as a builtin receiver.
+            raise TypeError("na copy takes no field overrides")
         # Measured on TradingView: copying an na drawing leaves the registry
         # untouched and returns na. NA is interned per declared type, so this
         # value already IS the na the namespace copy would return.
         return obj
-    builtin = _BUILTIN_COPY.get(type(obj))
-    if builtin is None:
-        return replace(obj, **changes)
-    if changes:
-        # Not expressible in Pine: the builtin ``.copy()`` takes no arguments, and
-        # only ``@udt``'s own ``copy`` forwards changes, which lands on the branch
-        # above. Refuse rather than poke attributes on a registered chart object.
-        raise TypeError(f"{type(obj).__name__} copy takes no field overrides")
-    return builtin(obj)
+    return replace(obj, **changes)
 
 
 @dataclass_transform()

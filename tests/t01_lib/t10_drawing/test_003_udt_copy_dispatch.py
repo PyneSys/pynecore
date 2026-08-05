@@ -9,7 +9,7 @@ import pytest
 
 from pynecore.core import viz
 from pynecore.core.pine_udt import udt_copy
-from pynecore.lib import box, label, line, matrix
+from pynecore.lib import box, chart, color, label, line, linefill, matrix, polyline, position, table
 from pynecore.lib import map as map_lib
 from pynecore.types.label import Label
 from pynecore.types.na import NA
@@ -73,5 +73,34 @@ def __test_udt_copy_dispatches_on_the_runtime_type__():
         # no arguments, so this can only be a programming error.
         with pytest.raises(TypeError):
             udt_copy(src, text="C")
+
+        # An na carries no fields either, so overrides are refused there too rather
+        # than dropped into a plausible-looking na.
+        with pytest.raises(TypeError):
+            udt_copy(NA(Label), text="C")
+    finally:
+        viz.reset_state()
+
+
+def __test_udt_copy_refuses_the_drawings_pine_cannot_copy__():
+    """Copying a linefill, polyline or table raises instead of orphaning it.
+
+    Measured on TradingView: these three receivers are rejected at compile time, in
+    the method and the namespace-function form alike, so the compiler stops every
+    receiver it can type. A container element it cannot type still arrives here, and
+    they are dataclasses — a field copy would succeed and hand back a drawing with a
+    duplicate vid that is in no registry and never reaches the chart.
+    """
+    viz.reset_state()
+    try:
+        l1 = line.new(1, 1.0, 2, 2.0)
+        l2 = line.new(1, 2.0, 2, 3.0)
+        lf = linefill.new(l1, l2, color.red)
+        pl = polyline.new([chart.point.new(0, 1, 1.0), chart.point.new(0, 2, 2.0)])
+        tb = table.new(position.top_right, 1, 1)
+
+        for drawing in (lf, pl, tb):
+            with pytest.raises(TypeError):
+                udt_copy(drawing)
     finally:
         viz.reset_state()
