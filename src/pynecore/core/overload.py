@@ -38,6 +38,7 @@ from types import FunctionType, UnionType
 
 from .instance_state import _bind_target, _make_state, register_shared_cache, __dyn_default__
 from ..types.base import StrLiteral
+from ..types.matrix import Matrix
 from ..types.na import NA
 
 __all__ = ['overload']
@@ -99,8 +100,46 @@ _implementations: dict[str, Implementation] = {}  # Store implementations separa
 _dispatchers: dict[str, Callable] = {}  # Store dispatchers separately
 
 
-def _check_type(value: Any, expected_type: Type) -> bool:
-    """Cached type checking for better performance with Pine Script compatibility"""
+def _match_declared(declared: Any, expected: Any, strict: bool) -> bool:
+    """Whether a declared type satisfies an expected one, structurally.
+
+    :param declared: The type an na argument carries, or one of its arguments.
+    :param expected: The declared parameter type, or one of its arguments.
+    :param strict: Match without the int-where-float-is-wanted widening.
+    """
+    # Type arguments cannot be compared by identity: two independently built
+    # generic aliases are equal but not the same object (`list[int] is
+    # list[int]` is False -- typing caches its own aliases, so a user Generic
+    # would accidentally pass while a builtin one never does), and a nested
+    # subscript has to be matched argument by argument
+    if expected is Any or declared is expected:
+        return True
+    if not strict and expected is float and declared is int:
+        return True
+    if (get_origin(declared) or declared) is not (get_origin(expected) or expected):
+        return False
+    expected_args = get_args(expected)
+    declared_args = get_args(declared)
+    # A side without a subscript carries no element type at all, so it takes any
+    # parameterization -- the same permissiveness an empty container gets when
+    # it is sampled. Two subscripts of DIFFERENT arity are genuinely different
+    # shapes though, and must not match
+    if not expected_args or not declared_args:
+        return True
+    if len(declared_args) != len(expected_args):
+        return False
+    return all(_match_declared(a, b, strict) for a, b in zip(declared_args, expected_args))
+
+
+def _check_type(value: Any, expected_type: Type, strict: bool = False) -> bool:
+    """Cached type checking for better performance with Pine Script compatibility
+
+    :param value: A call argument.
+    :param expected_type: The parameter's declared type.
+    :param strict: Match without the int-where-float-is-wanted widening, so an
+        int argument takes an int parameter over a float one. ``_select`` runs
+        this pass first.
+    """
     # ``Any`` matches every value. Parameters without a type hint default to ``Any``
     # (see ``param_types`` below), and the compiler threads a closure variable in as a
     # leading, unannotated parameter -- both surface here as ``Any`` and must accept any
@@ -113,24 +152,45 @@ def _check_type(value: Any, expected_type: Type) -> bool:
     # sample element -- overloads can differ only in their element types
     # (map<string, string> vs map<string, float>)
     _origin = get_origin(expected_type)
+    # The element types of a parameterized expectation, kept for the na branch
+    # below: matching an na argument needs them AFTER expected_type has been
+    # stripped to its origin here
+    _expected_args: tuple = ()
     if isinstance(_origin, type) and _origin is not UnionType:
         if isinstance(value, _origin):
             _args = get_args(expected_type)
             if _args and isinstance(value, dict):
                 if value:
                     _key, _val = next(iter(value.items()))
-                    return _check_type(_key, _args[0]) and _check_type(_val, _args[1])
+                    return (_check_type(_key, _args[0], strict)
+                            and _check_type(_val, _args[1], strict))
             elif _args and isinstance(value, (list, tuple)) and value:
-                return _check_type(value[0], _args[0])
+                return _check_type(value[0], _args[0], strict)
+            elif _args and isinstance(value, Matrix) and value.data and value.data[0]:
+                # A matrix keeps no element type of its own, so it is sampled
+                # like a list is
+                return _check_type(value.data[0][0], _args[0], strict)
             return True
+        _expected_args = get_args(expected_type)
         expected_type = cast(Type, _origin)
+
+    # Unions (`int | float` and typing.Union alike): isinstance() rejects a union
+    # holding a parameterized generic, and an na argument has to be matched
+    # against the members one by one anyway
+    elif _origin is UnionType or _origin is Union:
+        return any(_check_type(value, t, strict) for t in get_args(expected_type))
 
     # Direct type match
     if isinstance(value, expected_type):
+        # Python's bool subclasses int, Pine's does not: a bool argument must
+        # not answer an int parameter
+        if expected_type is int and (value is True or value is False):
+            return False
         return True
 
-    # Pine Script-like int to float conversion
-    if expected_type is float and isinstance(value, int):
+    # Pine Script-like int to float conversion. ``type(value) is int`` and not
+    # isinstance(): a bool is an int in Python, and Pine never widens it either
+    if not strict and expected_type is float and type(value) is int:
         return True
 
     # Pine Script allows plain str where StrLiteral subtypes are expected (e.g. size, xloc)
@@ -139,32 +199,33 @@ def _check_type(value: Any, expected_type: Type) -> bool:
 
     # Handle NA values - Pine Script allows NA for any basic type
     if isinstance(value, NA):
-        # Check if expected_type is a Pine Script basic type
-        if expected_type in (int, float, str, bool):
-            return True
-
-        # For Union types containing basic types, NA is also acceptable
-        origin = get_origin(expected_type)
-        if origin in (Union, type(None) | type):
-            args = get_args(expected_type)
-            # If any of the Union members is a basic type, accept NA
-            if any(arg in (int, float, str, bool) for arg in args):
-                return True
-
-        # For non-basic types, check if NA's type matches
         na_type = value.type
         # A typeless `na` is assignable to anything, like in Pine
         if na_type is None:
             return True
+
+        # Check if expected_type is a Pine Script basic type
+        if expected_type in (int, float, str, bool):
+            return not strict or na_type is expected_type
+
+        # An na of a container carries its declared type whole, subscript
+        # included (`matrix<float> m = na` gives NA(Matrix[float])) -- that
+        # subscript is the only element type such an argument has, so it is
+        # what discriminates two overloads of the same container here
+        na_args = get_args(na_type)
+        if na_args:
+            if get_origin(na_type) is not expected_type:
+                return False
+            if not _expected_args:
+                return True
+            if len(na_args) != len(_expected_args):
+                return False
+            return all(_match_declared(a, b, strict)
+                       for a, b in zip(na_args, _expected_args))
         # Handle the case when na_type is an actual instance and not a type
         if not isinstance(na_type, type):
             na_type = type(na_type)
         return na_type is expected_type
-
-    # Handle Union types
-    origin = get_origin(expected_type)
-    if origin in (Union, type(None) | type):
-        return any(_check_type(value, t) for t in get_args(expected_type))
 
     if hasattr(expected_type, '__instancecheck__'):
         return expected_type.__instancecheck__(value)
@@ -175,37 +236,46 @@ def _check_type(value: Any, expected_type: Type) -> bool:
 def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implementation | None:
     """Select the implementation matching a call's arguments.
 
+    An exact pass runs before the widening one, so the declaration order only
+    decides between implementations that match equally well.
+
     :param impls: Registered implementations (registration order).
     :param args: Positional arguments of the call.
     :param kwargs: Keyword arguments of the call.
     :return: The first matching implementation, or None.
     """
-    # Quick path: try direct positional args match first
-    if not kwargs:
+    # Measured on TradingView (FX:EURUSD 240): with `f(float)` and `f(int)`
+    # declared in either order, an int argument -- literal, variable, series or
+    # a typed na -- takes the int one, and only a script without an int
+    # implementation at all widens it to the float one. The same holds for the
+    # element type of an array or matrix argument.
+    for strict in (True, False):
+        # Quick path: try direct positional args match first
+        if not kwargs:
+            for impl in impls:
+                if len(args) == len(impl.param_types):
+                    if all(_check_type(arg, type_, strict)
+                           for arg, (_, type_) in zip(args, impl.param_types)):
+                        return impl
+
+        # Slower path: handle mixed args/kwargs and defaults
         for impl in impls:
-            if len(args) == len(impl.param_types):
-                if all(_check_type(arg, type_)
-                       for arg, (_, type_) in zip(args, impl.param_types)):
+            try:
+                bound = impl.sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+
+                # ``__dyn_default__`` marks a parameter DynamicDefaultTransformer
+                # took over: the declared default referenced ``lib.*`` (``= na``
+                # above all), so the real value is computed in the body when the
+                # argument is omitted. The sentinel is a bare object() and matches
+                # no annotation -- type-checking it would reject every overload
+                # whose optional parameters the caller left out.
+                if all(_check_type(value, impl.type_hints[name], strict)
+                       for name, value in bound.arguments.items()
+                       if name in impl.type_hints and value is not __dyn_default__):
                     return impl
-
-    # Slower path: handle mixed args/kwargs and defaults
-    for impl in impls:
-        try:
-            bound = impl.sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-
-            # ``__dyn_default__`` marks a parameter DynamicDefaultTransformer
-            # took over: the declared default referenced ``lib.*`` (``= na``
-            # above all), so the real value is computed in the body when the
-            # argument is omitted. The sentinel is a bare object() and matches
-            # no annotation -- type-checking it would reject every overload
-            # whose optional parameters the caller left out.
-            if all(_check_type(value, impl.type_hints[name])
-                   for name, value in bound.arguments.items()
-                   if name in impl.type_hints and value is not __dyn_default__):
-                return impl
-        except TypeError:
-            continue
+            except TypeError:
+                continue
     return None
 
 
@@ -214,8 +284,10 @@ def _type_token(value: Any) -> Any:
     discriminates on, so that two arguments with equal tokens are
     interchangeable for implementation selection.
 
-    Scalars map to their type; NA carries its ``type`` marker; parameterized
-    containers sample one element, mirroring ``_check_type``'s element probe.
+    Scalars map to their type; NA carries its ``type`` marker; containers
+    tokenize one sampled element, mirroring ``_check_type``'s element probe --
+    recursively, because the sample can be an na or a container itself, and
+    ``type()`` alone would merge ``NA(int)`` with ``NA(str)``.
     The token is conservative: distinct tokens never merge arguments that
     ``_check_type`` could treat differently.
 
@@ -230,12 +302,16 @@ def _type_token(value: Any) -> Any:
     if t is dict:
         if value:
             _k, _v = next(iter(value.items()))
-            return dict, type(_k), type(_v)
+            return dict, _type_token(_k), _type_token(_v)
         return (dict,)
     if t is list or t is tuple:
         if value:
-            return t, type(value[0])
+            return t, _type_token(value[0])
         return (t,)
+    if t is Matrix:
+        if value.data and value.data[0]:
+            return Matrix, _type_token(value.data[0][0])
+        return (Matrix,)
     return t
 
 

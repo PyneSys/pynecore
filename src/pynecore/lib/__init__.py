@@ -2,7 +2,6 @@
 Builtin library of Pyne
 """
 from typing import TYPE_CHECKING, TypeAlias, Any
-from types import GenericAlias
 
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
@@ -768,16 +767,25 @@ def is_na(x: Any = None) -> bool | NA:
     """
     # The parameter is named ``x`` because Pine accepts ``na(x = close)`` as a
     # named argument, and the compiler emits Pine's own keyword verbatim.
+    # The branches are ordered by how often each face is called: a script tests
+    # float values on every bar, na sentinels far less often, and builds an na
+    # OF a type only where one is declared.
+    if isinstance(x, float):
+        return not _math.isfinite(x)
+    if isinstance(x, NA):
+        return True
     if x is None:
         return _na_none
-    # If the value is a type or GenericAlias (like list[float]), return NA of that type
-    if isinstance(x, (type, GenericAlias)) and x is not NA:
+    # A type or a subscripted generic builds an na of that type. The generic is
+    # matched on ``__origin__`` because that is what both kinds carry:
+    # ``list[float]`` is a types.GenericAlias while a subscripted user Generic
+    # like ``Matrix[float]`` is a typing._GenericAlias -- and the second one is
+    # what a ``matrix<float> m = na`` declaration produces.
+    if x is not NA and (isinstance(x, type) or getattr(x, '__origin__', None) is not None):
         # na.pyi deliberately types NA(x) as x itself (so na sentinels flow as
         # values in user scripts), which contradicts the honest annotation here
         return NA(x)  # pyright: ignore[reportReturnType]
-    if isinstance(x, float):
-        return not _math.isfinite(x)
-    return isinstance(x, NA) or x is NA
+    return x is NA
 
 
 # In Pine Script, na is both a property and a function; any narrower type than
