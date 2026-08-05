@@ -16,6 +16,7 @@ from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
+from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.ohlcv import restore_f32_volume
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
@@ -461,6 +462,25 @@ class DataRequirements:
     same_symbol_other_tf: list[SecurityRequirement]
     cross_symbol: list[SecurityRequirement]
     dynamic: list[SecurityRequirement]
+
+
+# noinspection PyProtectedMember
+def _drop_discarded_run(drawing_snapshot: DrawingSnapshot) -> None:
+    """
+    Undo what a discarded body execution left behind.
+
+    A bar's body runs again after every calc_on_order_fills fill and on every
+    live intra-bar tick, and only the last run counts.
+
+    :param drawing_snapshot: Snapshot taken before the bar's first execution
+    """
+    drawing_snapshot.restore()
+    # A repeated title is numbered against the bar's own plot data, so without
+    # this a re-executed bar exported the FIRST run's value under the real title
+    # and the later runs as ``<title> 0``, ``<title> 1`` columns of their own.
+    lib._plot_data.clear()
+    lib._viz_dyn.clear()
+    lib._viz_seq.clear()
 
 
 class ScriptRunner:
@@ -1683,11 +1703,18 @@ class ScriptRunner:
             is_live = lib._is_live
             # Indicators always run on every tick; strategies only if calc_on_every_tick
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
-            if (is_strat and self.script.calc_on_order_fills
-                    and not self.script.process_orders_on_close):
+            coof_active = (is_strat and self.script.calc_on_order_fills
+                           and not self.script.process_orders_on_close)
+            if coof_active:
                 var_snapshot = instance_state.RootVarSnapshot(root_keys)
-            elif is_live and run_on_every_tick:
+            elif is_live:
+                # Not only for every-tick execution: the live feed also continues
+                # the last warmup bar under its own timestamp, and that bar's
+                # warmup run has to be rolled back like any other discarded one.
                 var_snapshot = instance_state.RootVarSnapshot(root_keys)
+            # Rolled back wherever ``var_snapshot`` is, but never gated on
+            # ``has_vars``: a script with no var slots still draws.
+            drawing_snapshot = DrawingSnapshot()
 
             # --timeframe mode: magnifier_iter provides sub-TF data
             if self._magnifier_iter is not None:
@@ -1695,7 +1722,8 @@ class ScriptRunner:
                     # Bar magnifier: accurate order fills at sub-bar resolution
                     yield from self._run_iter_magnified(
                         lib, barstate, position, run_main, lib_mains, var_snapshot,
-                        is_strat=is_strat, on_progress=on_progress, string=string,
+                        drawing_snapshot, is_strat=is_strat, on_progress=on_progress,
+                        string=string,
                     )
                     return
                 else:
@@ -1793,21 +1821,33 @@ class ScriptRunner:
                 """COOF re-execution loop: process orders, re-execute on fills."""
                 # Broker mode: no synchronous fill-driven re-execution — exchange
                 # fills arrive asynchronously and are routed on the next sync.
-                if self._broker_mode:
+                # ``var_snapshot`` also exists for a live every-tick script that
+                # has calc_on_order_fills off, so the flag — not the snapshot —
+                # decides whether a fill re-runs the body.
+                if self._broker_mode or not coof_active:
                     self._process_orders(position)
                     return
                 sim = cast('SimPosition', position)
                 old_fills = sim._fill_counter
                 sim.process_orders()
                 new_fills = sim._fill_counter
+                if new_fills <= old_fills:
+                    return
+                # Nothing of this bar's body has run yet, so the drawings are still
+                # exactly what the bar started with. Saving here and not at the call
+                # site keeps a bar without a fill free of the cost.
+                drawing_snapshot.save()
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
+                    _drop_discarded_run(drawing_snapshot)
                     instance_state.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
                     sim.process_orders()
                     new_fills = sim._fill_counter
+                # The real execution of this bar follows
+                _drop_discarded_run(drawing_snapshot)
 
             # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
@@ -1815,18 +1855,26 @@ class ScriptRunner:
                 if self._broker_mode:
                     self._process_orders(position)
                     return
+                if not coof_active:  # see _coof_loop
+                    self._process_orders_magnified(position, sub_bars_list, aggregated_candle)
+                    return
                 sim = cast('SimPosition', position)
                 old_fills = sim._fill_counter
                 sim.process_orders_magnified(sub_bars_list, aggregated_candle)
                 new_fills = sim._fill_counter
+                if new_fills <= old_fills:
+                    return
+                drawing_snapshot.save()  # see _coof_loop
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
+                    _drop_discarded_run(drawing_snapshot)
                     instance_state.reset()
                     _run_libs_and_main()
                     old_fills = new_fills
                     sim.process_orders_magnified(sub_bars_list, aggregated_candle)
                     new_fills = sim._fill_counter
+                _drop_discarded_run(drawing_snapshot)
 
             # --- Peek-ahead pattern: historical bars ---
             # LIVE_TRANSITION doubles as end-of-data sentinel → next() always returns OHLCV
@@ -1898,6 +1946,16 @@ class ScriptRunner:
                         var_snapshot.restore()
                 elif is_strat and position and not lib._strategy_suppressed:
                     self._process_orders(position)
+
+                # The first live update usually carries this bar's timestamp
+                # (``download_ohlcv`` returns the still-open current bar), so the
+                # live loop treats its own runs as re-executions of this bar and
+                # rolls back to the state before it. The live branches snapshot
+                # only when a new bar opens, so this one has to be taken here.
+                if is_live and next_item is LIVE_TRANSITION:
+                    if var_snapshot and var_snapshot.has_vars:
+                        var_snapshot.save()
+                    drawing_snapshot.save()
 
                 # Execute libraries + script
                 _run_libs_and_main()
@@ -1998,6 +2056,9 @@ class ScriptRunner:
                 # instead of a fresh one.
                 last_bar_timestamp: int | None = last_warmup_timestamp
                 sub_bars: list[OHLCV] = []
+                # The warmup loop just executed that bar, so an update continuing
+                # it has a run to discard.
+                bar_executed = True
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
@@ -2037,9 +2098,19 @@ class ScriptRunner:
                     if is_new_bar and not bar_update.is_closed:
                         # ── Bar open (first intra-bar tick) ──
                         sub_bars = [candle]
+                        bar_executed = False
+                        # A timestamp is snapshotted once, here, and that snapshot
+                        # has to outlive the bar's close: providers keep emitting
+                        # non-closed updates under a closed bar's timestamp until
+                        # the next one opens (only duplicate *closed* bars are
+                        # filtered upstream), and such an update re-executes the
+                        # bar. Unconditional, because the standing snapshot may be
+                        # the one taken before the last warmup bar's body, which
+                        # this new bar must not roll back to.
+                        if var_snapshot and var_snapshot.has_vars:
+                            var_snapshot.save()
+                        drawing_snapshot.save()
                         if run_on_every_tick:
-                            if var_snapshot and var_snapshot.has_vars:
-                                var_snapshot.save()
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
                             # become visible to this script run via record_fill.
@@ -2047,6 +2118,7 @@ class ScriptRunner:
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                             _run_libs_and_main()
+                            bar_executed = True
                         last_bar_timestamp = candle.timestamp
 
                     elif not bar_update.is_closed:
@@ -2055,23 +2127,33 @@ class ScriptRunner:
                         if run_on_every_tick:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.restore()
+                            _drop_discarded_run(drawing_snapshot)
                             instance_state.reset()
                             if is_strat and position and self._broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                             _run_libs_and_main()
+                            bar_executed = True
 
                     elif bar_update.is_closed:
                         # ── Bar close ──
                         if is_new_bar:
                             sub_bars = []
+                            bar_executed = False
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.save()
+                            drawing_snapshot.save()
                         else:
                             sub_bars.append(candle)
-                            if run_on_every_tick:
+                            # Not ``run_on_every_tick``: without it the only run to
+                            # discard here is the warmup's own execution of this bar,
+                            # which the live feed is now continuing. ``reset()`` drops
+                            # the child function instances, so it must not fire when
+                            # nothing has run.
+                            if bar_executed:
                                 if var_snapshot and var_snapshot.has_vars:
                                     var_snapshot.restore()
+                                _drop_discarded_run(drawing_snapshot)
                                 instance_state.reset()
 
                         # Strategy not running on ticks: bar close is first execution
@@ -2178,17 +2260,23 @@ class ScriptRunner:
                             # Backtest: simulator first (fills the previous
                             # close's queue at this bar's open price), then
                             # script executes at this bar's close.
+                            # ``has_vars`` gates the variable rollback only: a
+                            # script with no var slots still has to re-execute
+                            # its body on a fill, exactly like the historical
+                            # path does.
                             if is_strat and position:
                                 if sub_bars:
-                                    if var_snapshot and var_snapshot.has_vars:
+                                    if var_snapshot:
                                         _coof_magnified_loop(sub_bars, candle)
-                                        var_snapshot.restore()
+                                        if var_snapshot.has_vars:
+                                            var_snapshot.restore()
                                     else:
                                         self._process_orders_magnified(position, sub_bars, candle)
                                 else:
-                                    if var_snapshot and var_snapshot.has_vars:
+                                    if var_snapshot:
                                         _coof_loop()
-                                        var_snapshot.restore()
+                                        if var_snapshot.has_vars:
+                                            var_snapshot.restore()
                                     else:
                                         self._process_orders(position)
 
@@ -2212,9 +2300,9 @@ class ScriptRunner:
                         if is_strat and position:
                             self._process_deferred_margin_call(position)
 
-                        # Commit state for next bar
-                        if var_snapshot and var_snapshot.has_vars:
-                            var_snapshot.save()
+                        # A late update repeating this timestamp finds a run to
+                        # discard; a new bar clears the flag again.
+                        bar_executed = True
 
                         # Output (only on closed bars)
                         _write_bar_output(candle)
@@ -2420,7 +2508,7 @@ class ScriptRunner:
 
     # noinspection PyProtectedMember
     def _run_iter_magnified(self, lib, barstate, position, run_main, lib_mains, var_snapshot,
-                            is_strat, on_progress, string):
+                            drawing_snapshot, is_strat, on_progress, string):
         """
         Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
         resolution, execute script once per chart bar.
@@ -2466,9 +2554,16 @@ class ScriptRunner:
                 position.process_orders_magnified(window.sub_bars, window.aggregated)
                 new_fills = position._fill_counter
 
+                # Nothing of this bar's body has run yet, so the drawings are
+                # still exactly what the bar started with; saving only when a
+                # fill arrived keeps an ordinary bar free of the cost.
+                re_executed = new_fills > old_fills
+                if re_executed:
+                    drawing_snapshot.save()
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
+                    _drop_discarded_run(drawing_snapshot)
                     instance_state.reset()
                     lib._lib_semaphore = True
                     for run_lib_main in lib_mains:
@@ -2481,6 +2576,8 @@ class ScriptRunner:
 
                 if var_snapshot.has_vars:
                     var_snapshot.restore()
+                if re_executed:
+                    _drop_discarded_run(drawing_snapshot)
             elif position:
                 position.process_orders_magnified(window.sub_bars, window.aggregated)
 
