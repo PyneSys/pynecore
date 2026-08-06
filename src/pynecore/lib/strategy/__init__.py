@@ -11,7 +11,7 @@ from bisect import insort, bisect_left
 
 from ...core.module_property import module_property
 from ... import lib
-from .. import syminfo
+from .. import request, syminfo
 
 from ...types.strategy import QtyType, ADOPTED_STARTUP_ENTRY_ID
 from ...types.base import IntEnum
@@ -29,7 +29,8 @@ __all__ = [
     "long", "short", 'direction',
 
     'Trade', 'Order', 'PositionBase', 'SimPosition',
-    "cancel", "cancel_all", "close", "close_all", "entry", "exit", "order",
+    "cancel", "cancel_all", "close", "close_all", "convert_to_account", "convert_to_symbol",
+    "entry", "exit", "order",
 
     "closedtrades", "opentrades",
 ]
@@ -3696,6 +3697,57 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
 
 
 # noinspection PyProtectedMember
+def _account_rate() -> float:
+    """
+    Exchange rate from the symbol's quote currency to the strategy's account currency.
+
+    :return: The rate, 1.0 when no conversion applies, na when no rate data is available
+    """
+    script = lib._script
+    if script is None:
+        return 1.0
+    account = str(script.currency)
+    symbol_cur = syminfo.currency
+    if account == 'NONE' or account == symbol_cur:
+        return 1.0
+    return request.currency_rate(symbol_cur, account)
+
+
+def convert_to_account(value: PyneFloat) -> PyneFloat:
+    """
+    Converts the value from the currency of the chart symbol to the currency of the strategy account.
+
+    :param value: The value to convert, in the symbol's quote currency
+    :return: The value expressed in the account currency
+    """
+    if not (value == value):  # is_na_arg
+        return na_float
+    rate = _account_rate()
+    if not (rate == rate):  # is_na_arg
+        return na_float
+    return value * rate
+
+
+def convert_to_symbol(value: PyneFloat) -> PyneFloat:
+    """
+    Converts the value from the currency of the strategy account to the currency of the chart symbol.
+
+    :param value: The value to convert, in the account currency
+    :return: The value expressed in the symbol's quote currency
+    """
+    # Measured on TradingView (FX:EURUSD 1D, currency=currency.EUR):
+    # convert_to_symbol(1.0) = 1.161710037175 is exactly 1 / 0.8608, the reciprocal of
+    # convert_to_account(1.0) — TV keeps ONE symbol->account rate and divides by it here,
+    # so the two directions stay exactly reciprocal.
+    if not (value == value):  # is_na_arg
+        return na_float
+    rate = _account_rate()
+    if not (rate == rate) or rate == 0.0:  # is_na_arg
+        return na_float
+    return value / rate
+
+
+# noinspection PyProtectedMember
 def _default_entry_budget(price: float) -> tuple[float, float] | None:
     """Money amount and per-unit cost of a default-sized entry at ``price``.
 
@@ -4574,6 +4626,25 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
 # noinspection PyProtectedMember
 @module_property
+def account_currency() -> PyneStr:
+    """
+    The currency of the strategy account, in which the monetary strategy values are expressed.
+
+    :return: The account currency code (e.g. "USD")
+    """
+    # Measured on TradingView (FX:EURUSD 1D): with the default currency=currency.NONE the
+    # account currency is the symbol's quote currency ("USD" on EURUSD); with
+    # currency=currency.EUR it is "EUR".
+    if lib._script is None:
+        return na_str
+    cur = str(lib._script.currency)
+    if cur == 'NONE':
+        return syminfo.currency
+    return cur
+
+
+# noinspection PyProtectedMember
+@module_property
 def avg_losing_trade() -> PyneFloat:
     if lib._script is None:
         return 0.0
@@ -4651,6 +4722,64 @@ def losstrades() -> int:
     if lib._script is None:
         return 0
     return lib._script.position.losstrades
+
+
+# noinspection PyProtectedMember
+@module_property
+def margin_liquidation_price() -> PyneFloat:
+    """
+    The price at which the margin call of the open position occurs.
+
+    :return: The margin call price, na while flat, when the position's side requires no
+             margin, or in live broker mode (the exchange owns the margin state)
+    """
+    # Measured on TradingView (BINANCE:BTCUSDT 1D and FX:EURUSD 1D, margin_long=25,
+    # margin_short=30): the value solves ``equity(P) = margin(P)`` with
+    # ``equity(P) = initial_capital + netprofit + sign * qty * pv * (P - avg_price)`` and
+    # ``margin(P) = margin% * qty * pv * P`` — the same balance ``_check_margin_call``
+    # compares — then snaps to the tick grid DIRECTIONALLY: a long position floors toward
+    # -inf (4933.3866 -> 4933.38 and -255066.6133 -> -255066.62, refuting both
+    # nearest-rounding and trunc-toward-zero), a short position ceils
+    # (160805.9538 -> 160805.96, 1.1935384 -> 1.19354). TV happily reports a negative
+    # price for an unreachable long liquidation. Flat bars and a zero margin percent on
+    # the position's side give na (margin_long=0 with an open long is na even while
+    # margin_short=30). The pointvalue factor follows the engine's other monetary
+    # values; the probe symbols have pointvalue 1.
+    script = lib._script
+    if script is None:
+        return 0.0
+    position = script.position
+    if not isinstance(position, SimPosition):
+        # Live broker mode: the exchange owns collateral, leverage and
+        # maintenance-margin tiers — strategy.margin_long/short and
+        # initial_capital + netprofit below do not describe them, so the
+        # backtest formula would fabricate an unrelated price.
+        return na_float
+    sign = position.sign
+    if sign == 0:
+        return na_float
+    margin_percent = script.margin_short if sign < 0 else script.margin_long
+    if margin_percent <= 0:
+        return na_float
+    margin_ratio = margin_percent / 100.0
+    qpv = abs(position.size) * syminfo.pointvalue
+    capital = script.initial_capital + position.netprofit
+    if sign > 0:
+        denom = qpv * (1.0 - margin_ratio)
+        if denom == 0.0:
+            return na_float
+        price = (qpv * position.avg_price - capital) / denom
+    else:
+        denom = qpv * (1.0 + margin_ratio)
+        price = (capital + qpv * position.avg_price) / denom
+    # Directional tick snap on the minmove/pricescale grid (same grid as _price_round,
+    # but with a true floor for longs — _price_round truncates toward zero instead).
+    pricescale = syminfo.pricescale
+    minmove = syminfo.minmove
+    tick_count = round(price * pricescale / minmove, 7)
+    if sign > 0:
+        return math.floor(tick_count) * minmove / pricescale
+    return math.ceil(tick_count) * minmove / pricescale
 
 
 # noinspection PyProtectedMember

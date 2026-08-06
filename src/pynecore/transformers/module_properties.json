@@ -2232,6 +2232,9 @@
     "abstractmethod": {
       "type": "variable"
     },
+    "account_currency": {
+      "type": "property"
+    },
     "avg_losing_trade": {
       "type": "property"
     },
@@ -2261,6 +2264,12 @@
     },
     "closedtrades": {
       "type": "property"
+    },
+    "convert_to_account": {
+      "type": "variable"
+    },
+    "convert_to_symbol": {
+      "type": "variable"
     },
     "copy": {
       "type": "variable"
@@ -2310,6 +2319,9 @@
     "losstrades": {
       "type": "property"
     },
+    "margin_liquidation_price": {
+      "type": "property"
+    },
     "math": {
       "type": "variable"
     },
@@ -2354,6 +2366,9 @@
     },
     "position_size": {
       "type": "property"
+    },
+    "request": {
+      "type": "variable"
     },
     "short": {
       "type": "variable"

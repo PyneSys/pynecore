@@ -790,7 +790,12 @@ def is_na(x: Any = None) -> bool | NA:
 
 # In Pine Script, na is both a property and a function; any narrower type than
 # Any produces false positives on one of its three faces (bare value, na(x)
-# predicate, na(type) constructor)
+# predicate, na(type) constructor). The bare-VALUE face never reaches this
+# object in transformed code: ModulePropertyTransformer rewrites a
+# value-position ``na`` to ``lib._na_none`` (the interned typeless NA), so this
+# name only ever gets CALLED — and stays a plain function, the fastest callable
+# there is. Calling lib functions with this object from plain Python (outside
+# the @pyne transform) is therefore NOT a supported na-value spelling.
 na: Any = is_na
 
 
