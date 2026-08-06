@@ -67,14 +67,12 @@ def __test_bar_magnifier_matches_tradingview__(script_path, module_key, csv_read
             magnifier_iter=ohlcv_iter,
         )
 
-        trade_iter = iter(cr_trades)
         trade_count = 0
 
-        for candle, plot, new_closed in runner.run_iter():
-            for trade in new_closed:
-                good_entry = next(trade_iter)
-                good_exit = next(trade_iter)
-                strat_equity_comparator(trade, good_entry.extra_fields, good_exit.extra_fields)
-                trade_count += 1
+        with strat_equity_comparator(cr_trades) as reference:
+            for candle, plot, new_closed in runner.run_iter():
+                for trade in new_closed:
+                    reference.compare(trade)
+                    trade_count += 1
 
     assert trade_count > 0, "Expected at least one trade"

@@ -47,9 +47,7 @@ def __test_slippage_basic__(csv_reader, runner, strat_equity_comparator):
     with csv_reader('slippage_basic_ohlcv.csv', subdir="data") as cr, \
             csv_reader('slippage_basic_trades.csv', subdir="data") as cr_equity:
         r = runner(cr, syminfo_override=dict(timezone="US/Eastern", type="forex"))
-        equity_iter = iter(cr_equity)
-        for i, (candle, plot, new_closed_trades) in enumerate(r.run_iter()):
-            for trade in new_closed_trades:
-                good_entry = next(equity_iter)
-                good_exit = next(equity_iter)
-                strat_equity_comparator(trade, good_entry.extra_fields, good_exit.extra_fields)
+        with strat_equity_comparator(cr_equity) as reference:
+            for candle, plot, new_closed_trades in r.run_iter():
+                for trade in new_closed_trades:
+                    reference.compare(trade)

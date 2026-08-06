@@ -1,5 +1,6 @@
 from typing import cast, Protocol, Callable, Iterable, Any, Generator
 from typing import TYPE_CHECKING
+from contextlib import contextmanager, AbstractContextManager
 import ast
 import re
 import sys
@@ -60,8 +61,13 @@ class LogComparatorProtocol(Protocol):
         ...
 
 
+class StratTradeReferenceProtocol(Protocol):
+    def compare(self, trade: 'Trade') -> None:
+        ...
+
+
 class StratEquityComparatorProtocol(Protocol):
-    def __call__(self, trade: 'Trade', good_entry: dict[str, Any], good_exit: dict[str, Any]) -> None:
+    def __call__(self, csv_reader: CSVReader) -> AbstractContextManager[StratTradeReferenceProtocol]:
         ...
 
 
@@ -514,13 +520,16 @@ def log_comparator(capsys) -> LogComparatorProtocol:
 
 @pytest.fixture(scope="function")
 def strat_equity_comparator() -> StratEquityComparatorProtocol:
+    """Compare a run's closed trades against a TradingView trade-list export.
+
+    Used as a context manager over the reference CSV; every closed trade of the
+    run is handed to ``compare()`` in order, and leaving the block requires the
+    whole reference to have been consumed.
+    """
     from pynecore.lib import string
     from datetime import datetime
 
-    def _comparator(trade: 'Trade', good_entry: dict[str, Any], good_exit: dict[str, Any], **__):
-        # Skip trades where exit Signal is "Open" (TradingView backtest end artifact)
-        if good_exit.get('Signal') == 'Open':
-            return  # Skip validation for this trade
+    def _compare_trade(trade: 'Trade', good_entry: dict[str, Any], good_exit: dict[str, Any]):
         # Field mapping: TradingView export names -> PyneCore field names
         tv_to_pynecore = {
             'P&L %': 'Profit %',
@@ -600,7 +609,55 @@ def strat_equity_comparator() -> StratEquityComparatorProtocol:
         # assert math.isclose(trade.max_runup_percent, float(good_exit['Run-up %']), abs_tol=0.01)
         # assert math.isclose(trade.max_drawdown_percent, float(good_exit['Drawdown %']), abs_tol=0.01)
 
-    return cast(StratEquityComparatorProtocol, _comparator)
+    class _Reference:
+        """The closed trades of a TradingView trade-list export, in order."""
+
+        def __init__(self, rows: list[Any]):
+            # A trade occupies two consecutive rows of the export, an entry fill
+            # followed by its exit fill. The ``Trade #`` column that groups them
+            # is not readable here -- CSVReader only keeps the columns it does
+            # not consume as OHLCV -- but the pairing is implicit in the order.
+            self.closed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            entry: dict[str, Any] | None = None
+            for row in rows:
+                fields = row.extra_fields
+                if 'Entry' in fields.get('Type', ''):
+                    entry = fields
+                    continue
+                if entry is None:
+                    continue
+                # A position still open when the backtest ends has no exit fill to
+                # compare against: TradingView marks its exit row with the "Open"
+                # signal. PyneCore emits no closed trade for it, so it is not a
+                # miss -- an entry left without any exit row is open the same way.
+                if fields.get('Signal', '').strip() != 'Open':
+                    self.closed.append((entry, fields))
+                entry = None
+            self.compared = 0
+
+        def compare(self, trade: 'Trade') -> None:
+            """Compare the next closed trade against its reference row pair."""
+            assert self.compared < len(self.closed), (
+                f"PyneCore closed more trades than the reference has: "
+                f"trade #{self.compared + 1} of {len(self.closed)} reference trades"
+            )
+            good_entry, good_exit = self.closed[self.compared]
+            self.compared += 1
+            _compare_trade(trade, good_entry, good_exit)
+
+    @contextmanager
+    def _reference(csv_reader: CSVReader):
+        reference = _Reference(list(csv_reader))
+        yield reference
+        # Reached only on a clean exit, so a failed comparison keeps its own
+        # assertion. Trades missing from the TAIL of the run would otherwise go
+        # unnoticed: the loop simply stops pulling reference rows.
+        assert reference.compared == len(reference.closed), (
+            f"only {reference.compared} of the reference's {len(reference.closed)} "
+            f"closed trades were compared"
+        )
+
+    return cast(StratEquityComparatorProtocol, _reference)
 
 
 @pytest.fixture(scope="function")
