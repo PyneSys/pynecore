@@ -5,7 +5,7 @@ title: "request"
 description: "Data requests from other symbols and timeframes"
 icon: "cloud_download"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -195,8 +195,21 @@ Requests data from Nasdaq Data Link (formerly Quandl).
 
 Requests data from user-maintained GitHub repositories (Pine Seeds).
 
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| source | str | Seed repository name (e.g. `"seed_crypto_santiment"`) |
+| symbol | str | Data series name within the repository |
+| expression | series or tuple | Expression evaluated in the seed context |
+| ignore_invalid_symbol | bool | Return `na` for invalid symbols |
+| calc_bars_count | int | Number of bars to calculate (unused) |
+
+**Returns:** `na`, or a tuple of `na` when `expression` is a tuple.
+
 **Note:** Seed repositories are unavailable to PyneCore. The function returns `na`, allowing scripts
-that guard the result with `na()` to take their fallback path.
+that guard the result with `na()` to take their fallback path. A tuple expression keeps its arity, so
+`devAct, devActSMA = request.seed(src, sym, (close, ta.sma(close, 10)))` unpacks into two `na` values
+instead of failing. An array expression yields a single `na`, matching TradingView, where calling an
+array function on the result halts the script.
 
 ### footprint()
 

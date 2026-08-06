@@ -246,8 +246,17 @@ def seed(source=None, symbol=None, expression=None,
     :param expression: Expression to evaluate in the seed context
     :param ignore_invalid_symbol: If True, return na for invalid symbols
     :param calc_bars_count: Number of bars to calculate (unused)
-    :return: na — seed data is not available in PyneCore
+    :return: na, or a tuple of na when ``expression`` is a tuple
     """
+    # A tuple expression yields a tuple in Pine, so the na fallback has to keep the
+    # arity -- otherwise the compiled ``a, b = request.seed(...)`` destructuring dies
+    # with "na is not iterable" instead of handing the script two na values.
+    # Only a tuple, never a list: PyneComp compiles a Pine tuple expression to a tuple
+    # literal, while a Pine array arrives as a plain list. Measured on TradingView
+    # (BINANCE:BTCUSDT 1D): an array expression is legal and returns a single na array
+    # id -- array.size() on it halts with RE10052 -- so it must stay one na here too.
+    if isinstance(expression, tuple):
+        return tuple(NA(None) for _ in expression)
     return NA(None)
 
 
