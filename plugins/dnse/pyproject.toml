@@ -8,9 +8,17 @@ version = "0.1.0"
 description = "DNSE (Vietnam) data provider and broker plugin for PyneCore"
 requires-python = ">=3.11"
 dependencies = [
-    # v2 vendors DNSE's official openapi-sdk 2.0.0 (python/dnse) — see the vendor
-    # note below. Its runtime HTTP deps are pinned here once the vendor lands.
+    # Runtime deps of the vendored DNSE openapi-sdk (pynecore_dnse/_vendor/dnse).
+    # The REST client (DNSEClient) uses stdlib urllib only; these are for the WS
+    # TradingClient, which the SDK's package __init__ imports eagerly:
+    "msgpack>=1.0",
+    "websockets>=12",
+    "certifi",
 ]
+# Framework dep for a standalone install: pynesys-pynecore>=6.7. Intentionally
+# NOT declared here — this plugin is developed inside the pynecore fork (editable
+# install), and declaring it risks pip pulling upstream over the fork. Add when
+# packaging for external distribution.
 
 # v2: the DNSE SDK will be vendored from github.com/dnse-tech/openapi-sdk
 # (python/dnse, v2.0.0) — the official "sample SDK" that natively drives the

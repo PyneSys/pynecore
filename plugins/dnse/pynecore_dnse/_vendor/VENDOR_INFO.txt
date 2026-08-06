@@ -1,0 +1,18 @@
+Vendored: DNSE official OpenAPI SDK ("sample SDK")
+Source:   https://github.com/dnse-tech/openapi-sdk  (python/dnse)
+Tag:      v2.0.0
+Commit:   1532e33470cca87210363e892a9e9960a4806508
+Vendored: 2026-08-06
+
+Why vendored (not pip): per project policy, the DNSE SDK source is vendored, not
+pip-installed. This is the OFFICIAL SDK recommended by DNSE's changelog/versioning
+guide for the account-scoped conditional-order endpoints (orderCategory=STOP/OCO);
+its DNSEClient defaults to API version 2026-07-23 (see dnse/api/common.py).
+
+Contents:
+  dnse/api/        REST client (DNSEClient) — stdlib urllib only, no 3rd-party deps
+  dnse/websocket/  WS TradingClient — needs websockets, certifi, msgpack
+
+Imported via pynecore_dnse/_sdk.py (prepends this dir to sys.path so the vendored
+'dnse' package wins). To update: re-copy python/dnse from a newer tag and bump the
+Tag/Commit above.
