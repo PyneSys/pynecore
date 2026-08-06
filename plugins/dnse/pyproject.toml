@@ -7,11 +7,20 @@ name = "pynecore-dnse"
 version = "0.1.0"
 description = "DNSE (Vietnam) data provider and broker plugin for PyneCore"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    # v2 vendors DNSE's official openapi-sdk 2.0.0 (python/dnse) — see the vendor
+    # note below. Its runtime HTTP deps are pinned here once the vendor lands.
+]
 
-[project.entry-points."pyne.plugin"]
-dnse = "pynecore_dnse.provider:DNSEProvider"
-dnse_broker = "pynecore_dnse.broker:DNSEBroker"
+# v2: the DNSE SDK will be vendored from github.com/dnse-tech/openapi-sdk
+# (python/dnse, v2.0.0) — the official "sample SDK" that natively drives the
+# account-scoped conditional-order endpoints (orderCategory=STOP/OCO) with a
+# default `version` header of 2026-07-23. Not pip-installed ("don't trust pip").
+
+# Entry points are disabled until the v2 provider/broker modules land:
+# [project.entry-points."pyne.plugin"]
+# dnse = "pynecore_dnse.provider:DNSEProvider"
+# dnse_broker = "pynecore_dnse.broker:DNSEBroker"
 
 [tool.setuptools.packages.find]
 include = ["pynecore_dnse*"]
