@@ -2251,7 +2251,7 @@ class SimPosition(PositionBase):
         order.deferred_qty = False
         old_abs = abs(order.size)
         qty = _default_entry_qty(float(fill_price))
-        if qty <= 0.0:
+        if not (0.0 < qty < math.inf):  # unsizable_qty
             order.size = 0.0
             return
         size = _size_round((qty + order.flip_extra) * order.sign)
@@ -4049,8 +4049,17 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             market_sizing_price = float(exec_price)
         qty = _default_entry_qty(exec_price)
 
-    # qty must be greater than 0
-    if qty <= 0.0:
+    # qty must be a positive FINITE number. The range test also drops NaN and
+    # infinity, which a plain ``qty <= 0.0`` test lets through: default sizing
+    # hands back NaN when it has nothing to compute from (an na
+    # ``default_qty_value``, or an equity gone NaN), and both non-finite values
+    # then blow up the integer conversion inside ``_size_round`` /
+    # ``_judge_money_entry``, halting the whole script. An unsizable order is
+    # dropped like a zero-sized one below. This is PyneCore robustness, not a
+    # TradingView rule: ``default_qty_value`` is a const float that rejects na at
+    # compile time (CE10034 on a TV probe), so a compiled script cannot reach
+    # this state -- hand-written Pyne code can.
+    if not (0.0 < qty < math.inf):  # unsizable_qty
         return
 
     size = qty * direction_sign
@@ -4513,8 +4522,9 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             market_sizing_price = exec_price
         qty = _default_entry_qty(exec_price)
 
-    # qty must be greater than 0
-    if qty <= 0.0:
+    # qty must be a positive finite number; an unsizable NaN or infinite qty is
+    # dropped with the non-positive ones (see strategy.entry)
+    if not (0.0 < qty < math.inf):  # unsizable_qty
         return
 
     size = qty * direction_sign
@@ -4523,9 +4533,14 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # This is a key difference - strategy.order can open unlimited trades in the same direction
     # It uses _order_type_normal to distinguish it from entry/exit orders
 
-    size = _size_round(size)
-    if size == 0.0:
-        return
+    # The Pine-side lot floor is a backtest-only quantization (see strategy.entry):
+    # in broker mode the venue owns the quantity grid, so keep the raw requested
+    # qty and let the plugin's preflight report a below-minimum skip instead of
+    # silently dropping a live signal here.
+    if isinstance(position, SimPosition):
+        size = _size_round(size)
+        if size == 0.0:
+            return
 
     # Market orders keep their placement-close sizing (price-based orders
     # re-resolve at fill), so the big-money sizing gate is judged here.

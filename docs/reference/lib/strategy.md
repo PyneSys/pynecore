@@ -5,7 +5,7 @@ title: "strategy"
 description: "Strategy order management — entry, exit, close, and order functions"
 icon: "trending_up"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -193,9 +193,9 @@ orders but does not dispatch order-fill alerts, so the parameter has no addition
 
 | Name | Type | Description |
 |------|------|-------------|
-| position_size | float | Current position size (> 0 = long, < 0 = short, 0 = flat). Returns `NaN` if no position. |
+| position_size | float | Current position size (> 0 = long, < 0 = short, 0 = flat). |
 | position_avg_price | float | Average entry price of current position. Returns `NaN` if flat. |
-| opentrades | int | Count of open (unfilled entry) positions. |
+| opentrades | int | Count of currently open (filled, not yet closed) trades. Pending orders are not counted. |
 | openprofit | float | Current unrealized P&L for all open positions in currency units. |
 | closedtrades | int | Total count of closed trades for the entire trading range. |
 | wintrades | int | Count of winning trades. |
@@ -232,3 +232,9 @@ orders but does not dispatch order-fill alerts, so the parameter has no addition
 - `strategy.max_contracts_held_*` — Maximum contract tracking variables
 - All percentage variables: `strategy.netprofit_percent`, `strategy.grossprofit_percent`, `strategy.grossloss_percent`, `strategy.openprofit_percent`, `strategy.avg_trade_percent`, `strategy.avg_winning_trade_percent`, `strategy.avg_losing_trade_percent`
 - `strategy.position_entry_name` — Entry order name for current position
+
+**Order sizing:**
+- Only a positive, finite `qty` is placed. A quantity that cannot be sized — `na` or infinite — is
+  dropped like a non-positive one. This also covers a default-sized order whose size resolves to
+  `na`, for example `default_qty_value=na` with `strategy.percent_of_equity` sizing. Pine Script
+  rejects an `na` `default_qty_value` at compile time, so this only concerns hand-written Pyne code.
