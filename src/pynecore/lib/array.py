@@ -18,6 +18,7 @@ from ..types.box import Box
 from ..types.line import Line
 from ..types.label import Label
 from ..types.linefill import LineFill
+from ..types.table import Table
 from . import order as _order
 
 T = TypeVar('T')
@@ -58,6 +59,7 @@ __all__ = [
     'new_line',
     'new_linefill',
     'new_string',
+    'new_table',
     'percentile_linear_interpolation',
     'percentile_nearest_rank',
     'percentrank',
@@ -637,6 +639,21 @@ def new_linefill(size: int | NA = 0,
     """
     size = _na_size(size)
     assert isinstance(initial_value, (LineFill, NA)), "Initial value must be LineFill!"
+    return [initial_value] * size
+
+
+# noinspection PyShadowingNames
+def new_table(size: int | NA = 0, initial_value: Table = NA(Table)) -> list[Table]:
+    """
+    Creates a new array of table objects of the specified size, with each element initialized
+    to the specified value.
+
+    :param size: Size of the new array
+    :param initial_value: Initial value to set for each element in the array
+    :return: New array of table objects
+    """
+    size = _na_size(size)
+    assert isinstance(initial_value, (Table, NA)), "Initial value must be Table!"
     return [initial_value] * size
 
 

@@ -87,13 +87,17 @@ def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color 
 
 
 # noinspection PyShadowingNames
-def rgb(red: int, green: int, blue: int, transp: float = 0) -> Color:
+def rgb(red: float | NA[float], green: float | NA[float], blue: float | NA[float],
+        transp: float | NA[float] = 0) -> Color:
     """
     Return a new color with the given RGB values and transparency
 
-    :param red: Red value
-    :param green: Green value
-    :param blue: Blue value
+    Fractional values are truncated, out of range values are clipped, and an na value
+    counts as 0 for a channel and as fully transparent for the transparency.
+
+    :param red: Red value (0-255)
+    :param green: Green value (0-255)
+    :param blue: Blue value (0-255)
     :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
     """
     return Color.rgb(red, green, blue, transp)

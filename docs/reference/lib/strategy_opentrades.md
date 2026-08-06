@@ -5,7 +5,7 @@ title: "strategy.opentrades"
 description: "Information about open trades in a strategy"
 icon: "assignment"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -228,7 +228,25 @@ Returns the maximum unrealized loss during the open trade as a percentage of ent
 max_loss_pct: float = strategy.opentrades.max_drawdown_percent(0)  # -3.25
 ```
 
+## Variables
+
+| Name | Type | Description |
+|------|------|-------------|
+| capital_held | float | Capital held by the open trades, in currency units. |
+
+`capital_held` is the summed entry value of the open trades (`abs(size) * entry price`), so it does
+not follow the market and a short trade contributes to it just like a long one. It is `0.0` while
+the strategy is flat. The `margin_long` / `margin_short` percentages do not scale it, but a strategy
+that requires no margin at all (`margin_long=0` **and** `margin_short=0`) reports `na` on every bar.
+
+Like every other monetary strategy value, it is expressed in the symbol's quote currency scaled by
+`syminfo.pointvalue`. PyneCore does not convert monetary results to a `currency=` account currency —
+see the compatibility notes of [strategy](strategy.md#compatibility).
+
+```python
+held: float = strategy.opentrades.capital_held  # 50000.09
+```
+
 ## Compatibility
 
-**Not available in PyneCore:**
-- `strategy.opentrades.capital_held` — Not yet implemented
+Every Pine Script `strategy.opentrades` function and variable is implemented.

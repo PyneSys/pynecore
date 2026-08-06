@@ -1,6 +1,7 @@
 from ...types.na import NA, na_float
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
+from .. import syminfo
 
 from ...core.module_property import module_property
 
@@ -259,3 +260,36 @@ def opentrades() -> int:
         return 0
     position = lib._script.position
     return len(position.open_trades)
+
+
+# noinspection PyProtectedMember
+@module_property
+def capital_held() -> PyneFloat:
+    """
+    The capital the open trades hold, in currency units.
+
+    :return: The summed entry value of the open trades, 0 while flat, na when the strategy
+             requires no margin at all
+    """
+    # Like every other monetary strategy value this is the symbol's quote currency scaled by
+    # pointvalue -- the engine performs no `currency=` account-currency conversion anywhere.
+    # Measured on TradingView (BINANCE:BTCUSDT 1D, pyramiding 3): the value is the
+    # sum of |size| * entry price over the open trades. It does not follow the
+    # market, and a short trade contributes positively. TradingView keeps a running
+    # accumulator instead of re-summing, so its flat state carries a float residue
+    # (3.6e-12 measured) where this fresh sum gives an exact 0.0.
+    # The margin percentages do NOT scale the value: margin_long=50/margin_short=25 and
+    # margin_long=50/margin_short=0 both report the full entry value. Only the fully
+    # unfunded configuration is special -- with margin_long=0 AND margin_short=0
+    # TradingView reports na on every bar, flat ones included.
+    # The pointvalue factor is not separately measured -- the probe symbol has
+    # pointvalue 1 -- it follows how the engine scales its other monetary values.
+    if lib._script is None or lib._script.position is None:
+        return 0.0
+    if lib._script.margin_long <= 0.0 and lib._script.margin_short <= 0.0:
+        return na_float
+    pv = syminfo.pointvalue
+    total = 0.0
+    for trade in lib._script.position.open_trades:
+        total += abs(trade.size) * trade.entry_price * pv
+    return total

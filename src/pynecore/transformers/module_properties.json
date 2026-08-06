@@ -237,6 +237,9 @@
     "SequenceView": {
       "type": "variable"
     },
+    "Table": {
+      "type": "variable"
+    },
     "abs": {
       "type": "variable"
     },
@@ -346,6 +349,9 @@
       "type": "variable"
     },
     "new_string": {
+      "type": "variable"
+    },
+    "new_table": {
       "type": "variable"
     },
     "percentile_linear_interpolation": {
@@ -2494,6 +2500,9 @@
     "PyneStr": {
       "type": "variable"
     },
+    "capital_held": {
+      "type": "property"
+    },
     "commission": {
       "type": "variable"
     },
@@ -2540,6 +2549,9 @@
       "type": "variable"
     },
     "size": {
+      "type": "variable"
+    },
+    "syminfo": {
       "type": "variable"
     }
   },

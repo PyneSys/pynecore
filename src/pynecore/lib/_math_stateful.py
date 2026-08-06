@@ -37,7 +37,10 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
     """
     prng: Persistent[_PineRandom | None] = None
     if prng is None:  # Lazy init: the PRNG must not be created before the seed is known
-        prng = _PineRandom(seed)
+        # The seed defaults to na, which means "unseeded": the generator then
+        # starts from the clock. Handing the na to the PRNG would XOR it into the
+        # state and every single draw would come back na.
+        prng = _PineRandom(seed if seed == seed else None)  # is_na_arg
     res = prng.random(min, max)
     return res
 

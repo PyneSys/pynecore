@@ -121,6 +121,15 @@ Creates a new linefill array.
 | initial_value | linefill | Initial value for all elements, default na |
 | **Returns** | list[linefill] | New linefill array |
 
+#### `new_table(size, initial_value)`
+Creates a new table array.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| size | int | Initial size, default 0 |
+| initial_value | table | Initial value for all elements, default na |
+| **Returns** | list[table] | New table array |
+
 #### `from_items(*items)`
 Creates an array from the specified elements. (In Pine Script this is `array.from()`, but `from` is a reserved keyword in Python.)
 
@@ -577,6 +586,5 @@ The following Pine Script array functions are not available in PyneCore:
 
 - `array.from` — Use `array.from_items()` instead (in PyneCore, `from` is a reserved keyword)
 - `array.new<type>` — Use specific type constructors like `array.new_float()`
-- `array.new_table` — Not supported
 
 All other array functions are fully implemented.

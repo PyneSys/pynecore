@@ -5,7 +5,7 @@ title: "color"
 description: "Color functions and color constants"
 icon: "palette"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-08-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -125,12 +125,16 @@ Creates a new color from RGB component values with optional transparency.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| red | int | Red value (0-255) |
-| green | int | Green value (0-255) |
-| blue | int | Blue value (0-255) |
+| red | float | Red value (0-255) |
+| green | float | Green value (0-255) |
+| blue | float | Blue value (0-255) |
 | transp | float | Transparency percentage (0-100, default 0) |
 
 **Returns:** `Color` — Color with the specified RGB values and transparency
+
+A fractional value is truncated (`127.5` gives `127`, not `128`), a value outside its range is
+clipped to the nearest end, and an `NA` argument counts as `0` for a channel and as fully
+transparent for the transparency.
 
 ```python
 orange: Color = color.rgb(255, 165, 0)

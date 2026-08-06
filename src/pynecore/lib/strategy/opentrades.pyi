@@ -9,6 +9,12 @@ class OpenTradesModule(int):
     def __call__(self) -> int: ...
 
     #
+    # Variables
+    #
+
+    capital_held: PyneFloat
+
+    #
     # Functions
     #
 

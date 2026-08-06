@@ -1,3 +1,19 @@
+def _channel(value: float) -> int:
+    """
+    Bring a Pine rgb channel argument into the 0-255 integer range.
+
+    :param value: Channel value, possibly fractional, out of range or na
+    :return: The channel as an integer between 0 and 255
+    """
+    if not (value == value):  # is_na_arg
+        return 0
+    if value <= 0:
+        return 0
+    if value >= 255:
+        return 255
+    return int(value)
+
+
 class Color:
     """
     Color class that stores RGBA values in a single 32-bit integer.
@@ -89,9 +105,12 @@ class Color:
         self.value = (self.value & 0xFFFFFF00) | int((1 - transp / 100.0) * 255)
 
     @classmethod
-    def rgb(cls, r: int, g: int, b: int, transp: float = 0) -> 'Color':
+    def rgb(cls, r: float, g: float, b: float, transp: float = 0) -> 'Color':
         """
         Create a Color object from RGB values and transparency.
+
+        Fractional arguments are truncated, out of range arguments are clipped, and an
+        na argument counts as 0 for a channel and as fully transparent for ``transp``.
 
         :param r: Red component (0-255)
         :param g: Green component (0-255)
@@ -99,6 +118,16 @@ class Color:
         :param transp: Transparency percentage (0-100, 0: not transparent, 100: invisible)
         :return: Color object
         """
-        if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
-            raise ValueError("RGB values must be between 0 and 255")
-        return cls(f'#{r:02X}{g:02X}{b:02X}{int((1 - transp / 100.0) * 255):02X}')
+        # Measured on TradingView (BINANCE:BTCUSDT 1D): a fractional channel is
+        # TRUNCATED, not rounded (127.4/127.5/127.6 all give 127, 126.5 gives 126,
+        # 254.7 gives 254), every argument is clipped instead of rejected (300 -> 255,
+        # -20 -> 0, transp 110 -> 100, transp -10 -> 0), and an na argument yields a
+        # solid color: an na channel reads back as 0, an na transparency as 100.
+        if not (transp == transp):  # is_na_arg
+            transp = 100.0
+        elif transp <= 0:
+            transp = 0.0
+        elif transp >= 100:
+            transp = 100.0
+        return cls(f'#{_channel(r):02X}{_channel(g):02X}{_channel(b):02X}'
+                   f'{int((1 - transp / 100.0) * 255):02X}')

@@ -2,9 +2,10 @@
 @pyne
 
 Direct unit tests for the typed-array constructors of drawing-object types
-(`array.new_box`, `array.new_line`, `array.new_label`, `array.new_linefill`).
+(`array.new_box`, `array.new_line`, `array.new_label`, `array.new_linefill`,
+`array.new_table`).
 
-These do not go through the Pine runner; they verify the four functions return
+These do not go through the Pine runner; they verify the functions return
 `list[T]` of the requested size, matching the `new_bool`/`new_int`/`new_float`
 pattern. Pine's `array.new<box>(size, initial_value)` semantics is "create an
 array of N box references", not "create one box".
@@ -14,6 +15,7 @@ from pynecore.types.box import Box
 from pynecore.types.line import Line
 from pynecore.types.label import Label
 from pynecore.types.linefill import LineFill
+from pynecore.types.table import Table
 from pynecore.types.na import NA
 
 
@@ -83,6 +85,19 @@ def __test_new_linefill_with_size__():
         assert isinstance(el, NA)
 
 
+def __test_new_table_zero_arg__():
+    """ array.new_table() returns an empty list """
+    assert array.new_table() == []
+
+
+def __test_new_table_with_size__():
+    """ array.new_table(N) returns N NA(Table) elements """
+    result = array.new_table(3)
+    assert len(result) == 3
+    for el in result:
+        assert isinstance(el, NA)
+
+
 def __test_new_with_na_size_is_empty__():
     """ A na size (Pine's ``array.new<line>(na)`` idiom) yields an empty array.
 
@@ -93,6 +108,7 @@ def __test_new_with_na_size_is_empty__():
     assert array.new_line(NA(Line)) == []
     assert array.new_label(NA(Label)) == []
     assert array.new_linefill(NA(LineFill)) == []
+    assert array.new_table(NA(Table)) == []
     assert array.new(NA(None)) == []
     assert array.new_int(NA(int)) == []
     assert array.new_float(NA(float)) == []
