@@ -193,15 +193,6 @@ def __test_execute_exit_tp_only_is_normal_lo__(fake_client, tmp_path):
     assert orders[0].id == "6"
 
 
-@pytest.mark.xfail(
-    strict=True, raises=TypeError,
-    reason="PRODUCT BUG: broker.py execute_exit raises "
-           "OrderSkippedByPlugin('...') with only the positional message, but "
-           "OrderSkippedByPlugin.__init__ (pynecore.core.broker.exceptions) now "
-           "requires a keyword-only `intent_key` argument -> TypeError instead "
-           "of the intended graceful skip for a no-tp/no-sl exit (e.g. a "
-           "trailing-only strategy.exit()). Do not weaken this assertion; fix "
-           "is to pass intent_key=envelope.intent.intent_key at the call site.")
 def __test_execute_exit_neither_tp_nor_sl_is_skipped__(fake_client, tmp_path):
     b = _broker(fake_client, tmp_path)
     envelope = _envelope(ExitIntent(pine_id="X", from_entry="L", symbol="VN30F1M", side="sell",

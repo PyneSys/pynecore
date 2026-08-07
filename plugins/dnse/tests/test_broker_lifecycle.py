@@ -465,16 +465,15 @@ def __test_account_id_raises_runtime_error_on_non200_or_non_dict__(fake_client, 
     assert str(status) in str(exc_info.value)
 
 
-def __test_account_id_dict_body_missing_accounts_key_leaks_keyerror__(fake_client, tmp_path):
-    """PRODUCT BUG: a 200 response whose dict body has no "accounts" key passes
-    the `isinstance(body, dict)` guard (so the documented RuntimeError contract
-    never fires), and `body["accounts"][0]["id"]` then raises a raw, unclassified
-    KeyError instead. A caller written against the documented "non-200/malformed
-    -> RuntimeError" contract would NOT catch this. See the writer's final report."""
+@pytest.mark.parametrize("body", [{}, {"accounts": []}])
+def __test_account_id_missing_or_empty_accounts_raises_runtimeerror__(fake_client, tmp_path, body):
+    """A 200 whose body lacks (or empties) "accounts" must raise the documented
+    RuntimeError, not a raw KeyError/IndexError — the guard now covers the
+    missing/empty-accounts shape, not just non-200/non-dict."""
     b = _bare_broker(tmp_path, account_no="")
-    b._client = fake_client(get_accounts=(200, {}))
+    b._client = fake_client(get_accounts=(200, body))
 
-    with pytest.raises(KeyError):
+    with pytest.raises(RuntimeError):
         _ = b.account_id
 
 
