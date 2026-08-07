@@ -134,9 +134,10 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             self._account_no = self.config.account_no
             return self._account_no
         status, body = self.client.get_accounts()
-        if status != 200 or not isinstance(body, dict):
+        accounts = (body.get("accounts") or []) if isinstance(body, dict) else []
+        if status != 200 or not accounts:
             raise RuntimeError(f"cannot resolve account: {status} {body}")
-        self._account_no = body["accounts"][0]["id"]
+        self._account_no = accounts[0]["id"]
         return self._account_no
 
     def _token(self) -> str:
@@ -470,7 +471,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                                leg_type=LegType.TAKE_PROFIT)
         raise OrderSkippedByPlugin(
             "DNSE plugin cannot express this exit: no tp_price/sl_price "
-            "(trailing stops are not implemented)")
+            "(trailing stops are not implemented)",
+            intent_key=getattr(intent, "intent_key", ""))
 
     @override
     async def execute_close(self, envelope) -> ExchangeOrder:
