@@ -172,6 +172,39 @@ def __test_grid_stamp_snaps_delta_prices_to_full_precision__(tmp_path: Path):
         assert reader.read(0).low != 65_399.99
 
 
+def __test_grid_stamp_snaps_the_base_price_too__(tmp_path: Path):
+    """A base one f64 ulp off the grid snaps like the deltas, so the bar stays valid.
+
+    A feed can answer the four prices from four separate requests and hand back an
+    ``open`` one ulp above a ``high`` the bar actually opened at. The delta-decoded
+    high/low/close land on the grid; an unsnapped base then reads back ABOVE its own
+    high and the file no longer round-trips through the writer's OHLC check.
+    """
+    off_grid_open = 39.796440000000004  # one f64 ulp above the 1e-5 grid point
+    candle = OHLCV(1_751_308_200_000, off_grid_open, off_grid_open,
+                   39.7875, 39.79071, 44.0)
+    path = tmp_path / "base_snap.ohlcv"
+    _write_candles(path, [candle], minmove=1, pricescale=100_000)
+    with OHLCVReader(path) as reader:
+        stored = reader.read(0)
+    assert stored.open == 39.79644
+    assert stored.high == 39.79644
+    assert stored.high >= max(stored.open, stored.close)
+    assert stored.low <= min(stored.open, stored.close)
+    # The read-back bar must be writable again — the writer validates the relation.
+    _write_candles(tmp_path / "rewritten.ohlcv", [stored], minmove=1, pricescale=100_000)
+
+
+def __test_grid_stamp_leaves_a_genuinely_off_grid_base_alone__(tmp_path: Path):
+    """Only f64 dust snaps: a split-adjusted base keeps its own value."""
+    adjusted_open = 74.53253179
+    candle = OHLCV(1_751_308_200_000, adjusted_open, 74.6, 74.4, 74.5, 1.0)
+    path = tmp_path / "adjusted_base.ohlcv"
+    _write_candles(path, [candle], minmove=1, pricescale=100)
+    with OHLCVReader(path) as reader:
+        assert reader.read(0).open == adjusted_open
+
+
 def __test_set_tick_info_stamps_header_and_append_adopts_it__(tmp_path: Path):
     """A late grid declaration re-stamps the open file and survives grid-less reopens."""
     path = tmp_path / "late_grid.ohlcv"

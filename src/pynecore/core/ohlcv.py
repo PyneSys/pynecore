@@ -2418,6 +2418,21 @@ class _V2OHLCVReader:
         snap_minmove = self._snap_minmove
         snap_pricescale = self._snap_pricescale
 
+        # The base price carries no delta noise, but it does carry whatever the FEED
+        # sent, and a feed can answer the four prices one f64 ulp apart: TradingView
+        # exports them from four separate requests, which on USDTRY@30 returned an
+        # open of 39.796440000000004 against a high of 39.79644 on 202 of 19661 bars
+        # -- bars that opened exactly at their high. Left unsnapped while the
+        # delta-decoded high/low/close land on the grid, such a base reads back ABOVE
+        # its own high, and the file becomes one the writer refuses to take back. It
+        # snaps on the same rule as the others, at f64 dust only (no delta term):
+        # a genuinely off-grid base, like split-adjusted data, sits orders of
+        # magnitude outside this and never moves.
+        if snap_scale > 0.0 and not math.isnan(open_value):
+            snapped = round(open_value * snap_scale) * snap_minmove / snap_pricescale
+            if abs(snapped - open_value) <= abs(open_value) * _F64_SNAP_REL:
+                open_value = snapped
+
         high = values[role_indices[_ROLE_HIGH]]
         high_base_index = base_indices[_ROLE_HIGH]
         if high_base_index >= 0:
