@@ -527,3 +527,33 @@ def __test_to_tradingview_timeframe_unknown_falls_back_to_identity__():
 
     assert result == "bogus-resolution"
     assert isinstance(result, str)
+
+
+# === get_expected_price (Giá dự khớp — DNSE 2026-08-06 endpoint) ===============
+
+def __test_get_expected_price_resolves_alias_and_returns_body__(fake_client):
+    fake = fake_client(
+        get_instruments=(200, {"data": [{"symbolType": "VN30F1M", "symbol": "41I1G8000"}]}),
+        get_expected_price=(200, {"expectedPrices": [{"symbol": "41I1G8000", "price": 1900.0}]}))
+    p = _wired(fake, symbol="VN30F1M")
+
+    body = p.get_expected_price()
+
+    assert body["expectedPrices"][0]["price"] == 1900.0, "returns the parsed venue body"
+    call = next(c for c in fake.calls if c[0] == "get_expected_price")
+    assert call[1][0] == "41I1G8000", \
+        "the derivative alias must be resolved to its contract before the price call"
+
+
+@pytest.mark.parametrize("status, body", [
+    (500, {}),                        # API failure
+    (404, {"code": "RESOURCE_NOT_FOUND"}),
+    (200, "not-a-dict"),              # 200 but malformed body
+])
+def __test_get_expected_price_returns_empty_dict_on_non_200_or_non_dict__(fake_client, status, body):
+    fake = fake_client(
+        get_instruments=(200, {"data": [{"symbolType": "VN30F1M", "symbol": "41I1G8000"}]}),
+        get_expected_price=(status, body))
+    p = _wired(fake, symbol="VN30F1M")
+
+    assert p.get_expected_price() == {}, "non-200 or non-dict must degrade to an empty dict"
