@@ -1,0 +1,49 @@
+//@version=6
+// Order-type test 8 — OCA (One-Cancels-All / "OCO") group
+//
+// Tests Pine's OCA groups end to end. On a GREEN candle, place a breakout bracket
+// as TWO stop entries in the SAME OCA group (oca_type=cancel):
+//   "Up" = buy-stop +5% above  ,  "Dn" = sell-stop -5% below.
+// Both sit FAR from market, so on a live run they REST (won't fill) — a safe live
+// PLACEMENT test of OCA-grouped orders (two native STOPs sharing an oca_name). On a
+// RED candle, cancel both. The one-cancels-other semantics (the ENGINE cancels the
+// sibling when one fills, via execute_cancel) is exercised by the BACKTEST, where a
+// simulated breakout fills one leg and the group cancels the other.
+//
+// 1 contract VN30F1M. -0.1% close_all safe guard.
+
+// VN30F1M notional = price x 100,000 VND/point; margin ~35.6m/contract, so
+// initial_capital must clear it or entries are rejected on margin.
+strategy("T8 OCA breakout group", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+isGreen = close > open
+isRed   = close < open
+
+upStop = close[1] * 1.05   // buy-stop +5% (above market -> should rest, not fill)
+dnStop = close[1] * 0.95   // sell-stop -5% (below market -> should rest, not fill)
+
+// GREEN candle: place the OCA breakout group (both legs, one oca_name).
+if isGreen
+    strategy.entry("Up", strategy.long, stop=upStop, oca_name="brk", oca_type=strategy.oca.cancel,
+                   comment="buy-stop@" + str.tostring(upStop, format.mintick))
+    strategy.entry("Dn", strategy.short, stop=dnStop, oca_name="brk", oca_type=strategy.oca.cancel,
+                   comment="sell-stop@" + str.tostring(dnStop, format.mintick))
+
+// RED candle: cancel both legs.
+if isRed
+    strategy.cancel("Up")
+    strategy.cancel("Dn")
+
+// --- LAST PROTECTION LINE (live-test safe guard) ---
+// Flatten everything if the open position is losing more than 0.1%. Price-based,
+// so it is independent of the contract multiplier and fees. A fresh fill sits at
+// ~0%, so this fires only on a real adverse move: open profit percent < -0.1.
+PROTECT_PCT = -0.1
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < PROTECT_PCT
+    strategy.close_all(comment="PROTECT")
+
+plot(strategy.position_size, "pos", display=display.data_window)
