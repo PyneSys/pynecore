@@ -100,6 +100,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._order_ids: dict[str, list[str]] = {}
         #: venue order id -> (pine_id, from_entry, leg_type) for event tagging.
         self._identity: dict[str, tuple] = {}
+        #: venue order id -> the book it lives in ("NORMAL"/"STOP") for cancel/amend.
+        self._order_category: dict[str, str] = {}
         #: venue order id -> (cumulative_fill, status) from the last poll.
         self._last_seen: dict[str, tuple] = {}
         self._poll_interval: float = 2.0
@@ -305,6 +307,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             raise ExchangeOrderRejectedError(f"DNSE rejected order: {status} {body}")
 
         order = self._to_exchange_order(body)
+        tracked_category = category
         if category == "OCO":
             # The OCO record is an umbrella; its real working order is a spawned
             # NORMAL LO. Track THAT — fills + cancels route by it — via the OCO
@@ -312,6 +315,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             working = self._resolve_oco_lo(order.id)
             if working is not None:
                 order = working
+                tracked_category = "NORMAL"  # the live order lives on the NORMAL book
         key = getattr(envelope.intent, "intent_key", None)
         if key:
             self._order_ids.setdefault(key, []).append(order.id)
@@ -321,6 +325,10 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             getattr(intent, "from_entry", None),
             leg_type,
         )
+        # Cancel/amend must target the book the tracked order actually lives in
+        # (a STOP entry -> STOP; an OCO -> its NORMAL working LO). Guessing
+        # NORMAL-first let a wrong-book RESOURCE_NOT_FOUND look like a clean cancel.
+        self._order_category[order.id] = tracked_category
         return [order]
 
     def _resolve_oco_lo(self, oco_id: str, attempts: int = 6, delay: float = 0.15
@@ -411,13 +419,18 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         return list(self._order_ids.get(key, [])) if key else []
 
     def _order_category_for(self, order_id: str):
-        """Category a placed order was recorded under (leg_type -> STOP/OCO/NORMAL)."""
+        """The book a placed order lives in, recorded at place time (authoritative)."""
+        recorded = self._order_category.get(order_id)
+        if recorded:
+            return recorded
+        # Fallback for ids with no record (e.g. a restart before re-hydration):
+        # infer from the leg, and leave ENTRY unknown so cancel probes every book.
         _, _, leg_type = self._identity_for(order_id)
         name = getattr(leg_type, "name", "")
         if name == "STOP_LOSS":
             return "STOP"
         if name == "ENTRY":
-            return None  # could be STOP or NORMAL — cancel tries both
+            return None
         return "NORMAL"
 
     @override
@@ -431,18 +444,27 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         return ok
 
     def _cancel_one(self, order_id: str) -> bool:
-        """Cancel an order, trying conditional categories then NORMAL."""
+        """Cancel by the recorded book; if unknown, probe each.
+
+        A ``RESOURCE_NOT_FOUND`` from the WRONG book must NOT count as success — that
+        silently orphaned STOP entries (a STOP id is absent from the NORMAL book, so
+        the NORMAL-first attempt 404'd and short-circuited before ever trying STOP).
+        Only conclude "already gone" if a cancel succeeded, or EVERY book tried agrees
+        the order is not there.
+        """
         hinted = self._order_category_for(order_id)
-        for category in ([hinted] if hinted else _CATEGORIES):
+        categories = [hinted] if hinted else list(_CATEGORIES)
+        all_not_found = True
+        for category in categories:
             status, body = self.client.cancel_order(
                 self.account_id, order_id, self.market_type, self._token(),
                 order_category=category)
             if status in (200, 204):
                 return True
             code = (body or {}).get("code") if isinstance(body, dict) else None
-            if code == "RESOURCE_NOT_FOUND":
-                return True  # already gone (filled/cancelled)
-        return False
+            if code != "RESOURCE_NOT_FOUND":
+                all_not_found = False
+        return all_not_found
 
     @override
     async def execute_cancel_with_outcome(self, envelope):
