@@ -35,8 +35,16 @@ from pynecore.core.broker.models import (
     OrderStatus, OrderType,
 )
 from pynecore.types.ohlcv import OHLCV
+from pynecore.lib import log
+from pynecore.core.broker.exceptions import (
+    AuthenticationError, ExchangeConnectionError, ExchangeOrderRejectedError,
+    ExchangeRateLimitError, InsufficientMarginError, OrderDispositionUnknownError,
+)
+from pynecore.core.broker.idempotency import (
+    KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL, KIND_CLOSE)
 
 from .provider import DNSEConfig, DNSEProvider
+from . import errors
 
 _SIDE_TO_DNSE = {"buy": "NB", "sell": "NS"}
 _DNSE_TO_SIDE = {"NB": "buy", "NS": "sell"}
@@ -69,6 +77,12 @@ _TF_SECONDS = {"1": 60, "3": 180, "5": 300, "15": 900, "30": 1800,
 #: STOP is its own working order — so we scan NORMAL + STOP and skip the OCO
 #: umbrella book (whose records would double-count the LO / linger as zombies).
 _CATEGORIES = ("NORMAL", "STOP")
+
+#: LegType.name -> idempotency KIND, for the disposition-unknown client_order_id.
+_LEG_KIND = {
+    "ENTRY": KIND_ENTRY, "TAKE_PROFIT": KIND_EXIT_TP,
+    "STOP_LOSS": KIND_EXIT_SL, "CLOSE": KIND_CLOSE,
+}
 
 
 @dataclass
@@ -266,14 +280,71 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             self._loan_id = body["loanPackages"][0]["id"]
         return self._loan_id
 
+    # --- error handling (see errors.py + docs/plan/dnse-error-handling.md) ---
+
+    def _emit(self, classified, *, action: str, ident: str) -> None:
+        """Emit the one structured ``[BROKER]`` line for a classified error."""
+        fn = {"error": log.broker_error, "warning": log.broker_warning,
+              "info": log.broker_info}.get(classified.level, log.broker_warning)
+        fn("%s", classified.log_message(action, ident))
+
+    def _write(self, call):
+        """``call(token) -> (status, body)``; retry ONCE on INVALID_TRADING_TOKEN with
+        a freshly re-read token (the cron may have refreshed the state file)."""
+        status, body = call(self._token())
+        if errors.code_of(body) == "INVALID_TRADING_TOKEN":
+            log.broker_warning("%s", "write code=INVALID_TRADING_TOKEN -> "
+                                     "token-reread (retry once)")
+            status, body = call(self._token())
+        return status, body
+
+    @staticmethod
+    def _ident_str(envelope, leg_type) -> str:
+        intent = getattr(envelope, "intent", None)
+        pine = getattr(intent, "pine_id", None) or "?"
+        leg = getattr(leg_type, "value", None) or getattr(leg_type, "name", None) or "?"
+        key = getattr(intent, "intent_key", None) or "?"
+        return f"{pine}/{leg} intent={key}"
+
+    @staticmethod
+    def _coid(envelope, leg_type) -> str:
+        kind = _LEG_KIND.get(getattr(leg_type, "name", ""), KIND_ENTRY)
+        try:
+            return envelope.client_order_id(kind)
+        except Exception:
+            return getattr(getattr(envelope, "intent", None), "intent_key", "") or ""
+
+    def _raise_write_error(self, status, body, *, action: str, ident: str,
+                           coid: str) -> None:
+        """Classify a WRITE reply; on failure emit its log line and raise the
+        matching ``BrokerError``. Returns quietly on a 2xx success."""
+        classified = errors.classify(status, body, is_write=True)
+        if classified is None:
+            return
+        self._emit(classified, action=action, ident=ident)
+        disposition = classified.disposition
+        detail = f"{classified.code} {classified.message}".strip()
+        if disposition is errors.Disposition.MARGIN:
+            raise InsufficientMarginError(f"DNSE margin reject on {action}: {detail}")
+        if disposition is errors.Disposition.RATE_LIMIT:
+            raise ExchangeRateLimitError(f"DNSE rate limit on {action}: {detail}",
+                                         classified.retry_after)
+        if disposition is errors.Disposition.DISPOSITION_UNKNOWN:
+            raise OrderDispositionUnknownError(
+                f"DNSE disposition unknown on {action}: {detail}", client_order_id=coid)
+        if disposition in (errors.Disposition.AUTH, errors.Disposition.AUTH_TOKEN):
+            raise AuthenticationError(f"DNSE auth on {action}: {detail}",
+                                      reason=classified.code)
+        if disposition is errors.Disposition.CONNECTION:
+            raise ExchangeConnectionError(f"DNSE transient on {action}: {detail}")
+        # REJECT / SESSION_REJECT (+ any TERMINAL/NOT_FOUND reaching a place/amend)
+        raise ExchangeOrderRejectedError(f"DNSE rejected {action}: {detail}")
+
     def _place(self, envelope, side: str, qty: float, *, price: float,
                category: str = "NORMAL", stop_price: float | None = None,
                stop_order_price: float | None = None, leg_type=None
                ) -> list[ExchangeOrder]:
         """Place one native order (NORMAL / STOP / OCO) and record its identity."""
-        from pynecore.core.broker.exceptions import (
-            ExchangeOrderRejectedError, OrderDispositionUnknownError)
-
         payload = {
             "symbol": self.resolve_contract(),   # tradable KRX contract, not the alias
             "side": _SIDE_TO_DNSE[side],
@@ -296,15 +367,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 "durationType": "DAY",
             })
 
-        status, body = self.client.post_order(
-            self.account_id, self.market_type, payload, self._token(),
-            order_category=category)
-        if status == 0:
-            raise OrderDispositionUnknownError(
-                f"DNSE order disposition unknown: {body}",
-                client_order_id=envelope.client_order_id())
-        if status not in (200, 201) or not isinstance(body, dict):
-            raise ExchangeOrderRejectedError(f"DNSE rejected order: {status} {body}")
+        ident = self._ident_str(envelope, leg_type)
+        status, body = self._write(lambda tok: self.client.post_order(
+            self.account_id, self.market_type, payload, tok, order_category=category))
+        self._raise_write_error(status, body, action="place", ident=ident,
+                                coid=self._coid(envelope, leg_type))
+        if not isinstance(body, dict):
+            raise ExchangeOrderRejectedError(
+                f"DNSE place: non-dict success body: {body!r}")
 
         order = self._to_exchange_order(body)
         tracked_category = category
@@ -449,21 +519,30 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         A ``RESOURCE_NOT_FOUND`` from the WRONG book must NOT count as success — that
         silently orphaned STOP entries (a STOP id is absent from the NORMAL book, so
         the NORMAL-first attempt 404'd and short-circuited before ever trying STOP).
-        Only conclude "already gone" if a cancel succeeded, or EVERY book tried agrees
-        the order is not there.
+        Only conclude "already gone" if a cancel succeeded, the order is already
+        terminal (``ORDER_IS_DONE`` / ``CO-ORD-013``), or EVERY book agrees it is not
+        there. Any other failure (session-refused, transient, reject) is logged.
         """
         hinted = self._order_category_for(order_id)
         categories = [hinted] if hinted else list(_CATEGORIES)
         all_not_found = True
         for category in categories:
-            status, body = self.client.cancel_order(
-                self.account_id, order_id, self.market_type, self._token(),
-                order_category=category)
+            status, body = self._write(lambda tok: self.client.cancel_order(
+                self.account_id, order_id, self.market_type, tok,
+                order_category=category))
             if status in (200, 204):
                 return True
-            code = (body or {}).get("code") if isinstance(body, dict) else None
-            if code != "RESOURCE_NOT_FOUND":
-                all_not_found = False
+            code = errors.code_of(body)
+            if code in errors.TERMINAL_CODES:  # found, already done -> cancel is moot
+                log.broker_info("%s", f"cancel[{category}] code={code} http={status} -> "
+                                      f"treated-gone (already terminal) | order={order_id}")
+                return True
+            if code in errors.NOT_FOUND_CODES:  # not in THIS book -> probe the next
+                continue
+            classified = errors.classify(status, body, is_write=True)
+            if classified is not None:
+                self._emit(classified, action=f"cancel[{category}]", ident=order_id)
+            all_not_found = False
         return all_not_found
 
     @override
@@ -496,12 +575,15 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         category = self._order_category_for(order_id) or "NORMAL"
         payload = {"price": round(float(price), 1) if price else 0.0,
                    "quantity": int(intent.qty)}
-        status, body = self.client.put_order(
-            self.account_id, order_id, self.market_type, payload, self._token(),
-            order_category=category)
-        if status not in (200, 201) or not isinstance(body, dict):
-            from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
-            raise ExchangeOrderRejectedError(f"DNSE amend failed: {status} {body}")
+        status, body = self._write(lambda tok: self.client.put_order(
+            self.account_id, order_id, self.market_type, payload, tok,
+            order_category=category))
+        self._raise_write_error(
+            status, body, action="amend",
+            ident=f"{order_id} intent={getattr(intent, 'intent_key', '?')}", coid=order_id)
+        if not isinstance(body, dict):
+            raise ExchangeOrderRejectedError(
+                f"DNSE amend: non-dict success body: {body!r}")
         return [self._to_exchange_order(body)]
 
     # --- BrokerPlugin abstracts: state ---
@@ -514,6 +596,11 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 page_index=0, page_size=100)
             if status == 200 and isinstance(body, dict):
                 yield from body.get("orders") or []
+            else:
+                # High-frequency poll -> DEBUG so a transient blip stays inspectable
+                # without flooding the operator's log.
+                log.broker_debug("read:orders[%s] -> transient | http=%s code=%s",
+                                 category, status, errors.code_of(body))
 
     @override
     async def watch_orders(self):
@@ -551,7 +638,6 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
     @override
     async def get_open_orders(self, symbol: str | None = None) -> list[ExchangeOrder]:
         """Union of the NORMAL + conditional books; a failed fetch never looks empty."""
-        from pynecore.core.broker.exceptions import ExchangeConnectionError
         wanted = self.resolve_contract(symbol) if symbol else None
         orders: list[ExchangeOrder] = []
         any_ok = False
@@ -569,6 +655,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 if order.status not in _TERMINAL_STATUSES:
                     orders.append(order)
         if not any_ok:
+            log.broker_warning("%s", "read:orders -> reconnect | both order books unavailable")
             raise ExchangeConnectionError("DNSE order books unavailable")
         return orders
 
@@ -577,7 +664,9 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         """Net position for ``symbol`` from ``/positions`` (netting venue)."""
         status, body = self.client.get_positions(self.account_id, self.market_type)
         if status != 200 or not isinstance(body, dict):
-            from pynecore.core.broker.exceptions import ExchangeConnectionError
+            classified = errors.classify(status, body, is_write=False)
+            if classified is not None:
+                self._emit(classified, action="read:positions", ident=symbol)
             raise ExchangeConnectionError(f"DNSE positions unavailable: {status}")
         wanted = self.resolve_contract(symbol)
         net, cost = 0.0, 0.0
