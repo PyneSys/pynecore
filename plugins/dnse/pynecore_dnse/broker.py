@@ -144,10 +144,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
     @override
     def get_capabilities(self) -> ExchangeCapabilities:
         return ExchangeCapabilities(
-            # Native conditional orders (proven live): server-side STOP + OCO.
+            # Native server-side STOP (stays New until triggered -> cleanly
+            # cancellable). Used for entry-stops and the SL leg of a bracket.
             stop_order=CapabilityLevel.NATIVE,
-            tp_sl_bracket=CapabilityLevel.NATIVE,
-            oca_cancel=CapabilityLevel.NATIVE,
+            # Bracket = a NORMAL TP leg + a native STOP SL leg, run as two orders;
+            # the ENGINE drives the one-cancels-other. NOT native OCO (which
+            # activates within ~1s and then can't be cancelled/modified).
+            tp_sl_bracket=CapabilityLevel.SOFTWARE,
+            oca_cancel=CapabilityLevel.SOFTWARE,
             # Not natively supported by DNSE conditional orders.
             trailing_stop=CapabilityLevel.SOFTWARE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
@@ -329,25 +333,31 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     @override
     async def execute_exit(self, envelope) -> list[ExchangeOrder]:
+        """Bracket exit as SEPARATE legs (engine-managed OCA), NOT native OCO.
+
+        Native OCO proved unsuitable for plugin brackets (verified live 2026-08-07):
+        it activates within ~1s of placement (its NORMAL TP leg rests immediately),
+        after which it can't be cancelled or modified (400 "order status is not
+        new"), and cancelling it does NOT cascade to the TP leg. So TP is a NORMAL
+        LO and SL is a native STOP — both cleanly cancellable/amendable — and the
+        engine runs the one-cancels-other (tp_sl_bracket / oca_cancel = SOFTWARE).
+        """
         from pynecore.core.broker.models import LegType
         from pynecore.core.broker.exceptions import OrderSkippedByPlugin
         intent = envelope.intent
-        tp, sl = intent.tp_price, intent.sl_price
-        if tp is not None and sl is not None:
-            # native OCO bracket (one order = TP limit + SL stop)
-            return self._place(envelope, intent.side, intent.qty, price=tp,
-                               category="OCO", stop_price=sl, stop_order_price=sl,
-                               leg_type=LegType.TAKE_PROFIT)
-        if sl is not None:
-            return self._place(envelope, intent.side, intent.qty, price=sl,
-                               category="STOP", stop_price=sl,
-                               leg_type=LegType.STOP_LOSS)
-        if tp is not None:
-            return self._place(envelope, intent.side, intent.qty, price=tp,
-                               leg_type=LegType.TAKE_PROFIT)
-        raise OrderSkippedByPlugin(
-            "DNSE plugin cannot express this exit: no tp_price/sl_price "
-            "(trailing stops are not implemented)")
+        orders: list[ExchangeOrder] = []
+        if intent.tp_price is not None:
+            orders += self._place(envelope, intent.side, intent.qty,
+                                  price=intent.tp_price, leg_type=LegType.TAKE_PROFIT)
+        if intent.sl_price is not None:
+            orders += self._place(envelope, intent.side, intent.qty,
+                                  price=intent.sl_price, category="STOP",
+                                  stop_price=intent.sl_price, leg_type=LegType.STOP_LOSS)
+        if not orders:
+            raise OrderSkippedByPlugin(
+                "DNSE plugin cannot express this exit: no tp_price/sl_price "
+                "(trailing stops are not implemented)")
+        return orders
 
     @override
     async def execute_close(self, envelope) -> ExchangeOrder:
