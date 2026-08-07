@@ -25,10 +25,9 @@ dependencies = [
 # account-scoped conditional-order endpoints (orderCategory=STOP/OCO) with a
 # default `version` header of 2026-07-23. Not pip-installed ("don't trust pip").
 
-# Entry points are disabled until the v2 provider/broker modules land:
-# [project.entry-points."pyne.plugin"]
-# dnse = "pynecore_dnse.provider:DNSEProvider"
-# dnse_broker = "pynecore_dnse.broker:DNSEBroker"
+[project.entry-points."pyne.plugin"]
+dnse = "pynecore_dnse.provider:DNSEProvider"
+dnse_broker = "pynecore_dnse.broker:DNSEBroker"
 
 [tool.setuptools.packages.find]
 include = ["pynecore_dnse*"]
