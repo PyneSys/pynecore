@@ -194,6 +194,19 @@ class DNSEProvider(ProviderPlugin[DNSEConfig]):
                 return float(value)
         return 20.0  # mid-band fallback -> 0.05 tick
 
+    def get_expected_price(self, symbol: str | None = None) -> dict:
+        """Expected match price (Giá dự khớp) during a periodic-auction session.
+
+        ``GET /price/{symbol}/expected-price`` — the price a symbol is projected to
+        match at in an ATO/ATC call auction (added in the DNSE 2026-08-06 changelog;
+        a non-breaking addition, so still served at API version 2026-07-23). A
+        derivative alias (``VN30F1M``) is resolved to its contract code first (the
+        alias carries no price row). Returns the parsed body, or ``{}`` on non-200.
+        """
+        lookup = self.resolve_contract(symbol or self.symbol or "")
+        status, body = self.client.get_expected_price(lookup)
+        return body if status == 200 and isinstance(body, dict) else {}
+
     @property
     def market_type(self) -> str:
         """DNSE bar type for the current symbol.

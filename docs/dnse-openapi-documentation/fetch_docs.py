@@ -122,10 +122,14 @@ def _pinned_sdk_version(repo_root: Path) -> str | None:
 def verify_applied() -> None:
     """Verify our repo reflects the latest DNSE changelog / API version.
 
-    Cross-checks the freshly-mirrored **changelog** + **versioning guide** (what
-    DNSE has published) against what our repo actually **applies** (the version
-    the vendored openapi-sdk sends by default). Drift means DNSE shipped changes
-    we haven't picked up -> review the changelog and re-vendor the SDK.
+    Two checks, because they catch DIFFERENT drift:
+
+    * **version** — the vendored openapi-sdk's default API version vs the latest
+      PUBLISHED version. Catches *breaking* changes (which bump the date version).
+    * **changelog** — the LIVE changelog vs our mirror, plus any entry dated after
+      the applied version. Catches *non-breaking* additions: a new endpoint ships a
+      changelog entry WITHOUT a version bump, so the version check alone is blind to
+      it (e.g. 2026-08-06 "Get Expected Price" while the version stayed 2026-07-23).
     """
     print("\n=== verify: changelog vs applied ===")
     changelog = DEST / "changelog.md"
@@ -145,10 +149,30 @@ def verify_applied() -> None:
     print(f"  latest published version: {latest_version}   (all published: {', '.join(published) or '?'})")
     print(f"  vendored SDK applies:     {pinned}")
     if pinned != "?" and pinned == latest_version:
-        print("  ✓ up to date — the vendored SDK sends the latest published API version")
+        print("  ✓ version up to date — the vendored SDK sends the latest published API version")
     else:
-        print("  ⚠ DRIFT — DNSE may have shipped changes not yet applied. Review the")
-        print("    changelog and re-vendor: https://developers.dnse.com.vn/docs/changelog")
+        print("  ⚠ VERSION DRIFT — DNSE bumped the API version. Re-vendor the SDK:")
+        print("    https://developers.dnse.com.vn/docs/changelog")
+
+    # --- non-breaking additions: diff the LIVE changelog against our mirror ---
+    print("  --- live changelog vs mirror ---")
+    status, live = _get(f"{CONTENT_HOST}/docs/changelog.md")
+    if status != 200 or not live:
+        print(f"  (could not fetch live changelog: http {status} — skipping diff)")
+        return
+    live_entries = re.findall(r"^##\s+\[(\d{4}-\d{2}-\d{2})\]",
+                              live.decode("utf-8", "replace"), re.M)
+    unmirrored = [e for e in live_entries if e not in set(entries)]
+    if unmirrored:
+        print(f"  ⚠ {len(unmirrored)} live changelog entr(y/ies) NOT mirrored: "
+              f"{', '.join(unmirrored)} — re-run to mirror, then review for new endpoints.")
+    else:
+        print("  ✓ mirror carries every published changelog entry")
+    after_pin = sorted(e for e in set(live_entries) if pinned != "?" and e > pinned)
+    if after_pin:
+        print(f"  ⓘ {len(after_pin)} changelog entr(y/ies) dated AFTER the applied version "
+              f"{pinned} — likely non-breaking additions; confirm we consume them: "
+              f"{', '.join(after_pin)}")
 
 
 def main() -> int:
