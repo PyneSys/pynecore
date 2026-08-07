@@ -23,13 +23,8 @@ def main():
     elif long_ and isRed:
         strategy.close("L", comment="X-red@" + string.tostring(close, format.mintick))
 
-    PROTECT_PCT = -0.5
-    openPnlPct = 0.0
-    if strategy.position_size > 0:
-        openPnlPct = (close - strategy.position_avg_price) / strategy.position_avg_price * 100
-    elif strategy.position_size < 0:
-        openPnlPct = (strategy.position_avg_price - close) / strategy.position_avg_price * 100
-
+    PROTECT_PCT = -0.1
+    openPnlPct = (strategy.opentrades.profit_percent(strategy.opentrades - 1) if strategy.position_size != 0 else 0.0)
     if strategy.position_size != 0 and openPnlPct < PROTECT_PCT:
         strategy.close_all(comment="PROTECT")
 
