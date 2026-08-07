@@ -44,11 +44,20 @@ it. Vendored, not pip-installed. Docs mirrored at `docs/dnse-openapi-documentati
 - **STOP** (base + deriv): `orderType` LO (stop-limit) or MTL (stop-market);
   `stopPrice` + `conditionOperator` (`>=` / `<=`) + `durationType=GTD` +
   `durationDateTime` (RFC3339); `price` = the limit price after trigger.
-- **OCO** (deriv only): a TP+SL bracket = a **NORMAL take-profit leg** (`price`) + a
-  **conditional SL leg** (`stopPrice` + `stopOrderPrice`); `durationType=DAY`.
-- **Status lifecycle:** `New` (armed, cancellable) → `Activated` (triggered → becomes
-  a NORMAL order) → `Cancelled`/`Expired`/`Rejected`/`Failed`. **Cancel/replace only
-  while `New`**; once `Activated`, manage the resulting NORMAL order.
+- **OCO** (deriv only): ONE managed order, not two legs. `price`=TP, `stopPrice`=SL
+  trigger, `stopOrderPrice`=SL limit, `durationType=DAY`. On activation the venue
+  places a **working NORMAL LO** at the TP price and, if the SL condition hits first,
+  **amends that same LO to the SL price** (only one LO on the exchange at a time).
+  **The link is `externalOrderId`**: `get_order_detail(oco_id, orderCategory=OCO)`
+  returns `externalOrderId` = the working LO id (the LIST omits it), and the LO's
+  `metadata.conditionOrderId` points back. So the plugin **tracks the working LO**
+  (fills + cancels route by it — cancel the LO, not the umbrella); the `Activated`
+  umbrella record is cosmetic and auto-expires EOD.
+- **Status lifecycle:** `New` (armed, cancellable) → `Activated` (working / triggered)
+  → `Cancelled`/`Expired`/`Rejected`/`Failed`. The OCO umbrella is only cancellable
+  while `New`; once `Activated`, manage its working LO (via `externalOrderId`).
+- **Cancels are refused during the ATO/ATC auctions**
+  (`CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION`) — retry after the session opens.
 - **List:** `GET /accounts/{accountNo}/orders?orderCategory=STOP|OCO` (+ `pageIndex`/
   `pageSize`) — a dedicated conditional book. GET-by-id is NORMAL-only.
 - **Cancel:** `DELETE /accounts/{accountNo}/orders/{orderId}?marketType&orderCategory`.
@@ -130,9 +139,9 @@ consumer.** Keeps the fragile Gmail/OTP dance out of the broker loop and the tes
    zero findings, in a proper `plugins/dnse/tests/` package.
 2. **Native-conditional integration test** against an injected fake `DNSEClient`
    (recorded `(status, body)`): `entry(stop)` → a STOP placed with the correct schema;
-   `exit(limit, stop)` → an OCO (NORMAL TP leg + conditional SL leg); cancel/replace
-   while `New`; `Activated`→NORMAL fill routed to the engine by Pine identity; list
-   reconciliation of the conditional book.
+   `exit(limit, stop)` → an OCO whose working LO is resolved via `externalOrderId` and
+   tracked; a fill on that LO routed to the engine by Pine identity; cancel routed to
+   the working LO; the `Activated` umbrella not reported as a phantom open order.
 3. **Backtest as oracle:** `t3_long_stop` / `t4_short_stop` / `t5_long_stop_limit` /
    `t6_short_stop_limit` (`plugins/dnse/testing/strategies/`) through the backtest vs
    the fake broker; compare fills & positions. Note: native triggers **intrabar on
