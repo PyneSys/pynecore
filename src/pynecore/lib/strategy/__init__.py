@@ -4596,7 +4596,27 @@ def exit(id: str, from_entry: str = "",
         _exit()
 
     else:
-        # If still no entry order found, we should exit all open trades and open orders
+        # A from_entry-less exit binds to the OPEN position; a still-pending entry
+        # order is only its target when the strategy is flat. The distinction shows
+        # up on a REVERSAL, where both exist at once with different ids: the exit
+        # covers the position being reversed out of, and the position the reversal
+        # opens gets its own bracket from the NEXT bar's script run -- so its stop
+        # cannot fire on the bar the reversal filled.
+        # MEASURED on TradingView (CAPITALCOM:EURUSD 60, "Technical Ratings
+        # Strategy", 580 trades). Of the entries whose stop level was breached on
+        # their own fill bar, all 5 that were opened from FLAT exited on that bar,
+        # and the 1 opened by a reversal held -- a clean 6/6 split.
+        # Binding pending entries first also left the position being reversed out
+        # of with no bracket at all for the length of that bar.
+        seen_ids: set[str] = set()
+        for trade in position.open_trades:
+            from_entry = trade.entry_id or ""
+            if from_entry in seen_ids:
+                continue
+            seen_ids.add(from_entry)
+            direction, init_size = _bound_size(from_entry)
+            _exit()
+
         if not direction:
             for order in list(position.entry_orders.values()):
                 from_entry = order.order_id or ""
@@ -4609,16 +4629,6 @@ def exit(id: str, from_entry: str = "",
                     exit_order = position.exit_orders.get(exit_key)
                     if exit_order is not None:
                         exit_order.from_entry_na = True
-
-            if not direction:
-                seen_ids: set[str] = set()
-                for trade in position.open_trades:
-                    from_entry = trade.entry_id or ""
-                    if from_entry in seen_ids:
-                        continue
-                    seen_ids.add(from_entry)
-                    direction, init_size = _bound_size(from_entry)
-                    _exit()
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode
