@@ -64,6 +64,47 @@ def _round_digits(value: float, decimals: int, decimal_format: bool) -> str:
         return f"{d.quantize(Decimal(1).scaleb(-decimals), rounding=rounding):f}"
 
 
+@lru_cache(maxsize=128)
+def _split_number_pattern(pattern: str) -> tuple[str, str, str]:
+    """
+    Cut a Java DecimalFormat subpattern into literal prefix, digit pattern and literal suffix.
+
+    Only an unquoted ``#``, ``0``, ``.`` or ``,`` belongs to the digit pattern; in the
+    affixes ``'#'`` is a literal hash and ``''`` a literal quote, so ``'#'.##`` prints
+    ``#1.23`` instead of opening the digits one character early.
+
+    :param pattern: One subpattern (the part between two ``;`` separators)
+    :return: The prefix, the digit pattern and the suffix, all quotes resolved
+    """
+    chars: list[str] = []
+    is_digit: list[bool] = []
+    in_quote = False
+    i = 0
+    n = len(pattern)
+
+    while i < n:
+        ch = pattern[i]
+        if ch == "'":
+            if i + 1 < n and pattern[i + 1] == "'":
+                chars.append("'")
+                is_digit.append(False)
+                i += 1
+            else:
+                in_quote = not in_quote
+                i += 1
+                continue
+        else:
+            chars.append(ch)
+            is_digit.append(not in_quote and ch in '#0.,')
+        i += 1
+
+    if True not in is_digit:
+        return ''.join(chars), '', ''
+    lo = is_digit.index(True)
+    hi = len(is_digit) - 1 - is_digit[::-1].index(True)
+    return ''.join(chars[:lo]), ''.join(chars[lo:hi + 1]), ''.join(chars[hi + 1:])
+
+
 # noinspection PyProtectedMember
 def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###',
                    *, decimal_format: bool = False) -> str:
@@ -124,12 +165,8 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
             subpatterns = precision.split(';')
             negative_subpattern = value < 0 and len(subpatterns) > 1
             chosen = subpatterns[1] if negative_subpattern else subpatterns[0]
-            prefix = '-' if value < 0 and not negative_subpattern else ''
-            suffix = ''
-            digit_idx = [i for i, c in enumerate(chosen) if c in '#0.,']
-            if digit_idx:
-                prefix += chosen[:digit_idx[0]]
-                suffix = chosen[digit_idx[-1] + 1:]
+            affix, _, suffix = _split_number_pattern(chosen)
+            prefix = ('-' if value < 0 and not negative_subpattern else '') + affix
         return prefix + '∞' + suffix
 
     # Handle special formats first
@@ -186,7 +223,6 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
     # around the digit pattern. Pick the subpattern by sign, format the
     # magnitude with the bare digit pattern, and re-attach the affixes.
     prefix = ''
-    suffix = ''
     subpatterns = precision.split(';')
     if value < 0:
         value = -value
@@ -198,13 +234,8 @@ def _format_number(value: float | int | NA, fmt_type: str = '', precision: str =
     else:
         chosen = subpatterns[0]
 
-    pattern_chars = '#0.,'
-    digit_idx = [i for i, c in enumerate(chosen) if c in pattern_chars]
-    if digit_idx:
-        lo, hi = digit_idx[0], digit_idx[-1]
-        prefix += chosen[:lo]
-        suffix = chosen[hi + 1:]
-        precision = chosen[lo:hi + 1]
+    affix, precision, suffix = _split_number_pattern(chosen)
+    prefix += affix
 
     # Parse format string
     if '.' in precision:
@@ -378,6 +409,105 @@ def endswith(source: str, str: str) -> bool:
     return source.endswith(str)
 
 
+# The four segments a Java MessageFormat pattern is cut into: the literal text
+# between placeholders, then the argument index, the format type and the format
+# style inside one.
+_SEG_RAW, _SEG_INDEX, _SEG_TYPE, _SEG_STYLE = 0, 1, 2, 3
+
+# A style naming one of these is a keyword, matched case-insensitively and
+# ignoring surrounding space; anything else is a DecimalFormat pattern taken
+# verbatim, where a leading or trailing space is a literal affix.
+_NUMBER_STYLES = ('integer', 'currency', _format.percent, _format.mintick,
+                  _format.volume, _format.price, _format.inherit)
+
+# Java's Integer.parseInt accepts digits and an optional sign, but no surrounding
+# space -- ``{0 ,number,#.#}`` is an error on TradingView, not index 0.
+_ARG_INDEX_RE = re.compile(r'\+?\d+\Z')
+
+
+@lru_cache(maxsize=128)
+def _parse_format_pattern(pattern: str) -> tuple[str | tuple[str, str, str], ...]:
+    """
+    Split a ``str.format`` pattern into literal text and placeholders.
+
+    A ``str`` piece is literal output; a 3-tuple is a placeholder's raw index,
+    type and style segments. The scan is Java ``MessageFormat.applyPattern``:
+
+    - In literal text ``''`` is one quote, a lone ``'`` toggles quoting, and while
+      quoted both braces are literal -- ``'{'`` prints ``{``, ``'{{ticker}}'``
+      prints ``{{ticker}}``. An unterminated quote makes the rest literal.
+    - An unquoted ``}`` outside a placeholder is literal too; only ``{`` opens one.
+    - Inside a placeholder quotes are copied through to the segment (the style is
+      a DecimalFormat pattern with its own quoting), ``,`` moves to the next
+      segment, nested braces nest, and a space is dropped only ahead of the type.
+
+    The results are cached because Pine format patterns are compile-time constants
+    re-formatted on every bar.
+
+    :param pattern: The ``str.format`` pattern
+    :return: Literal strings and (index, type, style) placeholder segments in order
+    :raises ValueError: If the pattern ends inside a placeholder
+    """
+    parts: list[str | tuple[str, str, str]] = []
+    seg = ['', '', '', '']
+    part = _SEG_RAW
+    in_quote = False
+    brace_depth = 0
+    i = 0
+    n = len(pattern)
+
+    while i < n:
+        ch = pattern[i]
+        if part == _SEG_RAW:
+            if ch == "'":
+                if i + 1 < n and pattern[i + 1] == "'":
+                    seg[_SEG_RAW] += ch
+                    i += 1
+                else:
+                    in_quote = not in_quote
+            elif ch == '{' and not in_quote:
+                if seg[_SEG_RAW]:
+                    parts.append(seg[_SEG_RAW])
+                    seg[_SEG_RAW] = ''
+                seg[_SEG_INDEX] = seg[_SEG_TYPE] = seg[_SEG_STYLE] = ''
+                part = _SEG_INDEX
+            else:
+                seg[_SEG_RAW] += ch
+        elif in_quote:
+            seg[part] += ch
+            if ch == "'":
+                in_quote = False
+        elif ch == ',':
+            if part < _SEG_STYLE:
+                part += 1
+            else:
+                seg[part] += ch
+        elif ch == '{':
+            brace_depth += 1
+            seg[part] += ch
+        elif ch == '}':
+            if brace_depth:
+                brace_depth -= 1
+                seg[part] += ch
+            else:
+                parts.append((seg[_SEG_INDEX], seg[_SEG_TYPE], seg[_SEG_STYLE]))
+                part = _SEG_RAW
+        elif ch == "'":
+            in_quote = True
+            seg[part] += ch
+        elif not (ch == ' ' and part == _SEG_TYPE and not seg[_SEG_TYPE]):
+            seg[part] += ch
+        i += 1
+
+    # An unclosed placeholder is an error, except with a brace still open inside
+    # it -- Java drops that one silently instead of reporting it.
+    if part != _SEG_RAW and not brace_depth:
+        raise ValueError("Format pattern ends inside a placeholder")
+    if seg[_SEG_RAW]:
+        parts.append(seg[_SEG_RAW])
+    return tuple(parts)
+
+
 # noinspection PyPep8Naming,PyShadowingBuiltins
 def format(formatString: str, *args: Any) -> str:
     """
@@ -387,11 +517,12 @@ def format(formatString: str, *args: Any) -> str:
     - Number formats: {0,number,integer}, {0,number,currency}, {0,number,percent}
     - Custom precision: {0,number,#.#}
     - Pine-style array formatting: [item1, item2] without quotes for strings
-    - Special quote handling: single quotes are removed if unpaired, converted to single quote if paired
+    - Single quotes escape braces: '{' is a literal brace, '' is a literal quote
 
     :param formatString: Format pattern
     :param args: Values to format
     :return: Formatted string, or na if the format pattern is na
+    :raises ValueError: If the pattern is malformed
     """
     # na-propagation (Pine): a na format pattern yields na (e.g. the TV
     # Technical Ratings idiom ``str.repeat("\n", 0) + "{0}"`` — the repeat
@@ -399,76 +530,42 @@ def format(formatString: str, *args: Any) -> str:
     if isinstance(formatString, NA) or formatString is None:
         return NA(str)
 
-    # Pre-process quotes before handling placeholders
-    def process_quotes(s: str) -> str:
-        result = []
-        i = 0
-        while i < len(s):
-            if s[i] == "'":
-                # Look ahead for another quote
-                if i + 1 < len(s) and s[i + 1] == "'":
-                    result.append("'")
-                    i += 2  # Skip both quotes
-                else:
-                    # Single quote - remove it
-                    i += 1
-                continue
-            result.append(s[i])
-            i += 1
-        return ''.join(result)
+    out: list[str] = []
+    for piece in _parse_format_pattern(formatString):
+        if isinstance(piece, str):
+            out.append(piece)
+            continue
 
-    formatString = process_quotes(formatString)
-
-    # noinspection PyShadowingNames
-    def replace_field(match: re.Match) -> str:
-        field = match.group(1).strip()
-        parts = [p.strip() for p in field.split(',')]
-
-        try:
-            index = int(parts[0])
-            value = args[index]
-        except (ValueError, IndexError):
-            raise ValueError(f"Invalid argument index: {parts[0]}")
+        index, arg_type, style = piece
+        if not _ARG_INDEX_RE.match(index):
+            raise ValueError(f"Invalid argument index: {index}")
+        position = int(index)
+        if position >= len(args):
+            # An index with no argument behind it is echoed as its own placeholder
+            # instead of failing -- a script that misnumbers one keeps running.
+            out.append(f"{{{position}}}")
+            continue
+        value = args[position]
 
         if isinstance(value, NA) or value is None:
-            return "NaN"
+            out.append("NaN")
+        elif arg_type.strip().lower() != 'number':
+            out.append(_format_value(value))
+        else:
+            # The keyword lookup trims and lowercases, but a DecimalFormat pattern
+            # is passed on untouched: '{0, number, #.#}' formats with " #.#" and
+            # so prints a leading space, while '{0, number, integer}' does not.
+            keyword = style.strip().lower()
+            number = safe_convert.safe_float(value)
+            if keyword in _NUMBER_STYLES:
+                out.append(_format_number(number, decimal_format=True,
+                                          fmt_type=keyword, precision=style))
+            elif keyword:
+                out.append(_format_number(number, decimal_format=True, precision=style))
+            else:
+                out.append(_format_number(number, decimal_format=True))
 
-        if len(parts) >= 2 and parts[1] == 'number':
-            if len(parts) >= 3:
-                return _format_number(safe_convert.safe_float(value),
-                                      decimal_format=True,
-                                      fmt_type=parts[2] if parts[2] in (
-                                          'integer', 'currency',
-                                          _format.percent,
-                                          _format.mintick,
-                                          _format.volume,
-                                          _format.price,
-                                          _format.inherit
-                                      ) else '',
-                                      precision=parts[2])
-            return _format_number(safe_convert.safe_float(value), decimal_format=True)
-
-        return _format_value(value)
-
-    # Validate and balance curly braces
-    stack = []
-    in_placeholder = False
-    for c in formatString:
-        if c == '{' and not in_placeholder:
-            stack.append(c)
-            in_placeholder = True
-        elif c == '}' and in_placeholder:
-            if not stack:
-                raise ValueError("Unmatched closing brace '}'")
-            stack.pop()
-            in_placeholder = False
-        elif c == '}' and not in_placeholder:
-            raise ValueError("Unmatched closing brace '}'")
-
-    if stack:
-        raise ValueError("Unmatched opening brace '{'")
-
-    return re.sub(r'\{([^}]+)}', replace_field, formatString)
+    return ''.join(out)
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
