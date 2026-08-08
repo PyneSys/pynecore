@@ -2,6 +2,10 @@ from typing import TypeVar, Any, cast
 
 import builtins
 
+# Underscored: a plain module-level name here would leak into the Pine namespace
+# through the module-property registry as `array.bisect_left`.
+from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
+
 import math
 import statistics
 
@@ -156,52 +160,45 @@ def binary_search(id: list[Any], val: Any) -> int:
 # noinspection PyShadowingBuiltins
 def binary_search_leftmost(id: list[Any], val: Any) -> int:
     """
-    Returns the index of the specified value in the sorted array using binary search.
-    If the value is not found, returns the index of the leftmost element greater than the value.
+    Returns the index of the first occurrence of the value in the sorted array.
+    If the value is not found, returns the index of the last element smaller than the
+    value, or 0 when every element is greater.
     The array to search must be sorted in ascending order.
 
     :param id: Input array
     :param val: Value to search for
-    :return: Index of the specified value in the sorted array, or the index of the leftmost element
-             greater than the value
+    :return: Index of the first occurrence of the value, or of the last smaller element
     """
-    low = 0
-    high = len(id) - 1
-    while low <= high:
-        mid = (low + high) // 2
-        if id[mid] == val:
-            return mid
-        else:
-            if val < id[mid]:
-                high = mid - 1
-            else:
-                low = mid + 1
-    return low - 1
+    # Measured on TradingView with [10, 20, 20, 20, 30, 40]:
+    #   5 -> 0, 10 -> 0, 15 -> 0, 20 -> 1, 25 -> 3, 30 -> 4, 40 -> 5, 45 -> 5
+    # so a hit answers the FIRST of the duplicates, a miss steps one to the left,
+    # and a value below the whole array is clamped to 0 rather than returning -1.
+    index = _bisect_left(id, val)
+    if index < len(id) and id[index] == val:
+        return index
+    return index - 1 if index > 0 else 0
 
 
 # noinspection PyShadowingBuiltins
 def binary_search_rightmost(id: list[Any], val: Any) -> int:
     """
-    Returns the index of the specified value in the sorted array using binary search.
-    If the value is not found, returns the index of the rightmost element less than the value.
+    Returns the index of the last occurrence of the value in the sorted array.
+    If the value is not found, returns the index of the first element greater than the
+    value, which is the array size when every element is smaller.
     The array to search must be sorted in ascending order.
 
     :param id: Input array
     :param val: Value to search for
-    :return: Index of the specified value in the sorted array, or the index of the rightmost element less than the value
+    :return: Index of the last occurrence of the value, or of the first greater element
     """
-    low = 0
-    high = len(id) - 1
-    while low <= high:
-        mid = (low + high) // 2
-        if id[mid] == val:
-            return mid
-        else:
-            if val < id[mid]:
-                high = mid - 1
-            else:
-                low = mid + 1
-    return high + 1
+    # Measured on TradingView with [10, 20, 20, 20, 30, 40]:
+    #   5 -> 0, 10 -> 0, 15 -> 1, 20 -> 3, 25 -> 4, 30 -> 4, 40 -> 5, 45 -> 6
+    # so a hit answers the LAST of the duplicates and a miss steps to the first
+    # greater element -- past the end for a value above the whole array.
+    index = _bisect_right(id, val)
+    if index > 0 and id[index - 1] == val:
+        return index - 1
+    return index
 
 
 # noinspection PyShadowingBuiltins
