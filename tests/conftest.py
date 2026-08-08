@@ -347,7 +347,12 @@ def dummy_ohlcv_iter():
 def runner(script_path, module_key, syminfo) -> RunnerProtocol:
     # Remove module from sys.modules to be able to re-import it. A second runner test in
     # the same file finds it already gone, so its absence is not an error.
+    # Two keys, because the file is imported twice under different names: pytest uses the
+    # dotted package path, while ``import_script`` puts the script's directory on the path
+    # and imports the bare stem. Only re-importing the stem gives the test a fresh
+    # ``@script.strategy`` object, and with it a fresh position and ledger.
     sys.modules.pop(module_key, None)
+    sys.modules.pop(script_path.stem, None)
 
     def _runner(ohlcv_iter: Iterable[OHLCV], syminfo_override: dict[str, Any] | None = None, *,
                 syminfo_path: Path | None = None,

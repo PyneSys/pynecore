@@ -2565,9 +2565,6 @@
     },
     "size": {
       "type": "variable"
-    },
-    "syminfo": {
-      "type": "variable"
     }
   },
   "lib.strategy.risk": {

@@ -80,7 +80,8 @@ class CurrencyRateProvider:
         self._chart_pair: tuple[str, str] | None = None
         self._sync_block: 'SyncBlock | None' = sync_block
         self._result_readers: dict[str, ResultReader] = {}
-        self._file_rate_cache: dict[str, tuple[list[int], list[float]]] = {}
+        # Bar open times, closes and the series' own bar length in milliseconds.
+        self._file_rate_cache: dict[str, tuple[list[int], list[float], int]] = {}
 
         self._build_pair_map(
             security_data or {},
@@ -204,18 +205,50 @@ class CurrencyRateProvider:
 
         :param ohlcv_path: OHLCV file backing this pair.
         :param timestamp: Bar time in UNIX seconds, as :func:`get_rate` receives it.
-        :return: Close of the last bar at or before the timestamp, or NaN.
+        :return: Close of the last rate bar that had already closed, or NaN.
         """
         if ohlcv_path not in self._file_rate_cache:
             self._load_ohlcv(ohlcv_path)
-        timestamps, closes = self._file_rate_cache[ohlcv_path]
+        timestamps, closes, period_ms = self._file_rate_cache[ohlcv_path]
         if not timestamps:
             return float('nan')
+        # Only an already-CLOSED rate bar may be read. The bar covering the chart bar has
+        # not finished there, so its close is not knowable yet; reading it would be
+        # lookahead. It is also what TradingView does: measured on BINANCE:BTCUSDT, the
+        # account rate on chart day D is COINBASE:USDTUSD's daily close of day D-1, on
+        # 1919/1919 daily bars. A bar stamped ``t`` closes at ``t + period``, so it counts
+        # from chart time ``c`` when ``t <= c - period``.
         # The cache holds OHLCV timestamps, which are milliseconds.
-        idx = bisect.bisect_right(timestamps, timestamp * 1000) - 1
+        idx = bisect.bisect_right(timestamps, timestamp * 1000 - period_ms) - 1
         if idx < 0:
             return float('nan')
         return closes[idx]
+
+    @staticmethod
+    def _period_ms(declared: str | None, timestamps: list[int]) -> int:
+        """
+        Bar length of a rate series, in milliseconds.
+
+        The declared period wins; the median gap between bars is the fallback for legacy
+        v1 files, which declare none. The median is used rather than the smallest gap so
+        the weekend of a five-day fiat feed and a DST-shifted day cannot shrink it.
+
+        :param declared: Canonical period from the file header, or ``None``.
+        :param timestamps: Bar open times in milliseconds, ascending.
+        :return: The bar length, or 0 when neither source can tell.
+        """
+        if declared:
+            from ..lib.timeframe import in_seconds
+            try:
+                return in_seconds(declared) * 1000
+            except (ValueError, AssertionError):
+                pass
+        if len(timestamps) < 2:
+            return 0
+        deltas = sorted(b - a for a, b in zip(timestamps, timestamps[1:]) if b > a)
+        if not deltas:
+            return 0
+        return deltas[len(deltas) // 2]
 
     def _load_ohlcv(self, ohlcv_path: str) -> None:
         """
@@ -228,16 +261,19 @@ class CurrencyRateProvider:
         """
         timestamps: list[int] = []
         closes: list[float] = []
+        declared: str | None = None
         if Path(ohlcv_path).exists():
             try:
                 with OHLCVReader(ohlcv_path) as reader:
+                    declared = reader.period
                     for candle in reader:
                         timestamps.append(candle.timestamp)
                         closes.append(candle.close)
             except (OSError, ValueError):
                 timestamps.clear()
                 closes.clear()
-        self._file_rate_cache[ohlcv_path] = (timestamps, closes)
+        self._file_rate_cache[ohlcv_path] = (timestamps, closes,
+                                             self._period_ms(declared, timestamps))
 
     def close(self) -> None:
         """Close every attached :class:`ResultReader`."""

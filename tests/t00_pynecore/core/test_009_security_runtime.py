@@ -359,8 +359,8 @@ def __test_chart_protocol_currency_conversion__(log):
         ohlcv_path = tmpdir / "EURUSD.ohlcv"
         toml_path = tmpdir / "EURUSD.toml"
 
-        # Write OHLCV with close=1.085 at timestamp matching lib._time
-        # (OHLCV timestamps are milliseconds, lib._datetime below is 1000 seconds)
+        # Write OHLCV with close=1.085. Only an already-closed rate bar is readable, so this
+        # daily bar (timestamp in milliseconds) must end before the chart time set below.
         with OHLCVWriter(ohlcv_path, "1D", truncate=True) as writer:
             writer.write(OHLCV(1_000_000, 1.085, 1.09, 1.08, 1.085, 100.0))
 
@@ -378,10 +378,10 @@ def __test_chart_protocol_currency_conversion__(log):
         provider = CurrencyRateProvider({"fx": str(tmpdir / "EURUSD")})
         request._currency_provider = provider
 
-        # Set lib._datetime so currency_rate can resolve timestamp
+        # Set lib._datetime so currency_rate can resolve timestamp — a day past the rate bar
         from pynecore import lib
         from datetime import datetime, timezone
-        lib._datetime = datetime.fromtimestamp(1000, timezone.utc)
+        lib._datetime = datetime.fromtimestamp(200_000, timezone.utc)
 
         try:
             # Conversion: security result is in EUR, convert to USD

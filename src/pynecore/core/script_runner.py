@@ -263,6 +263,12 @@ def _reset_lib_vars():
     from ..lib import request
     request._reset_request_state()
 
+    # Indicator-only processes never import the strategy package; don't pull in its
+    # 4.8k lines just to reset a memo that cannot exist yet.
+    strategy_mod = sys.modules.get('pynecore.lib.strategy')
+    if strategy_mod is not None:
+        strategy_mod._reset_currency_state()
+
 
 def _try_in_seconds(period: str | None) -> int | None:
     """Convert a TradingView period to seconds, or ``None`` when unparseable.
@@ -843,16 +849,22 @@ class ScriptRunner:
         self.viz_journal = viz_journal
         self._viz_shadow: dict | None = {} if viz_journal else None
         self.viz_events: Callable[[list[dict]], None] | None = None
+        # Money columns are reported in the account currency the strategy declared, prices
+        # in the symbol's own — a price is a quote, not an amount, and does not convert.
+        _account_currency = str(getattr(self.script, 'currency', 'NONE'))
+        if _account_currency == 'NONE':
+            _account_currency = syminfo.currency
         self.strat_writer = CSVWriter(strat_path, headers=(
             "Metric",
-            f"All {syminfo.currency}", "All %",
-            f"Long {syminfo.currency}", "Long %",
-            f"Short {syminfo.currency}", "Short %",
+            f"All {_account_currency}", "All %",
+            f"Long {_account_currency}", "Long %",
+            f"Short {_account_currency}", "Short %",
         )) if strat_path else None
         self.trades_writer = CSVWriter(trade_path, headers=(
             "Trade #", "Bar Index", "Type", "Signal", "Date/Time", f"Price {syminfo.currency}",
-            "Contracts", f"Profit {syminfo.currency}", "Profit %", f"Cumulative profit {syminfo.currency}",
-            "Cumulative profit %", f"Run-up {syminfo.currency}", "Run-up %", f"Drawdown {syminfo.currency}",
+            "Contracts", f"Profit {_account_currency}", "Profit %",
+            f"Cumulative profit {_account_currency}", "Cumulative profit %",
+            f"Run-up {_account_currency}", "Run-up %", f"Drawdown {_account_currency}",
             "Drawdown %",
         )) if trade_path else None
 

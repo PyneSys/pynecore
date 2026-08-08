@@ -1,7 +1,6 @@
 from ...types.na import NA, na_float
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
-from .. import syminfo
 
 from ...core.module_property import module_property
 
@@ -271,8 +270,6 @@ def capital_held() -> PyneFloat:
     :return: The summed entry value of the open trades, 0 while flat, na when the strategy
              requires no margin at all
     """
-    # Like every other monetary strategy value this is the symbol's quote currency scaled by
-    # pointvalue -- the engine performs no `currency=` account-currency conversion anywhere.
     # Measured on TradingView (BINANCE:BTCUSDT 1D, pyramiding 3): the value is the
     # sum of |size| * entry price over the open trades. It does not follow the
     # market, and a short trade contributes positively. TradingView keeps a running
@@ -288,7 +285,10 @@ def capital_held() -> PyneFloat:
         return 0.0
     if lib._script.margin_long <= 0.0 and lib._script.margin_short <= 0.0:
         return na_float
-    pv = syminfo.pointvalue
+    # Imported here rather than at module level: the strategy package imports this
+    # module while it is still executing, long before it defines this function.
+    from . import _account_point_value
+    pv = _account_point_value()
     total = 0.0
     for trade in lib._script.position.open_trades:
         total += abs(trade.size) * trade.entry_price * pv

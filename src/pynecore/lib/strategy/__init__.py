@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Literal, overload
 from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
 
+import logging as _logging  # underscore-aliased: kept out of the module-property registry
 import math
 import struct
 from abc import ABC, abstractmethod
@@ -24,6 +25,10 @@ from . import oca as _oca
 
 from . import closedtrades, opentrades
 
+# Deliberately not the Pine ``log.*`` stream (``pyne_core_logger``): that one carries
+# script output and is compared against TradingView logs.
+_logger = _logging.getLogger(__name__)
+
 __all__ = [
     "fixed", "cash", "percent_of_equity",
     "long", "short", 'direction',
@@ -43,6 +48,7 @@ __all__ = [
 from ...types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
+    from ...core.script import Script
     from .closedtrades import closedtrades
     from .opentrades import opentrades
     # Static-only public aliases: at runtime the submodule import above already
@@ -984,8 +990,10 @@ class SimPosition(PositionBase):
         script = lib._script
         commission_type = script.commission_type
         commission_value = script.commission_value
-        # USD value per 1.0-point move per 1 contract — futures-aware PnL conversion factor
-        pv = syminfo.pointvalue
+        # Account-currency value of a 1.0-point move on 1 contract: the futures point
+        # value scaled by this bar's symbol-to-account rate. Every money amount below
+        # rides it, so each is booked at the rate of the bar it is booked on.
+        pv = _account_point_value()
 
         new_closed_trades = []
         closed_trade_size = 0.0
@@ -2071,7 +2079,7 @@ class SimPosition(PositionBase):
 
         quantity = abs(self.size)
         # Convert price * quantity to account-currency for margin/equity comparisons.
-        pv = syminfo.pointvalue
+        pv = _account_point_value()
 
         money_spent = quantity * self.avg_price * pv
         mvs = quantity * check_price * pv
@@ -2305,7 +2313,7 @@ class SimPosition(PositionBase):
         if not self.entry_orders:
             return
         script = lib._script
-        pv = syminfo.pointvalue
+        pv = _account_point_value()
         for order in list(self.entry_orders.values()):
             if order.order_type != _order_type_entry:
                 continue
@@ -2341,7 +2349,7 @@ class SimPosition(PositionBase):
         if margin_percent <= 0:
             return False
 
-        pv = syminfo.pointvalue
+        pv = _account_point_value()
         margin_ratio = margin_percent / 100.0
 
         if base_size is None:
@@ -2727,7 +2735,7 @@ class SimPosition(PositionBase):
                 if (same_bar_entry_sign != 0.0 and self.size != 0.0
                         and self.sign == same_bar_entry_sign
                         and order.sign == -same_bar_entry_sign):
-                    pv = syminfo.pointvalue
+                    pv = _account_point_value()
                     ratio_old = (script.margin_short if self.sign < 0
                                  else script.margin_long) / 100.0
                     ratio_new = (script.margin_short if order.sign < 0
@@ -3056,8 +3064,10 @@ class SimPosition(PositionBase):
         """Phase 3: Calculate P&L, drawdown, runup, and cumulative stats."""
         # Calculate average entry price, unrealized P&L, drawdown and runup...
         if self.open_trades:
-            # USD value per 1.0-point move per 1 contract — futures-aware PnL conversion factor
-            pv = syminfo.pointvalue
+            # Account-currency value of a 1.0-point move on 1 contract. Re-read every bar,
+            # so an open position's unrealized P&L and its run-up/draw-down extremes are
+            # marked at the rate of the bar they occur on.
+            pv = _account_point_value()
 
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
@@ -3696,21 +3706,112 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
         position._deferred_immediate_closes.append(order)
 
 
+#
+# Account-currency conversion
+#
+# TradingView converts a strategy's money at the CASH-FLOW level: every amount is
+# multiplied by the rate of the day it is booked on, and nothing re-marks afterwards.
+# Measured on BINANCE:BTCUSDT against currency.JPY (18.4% rate amplitude): a closed
+# trade's profit is gross * rate(exit) - percent_commission_entry * rate(entry) -
+# percent_commission_exit * rate(exit), 274/274 trades, worst 1.1e-7 relative.
+#
+# Every money quantity in this engine is `<something> * syminfo.pointvalue`, so folding
+# the rate into the point value reproduces that automatically -- the entry commission is
+# computed on the entry bar and the exit legs on the exit bar, each with its own rate,
+# with no per-trade rate stored anywhere. It also keeps the percent metrics right: they
+# divide two converted amounts, so the rate cancels, exactly as TradingView reports.
+#
+# The two exceptions are deliberate and measured:
+# * cash_per_contract / cash_per_order amounts are already in the account currency and
+#   are booked verbatim (584/584 each) -- they carry no point value, so they are
+#   untouched by construction.
+# * initial_capital is declared in the account currency, so it is never converted.
+
+# The rate is a daily series but every money expression reads it, so it is sampled once
+# per bar. Three forms are kept: the raw value the Pine builtins must return (na when
+# there is no rate data), the safe multiplier the ledger uses (an unusable rate degrades
+# to 1.0, which leaves an unconverted run bit-identical), and the scaled point value.
+_conv_script: 'Script | None' = None
+_conv_bar: int = -1
+_conv_rate: float = 1.0
+_conv_safe: float = 1.0
+_conv_pv: float = 0.0
+_conv_warned: bool = False
+
+
+def _reset_currency_state() -> None:
+    """Drop the per-bar account-rate memo between script runs."""
+    global _conv_script, _conv_bar, _conv_rate, _conv_safe, _conv_pv, _conv_warned
+    _conv_script = None
+    _conv_bar = -1
+    _conv_rate = 1.0
+    _conv_safe = 1.0
+    _conv_pv = 0.0
+    _conv_warned = False
+
+
 # noinspection PyProtectedMember
+def _sample_account_currency() -> float:
+    """
+    Sample the symbol-to-account rate for the current bar and refresh the memo.
+
+    :return: The point value scaled into the account currency
+    """
+    global _conv_script, _conv_bar, _conv_rate, _conv_safe, _conv_pv, _conv_warned
+
+    script = lib._script
+    symbol_cur = syminfo.currency
+    # With no script the account is the symbol's own currency, so nothing converts.
+    account = symbol_cur if script is None else script.currency
+    rate = 1.0
+    if account != 'NONE' and account != symbol_cur:
+        rate = request.currency_rate(symbol_cur, account)
+
+    # A zero or negative rate can only come from a damaged feed, and a sign flip would
+    # invert the whole ledger, so it degrades the same way na does.
+    safe = rate if (rate == rate and rate > 0.0) else 1.0
+    if safe != rate and not _conv_warned:
+        _conv_warned = True
+        _logger.warning(
+            "strategy(currency=%s) needs a %s to %s rate, but no rate data is available; "
+            "profits stay in %s. Supply the pair as an OHLCV file with a sibling TOML "
+            "declaring its basecurrency and currency.",
+            account, symbol_cur, account, symbol_cur,
+        )
+
+    _conv_script = script
+    _conv_bar = lib.bar_index
+    _conv_rate = rate
+    _conv_safe = safe
+    _conv_pv = syminfo.pointvalue * safe
+    return _conv_pv
+
+
+# noinspection PyProtectedMember
+def _account_point_value() -> float:
+    """
+    Point value of one contract for the current bar, in the account currency.
+
+    :return: ``syminfo.pointvalue`` scaled by the symbol-to-account rate
+    """
+    # The script identity is part of the key, not just the bar: PyneAPI runs several
+    # scripts in one process and re-applies syminfo every bar, so a bar_index-only memo
+    # could hand one script the rate sampled for another. A realtime bar skips the memo
+    # because the chart-pair rate source reads lib.close, which moves within the bar.
+    if (_conv_script is lib._script and _conv_bar == lib.bar_index
+            and not lib.barstate.isrealtime):
+        return _conv_pv
+    return _sample_account_currency()
+
+
 def _account_rate() -> float:
     """
     Exchange rate from the symbol's quote currency to the strategy's account currency.
 
     :return: The rate, 1.0 when no conversion applies, na when no rate data is available
     """
-    script = lib._script
-    if script is None:
-        return 1.0
-    account = str(script.currency)
-    symbol_cur = syminfo.currency
-    if account == 'NONE' or account == symbol_cur:
-        return 1.0
-    return request.currency_rate(symbol_cur, account)
+    _account_point_value()  # refreshes the memo when it is stale
+    return _conv_rate
 
 
 def convert_to_account(value: PyneFloat) -> PyneFloat:
@@ -3753,27 +3854,36 @@ def _default_entry_budget(price: float) -> tuple[float, float] | None:
 
     Returns ``(money, unit_cost)`` so that the raw quantity is
     ``money / unit_cost``, or None for fixed sizing (not money-based).
+
+    Both sides are in the account currency: the budget because equity and
+    ``default_qty_value`` are, the unit cost because the point value carries the rate.
+    Measured on TradingView with a JPY account on BINANCE:BTCUSDT --
+    ``strategy.cash`` sizes 584/584 at ``(cash / rate) / price`` and
+    ``percent_of_equity`` 581/584 at ``floor_mc((equity / rate) / price)``, which is the
+    same thing as dividing an account-currency budget by an account-currency unit cost.
     """
     script = lib._script
     default_qty_type = script.default_qty_type
     if default_qty_type == fixed:
         return None
 
+    pv = _account_point_value()
+
     if default_qty_type == percent_of_equity:
         target_investment = script.position.equity * script.default_qty_value * 0.01
         if script.commission_type == _commission.percent:
             commission_multiplier = 1.0 + script.commission_value * 0.01
-            return target_investment, price * syminfo.pointvalue * commission_multiplier
+            return target_investment, price * pv * commission_multiplier
         if script.commission_type == _commission.cash_per_contract:
-            return target_investment, price * syminfo.pointvalue + script.commission_value
+            # The cash fee is already in the account currency, so it is added unscaled.
+            return target_investment, price * pv + script.commission_value
         if script.commission_type == _commission.cash_per_order:
-            return (max(0.0, target_investment - script.commission_value),
-                    price * syminfo.pointvalue)
+            return max(0.0, target_investment - script.commission_value), price * pv
         # No commission
-        return target_investment, price * syminfo.pointvalue
+        return target_investment, price * pv
 
     if default_qty_type == cash:
-        return script.default_qty_value, price * syminfo.pointvalue
+        return script.default_qty_value, price * pv
 
     raise ValueError("Unknown default qty type: ", default_qty_type)
 
@@ -4177,7 +4287,8 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
                 check_price = position.c
             equity = script.initial_capital + position.netprofit + position.openprofit
             # Margin/equity are in account currency — convert via pointvalue.
-            margin_needed = abs(size) * check_price * syminfo.pointvalue * margin_ratio
+            pv = _account_point_value()
+            margin_needed = abs(size) * check_price * pv * margin_ratio
             # From 1e7 account-currency units of equity upward TV runs this
             # creation-time check as the quantized big-money gate (see
             # _gate_entry_lots): the order is cancelled unless the equity tick
@@ -4191,11 +4302,16 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             # refilled one bar later; MAB corpus entries at 1.06M/1.32M
             # equity fill despite the same tick geometry, bracketing the gate
             # below 1e7 together with the sizing-law gate in (9.0e6, 1.01e7].
+            # The tick grid below divides an account-currency equity by the SYMBOL's
+            # mintick. That was measured on a chart whose quote currency is the account
+            # currency, so the mismatch never showed; with an account rate != 1 the grid's
+            # unit is undefined. The gate only engages above 1e7 equity, so this is left
+            # as measured rather than guessed at.
             mintick = syminfo.mintick
             if equity >= 1e7 and mintick and mintick > 0:
                 rfactor = syminfo._size_round_factor  # noqa
                 lots = round(abs(size) * rfactor)
-                unit_margin = check_price * syminfo.pointvalue * margin_ratio
+                unit_margin = check_price * pv * margin_ratio
                 if lots > 0:
                     granted = _gate_entry_lots(equity / mintick, lots, rfactor,
                                                unit_margin, mintick, check_price)
@@ -4762,7 +4878,7 @@ def margin_liquidation_price() -> PyneFloat:
     if margin_percent <= 0:
         return na_float
     margin_ratio = margin_percent / 100.0
-    qpv = abs(position.size) * syminfo.pointvalue
+    qpv = abs(position.size) * _account_point_value()
     capital = script.initial_capital + position.netprofit
     if sign > 0:
         denom = qpv * (1.0 - margin_ratio)
