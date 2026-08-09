@@ -289,32 +289,38 @@ def fill(id: list[T] | SequenceView[T], value: T,
     Fills the elements in the array with the specified value.
 
     An na ``index_from`` fills from the start of the array and an na ``index_to``
-    fills to its end, instead of failing. Bounds outside the array address only
-    the part that exists, so the array size never changes. A slice view fills the
-    addressed part of its parent, like every other write through a view.
+    fills to its end, instead of failing. ``index_from`` must address an existing
+    element and ``index_to`` may reach one position past the last one; any other
+    bound, negative ones included, is an error. Reversed bounds fill nothing. A
+    slice view fills the addressed part of its parent, like every other write
+    through a view.
 
     :param id: Input array
     :param value: Value to fill
     :param index_from: Index to start filling from
     :param index_to: Index to stop filling at
+    :raises IndexError: If a bound is out of range
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     #   fill(a, 5, na, 2) -> 5,5,30,40      fill(a, 5, 1, na) -> 10,5,5,5
-    # ``index_to`` defaults to na, so this guard also implements Pine's
+    # ``index_to`` defaults to na, so the na guard also implements Pine's
     # "omitted index_to means the array size" default.
     #
-    # ``slice.indices`` clamps both bounds into [0, size] the way Python's own
-    # slicing does. Without it the replacement list is sized from the REQUESTED
-    # span rather than the addressed one, and a bound outside the array silently
-    # resizes it: [10, 20, 30, 40] filled with index_to = 99 grew to 99 elements
-    # and with index_to = -1 shrank to a single element. TradingView halts on an
-    # out-of-range fill bound (RE10045), so no behaviour here is TV-exact, but
-    # destroying live data is strictly worse than filling what exists.
+    # Bounds outside the array HALT the script (RE10045), they are not clamped:
+    #   fill(a, 5, 0, 99)  fill(a, 5, 0, -1)  fill(a, 5, -1, 2)  fill(a, 5, 4, 4)
+    # all halt, as does fill(array.new_float(0), 5) on an empty array, whose
+    # implied index_from 0 addresses nothing. So index_from addresses an element
+    # while index_to may equal the size -- the range slice() takes as well. A
+    # NEGATIVE bound is not counted from the end here, unlike in get/set/remove/
+    # insert. Reversed bounds are a silent no-op though (fill(a, 5, 3, 1) left
+    # the array untouched), where slice() halts on them.
     length = len(id)
-    start, stop, _ = builtins.slice(
-        int(index_from) if index_from == index_from else 0,  # is_na_arg
-        int(cast(int, index_to)) if index_to == index_to else length,  # is_na_arg
-    ).indices(length)
+    start = int(index_from) if index_from == index_from else 0  # is_na_arg
+    stop = int(cast(int, index_to)) if index_to == index_to else length  # is_na_arg
+    if not 0 <= start < length:
+        raise IndexError(f"Start index {start} is out of bounds, array size is {length}")
+    if not 0 <= stop <= length:
+        raise IndexError(f"End index {stop} is out of bounds, array size is {length}")
     id[start:stop] = [value] * (stop - start)
 
 
@@ -349,12 +355,22 @@ def get(id: list[T] | SequenceView[T], index: int) -> T:
     Returns the element at the specified index in the array.
 
     An na index returns na and leaves the array untouched. A float index is
-    truncated to an integer. An out-of-range integer index still raises.
+    truncated to an integer. A negative index addresses the array from its end,
+    and an index outside ``-size .. size - 1`` raises.
 
     :param id: Input array
     :param index: Index of the element to return
     :return: Element at the specified index in the array, or na if the index is na
+    :raises IndexError: If the index is out of range
     """
+    # Negative indices are a Pine v6 feature and they follow Python's own rule
+    # exactly, which is why nothing here handles them. Measured on TradingView
+    # (FX:EURUSD 240, array [10, 20, 30, 40]): get(a, -1) is 40 while get(a, -5)
+    # and get(a, 4) halt (RE10045) -- and the SAME get(a, -1) halts on every bar
+    # under v4 and v5, so it is the version that grants it, not leniency here.
+    # ``set``, ``remove`` and slice views (get(slice(a, 1, 3), -1) -> 30) share
+    # the rule; ``insert`` extends it by one position and ``fill`` does not take
+    # negative bounds at all.
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   get([10, 20, 30, 40], na) -> NaN, array unchanged
@@ -413,11 +429,14 @@ def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     Inserts the specified value at the specified index in the array.
 
     An na index appends the value at the end of the array, a float index is
-    truncated to an integer.
+    truncated to an integer. A negative index counts from the end and the array
+    size itself is a valid index (it appends), so ``-size .. size`` addresses a
+    position and anything outside it is an error.
 
     :param id: Input array
     :param index: Index to insert the value at
     :param value: Value to insert
+    :raises IndexError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
@@ -426,7 +445,17 @@ def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
         # i.e. na resolves to the array size, it is not clamped from 0.
         id.append(value)
         return
-    id.insert(int(index), value)  # float-carried integer index, see get()
+    index = int(index)  # float-carried integer index, see get()
+    # Measured on TradingView (FX:EURUSD 240, array [10, 20, 30, 40]):
+    #   insert(a, 4, 77) -> 10,20,30,40,77   insert(a, -4, 77) -> 77,10,20,30,40
+    #   insert(a, 5, 77) / insert(a, -5, 77) -> both halt (RE10045)
+    # Python's list.insert CLAMPS an out-of-range index into the array instead of
+    # raising, so this bound needs its own check -- get/set/remove inherit the
+    # equivalent range from Python's own indexing and need none.
+    length = len(id)
+    if not -length <= index <= length:
+        raise IndexError(f"Index {index} is out of bounds, array size is {length}")
+    id.insert(index, value)
 
 
 # noinspection PyShadowingBuiltins
@@ -988,11 +1017,12 @@ def remove(id: list[T] | SequenceView[T], index: int) -> T:
     Removes the element at the specified index from the array.
 
     An na index removes nothing and returns na, a float index is truncated to an
-    integer.
+    integer and a negative one addresses the array from its end, like in ``get``.
 
     :param id: Input array
     :param index: Index of the element to remove
     :return: The removed element, or na if the index is na
+    :raises IndexError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
@@ -1021,11 +1051,13 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     """
     Sets the value of the element at the specified index in the array.
 
-    An na index is a silent no-op, a float index is truncated to an integer.
+    An na index is a silent no-op, a float index is truncated to an integer and a
+    negative one addresses the array from its end, like in ``get``.
 
     :param id: Input array
     :param index: Index of the element to set
     :param value: Value to set
+    :raises IndexError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
