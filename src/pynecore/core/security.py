@@ -401,15 +401,34 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     if state.same_timeframe:
         if state.bar_opens is None:
             return chart_time
+        opens = state.bar_opens
+        n = len(opens)
+        ptr = state.bar_ptr
+        if state.bar_closes is not None:
+            # The security's session does not start on the chart's grid, so its
+            # bars are OFFSET from the chart's: a US-equity session opening at
+            # 09:30 puts its bars on the half hour while a forex chart sits on
+            # the hour. Confirmation must then ride the child's close instants,
+            # exactly as the HTF path does — the bar is known to the chart bar
+            # whose close it reaches, and the session-closing stub bar (15:30 ->
+            # 16:00) ends on that chart bar's own close. Measured on TradingView
+            # (CAPITALCOM:EURUSD 60 requesting GOOG at the chart TF): the stub's
+            # close arrives on the 20:00 UTC chart bar, one bar earlier than the
+            # open-time clamp below places it, on all 897 affected bars.
+            closes = state.bar_closes
+            close_time = chart_time + state.chart_off + 1
+            while ptr + 1 < n and closes[ptr + 1] <= close_time:
+                ptr += 1
+            state.bar_ptr = ptr
+            if ptr >= 0 and closes[ptr] <= close_time:
+                return opens[ptr]
+            return state.last_confirmed
         # Gappy same-TF cross-symbol feed: clamp to the latest real child bar
         # open. ``chart_time`` and ``bar_opens`` are both monotonic across chart
         # bars, so the persistent ``bar_ptr`` only ever advances. ``ptr == -1``
         # means the chart still precedes the first real security bar — return
         # ``last_confirmed`` (0) so nothing is confirmed yet and the read stays
         # ``na``, matching TradingView before the security series begins.
-        opens = state.bar_opens
-        n = len(opens)
-        ptr = state.bar_ptr
         while ptr + 1 < n and opens[ptr + 1] <= chart_time:
             ptr += 1
         state.bar_ptr = ptr
@@ -1234,6 +1253,7 @@ def _session_bar_closes(
         tz: ZoneInfo | None,
         opening_hours: list[SymInfoInterval],
         period_ms: int,
+        corrections: dict[date, tuple[SymInfoInterval, ...]] | None = None,
 ) -> list[int] | None:
     """
     Close instant (epoch ms) of each intraday HTF bar: the earlier of its period
@@ -1253,10 +1273,18 @@ def _session_bar_closes(
     belongs to (e.g. a ``21:00->02:00`` night session's ``01:00`` bar closes at the
     ``02:00`` session end, not a full period later).
 
+    A date listed in ``corrections`` trades on its own hours instead of its
+    weekday's — an exchange early close (US equities' 13:00 half-days) ends the
+    session hours before the regular close, and a bar opening in the final hour
+    then closes at the early close, not a full period later. The correction
+    applies per calendar date on both branches, so an overnight session's
+    after-midnight leg takes the correction of the date its session STARTED.
+
     :param opens: HTF bar opens in epoch ms, ascending.
     :param tz: The security's exchange timezone.
     :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
     :param period_ms: The HTF period length in milliseconds.
+    :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
     :return: A parallel list of close instants (epoch ms), or ``None`` if any open
         has no containing interval — the schedule does not fully describe the
         feed, so the caller keeps the arithmetic grid clamp rather than risk a
@@ -1266,28 +1294,39 @@ def _session_bar_closes(
     closes: list[int] = []
     for open_ms in opens:
         open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
+        open_date = open_dt.date()
         weekday = open_dt.weekday()
         prev_weekday = (weekday - 1) % 7
         open_time = open_dt.time()
+        if corrections:
+            today_hours = corrections.get(open_date, opening_hours)
+            prev_hours = corrections.get(open_date - timedelta(days=1), opening_hours)
+        else:
+            today_hours = prev_hours = opening_hours
         end_ms: int | None = None
-        for interval in opening_hours:
+        for interval in today_hours:
             overnight = crosses_midnight(interval.start, interval.end)
             if (interval.day == weekday and interval.start <= open_time
                     and (overnight or open_time < interval.end)):
                 # Same-day session, or the pre-midnight leg of an overnight one
                 # (which closes on the following calendar day).
-                end_date = open_dt.date() + timedelta(days=1 if overnight else 0)
-            elif overnight and interval.day == prev_weekday and open_time < interval.end:
-                # After-midnight leg of the PREVIOUS day's overnight session: the
-                # bar opens today but its session started yesterday and closes
-                # today (e.g. a 21:00->02:00 night session's 01:00 bar).
-                end_date = open_dt.date()
+                end_date = open_date + timedelta(days=1 if overnight else 0)
             else:
                 continue
             candidate = int(
                 datetime.combine(end_date, interval.end, tzinfo=tz).timestamp() * 1000)
             if end_ms is None or candidate < end_ms:
                 end_ms = candidate
+        for interval in prev_hours:
+            # After-midnight leg of the PREVIOUS day's overnight session: the bar
+            # opens today but its session started yesterday and closes today
+            # (e.g. a 21:00->02:00 night session's 01:00 bar).
+            if (crosses_midnight(interval.start, interval.end)
+                    and interval.day == prev_weekday and open_time < interval.end):
+                candidate = int(
+                    datetime.combine(open_date, interval.end, tzinfo=tz).timestamp() * 1000)
+                if end_ms is None or candidate < end_ms:
+                    end_ms = candidate
         if end_ms is None:
             return None
         # Whichever comes first: the bar's own period end, or the session end (a
@@ -1346,7 +1385,7 @@ def _dated_session_bar_closes(
         while j < n and idx[j] == k:
             j += 1
         oh = si.session_schedules[k].opening_hours
-        seg = _session_bar_closes(opens[i:j], tz, oh, period_ms)
+        seg = _session_bar_closes(opens[i:j], tz, oh, period_ms, si.session_corrections)
         if seg is None:
             return None
         closes.extend(seg)
@@ -1480,12 +1519,14 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         sec_hours = si.opening_hours or None
         mode = grid_mode(si.type, si.opening_hours)
 
-        # Session-bounded intraday HTF (e.g. a futures contract's day/night
-        # sessions): confirm each bar on its scheduled session end instead of the
+        # Session-bounded intraday feed (e.g. a futures contract's day/night
+        # sessions, or an equity whose 09:30 open puts its bars off the chart's
+        # grid): confirm each bar on its scheduled session end instead of the
         # arithmetic next-period boundary (see ``_get_confirmed_time``). Needs the
         # session schedule; ``None`` (no schedule, or a bar outside it) keeps the
-        # grid clamp.
-        if not is_dwm and sec_hours and not state.same_timeframe:
+        # grid clamp. Same-TF contexts need it for the same reason as HTF ones —
+        # only their offset comes from the session, not from the period length.
+        if not is_dwm and sec_hours:
             period_ms = tf_module.in_seconds(state.timeframe) * 1000
             if si.has_schedule_history:
                 # The trading-day roll keys off the flat (newest) session opens;
@@ -1530,7 +1571,8 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
                 state.bar_closes = _dated_session_bar_closes(
                     opens, sec_tz, si, period_ms, overnight)
             else:
-                state.bar_closes = _session_bar_closes(opens, sec_tz, sec_hours, period_ms)
+                state.bar_closes = _session_bar_closes(
+                    opens, sec_tz, sec_hours, period_ms, si.session_corrections)
     state.sec_grid_args = (sec_tz, sec_starts, sec_hours, mode)
 
 

@@ -111,16 +111,25 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
     at the current bar's timestamp. The rate is looked up from OHLCV data files
     whose TOML metadata matches the requested currency pair.
 
+    An empty currency code means "no conversion" and the identity rate needs no
+    data at all, so both cases answer 1.0 before any provider is consulted.
+
     :param from_currency: Source currency code (e.g. ``"EUR"``, ``currency.EUR``)
     :param to_currency: Target currency code (e.g. ``"USD"``, ``currency.USD``)
     :return: Exchange rate as float, or ``na`` if no data is available
     """
+    # Measured on TradingView (CAPITALCOM:EURUSD 60): ("USD", ""), ("", "USD"),
+    # ("", "") and ("USD", "USD") all plot 1.0, while ("EUR", "USD") plots the
+    # real rate. Pine's own "Default currency" inputs pass "" for exactly this.
+    _from, _to = str(from_currency), str(to_currency)
+    if not _from or not _to or _from == _to:
+        return 1.0
     if _currency_provider is None:
         return nan
     from .. import lib
     # noinspection PyProtectedMember
     timestamp = int(lib._datetime.timestamp())
-    return _currency_provider.get_rate(str(from_currency), str(to_currency), timestamp)
+    return _currency_provider.get_rate(_from, _to, timestamp)
 
 
 # noinspection PyUnusedLocal

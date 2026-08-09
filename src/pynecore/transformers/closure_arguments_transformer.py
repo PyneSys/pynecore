@@ -191,14 +191,16 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
             elif func_name == 'method_call' and len(node.args) >= 2:
                 method_name = None
 
-                # First argument can be either a string literal or a function reference
+                # Only the reference form ``method_call(method_function, this, ...)``
+                # names a function of this module. The string form asks the runtime
+                # to resolve the name against the receiver's type and the imported
+                # libraries, and that lookup only ever yields an ``Exported`` — never
+                # an inner function. Injecting closure arguments there would push a
+                # local function's captures in front of a LIBRARY method's receiver
+                # whenever the two happen to share a name (`zigZag.update()` next to
+                # a local `update()`), so the string form is left untouched.
                 first_arg = node.args[0]
-                if (isinstance(first_arg, ast.Constant) and
-                        isinstance(first_arg.value, str)):
-                    # method_call('method_name', this_object, ...) format
-                    method_name = first_arg.value
-                elif isinstance(first_arg, ast.Name):
-                    # method_call(method_function, this_object, ...) format
+                if isinstance(first_arg, ast.Name):
                     method_name = first_arg.id
 
                 if method_name:

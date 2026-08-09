@@ -127,6 +127,15 @@ class SymInfo:
     newest variant; consumers that need a schedule for a specific date resolve it
     via :meth:`schedule_for` / :meth:`schedule_index_for`. Empty for the common
     case of a symbol whose hours never changed."""
+    session_corrections: dict[date, tuple[SymInfoInterval, ...]] = field(default_factory=dict)
+    """Single-day exceptions to the weekly schedule, keyed by exchange-local date:
+    the intervals that replace that date's ``opening_hours`` (an empty tuple means
+    the market did not trade at all). Exchanges shorten sessions on a handful of
+    days a year — US equities close at 13:00 the day after Thanksgiving, on
+    Christmas Eve and around Independence Day — and a bar on such a day closes at
+    the early close, not at the regular one. That is not derivable from the bar
+    data (the day's last bar is a stub with no marker), so it comes from the
+    exchange calendar the data source publishes."""
     timezone: str = 'UTC'
 
     avg_spread: float | None = None
@@ -222,7 +231,7 @@ class SymInfo:
         # present, overwrites the flat fields above with the NEWEST variant so
         # setup-time classification and the live "now" both see today's calendar.
         # noinspection PyShadowingNames
-        def parse_effective_from(value: object) -> date:
+        def parse_local_date(value: object, what: str) -> date:
             """Normalize a TOML local-date / local-datetime / ISO string to a date."""
             if isinstance(value, datetime):  # datetime first: it subclasses date
                 return value.date()
@@ -230,7 +239,7 @@ class SymInfo:
                 return value
             if isinstance(value, str):
                 return date.fromisoformat(value.replace(' ', 'T').split('T')[0])
-            raise ValueError("Invalid session_schedules effective_from type "
+            raise ValueError(f"Invalid {what} type "
                              f"{type(value).__name__}: expected a date or YYYY-MM-DD string")
 
         session_schedules: list[SymInfoScheduleVariant] = []
@@ -238,7 +247,7 @@ class SymInfo:
         for sched in data.get('session_schedules', []):
             if 'effective_from' not in sched:
                 raise ValueError("session_schedules entry is missing 'effective_from'")
-            eff = parse_effective_from(sched['effective_from'])
+            eff = parse_local_date(sched['effective_from'], "session_schedules effective_from")
             if eff in seen_effective:
                 raise ValueError(f"Duplicate session_schedules effective_from: {eff}")
             seen_effective.add(eff)
@@ -260,6 +269,22 @@ class SymInfo:
             session_starts = newest.session_starts
             session_ends = newest.session_ends
 
+        # Single-day calendar exceptions. One block lists every date sharing the
+        # same corrected hours, so a decade of early closes stays a few lines. The
+        # interval's weekday is the date's own -- it is not written out, and a
+        # value contradicting the date could only be wrong.
+        session_corrections: dict[date, tuple[SymInfoInterval, ...]] = {}
+        for corr in data.get('session_corrections', []):
+            hours = [(parse_time(iv['start']), parse_time(iv['end']))
+                     for iv in corr.get('opening_hours', [])]
+            for raw_date in corr.get('dates', []):
+                corrected = parse_local_date(raw_date, "session_corrections date")
+                if corrected in session_corrections:
+                    raise ValueError(f"Duplicate session_corrections date: {corrected}")
+                session_corrections[corrected] = tuple(
+                    SymInfoInterval(day=corrected.weekday(), start=start, end=end)
+                    for start, end in hours)
+
         # Create instance with all fields
         return cls(
             prefix=symbol['prefix'],
@@ -280,6 +305,7 @@ class SymInfo:
             session_starts=session_starts,
             session_ends=session_ends,
             session_schedules=session_schedules,
+            session_corrections=session_corrections,
             timezone=symbol.get('timezone', 'UTC'),
             volumetype=symbol.get('volumetype', 'base'),
             avg_spread=symbol.get('avg_spread'),
@@ -425,6 +451,24 @@ class SymInfo:
         else:
             lines.append(_SESSION_SCHEDULE_EXAMPLE_COMMENT)
             lines.append("")
+
+        # Single-day calendar exceptions, grouped by identical hours so one block
+        # covers every date that shares them.
+        if self.session_corrections:
+            groups: dict[tuple[tuple[time, time], ...], list[date]] = {}
+            for corrected in sorted(self.session_corrections):
+                key = tuple((iv.start, iv.end) for iv in self.session_corrections[corrected])
+                groups.setdefault(key, []).append(corrected)
+            lines.append("# Single-day calendar exceptions: dates whose trading hours")
+            lines.append("# differ from the weekly schedule. Empty opening_hours = closed.")
+            for hours, dates in groups.items():
+                lines.append("[[session_corrections]]")
+                intervals = ", ".join(
+                    f'{{ start = "{time_to_str(start)}", end = "{time_to_str(end)}" }}'
+                    for start, end in hours)
+                lines.append(f"opening_hours = [{intervals}]")
+                lines.append("dates = [" + ", ".join(d.isoformat() for d in dates) + "]")
+                lines.append("")
 
         if preserved_download:
             lines.append(preserved_download)

@@ -530,11 +530,26 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFlo
     assert adxSmoothing > 0, "Invalid ADX smoothing, ADX smoothing must be greater than 0!"
     up = change(high)
     down = -change(low)
-    if not (up == up) or not (down == down):
-        return na_float, na_float, na_float
-    a = atr(diLength)
-    plus_dm = up if (up > down and up > 0.0) else 0.0
-    minus_dm = down if (down > up and down > 0.0) else 0.0
+    # All three rolling averages must be entered on EVERY bar, the first one
+    # included. ``tr`` carries the previous close in its own per-call-site slot,
+    # so a bar it is not called on is a bar it never sees: entering it first at
+    # bar 1 leaves that slot na and the true range there degrades to high - low,
+    # which then seeds the average. MEASURED on TradingView (CAPITALCOM:EURUSD 60,
+    # 22396 bars): the denominator of ``ta.dmi`` is ``rma`` over a true range that
+    # is na on the first bar and exact from the second on -- ``tr()``, not
+    # ``tr(true)``, so it differs from ``ta.atr(diLength)`` for the whole run
+    # (240 bars still above 1e-12 apart). The directional movements stay na on
+    # that bar for the same reason ``ta.change`` is na there.
+    input_na = not (up == up) or not (down == down)
+    a = rma(tr(), diLength)
+    # The directional-movement selection compares TOLERANTLY, like Pine's own
+    # operators: MEASURED on TradingView (CAPITALCOM:EURUSD 60), a bar whose high
+    # and low moved by the same quantized amount produces no directional movement
+    # at all, even though the two differences land ~1e-18 apart in float. A strict
+    # ``>`` picks a movement there and the smoothed result stays off for hundreds
+    # of bars (1324 of 22396 above 1e-12).
+    plus_dm = na_float if input_na else (up if (up - down > _EPSILON and up > _EPSILON) else 0.0)
+    minus_dm = na_float if input_na else (down if (down - up > _EPSILON and down > _EPSILON) else 0.0)
     p = rma(plus_dm, diLength)
     m = rma(minus_dm, diLength)
     if not (a == a) or not (p == p) or not (m == m) or a == 0.0:
