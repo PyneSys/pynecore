@@ -143,8 +143,8 @@ class HTFAggregator:
 
         closed: DevelopingBar | None = None
         state = self._state
-        is_new = state is None or period_start != state.period_start
-        if is_new:
+        if state is None or period_start != state.period_start:
+            is_new = True
             if state is not None:
                 # The period was left without its completing chart bar (data
                 # gap) — deliver its accumulated final form one bar late.
@@ -158,6 +158,7 @@ class HTFAggregator:
             )
             self._state = state
         else:
+            is_new = False
             state.update(chart_time_ms, chart_high, chart_low,
                          chart_close, chart_volume)
 
