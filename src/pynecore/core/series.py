@@ -317,7 +317,12 @@ class SeriesImpl(Generic[T]):
             if start > stop:
                 start = stop
 
-            return ReadOnlySeriesView[T](
+            # Unsubscripted on purpose: the subscripted form routes construction
+            # through ``typing._GenericAlias.__call__``, which costs ~290ns per
+            # slice and buys nothing here -- it can only attach ``__orig_class__``,
+            # which a ``__slots__`` class rejects anyway. ``T`` still binds from
+            # the ``buffer`` argument, so the inferred type is unchanged.
+            return ReadOnlySeriesView(
                 self._buffer,
                 self._capacity,
                 self._write_pos,
