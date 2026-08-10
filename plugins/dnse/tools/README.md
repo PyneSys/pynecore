@@ -32,21 +32,20 @@ code, it writes the new token.
 
 1. On the Google account: enable **2-Step Verification**, then create an **App password**
    (Google Account → Security → App passwords → "Mail").
-2. Store the creds in a private, gitignored env file:
+2. Put it in the repo-root **`.env`** — it already carries the keys (see `.env.example`;
+   `.env` is gitignored), so just fill the blank password:
 
-   ```bash
-   umask 077
-   cat > workdir/state/dnse_gmail.env <<'EOF'
+   ```dotenv
    DNSE_GMAIL_USER=you@gmail.com
    DNSE_GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
-   EOF
    ```
 
-3. Install ONE daily cron at 08:00 ICT (TTL 8h covers the morning + afternoon session):
+3. Install ONE daily cron at 08:00 ICT (TTL 8h covers the morning + afternoon session).
+   The minter **auto-loads `.env`**, so no `set -a && . .env` is needed:
 
    ```cron
    CRON_TZ=Asia/Ho_Chi_Minh
-   0 8 * * 1-5 cd /home/mike/workspace/github/pynecore && set -a && . workdir/state/dnse_gmail.env && .venv/bin/python plugins/dnse/tools/refresh_token.py >> workdir/state/refresh_token.log 2>&1
+   0 8 * * 1-5 cd /home/mike/workspace/github/pynecore && .venv/bin/python plugins/dnse/tools/refresh_token.py >> workdir/state/refresh_token.log 2>&1
    ```
 
 If a morning cron fails (no OTP arrived, Gmail hiccup), fall back to the manual leg above
@@ -55,6 +54,6 @@ mid-session manual refresh is picked up without a restart.
 
 ## Security
 
-The state file and the env file are **order-placement authority**: written `0600`, kept
-under `workdir/state/` (gitignored), never committed, never logged. Treat them like
-`api_secret`.
+The token state file (`workdir/state/…`, `0600`) and the repo-root `.env` are
+**order-placement authority**: both gitignored, never committed, never logged. Treat the
+`.env` app password like `api_secret` — and revoke it in your Google account if leaked.
