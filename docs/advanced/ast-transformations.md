@@ -36,6 +36,10 @@ The `@pyne` marker is recognized strictly to avoid accidentally transforming ord
 
 A cheap regex prefilter (`@pyne(\s|$)`) skips full AST parsing for files that obviously cannot match. Files that pass the prefilter still go through the strict AST check above before any transformer runs.
 
+### Reserved Identifier Namespace
+
+Every name the transformers inject into script scope carries a Unicode middle dot (`·`): the scope-qualified state parameters and slot constants (`__state·main__`, `__slot·main·x__`), the generated temporaries (`__st·__`, `__cnt·0__`) and the aliased runtime helper imports (`__resolve_slot·__`). The character is a legal Python identifier character, so the hook reserves it: Pyne code whose identifier contains `·` in **any** position is rejected with a `SyntaxError` naming the identifier, before a single transformer runs. Because Python NFKC-normalizes identifiers while parsing, the check compares the normalized form — equivalent spellings (U+0387 GREEK ANO TELEIA, and U+013F / U+0140 LATIN LETTER L WITH MIDDLE DOT, which decompose into one) are rejected the same way. Strings, comments and docstrings may contain it freely.
+
 ## Transformation Chain
 
 PyneCore applies several key transformations to Python code to make it behave like Pine Script, in this order:
@@ -450,11 +454,11 @@ def main():
 ```python
 from pynecore import lib
 import pynecore.lib.ta
-from pynecore.core.instance_state import __resolve_slot__
+from pynecore.core.instance_state import __resolve_slot__ as __resolve_slot·__
 __pyne_slot_layout__ = {'main': {'init': (None,), 'series': (), 'varip': (), 'children': ((0, 'main·lib.ta.sma·0', False),), 'names': ('main·lib.ta.sma·0',)}}
 
 def main(__state__):
-    print(lib.ta.sma(__st__ if (__st__ := __state__[0]) is not None else __resolve_slot__(__state__, 0, lib.ta.sma), lib.close, 12))
+    print(lib.ta.sma(__st·__ if (__st·__ := __state__[0]) is not None else __resolve_slot·__(__state__, 0, lib.ta.sma), lib.close, 12))
 main.__pyne_layout__ = __pyne_slot_layout__['main']
 ```
 
@@ -581,7 +585,7 @@ def main():
 from pynecore import lib
 import pynecore.lib.color
 import pynecore.lib.ta
-from pynecore.core.instance_state import __bind_any__, __resolve_slot__
+from pynecore.core.instance_state import __bind_any__ as __bind_any·__, __resolve_slot__ as __resolve_slot·__
 from pynecore.core import safe_convert
 from pynecore.core.instance_state import __attach_layout__
 __pyne_slot_layout__ = {'main': {'init': (0, None), 'series': (), 'varip': (), 'children': ((1, 'main·lib.ta.sma·0', False),), 'names': ('count', 'main·lib.ta.sma·0')}}
@@ -590,7 +594,7 @@ __pyne_slot_layout__ = {'main': {'init': (0, None), 'series': (), 'varip': (), '
 @__attach_layout__(__pyne_slot_layout__['main'])
 def main(__state__):
     __state__[0] += 1
-    ma: float = lib.ta.sma(__st__ if (__st__ := __state__[1]) is not None else __resolve_slot__(__state__, 1, lib.ta.sma), lib.close, 14)
+    ma: float = lib.ta.sma(__st·__ if (__st·__ := __state__[1]) is not None else __resolve_slot·__(__state__, 1, lib.ta.sma), lib.close, 14)
     range_ratio = safe_convert.safe_div(lib.close - lib.open, lib.high - lib.low)
     lib.plot.plot(ma, 'MA', color=lib.color.blue)
     lib.plot.plot(__state__[0], 'Count', color=lib.color.red)

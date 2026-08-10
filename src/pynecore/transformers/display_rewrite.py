@@ -6,7 +6,7 @@ dump hard to read. This module rebuilds the dump text with named index
 constants instead:
 
 - ``__state__[3]`` -> ``__state__[__slot·main·p__]``,
-- ``__resolve_slot__(__state__, 5, f)`` / ``__bind_any__(__state__, 7, f)``
+- ``__resolve_slot·__(__state__, 5, f)`` / ``__bind_any·__(__state__, 7, f)``
   index arguments are renamed the same way,
 - ``__state__.__setitem__(2, v)`` (the walrus-write form) likewise,
 - the constant definitions are inserted right after the module docstring.
@@ -25,7 +25,7 @@ from .slot_layout import ModuleLayout, DEFAULT_STATE_PARAM, collect_scope_segmen
 
 __all__ = ['display_dump']
 
-_INDEXED_HELPERS = ('__resolve_slot__', '__bind_any__')
+_INDEXED_HELPERS = ('__resolve_slot·__', '__bind_any·__')
 
 
 class _IndexNamer(ast.NodeTransformer):
@@ -96,7 +96,7 @@ class _IndexNamer(ast.NodeTransformer):
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         self.generic_visit(node)
-        # __resolve_slot__(P, N, f) / __bind_any__(P, N, f)
+        # __resolve_slot·__(P, N, f) / __bind_any·__(P, N, f)
         if (isinstance(node.func, ast.Name) and node.func.id in _INDEXED_HELPERS
                 and len(node.args) >= 2 and isinstance(node.args[0], ast.Name)):
             index = self._literal_index(node.args[1])

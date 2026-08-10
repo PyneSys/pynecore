@@ -41,7 +41,7 @@ def main():
     assert '__state__[__slot·t1·p__] += 1' in out
     assert '__state__[__slot·main·q__]' in out
     # fast-path helper index argument is renamed too
-    assert '__resolve_slot__(__state__, __slot·main·t1·0__, t1)' in out
+    assert '__resolve_slot·__(__state__, __slot·main·t1·0__, t1)' in out
     # the walrus-write __setitem__ index as well
     assert '__setitem__(__slot·main·q__' in out
     # no bare literal state indexes remain

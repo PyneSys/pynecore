@@ -97,8 +97,8 @@ At transform time every call site is classified, because the best possible emiss
 The child slot is filled on first call and reused afterwards — the hot path is a single list read:
 
 ```python
-lib.ta.sma(__st__ if (__st__ := __state__[1]) is not None
-           else __resolve_slot__(__state__, 1, lib.ta.sma), lib.close, 14)
+lib.ta.sma(__st·__ if (__st·__ := __state__[1]) is not None
+           else __resolve_slot·__(__state__, 1, lib.ta.sma), lib.close, 14)
 ```
 
 ### Fast path in a loop
@@ -107,23 +107,23 @@ A call site inside a loop needs one instance per iteration. The loop's call coun
 
 ```python
 def main(__state__):
-    __cnt_0__ = 0
-    __chl_0__ = __state__[0]
+    __cnt·0__ = 0
+    __chl·0__ = __state__[0]
     total = 0
     for length in (5, 10, 20):
-        total += counter(__chl_0__[__i__] if (__i__ := ((__cnt_0__ := (__cnt_0__ + 1)) - 1)) < __chl_0__.__len__()
-                         else __grow__(__chl_0__, counter))
+        total += counter(__chl·0__[__i·__] if (__i·__ := ((__cnt·0__ := (__cnt·0__ + 1)) - 1)) < __chl·0__.__len__()
+                         else __grow·__(__chl·0__, counter))
 ```
 
-The counter guard calls `__chl_0__.__len__()` rather than `len(__chl_0__)` on purpose: a script variable named `len` (a common Pine input name) would shadow the builtin in the function scope, so a bare `len(...)` could resolve to that value and fail. Calling the list's `__len__` slot directly sidesteps name resolution.
+The counter guard calls `__chl·0__.__len__()` rather than `len(__chl·0__)` on purpose: a script variable named `len` (a common Pine input name) would shadow the builtin in the function scope, so a bare `len(...)` could resolve to that value and fail. Calling the list's `__len__` slot directly sidesteps name resolution.
 
 ### Uniform path
 
 When the callee is only known at runtime, the call site gets an **anchor slot** holding a `(callee, bound)` pair. The emission checks the callee's identity: on a hit it calls the cached binding, on a miss (first call, or the callee changed) `__bind_any__` rebinds with fresh state:
 
 ```python
-(__b__[1] if (__b__ := __state__[7]) is not None and __b__[0] is f
- else __bind_any__(__state__, 7, f))(x)
+(__b·__[1] if (__b·__ := __state__[7]) is not None and __b·__[0] is f
+ else __bind_any·__(__state__, 7, f))(x)
 ```
 
 `__bind_any__` handles what the callee turns out to be at runtime: state-carrying functions get a fresh state vector baked into a partial, exported library functions are unwrapped, overload dispatchers are bound through their `__pyne_bind__` factory, and plain callables pass through as-is. Loop-shaped uniform sites keep a list of pairs indexed by the call counter, so each iteration keeps its own instance.
@@ -133,6 +133,10 @@ Note: when the callee at a uniform site changes (`g = a if cond else b; g(x)`), 
 ## Call Site Identifiers
 
 Each isolated call site gets an identifier built from the scope path, the callee path and an ordinal — for example `main·lib.ta.sma·0`. These appear in the layout's `children` tuple and in the debug `names`, so a state tree can be navigated by eye. The Unicode middle dot (`·`) separator prevents collisions with underscores in function names.
+
+The same separator guards every name the transformer injects into script scope: the generated temporaries (`__st·__`, `__b·__`, `__i·__`, `__cnt·0__`) and the runtime helper imports, which are aliased on the way in (`from pynecore.core.instance_state import __resolve_slot__ as __resolve_slot·__`). A script variable spelled like a helper (`__slot_state__`) therefore neither shadows the injected name nor overwrites it.
+
+The middle dot is a legal identifier character in Python, so the namespace is closed from the other side as well: the import hook rejects Pyne code that spells `·` in any identifier, with a `SyntaxError` pointing at the name. Strings and comments are unaffected — only identifiers are reserved.
 
 ## Example: Transformed Code
 
@@ -160,7 +164,7 @@ def main():
 """
 @pyne
 """
-from pynecore.core.instance_state import __resolve_slot__
+from pynecore.core.instance_state import __resolve_slot__ as __resolve_slot·__
 __pyne_slot_layout__ = {'main': {'init': (None, None), 'series': (), 'varip': (), 'children': ((0, 'main·t·0', False), (1, 'main·t·1', False)), 'names': ('main·t·0', 'main·t·1')}, 'main·t': {'init': (None,), 'series': ((0, None),), 'varip': (), 'children': (), 'names': ('a',)}}
 
 def main(__state·main__):
@@ -170,9 +174,9 @@ def main(__state·main__):
         a = __state__[0].set(a + 1)
         return __state__[0][1]
     t.__pyne_layout__ = __pyne_slot_layout__['main·t']
-    a = t(__st__ if (__st__ := __state·main__[0]) is not None else __resolve_slot__(__state·main__, 0, t))
+    a = t(__st·__ if (__st·__ := __state·main__[0]) is not None else __resolve_slot·__(__state·main__, 0, t))
     print(a)
-    b = t(__st__ if (__st__ := __state·main__[1]) is not None else __resolve_slot__(__state·main__, 1, t))
+    b = t(__st·__ if (__st·__ := __state·main__[1]) is not None else __resolve_slot·__(__state·main__, 1, t))
     print(b)
 main.__pyne_layout__ = __pyne_slot_layout__['main']
 ```

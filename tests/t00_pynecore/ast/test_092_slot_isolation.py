@@ -62,8 +62,8 @@ def main():
     state = _make_state(layouts['main'])
     assert ns['main'](state) == (1, 1)
     assert ns['main'](state) == (2, 2)  # both instances persist independently
-    assert '__resolve_slot__(__state__, 0, t1)' in dump
-    assert '__resolve_slot__(__state__, 1, t1)' in dump
+    assert '__resolve_slot·__(__state__, 0, t1)' in dump
+    assert '__resolve_slot·__(__state__, 1, t1)' in dump
 
 
 def __test_fast_path_loop__():
@@ -81,9 +81,9 @@ def main():
     assert ns['main'](state) == 3   # three fresh instances
     assert ns['main'](state) == 6   # the same three instances again
     assert len(state[0]) == 3
-    assert '__cnt_0__ = 0' in dump
-    assert '__chl_0__ = __state__[0]' in dump
-    assert '__grow__(__chl_0__, t1)' in dump
+    assert '__cnt·0__ = 0' in dump
+    assert '__chl·0__ = __state__[0]' in dump
+    assert '__grow·__(__chl·0__, t1)' in dump
 
 
 def __test_fast_path_loop_len_shadow__():
@@ -99,8 +99,8 @@ def main():
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state) == 10   # three fresh instances (1+1+1) + len(7)
     assert ns['main'](state) == 13   # same three instances (2+2+2 -> 6) + 7
-    assert 'len(__chl_0__)' not in dump   # never a shadowable builtin call
-    assert '__chl_0__.__len__()' in dump
+    assert 'len(__chl·0__)' not in dump   # never a shadowable builtin call
+    assert '__chl·0__.__len__()' in dump
 
 
 def __test_direct_path_stateless__():
@@ -114,8 +114,8 @@ def main(x):
 ''')
     assert ns['__pyne_slot_layout__'] == {}
     assert ns['main'](5) == 10  # no hidden parameters anywhere
-    assert '__resolve_slot__' not in dump
-    assert '__bind_any__' not in dump
+    assert '__resolve_slot·__' not in dump
+    assert '__bind_any·__' not in dump
 
 
 def __test_carrier_fixpoint__():
@@ -158,7 +158,7 @@ def main(flag):
     assert ns['main'](state, True) == 2     # identity hit, state persists
     assert ns['main'](state, False) == 101  # rebind: fresh t2 instance
     assert ns['main'](state, True) == 1     # swap back: fresh again (documented)
-    assert '__bind_any__(__state__, 0, f)' in dump
+    assert '__bind_any·__(__state__, 0, f)' in dump
 
 
 def __test_uniform_path_redefined_callee_keeps_state__():
@@ -178,7 +178,7 @@ def main():
     f = acc
     return f()
 ''')
-    assert '__bind_any__(__state·main__, 0, f)' in dump  # uniform, not fast path
+    assert '__bind_any·__(__state·main__, 0, f)' in dump  # uniform, not fast path
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state) == 1
     assert ns['main'](state) == 2  # state survives the per-bar rebind
@@ -204,7 +204,7 @@ def main(flag):
     assert ns['main'](state, True) == 2     # 1 + 1, two fresh instances
     assert ns['main'](state, True) == 4     # 2 + 2, both persisted
     assert ns['main'](state, False) == 202  # both iterations rebound to t2
-    assert '__bind_any_loop__(__chl_0__, __i__, f)' in dump
+    assert '__bind_any_loop·__(__chl·0__, __i·__, f)' in dump
 
 
 def __test_uniform_loop_len_shadow__():
@@ -226,8 +226,8 @@ def main(flag):
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, True) == 7      # 1 + 1 + len(5)
     assert ns['main'](state, True) == 9      # 2 + 2 + 5
-    assert 'len(__chl_0__)' not in dump
-    assert '__chl_0__.__len__()' in dump
+    assert 'len(__chl·0__)' not in dump
+    assert '__chl·0__.__len__()' in dump
 
 
 def __test_nested_def_fast_path__():
@@ -250,7 +250,7 @@ def main():
     state = _make_state(layouts['main'])
     assert ns['main'](state) == (1, 1)
     assert ns['main'](state) == (2, 2)
-    assert '__resolve_slot__(__state·main__, 0, t)' in dump
+    assert '__resolve_slot·__(__state·main__, 0, t)' in dump
 
 
 def __test_decorated_def_uniform__():
@@ -276,7 +276,7 @@ def main():
     state = _make_state(layouts['main'])
     assert ns['main'](state) == 1
     assert ns['main'](state) == 2  # anchored instance persists
-    assert '__bind_any__(__state__, 0, t)' in dump  # uniform, not fast
+    assert '__bind_any·__(__state__, 0, t)' in dump  # uniform, not fast
     # the attach decorator sits innermost, tagging the raw function
     assert "@__attach_layout__(__pyne_slot_layout__['t'])" in dump
     assert 't.__pyne_layout__' not in dump  # no post-def attach for decorated defs
@@ -308,7 +308,7 @@ def main():
     state = _make_state(layouts['main'])
     assert ns['main'](state) == 101  # the second definition wins
     assert ns['main'](state) == 102
-    assert '__resolve_slot__(__state__, 0, f)' in dump
+    assert '__resolve_slot·__(__state__, 0, f)' in dump
 
 
 def __test_builtins_skipped__():
@@ -321,7 +321,7 @@ def main(xs):
 ''')
     assert ns['__pyne_slot_layout__'] == {}
     assert ns['main']([1, 2, 3]) == 3
-    assert '__bind_any__' not in dump and '__resolve_slot__' not in dump
+    assert '__bind_any·__' not in dump and '__resolve_slot·__' not in dump
 
 
 def __test_module_level_stateful_call_rejected__():
@@ -381,9 +381,328 @@ def main(x):
         state = _make_state(ns['__pyne_slot_layout__']['main'])
         assert ns['main'](state, 1.0) == (1.0, 2.0, -1.0)
         assert ns['main'](state, 2.0) == (3.0, 3.0, -2.0)  # acc state persisted
-        assert '__resolve_slot__(__state__, 0, fake_pyne_lib_t092.acc)' in dump
+        assert '__resolve_slot·__(__state__, 0, fake_pyne_lib_t092.acc)' in dump
         assert 'fake_pyne_lib_t092.helper(x)' in dump  # direct, untouched
-        assert '__bind_any__(__state__, 1, fake_plain_t092.setter)' in dump
+        assert '__bind_any·__(__state__, 1, fake_plain_t092.setter)' in dump
     finally:
         del sys.modules['fake_pyne_lib_t092']
         del sys.modules['fake_plain_t092']
+
+
+def __test_nested_callee_in_attribute_base_gets_own_site__():
+    """ A call inside an attribute callee's base becomes a call site of its own """
+    ns, dump = _transform('''
+from pynecore import Persistent
+
+def main():
+    def bump():
+        p: Persistent[str] = ''
+        p += 'X'
+        return p
+    return bump().upper()
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert layouts['main']['children'] == ((0, 'main·bump·0', False),
+                                           (1, 'main·<callee>·1', False))
+    state = _make_state(layouts['main'])
+    assert ns['main'](state) == 'X'
+    assert ns['main'](state) == 'XX'  # exactly one bump() per bar
+    assert ns['main'](state) == 'XXX'
+    assert dump.count('__resolve_slot·__(__state·main__, 0, bump)') == 1
+
+
+def __test_nested_callee_in_loop_keeps_per_iteration_state__():
+    """ Each loop iteration keeps its own instance for a nested callee site """
+    ns, _ = _transform('''
+from pynecore import Persistent
+
+def main():
+    def bump():
+        p: Persistent[str] = ''
+        p += 'X'
+        return p
+    out = ''
+    for _ in range(2):
+        out += bump().upper() + '|'
+    return out
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 'X|X|'
+    assert ns['main'](state) == 'XX|XX|'  # not 'XX|X|' (counter double-advance)
+    assert ns['main'](state) == 'XXX|XXX|'
+
+
+def __test_impure_callee_evaluated_once_per_bar__():
+    """ The anchored guard and the rebind share one evaluation of the callee """
+    ns, _ = _transform('''
+def main(log):
+    def probe():
+        log.append(1)
+        return 'x'
+    return probe().upper()
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    log: list = []
+    for expected in (1, 2, 3, 4):
+        assert ns['main'](state, log) == 'X'
+        assert len(log) == expected  # two evaluations per bar would double this
+
+
+def __test_impure_none_callee_in_loop_keeps_state__():
+    """ A callee that is None must not skip the loop counter: the binding
+    conjunct is unfalsifiable, so a surviving iteration keeps its instance """
+    ns, _ = _transform('''
+import types
+from pynecore import Persistent
+
+def main():
+    def use():
+        p: Persistent[str] = ''
+        p += 'a'
+        return p
+
+    def pick(i):
+        return types.SimpleNamespace(run=None if i == 1 else use)
+
+    out = []
+    for i in range(3):
+        try:
+            out.append(pick(i).run())
+        except TypeError:
+            out.append('TE')
+    return out
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == ['a', 'TE', 'a']
+    assert ns['main'](state) == ['aa', 'TE', 'aa']  # not [..., 'a'] (index desync)
+    assert ns['main'](state) == ['aaa', 'TE', 'aaa']
+
+
+def __test_stable_impure_callee_binds_the_right_target__():
+    """ On an identity hit the anchor must still hold the callee, not a value
+    written by a call site nested inside the callee expression """
+    ns, _ = _transform('''
+import types
+from pynecore import Persistent
+
+def leaf():
+    p: Persistent[int] = 0
+    p += 1
+    return p
+
+BOX = types.SimpleNamespace(fn=leaf)
+CALLS = []
+
+def make_box():
+    CALLS.append('make_box')
+    return BOX
+
+def main():
+    return make_box().fn()
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 1
+    assert ns['main'](state) == 2  # identity hit must call leaf, not make_box
+    assert ns['main'](state) == 3
+    assert ns['CALLS'] == ['make_box'] * 3  # one base evaluation per bar
+
+
+def __test_indirect_attribute_callee_still_anchored__():
+    """ A path-less callee with no call in its base keeps its plain anchor """
+    ns, dump = _transform('''
+import types
+from pynecore import Persistent
+
+def acc():
+    p: Persistent[int] = 0
+    p += 1
+    return p
+
+HOLDER = [types.SimpleNamespace(run=acc)]
+
+def main():
+    return HOLDER[0].run()
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 1
+    assert ns['main'](state) == 2
+    assert ns['main'](state) == 3
+    assert '__bind_any·__(__state__, 0, HOLDER[0].run)' in dump  # no __c·__ binding here
+    assert '__c·__' not in dump
+
+
+def __test_chained_impure_callees__():
+    """ Nested impure sites bind independently and each runs once """
+    ns, _ = _transform('''
+from pynecore import Persistent
+
+def main():
+    def bump():
+        p: Persistent[int] = 0
+        p += 1
+        return p
+    return str(bump()).zfill(3).lstrip('0')
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == '1'
+    assert ns['main'](state) == '2'
+    assert ns['main'](state) == '3'
+
+
+def __test_module_level_impure_stateful_callee_rejected__():
+    """ Module level rejects a stateful call inside an attribute callee too """
+    with pytest.raises(SyntaxError):
+        _transform(COUNTER_FUNC + '''
+Z = t1().bit_length()
+''')
+
+
+def __test_generated_temporaries_do_not_clobber_user_names__():
+    """ A user variable spelled like a generated temporary survives the call """
+    ns, dump = _transform('''
+class Box:
+    def fn(self, v):
+        return v
+
+def make_box():
+    return Box()
+
+def main():
+    __c__ = 'sentinel'
+    __b__ = 'anchor'
+    __st__ = 'state'
+    __i__ = 'index'
+    return make_box().fn(__c__), __b__, __st__, __i__
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == ('sentinel', 'anchor', 'state', 'index')
+    assert "__c__ = 'sentinel'" in dump  # the user's name is untouched
+    assert '__c·__' in dump             # ours carries the middle dot
+
+
+def __test_runtime_helpers_survive_user_names__():
+    """ A user name spelled like a runtime helper neither shadows nor is shadowed """
+    ns, dump = _transform(COUNTER_FUNC + '''
+__bind_any__ = 'module global'
+
+def main(__slot_state__, __resolve_slot__):
+    a = t1()
+    b = [x for x in range(t1())]
+    return __slot_state__, __resolve_slot__, a, b, __bind_any__
+''')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, 'arg1', 'arg2') == ('arg1', 'arg2', 1, [0], 'module global')
+    assert "__bind_any__ = 'module global'" in dump  # the user's names are untouched
+    assert '__slot_state__ as __slot_state·__' in dump  # ours carry the middle dot
+
+
+def __test_comprehension_iterable_uniform_site__():
+    """ A comprehension iterable holds no walrus — the whole guard is a helper """
+    ns, dump = _transform('''
+def main(g):
+    return [x for x in g()]
+''')
+    assert '__bind_slot·__(__state__, 0, g)' in dump
+    assert ':=' not in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    seen = []
+
+    def g():
+        seen.append(1)
+        return [1, 2]
+
+    assert ns['main'](state, g) == [1, 2]
+    assert ns['main'](state, g) == [1, 2]
+    assert len(seen) == 2  # callee evaluated once per bar
+
+
+def __test_comprehension_iterable_fast_site__():
+    """ A state-carrying callee in a comprehension iterable keeps its instance """
+    ns, dump = _transform(COUNTER_FUNC + '''
+def main():
+    return [x for x in range(t1())]
+''')
+    layouts = ns['__pyne_slot_layout__']
+    # The OUTERMOST iterable runs once, in the enclosing scope: not a loop site
+    assert layouts['main']['children'] == ((0, 'main·t1·0', False),)
+    assert '__slot_state·__(__state__, 0, t1)' in dump
+    state = _make_state(layouts['main'])
+    assert ns['main'](state) == [0]
+    assert ns['main'](state) == [0, 1]
+
+
+def __test_comprehension_iterable_pathless_callee__():
+    """ ``f().g()`` in a comprehension iterable compiles and runs once per bar """
+    ns, dump = _transform('''
+CALLS = []
+
+class Box:
+    def items(self):
+        return [1, 2]
+
+def make_box():
+    CALLS.append('make_box')
+    return Box()
+
+def main():
+    return [x for x in make_box().items()]
+''')
+    assert ':=' not in dump.split('def main')[1]
+    # The nested state-carrying base gets its own (also walrus-free) site
+    assert '__bind_slot·__(__state__, 1, make_box(__slot_state·__(__state__, 0, ' \
+           'make_box)).items)' in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == [1, 2]
+    assert ns['main'](state) == [1, 2]
+    assert ns['CALLS'] == ['make_box'] * 2  # callee expression evaluated once per bar
+
+
+def __test_comprehension_iterable_in_loop_keeps_per_iteration_state__():
+    """ A loop-shaped iterable site advances a counter CELL, not a walrus """
+    ns, dump = _transform(COUNTER_FUNC + '''
+def main():
+    out = []
+    for _ in range(3):
+        out.append([x for x in range(t1())])
+    return out
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert layouts['main']['children'][0] == (0, 'main·t1·0', True)
+    assert '__cnt·0__ = [0]' in dump
+    assert '__next_state·__(__chl·0__, __cnt·0__, t1)' in dump
+    state = _make_state(layouts['main'])
+    assert ns['main'](state) == [[0]] * 3
+    assert ns['main'](state) == [[0, 1]] * 3  # each iteration keeps its own instance
+
+
+def __test_nested_comprehension_iterable_is_a_loop_site__():
+    """ A LATER generator's iterable runs per element -> own instance each """
+    ns, dump = _transform('''
+from pynecore import Persistent
+
+def bump(_a):
+    p: Persistent[int] = 0
+    p += 1
+    return range(p)
+
+def main(items):
+    return [y for a in items for y in bump(a)]
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert layouts['main']['children'][0] == (0, 'main·bump·0', True)
+    assert '__cnt·0__ = [0]' in dump
+    assert ':=' not in dump
+    state = _make_state(layouts['main'])
+    assert ns['main'](state, [10, 20]) == [0, 0]
+    assert ns['main'](state, [10, 20]) == [0, 1, 0, 1]
+
+
+def __test_comprehension_element_still_uses_the_walrus_form__():
+    """ Only the ITERABLE is walrus-free; element and condition stay inline """
+    _, dump = _transform('''
+def main(g, h):
+    return [h(x) for x in g() if h(x)]
+''')
+    assert '__bind_slot·__(__state__, 0, g)' in dump
+    assert '__bind_any_loop·__' in dump  # element/condition sites keep the fast guard
+    assert ':=' in dump

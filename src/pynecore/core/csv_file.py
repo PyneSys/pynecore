@@ -16,6 +16,7 @@ WRITE_TUPLE = 0
 WRITE_DICT = 1
 WRITE_OHLCV = 2
 STOP = 3
+FLUSH = 4
 
 
 class DialectLF(csv.excel):
@@ -33,7 +34,7 @@ class CSVWriter:
     """
     __slots__ = ('path', '_file', '_buffer_size', '_float_fmt',
                  '_timestamp_as_iso', '_headers', '_queue',
-                 '_worker', '_error', '_is_open', '_lock',
+                 '_worker', '_error', '_is_open', '_stopping', '_lock',
                  '_idle_time', '_dialect')
 
     def __init__(self, path: Path, *,
@@ -73,6 +74,9 @@ class CSVWriter:
         self._worker = None
         self._error = None
         self._is_open = False
+        # True once close() has queued the STOP: the worker is on its way out,
+        # so nothing queued after it can still reach the file
+        self._stopping = False
         self._lock = threading.Lock()
 
     def __enter__(self):
@@ -95,6 +99,15 @@ class CSVWriter:
         # Format string for float values
         fmt = '{:' + self._float_fmt + '}'
 
+        # With the default (empty) float_fmt, ``repr(x)`` emits the very same
+        # shortest-roundtrip digits as ``'{:}'.format(x)`` for an exact float, but
+        # skips the whole __format__ dispatch. Verified byte-identical on 2 000 000
+        # random doubles plus 0.0, -0.0, ±inf, 5e-324, 1e308, 1e23, 1/3, 2^53 and the
+        # 1e-3/1e-4/1e16/1e17 notation switch points. The guard has to be an exact
+        # type test: a float *subclass* renders its type name (repr(np.float64(1.5))
+        # -> 'np.float64(1.5)'), so those keep going through fmt.
+        fast_repr = not self._float_fmt
+
         def fmt_float(x: object) -> str:
             # Canonicalize na to Pine's "NaN". A native nan would format lowercase
             # ("nan") via fmt; an NA object formats as "NaN" already but we keep the
@@ -106,100 +119,164 @@ class CSVWriter:
         row = []
 
         assert self._file is not None
+        # Bound locally: close() drops the attribute once it stops waiting for
+        # us, and a worker still draining must not trip over a None there
+        file = self._file
+
+        def drain() -> None:
+            """Move the in-memory buffer into the file."""
+            file.write(buffer.getvalue())
+            file.flush()
+            buffer.truncate(0)
+            buffer.seek(0)
 
         try:
             while True:
                 try:
                     cmd, data = self._queue.get(timeout=self._idle_time)
                 except queue.Empty:
-                    # Write buffer if idle
-                    if buffer.tell() > self._buffer_size // 2:
-                        self._file.write(buffer.getvalue())
-                        self._file.flush()
-                        buffer.truncate(0)
-                        buffer.seek(0)
+                    # Idle: nothing is coming, so put whatever is buffered into
+                    # the file — a half-full threshold here would leave a small
+                    # tail sitting in memory until close()
+                    if buffer.tell() > 0:
+                        drain()
                     continue
 
-                if cmd == STOP:
-                    break
+                stop = False
+                try:
+                    if cmd == STOP:
+                        stop = True
 
-                # Write header if needed
-                if not self._headers:
-                    if cmd == WRITE_DICT:
-                        headers = list(data.keys())
-                        writer.writerow(headers)
-                    elif cmd == WRITE_OHLCV:
-                        headers = ['time', 'open', 'high', 'low', 'close', 'volume']
-                        if data.extra_fields:
-                            headers.extend(data.extra_fields.keys())
-                        writer.writerow(headers)
+                    elif cmd == FLUSH:
+                        # The waiter is released only AFTER the file write, so
+                        # flush() never returns while rows are still sitting in
+                        # the in-memory buffer. A failing write must release it
+                        # too, with the error recorded FIRST so the waiter
+                        # reports the failure instead of returning cleanly.
+                        try:
+                            if buffer.tell() > 0:
+                                drain()
+                        except Exception as e:
+                            self._error = e
+                            raise
+                        finally:
+                            if data is not None:
+                                data.set()
+
                     else:
-                        raise ValueError(f"No headers provided!")
-                    self._headers = headers
-
-                # Format Timestamp
-                row.clear()
-
-                # Raw dictionary data
-                if cmd == WRITE_DICT:
-                    data = data.values()
-
-                # OHLCV data
-                if cmd == WRITE_OHLCV:
-                    # OHLCV timestamps are Unix milliseconds.
-                    if self._timestamp_as_iso:
-                        row.append(datetime.fromtimestamp(data.timestamp / 1000, UTC).isoformat())
-                    else:
-                        row.append(str(data.timestamp))
-
-                    # Format OHLCV values
-                    row.extend(fmt_float(x) for x in (data.open, data.high, data.low, data.close, data.volume))
-                    # Format extra fields
-                    if data.extra_fields:
-                        for value in data.extra_fields.values():
-                            if isinstance(value, float):
-                                row.append(fmt_float(value))
-                            elif isinstance(value, NA):
-                                row.append("NaN")
+                        # Write header if needed
+                        if not self._headers:
+                            if cmd == WRITE_DICT:
+                                headers = list(data.keys())
+                                writer.writerow(headers)
+                            elif cmd == WRITE_OHLCV:
+                                headers = ['time', 'open', 'high', 'low', 'close', 'volume']
+                                if data.extra_fields:
+                                    headers.extend(data.extra_fields.keys())
+                                writer.writerow(headers)
                             else:
-                                row.append(str(value))
+                                raise ValueError(f"No headers provided!")
+                            self._headers = headers
 
-                # Tuple or dict data
-                else:
-                    for value in data:
-                        if isinstance(value, float):
-                            row.append(fmt_float(value))
-                        elif isinstance(value, datetime):
+                        # Format Timestamp
+                        row.clear()
+
+                        # Raw dictionary data
+                        if cmd == WRITE_DICT:
+                            data = data.values()
+
+                        # OHLCV data
+                        if cmd == WRITE_OHLCV:
+                            # OHLCV timestamps are Unix milliseconds.
                             if self._timestamp_as_iso:
-                                row.append(value.isoformat())
+                                row.append(
+                                    datetime.fromtimestamp(data.timestamp / 1000, UTC).isoformat())
                             else:
-                                row.append(str(value))
-                        elif isinstance(value, NA):
-                            row.append("NaN")
+                                row.append(str(data.timestamp))
+
+                            # Format OHLCV values
+                            ohlcv = (data.open, data.high, data.low, data.close, data.volume)
+                            if fast_repr:
+                                row.extend(repr(x) if type(x) is float and x == x else fmt_float(x)
+                                           for x in ohlcv)
+                            else:
+                                row.extend(fmt_float(x) for x in ohlcv)
+                            # Format extra fields
+                            if data.extra_fields:
+                                for value in data.extra_fields.values():
+                                    if fast_repr and type(value) is float:
+                                        row.append(repr(value) if value == value else "NaN")
+                                    elif isinstance(value, float):
+                                        row.append(fmt_float(value))
+                                    elif isinstance(value, NA):
+                                        row.append("NaN")
+                                    else:
+                                        row.append(str(value))
+
+                        # Tuple or dict data
                         else:
-                            row.append(str(value))
+                            for value in data:
+                                if isinstance(value, float):
+                                    row.append(fmt_float(value))
+                                elif isinstance(value, datetime):
+                                    if self._timestamp_as_iso:
+                                        row.append(value.isoformat())
+                                    else:
+                                        # What ``str(datetime)`` yields: ISO with a space
+                                        row.append(value.isoformat(sep=' '))
+                                elif isinstance(value, NA):
+                                    row.append("NaN")
+                                else:
+                                    row.append(str(value))
 
-                # Write row to buffer
-                writer.writerow(row)
-                self._queue.task_done()
+                        # Write row to buffer
+                        writer.writerow(row)
 
-                # Write if buffer is half full
-                if buffer.tell() >= self._buffer_size // 2:
-                    self._file.write(buffer.getvalue())
-                    self._file.flush()
-                    buffer.truncate(0)
-                    buffer.seek(0)
+                        # Write if buffer is half full
+                        if buffer.tell() >= self._buffer_size // 2:
+                            drain()
+                finally:
+                    # Every successful get() must be balanced, error paths and
+                    # STOP included — an unfinished item blocks queue.join()
+                    self._queue.task_done()
+
+                if stop:
+                    break
 
         except Exception as e:
             self._error = e
         finally:
-            # Final flush
+            # Final flush. A failure here means queued rows never reached the
+            # file, so it must be recorded — close() reports it instead of
+            # returning as if everything had been written. An error already
+            # recorded is the earlier (root) one and wins.
             if buffer.tell() > 0:
                 try:
-                    self._file.write(buffer.getvalue())
-                    self._file.flush()
-                except:  # noqa
-                    pass
+                    drain()
+                except Exception as e:
+                    if self._error is None:
+                        self._error = e
+            # A dead worker must not turn a pending flush() or close() into a
+            # permanent block: release everything still queued
+            self._abandon_queue()
+
+    def _abandon_queue(self) -> None:
+        """Discard everything left in the queue, releasing any flush waiter.
+
+        Called from the worker's exit path. Without it a producer blocked in
+        ``flush()`` — or in a bounded ``put()`` against a full queue — would
+        wait for a thread that is never coming back.
+        """
+        while True:
+            try:
+                cmd, data = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if cmd == FLUSH and data is not None:
+                    data.set()
+            finally:
+                self._queue.task_done()
 
     def open(self) -> CSVWriter:
         """Open the CSV file and start the worker thread"""
@@ -231,10 +308,15 @@ class CSVWriter:
         :param data: The dict to write
         :param timeout: Optional timeout in seconds
         :return: True if write command was queued, False on timeout
-        :raises RuntimeError: If writer thread has died with an error
+        :raises RuntimeError: If the writer is shutting down, or the writer thread
+                              has died with an error
         """
         if not self._is_open:
             raise RuntimeError("Writer not opened!")
+        # A record queued behind the STOP is dropped by the worker's exit path,
+        # so accepting it would hand back an acknowledgement that never holds
+        if self._stopping:
+            raise RuntimeError("Writer is closing!")
         if self._error:
             raise RuntimeError(f"Writer thread error: {self._error}!")
 
@@ -251,10 +333,13 @@ class CSVWriter:
         :param data: the data to write
         :param timeout: Optional timeout in seconds
         :return: True if write command was queued, False on timeout
-        :raises RuntimeError: If writer thread has died with an error
+        :raises RuntimeError: If the writer is shutting down, or the writer thread
+                              has died with an error
         """
         if not self._is_open:
             raise RuntimeError("Writer not opened!")
+        if self._stopping:  # queued behind the STOP, see write_dict()
+            raise RuntimeError("Writer is closing!")
         if self._error:
             raise RuntimeError(f"Writer thread error: {self._error}!")
 
@@ -271,10 +356,13 @@ class CSVWriter:
         :param candle: The OHLCV record to write
         :param timeout: Optional timeout in seconds
         :return: True if write command was queued, False on timeout
-        :raises RuntimeError: If writer thread has died with an error
+        :raises RuntimeError: If the writer is shutting down, or the writer thread
+                              has died with an error
         """
         if not self._is_open:
             raise RuntimeError("Writer not opened!")
+        if self._stopping:  # queued behind the STOP, see write_dict()
+            raise RuntimeError("Writer is closing!")
         if self._error:
             raise RuntimeError(f"Writer thread error: {self._error}!")
 
@@ -284,33 +372,73 @@ class CSVWriter:
         except queue.Full:
             return False
 
-    def flush(self):
+    def flush(self, timeout: Optional[float] = None) -> bool:
         """
-        Wait for all pending writes to be processed by the worker thread.
+        Wait until every record queued so far has reached the file.
+
+        The queue is FIFO, so the acknowledgement of this command implies every
+        earlier record was formatted, buffered AND written out.
+
+        :param timeout: Optional timeout in seconds for queuing the command
+        :return: True if the flush completed, False if the command could not be queued
+        :raises RuntimeError: If writer thread has died with an error
         """
-        if self._is_open and self._queue is not None:
-            self._queue.join()
+        # Same lock as close(): a command queued for a worker that is already
+        # on its way out would wait for an acknowledgement nobody sends
+        with self._lock:
+            # A worker on its way out releases the FLUSH waiter without writing
+            # anything, so the acknowledgement would be meaningless
+            if not self._is_open or self._stopping:
+                return False
+            if self._error:
+                raise RuntimeError(f"Writer thread error: {self._error}!")
+
+            done = threading.Event()
+            try:
+                self._queue.put((FLUSH, done), timeout=timeout)
+            except queue.Full:
+                return False
+            done.wait()
+            if self._error:
+                raise RuntimeError(f"Writer thread error: {self._error}!")
+            return True
 
     def close(self, timeout: Optional[float] = None):
         """
         Close the CSV file and stop the worker thread.
 
         :param timeout: Optional timeout in seconds to wait for remaining writes
+        :raises TimeoutError: If the worker did not stop in time; the file stays open so
+                              the call can be retried, but once the STOP is queued the
+                              writer no longer accepts records
+        :raises RuntimeError: If writer thread has died with an error
         """
         with self._lock:
             if not self._is_open:
                 return
 
-            # Signal the worker to stop
-            try:
-                self._queue.put((STOP, None), timeout=timeout)
-            except queue.Full:
-                pass  # We'll stop anyway
+            # A worker that never received the STOP — or that is still draining
+            # when the timeout expires — keeps writing to the file. Closing it
+            # here would destroy records write() already accepted, so nothing is
+            # torn down until the thread is confirmed gone.
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                # A retry after a timed-out join must not queue a second STOP:
+                # the first one is still on its way and the extra command would
+                # only be dropped by the worker's exit path
+                if not self._stopping:
+                    try:
+                        self._queue.put((STOP, None), timeout=timeout)
+                    except queue.Full:
+                        raise TimeoutError(
+                            f"Could not signal the writer thread of {self.path} to stop!") from None
+                    self._stopping = True
 
-            # Wait for the worker to finish
-            if self._worker:
-                self._worker.join(timeout=timeout)
-                self._worker = None
+                worker.join(timeout=timeout)
+                if worker.is_alive():
+                    raise TimeoutError(f"Writer thread of {self.path} did not stop in time!")
+
+            self._worker = None
 
             # Close the file
             if self._file:
@@ -318,6 +446,7 @@ class CSVWriter:
                 self._file = None
 
             self._is_open = False
+            self._stopping = False
 
             # Re-raise any worker thread error
             if self._error:

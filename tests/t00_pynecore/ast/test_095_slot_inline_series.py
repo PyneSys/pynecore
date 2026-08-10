@@ -77,8 +77,8 @@ def main(c, o):
         assert a == 10.0  # c[1] — the legacy shared buffer returned o[1] here
         assert b == 1.0   # o[1]
     # __pyne_bind__ routes the sites uniform, one anchor each
-    assert '__bind_any__(__state__, 0, inline_series)' in dump
-    assert '__bind_any__(__state__, 1, inline_series)' in dump
+    assert '__bind_any·__(__state__, 0, inline_series)' in dump
+    assert '__bind_any·__(__state__, 1, inline_series)' in dump
 
 
 def __test_inline_series_loop_site__():
@@ -98,7 +98,7 @@ def main(v):
         assert all(isinstance(x, NA) for x in first)
         next_bar()
         assert ns['main'](state, 10.0) == [0.0, 1.0]  # each iteration sees its own [1]
-    assert '__bind_any_loop__(__chl_0__, __i__, inline_series)' in dump
+    assert '__bind_any_loop·__(__chl·0__, __i·__, inline_series)' in dump
 
 
 def __test_inline_series_direct_call_shared__():

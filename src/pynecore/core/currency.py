@@ -18,7 +18,7 @@ from __future__ import annotations
 import bisect
 from math import isnan
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .ohlcv import OHLCVReader, record_count
 from .security_shm import ResultReader
@@ -26,6 +26,12 @@ from .security_shm import ResultReader
 if TYPE_CHECKING:
     from .syminfo import SymInfo
     from .security_shm import SyncBlock
+
+# Bound on first use, never at module level: pulling ``pynecore.lib`` in while a
+# core module is still importing would load the runtime surface ahead of the
+# import hook. Caching leaves that ordering untouched and only stops the lookup
+# from running again on every later bar.
+_lib: Any = None
 
 
 class CurrencyRateProvider:
@@ -152,11 +158,16 @@ class CurrencyRateProvider:
         if from_cur == to_cur:
             return 1.0
 
+        global _lib
         if self._chart_pair == (from_cur, to_cur):
-            from .. import lib
+            if (lib := _lib) is None:
+                from .. import lib
+                _lib = lib
             return float(lib.close)
         if self._chart_pair == (to_cur, from_cur):
-            from .. import lib
+            if (lib := _lib) is None:
+                from .. import lib
+                _lib = lib
             close = float(lib.close)
             return 1.0 / close if close and not isnan(close) and close != 0.0 else float('nan')
 

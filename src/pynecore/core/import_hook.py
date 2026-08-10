@@ -1,4 +1,4 @@
-from typing import cast
+from typing import TYPE_CHECKING, cast
 import os
 import sys
 import hashlib
@@ -6,6 +6,9 @@ import importlib.util
 import importlib.machinery
 import re
 from pathlib import Path
+
+if TYPE_CHECKING:
+    import ast
 
 
 # Module-level constant the transform pipeline bakes into every transformed module
@@ -29,6 +32,71 @@ def _source_starts_with_pyne(head: bytes) -> bool:
     :return: Whether the module should carry the transform sentinel.
     """
     return _PYNE_HEAD_RE.match(head) is not None
+
+
+# Everything the transformers inject into script scope is named with a Unicode
+# middle dot: the scope-qualified state parameters and slot constants
+# (``__state·main__``, ``__slot·main·x__``), the generated temporaries
+# (``__st·__``, ``__cnt·0__``) and the aliased runtime helper imports
+# (``__resolve_slot·__``). The separator is a legal identifier character in
+# Python (``Other_ID_Continue``), so the namespace is only collision-free while
+# scripts stay out of it — a script name spelled with it would shadow or clobber
+# an injected one and break the emission in ways no transformer can detect.
+PYNE_RESERVED_NAME_CHAR = '·'
+
+
+def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
+    """Reject Pyne code that spells an identifier in the transformers' namespace.
+
+    :param tree: Parsed module AST of ``source``.
+    :param source: Full module source, used for the error location.
+    :param path: Source path, used for the error location.
+    :raises SyntaxError: If any identifier resolves to a name containing the separator.
+    """
+    # ASCII is NFKC-invariant and the separator is not ASCII, so a pure-ASCII module —
+    # virtually every script — cannot produce a reserved name in any spelling
+    if source.isascii():
+        return
+    # The parsed tree is what has to be checked, not the source spelling. Python
+    # NFKC-normalizes identifiers while parsing, so the bound name can carry a
+    # separator the source never spells: U+0387 GREEK ANO TELEIA normalizes to one
+    # outright, U+013F / U+0140 (LATIN LETTER L WITH MIDDLE DOT) decompose into one.
+    # The token stream cannot stand in for the tree either — before Python 3.12 the
+    # tokenizer hands out a whole f-string as a single string token, hiding every
+    # name its replacement expressions bind (``f"{(__st·__ := x)}"``).
+    import ast
+
+    # A template string's interpolation carries its own source text in ``str``
+    # (``t"{expr}"``, Python 3.14+); the empty tuple makes the check a no-op on
+    # older runtimes, where the node does not exist
+    interpolation = getattr(ast, 'Interpolation', ())
+
+    for node in ast.walk(tree):
+        # A literal and an interpolation's source text are the only ``str`` payloads in
+        # the tree that are not identifiers (``type_comment`` stays ``None`` unless
+        # ``ast.parse`` is asked for it), so every other one can be tested blindly. That
+        # covers all binding and reference forms at once — names, parameters, attributes,
+        # keyword arguments, imports, ``global`` / ``nonlocal``, match captures, type
+        # parameters — and keeps identifier fields added by later grammar versions
+        # covered for free.
+        if isinstance(node, ast.Constant):
+            continue
+        for field, value in ast.iter_fields(node):
+            # The interpolated expression itself is a child node of its own, so the
+            # names it binds or reads are still reached by the walk
+            if field == 'str' and isinstance(node, interpolation):
+                continue
+            for name in (value if isinstance(value, list) else (value,)):
+                if not isinstance(name, str) or PYNE_RESERVED_NAME_CHAR not in name:
+                    continue
+                lineno = getattr(node, 'lineno', 1)
+                lines = source.splitlines()
+                raise SyntaxError(
+                    f"'{name}' contains '{PYNE_RESERVED_NAME_CHAR}', which is reserved "
+                    f"for PyneCore's internal names in Pyne code — rename the identifier",
+                    (str(path), lineno, getattr(node, 'col_offset', 0) + 1,
+                     lines[lineno - 1] if 0 < lineno <= len(lines) else None),
+                )
 
 
 def _cache_from_source(source_path: Path) -> Path:
@@ -73,25 +141,28 @@ def _get_transform_pipeline_hash() -> str:
     :return: Hex digest pinning the transform pipeline.
     """
     global _transform_pipeline_hash
-    if _transform_pipeline_hash is None:
-        # This module pins the transformer pipeline order; ``pine_compare`` holds
-        # a constant the pipeline bakes into the emitted bytecode
-        files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
-        transformers_dir = Path(__file__).parent.parent / "transformers"
+    if _transform_pipeline_hash is not None:
+        return _transform_pipeline_hash
+
+    # This module pins the transformer pipeline order; ``pine_compare`` holds
+    # a constant the pipeline bakes into the emitted bytecode
+    files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
+    transformers_dir = Path(__file__).parent.parent / "transformers"
+    try:
+        files.extend(transformers_dir.iterdir())
+    except OSError:
+        pass
+    digest = hashlib.sha256()
+    for f in sorted(files, key=lambda p: p.name):
         try:
-            files.extend(transformers_dir.iterdir())
+            if f.is_file():
+                digest.update(f.name.encode('utf-8'))
+                digest.update(f.read_bytes())
         except OSError:
             pass
-        digest = hashlib.sha256()
-        for f in sorted(files, key=lambda p: p.name):
-            try:
-                if f.is_file():
-                    digest.update(f.name.encode('utf-8'))
-                    digest.update(f.read_bytes())
-            except OSError:
-                pass
-        _transform_pipeline_hash = digest.hexdigest()[:16]
-    return _transform_pipeline_hash
+    pipeline_hash = digest.hexdigest()[:16]
+    _transform_pipeline_hash = pipeline_hash
+    return pipeline_hash
 
 
 class PyneLoader(importlib.machinery.SourceFileLoader):
@@ -177,16 +248,20 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # windows), 'edge' the compiler's output, nothing at all a hand-written
         # script.
         pyne_mode: str | None = None
-        if (tree.body and isinstance(tree.body[0], ast.Expr) and
-                isinstance(cast(ast.Expr, tree.body[0]).value, ast.Constant) and
-                isinstance(cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value, str)):
-            docstring = cast(str, cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value)
+        first = tree.body[0] if tree.body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            docstring = first.value.value
             magic = re.match(r'\s*@pyne(?:[ \t]+(?P<mode>\w+))?(\s|$)', docstring)
             is_pyne_module = magic is not None
             if magic is not None:
                 pyne_mode = magic.group('mode')
 
         if is_pyne_module:
+
+            # The transformers own the middle-dot namespace; a script that spells a
+            # name in it is rejected here, before anything is injected
+            _reject_reserved_names(tree, data_str, path)
 
             # Remove test cases from the output, because they can coorupt the output
             transformed = tree
@@ -345,15 +420,14 @@ class PyneImportHook:
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def find_spec(self, fullname: str, path, target=None):
         """Find and create module spec"""
-        if path is None:
-            path = sys.path
+        entries = sys.path if path is None else path
 
         if "." in fullname:
             *_, name = fullname.split(".")
         else:
             name = fullname
 
-        for entry in path:
+        for entry in entries:
             if entry == "":
                 entry = "."
 

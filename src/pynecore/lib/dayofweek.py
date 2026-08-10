@@ -1,3 +1,5 @@
+from typing import Any
+
 from ..types.datetime import DayOfWeek
 from ..core.module_property import module_function_property
 
@@ -19,6 +21,12 @@ saturday = DayOfWeek()
 # Module function
 #
 
+# ``pynecore.lib`` imports this module, so the bind cannot move to the top of the
+# file -- it would import a half-built package. Binding it on first call keeps the
+# ordering as it is and drops the import machinery from every later bar.
+_lib: Any = None
+
+
 # noinspection PyShadowingNames,PyProtectedMember
 @module_function_property
 def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
@@ -29,7 +37,10 @@ def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The day of the week, 1 is Sunday, 2 is Monday, ..., 7 is Saturday
     """
-    from .. import lib
+    global _lib
+    if (lib := _lib) is None:
+        from .. import lib
+        _lib = lib
     res = lib._get_dt(time, timezone).weekday() + 2
     if res == 8:
         res = 1

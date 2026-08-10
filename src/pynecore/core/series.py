@@ -276,19 +276,9 @@ class SeriesImpl(Generic[T]):
         :return: Single value for integer index, ReadOnlySeriesView for slice
         :raises TypeError: If key is not int, NA, or slice
         """
-        # Pine: series[na] -> series[0] (an na offset is treated as the current
-        # bar). Coerce to 0 here, before the int(key) path, since int(NA) raises;
-        # the bounds check below then returns na only for a genuinely empty series.
-        if isinstance(key, NA):
-            key = 0
-
-        if isinstance(key, float):
-            # A native nan offset is an na offset -> current bar (int(nan) raises).
-            # The separate binding keeps the conversion on a plainly float-typed
-            # name; the IDE cannot narrow the reassigned union of ``key`` here.
-            f_key = key
-            key = 0 if f_key != f_key else int(f_key)
-
+        # Int first: it is the whole hot loop, and every other form reaches this
+        # branch through a one-off conversion, so the common subscript walks a
+        # single isinstance instead of the three the na/float order cost it.
         if isinstance(key, int):
             # Pine: out-of-range subscript -> na (covers both negative and
             # positive past-end indices).
@@ -298,6 +288,19 @@ class SeriesImpl(Generic[T]):
             if pos < 0:
                 pos += self._capacity
             return self._buffer[pos]
+
+        # Pine: series[na] -> series[0] (an na offset is treated as the current
+        # bar). Route through 0 rather than converting in place, since int(NA)
+        # raises; the bounds check above then returns na only for an empty series.
+        if isinstance(key, NA):
+            return self[0]
+
+        if isinstance(key, float):
+            # A native nan offset is an na offset -> current bar (int(nan) raises).
+            # The separate binding keeps the conversion on a plainly float-typed
+            # name; the IDE cannot narrow the reassigned union of ``key`` here.
+            f_key = key
+            return self[0 if f_key != f_key else int(f_key)]
 
         elif isinstance(key, slice):
             # Handle slice notation

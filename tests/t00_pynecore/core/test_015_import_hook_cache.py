@@ -1,19 +1,25 @@
 """
 @pyne
 """
+import ast
 import os
 import subprocess
 import sys
 import types
 import py_compile
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 import pynecore.core.import_hook as import_hook
 from pynecore.core.import_hook import (
     PyneLoader,
+    PYNE_RESERVED_NAME_CHAR,
     _cache_from_source,
     _get_transform_pipeline_hash,
+    _reject_reserved_names,
     _PYNE_SENTINEL,
 )
 
@@ -47,9 +53,10 @@ def _write_foreign_pyc(mod: Path, pyc: Path) -> None:
     assert pyc.exists(), "foreign .pyc was not produced"
 
 
-def _is_current_transform(code: types.CodeType) -> bool:
+def _is_current_transform(code: types.CodeType | None) -> bool:
     """Whether a code object carries the current pipeline's transform sentinel."""
-    return _PYNE_SENTINEL in code.co_names and _get_transform_pipeline_hash() in code.co_consts
+    return (code is not None and _PYNE_SENTINEL in code.co_names
+            and _get_transform_pipeline_hash() in code.co_consts)
 
 
 def __test_foreign_pyc_is_retransformed__(tmp_path):
@@ -80,6 +87,110 @@ def __test_single_line_pyne_marker_is_transformed__(tmp_path):
     code = loader.source_to_code(mod.read_bytes(), str(mod))
 
     # The sentinel is baked in only when the transform pipeline actually runs.
+    assert _is_current_transform(code)
+
+
+def __test_reserved_name_is_rejected__(tmp_path):
+    """A script identifier in the transformers' middle-dot namespace is a SyntaxError"""
+    # The separator is a legal Python identifier character, so a script CAN spell the
+    # injected names (helper aliases, generated temporaries, scope-qualified state
+    # parameters). Left alone, such a name silently shadows or clobbers the emission.
+    reserved = "__slot_state" + PYNE_RESERVED_NAME_CHAR + "__"
+    mod = tmp_path / "reserved_mod.py"
+    mod.write_text(f'"""\n@pyne\n"""\ndef main({reserved}):\n    return {reserved}\n',
+                   encoding="utf-8")
+
+    loader = PyneLoader("reserved_mod", str(mod))
+    with pytest.raises(SyntaxError) as excinfo:
+        loader.source_to_code(mod.read_bytes(), str(mod))
+
+    assert reserved in str(excinfo.value)
+    assert excinfo.value.lineno == 4  # points at the offending identifier
+
+
+def __test_nfkc_equivalent_reserved_name_is_rejected__(tmp_path):
+    """An identifier that only becomes reserved after NFKC normalization is rejected too"""
+    # Python NFKC-normalizes identifiers while parsing, so the bound name is not the
+    # source spelling: U+0387 GREEK ANO TELEIA turns into the separator, which would
+    # shadow an injected name while the source contains no literal separator at all.
+    spelled = "__bind_slot·__"
+    parsed = "__bind_slot" + PYNE_RESERVED_NAME_CHAR + "__"
+    assert unicodedata.normalize("NFKC", spelled) == parsed
+    assert PYNE_RESERVED_NAME_CHAR not in spelled  # the source-level spelling hides it
+
+    mod = tmp_path / "nfkc_mod.py"
+    mod.write_text(f'"""\n@pyne\n"""\ndef main({spelled}):\n    return {spelled}\n',
+                   encoding="utf-8")
+
+    loader = PyneLoader("nfkc_mod", str(mod))
+    with pytest.raises(SyntaxError) as excinfo:
+        loader.source_to_code(mod.read_bytes(), str(mod))
+
+    assert parsed in str(excinfo.value)  # the message shows what the parser would bind
+    assert excinfo.value.lineno == 4
+
+
+def __test_reserved_name_inside_fstring_is_rejected__(tmp_path):
+    """A reserved name bound inside an f-string replacement expression is rejected too"""
+    # Before Python 3.12 the tokenizer hands out a whole f-string as a single string
+    # token, so the names its replacement expressions bind are invisible there. The
+    # check runs on the parsed tree, which sees the walrus target on every version.
+    reserved = "__bind_slot" + PYNE_RESERVED_NAME_CHAR + "__"
+    mod = tmp_path / "fstring_mod.py"
+    mod.write_text(
+        '"""\n@pyne\n"""\n'
+        'def main():\n'
+        f'    return f"{{({reserved} := 1)}}"\n',
+        encoding="utf-8",
+    )
+
+    loader = PyneLoader("fstring_mod", str(mod))
+    with pytest.raises(SyntaxError) as excinfo:
+        loader.source_to_code(mod.read_bytes(), str(mod))
+
+    assert reserved in str(excinfo.value)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="template strings need Python 3.14")
+def __test_reserved_char_inside_template_string_text_is_allowed__(tmp_path):
+    """The separator stays legal inside a template string's interpolated literal"""
+    # ``ast.Interpolation`` keeps the interpolation's own source text in a ``str``
+    # field, so the blanket identifier scan must skip it — the interpolated
+    # expression is a child node of its own and gets checked there.
+    src = ('"""\n@pyne\n"""\n'
+           f'LABEL = t"{{\'scope{PYNE_RESERVED_NAME_CHAR}path\'}}"\n')
+
+    _reject_reserved_names(ast.parse(src), src, tmp_path / "template_text_mod.py")
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="template strings need Python 3.14")
+def __test_reserved_name_inside_template_string_is_rejected__(tmp_path):
+    """A reserved name bound inside a template string interpolation is rejected"""
+    reserved = "__bind_slot" + PYNE_RESERVED_NAME_CHAR + "__"
+    src = ('"""\n@pyne\n"""\n'
+           f'LABEL = t"{{({reserved} := 1)}}"\n')
+
+    with pytest.raises(SyntaxError) as excinfo:
+        _reject_reserved_names(ast.parse(src), src, tmp_path / "template_name_mod.py")
+
+    assert reserved in str(excinfo.value)
+
+
+def __test_reserved_char_outside_identifiers_is_allowed__(tmp_path):
+    """The reserved character stays legal in strings and comments"""
+    mod = tmp_path / "dotted_text_mod.py"
+    mod.write_text(
+        '"""\n@pyne\n"""\n'
+        f'# separator: {PYNE_RESERVED_NAME_CHAR}\n'
+        f'LABEL = "scope{PYNE_RESERVED_NAME_CHAR}path"\n'
+        'def main():\n'
+        '    return LABEL\n',
+        encoding="utf-8",
+    )
+
+    loader = PyneLoader("dotted_text_mod", str(mod))
+    code = loader.source_to_code(mod.read_bytes(), str(mod))
+
     assert _is_current_transform(code)
 
 
@@ -125,6 +236,7 @@ def __test_stale_pipeline_pyc_is_retransformed__(tmp_path, monkeypatch):
     with _bytecode_writing_enabled():
         code = loader.get_code("stalepipe_mod")
 
+    assert code is not None
     assert real_hash in code.co_consts
     assert "0000oldpipeline0" not in code.co_consts
 

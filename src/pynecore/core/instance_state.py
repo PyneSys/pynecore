@@ -50,26 +50,44 @@ Call shapes emitted by the transformer:
 
 - fast path, straight-line site::
 
-    ema((__st__ if (__st__ := __state__[5]) is not None
-         else __resolve_slot__(__state__, 5, ema)), close, 12)
+    ema((__st·__ if (__st·__ := __state__[5]) is not None
+         else __resolve_slot·__(__state__, 5, ema)), close, 12)
 
-- fast path, loop site (with the per-invocation counter ``__cnt_0__``)::
+- fast path, loop site (with the per-invocation counter ``__cnt·0__``)::
 
-    ema((__sl0__[__i__] if (__i__ := (__cnt_0__ := __cnt_0__ + 1) - 1) < len(__sl0__)
-         else __grow__(__sl0__, ema)), x, 12)
+    ema((__chl·0__[__i·__] if (__i·__ := (__cnt·0__ := __cnt·0__ + 1) - 1) < len(__chl·0__)
+         else __grow·__(__chl·0__, ema)), x, 12)
 
 - uniform path (callee unknown at transform time), anchored at slot 7::
 
-    (__b__[1] if (__b__ := __state__[7]) is not None and __b__[0] is f
-     else __bind_any__(__state__, 7, f))(x)
+    (__b·__[1] if (__b·__ := __state__[7]) is not None and __b·__[0] is f
+     else __bind_any·__(__state__, 7, f))(x)
 
 - uniform path in a loop (anchor slot holds a list of ``(callee, bound)``
   pairs indexed by the per-invocation counter, so every iteration keeps its
   own instance, like the legacy counter-keyed cache did)::
 
-    (__b__[1] if (__i__ := (__cnt_0__ := __cnt_0__ + 1) - 1) < len(__chl_0__)
-     and (__b__ := __chl_0__[__i__])[0] is f
-     else __bind_any_loop__(__chl_0__, __i__, f))(x)
+    (__b·__[1] if (__i·__ := (__cnt·0__ := __cnt·0__ + 1) - 1) < len(__chl·0__)
+     and (__b·__ := __chl·0__[__i·__])[0] is f
+     else __bind_any_loop·__(__chl·0__, __i·__, f))(x)
+
+- uniform path whose CALLEE EXPRESSION runs code (a call hides in it, e.g.
+  ``bump().upper()``): the callee is bound once in a leading tautological
+  conjunct, so it is evaluated exactly once and before the anchor read::
+
+    (__b·__[1] if (__c·__ := bump(__state__[0]).upper) is __c·__
+     and (__b·__ := __state__[1]) is not None and __b·__[0] is __c·__
+     else __bind_any·__(__state__, 1, __c·__))()
+
+  The conjunct must stay first and must not be falsifiable: an inner call site
+  writes ``__b·__`` and the loop counter, and a short circuit would skip them.
+
+- comprehension ITERABLE positions, where Python rejects every assignment
+  expression: the guard folds into a single helper call instead, and the
+  loop-shaped variants advance a one-element counter cell::
+
+    [x for x in __bind_slot·__(__state__, 7, f)()]
+    [y for a in items for y in bump(__next_state·__(__chl·0__, __cnt·0__, bump), a)]
 
 Semantics note: when the callee at a uniform site genuinely changes (``g = a
 if c else b; g(x)``), the identity check misses and the site is rebound with
@@ -81,7 +99,7 @@ is a new object every bar) is NOT a change: the rebind reuses the prior state
 vector (matched by the module-level layout object), so the callee's series /
 var / varip slots survive across bars — see :func:`_carry_state`.
 """
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 from copy import copy, deepcopy
 from dataclasses import replace as dataclass_replace
 from functools import partial
@@ -89,10 +107,11 @@ from functools import partial
 from .pine_export import Exported
 from .series import SeriesImpl
 from ..types.base import Drawing
-from ..types.na import na_float as _NAN
+from ..types.na import na_float
 
 __all__ = [
     '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
+    '__slot_state__', '__next_state__', '__bind_slot__', '__bind_next__',
     '__attach_layout__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'RootSeriesSnapshot', 'explain_state',
@@ -147,7 +166,7 @@ def _make_state(layout: dict[str, Any]) -> list:
     state = list(layout['init'])
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
-        state[slot] = SeriesImpl(max_bars_back, _NAN if elem == 'float' else None, compacted)
+        state[slot] = SeriesImpl(max_bars_back, na_float if elem == 'float' else None, compacted)
     for slot, _call_id, in_loop in layout['children']:
         if in_loop:
             state[slot] = []
@@ -179,6 +198,39 @@ def __grow__(children: list, func: Any) -> list:
     state = _make_state(func.__pyne_layout__)
     children.append(state)
     return state
+
+
+def __slot_state__(parent: list, slot: int, func: Any) -> list:
+    """Whole straight-line fast-path call site, guard included.
+
+    Emitted where the inline guard cannot be: Python rejects an assignment
+    expression anywhere inside a comprehension's iterable expression, so the
+    ``__st·__`` walrus form is not available there.
+
+    :param parent: The caller's state vector.
+    :param slot: Child slot index assigned at transform time.
+    :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :return: The child state vector.
+    """
+    state = parent[slot]
+    return state if state is not None else __resolve_slot__(parent, slot, func)
+
+
+def __next_state__(children: list, counter: list, func: Any) -> list:
+    """Whole loop-shaped fast-path call site, counter advance included.
+
+    The per-invocation counter lives in a one-element list here instead of a
+    plain local, because the walrus that would advance a local is illegal in
+    the comprehension-iterable position this form serves.
+
+    :param children: The child list living in the parent's slot.
+    :param counter: One-element counter cell, reset in the function prologue.
+    :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :return: This iteration's child state vector.
+    """
+    index = counter[0]
+    counter[0] = index + 1
+    return children[index] if index < len(children) else __grow__(children, func)
 
 
 def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
@@ -245,18 +297,19 @@ def _bind_target(func: Any, prev: tuple | None = None) -> Callable:
     :param prev: The anchor's previous ``(callee, bound)`` entry, if any.
     :return: The bound callable to invoke.
     """
-    target = func
+    target: Any = func
     if isinstance(target, Exported):
-        target = target.__fn__
-        if target is None:
+        unwrapped = target.__fn__
+        if unwrapped is None:
             raise ValueError("Exported proxy has not been initialized with a function yet")
+        target = unwrapped
     bind = getattr(target, '__pyne_bind__', None)
     if bind is not None:
         return bind()
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target
-    layout = getattr(target, '__pyne_layout__', None)
+    layout: dict[str, Any] | None = getattr(target, '__pyne_layout__', None)
     return partial(target, _carry_state(prev, layout)) if layout is not None else target
 
 
@@ -301,6 +354,42 @@ def __bind_any_loop__(children: list, index: int, func: Any) -> Callable:
     else:
         children.append(entry)
     return bound
+
+
+def __bind_slot__(parent: list, slot: int, func: Any) -> Callable:
+    """Whole straight-line anchored call site, identity check included.
+
+    Emitted where the inline guard cannot be (comprehension iterable
+    expressions, see :func:`__slot_state__`). The callee expression is
+    evaluated exactly once — as this call's argument — so a callee that runs
+    code needs no temporary here.
+
+    :param parent: The caller's state vector.
+    :param slot: Anchor slot index assigned at transform time.
+    :param func: The callee as it appears at the call site.
+    :return: The bound callable to invoke.
+    """
+    pair = parent[slot]
+    if pair is not None and pair[0] is func:
+        return pair[1]
+    return __bind_any__(parent, slot, func)
+
+
+def __bind_next__(children: list, counter: list, func: Any) -> Callable:
+    """Whole loop-shaped anchored call site, counter advance included.
+
+    :param children: The pair list living in the parent's anchor slot.
+    :param counter: One-element counter cell, reset in the function prologue.
+    :param func: The callee as it appears at the call site.
+    :return: The bound callable to invoke.
+    """
+    index = counter[0]
+    counter[0] = index + 1
+    if index < len(children):
+        pair = children[index]
+        if pair[0] is func:
+            return pair[1]
+    return __bind_any_loop__(children, index, func)
 
 
 def create_root(key: str, layout: dict[str, Any]) -> list:
@@ -491,8 +580,9 @@ def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
     :param state: The instance's state vector.
     :return: Slot name (or descriptive fallback label) -> current value.
     """
-    layout: dict[str, Any] = getattr(func_or_layout, '__pyne_layout__', func_or_layout)
-    names = layout.get('names')
+    layout: dict[str, Any] = cast(dict[str, Any],
+                                  getattr(func_or_layout, '__pyne_layout__', func_or_layout))
+    names: tuple[str, ...] | None = layout.get('names')
     series_slots = {slot for slot, _max_bars_back, _elem in layout['series']}
     child_ids = {slot: call_id for slot, call_id, _in_loop in layout['children']}
     out: dict[str, Any] = {}

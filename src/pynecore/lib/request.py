@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 
 _currency_provider: CurrencyRateProvider | None = None
 
+# Bound on first use, never at module level: importing ``pynecore.lib`` from here
+# would load the runtime surface while this module is still being imported.
+# Caching leaves that ordering untouched and only stops the lookup from running
+# again on every later bar.
+_lib: Any = None
+
 T = TypeVar('T')
 
 
@@ -126,7 +132,10 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
         return 1.0
     if _currency_provider is None:
         return nan
-    from .. import lib
+    global _lib
+    if (lib := _lib) is None:
+        from .. import lib
+        _lib = lib
     # noinspection PyProtectedMember
     timestamp = int(lib._datetime.timestamp())
     return _currency_provider.get_rate(_from, _to, timestamp)

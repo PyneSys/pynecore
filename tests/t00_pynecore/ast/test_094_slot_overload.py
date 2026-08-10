@@ -78,8 +78,8 @@ def main(v):
     assert ns['main'](state, 2) == 3      # int impl state survived the str call
     assert ns['main'](state, 'b') == 'ab'  # and the str impl state too
     # decorated def -> uniform route, never the fast path
-    assert '__bind_any__(__state__, 0, acc)' in dump
-    assert '__resolve_slot__' not in dump
+    assert '__bind_any·__(__state__, 0, acc)' in dump
+    assert '__resolve_slot·__' not in dump
     # both implementations got their layout through the attach decorator
     assert "@__attach_layout__(__pyne_slot_layout__['acc'])" in dump
     assert "@__attach_layout__(__pyne_slot_layout__['acc·2'])" in dump

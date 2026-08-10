@@ -1,7 +1,7 @@
 """
 @pyne
 """
-from pynecore.core.instance_state import __resolve_slot__
+from pynecore.core.instance_state import __resolve_slot__ as __resolve_slot·__
 __pyne_slot_layout__ = {'main': {'init': (None, None), 'series': (), 'varip': (), 'children': ((0, 'main·t·0', False), (1, 'main·t·1', False)), 'names': ('main·t·0', 'main·t·1')}, 'main·t': {'init': (None,), 'series': ((0, None, 'float'),), 'varip': (), 'children': (), 'names': ('a',)}}
 
 def main(__state·main__):
@@ -11,8 +11,8 @@ def main(__state·main__):
         a = __state__[0].set(a + 1)
         return __state__[0][1]
     t.__pyne_layout__ = __pyne_slot_layout__['main·t']
-    a = t(__st__ if (__st__ := __state·main__[0]) is not None else __resolve_slot__(__state·main__, 0, t))
+    a = t(__st·__ if (__st·__ := __state·main__[0]) is not None else __resolve_slot·__(__state·main__, 0, t))
     print(a)
-    b = t(__st__ if (__st__ := __state·main__[1]) is not None else __resolve_slot__(__state·main__, 1, t))
+    b = t(__st·__ if (__st·__ := __state·main__[1]) is not None else __resolve_slot·__(__state·main__, 1, t))
     print(b)
 main.__pyne_layout__ = __pyne_slot_layout__['main']

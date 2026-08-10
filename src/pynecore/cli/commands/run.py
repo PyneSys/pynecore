@@ -1,6 +1,5 @@
 import asyncio
 import os
-import queue
 import signal
 import tempfile
 import threading
@@ -1056,6 +1055,10 @@ def run(
         plot_path: Path | None = Option(None, "--plot", "-pp",
                                         help="Path to save the plot data",
                                         rich_help_panel="Out Path Options"),
+        no_plot: bool = Option(False, "--no-plot",
+                               help="Do not write the plot CSV at all (it is written by default). "
+                                    "Useful in live mode, where the file grows without bound.",
+                               rich_help_panel="Out Path Options"),
         strat_path: Path | None = Option(None, "--strat", "-sp",
                                          help="Path to save the strategy statistics",
                                          rich_help_panel="Out Path Options"
@@ -1284,9 +1287,12 @@ def run(
             raise Exit(1)
 
     # --- Output paths ---
+    if no_plot and plot_path:
+        secho("--no-plot and --plot are mutually exclusive!", fg="red", err=True)
+        raise Exit(1)
     if plot_path and plot_path.suffix != ".csv":
         plot_path = plot_path.with_suffix(".csv")
-    if not plot_path:
+    if not plot_path and not no_plot:
         plot_path = app_state.output_dir / f"{script.stem}.csv"
 
     if strat_path and strat_path.suffix != ".csv":
@@ -1943,8 +1949,12 @@ def run(
                         total=total_seconds,
                     )
 
-                    # Create queue for progress updates
-                    progress_queue = queue.Queue()
+                    # Single slot for progress updates. The callback runs once per
+                    # BAR while the bar only ever redraws on a whole-second change,
+                    # so all a queue could offer is a backlog the reader throws
+                    # away. One producer, one consumer, and a list store is a single
+                    # bytecode under the GIL -- overwriting needs no lock.
+                    last_time: list[datetime | None] = [None]
                     stop_event = threading.Event()
 
                     def progress_worker():
@@ -1952,15 +1962,7 @@ def run(
                         last_update = 0
                         while not stop_event.is_set():
                             try:
-                                # Drain all pending updates
-                                current_time = None
-                                while True:
-                                    try:
-                                        current_time = progress_queue.get_nowait()
-                                    except queue.Empty:
-                                        break
-
-                                # Update progress if we have new data
+                                current_time = last_time[0]
                                 if current_time is not None:
                                     if current_time == datetime.max:
                                         current_time = time_to_display
@@ -1979,17 +1981,11 @@ def run(
                     worker.start()
 
                     def cb_progress(current_time: datetime | None):
-                        """Callback that just puts timestamp in queue"""
-                        try:
-                            progress_queue.put_nowait(current_time)
-                        except queue.Full:
-                            pass
+                        """Callback that keeps only the newest timestamp"""
+                        last_time[0] = current_time
 
                     try:
                         runner.run(on_progress=cb_progress)
-
-                        progress_queue.put(time_to_display)
-                        time.sleep(0.05)
 
                         progress.update(task, completed=total_seconds)
                     finally:

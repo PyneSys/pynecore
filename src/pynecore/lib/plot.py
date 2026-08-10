@@ -30,6 +30,13 @@ linestyle_dotted = PlotEnum()
 # Module function
 #
 
+# ``pynecore.lib`` imports this module (``lib/__init__.py``), so the bind cannot
+# move to the top of the file -- it would import a half-built package. Binding it
+# on first call keeps the ordering exactly as it is and drops the import machinery
+# from every later bar.
+_lib: Any = None
+
+
 # noinspection PyProtectedMember,PyShadowingBuiltins
 def plot(series: Any, title: str | None = None, color: Any = None, linewidth: int = 1,
          style: Any = None, trackprice: bool = False, histbase: float = 0.0, offset: int = 0,
@@ -56,7 +63,10 @@ def plot(series: Any, title: str | None = None, color: Any = None, linewidth: in
     :param force_overlay: If true, the plot displays on the main chart pane
     :return: A Plot object, used to reference the plot in other functions
     """
-    from .. import lib
+    global _lib
+    if (lib := _lib) is None:
+        from .. import lib
+        _lib = lib
     if lib._lib_semaphore:
         return Plot('')
 
