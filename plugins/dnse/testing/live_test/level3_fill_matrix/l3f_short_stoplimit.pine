@@ -1,0 +1,45 @@
+//@version=6
+// LIVE TEST LEVEL 3 — SHORT via STOP-LIMIT. Fill, protect with a stop-loss, flatten. 1m. SUPERVISED ONLY.
+//
+// Gate: run ONLY after LEVEL 1 (place/cancel) and LEVEL 2 (single market fill) pass. Enters
+// ONE short stop-limit order (1 contract) on the first realtime bar. The moment it FILLS a
+// protective STOP-LOSS is armed on the position (learned from t3-t6: buy-stop at high[1]), then the
+// position is flattened on sight (strategy.close(E)); flattening cancels the stop-loss.
+// Bound by: 1 lot, pyramiding off, an enter-once latch, a realtime gate (historical warmup
+// NEVER trades -> a plain `dnse:` backtest places ZERO trades, the proof), a FLAT-account
+// precondition, the venue-side stop-loss, and the -0.1% PROTECT last line. Supervised; app open.
+//
+// Expected in the LIVE log (grade on this): entry dispatched as orderCategory=STOP WITH a limit price (must NOT be OCO - backlog check); FILLED -> position
+// -1; a protective STOP (comment_loss "SL@") placed; flatten dispatched -> FILLED ->
+// position 0; the SL STOP CANCELLED (no orphan); NO `[BROKER] ... ERROR`. See LIVE_TEST_PLAN_L3.md.
+strategy("L3f short stop-limit", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+var bool traded  = false   // enter-once latch — one real entry for the whole run
+var bool closing = false   // close-once latch — one flatten order
+
+// (1) the single real entry — ONLY on the live bar, never during historical warmup
+if barstate.isrealtime and not traded
+    strategy.entry("E", strategy.short, stop=low[1], limit=low[1] * 0.999, comment="STOPLIMIT short")
+    traded := true
+
+// (2) ALWAYS protect the live position with a native stop-loss (t3-t6 pattern)
+if strategy.position_size < 0
+    strategy.exit("X", from_entry="E", stop=high[1],
+                  comment_loss="SL@" + str.tostring(high[1], format.mintick))
+
+// (3) flatten the instant a position exists (the "flatten right after filled" step)
+if traded and strategy.position_size != 0 and not closing
+    strategy.close("E", comment="FLATTEN")
+    closing := true
+
+// (4) -0.1% last-protection line (learned from t1-t8): flatten if losing > 0.1%
+PROTECT_PCT = -0.1
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < PROTECT_PCT
+    strategy.close_all(comment="PROTECT")
+
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(strategy.position_avg_price, "avg", display=display.data_window)

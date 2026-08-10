@@ -1,0 +1,14 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] skipping startup size adoption (exchange=4.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 31 bar(s) processed
+[BROKER] live trading active
+[BROKER] dispatching ENTRY BUY id='L' qty=1.0 type=limit limit=1832.5
+[BROKER] dispatched ENTRY BUY id='L' qty=1.0 type=limit limit=1832.5 -> ['444476']
+[BROKER] event CREATED id=444476 side=buy qty=1.0 filled=0.0 pine='L' leg=entry
+[BROKER] modifying ENTRY BUY id='L' qty=1.0 type=limit limit=1832.5 -> ENTRY BUY id='L' qty=1.0 type=limit limit=1832.8
+[BROKER] cancelling CANCEL id='L'
+[BROKER] event CANCELLED id=444476 side=buy qty=1.0 filled=0.0 pine='L' leg=entry
+[BROKER] run stopped (completed) position=4 equity=292,889,649.00 VND

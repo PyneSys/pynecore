@@ -1,0 +1,41 @@
+//@version=6
+// LIVE TEST LEVEL 2 — one real 1-contract FILL, then flatten on sight. SUPERVISED ONLY.
+//
+// Gate: run ONLY after LEVEL 1 (live1/live2/live3 place+cancel) all pass. This is the FIRST
+// test that takes a REAL position. It enters exactly ONE market long (1 contract) on the
+// first realtime bar, then closes THAT entry the instant a position is seen — so the
+// contract is held ~1 bar. An enter-once latch makes it trade once and never again.
+//
+// Why each guard matters (verified against the runtime + plugin, not assumed):
+//   * default_qty_value=1, pyramiding=0  -> one lot, never stacks.
+//   * `var traded` enter-once latch       -> exactly one real entry for the whole run.
+//   * `barstate.isrealtime` gate          -> the entry NEVER fires on historical warmup
+//       (isrealtime is False in backtest/warmup, set True only on the live bar by the
+//       engine). A plain `dnse:` backtest of this file therefore places ZERO orders —
+//       that quiet backtest IS the safety proof that warmup cannot trade.
+//   * price-less entry                    -> the plugin sends a MARKETABLE LO at the band
+//       edge: it fills at market but cannot fill worse than the +/-7% band (capped slippage).
+//   * strategy.close("E") (NOT close_all) -> flattens only OUR entry; an external/adopted
+//       position is never touched (plugin reduce_only is software-enforced).
+//
+// PRECONDITION (hard): continuous session, FLAT account (no position, no working orders),
+// operator watching, DNSE app open for one-tap manual flatten. See LIVE_TEST_PLAN_L2.md.
+strategy("LIVE2 fill+flatten", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+var bool traded  = false   // enter-once latch — one real entry for the whole run
+var bool closing = false   // close-once latch — one flatten order
+
+// (1) The single real entry — ONLY on the live bar, never during historical warmup.
+if barstate.isrealtime and not traded
+    strategy.entry("E", strategy.long, comment="MKT 1-lot")
+    traded := true
+
+// (2) Flatten OUR entry the instant a position exists (the "cancel immediately" step).
+if traded and strategy.position_size != 0 and not closing
+    strategy.close("E", comment="FLATTEN")
+    closing := true
+
+plot(strategy.position_size, "pos", display=display.data_window)
