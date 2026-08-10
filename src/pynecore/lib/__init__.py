@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 import sys
 import math as _math
 
+from functools import lru_cache as _lru_cache
 from datetime import datetime, timedelta, time as dt_time, date, UTC
 
 from pynecore.types.source import Source
@@ -943,7 +944,7 @@ def second(time: int | None = None, timezone: str | None = None) -> int:
 
 ### Session parsing and validation helpers ###
 
-def _parse_session_string(session: str, timezone: str | None = None) -> list['SessionInfo']:
+def _parse_session_string(session: str, timezone: str | None = None) -> tuple['SessionInfo', ...]:
     """
     Parse a session string into one SessionInfo per time range.
 
@@ -957,18 +958,37 @@ def _parse_session_string(session: str, timezone: str | None = None) -> list['Se
     :return: One SessionInfo per time range, in the order they were written
     :raises ValueError: If session string is invalid
     """
-    from ..types.session import SessionInfo
-
-    if not session or session.strip() == "":
-        raise ValueError("Session string cannot be empty")
-
-    # Use exchange timezone if not specified
+    # The exchange fallback is resolved here rather than inside the cached parse so
+    # a later symbol change takes effect instead of returning the previous run's
+    # timezone -- the same split ``core.datetime.parse_timezone`` uses.
     if timezone is None:
         # Use a safe default if syminfo.timezone is not available
         timezone = getattr(syminfo, 'timezone', 'UTC')
         # Handle NA values
         if hasattr(timezone, '__class__') and 'NA' in timezone.__class__.__name__:
             timezone = 'UTC'
+    return _parse_session_string_cached(session, timezone)
+
+
+@_lru_cache(maxsize=128)
+def _parse_session_string_cached(session: str, timezone: str) -> tuple['SessionInfo', ...]:
+    """
+    Parse a fully resolved session specification, memoized on its arguments.
+
+    A script's session strings are constants, so every bar re-derives the same
+    ranges: ``time(tf, session)`` alone reached this parser ~50 times per bar on a
+    multi-context strategy. The result is a tuple of frozen ``SessionInfo`` and
+    callers only read it, so one instance can be shared by every caller.
+
+    :param session: Session string, never empty
+    :param timezone: Timezone string, already resolved to a concrete zone
+    :return: One SessionInfo per time range, in the order they were written
+    :raises ValueError: If session string is invalid
+    """
+    from ..types.session import SessionInfo
+
+    if not session or session.strip() == "":
+        raise ValueError("Session string cannot be empty")
 
     # Split session and days if present
     if ':' in session:
@@ -1008,25 +1028,33 @@ def _parse_session_string(session: str, timezone: str | None = None) -> list['Se
 
     # Parse days (1=Sunday, 2=Monday, ..., 7=Saturday)
     try:
-        days = set()
+        day_nums = set()
         for day_char in days_part:
             day_num = int(day_char)
             if not 1 <= day_num <= 7:
                 raise ValueError(f"Invalid day: {day_num}")
-            days.add(day_num)
+            day_nums.add(day_num)
     except ValueError as e:
         raise ValueError(f"Invalid days specification: {days_part}") from e
+    days = frozenset(day_nums)
 
-    return [
+    return tuple(
         SessionInfo(start_time=start_time, end_time=end_time, days=days, timezone=timezone)
         for start_time, end_time in ranges
-    ]
+    )
 
 
-def _is_bar_in_session(bar_time_ms: int, session_infos: list['SessionInfo'],
+@_lru_cache(maxsize=256)
+def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]',
                        timeframe: str) -> bool:
     """
     Check if a bar time falls within any of the specified session ranges.
+
+    The answer depends on nothing but the arguments, and a script asks it many
+    times per bar -- once per ``time()``/``time_close()`` call, each rebuilding the
+    same localized datetimes -- so the recent answers are memoized. The session
+    ranges arrive as the frozen tuple :func:`_parse_session_string` hands out, so
+    the key is cheap to hash and stable for the whole run.
 
     :param bar_time_ms: Bar time in milliseconds (UNIX timestamp)
     :param session_infos: Session ranges of one session specification -- every range

@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from datetime import time
-from typing import Set
 
 from ..types.base import StrLiteral
 
@@ -9,13 +8,15 @@ from ..types.base import StrLiteral
 class SessionInfo:
     """
     Session information containing time range, valid days, and timezone.
-    
+
     This dataclass represents a trading session specification that can be used
     to determine if a given timestamp falls within the session bounds.
     """
     start_time: time
     end_time: time
-    days: Set[int]  # 1=Sunday, 2=Monday, ..., 7=Saturday (TradingView format)
+    # Frozen so the whole instance is hashable: session ranges are parsed once and
+    # then looked up once per bar, and those lookups are memoized on the ranges.
+    days: frozenset[int]  # 1=Sunday, 2=Monday, ..., 7=Saturday (TradingView format)
     timezone: str | None
     is_overnight: bool = False
 

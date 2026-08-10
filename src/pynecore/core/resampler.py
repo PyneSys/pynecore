@@ -9,6 +9,43 @@ if TYPE_CHECKING:
     from .syminfo import SymInfoSession, SymInfoInterval
 
 
+@lru_cache(maxsize=512)
+def _candidate_opens_sec(
+        ordinal: int,
+        tz: ZoneInfo | dt_timezone | None,
+        session_starts: 'tuple[SymInfoSession, ...]',
+) -> tuple[int, ...]:
+    """
+    Session opens that may anchor a bar on the local date ``ordinal``, newest first.
+
+    A session shorter than 24h is anchored either by an open on the bar's own local
+    date or by one on the day before, so both days' opens are resolved together.
+    They depend on the calendar day alone, never on the bar, and building them
+    means one ``datetime`` construction plus a ``timestamp()`` per declared session
+    — which a per-bar caller repeats identically for every bar of the same day.
+
+    :param ordinal: Proleptic Gregorian ordinal of the bar's local date.
+    :param tz: Exchange timezone the opens are stamped in. ``None`` uses local time.
+    :param session_starts: Per-trading-day primary opens (``SymInfoSession``).
+    :return: Opening instants in epoch seconds, sorted newest first.
+    """
+    local_date = date.fromordinal(ordinal)
+    opens: list[int] = []
+    for delta in (0, 1):
+        d = local_date - timedelta(days=delta)
+        weekday = d.weekday()
+        for s in session_starts:
+            if s.day != weekday:
+                continue
+            opens.append(int(datetime(
+                d.year, d.month, d.day,
+                s.time.hour, s.time.minute, s.time.second,
+                tzinfo=tz,
+            ).timestamp()))
+    opens.sort(reverse=True)
+    return tuple(opens)
+
+
 def _session_anchor_sec(
         t_sec: int,
         tz: ZoneInfo | dt_timezone | None,
@@ -36,21 +73,10 @@ def _session_anchor_sec(
     else:
         local_date = datetime.fromtimestamp(t_sec).date()
 
-    best: int | None = None
-    for delta in (0, 1):
-        d = local_date - timedelta(days=delta)
-        weekday = d.weekday()
-        for s in session_starts:
-            if s.day != weekday:
-                continue
-            open_sec = int(datetime(
-                d.year, d.month, d.day,
-                s.time.hour, s.time.minute, s.time.second,
-                tzinfo=tz,
-            ).timestamp())
-            if open_sec <= t_sec and (best is None or open_sec > best):
-                best = open_sec
-    return best if best is not None else 0
+    for open_sec in _candidate_opens_sec(local_date.toordinal(), tz, tuple(session_starts)):
+        if open_sec <= t_sec:
+            return open_sec
+    return 0
 
 
 #

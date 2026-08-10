@@ -228,8 +228,13 @@ def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
     assert numbers, "At least one number is necessary!"
 
-    if any(not (n == n) for n in numbers):
-        return _na_of_operands(numbers)
+    # The na scan is a plain loop, not ``any(... for n in numbers)``: the generator
+    # object the comprehension allocates on every call is pure overhead here, and
+    # these two are among the most-called builtins in a script (a rolling
+    # min/max loop reaches them once per window element per bar).
+    for n in numbers:
+        if not (n == n):  # is_na_arg
+            return _na_of_operands(numbers)
 
     return builtins.max(cast(list[TFI], numbers))
 
@@ -252,8 +257,10 @@ def min(*numbers: TFI | NA[TFI]) -> PyneFloat:
     """
     assert numbers, "At least one number is necessary!"
 
-    if any(not (n == n) for n in numbers):
-        return _na_of_operands(numbers)
+    # Plain loop instead of ``any(... for n in numbers)`` -- see :func:`max`.
+    for n in numbers:
+        if not (n == n):  # is_na_arg
+            return _na_of_operands(numbers)
 
     return builtins.min(cast(list[TFI], numbers))
 
