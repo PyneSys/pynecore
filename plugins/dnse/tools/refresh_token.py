@@ -15,9 +15,10 @@ Modes
 * ``refresh_token.py --send``     just send the OTP email, then exit (read it, then
                                   re-run with ``--otp CODE``).
 
-Auto mode needs a Gmail **app password** (not your login password) in the environment:
-``DNSE_GMAIL_USER`` + ``DNSE_GMAIL_APP_PASSWORD`` (optionally ``DNSE_OTP_FROM`` to
-narrow the sender, default ``dnse``).
+Auto mode needs a Gmail **app password** (not your login password). Put it in the
+repo-root ``.env`` — ``DNSE_GMAIL_USER`` + ``DNSE_GMAIL_APP_PASSWORD`` (optionally
+``DNSE_OTP_FROM``); this script auto-loads that file, so no manual sourcing is needed.
+See ``.env.example`` for the template.
 
 Security: the state file is order-placement authority. It is written ``0600`` under
 ``workdir/state/`` (gitignored) via an atomic temp+rename; the token is never printed.
@@ -103,8 +104,24 @@ def _extract_otp(text: str) -> str | None:
     return loose.group(1) if loose else None
 
 
+def _load_dotenv(path: "Path | None" = None) -> None:
+    """Load ``KEY=value`` lines from the repo-root ``.env`` into ``os.environ`` (without
+    overriding already-set vars), so the Gmail creds work without a manual
+    ``set -a && . .env``. Comment and malformed lines are skipped."""
+    env_path = path or (REPO / ".env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
 def read_otp_from_gmail(after_ts: float, *, timeout: int = 180, poll: int = 10) -> str:
     """Poll Gmail (IMAP) for the newest DNSE OTP that arrived AFTER ``after_ts``."""
+    _load_dotenv()  # pick up DNSE_GMAIL_* from the repo-root .env if not already exported
     user = os.environ.get("DNSE_GMAIL_USER")
     app_pw = os.environ.get("DNSE_GMAIL_APP_PASSWORD")
     sender = os.environ.get("DNSE_OTP_FROM", "dnse")

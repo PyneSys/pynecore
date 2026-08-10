@@ -89,3 +89,17 @@ def __test_send_and_otp_are_mutually_exclusive__(tmp_path, monkeypatch):
     monkeypatch.setattr(rt, "DNSEClient", lambda *a, **k: _FakeClient())
     with pytest.raises(SystemExit):
         rt.main(["--send", "--otp", "1", "--config", str(_config(tmp_path))])
+
+
+def __test_load_dotenv_sets_unset_keys_only__(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text('# a comment\nDNSE_GMAIL_USER=me@x.com\n'
+                   'DNSE_GMAIL_APP_PASSWORD="already-set-in-file"\nMALFORMED LINE\n')
+    monkeypatch.delenv("DNSE_GMAIL_USER", raising=False)
+    monkeypatch.setenv("DNSE_GMAIL_APP_PASSWORD", "from-shell")
+
+    rt._load_dotenv(env)
+
+    assert os.environ["DNSE_GMAIL_USER"] == "me@x.com", "unset key filled from .env"
+    assert os.environ["DNSE_GMAIL_APP_PASSWORD"] == "from-shell", \
+        "an already-exported var must win over .env (setdefault, not override)"
