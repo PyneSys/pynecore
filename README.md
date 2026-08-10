@@ -169,6 +169,33 @@ pyne run my_indicator.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 
 > **Note**: Pine Script compilation requires a PyneSys API key. Get yours at [pynesys.io](https://pynesys.io).
 
+## Broker Plugins (this fork)
+
+This fork adds venue plugins under [`plugins/`](plugins/), editable-installed and
+auto-discovered through the `pyne.plugin` entry-point group:
+
+| Plugin | Entry points | What it does |
+|---|---|---|
+| **DNSE** — [`plugins/dnse`](plugins/dnse) | `dnse` (data) · `dnse_broker` (broker) | Vietnamese derivatives & stocks: OHLCV history + **native STOP/OCO conditional orders** on DNSE's OpenAPI, built on the vendored `openapi-sdk` 2.0.0. REST-only. |
+
+```bash
+# historical / live data feed
+pyne run my_strategy.py dnse:VN30F1M@5 --from -500
+
+# live broker — places REAL orders (implies --live)
+pyne run my_strategy.py dnse_broker:VN30F1M@5 --broker
+```
+
+Unit tests: `pytest plugins/dnse/tests/`. The vendored SDK, a mirror of DNSE's
+OpenAPI docs (`docs/dnse-openapi-documentation/`) with a sync/verify tool, and the
+error-handling plan (`docs/plan/`) live alongside the plugin.
+
+**Reference plugins** — the DNSE plugin follows PyneSys's official broker-plugin
+examples, kept as workspace siblings for pattern reference:
+[`pynecore-plugin-bybit`](https://github.com/PyneSys/pynecore-plugin-bybit),
+[`pynecore-plugin-capitalcom`](https://github.com/PyneSys/pynecore-plugin-capitalcom),
+[`pynecore-plugin-ctrader`](https://github.com/PyneSys/pynecore-plugin-ctrader).
+
 ## Why Choose PyneCore?
 
 - **Beyond TradingView Limitations**: No more platform restrictions, code size limits, or subscription fees
