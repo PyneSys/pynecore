@@ -1,4 +1,4 @@
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass
 import re
 from datetime import datetime, UTC, timedelta, time
@@ -9,6 +9,9 @@ from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from ..types.ohlcv import OHLCV
+
+if TYPE_CHECKING:
+    import ccxt.pro
 
 __all__ = ['CCXTProvider', 'CCXTError']
 
@@ -141,6 +144,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             raise ImportError("CCXT is not installed. Please install it using `pip install ccxt`.")
         brokers: list[Broker] = []
         for exchange_id in ccxt.exchanges:
+            # noinspection PyBroadException
             try:
                 name = getattr(ccxt, exchange_id)().name or ""
             except Exception:  # noqa: BLE001 - a single bad exchange must not drop the list
@@ -218,7 +222,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
     @override
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlcv_dir: Path | None = None, config: object | None = None):
+                 ohlcv_dir: Path | None = None, config: CCXTConfig | None = None):
         """
         :param symbol: The symbol to get data for (e.g. "binance:BTC/USDT")
         :param timeframe: The timeframe to get data for in TradingView fmt
@@ -271,7 +275,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                     if exchange_name in raw_toml and isinstance(raw_toml[exchange_name], dict):
                         exchange_config = raw_toml[exchange_name]
 
-        self._async_client = None
+        self._async_client: "ccxt.pro.Exchange | None" = None
         self._last_bar_timestamp: int | None = None
         self._last_bar_ohlcv: OHLCV | None = None
         self._exchange_config: dict[str, Any] = dict(exchange_config)
@@ -318,17 +322,6 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         :return: Tuple of (opening_hours, session_starts, session_ends).
         """
-        return cls._create_24_7_sessions()
-
-    @staticmethod
-    def _create_24_7_sessions() -> tuple[
-        list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]
-    ]:
-        """
-        Create 24/7 opening hours and sessions for crypto markets.
-
-        :return: Tuple of (opening_hours, session_starts, session_ends).
-        """
         opening_hours = []
         session_starts = []
         session_ends = []
@@ -362,7 +355,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         """
         import ccxt
 
-        precision_price = market_details.get('precision', {}).get('price')
+        precision_price: float | int | None = market_details.get('precision', {}).get('price')
         mode = self._client.precisionMode
 
         if precision_price is not None:
@@ -372,6 +365,9 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 return 10.0 ** -int(precision_price)
             # SIGNIFICANT_DIGITS: not a fixed tick -- fall through to raw values.
 
+        # ``info['tickSize']`` is the untouched exchange payload, so it is
+        # commonly a string; ``limits.price.min`` is CCXT-normalised.
+        raw: float | int | str | None
         for raw in (market_details.get('info', {}).get('tickSize'),
                     market_details.get('limits', {}).get('price', {}).get('min')):
             if raw is None:
@@ -408,7 +404,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         """
         import ccxt
 
-        precision_amount = market_details.get('precision', {}).get('amount')
+        precision_amount: float | int | None = market_details.get('precision', {}).get('amount')
         mode = self._client.precisionMode
 
         if precision_amount is not None:
@@ -592,11 +588,12 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 if v and k not in _PYNECORE_ONLY_CONFIG_KEYS
             })
 
-        self._async_client = getattr(ccxtpro, exchange_name)(exchange_config)
+        client: "ccxt.pro.Exchange" = getattr(ccxtpro, exchange_name)(exchange_config)
+        self._async_client = client
 
         if self.config and self.config.sandbox:
             try:
-                self._async_client.set_sandbox_mode(True)
+                client.set_sandbox_mode(True)
             except Exception as exc:  # noqa: BLE001
                 import logging
                 logging.getLogger(__name__).warning(
@@ -605,8 +602,8 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 )
 
         if self.config and self.config.default_type:
-            self._async_client.options = {
-                **getattr(self._async_client, 'options', {}),
+            client.options = {
+                **getattr(client, 'options', {}),
                 'defaultType': self.config.default_type,
             }
 
@@ -637,6 +634,10 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         :return: OHLCV with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
         xchg_tf = self.to_exchange_timeframe(timeframe)
+        # ``connect()`` always precedes streaming in the LiveProviderPlugin
+        # contract, so a missing client is a programming error, not a runtime
+        # condition to recover from.
+        assert self._async_client is not None
 
         while True:
             candles = await self._async_client.watch_ohlcv(symbol, xchg_tf)
