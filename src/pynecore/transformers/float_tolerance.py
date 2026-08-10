@@ -210,6 +210,11 @@ class FloatToleranceTransformer(ast.NodeTransformer):
     def visit_Compare(self, node: ast.Compare) -> ast.expr:
         self.generic_visit(node)
 
+        # An earlier pass may have emitted a comparison that already IS the
+        # tolerance (``PineTruthinessTransformer``'s bounds): rewriting it would
+        # add a second EPSILON to a threshold that was measured on TradingView.
+        if getattr(node, 'pine_exact', False):
+            return node
         if not all(isinstance(op, _TOLERANT_OPS) for op in node.ops):
             return node
         operands = [node.left, *node.comparators]

@@ -166,9 +166,18 @@ class ScopeLayout:
 class ModuleLayout:
     """Slot layouts of every scope in one module, shared by the transformers."""
 
-    def __init__(self):
+    def __init__(self, *, compacted_series: bool = False):
+        """
+        :param compacted_series: True for ``@pyne lib`` modules. Their series are
+            the rolling windows of the builtin machines, which leave out na bars
+            on purpose so ``src[k]`` is the k-th most recent non-na value. Script
+            series instead advance one slot per BAR and repeat the last value on
+            a bar their branch never ran, so the flag turns that forward fill off
+            for the lib windows alone.
+        """
         self.scopes: dict[str, ScopeLayout] = {}
         self._segments: dict[int, str] = {}
+        self.compacted_series = compacted_series
 
     def assign_scope_ids(self, tree: ast.Module) -> None:
         """(Re)build the definition -> scope-segment mapping for a module.
@@ -241,8 +250,13 @@ def scope_for_function(layout: ModuleLayout, scope_id: str, node: ast.FunctionDe
     return scope
 
 
-def _scope_entry_ast(scope: ScopeLayout) -> ast.Dict:
-    """Build the layout dict literal of one scope."""
+def _scope_entry_ast(scope: ScopeLayout, compacted: bool = False) -> ast.Dict:
+    """Build the layout dict literal of one scope.
+
+    :param scope: The scope's slot table.
+    :param compacted: Whether the module's series are na-compacted windows
+        (see :attr:`ModuleLayout.compacted_series`).
+    """
     init = ast.Tuple(elts=[slot.init for slot in scope.slots], ctx=ast.Load())
     series = ast.Tuple(
         elts=[ast.Tuple(elts=[ast.Constant(value=slot.index),
@@ -265,9 +279,14 @@ def _scope_entry_ast(scope: ScopeLayout) -> ast.Dict:
     names = ast.Tuple(
         elts=[ast.Constant(value=slot.name) for slot in scope.slots],
         ctx=ast.Load())
+    keys = ['init', 'series', 'varip', 'children', 'names']
+    values: list[ast.expr] = [init, series, varip, children, names]
+    if compacted:
+        keys.append('compacted')
+        values.append(ast.Constant(value=True))
     return ast.Dict(
-        keys=[ast.Constant(value=key) for key in ('init', 'series', 'varip', 'children', 'names')],
-        values=[init, series, varip, children, names],
+        keys=[ast.Constant(value=key) for key in keys],
+        values=values,
     )
 
 
@@ -278,7 +297,7 @@ def _layout_assign_ast(layout: ModuleLayout) -> ast.Assign:
         targets=[ast.Name(id='__pyne_slot_layout__', ctx=ast.Store())],
         value=ast.Dict(
             keys=[ast.Constant(value=scope.scope) for scope in carrying],
-            values=[_scope_entry_ast(scope) for scope in carrying],
+            values=[_scope_entry_ast(scope, layout.compacted_series) for scope in carrying],
         ),
     )
 

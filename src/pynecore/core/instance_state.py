@@ -41,6 +41,10 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
 ``names``
     Optional tuple of per-slot debug names (same order as ``init``); used
     only by :func:`explain_state` and the dump display-rewrite.
+``compacted``
+    Present and true only for ``@pyne lib`` modules: their series are the
+    rolling windows of the builtin machines, which skip na bars on purpose,
+    so the per-bar forward fill of :meth:`SeriesImpl.add` must stay off.
 
 Call shapes emitted by the transformer:
 
@@ -141,8 +145,9 @@ def _make_state(layout: dict[str, Any]) -> list:
     :return: New state vector.
     """
     state = list(layout['init'])
+    compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
-        state[slot] = SeriesImpl(max_bars_back, _NAN if elem == 'float' else None)
+        state[slot] = SeriesImpl(max_bars_back, _NAN if elem == 'float' else None, compacted)
     for slot, _call_id, in_loop in layout['children']:
         if in_loop:
             state[slot] = []

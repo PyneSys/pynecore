@@ -147,9 +147,16 @@ def _round_price(price: float, tick_decimals: int | None):
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
                         round_decimals: int | None, last_bar_index: int | None = None,
                         last_bar_time: int | None = None,
-                        lossless_volume: bool = False):
+                        lossless_volume: bool = False,
+                        derived_prices: bool = False):
     """
     Set lib properties from OHLCV
+
+    :param derived_prices: The bar's prices are computed from already cleaned
+        feed values (a synthetic Heikin Ashi candle), not read from float32
+        storage. Such a price carries no storage artifact and does not sit on
+        the mintick grid, so ``_round_price`` must not touch it — TradingView
+        keeps the full-precision value (measured).
     """
     if TYPE_CHECKING:  # This is needed for the type checker to work
         from .. import lib
@@ -157,10 +164,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     lib.bar_index = bar_index
     lib.last_bar_index = bar_index if last_bar_index is None else last_bar_index
 
-    lib.open = o = _round_price(ohlcv.open, round_decimals)
-    lib.high = h = _round_price(ohlcv.high, round_decimals)
-    lib.low = lo = _round_price(ohlcv.low, round_decimals)
-    lib.close = c = _round_price(ohlcv.close, round_decimals)
+    if derived_prices:
+        lib.open = o = ohlcv.open
+        lib.high = h = ohlcv.high
+        lib.low = lo = ohlcv.low
+        lib.close = c = ohlcv.close
+    else:
+        lib.open = o = _round_price(ohlcv.open, round_decimals)
+        lib.high = h = _round_price(ohlcv.high, round_decimals)
+        lib.low = lo = _round_price(ohlcv.low, round_decimals)
+        lib.close = c = _round_price(ohlcv.close, round_decimals)
 
     lib.volume = ohlcv.volume if lossless_volume else restore_f32_volume(ohlcv.volume)
     lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}

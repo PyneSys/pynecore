@@ -1,11 +1,14 @@
 from ..types.na import NA, na_float
-
 from ..types.color import Color
 from ..types.label import Label
 from ..types.table import Table
 from ..types.box import Box
 from ..types.line import Line
 from ..types.linefill import LineFill
+
+# The one definition of Pine's comparison tolerance, which also decides the
+# float-to-bool conversion (see ``transformers.pine_truthiness``).
+from .pine_compare import EPSILON
 
 
 def cast_color(x: Color | NA) -> Color:
@@ -46,6 +49,13 @@ def cast_bool(x: bool | int | float | NA) -> bool:
     """
     if not (x == x):  # NA object or native nan
         return False
+    if x.__class__ is float:
+        # Pine converts a float to bool by the same tolerant rule its comparison
+        # operators use, in the explicit cast too, not only in the implicit
+        # contexts the truthiness rewrite covers (measured on TradingView,
+        # BINANCE:BTCUSDT 30m: ``bool(1e-10)`` is false and ``bool(1.000001e-10)``
+        # is true at both signs, on every one of 28149 bars)
+        return x < -EPSILON or x > EPSILON
     return not not x
 
 

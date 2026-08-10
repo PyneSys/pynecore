@@ -614,7 +614,8 @@ def security_process_main(
                 real_index_map = rim
 
     # Import the script module (triggers AST transformation)
-    from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
+    from .script_runner import (import_script, _round_price, _set_lib_properties,
+                                _set_lib_syminfo_properties)
     from pynecore import lib
     from pynecore.lib import barstate
     from pynecore.core import instance_state, script as script_mod
@@ -750,6 +751,15 @@ def security_process_main(
     # Registering the HA root also makes ``RootVarSnapshot.has_vars`` True for an
     # otherwise var-less plain-OHLCV context, activating the snapshot exactly
     # where the recurrence needs it.
+    #
+    # The float32 storage clean-up belongs to the feed values the recurrence
+    # READS, so ``_ha_apply`` runs it itself and the emitted HA bar is then
+    # handed to ``_set_lib_properties`` as ``derived_prices``: an HA candle is an
+    # average, it does not sit on the mintick grid, and TradingView keeps its
+    # full precision (measured on BINANCE:BTCUSDT 30m — snapping it to mintick
+    # moved ``ta.ema(haClose, 34)`` by up to 2.2e-3, the raw average reproduces
+    # TV's own plot to 1.5e-11).
+    _derived_prices = chart_type == 'heikinashi'
     if chart_type == 'heikinashi':
         _ha_key = f'__heikinashi__{sec_id}'
         _ha_root = instance_state.create_root(_ha_key, {
@@ -764,11 +774,14 @@ def security_process_main(
                 # Legacy gap-fill bar: forward-fill the last HA close flat and do
                 # NOT advance the recurrence (mirrors the removed feed transform's
                 # ``volume < 0`` skip).
-                _fill = _ha_root[1] if _ha_root[1] is not None else _b.close
+                _fill = _ha_root[1] if _ha_root[1] is not None else _round_price(
+                    _b.close, round_decimals)
                 _ha_pending[0], _ha_pending[1] = _ha_root[0], _ha_root[1]
                 return _b._replace(open=_fill, high=_fill, low=_fill, close=_fill)
             _ho, _hh, _hl, _hc = _heikinashi_step(
-                _ha_root[0], _ha_root[1], _b.open, _b.high, _b.low, _b.close)
+                _ha_root[0], _ha_root[1],
+                _round_price(_b.open, round_decimals), _round_price(_b.high, round_decimals),
+                _round_price(_b.low, round_decimals), _round_price(_b.close, round_decimals))
             _ha_pending[0], _ha_pending[1] = _ho, _hc
             return _b._replace(open=_ho, high=_hh, low=_hl, close=_hc)
 
@@ -1076,7 +1089,8 @@ def security_process_main(
                     instance_state.reset()
 
                 _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume)
+                                    lossless_volume=lossless_volume,
+                                    derived_prices=_derived_prices)
                 lib.last_bar_index = current_bar
 
                 barstate.isfirst = (current_bar == 0)
@@ -1138,7 +1152,8 @@ def security_process_main(
                 last_dev_period_start = None
 
                 _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume)
+                                    lossless_volume=lossless_volume,
+                                    derived_prices=_derived_prices)
                 lib.last_bar_index = current_bar
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = False
@@ -1216,7 +1231,8 @@ def security_process_main(
 
                 total_bars = _current_total()
                 _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume)
+                                    lossless_volume=lossless_volume,
+                                    derived_prices=_derived_prices)
                 lib.last_bar_index = total_bars - 1
                 if reader is not None:
                     lib.last_bar_time = file_last_bar_time_ms

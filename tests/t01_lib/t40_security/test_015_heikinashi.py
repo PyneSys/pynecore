@@ -94,3 +94,75 @@ def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
     assert checked >= len(bars) - 1, \
         f"expected Heikin Ashi values on nearly every bar, got {checked}/{len(bars)}"
     log.info(f"Heikin Ashi same-symbol test passed — {checked}/{len(bars)} bars matched")
+
+
+def __test_heikinashi_subtick_precision__(runner, syminfo, tmp_path, log):
+    """A Heikin Ashi bar keeps full precision — it is never snapped to the mintick grid.
+
+    ``_round_price`` cleans float32 ``.ohlcv`` storage artifacts off values that
+    genuinely sit on the mintick grid. A Heikin Ashi candle is an average of
+    four such values, so it lands BETWEEN grid points and TradingView reports it
+    unrounded (measured on BINANCE:BTCUSDT 30m). The feed below is on the grid
+    while every derived HA value needs one decimal more, so a snap of the output
+    shows up as an exact-equality failure.
+    """
+    from datetime import datetime, UTC
+    from pynecore import lib
+    from pynecore.types.na import NA
+    from pynecore.types.ohlcv import OHLCV
+    from pynecore.core.ohlcv import OHLCVWriter
+
+    base_ts = int(datetime(2025, 1, 1, tzinfo=UTC).timestamp()) * 1000
+    # Every value is a multiple of the fixture's 1e-5 mintick; every (o+h+l+c)/4
+    # and (o+c)/2 needs a sixth decimal.
+    ohlc = [
+        (100.00001, 100.00007, 100.00000, 100.00002),
+        (100.00002, 100.00009, 100.00001, 100.00005),
+        (100.00005, 100.00011, 100.00003, 100.00004),
+        (100.00004, 100.00008, 100.00001, 100.00003),
+        (100.00003, 100.00013, 100.00002, 100.00012),
+        (100.00012, 100.00015, 100.00009, 100.00010),
+    ]
+    bars = [OHLCV(timestamp=base_ts + i * 300_000, open=o, high=h, low=lo, close=c, volume=1000.0)
+            for i, (o, h, lo, c) in enumerate(ohlc)]
+
+    src = tmp_path / "ha_subtick.ohlcv"
+    with OHLCVWriter(src, syminfo.period) as w:
+        for b in bars:
+            w.write(b)
+    syminfo.save_toml(src.with_suffix('.toml'))
+
+    exp_close, exp_open, exp_high, exp_low = [], [], [], []
+    prev_open = prev_close = None
+    for b in bars:
+        hc = (b.open + b.high + b.low + b.close) / 4.0
+        ho = (b.open + b.close) / 2.0 if prev_open is None else (prev_open + prev_close) / 2.0
+        exp_close.append(hc)
+        exp_open.append(ho)
+        exp_high.append(max(b.high, ho, hc))
+        exp_low.append(min(b.low, ho, hc))
+        prev_open, prev_close = ho, hc
+
+    tickerid = f"{syminfo.prefix}:{syminfo.ticker}"
+    r = runner(
+        iter(bars),
+        security_data={tickerid: str(src.with_suffix(''))},
+    )
+
+    checked = 0
+    for i, (_candle, plot_values) in enumerate(r.run_iter()):
+        hc = plot_values.get('haClose')
+        if isinstance(hc, NA) or hc is None:
+            continue
+        assert hc == exp_close[i], f"bar {i}: haClose={hc!r} != expected {exp_close[i]!r}"
+        assert plot_values['haOpen'] == exp_open[i], \
+            f"bar {i}: haOpen={plot_values['haOpen']!r} != expected {exp_open[i]!r}"
+        assert plot_values['haHigh'] == exp_high[i], \
+            f"bar {i}: haHigh={plot_values['haHigh']!r} != expected {exp_high[i]!r}"
+        assert plot_values['haLow'] == exp_low[i], \
+            f"bar {i}: haLow={plot_values['haLow']!r} != expected {exp_low[i]!r}"
+        checked += 1
+
+    assert checked >= len(bars) - 1, \
+        f"expected Heikin Ashi values on nearly every bar, got {checked}/{len(bars)}"
+    log.info(f"Heikin Ashi sub-tick precision test passed — {checked}/{len(bars)} bars exact")

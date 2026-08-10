@@ -29,7 +29,7 @@ class SeriesImpl(Generic[T]):
     __slots__ = ('_buffer',
                  '_max_bars_back', '_max_bars_back_set',
                  '_capacity', '_write_pos', '_size',
-                 '_last_bar_index', '_na')
+                 '_last_bar_index', '_na', '_compacted')
 
     DEFAULT_MAX_BARS_BACK = 500  # This can be set globally by indicator or strategy commands
     MAXIMUM_MAX_BARS_BACK = 5000  # This is the maximum allowed value
@@ -37,7 +37,8 @@ class SeriesImpl(Generic[T]):
     _lib: ModuleType = None  # Placeholder for the lib module
 
     # noinspection PyMissingConstructor
-    def __init__(self, max_bars_back: int | None = None, na_value: T | None = None):
+    def __init__(self, max_bars_back: int | None = None, na_value: T | None = None,
+                 compacted: bool = False):
         """
         :param max_bars_back: Optional initial capacity for historical lookback.
                               If not provided, DEFAULT_MAX_BARS_BACK is used.
@@ -46,6 +47,13 @@ class SeriesImpl(Generic[T]):
                          Float series pass the native nan here so a warmup /
                          out-of-history read behaves exactly like every other
                          float na; untyped series keep the interned NA object.
+        :param compacted: History counts stored values instead of bars: a bar with
+                          no :meth:`add` is simply absent rather than repeating the
+                          previous value. Set for the rolling windows of the
+                          ``@pyne lib`` machines (``math.sum``, the ``ta.*``
+                          averages), which drop na bars on purpose so ``src[k]`` is
+                          the k-th most recent non-na value — the window
+                          TradingView's native builtins keep.
         """
         # Importing the lib module here to avoid circular imports
         if not SeriesImpl._lib:
@@ -53,6 +61,7 @@ class SeriesImpl(Generic[T]):
             SeriesImpl._lib = lib
 
         self._na: T | NA[T] = _NA_UNTYPED if na_value is None else na_value
+        self._compacted = compacted
 
         self._max_bars_back = max_bars_back or self.DEFAULT_MAX_BARS_BACK
         self._max_bars_back_set = max_bars_back or 0
@@ -152,9 +161,39 @@ class SeriesImpl(Generic[T]):
         lib = SeriesImpl._lib
 
         # Set data instead of adding a new one if the bar index is the same
-        if self._last_bar_index == lib.bar_index:
+        last_bar_index = self._last_bar_index
+        if last_bar_index == lib.bar_index:
             return self.set(value)
 
+        # A series that lives inside a conditionally evaluated branch (a stateful
+        # function called from one arm of a ternary, a body that only some bars
+        # enter) is not updated on the bars the branch is skipped. TradingView
+        # still advances such a history by one slot per BAR and repeats the last
+        # value it did see, so ``x[k]`` keeps counting bars rather than calls
+        # (measured: BINANCE:BTCUSDT 30m, a fractal test called only when its
+        # sibling test is false matches the forward-filled model on every one of
+        # 23949 bars, while the compacted model misses 769). ``_size`` gates the
+        # fill: before the first value there is nothing to repeat, and the reads
+        # are na there either way.
+        missed = lib.bar_index - last_bar_index - 1
+        if missed > 0 and self._size > 0 and not self._compacted:
+            fill = self._buffer[self._write_pos - 1]
+            # Filling more than the whole buffer would only overwrite itself
+            for _ in range(missed if missed < self._capacity else self._capacity):
+                self._push(fill)
+
+        self._push(value)
+
+        # Store the last bar index to prevent adding more than one value per bar
+        self._last_bar_index = lib.bar_index
+
+        return value
+
+    def _push(self, value: T | NA[T]) -> None:
+        """
+        Append one value to the circular buffer, growing it until it is full and
+        overwriting the oldest entry afterwards.
+        """
         if self._size < self._capacity:
             # The buffer is not yet full - use direct indexing to pre-allocated buffer
             self._buffer[self._write_pos] = value
@@ -169,11 +208,6 @@ class SeriesImpl(Generic[T]):
             else:
                 self._write_pos += 1
             self._buffer[pos] = value
-
-        # Store the last bar index to prevent adding more than one value per bar
-        self._last_bar_index = lib.bar_index
-
-        return value
 
     def set(self, value: T | NA[T]) -> T | NA[T]:
         """

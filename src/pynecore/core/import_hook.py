@@ -172,11 +172,19 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # followed by whitespace or end of string. Substring matches don't count — they
         # would catch innocuous mentions inside docstrings of non-script library modules.
         is_pyne_module = False
+        # The optional word after the token is the module's mode: 'lib' marks the
+        # builtin machines shipped with PyneCore (their series are na-compacted
+        # windows), 'edge' the compiler's output, nothing at all a hand-written
+        # script.
+        pyne_mode: str | None = None
         if (tree.body and isinstance(tree.body[0], ast.Expr) and
                 isinstance(cast(ast.Expr, tree.body[0]).value, ast.Constant) and
                 isinstance(cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value, str)):
             docstring = cast(str, cast(ast.Constant, cast(ast.Expr, tree.body[0]).value).value)
-            is_pyne_module = re.match(r'\s*@pyne(\s|$)', docstring) is not None
+            magic = re.match(r'\s*@pyne(?:[ \t]+(?P<mode>\w+))?(\s|$)', docstring)
+            is_pyne_module = magic is not None
+            if magic is not None:
+                pyne_mode = magic.group('mode')
 
         if is_pyne_module:
 
@@ -215,12 +223,13 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
             from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
             from pynecore.transformers.float_tolerance import FloatToleranceTransformer
+            from pynecore.transformers.pine_truthiness import PineTruthinessTransformer
             from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
             from pynecore.transformers.locations import fix_locations
 
             # Shared slot allocator of the module (see slot_layout.py); the
             # state-contributing transformers fill it, apply_layout emits it
-            slot_layout = ModuleLayout()
+            slot_layout = ModuleLayout(compacted_series=pyne_mode == 'lib')
 
             transformed = ImportLifterTransformer().visit(transformed)
             transformed = TypeCheckingStripperTransformer().visit(transformed)
@@ -235,6 +244,13 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # Lazy-context history hoist must run before call-site anchoring:
             # the hoisted statements are the anchorable call sites
             transformed = InlineSeriesHoistTransformer().visit(transformed)
+            # Pine's tolerant float-to-bool conversion, over the script's OWN
+            # bool contexts: it runs before the passes that emit control flow of
+            # their own (lazy-init flags and friends), whose tests are bools by
+            # construction. Only user/compiled scripts get it -- see the
+            # comparison rewrite at the end of the pipeline for the same rule
+            if not path.is_relative_to(Path(__file__).parent.parent):
+                transformed = PineTruthinessTransformer().visit(transformed)
             # Pine instantiation semantics: clone security-bearing functions
             # per call site so each call site gets its own security contexts
             transformed = SecurityInstantiationTransformer().visit(transformed)
