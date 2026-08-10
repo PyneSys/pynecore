@@ -1,0 +1,38 @@
+//@version=6
+// SAFEST live test 3 — far OCA/OCO breakout GROUP, place then cancel. NO TRIGGER / NO FILL.
+//
+// On a GREEN candle place TWO stop entries in ONE OCA group (oca_type=cancel):
+//   "Up" buy-stop +5% above, "Dn" sell-stop -5% below — both far, both REST, neither
+// triggers. On a RED candle cancel both. No position is ever taken. Proves OCA-grouped
+// STOP placement + cancel (two native STOPs sharing an oca_name, each cancelled by its
+// own book). The one-cancels-other on a real fill is verified by the BACKTEST, not here
+// (nothing fills live).
+//
+// 1 contract VN30F1M. -0.1% close_all guard (backstop; never fires with no position).
+strategy("LIVE3 OCA group place+cancel", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+isGreen = close > open
+isRed   = close < open
+
+upStop = close[1] * 1.05   // buy-stop +5% (won't trigger)
+dnStop = close[1] * 0.95   // sell-stop -5% (won't trigger)
+
+if isGreen
+    strategy.entry("Up", strategy.long, stop=upStop, oca_name="brk", oca_type=strategy.oca.cancel,
+                   comment="buy-stop@" + str.tostring(upStop, format.mintick))
+    strategy.entry("Dn", strategy.short, stop=dnStop, oca_name="brk", oca_type=strategy.oca.cancel,
+                   comment="sell-stop@" + str.tostring(dnStop, format.mintick))
+if isRed
+    strategy.cancel("Up")
+    strategy.cancel("Dn")
+
+// --- LAST PROTECTION LINE (backstop; never fires with no position) ---
+PROTECT_PCT = -0.1
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < PROTECT_PCT
+    strategy.close_all(comment="PROTECT")
+
+plot(strategy.position_size, "pos", display=display.data_window)

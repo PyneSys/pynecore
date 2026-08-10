@@ -1,0 +1,24 @@
+//@version=6
+// Falsifiable order-semantics test: place a LONG LIMIT 5% below market, then
+// cancel it. A limit that far below cannot fill in the test window, so:
+//   correct plugin -> order RESTS, then is cancelled, NEVER fills (0 trades)
+//   market-fill bug -> order fills immediately at a marketable price (WRONG)
+// Also exercises strategy.cancel() end to end.
+strategy("N0 Limit then Cancel", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+var bool placed = false
+var bool cancelled = false
+limitPx = close[1] * 0.95
+
+if not placed
+    strategy.entry("L", strategy.long, qty=1, limit=limitPx, comment="LIMIT@" + str.tostring(limitPx, format.mintick))
+    placed := true
+else if placed and not cancelled
+    strategy.cancel("L", comment="CANCEL")
+    cancelled := true
+
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(limitPx, "limit", display=display.data_window)

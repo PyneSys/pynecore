@@ -1,0 +1,33 @@
+//@version=6
+// SAFEST live test 1 — single far LIMIT, place then cancel (NORMAL LO). NO FILL POSSIBLE.
+//
+// On a GREEN candle place ONE long-limit entry 5% under the prior close — far below
+// market: well inside the +/-7% daily band so it RESTS (not rejected), yet far enough it
+// cannot fill in a normal session (VN30 moves ~1-2%/day). On a RED candle cancel it. No
+// position is ever taken, so nothing is at risk beyond an order that cannot fill. Proves
+// place -> rest -> cancel of a plain NORMAL LO end to end — the safest possible live test.
+//
+// 1 contract VN30F1M. -0.1% close_all guard (a backstop; with no position it never fires).
+strategy("LIVE1 limit place+cancel", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+isGreen = close > open
+isRed   = close < open
+
+limitPrice = close[1] * 0.95   // 5% below the prior close -> rests, cannot fill
+
+if isGreen
+    strategy.entry("L", strategy.long, limit=limitPrice,
+                   comment="lim@" + str.tostring(limitPrice, format.mintick))
+if isRed
+    strategy.cancel("L")
+
+// --- LAST PROTECTION LINE (backstop; never fires with no position) ---
+PROTECT_PCT = -0.1
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < PROTECT_PCT
+    strategy.close_all(comment="PROTECT")
+
+plot(strategy.position_size, "pos", display=display.data_window)

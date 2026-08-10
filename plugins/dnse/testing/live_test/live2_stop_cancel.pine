@@ -1,0 +1,34 @@
+//@version=6
+// SAFEST live test 2 — single far STOP entry, place then cancel. NO TRIGGER / NO FILL.
+//
+// On a GREEN candle place ONE long stop-entry 5% ABOVE the prior close — far above market:
+// inside the +/-7% band so it RESTS as a `New` conditional order, yet far enough it won't
+// trigger in a session. On a RED candle cancel it. No position is ever taken. Proves
+// place -> rest (the conditional STOP book) -> cancel of a native STOP end to end — the
+// exact path the cancel-by-own-book fix covers (an entry-STOP cancelled with
+// orderCategory=STOP, not NORMAL-first).
+//
+// 1 contract VN30F1M. -0.1% close_all guard (backstop; never fires with no position).
+strategy("LIVE2 stop place+cancel", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+isGreen = close > open
+isRed   = close < open
+
+stopPrice = close[1] * 1.05   // 5% above the prior close -> rests as a STOP, won't trigger
+
+if isGreen
+    strategy.entry("S", strategy.long, stop=stopPrice,
+                   comment="stop@" + str.tostring(stopPrice, format.mintick))
+if isRed
+    strategy.cancel("S")
+
+// --- LAST PROTECTION LINE (backstop; never fires with no position) ---
+PROTECT_PCT = -0.1
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < PROTECT_PCT
+    strategy.close_all(comment="PROTECT")
+
+plot(strategy.position_size, "pos", display=display.data_window)
