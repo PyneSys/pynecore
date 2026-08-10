@@ -323,7 +323,7 @@ def plotshape(series: Any, title: str | None = None, style: Any = None, location
     if bar_index == 0:
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plotshape function can only be called from the main function!")
-    t = _uniq_title('Shape' if title is None else title)
+    t = _uniq_title('Shapes' if title is None else title)
     # TradingView exports whatever the series holds, not a truthiness flag: a
     # numeric series marks the bar AND carries its value into the exported
     # column (measured: ``plotshape(cond ? high : na, location=location.abovebar)``
@@ -378,7 +378,7 @@ def plotchar(series: Any, title: str | None = None, char: str | None = None, loc
     if bar_index == 0:
         if sys._getframe(1).f_code.co_name != 'main':  # noqa
             raise RuntimeError("The plotchar function can only be called from the main function!")
-    t = _uniq_title('Char' if title is None else title)
+    t = _uniq_title('Chars' if title is None else title)
     _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
     if meta is None:

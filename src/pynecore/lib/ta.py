@@ -2226,10 +2226,16 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     :return: The value of the source series when the condition is true for the given occurrence
     """
     assert occurrence >= 0, "Invalid occurrence, must be >= 0!"
-    if not (source == source):  # is_na_arg
-        return na_float
 
-    values: Persistent[deque[float]] = deque(maxlen=occurrence + 1)
+    # The remembered value survives every bar the condition is false, so a na
+    # source on such a bar must not blank the result. A na source ON a condition
+    # bar is recorded verbatim: it still consumes an occurrence and is returned
+    # as na. Both measured on TradingView (CAPITALCOM:EURUSD 30m, condition
+    # ``bar_index % 3 == 0`` over a source na on even bars): occurrence 1 read
+    # from a condition bar whose source was na came back na while occurrence 2
+    # reached past it to the older value, and a always-defined source held its
+    # last value across the false bars.
+    values: Persistent[deque[PyneFloat]] = deque(maxlen=occurrence + 1)
 
     if condition:
         values.append(source)

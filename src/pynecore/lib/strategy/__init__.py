@@ -4560,6 +4560,7 @@ def exit(id: str, from_entry: str = "",
         # issue bar's close only (see above).
         position._seed_trail_at_issue(order, fold_extreme=not had_trail or trail_unchanged)
 
+    # noinspection PyProtectedMember
     def _bound_size(entry_id: str) -> tuple[float, float]:
         """Combined sign and ORIGINAL size of everything bound to an entry id:
         open pyramid adds at their entry size plus a still-pending entry order at
@@ -4578,7 +4579,20 @@ def exit(id: str, from_entry: str = "",
             # intent stability while ``record_fill`` moves the filled slice into
             # ``open_trades``; counting the full order size there would
             # double-count the fill and over-reserve the exit (issue BYBIT-001).
-            unfilled = abs(pending.size) - pending.filled_qty
+            # A market entry that adds to a same-direction position is re-checked
+            # against the pyramiding limit when it is processed and dropped there
+            # without ever reaching the position, so it must not enlarge the slice
+            # this leg reserves. The inflated reservation would also be sticky: on
+            # the next bar the sibling leg finds nothing unreserved left and keeps
+            # its own oversized share, so a qty_percent leg goes on closing the
+            # whole position. TradingView keeps such an exit at half the position
+            # that actually exists -- measured on the CAPITALCOM:EURUSD 30m
+            # reference of the "TradingView Alerts to MT4 MT5" strategy, whose
+            # ``GoShort`` fires again while the short is already open.
+            rejected_pyramid = (pending.limit is None and pending.stop is None
+                                and position.sign == pending.sign
+                                and lib._script.pyramiding <= len(position.open_trades))
+            unfilled = 0.0 if rejected_pyramid else abs(pending.size) - pending.filled_qty
             if unfilled > 0.0:
                 total += unfilled
         for open_trade in position.open_trades:

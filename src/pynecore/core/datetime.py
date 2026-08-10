@@ -223,25 +223,31 @@ def parse_datestring(datestring: str) -> datetime:
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Try parsing ISO 8601 style dates WITH TIME first (handles both T and space
-    # separator; seconds are optional -- "2021-01-01 00:00" is accepted too)
+    # Try parsing ISO 8601 style dates WITH TIME first. The date and the time may
+    # be separated by "T", a space or a colon, and the hour needs no zero padding;
+    # seconds are optional. TradingView accepts every one of those spellings --
+    # measured: "2021-01-13:05:00", "2021-01-13:5:00", "2021-01-13:05:00:00" and
+    # "2021-01-13T05:00" all resolve to 2021-01-13 05:00 UTC, while a missing
+    # separator ("2021-01-1305:00"), a letter one ("2021-01-13x05:00") and a
+    # minute-less time ("2021-01-13:05") are rejected outright.
     iso_match = re.match(
-        r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)'  # datetime part
+        r'(\d{4}-\d{2}-\d{2})'  # date part
+        r'[T\s:]'  # date/time separator
+        r'(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)'  # time part
         r'([+-]\d{2}:\d{2})?$',  # timezone part
         datestring
     )
     if iso_match:
-        dt_part, tz_part = iso_match.groups()
+        date_part, time_part, tz_part = iso_match.groups()
+        dt_str = f"{date_part}T{time_part}"
         if tz_part:
-            datestring = normalize_timezone(datestring)
-            dt_str = datestring.replace(' ', 'T')  # Normalize to T for parsing
+            dt_str = normalize_timezone(dt_str + tz_part)
             for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"):
                 try:
                     return datetime.strptime(dt_str, fmt)
                 except ValueError:
                     continue
         else:
-            dt_str = dt_part.replace(' ', 'T')
             for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
                 try:
                     return datetime.strptime(dt_str, fmt).replace(tzinfo=UTC)
@@ -288,7 +294,8 @@ def parse_datestring(datestring: str) -> datetime:
     raise ValueError(
         f"Invalid date format: {datestring}\n"
         "Supported formats:\n"
-        "- ISO Style: '2020-02-20T15:30:00+02:00', '2025-01-01 01:23:45-05:00'\n"
+        "- ISO Style: '2020-02-20T15:30:00+02:00', '2025-01-01 01:23:45-05:00',"
+        " '2021-01-13:05:00'\n"
         "- With fraction: '2024-08-01T04:38:47.731215+00:00'\n"
         "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200', '1 January 2018 00:00 +0000'\n"
         "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'\n"
