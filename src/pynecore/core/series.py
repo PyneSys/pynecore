@@ -157,12 +157,14 @@ class SeriesImpl(Generic[T]):
         :param value: The new data to be added.
         :return: The same value that was added (for chaining or inline usage).
         """
-        # Optimize attribute lookup by using local variable
-        lib = SeriesImpl._lib
+        # Read the module attribute once: this runs for every series assignment
+        # on every bar, and the three reads it replaces cannot see a different
+        # value anyway — nothing between them advances the bar.
+        bar_index = SeriesImpl._lib.bar_index
 
         # Set data instead of adding a new one if the bar index is the same
         last_bar_index = self._last_bar_index
-        if last_bar_index == lib.bar_index:
+        if last_bar_index == bar_index:
             return self.set(value)
 
         # A series that lives inside a conditionally evaluated branch (a stateful
@@ -175,17 +177,32 @@ class SeriesImpl(Generic[T]):
         # 23949 bars, while the compacted model misses 769). ``_size`` gates the
         # fill: before the first value there is nothing to repeat, and the reads
         # are na there either way.
-        missed = lib.bar_index - last_bar_index - 1
+        missed = bar_index - last_bar_index - 1
         if missed > 0 and self._size > 0 and not self._compacted:
             fill = self._buffer[self._write_pos - 1]
             # Filling more than the whole buffer would only overwrite itself
             for _ in range(missed if missed < self._capacity else self._capacity):
                 self._push(fill)
 
-        self._push(value)
+        # _push, inlined verbatim: this is THE per-bar write of every series in
+        # the script, and its call frame costs more than the body. Kept a literal
+        # copy so a drift between the two is visible at a glance — a wrap one of
+        # them makes and the other does not corrupts a full buffer silently.
+        if self._size < self._capacity:
+            self._buffer[self._write_pos] = value
+            self._size += 1
+            self._write_pos += 1
+        else:
+            pos = self._write_pos
+            if pos >= self._capacity:
+                pos = 0
+                self._write_pos = 1
+            else:
+                self._write_pos += 1
+            self._buffer[pos] = value
 
         # Store the last bar index to prevent adding more than one value per bar
-        self._last_bar_index = lib.bar_index
+        self._last_bar_index = bar_index
 
         return value
 

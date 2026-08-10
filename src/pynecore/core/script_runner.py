@@ -161,42 +161,52 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     if TYPE_CHECKING:  # This is needed for the type checker to work
         from .. import lib
 
-    lib.bar_index = bar_index
-    lib.last_bar_index = bar_index if last_bar_index is None else last_bar_index
+    # The 18 properties below are written straight into the module namespace:
+    # a module attribute store costs twice a dict store (measured 20.4 vs
+    # 10.4 ns), and this whole block runs once per bar. The reads stay on the
+    # attribute form — those are already a specialized single opcode, and they
+    # keep the type checker's view of the module, which a dict store loses.
+    # Safe to lose here because every name written this way is either one of
+    # Pine's own built-ins (frozen by the language) or a ``_dg_*`` internal the
+    # attribute reads below still cover.
+    props = vars(lib)
+
+    props['bar_index'] = bar_index
+    props['last_bar_index'] = bar_index if last_bar_index is None else last_bar_index
 
     if derived_prices:
-        lib.open = o = ohlcv.open
-        lib.high = h = ohlcv.high
-        lib.low = lo = ohlcv.low
-        lib.close = c = ohlcv.close
+        props['open'] = o = ohlcv.open
+        props['high'] = h = ohlcv.high
+        props['low'] = lo = ohlcv.low
+        props['close'] = c = ohlcv.close
     else:
-        lib.open = o = _round_price(ohlcv.open, round_decimals)
-        lib.high = h = _round_price(ohlcv.high, round_decimals)
-        lib.low = lo = _round_price(ohlcv.low, round_decimals)
-        lib.close = c = _round_price(ohlcv.close, round_decimals)
+        props['open'] = o = _round_price(ohlcv.open, round_decimals)
+        props['high'] = h = _round_price(ohlcv.high, round_decimals)
+        props['low'] = lo = _round_price(ohlcv.low, round_decimals)
+        props['close'] = c = _round_price(ohlcv.close, round_decimals)
 
-    lib.volume = ohlcv.volume if lossless_volume else restore_f32_volume(ohlcv.volume)
-    lib.extra_fields = ohlcv.extra_fields if ohlcv.extra_fields else {}
+    props['volume'] = ohlcv.volume if lossless_volume else restore_f32_volume(ohlcv.volume)
+    props['extra_fields'] = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
     # Pine's ``bid``/``ask`` only carry real values on the ``"1T"`` (tick) feed; on every
     # other timeframe TradingView reports ``na``. PyneCore does not support tick data, so
     # they are always ``na`` — matching TV behaviour on bar timeframes.
-    lib.bid = lib.ask = na_float
+    props['bid'] = props['ask'] = na_float
 
-    lib.hl2 = (h + lo) / 2.0
-    lib.hlc3 = (h + lo + c) / 3.0
-    lib.ohlc4 = (o + h + lo + c) / 4.0
-    lib.hlcc4 = (h + lo + 2 * c) / 4.0
+    props['hl2'] = (h + lo) / 2.0
+    props['hlc3'] = (h + lo + c) / 3.0
+    props['ohlc4'] = (o + h + lo + c) / 4.0
+    props['hlcc4'] = (h + lo + 2 * c) / 4.0
 
     # ``fromtimestamp(ts, tz)`` converts straight to the exchange timezone (same
     # instant as a UTC roundtrip), and the epoch milliseconds are the raw
     # timestamp itself — no astimezone/timestamp C calls per bar.
-    lib._time = t = ohlcv.timestamp  # PineScript representation of time
-    lib._datetime = datetime.fromtimestamp(t / 1000, tz)
+    props['_time'] = t = ohlcv.timestamp  # PineScript representation of time
+    props['_datetime'] = datetime.fromtimestamp(t / 1000, tz)
     # Historical runs anchor ``last_bar_time`` to the chart's final bar (Pine
     # semantics — the whole history is known up front); live updates pass
     # ``None`` so it tracks the current (realtime) bar, which IS the last bar.
-    lib.last_bar_time = t if last_bar_time is None else last_bar_time
+    props['last_bar_time'] = t if last_bar_time is None else last_bar_time
 
     # Multi-period scheduled-grid tracker (lib._dg_*): one compare per bar,
     # the roll path runs at most once per trading day. It works in epoch seconds.
@@ -205,7 +215,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
         lib._dg_on_roll(ts_sec)
     # Remember this bar so the next roll can measure the day it closes (the
     # holiday half-day fold needs the previous day's last bar end).
-    lib._dg_last_ts = ts_sec
+    props['_dg_last_ts'] = ts_sec
 
 
 # noinspection PyUnusedLocal

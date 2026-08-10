@@ -364,28 +364,55 @@ def _anchored(impls: list[Implementation], qualname: str,
     # the call's keyword-name tuple, stable for the same reason _select_cache
     # is — implementation signatures only change with a recompile.
     _kw_rename_cache: dict[tuple[str, ...], tuple[tuple[str, str], ...]] = {}
+    # Positional-only shortcut over _select_cache, keyed by the raw argument
+    # TYPES: a hit needs one map(type) and one dict lookup, with no _type_token
+    # call and no nested key tuple to build. Latched off for good on the first
+    # call whose tokens are not simply its types (see below), so an anchor that
+    # passes na or container arguments does not keep paying for a key it can
+    # never hit on. A one-element list, not a nonlocal: the read is the hot
+    # part and a list index is cheaper than a cell rebind would be worth.
+    _fast: dict[tuple[type, ...], Implementation] = {}
+    _fast_ok = [True]
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
-        if kwargs:
-            names = tuple(kwargs)
-            renames = _kw_rename_cache.get(names)
-            if renames is None:
-                renames = _kw_rename_cache[names] = _canonical_kwarg_renames(impls, names)
-            for raw, canonical in renames:
-                kwargs[canonical] = kwargs.pop(raw)
-        # Selection key, inlined (this is per-bar hot code): a uniform hashable
-        # ``(positional_tokens, keyword_tokens)`` pair so the no-kwargs and
-        # with-kwargs forms can never collide. map() over _type_token beats a
-        # generator expression here. Equal keys guarantee the same impl.
-        pos = tuple(map(_type_token, args))
-        key = (pos, ()) if not kwargs else \
-            (pos, tuple((k, _type_token(v)) for k, v in kwargs.items()))
-        impl = _select_cache.get(key)
+        impl = types = None
+        if _fast_ok[0] and not kwargs:
+            types = tuple(map(type, args))
+            impl = _fast.get(types)
         if impl is None:
-            impl = _select(impls, args, kwargs)
+            if kwargs:
+                names = tuple(kwargs)
+                renames = _kw_rename_cache.get(names)
+                if renames is None:
+                    renames = _kw_rename_cache[names] = _canonical_kwarg_renames(impls, names)
+                for raw, canonical in renames:
+                    kwargs[canonical] = kwargs.pop(raw)
+            # Selection key, inlined (this is per-bar hot code): a uniform hashable
+            # ``(positional_tokens, keyword_tokens)`` pair so the no-kwargs and
+            # with-kwargs forms can never collide. map() over _type_token beats a
+            # generator expression here. Equal keys guarantee the same impl.
+            pos = tuple(map(_type_token, args))
+            key = (pos, ()) if not kwargs else \
+                (pos, tuple((k, _type_token(v)) for k, v in kwargs.items()))
+            impl = _select_cache.get(key)
             if impl is None:
-                raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
-            _select_cache[key] = impl
+                impl = _select(impls, args, kwargs)
+                if impl is None:
+                    raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
+                _select_cache[key] = impl
+            if types is not None:
+                # A token that IS its argument's type carries nothing the type does
+                # not: _type_token picks its branch on type() alone, and the branches
+                # returning the bare type are exactly the ones that look no further,
+                # so every value of such a type tokenizes identically and the type
+                # tuple selects what the token key would. Where an argument tokenized
+                # to a tuple instead — an na with its declared type, a container with
+                # its sampled element — the type tuple would merge arguments
+                # _check_type can tell apart, so it must never key this anchor.
+                if pos == types:
+                    _fast[types] = impl
+                else:
+                    _fast_ok[0] = False
         entry = _cache.get(impl)
         if entry is None or entry[0] is not impl.func:
             # First win at this anchor, or the implementation function was
