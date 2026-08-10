@@ -408,9 +408,10 @@ class ReadOnlySeriesView(Generic[T]):
                 pos += self._capacity
             yield self._buffer[pos]
 
-    def oldest_first(self) -> list[T | NA[T]]:
+    @property
+    def oldest(self) -> list[T | NA[T]]:
         """
-        Return the viewed values as a plain list ordered oldest to newest.
+        The viewed values as a plain list ordered oldest to newest.
 
         :return: The values of the view, oldest first
         """
@@ -418,6 +419,13 @@ class ReadOnlySeriesView(Generic[T]):
         # whole slice on every bar, where per-element ``__getitem__`` calls are
         # the dominant cost; handing the window over as at most two native list
         # slices removes that overhead entirely.
+        # A property rather than a method because the window consumers reach it
+        # through an isolated call site: a ``<slice>.method()`` callee is a fresh
+        # bound object every bar, so the transformer's anchor guard never hits --
+        # every bar pays a rebind, and the emitted form constructs the view object
+        # a second time just to re-check identity. (The call stays outside that
+        # guard, so the list below was built once either way.) An attribute read
+        # carries no call site at all.
         # Slice with an explicit upper bound everywhere: the buffer list may be
         # physically longer than ``_capacity`` (a shrink through the
         # ``max_bars_back`` fast path keeps the old allocation), so an open-ended

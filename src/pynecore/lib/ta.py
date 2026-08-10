@@ -477,7 +477,7 @@ def cum(source: Series[float | int]) -> PyneFloat:
     return var
 
 
-# The slice + ``oldest_first`` call on ``source`` looks ill-typed only because
+# The slice + ``oldest`` read on ``source`` looks ill-typed only because
 # ``Series[T]`` erases to ``T`` for the IDE; it is a series under the transform.
 # noinspection PyUnresolvedReferences,PyTypeChecker
 def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> PyneFloat:
@@ -508,7 +508,7 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     # ``source[i]`` reads, but the list walk is several times cheaper -- the
     # ``__getitem__`` call, not the arithmetic, dominates here.
     summ = 0.0
-    for y in builtins.reversed(source[0:length].oldest_first()):
+    for y in builtins.reversed(source[0:length].oldest):
         summ += abs(y - mean)
 
     return summ / length
@@ -777,7 +777,7 @@ def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True
 
 
 # The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
-# unused because they are read on the NEXT bar, and the slice + ``oldest_first`` call
+# unused because they are read on the NEXT bar, and the slice + ``oldest`` read
 # on ``src`` look ill-typed because ``Series[T]`` erases to ``T`` for the IDE.
 # noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
@@ -846,7 +846,7 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     sum_y = 0.0
     sum_xy = 0.0
     per = 0.0
-    for y in src[0:length].oldest_first():
+    for y in src[0:length].oldest:
         per = per + 1.0
         sum_y = sum_y + y
         sum_xy = sum_xy + y * per
@@ -2325,7 +2325,7 @@ def wad() -> PyneFloat:
 
 
 # The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
-# unused because they are read on the NEXT bar, and the slice + ``oldest_first`` call
+# unused because they are read on the NEXT bar, and the slice + ``oldest`` read
 # on ``ff`` look ill-typed because ``Series[T]`` erases to ``T`` for the IDE.
 # noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
 def wma(source: Series[float], length: int) -> PyneFloat:
@@ -2384,7 +2384,7 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     # times cheaper -- the ``__getitem__`` call dominates, not the arithmetic.
     summ = 0.0
     weight = 0.0
-    for y in ff[0:length].oldest_first():
+    for y in ff[0:length].oldest:
         weight = weight + 1.0
         summ = summ + y * weight
 
