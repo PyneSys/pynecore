@@ -5,6 +5,22 @@ which the plugin only ever **reads**. A token is valid ~8h and self-invalidating
 OTP kills the previous one), so mint once each trading morning — the plugin picks up the
 new file automatically on its next read.
 
+## Daily check (run this at ~08:05, after the cron)
+
+`token_status.py` tells you whether the 08:00 job left a **working** token — and lets you
+fix it on the spot:
+
+```bash
+.venv/bin/python plugins/dnse/tools/token_status.py       # add --refresh to force one
+```
+
+It prints the mint time + age vs the 8h TTL, whether it was minted after 08:00 today, the
+cron-log tail, and a **live probe** — a harmless cancel of a bogus order id: DNSE checks
+the token header before it looks the order up, so `INVALID_TRADING_TOKEN` means the token
+is bad while any other reply (not-found, session-closed, …) means it was accepted. If the
+token isn't good it offers to refresh: it sends the OTP, you read your email and type the
+code, it writes the new token.
+
 ## Manual (works today, no Gmail creds)
 
 ```bash
