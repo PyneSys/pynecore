@@ -317,6 +317,9 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the COG
     :return: The Center of Gravity (COG) of the source series
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``.
+    length = int(length)
     count: Persistent[int] = 0
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
@@ -335,7 +338,7 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
     # beyond the per-series default max_bars_back (500); otherwise the window-drop
     # read returns na and poisons ``summ`` permanently.
-    max_bars_back(src, int(length))
+    max_bars_back(src, length)
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
@@ -647,6 +650,9 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     :param _check_eq: If true, check for equality too, internal use only
     :return: The highest value of the source series
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``.
+    length = int(length)
     last_max: Persistent[float] = na_float
     last_max_index: Persistent[int] = 0
 
@@ -794,10 +800,16 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     # update of the two sums drifts to 1e-11 on the same data. The x-axis runs
     # 1..length from the oldest bar, and the result is the line evaluated at
     # ``length - offset``.
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes both the domain check and the single-bar shortcut, because the
+    # regression runs on the truncated length: a 1.5 IS a 1, and a 0.5 IS an
+    # invalid 0 rather than a value that passes ``> 0`` and then divides by zero.
+    length = int(length)
+    offset = int(offset)
     assert length > 0, "Invalid length, must be greater than 0!"
     if length == 1:
         return source
-    length = int(length)
 
     count: Persistent[int] = 0
     val: Persistent[float] = na_float
@@ -882,6 +894,9 @@ def lowest(source: Series[float], length: int,
     :param _check_eq: If true, check for equality too, internal use only
     :return: The lowest value of the source series
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``.
+    length = int(length)
     last_min: Persistent[float] = na_float
     last_min_index: Persistent[int] = 0
 
@@ -1532,6 +1547,12 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     :param rightbars: Right strength.
     :return: Price of the pivot high point, or NaN if no pivot
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. The
+    # strength checks run on the truncated values, since those are the ones the
+    # pivot window is built from: a 0.5 strength is an invalid 0, not a legal side.
+    leftbars = int(leftbars)
+    rightbars = int(rightbars)
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
 
@@ -1575,6 +1596,12 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     :param rightbars: Right strength.
     :return: Price of the pivot low point, or NaN if no pivot
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. The
+    # strength checks run on the truncated values, since those are the ones the
+    # pivot window is built from: a 0.5 strength is an invalid 0, not a legal side.
+    leftbars = int(leftbars)
+    rightbars = int(rightbars)
     assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
     assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
 
@@ -1956,6 +1983,11 @@ def sma(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the moving average
     :return: The Simple Moving Average (SMA)
     """
+    # The divisor is the TRUNCATED length, not the argument: Pine's ``int / int``
+    # keeps its fraction while staying int-typed, and ``ta.sma(close, R / 8)``
+    # with R = 14 is ``ta.sma(close, 1)`` on TradingView, not a division by 1.75.
+    # ``lib_math.sum`` truncates its own window the same way.
+    length = int(length)
     # No decimal rounding here: ``lib_math.sum`` reproduces Pine's compensated
     # accumulator bit-for-bit, so the plain quotient IS TradingView's value.
     # Rounding to 15 decimals sits above the ulp for typical price magnitudes
@@ -2225,6 +2257,11 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     :param occurrence: The occurrence of the condition
     :return: The value of the source series when the condition is true for the given occurrence
     """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. The
+    # domain check runs on the truncated value, which is the occurrence actually
+    # looked up: a -0.5 IS occurrence 0, not an out-of-domain argument.
+    occurrence = int(occurrence)
     assert occurrence >= 0, "Invalid occurrence, must be >= 0!"
 
     # The remembered value survives every bar the condition is false, so a na

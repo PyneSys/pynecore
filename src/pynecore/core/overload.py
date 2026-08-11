@@ -193,6 +193,18 @@ def _check_type(value: Any, expected_type: Type, strict: bool = False) -> bool:
     if not strict and expected_type is float and type(value) is int:
         return True
 
+    # The mirror image, and it is not symmetry but a measured TradingView law:
+    # ``int / int`` is int-TYPED while keeping its fractional VALUE. Measured on
+    # BINANCE:BTCUSDT 30m in v4 and v6 alike, with ``R = 14``: ``R / 8`` plots
+    # 1.75 and ``R / 8 * 100`` plots 175, yet ``ta.highest(R / 8)`` compiles and
+    # equals ``ta.highest(1)`` and ``ta.sma(close, R / 8)`` equals
+    # ``ta.sma(close, 1)`` — the truncation happens where an integer is actually
+    # required, not at the division. Such a value reaches an int parameter as a
+    # plain Python float, so the exact pass above cannot place it; the callee
+    # truncates it (``length = int(length)``), exactly as TradingView does.
+    if not strict and expected_type is int and type(value) is float:
+        return True
+
     # Pine Script allows plain str where StrLiteral subtypes are expected (e.g. size, xloc)
     if isinstance(value, str) and isinstance(expected_type, type) and issubclass(expected_type, StrLiteral):
         return True

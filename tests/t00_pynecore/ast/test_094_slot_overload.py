@@ -146,8 +146,11 @@ def main(v):
     return acc(v)
 ''', 'ovl_mod_e')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
+    # A bare float is no mismatch: Pine's ``int / int`` is int-TYPED while keeping
+    # its fraction, so such a value legally reaches an int parameter and the callee
+    # truncates it. An array fits neither implementation under any reading.
     with pytest.raises(TypeError, match='No matching implementation'):
-        ns['main'](state, 1.5)
+        ns['main'](state, [1.5])
 
 
 def __test_overload_direct_call_fallback__():
