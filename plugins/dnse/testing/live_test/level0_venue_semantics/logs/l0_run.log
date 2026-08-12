@@ -1,0 +1,56 @@
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+=== LEVEL 0 — DNSE order semantics @ 2026-08-12 12:18 ICT ===
+session: CLOSED (after hours / break)
+account: 0001672126   contract: 41I1G8000
+reference (daily close): 1924.0   -> long trigger 2020.2 / short trigger 1827.8
+
+[1] MARKET long + short — after hours: must NOT fill, must be cancellable
+  [PASS] market long — queued at band edge 2058.6, filled=0, ids=['486956']
+  [PASS] market long: cancel — cancelled — nothing left to fill at the open
+  [PASS] market short — queued at band edge 1789.4, filled=0, ids=['486966']
+  [PASS] market short: cancel — cancelled — nothing left to fill at the open
+
+[2] STOP long + short — expect RESTING, then cancellable
+  [PASS] stop long: place — accepted, filled=0, ids=['d9u04di1a4skcecmcphg']
+  [PASS] stop long: rests on book — found on order book
+  [PASS] stop long: cancel — cancel accepted
+  [PASS] stop long: gone after cancel — absent from book
+  [PASS] stop short: place — accepted, filled=0, ids=['d9u04e21a4skcecmcpi0']
+  [PASS] stop short: rests on book — found on order book
+  [PASS] stop short: cancel — cancel accepted
+  [PASS] stop short: gone after cancel — absent from book
+
+[3] STOP-LIMIT long + short — expect RESTING, then cancellable
+  [PASS] stop-limit long: place — accepted, filled=0, ids=['d9u04ei1a4skcecmcpig']
+  [PASS] stop-limit long: rests on book — found on order book
+  [PASS] stop-limit long: cancel — cancel accepted
+  [PASS] stop-limit long: gone after cancel — absent from book
+  [PASS] stop-limit short: place — accepted, filled=0, ids=['d9u04f21a4skcecmcpj0']
+  [PASS] stop-limit short: rests on book — found on order book
+  [PASS] stop-limit short: cancel — cancel accepted
+  [PASS] stop-limit short: gone after cancel — absent from book
+[cleanup] position now: None
+
+=== SUMMARY ===
+  [PASS] market long — queued at band edge 2058.6, filled=0, ids=['486956']
+  [PASS] market long: cancel — cancelled — nothing left to fill at the open
+  [PASS] market short — queued at band edge 1789.4, filled=0, ids=['486966']
+  [PASS] market short: cancel — cancelled — nothing left to fill at the open
+  [PASS] stop long: place — accepted, filled=0, ids=['d9u04di1a4skcecmcphg']
+  [PASS] stop long: rests on book — found on order book
+  [PASS] stop long: cancel — cancel accepted
+  [PASS] stop long: gone after cancel — absent from book
+  [PASS] stop short: place — accepted, filled=0, ids=['d9u04e21a4skcecmcpi0']
+  [PASS] stop short: rests on book — found on order book
+  [PASS] stop short: cancel — cancel accepted
+  [PASS] stop short: gone after cancel — absent from book
+  [PASS] stop-limit long: place — accepted, filled=0, ids=['d9u04ei1a4skcecmcpig']
+  [PASS] stop-limit long: rests on book — found on order book
+  [PASS] stop-limit long: cancel — cancel accepted
+  [PASS] stop-limit long: gone after cancel — absent from book
+  [PASS] stop-limit short: place — accepted, filled=0, ids=['d9u04f21a4skcecmcpj0']
+  [PASS] stop-limit short: rests on book — found on order book
+  [PASS] stop-limit short: cancel — cancel accepted
+  [PASS] stop-limit short: gone after cancel — absent from book
+
+VERDICT: PASS

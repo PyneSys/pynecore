@@ -1,0 +1,19 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-12 04:57 ━━━━━━━━━━━━━━━━━ 0:00:14 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-12 11:28:00+0700] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-08-12 11:28:00+0700] bar:    499 INFO     [BROKER] live trading active
+
+[2026-08-12 12:01:36+0700] bar:    499 INFO     [BROKER] run stopped (completed) position=flat equity=457,092,958.00 VND

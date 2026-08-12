@@ -11,6 +11,27 @@ small and as bounded as possible.
 > **This tier is SUPERVISED. Never run it unattended.** An operator watches the whole run
 > with the DNSE app open for a one-tap manual flatten.
 
+## MANDATORY PRE-FLIGHT — Level 0 must pass first
+
+**Every live test below is gated on Level 0.** It runs at any hour (no session, no
+candles needed) and exercises the whole chain against the real venue in ~30 s:
+config -> trading token -> contract resolution -> place -> read back -> cancel.
+
+```bash
+cd /home/mike/workspace/github/pynecore
+.venv/bin/python plugins/dnse/testing/live_test/level0_venue_semantics/l0_order_semantics.py
+# exit 0 = cleared to proceed;  non-zero = STOP, do not run any live test
+```
+
+It catches, before you risk anything, what the higher tiers would only hit mid-flight:
+an expired/broken trading token (a stronger check than `token_status.py` — L0 actually
+places an order), a **stale contract mapping** after the monthly `VN30F1M` roll, a
+changed venue behaviour, and whether native STOP/STOP-LIMIT orders still rest and cancel.
+
+Run it **the same day** as the live test (the token lasts ~8 h). During an open session
+L0 skips its market-order part automatically — that part would fill — so an in-session
+run still validates the STOP / STOP-LIMIT paths, which is what matters here.
+
 ## Risk model — what is actually at stake
 
 - **One** VN30F1M contract: ~135 M VND notional, ~25 M VND margin (18.48 %).
