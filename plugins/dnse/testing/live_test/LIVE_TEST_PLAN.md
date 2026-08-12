@@ -69,13 +69,13 @@ cd /home/mike/workspace/github/pine2pyne
 **2. Backtest first** (must run clean — no exceptions, orders place & cancel in the log):
 ```bash
 cd /home/mike/workspace/github/pynecore
-.venv/bin/pyne run plugins/dnse/testing/live_test/live1_limit_cancel.py dnse:VN30F1M@1 --from -300
+.venv/bin/pyne run plugins/dnse/testing/live_test/live1_limit_cancel.py dnse:VN30F1M@1
 ```
 
 **3. Run live** (background; `--broker` places REAL orders on the real account):
 ```bash
 .venv/bin/pyne run plugins/dnse/testing/live_test/live1_limit_cancel.py \
-  dnse_broker:VN30F1M@1 --broker --from -30
+  dnse_broker:VN30F1M@1 --broker
 ```
 Run this **in the background** and watch the log. On a green bar you should see the order
 dispatched and a `CREATED` event; on the next red bar, a cancel and a `CANCELLED` event.
