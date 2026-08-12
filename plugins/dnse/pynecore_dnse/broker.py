@@ -90,11 +90,18 @@ class DNSEBrokerConfig(DNSEConfig):
     """:ivar account_no: DNSE trading account. Empty = resolve via ``/accounts``.
     :ivar trading_token: Bootstrap token; used only if the state file is absent.
     :ivar token_file: State file written by the OTP minter (the live source).
+    :ivar stop_slippage_ticks: Fallback offset (in ticks) applied *through* a stop's
+        trigger when pricing the LO it emits, used only when the strategy declares no
+        ``strategy(slippage=)``. DNSE has no stop-market order, so a triggered stop
+        posts a limit; pricing it at the trigger means a gap through never fills. The
+        strategy's own ``slippage x 2`` takes precedence; this is the floor so the
+        Pine default of 0 cannot silently recreate a never-filling stop.
     """
 
     account_no: str = ""
     trading_token: str = ""
     token_file: str = "workdir/state/dnse_trading_token.json"
+    stop_slippage_ticks: int = 10
 
 
 class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
@@ -258,14 +265,56 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     def _marketable_price(self, side: str) -> float:
         """Band-edge price for a market intent — ceiling to buy, floor to sell."""
+        ceiling, floor = self._band()
+        return ceiling if side == "buy" else floor
+
+    def _band(self) -> tuple[float, float]:
+        """(ceilingPrice, floorPrice) for the symbol — the venue's hard price limits."""
         row = self._secdef(self.symbol or "")
         ceiling = float(row.get("ceilingPrice") or 0)
         floor = float(row.get("floorPrice") or 0)
         if not ceiling or not floor:
             raise RuntimeError(
-                f"cannot price a market {side}: secdef has no ceiling/floor for "
+                f"cannot read the price band: secdef has no ceiling/floor for "
                 f"{self.symbol!r}")
-        return ceiling if side == "buy" else floor
+        return ceiling, floor
+
+    def _stop_fill_price(self, side: str, stop_price: float) -> float:
+        """Limit price for the LO a triggered stop emits — trigger + 2x slippage.
+
+        Pine's ``entry(stop=)`` / ``exit(stop=)`` mean a stop-**market**: once the
+        trigger prints, you want out (or in) and accept slippage. DNSE has no
+        stop-market — every order is an ``LO``, and a conditional order emits that LO
+        at ``price`` when ``stopPrice`` is crossed. Posting it *at* the trigger (the
+        old behaviour) makes it a stop-**limit**: if price gaps through, the LO never
+        fills, so the stop silently does nothing — triggered, unfilled, still exposed.
+
+        The LO is therefore offset **through** the trigger by ``2 x slippage`` ticks
+        (the strategy's own ``strategy(slippage=)``, in ticks) so it can cross the
+        spread. Doubling gives room for the book to move between trigger and arrival
+        while still bounding the worst fill — unlike a band-edge order, which always
+        fills but can print up to +/-7% away.
+
+        Falls back to :attr:`stop_slippage_ticks` when the script declares no slippage
+        (Pine's default is 0, which would reproduce the never-fills bug), and is
+        always clamped into the venue band so the order cannot be rejected.
+        """
+        from pynecore import lib
+        script = getattr(lib, "_script", None)
+        ticks = int(getattr(script, "slippage", 0) or 0) * 2
+        if ticks <= 0:
+            ticks = int(getattr(self.config, "stop_slippage_ticks", 0) or 0)
+        offset = ticks * self._mintick()
+        price = stop_price + offset if side == "buy" else stop_price - offset
+        ceiling, floor = self._band()
+        return round(min(max(price, floor), ceiling), 1)
+
+    def _mintick(self) -> float:
+        """Tick size for the traded contract (VN30F1M derivatives: 0.1)."""
+        try:
+            return float(self.get_symbol_info().mintick) or 0.1
+        except Exception:                                          # noqa: BLE001
+            return 0.1
 
     @staticmethod
     def _gtd(days: int = 7) -> str:
@@ -432,9 +481,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         from pynecore.core.broker.models import LegType
         intent = envelope.intent
         if intent.stop is not None:
-            # stop or stop-limit entry -> native STOP (price = limit if given)
+            # stop or stop-limit entry -> native STOP. An explicit ``limit`` is the
+            # user asking for a stop-LIMIT, so it is honoured verbatim; a bare
+            # ``stop`` means stop-MARKET, which DNSE cannot express, so the emitted
+            # LO is priced through the trigger (see ``_stop_fill_price``).
             return self._place(envelope, intent.side, intent.qty,
-                               price=intent.limit or intent.stop, category="STOP",
+                               price=(intent.limit if intent.limit is not None
+                                      else self._stop_fill_price(intent.side, intent.stop)),
+                               category="STOP",
                                stop_price=intent.stop, leg_type=LegType.ENTRY)
         if intent.limit is not None:
             return self._place(envelope, intent.side, intent.qty,
@@ -458,12 +512,17 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         from pynecore.core.broker.exceptions import OrderSkippedByPlugin
         intent = envelope.intent
         tp, sl = intent.tp_price, intent.sl_price
+        # A stop-loss must FILL when it fires — price the LO it emits through the
+        # trigger, never at it (see ``_stop_fill_price``). The TP leg keeps its exact
+        # limit: a take-profit is a limit order by nature and must not slip.
         if tp is not None and sl is not None:
             return self._place(envelope, intent.side, intent.qty, price=tp,
-                               category="OCO", stop_price=sl, stop_order_price=sl,
+                               category="OCO", stop_price=sl,
+                               stop_order_price=self._stop_fill_price(intent.side, sl),
                                leg_type=LegType.TAKE_PROFIT)
         if sl is not None:
-            return self._place(envelope, intent.side, intent.qty, price=sl,
+            return self._place(envelope, intent.side, intent.qty,
+                               price=self._stop_fill_price(intent.side, sl),
                                category="STOP", stop_price=sl,
                                leg_type=LegType.STOP_LOSS)
         if tp is not None:
