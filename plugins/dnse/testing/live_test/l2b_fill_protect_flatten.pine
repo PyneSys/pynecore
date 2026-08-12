@@ -1,0 +1,75 @@
+//@version=6
+// LIVE TEST LEVEL 2b — venue-protected fill with a TP/SL bracket. SUPERVISED ONLY.
+//
+// 2a proved fill -> flatten but left an UNPROTECTED window: if the process died between
+// the fill and the flatten, the position sat naked. 2b closes that window with a native
+// venue-side bracket armed the instant the entry is placed — the exchange holds it even
+// if we crash — and so also exercises the two things 2a cannot:
+//
+//   * exit-order PLACEMENT alongside a live position, and
+//   * its CANCELLATION when we flatten — no orphan left resting.
+// Every Level 3 case depends on that path, so breaking it here once beats breaking it
+// eight times there.
+//
+// PROTECTION, three independent layers (outermost last):
+//   1. Native OCO bracket: TP +0.2% / SL -0.2%, one server-side order sharing an
+//      `oca_name`, so the venue runs one-cancels-other itself and CANNOT leave a stop
+//      behind when the other side fills.
+//   2. Flatten-on-sight: close the position the moment it is seen (this is the test).
+//   3. DOUBLE-CHECK at -0.3%: if open PnL ever drops past -0.3%, `strategy.cancel_all()`
+//      then `strategy.close_all()` — cancel first so no resting leg can re-open exposure
+//      after the flatten. This is the backstop for layers 1-2 failing, and it is why the
+//      threshold sits OUTSIDE the 0.2% bracket: it must only fire if the bracket didn't.
+//
+// Other guards: 1 lot, pyramiding=0, enter-once/close-once latches, `barstate.isrealtime`
+// gate (warmup NEVER trades; a plain `dnse:` backtest places ZERO trades — the proof).
+// TP/SL levels are frozen at entry into `var`s: a moving level would make the engine
+// amend the resting conditional, and DNSE answers that with HTTP 500 (rubycell/pynecore#18).
+//
+// NOTE ON TIMING: the flatten lands on the NEXT bar, not intrabar. The DNSE v2 plugin's
+// `watch_ohlcv` skips the still-forming bar and yields CLOSED bars only, so there are no
+// intrabar ticks to evaluate on — `calc_on_every_tick` cannot shorten this. The bracket
+// above is what protects that one-bar window.
+//
+// PRECONDITION: continuous session, FLAT account, operator watching, DNSE app open.
+strategy("LIVE2b fill+bracket+flatten", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     slippage=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+var bool  traded  = false   // enter-once latch
+var bool  closing = false   // close-once latch
+var float tpLevel = na      // +0.2%, frozen at entry (never amended)
+var float slLevel = na      // -0.2%, frozen at entry (never amended)
+
+// (1) the single real entry + its native venue-side OCO bracket — LIVE bar only
+if barstate.isrealtime and not traded
+    tpLevel := close * 1.002
+    slLevel := close * 0.998
+    strategy.entry("E", strategy.long, comment="MKT 1-lot")
+    strategy.exit("X", from_entry="E", limit=tpLevel, stop=slLevel,
+                  oca_name="brk", oca_type=strategy.oca.cancel,
+                  comment_profit="TP@" + str.tostring(tpLevel, format.mintick),
+                  comment_loss="SL@" + str.tostring(slLevel, format.mintick))
+    traded := true
+
+// (2) DOUBLE-CHECK — outermost backstop, wider than the 0.2% bracket so it only fires if
+//     the bracket did not. Cancel first: a resting leg left working could otherwise
+//     re-open exposure right after close_all flattens.
+DOUBLE_CHECK_PCT = -0.3
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < DOUBLE_CHECK_PCT
+    strategy.cancel_all()
+    strategy.close_all(comment="DOUBLECHECK")
+
+// (3) flatten on sight — this must ALSO tear down the resting bracket
+if traded and strategy.position_size != 0 and not closing
+    strategy.close("E", comment="FLATTEN")
+    strategy.cancel_all()   // explicit: the engine's implicit bracket
+                            // teardown left an order working (see log 14:06)
+    closing := true
+
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(tpLevel, "tp", display=display.data_window)
+plot(slLevel, "sl", display=display.data_window)

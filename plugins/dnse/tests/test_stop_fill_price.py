@@ -53,14 +53,15 @@ def __test_zero_slippage_falls_back_to_config_not_the_trigger__(broker, monkeypa
     _set_slippage(monkeypatch, 0)
     price = broker._stop_fill_price("buy", 1900.0)
     assert price > 1900.0, "a 0-slippage script must NOT post the LO at the trigger"
-    # default stop_slippage_ticks = 10 -> 10 x 0.1 = 1.0
-    assert price == pytest.approx(1901.0)
+    # default stop_slippage_ticks = 3 -> 3 x 0.1 = 0.3. Deliberately SMALL: on a
+    # 0.2% stop (~3.9 pts on VN30F1M) a 1.0-pt offset was 26% of the stop distance.
+    assert price == pytest.approx(1900.3)
 
 
 def __test_missing_script_still_offsets__(broker, monkeypatch):
     """No running script (probe/tooling) must not collapse to trigger price."""
     monkeypatch.setattr(lib, "_script", None, raising=False)
-    assert broker._stop_fill_price("sell", 1900.0) == pytest.approx(1899.0)
+    assert broker._stop_fill_price("sell", 1900.0) == pytest.approx(1899.7)
 
 
 def __test_clamped_to_the_band__(broker, monkeypatch):

@@ -101,7 +101,7 @@ class DNSEBrokerConfig(DNSEConfig):
     account_no: str = ""
     trading_token: str = ""
     token_file: str = "workdir/state/dnse_trading_token.json"
-    stop_slippage_ticks: int = 10
+    stop_slippage_ticks: int = 3
 
 
 class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):

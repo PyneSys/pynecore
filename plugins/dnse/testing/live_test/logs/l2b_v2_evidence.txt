@@ -1,0 +1,21 @@
+[2026-08-12 14:05:32+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-12 14:05:32+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-12 14:05:32+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-12 14:05:32+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-12 14:04:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-12 14:04:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=market
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=market -> 
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] dispatching EXIT id='X' from='E' qty=1.0 tp=1942.1 sl=1934.3
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] dispatched EXIT id='X' from='E' qty=1.0 tp=1942.1 sl=1934.3 -> 
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] event CREATED id=622076 side=sell qty=1.0 filled=0.0 pine='X' from='E' leg=tp
+[2026-08-12 14:05:00+0700] bar:    501 INFO     [BROKER] event FILLED id=622066 side=buy qty=1.0 filled=1.0 price=1938.2 pine='E' leg=entry
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] position size=1.0 sign=1.0 avg=1938.2 (after filled pine='E')
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] modifying ENTRY BUY id='E' qty=1.0 type=market -> CLOSE id='E' side=sell qty=1.0
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] dispatching keyed close E directly over consumed entry (filled=1.0 qty=1.0); dependent protection stays armed
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] dispatching CLOSE id='E' side=sell qty=1.0
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] dispatched CLOSE id='E' side=sell qty=1.0 -> 
+[2026-08-12 14:06:00+0700] bar:    502 INFO     [BROKER] event FILLED id=623026 side=sell qty=1.0 filled=1.0 price=1938.0 pine='E' leg=close
+[2026-08-12 14:07:00+0700] bar:    503 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='E')
+[2026-08-12 14:07:00+0700] bar:    503 INFO     [BROKER] event CANCELLED id=622076 side=sell qty=1.0 filled=0.0 pine='X' from='E' leg=tp
+[2026-08-12 14:08:18+0700] bar:    503 INFO     [BROKER] run stopped (completed) position=flat equity=456,956,400.00 VND
