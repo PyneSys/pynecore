@@ -1,0 +1,13 @@
+[2026-08-12 14:17:30+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-12 14:17:30+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-12 14:17:30+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-12 14:17:30+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-12 14:16:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-12 14:16:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=market
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=market -> 
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] dispatching EXIT id='X' from='E' qty=1.0 tp=1937.0 sl=1929.2
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] dispatched EXIT id='X' from='E' qty=1.0 tp=1937.0 sl=1929.2 -> 
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] event CREATED id=650476 side=sell qty=1.0 filled=0.0 pine='X' from='E' leg=tp
+[2026-08-12 14:17:00+0700] bar:    501 INFO     [BROKER] event FILLED id=650466 side=buy qty=1.0 filled=1.0 price=1933.0 pine='E' leg=entry
+[2026-08-12 14:18:22+0700] bar:    501 INFO     [BROKER] run stopped (completed) position=1 equity=456,910,952.00 VND
