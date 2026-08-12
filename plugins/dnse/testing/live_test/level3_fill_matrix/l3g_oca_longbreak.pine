@@ -27,9 +27,13 @@ if barstate.isrealtime and not traded
     traded := true
 
 // (2) ALWAYS protect the live position with a native stop-loss (t3-t6 pattern)
+var float slLevel = na
 if strategy.position_size > 0
-    strategy.exit("X", from_entry="Up", stop=low[1],
-                  comment_loss="SL@" + str.tostring(low[1], format.mintick))
+    if na(slLevel)
+        slLevel := low[1]   // capture ONCE at fill — a moving stop would
+                              // amend the resting conditional, and DNSE 500s on that
+    strategy.exit("X", from_entry="Up", stop=slLevel,
+                  comment_loss="SL@" + str.tostring(slLevel, format.mintick))
 
 // (3) flatten the instant a position exists (the "flatten right after filled" step)
 if traded and strategy.position_size != 0 and not closing
