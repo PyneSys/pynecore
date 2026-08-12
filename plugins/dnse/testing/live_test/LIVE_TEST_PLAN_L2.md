@@ -163,7 +163,12 @@ if traded and strategy.position_size != 0 and not closing
 ```
 
 - `strategy.exit(stop=…)` → a native STOP resting at the venue (`broker.py:14,455`) ≈0.5 %
-  below entry — the crash backstop that 2a lacks.
+  below entry — the crash backstop that 2a lacks. Since `5b03bc3` the LO it emits is priced
+  **through** the trigger (`2 x strategy(slippage=)` ticks, band-clamped), so it can
+  actually fill on a gap; the trigger itself is unchanged.
+- The exit is issued **once**, inside the `not traded` latch, so no modify is ever
+  dispatched — important because DNSE **cannot amend a conditional order** (HTTP 500,
+  measured in `live2` 2026-08-12).
 - On flatten, the engine cancels the orphaned STOP; **verify that cancel lands** (no stray
   resting stop left behind). Run 2b on **5 m** since the venue stop covers the longer hold.
 

@@ -52,9 +52,20 @@ Stops fill when price breaks the prior 1 m bar's high/low — normal within a fe
 active session. The OCA cases bias one leg near market (fills) and the sibling far (cancels).
 
 **Every case also arms a protective stop-loss** the moment it fills, via
-`strategy.exit("X", from_entry=…, stop=…, comment_loss="SL@…")` — a native venue-side STOP
-at **`low[1]` for longs / `high[1]` for shorts** (the `t3`–`t6` pattern; for OCA it rides
-the filled leg). It's tagged `SL@<price>` in the log so it's distinguishable from the entry
+`strategy.exit("X", from_entry=…, stop=slLevel, comment_loss="SL@…")` — a native venue-side
+STOP at **`low[1]` for longs / `high[1]` for shorts** (the `t3`–`t6` pattern; for OCA it
+rides the filled leg).
+
+The level is **captured once, at fill, into `var float slLevel`** — deliberately NOT
+re-read each bar. A stop that walked with `low[1]` would be an accidental *trailing* stop,
+and every step would make the engine **amend** the resting conditional — which DNSE
+rejects with **HTTP 500** (`REMOTE_SERVER_ERROR`, measured 2026-08-12 in `live2`). A frozen
+level dispatches no modify at all.
+
+Since `5b03bc3`, a bare `entry(stop=)` and every stop-loss are priced **through** their
+trigger (by `2 x strategy(slippage=)` ticks, band-clamped) rather than at it — DNSE has no
+stop-market, so an LO posted at the trigger never fills on a gap. The **trigger** is still
+exactly what Pine asked for; only the limit it emits is offset. It's tagged `SL@<price>` in the log so it's distinguishable from the entry
 STOP and the flatten. Flatten-on-sight closes before it can trigger, so the flatten must
 also **cancel** it.
 
@@ -150,6 +161,9 @@ grep -iE "\[BROKER\]|dispatch|orderCategory|order type|SL@|FILLED|CANCELLED|REJE
 - [ ] **Stop-loss cancelled** — the `SL@…` STOP shows `CANCELLED` on the flatten (it must
       NOT be left resting, and must NOT have fired ahead of the flatten).
 - [ ] **No errors** — no `[BROKER] … ERROR` line and no `REJECTED` for our orders.
+- [ ] **No amend attempted** — no `modifying …` / `amend code=REMOTE_SERVER_ERROR` line.
+      The stop-loss level is frozen at fill precisely so no modify is ever dispatched;
+      an amend here means the freeze regressed, not that the venue misbehaved.
 - [ ] **No orphans** — nothing left resting. For g/h the losing OCA leg MUST show
       `CANCELLED`; for c/f no second (OCO-style) order should exist.
 

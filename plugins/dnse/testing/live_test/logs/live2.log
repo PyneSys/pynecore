@@ -7,13 +7,27 @@
 
 ✓ Fetching symbol info...
 [LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
-✓ Downloading OHLCV data... 2026-08-12 04:57 ━━━━━━━━━━━━━━━━━ 0:00:14 / 0:00:00
+✓ Downloading OHLCV data... 2026-08-12 06:08 ━━━━━━━━━━━━━━━━━ 0:00:13 / 0:00:00
 ✓ Loading PyneCore...
-[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
-[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
-[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
-[2026-08-12 11:58:08+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
-[2026-08-12 11:28:00+0700] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
-[2026-08-12 11:28:00+0700] bar:    499 INFO     [BROKER] live trading active
+[2026-08-12 13:08:16+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-12 13:08:16+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-12 13:08:16+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-12 13:08:16+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-12 13:07:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-12 13:07:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-12 13:08:00+0700] bar:    501 INFO     [OHLCV] O=1941.1 H=1942.5 L=1941.0 C=1942.0 V=410
+[2026-08-12 13:08:00+0700] bar:    501 INFO     [BROKER] dispatching ENTRY BUY id='S' qty=1.0 type=stop stop=2038.2
+[2026-08-12 13:08:00+0700] bar:    501 INFO     [BROKER] dispatched ENTRY BUY id='S' qty=1.0 type=stop stop=2038.2 -> ['d9u0rvi1a4skcecmcqd0']
+[2026-08-12 13:08:00+0700] bar:    501 INFO     [BROKER] event CREATED id=d9u0rvi1a4skcecmcqd0 side=buy qty=1.0 filled=0.0 pine='S' leg=entry
+[2026-08-12 13:09:00+0700] bar:    502 INFO     [OHLCV] O=1941.9 H=1943.3 L=1941.6 C=1942.5 V=646
+[2026-08-12 13:09:00+0700] bar:    502 INFO     [BROKER] modifying ENTRY BUY id='S' qty=1.0 type=stop stop=2038.2 -> ENTRY BUY id='S' qty=1.0 type=stop stop=2039.1
+[2026-08-12 13:09:00+0700] bar:    502 WARNING  [BROKER] amend code=REMOTE_SERVER_ERROR http=500 -> park+verify | order=d9u0rvi1a4skcecmcqd0 intent=S msg="Error in backend service"
+[2026-08-12 13:09:00+0700] bar:    502 WARNING  [BROKER] modify parked (unknown disposition) for ENTRY BUY id='S' qty=1.0 type=stop stop=2039.1: DNSE disposition unknown on amend: REMOTE_SERVER_ERROR 
+                                                Error in backend service                                                                                                                                
+dispatch for S ended with unknown disposition (client_order_id=d9u0rvi1a4skcecmcqd0, kind=modify); will verify on next sync: DNSE disposition unknown on amend: REMOTE_SERVER_ERROR Error in backend service
+[2026-08-12 13:10:00+0700] bar:    503 INFO     [OHLCV] O=1942.8 H=1943.4 L=1942.0 C=1942.8 V=553
+[2026-08-12 13:11:00+0700] bar:    504 INFO     [OHLCV] O=1942.8 H=1942.9 L=1942.0 C=1942.0 V=272
+[2026-08-12 13:11:00+0700] bar:    504 INFO     [BROKER] cancelling CANCEL id='S'
+[2026-08-12 13:11:00+0700] bar:    504 INFO     [BROKER] event CANCELLED id=d9u0rvi1a4skcecmcqd0 side=buy qty=1.0 filled=0.0 pine='S' leg=entry
 
-[2026-08-12 12:01:36+0700] bar:    499 INFO     [BROKER] run stopped (completed) position=flat equity=457,092,958.00 VND
+[2026-08-12 13:12:16+0700] bar:    504 INFO     [BROKER] run stopped (completed) position=flat equity=457,092,958.00 VND

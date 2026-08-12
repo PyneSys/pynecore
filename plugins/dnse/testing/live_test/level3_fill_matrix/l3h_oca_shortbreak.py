@@ -5,7 +5,7 @@ This code was compiled by Pine2Pyne — the Pine Script to PyneCore's Python com
 """
 
 from pynecore.lib import (
-    barstate, display, format, high, low, plot, script, strategy, string
+    NA, barstate, display, format, high, low, na, plot, script, strategy, string
 )
 from pynecore.types import PersistentSeries, Series
 
@@ -19,8 +19,12 @@ def main():
         strategy.entry("Dn", strategy.short, stop=low[1], oca_name="g", oca_type=strategy.oca.cancel, comment="OCA dn (fills)")
         traded = True
 
+    slLevel: PersistentSeries[float] = na(float)
+
     if strategy.position_size < 0:
-        strategy.exit("X", from_entry="Dn", stop=high[1], comment_loss="SL@" + string.tostring(high[1], format.mintick))
+        if na(slLevel):
+            slLevel = high[1]
+        strategy.exit("X", from_entry="Dn", stop=slLevel, comment_loss="SL@" + string.tostring(slLevel, format.mintick))
 
     if traded and strategy.position_size != 0 and (not closing):
         strategy.close_all(comment="FLATTEN")
