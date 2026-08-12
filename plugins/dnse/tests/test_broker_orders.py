@@ -158,7 +158,12 @@ def __test_execute_exit_tp_and_sl_is_native_oco__(fake_client, tmp_path):
     assert kwargs["order_category"] == "OCO"
     assert payload["price"] == 1520.5 and payload["stopPrice"] == 1480.5, \
         "OCO payload must carry the TP limit and the SL trigger"
-    assert payload["stopOrderPrice"] == 1480.5
+    # The SL leg's LO is priced THROUGH its trigger, never at it: DNSE has no
+    # stop-market, so an LO posted at the trigger never fills on a gap — the stop
+    # would fire and leave the position open. See broker._stop_fill_price and
+    # tests/test_stop_fill_price.py. (The TP limit above stays exact.)
+    assert payload["stopOrderPrice"] < 1480.5, \
+        "sell-side SL must post below its trigger so it can actually fill"
     assert payload["durationType"] == "DAY"
     # Re-tracking: the OCO's spawned NORMAL LO replaces the umbrella order.
     assert orders[0].id == "9001", "must re-track to the spawned NORMAL LO id"
@@ -169,13 +174,18 @@ def __test_execute_exit_tp_and_sl_is_native_oco__(fake_client, tmp_path):
 def __test_execute_exit_sl_only_is_native_stop__(fake_client, tmp_path):
     b = _broker(fake_client, tmp_path, post_order=(
         201, {"id": "5", "symbol": "VN30F1M", "side": "NB", "quantity": 2, "orderStatus": "New"}))
+    # sl inside the fixture band (floor 1450 / ceiling 1550) — a trigger outside the
+    # band could never fill anyway, and would only exercise the clamp.
     envelope = _envelope(ExitIntent(pine_id="X", from_entry="L", symbol="VN30F1M", side="sell",
-                                    qty=2, sl_price=1440.0))
+                                    qty=2, sl_price=1480.0))
     orders = asyncio.run(b.execute_exit(envelope))
     args, kwargs = _last_call(b._client, "post_order")
     payload = args[2]
     assert kwargs["order_category"] == "STOP"
-    assert payload["price"] == 1440.0 and payload["stopPrice"] == 1440.0
+    # Trigger is exactly what Pine asked for; the LO it emits is priced through it
+    # so the stop can actually fill on a gap (see broker._stop_fill_price).
+    assert payload["stopPrice"] == 1480.0
+    assert payload["price"] < 1480.0, "sell-side stop must post below its trigger"
     assert orders[0].id == "5"
 
 
