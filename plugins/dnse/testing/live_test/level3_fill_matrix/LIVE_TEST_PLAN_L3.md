@@ -97,12 +97,12 @@ cd /home/mike/workspace/github/pine2pyne
 
 # 2. backtest gate — MUST show zero trades + clean exit (proves warmup can't fire)
 cd /home/mike/workspace/github/pynecore
-.venv/bin/pyne run plugins/dnse/testing/live_test/level3_fill_matrix/<C>.py dnse:VN30F1M@1 --from -300
+.venv/bin/pyne run plugins/dnse/testing/live_test/level3_fill_matrix/<C>.py dnse:VN30F1M@1
 
 # 3. run LIVE on 1m, capturing the log to grade afterwards
 mkdir -p plugins/dnse/testing/live_test/level3_fill_matrix/logs
 .venv/bin/pyne run plugins/dnse/testing/live_test/level3_fill_matrix/<C>.py \
-  dnse_broker:VN30F1M@1 --broker --from -30 \
+  dnse_broker:VN30F1M@1 --broker \
   2>&1 | tee plugins/dnse/testing/live_test/level3_fill_matrix/logs/<C>.log
 ```
 

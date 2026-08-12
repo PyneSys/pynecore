@@ -70,7 +70,7 @@ cd /home/mike/workspace/github/pine2pyne
   -o /home/mike/workspace/github/pynecore/plugins/dnse/testing/live_test/l2_fill_flatten.py
 
 cd /home/mike/workspace/github/pynecore
-.venv/bin/pyne run plugins/dnse/testing/live_test/l2_fill_flatten.py dnse:VN30F1M@3 --from -300
+.venv/bin/pyne run plugins/dnse/testing/live_test/l2_fill_flatten.py dnse:VN30F1M@3
 ```
 
 **Expected: ZERO trades, clean exit.** Because `barstate.isrealtime` is always `False` in
@@ -82,7 +82,7 @@ STOP: the gate is not holding, do not go live.
 
 ```bash
 .venv/bin/pyne run plugins/dnse/testing/live_test/l2_fill_flatten.py \
-  dnse_broker:VN30F1M@3 --broker --from -30
+  dnse_broker:VN30F1M@3 --broker
 ```
 
 Watch the log in real time. Expected sequence:
