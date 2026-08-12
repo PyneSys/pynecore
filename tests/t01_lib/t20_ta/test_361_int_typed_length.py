@@ -21,7 +21,16 @@ from pynecore.lib import script, close, ta
 @script.indicator(title="Int-typed length")
 def main():
     length = 14 / 8  # int-typed on TradingView, 1.75 in Python
+    window = 14 / 4  # the same, 3.5 in Python -- a window wide enough to differ
     return {
+        "median_frac": ta.median(close, window),
+        "median_int": ta.median(close, 3),
+        "mode_frac": ta.mode(close, window),
+        "mode_int": ta.mode(close, 3),
+        "prank_frac": ta.percentile_nearest_rank(close, window, 100),
+        "prank_int": ta.percentile_nearest_rank(close, 3, 100),
+        "plin_frac": ta.percentile_linear_interpolation(close, window, 50),
+        "plin_int": ta.percentile_linear_interpolation(close, 3, 50),
         "close": close,
         "highest_frac": ta.highest(length),
         "highest_int": ta.highest(1),
@@ -74,7 +83,8 @@ def __test_int_typed_length__(runner):
         return isinstance(value, NA) or value != value
 
     pairs = ("highest", "highest_src", "lowest", "sma", "cog", "linreg",
-             "valuewhen", "pivothigh", "pivotlow", "hist")
+             "valuewhen", "pivothigh", "pivotlow", "hist",
+             "median", "mode", "prank", "plin")
     compared = 0
     for i, (_candle, plot) in enumerate(runner(iter(rows)).run_iter()):
         for name in pairs:

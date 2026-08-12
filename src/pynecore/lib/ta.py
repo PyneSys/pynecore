@@ -17,6 +17,7 @@ from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
 from ..core import safe_convert
+from ..core.series import SeriesImpl as _SeriesImpl
 # Pine's absolute comparison tolerance. Only the builtins MEASURED to compare
 # tolerantly use it (see core/pine_compare.py); the bit-exact ones must not.
 from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_bound,
@@ -996,6 +997,11 @@ def max(source: Series[float]) -> PyneFloat:
     return max_val
 
 
+# The IDE findings below are ``@pyne`` transform artifacts: ``Persistent``
+# assignments look dead because their value is read on the NEXT bar, and ``src``
+# looks possibly-unbound because it is a series whose storage outlives the ``if``
+# that feeds it.
+# noinspection PyUnusedLocal,PyUnboundLocalVariable
 def median(source: Series[TFI], length: int) -> TFI:
     """
     Calculate the median of the source series over a given period.
@@ -1004,19 +1010,73 @@ def median(source: Series[TFI], length: int) -> TFI:
     :param length: Number of bars to calculate over
     :return: The median value or na during warmup
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    if length == 1:  # Shortcut
-        return source
-    length = int(length)
-
-    if not (source == source):  # is_na_arg
-        # type(source) would be the NA class itself — keep the source sentinel's type
-        return source
-
     # Store heaps and window
     heap_low: Persistent[list[TFI]] = []  # Max heap (negative values)
     heap_high: Persistent[list[TFI]] = []  # Min heap
     window: Persistent[list[TFI]] = []  # Recent values for removal
+    prev_length: Persistent[int] = 0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+
+    source_na = not (source == source)  # is_na_arg
+    if not source_na:
+        # The window drops na bars, so the rebuild below has to read a history
+        # that drops them too: this second buffer is na-compacted (only non-na
+        # bars reach the assignment), so ``src[k]`` is the k-th most recent
+        # non-na value. It is fed ahead of every length guard below, because the
+        # bars those return early on are still part of the history a later
+        # rebuild has to see.
+        src: Series[TFI] = source
+
+    # na length is an all-na series here, not an error; see
+    # ``percentile_linear_interpolation`` for the measured family law.
+    if not (length == length):  # is_na_arg
+        # The window is frozen while the length is na; ``-1`` marks it for a
+        # rebuild so a valid length coming back does not inherit a short window.
+        prev_length = -1
+        return NA(cast(type[TFI], type(source)))  # type: ignore
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
+    # rather than a value that passes ``> 0`` and then indexes an empty heap.
+    length = int(length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
+    # History is only read on a mid-run length change (window rebuild); keep the
+    # buffer large enough for that. The resize is monotonic and floored at the
+    # series' own default: a series ``length`` that dips low must not shrink the
+    # buffer, or the history a later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(src, capacity)
+
+    if source_na:
+        # An na bar is not part of the window at all, so it must not touch the
+        # length bookkeeping either: the next non-na bar still has to see the
+        # length change this bar may have carried.
+        # type(source) would be the NA class itself — keep the source sentinel's type
+        return source
+
+    if length != prev_length and prev_length != 0:
+        # ``length`` is a series value and changed: rebuild the window and both
+        # heaps from the source history, oldest first, without the current bar.
+        # Without this a shrinking length would never evict more than one value
+        # per bar and the machine would keep answering from the older, wider
+        # window. The buffer is na-compacted, so an na only comes back where the
+        # history ends — deepest first, which is where the skip belongs.
+        window = []
+        heap_low = []
+        heap_high = []
+        for i in builtins.range(length - 1, 0, -1):
+            old_value = src[i]
+            if old_value == old_value:  # is_na_arg
+                window.append(old_value)
+                heapq.heappush(heap_low, -old_value)
+                heapq.heappush(heap_high, -heapq.heappop(heap_low))
+                if len(heap_low) < len(heap_high):
+                    heapq.heappush(heap_low, -heapq.heappop(heap_high))
+    prev_length = length
+
+    if length == 1:  # Shortcut
+        return source
 
     # Add new value and balance heaps
     value = source
@@ -1120,12 +1180,19 @@ def mode(source: Series[TFI], length: int) -> TFI:
     :return: The most frequently occurring value from the source. If none exists, returns
              the smallest value instead. Returns na during warm-up period.
     """
+    if not (length == length):  # is_na_arg
+        return cast(TFI, NA(builtins.type(source)))
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes both the domain check and the warmup guard, because the whole
+    # function runs on the truncated length: a 1.5 IS a 1, and a 0.5 IS an
+    # invalid 0 rather than a value that passes ``> 0`` and then returns na.
+    length = int(length)
     assert length > 0, "Invalid length, length must be greater than 0!"
     if not (source == source):  # is_na_arg
         return source
     if bar_index < length - 1:
         return cast(TFI, NA(builtins.type(source)))
-    length = int(length)
 
     # Store values for quick access
     values = [source[i] for i in builtins.range(length) if source[i] == source[i]]
@@ -1218,13 +1285,6 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     :param percentage: The percentage of the percentile
     :return: The percentile of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    length = int(length)
-    # History is only read on a mid-run length change (window rebuild); keep
-    # the buffer large enough for that. Done before the warmup guard so the
-    # oldest candles are kept from the first bar on.
-    max_bars_back(source, length)
-
     # Rolling state and its tolerant ordering are ``percentile_nearest_rank``'s;
     # see there for the measurement. Confirmed for this form too (probe m580, four
     # length/percentage configurations, 22k bars each, zero mismatches), where an
@@ -1232,6 +1292,35 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
     prev_length: Persistent[int] = 0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+
+    # The percentile machines are the only rolling ``ta`` functions that accept an
+    # na length: TradingView returns na for the whole series instead of raising
+    # (probe sweep on BINANCE:BTCUSDT 30m -- ``percentile_nearest_rank``,
+    # ``percentile_linear_interpolation``, ``median`` and ``mode`` all export an
+    # all-na plot, while sma/stdev/wma/linreg/change/highest/percentrank and the
+    # rest raise RE10003 "must not be na"). A length of exactly 0 raises RE10001
+    # in this family too, so only the na case is let through.
+    if not (length == length):  # is_na_arg
+        # The window is frozen while the length is na; ``-1`` marks it for a
+        # rebuild so a valid length coming back does not inherit a short window.
+        prev_length = -1
+        return na_float
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
+    # rather than a value that passes ``> 0`` and then answers na forever.
+    length = int(length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
+    # History is only read on a mid-run length change (window rebuild); keep the
+    # buffer large enough for that. Done before the warmup guard so the oldest
+    # candles are kept from the first bar on. The resize is monotonic and floored
+    # at the series' own default: a series ``length`` that dips low must not
+    # shrink the buffer, or the history a later increase needs would already be
+    # gone by the time the length comes back up.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
 
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window from
@@ -1282,13 +1371,6 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     :param percentage: The percentage of the percentile
     :return: The percentile of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    length = int(length)
-    # History is only read on a mid-run length change (window rebuild); keep
-    # the buffer large enough for that. Done before the warmup guard so the
-    # oldest candles are kept from the first bar on.
-    max_bars_back(source, length)
-
     # Rolling state: the chronological window plus its ascending-ordered numeric
     # part, maintained incrementally (insert/remove per bar instead of a full
     # re-sort of the window).
@@ -1305,6 +1387,30 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
     prev_length: Persistent[int] = 0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+
+    # na length is an all-na series here, not an error; see
+    # ``percentile_linear_interpolation`` for the measured family law.
+    if not (length == length):  # is_na_arg
+        # The window is frozen while the length is na; ``-1`` marks it for a
+        # rebuild so a valid length coming back does not inherit a short window.
+        prev_length = -1
+        return na_float
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
+    # rather than a value that passes ``> 0`` and then answers na forever.
+    length = int(length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
+    # History is only read on a mid-run length change (window rebuild); keep the
+    # buffer large enough for that. Done before the warmup guard so the oldest
+    # candles are kept from the first bar on. The resize is monotonic and floored
+    # at the series' own default: a series ``length`` that dips low must not
+    # shrink the buffer, or the history a later increase needs would already be
+    # gone by the time the length comes back up.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
 
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window from
