@@ -723,7 +723,7 @@ def live_ohlcv_generator(
             reconnect_attempts = 0
 
             async def _handle_connection_error(
-                    err: BaseException,
+                    connection_error: BaseException,
                     attempts: int,
             ) -> tuple[int, bool]:
                 """Drive the closed-market wait / reconnect sequence.
@@ -738,90 +738,108 @@ def live_ohlcv_generator(
                 ``except Exception`` and kill the live iterator.
                 """
                 nonlocal market_open_state, last_real_update, outage_started
-                # Session-gate: when the market is in a known-closed
-                # window (e.g. FX weekend), do not churn through
-                # reconnect cycles on a connection error. We sleep ~30s
-                # and re-enter the loop without incrementing
-                # ``reconnect_attempts`` so the backoff (and the
-                # rate-limited logging keyed on the attempt count) does
-                # not run away across a long closed window.
-                # Logs the connection error once on the closed→still-
-                # closed transition for post-mortem visibility.
-                # Uses the point-in-time helper (not the slot-aware
-                # ``_market_open_at``) so a long timeframe cannot report
-                # the market as already open one TF before the real
-                # session start.
-                if not _market_open_now():
-                    if market_open_state:
-                        broker_info(
-                            "market closed: pausing reconnect attempts "
-                            "until next session open "
-                            "(last error: %s)",
-                            err,
-                        )
-                        market_open_state = False
-                    slept = 0.0
-                    while slept < 30.0 and not stop_event.is_set():
-                        await asyncio.sleep(min(1.0, 30.0 - slept))
-                        slept += 1.0
-                    return attempts, stop_event.is_set()
-                # No attempt limit: a live session must ride out an
-                # arbitrarily long outage (router restart, ISP drop,
-                # provider maintenance) and resume on its own. The
-                # exponential backoff saturates at
-                # ``provider.max_reconnect_delay`` and the per-attempt
-                # logging is rate-limited so a multi-hour outage costs
-                # a handful of log lines, not one per attempt.
-                attempts += 1
-                if attempts == 1:
-                    outage_started = time.time()
-                offline_s = time.time() - (outage_started or time.time())
-                log = logger.warning if _warn_this_attempt(attempts) else logger.debug
-                log(
-                    "Connection error (attempt %d, offline %.0fs): %s",
-                    attempts, offline_s, err,
-                )
-                if await _await_or_stop(provider.on_disconnect()):
-                    return attempts, True
-                # The exponent is clamped so the power stays a small int;
-                # the delay saturates at ``max_reconnect_delay`` anyway.
-                delay = min(
-                    provider.reconnect_delay * (2 ** min(attempts - 1, 16)),
-                    provider.max_reconnect_delay,
-                )
-                slept = 0.0
-                while slept < delay and not stop_event.is_set():
-                    await asyncio.sleep(min(0.5, delay - slept))
-                    slept += 0.5
-                if stop_event.is_set():
-                    return attempts, True
-                try:
-                    if await _await_or_stop(provider.disconnect()):
-                        return attempts, True
-                except Exception as disc_err:
-                    logger.debug(
-                        "disconnect() before reconnect raised: %s",
-                        disc_err,
+                while not stop_event.is_set():
+                    # Session-gate: when the market is in a known-closed
+                    # window (e.g. FX weekend), do not churn through
+                    # reconnect cycles on a connection error. Wait one closed-
+                    # window cadence and re-enter without incrementing
+                    # ``reconnect_attempts`` so the backoff (and the
+                    # rate-limited logging keyed on the attempt count) does
+                    # not run away across a long closed window.
+                    # Logs the connection error once on the closed→still-
+                    # closed transition for post-mortem visibility.
+                    # Uses the point-in-time helper (not the slot-aware
+                    # ``_market_open_at``) so a long timeframe cannot report
+                    # the market as already open one TF before the real
+                    # session start.
+                    if not _market_open_now():
+                        if market_open_state:
+                            broker_info(
+                                "market closed: pausing reconnect attempts "
+                                "until next session open "
+                                "(last error: %s)",
+                                connection_error,
+                            )
+                            market_open_state = False
+                        try:
+                            await asyncio.wait_for(
+                                stop_aevent.wait(),
+                                timeout=_CLOSED_WINDOW_SLEEP_S,
+                            )
+                            return attempts, True
+                        except asyncio.TimeoutError:
+                            continue
+                    # No attempt limit: a live session must ride out an
+                    # arbitrarily long outage (router restart, ISP drop,
+                    # provider maintenance) and resume on its own. The
+                    # exponential backoff saturates at
+                    # ``provider.max_reconnect_delay`` and the per-attempt
+                    # logging is rate-limited so a multi-hour outage costs
+                    # a handful of log lines, not one per attempt.
+                    attempts += 1
+                    if attempts == 1:
+                        outage_started = time.time()
+                    offline_s = time.time() - (outage_started or time.time())
+                    log = (
+                        logger.warning
+                        if _warn_this_attempt(attempts)
+                        else logger.debug
                     )
-                try:
-                    if await _await_or_stop(provider.connect()):
+                    log(
+                        "Connection error (attempt %d, offline %.0fs): %s",
+                        attempts, offline_s, connection_error,
+                    )
+                    if await _await_or_stop(provider.on_disconnect()):
                         return attempts, True
-                    if await _await_or_stop(provider.on_reconnect()):
-                        return attempts, True
+                    # The exponent is clamped so the power stays a small int;
+                    # the delay saturates at ``max_reconnect_delay`` anyway.
+                    delay = min(
+                        provider.reconnect_delay * (2 ** min(attempts - 1, 16)),
+                        provider.max_reconnect_delay,
+                    )
+                    if delay > 0.0:
+                        try:
+                            await asyncio.wait_for(
+                                stop_aevent.wait(),
+                                timeout=delay,
+                            )
+                            return attempts, True
+                        except asyncio.TimeoutError:
+                            pass
+                    try:
+                        if await _await_or_stop(provider.disconnect()):
+                            return attempts, True
+                    except Exception as disc_err:
+                        logger.debug(
+                            "disconnect() before reconnect raised: %s",
+                            disc_err,
+                        )
+                    try:
+                        if await _await_or_stop(provider.connect()):
+                            return attempts, True
+                        if await _await_or_stop(provider.on_reconnect()):
+                            return attempts, True
+                    except Exception as reconn_err:
+                        log = (
+                            logger.warning
+                            if _warn_this_attempt(attempts)
+                            else logger.debug
+                        )
+                        log(
+                            "Reconnect failed (attempt %d, offline %.0fs): %s",
+                            attempts,
+                            time.time() - (outage_started or time.time()),
+                            reconn_err,
+                        )
+                        connection_error = reconn_err
+                        continue
                     # Give the freshly (re)subscribed feed a full
                     # staleness window to deliver before the liveness
                     # watchdog may declare it dead again.
                     last_real_update = time.time()
                     logger.info("Reconnected successfully (attempt %d)", attempts)
-                except Exception as reconn_err:
-                    log = (logger.warning if _warn_this_attempt(attempts)
-                           else logger.debug)
-                    log(
-                        "Reconnect failed (attempt %d, offline %.0fs): %s",
-                        attempts, time.time() - (outage_started or time.time()),
-                        reconn_err,
-                    )
-                return attempts, False
+                    return attempts, False
+                return attempts, True
 
             # Latched dead-WS signal from inside the
             # ``except asyncio.TimeoutError`` handler: ``raise`` from one

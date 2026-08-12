@@ -4,9 +4,11 @@ Tests for the live runner async/sync bridge.
 import asyncio
 import threading
 import time
+from datetime import UTC, datetime, time as datetime_time, timedelta
 
 from pynecore.core.live_runner import live_ohlcv_generator, LiveBarStreamer
 from pynecore.core.script_runner import LIVE_TRANSITION
+from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -617,6 +619,51 @@ def __test_connection_error_triggers_reconnect__():
     assert provider._reconnected
 
 
+class _ReconnectHookFailureProvider(MockLiveProvider):
+    """Fails the first reconnect hook while keeping the connection marked live."""
+
+    def __init__(self):
+        super().__init__([_make_ohlcv(1_000, is_closed=True)])
+        self.reconnect_delay = 0.0
+        self.max_reconnect_delay = 0.0
+        self.connect_calls = 0
+        self.reconnect_calls = 0
+        self.watch_calls = 0
+        self.watch_before_success = False
+        self.reconnect_succeeded = False
+
+    async def connect(self):
+        self.connect_calls += 1
+        self._connected = True
+
+    async def on_reconnect(self):
+        self.reconnect_calls += 1
+        if self.reconnect_calls == 1:
+            raise ConnectionError("history handshake incomplete")
+        self.reconnect_succeeded = True
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        self.watch_calls += 1
+        if self.watch_calls == 1:
+            raise ConnectionError("feed dropped")
+        if not self.reconnect_succeeded:
+            self.watch_before_success = True
+            raise AssertionError("watch resumed before reconnect handshake")
+        return await super().watch_ohlcv(symbol, timeframe)
+
+
+def __test_reconnect_hook_failure_forces_fresh_connection_before_watch__():
+    """A failed reconnect hook invalidates that connection before streaming resumes."""
+    provider = _ReconnectHookFailureProvider()
+
+    _, bars = _drain(provider, "BTC/USDT", "1D")
+
+    assert [bar.timestamp for bar in bars] == [1_000]
+    assert provider.connect_calls == 3
+    assert provider.reconnect_calls == 2
+    assert not provider.watch_before_success
+
+
 # --- Session-gate tests ---
 
 def _make_syminfo(opening_hours, timezone: str = "UTC"):
@@ -625,7 +672,6 @@ def _make_syminfo(opening_hours, timezone: str = "UTC"):
     Only the fields read by ``live_ohlcv_generator``'s session gate are
     populated meaningfully; the rest get throw-away values.
     """
-    from pynecore.core.syminfo import SymInfo
     return SymInfo(
         prefix="TEST",
         description="test",
@@ -643,6 +689,81 @@ def _make_syminfo(opening_hours, timezone: str = "UTC"):
         session_ends=[],
         timezone=timezone,
     )
+
+
+class _ReconnectHookSessionBoundaryProvider(_ReconnectHookFailureProvider):
+    """Moves through close and reopen after the first reconnect hook fails."""
+
+    def __init__(
+        self,
+        syminfo: SymInfo,
+        closed_hours: list[SymInfoInterval],
+        open_hours: list[SymInfoInterval],
+    ):
+        super().__init__()
+        self.syminfo = syminfo
+        self.closed_hours = list(closed_hours)
+        self.open_hours = list(open_hours)
+        self.reopen_fired = False
+        self.reconnect_before_reopen = False
+
+    def _reopen(self, _timer_arg: object | None = None) -> None:
+        self.syminfo.opening_hours[:] = self.open_hours
+        self.reopen_fired = True
+
+    async def on_reconnect(self):
+        self.reconnect_calls += 1
+        if self.reconnect_calls == 1:
+            self.syminfo.opening_hours[:] = self.closed_hours
+            asyncio.get_running_loop().call_later(0.005, self._reopen, None)
+            raise ConnectionError("history handshake incomplete at session close")
+        if not self.reopen_fired:
+            self.reconnect_before_reopen = True
+        self.reconnect_succeeded = True
+
+
+def __test_failed_reconnect_generation_survives_neither_close_nor_reopen__():
+    """A failed handshake remains quarantined across a close→reopen boundary."""
+    open_hours = [
+        SymInfoInterval(
+            day=day,
+            start=datetime_time(0, 0),
+            end=datetime_time(23, 59, 59),
+        )
+        for day in range(7)
+    ]
+    now = datetime.now(UTC)
+    closed_start = now + timedelta(hours=12)
+    closed_end = closed_start + timedelta(minutes=5)
+    closed_hours = [
+        SymInfoInterval(
+            day=day,
+            start=closed_start.time().replace(tzinfo=None),
+            end=closed_end.time().replace(tzinfo=None),
+        )
+        for day in range(7)
+    ]
+    syminfo = _make_syminfo(open_hours, timezone="UTC")
+    provider = _ReconnectHookSessionBoundaryProvider(
+        syminfo,
+        closed_hours,
+        open_hours,
+    )
+
+    from pynecore.core import live_runner as _live_runner_mod
+    original_closed_wait = _live_runner_mod._CLOSED_WINDOW_SLEEP_S
+    _live_runner_mod._CLOSED_WINDOW_SLEEP_S = 0.01
+    try:
+        _, bars = _drain(provider, "TEST", "1D", syminfo=syminfo)
+    finally:
+        _live_runner_mod._CLOSED_WINDOW_SLEEP_S = original_closed_wait
+
+    assert [bar.timestamp for bar in bars] == [1_000]
+    assert provider.reopen_fired
+    assert provider.connect_calls == 3
+    assert provider.reconnect_calls == 2
+    assert not provider.reconnect_before_reopen
+    assert not provider.watch_before_success
 
 
 class _IdleThenCancelProvider(MockLiveProvider):
@@ -689,16 +810,13 @@ def __test_synth_gate_suppresses_synth_during_known_closed_window__():
     to synth. The synth deadline elapses (real bar 200s in the past on
     1m TF) but the gate intercepts before any V=0 OHLCV lands in queue.
     """
-    from pynecore.core.syminfo import SymInfoInterval
-    from datetime import datetime as ddatetime, time as dtime, timedelta, UTC
-
     base_ts = (int(time.time()) - 200) * 1000
     synth_ts = base_ts + 60_000
-    synth_dt = ddatetime.fromtimestamp(synth_ts / 1000, tz=UTC)
+    synth_dt = datetime.fromtimestamp(synth_ts / 1000, tz=UTC)
     open_dt = synth_dt + timedelta(hours=12)
-    open_time = dtime(open_dt.hour, open_dt.minute, 0)
+    open_time = datetime_time(open_dt.hour, open_dt.minute, 0)
     close_dt = open_dt + timedelta(minutes=5)
-    close_time = dtime(close_dt.hour, close_dt.minute, 0)
+    close_time = datetime_time(close_dt.hour, close_dt.minute, 0)
     closed_calendar = [
         SymInfoInterval(day=d, start=open_time, end=close_time)
         for d in range(7)
