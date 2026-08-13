@@ -1,0 +1,112 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-13 06:54 ━━━━━━━━━━━━━━━━━ 0:00:19 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-13 13:54:42+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-13 13:54:42+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-13 13:54:42+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-13 13:54:42+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-13 13:53:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-13 13:53:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-13 13:54:00+0700] bar:    501 INFO     [OHLCV] O=1925.3 H=1926.4 L=1924.2 C=1925.3 V=1191
+[2026-08-13 13:55:00+0700] bar:    502 INFO     [OHLCV] O=1925.3 H=1926.0 L=1924.7 C=1925.4 V=513
+[2026-08-13 13:56:00+0700] bar:    503 INFO     [OHLCV] O=1925.7 H=1926.0 L=1925.0 C=1925.0 V=552
+[2026-08-13 13:57:00+0700] bar:    504 INFO     [OHLCV] O=1925.0 H=1925.7 L=1924.2 C=1925.7 V=1003
+[2026-08-13 13:58:00+0700] bar:    505 INFO     [OHLCV] O=1925.6 H=1925.9 L=1924.5 C=1924.8 V=431
+[2026-08-13 13:58:00+0700] bar:    505 INFO     [L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, every order >=5% away so none can fill. ===
+[2026-08-13 13:58:00+0700] bar:    505 INFO     [L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) | T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only
+[2026-08-13 13:58:00+0700] bar:    505 INFO     [L1] bar=505 close=1924.8 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 13:59:00+0700] bar:    506 INFO     [OHLCV] O=1924.7 H=1924.8 L=1923.3 C=1924.1 V=1295
+[2026-08-13 13:59:00+0700] bar:    506 INFO     [L1] bar=506 close=1924.1 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:00:00+0700] bar:    507 INFO     [OHLCV] O=1923.8 H=1923.8 L=1920.5 C=1922.3 V=3814
+[2026-08-13 14:00:00+0700] bar:    507 INFO     [L1] bar=507 close=1922.3 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:01:00+0700] bar:    508 INFO     [OHLCV] O=1922.4 H=1922.7 L=1920.5 C=1921.0 V=1450
+[2026-08-13 14:01:00+0700] bar:    508 INFO     [L1] bar=508 close=1921 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:02:00+0700] bar:    509 INFO     [OHLCV] O=1921.0 H=1921.4 L=1919.6 C=1920.4 V=2063
+[2026-08-13 14:02:00+0700] bar:    509 INFO     [L1] bar=509 close=1920.4 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:03:00+0700] bar:    510 INFO     [OHLCV] O=1920.6 H=1920.8 L=1918.8 C=1919.9 V=1813
+[2026-08-13 14:03:00+0700] bar:    510 INFO     [L1] bar=510 close=1919.9 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:04:00+0700] bar:    511 INFO     [OHLCV] O=1919.6 H=1920.4 L=1918.8 C=1918.8 V=1396
+[2026-08-13 14:04:00+0700] bar:    511 INFO     [L1] bar=511 close=1918.8 candle=RED state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [OHLCV] O=1919.0 H=1920.3 L=1918.8 C=1920.0 V=1259
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [L1] bar=512 close=1920 candle=GREEN state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [L1] TEST 1 PLACE id=T1 LONG limit=1824 (close 1920, -5%) — expect: one NORMAL LO resting, filled=0, int order id
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [BROKER] dispatching ENTRY BUY id='T1' qty=1.0 type=limit limit=1824.0
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [BROKER] dispatched ENTRY BUY id='T1' qty=1.0 type=limit limit=1824.0 -> ['375476']
+[2026-08-13 14:05:00+0700] bar:    512 INFO     [BROKER] event CREATED id=375476 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [OHLCV] O=1920.2 H=1920.2 L=1916.6 C=1917.3 V=3049
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [L1] bar=513 close=1917.3 candle=RED state=0 pending=yes pos=0 canPlace=yes
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [L1] TEST 1 CANCEL id=T1 — expect: [BROKER] event CANCELLED, book clear
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [L1] TEST 1 DONE — entry_lvl=1824 stop_lvl=n/a; state 0->1
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [BROKER] cancelling CANCEL id='T1'
+[2026-08-13 14:06:00+0700] bar:    513 INFO     [BROKER] event CANCELLED id=375476 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [OHLCV] O=1917.3 H=1917.9 L=1916.5 C=1916.6 V=1235
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=375476 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry)
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [L1] bar=514 close=1916.6 candle=RED state=1 pending=no pos=0 canPlace=yes
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [L1] TEST 2 PLACE id=T2 SHORT limit=2012.4 (close 1916.6, +5%) — expect: one NORMAL LO resting, filled=0
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [BROKER] dispatching ENTRY SELL id='T2' qty=1.0 type=limit limit=2012.5
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [BROKER] dispatched ENTRY SELL id='T2' qty=1.0 type=limit limit=2012.5 -> ['383766']
+[2026-08-13 14:07:00+0700] bar:    514 INFO     [BROKER] event CREATED id=383766 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [OHLCV] O=1917.0 H=1917.0 L=1913.2 C=1915.5 V=3576
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [L1] bar=515 close=1915.5 candle=RED state=1 pending=yes pos=0 canPlace=yes
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [L1] TEST 2 CANCEL id=T2 — expect: [BROKER] event CANCELLED, book clear
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [L1] TEST 2 DONE — entry_lvl=2012.4 stop_lvl=n/a; state 1->2
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [BROKER] cancelling CANCEL id='T2'
+[2026-08-13 14:08:00+0700] bar:    515 INFO     [BROKER] event CANCELLED id=383766 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[2026-08-13 14:09:00+0700] bar:    516 INFO     [OHLCV] O=1915.5 H=1916.8 L=1913.7 C=1914.2 V=1716
+[2026-08-13 14:09:00+0700] bar:    516 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=383766 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry)
+[2026-08-13 14:09:00+0700] bar:    516 INFO     [L1] bar=516 close=1914.2 candle=RED state=2 pending=no pos=0 canPlace=yes
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [OHLCV] O=1914.0 H=1915.4 L=1912.5 C=1914.9 V=1741
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [L1] bar=517 close=1914.9 candle=GREEN state=2 pending=no pos=0 canPlace=yes
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [L1] TEST 3 PLACE id=T3 LONG limit=1819.2 + exit X3 stop=1800 (-6%) — expect: entry rests; the exit likely NEVER reaches DNSE (bracket parked           
+                                                pending_entry until the entry fills)                                                                                                                    
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] dispatching ENTRY BUY id='T3' qty=1.0 type=limit limit=1819.1
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] dispatched ENTRY BUY id='T3' qty=1.0 type=limit limit=1819.1 -> ['399456']
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] dispatching EXIT id='X3' from='T3' qty=1.0 sl=1800.0
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] dispatched EXIT id='X3' from='T3' qty=1.0 sl=1800.0 -> ['d9ums1i1a4skcecmf450']
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] event CREATED id=399456 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[2026-08-13 14:10:00+0700] bar:    517 INFO     [BROKER] event CREATED id=d9ums1i1a4skcecmf450 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [OHLCV] O=1914.9 H=1917.3 L=1914.6 C=1915.3 V=1607
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [L1] bar=518 close=1915.3 candle=GREEN state=2 pending=yes pos=0 canPlace=yes
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [L1] TEST 3 CANCEL id=T3 and id=X3 (both) — expect: entry CANCELLED; X3 may be a no-op if it never reached the venue
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [L1] TEST 3 DONE — entry_lvl=1819.2 stop_lvl=1800; state 2->3
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [BROKER] cancelling CANCEL id='T3'
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [BROKER] cancelling CANCEL id='X3' from='T3'
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [BROKER] event CANCELLED id=399456 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[2026-08-13 14:11:00+0700] bar:    518 INFO     [BROKER] event CANCELLED id=d9ums1i1a4skcecmf450 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [OHLCV] O=1915.4 H=1915.5 L=1913.2 C=1914.8 V=1775
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=399456 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry)
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=d9ums1i1a4skcecmf450 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl)
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [L1] bar=519 close=1914.8 candle=RED state=3 pending=no pos=0 canPlace=yes
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [L1] TEST 4 PLACE id=T4 SHORT limit=2010.5 + exit X4 stop=2020.1 (+5.5%), oca_name=t4 — next bar cancels ONLY T4, to see whether X4 goes with it
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] dispatching ENTRY SELL id='T4' qty=1.0 type=limit limit=2010.6
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] dispatched ENTRY SELL id='T4' qty=1.0 type=limit limit=2010.6 -> ['405616']
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] dispatching EXIT id='X4' from='T4' qty=1.0 sl=2020.2
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] dispatched EXIT id='X4' from='T4' qty=1.0 sl=2020.2 -> ['d9umsv21a4skcecmf4ag']
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] event CREATED id=405616 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-13 14:12:00+0700] bar:    519 INFO     [BROKER] event CREATED id=d9umsv21a4skcecmf4ag side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [OHLCV] O=1914.8 H=1917.0 L=1914.6 C=1915.7 V=1505
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [L1] bar=520 close=1915.7 candle=GREEN state=3 pending=yes pos=0 canPlace=yes
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [L1] TEST 4 CANCEL id=T4 ONLY (X4 deliberately left alone) — KEY OBSERVATION: does X4 also disappear from DNSE?
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [L1] TEST 4 DONE — entry_lvl=2010.5 stop_lvl=2020.1; state 3->4
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [L1] === ALL 4 TESTS DONE. Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [BROKER] cancelling CANCEL id='T4'
+[2026-08-13 14:13:00+0700] bar:    520 INFO     [BROKER] event CANCELLED id=405616 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-13 14:14:00+0700] bar:    521 INFO     [OHLCV] O=1915.7 H=1917.2 L=1914.5 C=1914.5 V=1082
+[2026-08-13 14:14:00+0700] bar:    521 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=405616 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry)
+[2026-08-13 14:14:00+0700] bar:    521 INFO     [L1] bar=521 close=1914.5 candle=RED state=4 pending=no pos=0 canPlace=yes
+[2026-08-13 14:15:00+0700] bar:    522 INFO     [OHLCV] O=1914.5 H=1916.0 L=1914.4 C=1916.0 V=799
+[2026-08-13 14:15:00+0700] bar:    522 INFO     [L1] bar=522 close=1916 candle=GREEN state=4 pending=no pos=0 canPlace=yes
+[2026-08-13 14:16:00+0700] bar:    523 INFO     [OHLCV] O=1915.9 H=1915.9 L=1913.6 C=1914.2 V=1442
+[2026-08-13 14:16:00+0700] bar:    523 INFO     [L1] bar=523 close=1914.2 candle=RED state=4 pending=no pos=0 canPlace=yes
+[2026-08-13 14:17:00+0700] bar:    524 INFO     [OHLCV] O=1914.2 H=1915.3 L=1913.2 C=1914.4 V=1465
+[2026-08-13 14:17:00+0700] bar:    524 INFO     [L1] bar=524 close=1914.4 candle=GREEN state=4 pending=no pos=0 canPlace=yes
+
+[2026-08-13 14:18:08+0700] bar:    524 INFO     [BROKER] run stopped (completed) position=flat equity=463,422,461.00 VND

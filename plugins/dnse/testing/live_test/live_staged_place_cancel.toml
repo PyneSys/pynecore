@@ -44,7 +44,7 @@
 #      title: "Trade window START"
 #    confirm: false
 # Change here to modify the input value
-#value =
+value = 1786604280000
 
 [inputs.winEnd]
 # Input metadata, cannot be modified
@@ -53,4 +53,4 @@
 #      title: "Trade window END"
 #    confirm: false
 # Change here to modify the input value
-#value =
+value = 1786605900000

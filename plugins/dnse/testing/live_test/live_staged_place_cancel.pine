@@ -60,8 +60,10 @@ strategy("LIVE staged place+cancel", overlay=true, pyramiding=0, initial_capital
 // --- trade window (edit in the generated .toml, not here) ---
 winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
 winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+// Resume point: 0 = run all four, 2 = start at TEST 3, 3 = start at TEST 4.
+startState = input.int(0, "Start at state (0=T1, 1=T2, 2=T3, 3=T4)", minval=0, maxval=3)
 
-var int   state     = 0    // which test is running / next to run
+var int   state     = startState  // which test is running / next to run
 var int   placedBar = na   // bar_index the current stage placed on; na = nothing pending
 var float lvlEntry  = na   // frozen entry limit  (never re-derived -> never amended)
 var float lvlStop   = na   // frozen protective stop level
