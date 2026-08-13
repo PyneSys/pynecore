@@ -391,7 +391,11 @@ def __test_execute_cancel_multiple_ids_attempts_both_and_ands_results__(fake_cli
             return (200, {"orderStatus": "Canceled"})
         return (400, {"code": "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION"})  # session-refused
 
-    b = _broker(fake_client, tmp_path, cancel_order=_cancel)
+    # The venue must AGREE the order is gone: a 2xx cancel is only an ACK, so the
+    # plugin re-reads the order before reporting success (see _cancel_took_effect).
+    b = _broker(fake_client, tmp_path, cancel_order=_cancel,
+                get_order_detail=(200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
+                                        "quantity": 1, "orderStatus": "Canceled"}))
     b._order_ids["K"] = ["ID1", "ID2"]
     b._order_category["ID1"] = "STOP"
     b._order_category["ID2"] = "NORMAL"
@@ -409,7 +413,11 @@ def __test_execute_cancel_with_outcome_uses_only_first_id__(fake_client, tmp_pat
             f"execute_cancel_with_outcome must not touch id {order_id!r} — only the first id"
         return (200, {"orderStatus": "Canceled"})
 
-    b = _broker(fake_client, tmp_path, cancel_order=_cancel)
+    # The venue must AGREE the order is gone: a 2xx cancel is only an ACK, so the
+    # plugin re-reads the order before reporting success (see _cancel_took_effect).
+    b = _broker(fake_client, tmp_path, cancel_order=_cancel,
+                get_order_detail=(200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
+                                        "quantity": 1, "orderStatus": "Canceled"}))
     b._order_ids["K"] = ["ID1", "ID2"]
     b._order_category["ID1"] = "STOP"
 
@@ -543,3 +551,53 @@ def __test_token_neither_file_nor_config_raises_with_guidance__(tmp_path):
 
     with pytest.raises(RuntimeError, match="no trading_token"):
         b._token()
+
+
+# === cancel ACK vs completion =================================================
+# DNSE answers a conditional cancel with 200 + the order object, which is only an
+# acknowledgement. Measured live 2026-08-13: three consecutive `cancel -> 200 OK`
+# calls on a resting STOP left orderStatus=New for >12s before the venue flipped it
+# to Canceled. Trusting the 2xx reported orders gone while they were still working.
+
+def __test_cancel_2xx_is_not_trusted_until_the_venue_agrees__(fake_client, tmp_path):
+    """A 200 cancel whose readback still says New must NOT report success."""
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(200, {"orderStatus": "New"}),
+                get_order_detail=(200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
+                                        "quantity": 1, "orderStatus": "New"}))
+    b._order_category["ID1"] = "STOP"
+    b._cancel_verify_attempts, b._cancel_verify_delay = 2, 0.0
+
+    assert b._cancel_one("ID1") is False, \
+        "a 2xx ACK with the order still working must report NOT cancelled, so the engine retries"
+    assert b._client.count("get_order_detail") == 2, "the readback must actually poll"
+
+
+def __test_cancel_confirmed_once_the_readback_turns_terminal__(fake_client, tmp_path):
+    """The realistic case: the venue applies the cancel a moment after the ACK."""
+    seen = {"n": 0}
+
+    def _detail(*a, **k):
+        seen["n"] += 1
+        status = "New" if seen["n"] == 1 else "Canceled"   # flips on the second read
+        return (200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
+                      "quantity": 1, "orderStatus": status})
+
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(200, {"orderStatus": "New"}), get_order_detail=_detail)
+    b._order_category["ID1"] = "STOP"
+    b._cancel_verify_attempts, b._cancel_verify_delay = 4, 0.0
+
+    assert b._cancel_one("ID1") is True, "must confirm once the venue reports terminal"
+    assert seen["n"] == 2, "should stop polling as soon as the venue agrees"
+
+
+def __test_cancel_confirmed_when_the_order_vanishes_from_the_book__(fake_client, tmp_path):
+    """A readback 404 means it is gone — that counts as cancelled, not as unknown."""
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(200, {"orderStatus": "New"}),
+                get_order_detail=(404, {"code": "RESOURCE_NOT_FOUND"}))
+    b._order_category["ID1"] = "STOP"
+    b._cancel_verify_attempts, b._cancel_verify_delay = 3, 0.0
+
+    assert b._cancel_one("ID1") is True

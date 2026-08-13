@@ -12,9 +12,10 @@ from pynecore.types import PersistentSeries, Series
 @script.strategy('LIVE staged place+cancel', overlay=True, pyramiding=0, initial_capital=500000000, default_qty_type=strategy.fixed, default_qty_value=1, margin_long=18.48, margin_short=18.48, slippage=1, calc_on_every_tick=False, process_orders_on_close=False)
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
-    winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+    winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
+    startState=input.int(0, "Start at state (0=T1, 1=T2, 2=T3, 3=T4)", minval=0, maxval=3)
 ):
-    state: PersistentSeries[int] = 0
+    state: PersistentSeries[int] = startState
     placedBar: PersistentSeries[int] = na(int)
     lvlEntry: PersistentSeries[float] = na(float)
     lvlStop: PersistentSeries[float] = na(float)

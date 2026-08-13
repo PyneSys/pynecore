@@ -131,4 +131,9 @@ def _book(category):
 def __test_cancel_one__(name, behavior, attrs, want):
     fake = _FakeClient(behavior)
     stub = _stub(client=fake, **attrs)
+    # These cases pin WHICH BOOK is probed and how each error code is classified. The
+    # separate question — whether a 2xx cancel actually took effect at the venue — is
+    # covered by __test_cancel_2xx_is_not_trusted_until_the_venue_agrees__ and friends
+    # in test_broker_lifecycle.py, so here the venue simply agrees.
+    stub._cancel_took_effect = lambda *_args: True
     assert (stub._cancel_one("X"), fake.calls) == want

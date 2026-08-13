@@ -1,0 +1,38 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-13 06:52 ━━━━━━━━━━━━━━━━━ 0:00:19 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-13 13:52:37+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-13 13:52:37+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-13 13:52:37+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-13 13:52:37+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-13 13:48:00+0700] bar:    496 INFO     [L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, every order >=5% away so none can fill. ===
+[2026-08-13 13:48:00+0700] bar:    496 INFO     [L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) | T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only
+[2026-08-13 13:48:00+0700] bar:    496 INFO     [L1] bar=496 close=1925.9 candle=GREEN state=0 pending=no pos=0 canPlace=yes
+[2026-08-13 13:48:00+0700] bar:    496 INFO     [L1] TEST 1 PLACE id=T1 LONG limit=1829.6 (close 1925.9, -5%) — expect: one NORMAL LO resting, filled=0, int order id
+[2026-08-13 13:49:00+0700] bar:    497 INFO     [L1] bar=497 close=1924.3 candle=RED state=0 pending=yes pos=0 canPlace=yes
+[2026-08-13 13:49:00+0700] bar:    497 INFO     [L1] TEST 1 CANCEL id=T1 — expect: [BROKER] event CANCELLED, book clear
+[2026-08-13 13:49:00+0700] bar:    497 INFO     [L1] TEST 1 DONE — entry_lvl=1829.6 stop_lvl=n/a; state 0->1
+[2026-08-13 13:50:00+0700] bar:    498 INFO     [L1] bar=498 close=1925 candle=GREEN state=1 pending=no pos=0 canPlace=yes
+[2026-08-13 13:50:00+0700] bar:    498 INFO     [L1] TEST 2 PLACE id=T2 SHORT limit=2021.2 (close 1925, +5%) — expect: one NORMAL LO resting, filled=0
+[2026-08-13 13:51:00+0700] bar:    499 INFO     [L1] bar=499 close=1925.7 candle=GREEN state=1 pending=yes pos=0 canPlace=yes
+[2026-08-13 13:51:00+0700] bar:    499 INFO     [L1] TEST 2 CANCEL id=T2 — expect: [BROKER] event CANCELLED, book clear
+[2026-08-13 13:51:00+0700] bar:    499 INFO     [L1] TEST 2 DONE — entry_lvl=2021.2 stop_lvl=n/a; state 1->2
+[2026-08-13 13:51:00+0700] bar:    500 INFO     [L1] bar=500 close=1925.7 candle=GREEN state=2 pending=no pos=0 canPlace=yes
+[2026-08-13 13:51:00+0700] bar:    500 INFO     [L1] TEST 3 PLACE id=T3 LONG limit=1829.4 + exit X3 stop=1810.2 (-6%) — expect: entry rests; the exit likely NEVER reaches DNSE (bracket parked         
+                                                pending_entry until the entry fills)                                                                                                                    
+[2026-08-13 13:51:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-13 13:51:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-13 13:52:00+0700] bar:    501 INFO     [OHLCV] O=1925.7 H=1928.2 L=1925.1 C=1925.6 V=2038
+[2026-08-13 13:52:00+0700] bar:    501 INFO     [L1] bar=501 close=1925.6 candle=RED state=2 pending=yes pos=0 canPlace=yes
+[2026-08-13 13:52:00+0700] bar:    501 INFO     [L1] TEST 3 CANCEL id=T3 and id=X3 (both) — expect: entry CANCELLED; X3 may be a no-op if it never reached the venue
+[2026-08-13 13:52:00+0700] bar:    501 INFO     [L1] TEST 3 DONE — entry_lvl=1829.4 stop_lvl=1810.2; state 2->3
+
+[2026-08-13 13:53:55+0700] bar:    501 INFO     [BROKER] run stopped (completed) position=flat equity=463,422,461.00 VND

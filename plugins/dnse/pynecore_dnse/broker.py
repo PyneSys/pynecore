@@ -127,6 +127,9 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._last_seen: dict[str, tuple] = {}
         self._poll_interval: float = 2.0
         self._bar_poll_interval: float = 3.0
+        #: Cancel-confirmation poll (see ``_cancel_took_effect``); tunable for tests.
+        self._cancel_verify_attempts: int = 6
+        self._cancel_verify_delay: float = 0.7
         self._last_bar_ts: int = 0
         self._loan_id: int | None = None
 
@@ -574,6 +577,34 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             ok = self._cancel_one(str(order_id)) and ok
         return ok
 
+    def _cancel_took_effect(self, order_id: str, category: str) -> bool:
+        """Re-read ``order_id`` until it reports a terminal status.
+
+        DNSE answers a conditional cancel with **200 and the order object**, which is
+        only an acknowledgement that the request was accepted — the order can still be
+        ``New`` afterwards. Measured 2026-08-13 on a resting STOP: three consecutive
+        ``cancel -> 200 OK`` calls left ``orderStatus=New`` for >12s before the venue
+        finally flipped it to ``Canceled``. Trusting the 2xx therefore reports orders
+        gone while they are still live at the exchange — the plugin says "cancelled",
+        the book says otherwise, and nothing retries.
+
+        Polls the order detail and returns True only once the venue itself agrees the
+        order is terminal. A read failure is not treated as terminal.
+        """
+        for _ in range(self._cancel_verify_attempts):
+            status, body = self.client.get_order_detail(
+                self.account_id, order_id, self.market_type, order_category=category)
+            if status == 200 and isinstance(body, dict):
+                try:
+                    if self._to_exchange_order(body).status in _TERMINAL_STATUSES:
+                        return True
+                except Exception:                                   # noqa: BLE001
+                    pass                    # unparseable row: fall through and retry
+            elif errors.code_of(body) in errors.NOT_FOUND_CODES:
+                return True                 # gone from the book entirely
+            time.sleep(self._cancel_verify_delay)
+        return False
+
     def _cancel_one(self, order_id: str) -> bool:
         """Cancel by the recorded book; if unknown, probe each.
 
@@ -592,7 +623,15 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 self.account_id, order_id, self.market_type, tok,
                 order_category=category))
             if status in (200, 204):
-                return True
+                # A 2xx from DNSE's conditional cancel is an ACKNOWLEDGEMENT, not a
+                # completion — so it is NOT sufficient to report the order gone.
+                if self._cancel_took_effect(order_id, category):
+                    return True
+                log.broker_warning("%s", (
+                    f"cancel[{category}] http={status} ACKED but the order is still "
+                    f"working after re-reading the book -> reporting NOT cancelled so "
+                    f"the engine retries | order={order_id}"))
+                return False
             code = errors.code_of(body)
             if code in errors.TERMINAL_CODES:  # found, already done -> cancel is moot
                 log.broker_info("%s", f"cancel[{category}] code={code} http={status} -> "

@@ -1,0 +1,24 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-13 06:45 ━━━━━━━━━━━━━━━━━ 0:00:25 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-13 13:46:11+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-13 13:46:11+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@3
+[2026-08-13 13:46:11+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-13 13:46:11+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-13 13:42:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-13 13:42:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-13 13:45:00+0700] bar:    501 INFO     [OHLCV] O=1924.8 H=1927.2 L=1924.3 C=1926.0 V=3214
+[2026-08-13 13:48:00+0700] bar:    502 INFO     [OHLCV] O=1925.8 H=1926.5 L=1923.6 C=1925.0 V=3487
+[2026-08-13 13:48:00+0700] bar:    502 INFO     [L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, every order >=5% away so none can fill. ===
+[2026-08-13 13:48:00+0700] bar:    502 INFO     [L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) | T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only
+[2026-08-13 13:48:00+0700] bar:    502 INFO     [L1] bar=502 close=1925 candle=RED state=0 pending=no pos=0 canPlace=yes
+
+[2026-08-13 13:52:08+0700] bar:    502 INFO     [BROKER] run stopped (completed) position=flat equity=463,422,461.00 VND
