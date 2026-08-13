@@ -3,7 +3,7 @@ Tests for the plugin discovery and loading system.
 """
 
 from dataclasses import dataclass
-from importlib.metadata import EntryPoint
+from importlib.metadata import EntryPoint, packages_distributions
 
 from pynecore.core.plugin import (
     PLUGIN_GROUP,
@@ -127,7 +127,13 @@ def __test_plugin_metadata__():
     meta = get_plugin_metadata(plugins["ccxt"])
     assert meta['name'] == 'ccxt'
     assert meta['version']  # should be non-empty
-    assert meta['package'] == 'pynesys-pynecore'
+    # The bundled ccxt plugin ships inside the PyneCore distribution itself, so the
+    # invariant is "the plugin belongs to the runtime's own dist" -- not one literal
+    # name. Upstream publishes it as `pynesys-pynecore`, this fork as
+    # `opencode-pyneruntime` (see pyproject.toml); deriving the name keeps the test
+    # true on both and stops it going stale on the next rename.
+    own_dist = packages_distributions()['pynecore'][0]
+    assert meta['package'] == own_dist
 
 
 class _FakeDist:
