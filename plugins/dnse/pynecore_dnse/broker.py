@@ -574,8 +574,45 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             return False
         ok = True
         for order_id in ids:
-            ok = self._cancel_one(str(order_id)) and ok
+            cancelled = self._cancel_one(str(order_id))
+            if cancelled:
+                # DNSE does not remove an entry's exit legs with it (#19).
+                self._cancel_dependent_exits(str(order_id))
+            ok = cancelled and ok
         return ok
+
+    def _cancel_dependent_exits(self, entry_order_id: str) -> None:
+        """Cancel any exit legs bound to a just-cancelled ENTRY.
+
+        DNSE does NOT cascade. Measured 2026-08-13 (rubycell/pynecore#19): an entry and
+        its ``strategy.exit`` stop were placed in one OCA group; cancelling only the entry
+        left the exit ``New`` at the venue — a naked buy-stop above the market, with no
+        position to protect. Left there it does not merely linger: if it triggers it OPENS
+        a position on a flat account, turning protection into exposure.
+
+        The plugin already knows the binding — ``_identity`` maps every venue order id to
+        ``(pine_id, from_entry, leg_type)`` — so an entry's dependants are exactly the
+        tracked orders whose ``from_entry`` is that entry's ``pine_id``. Best-effort and
+        idempotent: an already-terminal leg simply reports gone.
+        """
+        pine_id, _from_entry, leg_type = self._identity_for(entry_order_id)
+        if pine_id is None or getattr(leg_type, "name", "") != "ENTRY":
+            return                       # only an ENTRY has dependants
+        for other_id, (_pid, other_from, other_leg) in list(self._identity.items()):
+            if other_id == entry_order_id or other_from != pine_id:
+                continue
+            if getattr(other_leg, "name", "") == "ENTRY":
+                continue                 # never cascade into another entry
+            log.broker_info("%s", (
+                f"cascading cancel to exit leg {other_id} (from_entry={pine_id}) — DNSE "
+                f"does not remove it with the entry, and a stranded exit can OPEN a "
+                f"position on a flat account"))
+            try:
+                self._cancel_one(other_id)
+            except Exception as exc:                                # noqa: BLE001
+                log.broker_warning("%s", (
+                    f"cascade cancel failed for {other_id}: {type(exc).__name__}: {exc} "
+                    f"— CHECK THE VENUE, an exit leg may still be working"))
 
     def _cancel_took_effect(self, order_id: str, category: str) -> bool:
         """Re-read ``order_id`` until it reports a terminal status.
@@ -651,8 +688,12 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         ids = self._ids_for(envelope)
         if not ids:
             return CancelDispositionOutcome.UNKNOWN
-        return (CancelDispositionOutcome.CANCEL_CONFIRMED
-                if self._cancel_one(str(ids[0]))
+        confirmed = self._cancel_one(str(ids[0]))
+        if confirmed:
+            # DNSE does not remove an entry's exit legs with it (#19) — do it here, or a
+            # naked stop is left able to OPEN a position on a flat account.
+            self._cancel_dependent_exits(str(ids[0]))
+        return (CancelDispositionOutcome.CANCEL_CONFIRMED if confirmed
                 else CancelDispositionOutcome.UNKNOWN)
 
     @override

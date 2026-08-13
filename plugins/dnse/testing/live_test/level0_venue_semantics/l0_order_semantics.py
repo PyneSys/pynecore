@@ -97,8 +97,12 @@ def session_phase(now: datetime | None = None) -> str:
                                               queues harmlessly AND can be cancelled.
       "atc"        14:30-14:45              — cancels are REFUSED; anything resting fills
                                               in the auction. Place nothing.
-      "closed"     everything else          — conditionals are rejected outright
-                                              (CO-ORD-006 Validate Order Failed).
+      "closed"     everything else          — NOTHING can be placed: conditionals are
+                                              rejected with CO-ORD-006 "Validate Order
+                                              Failed" and even a plain NORMAL limit is
+                                              refused with
+                                              CANNOT_PLACE_ORDER_IN_THE_CLOSED_SESSION
+                                              (both measured 2026-08-13 14:37 / 14:51).
     """
     now = now or datetime.now(ICT)
     if now.weekday() > 4:
