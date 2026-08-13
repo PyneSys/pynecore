@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""LIVE TEST LEVEL 0 — venue order semantics. Runs ANY TIME, including after hours.
+"""LIVE TEST LEVEL 0 — venue order semantics. Session-phase aware.
+
+WHEN IT CAN RUN (measured 2026-08-13, partly the hard way):
+  * lunch break 11:30-13:00  — FULL run: market orders queue harmlessly and cancel
+    cleanly, conditionals rest and cancel. This is the only phase where every part
+    is both meaningful and safe.
+  * continuous 09:15-11:30 / 13:00-14:30 — conditionals only; the market part is
+    skipped because those orders would FILL.
+  * ATC 14:30-14:45 and outside trading hours — nothing is placed. DNSE rejects
+    conditionals with CO-ORD-006, and refuses cancels in the ATC with
+    CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION, so anything placed is stuck and
+    fills in the auction. Learned by doing exactly that: two band-edge market orders
+    placed at 14:37 could not be cancelled across 18 attempts and both filled at
+    1901.1 in the close. They offset, so it cost only fees.
 
 Answers the question the Pine-driven tests cannot answer outside a session: **does
 DNSE actually accept and REST each order type we send, and can we cancel it again?**
@@ -68,14 +81,41 @@ class Result:
         return any(ok is False for _, ok, _ in self.rows)
 
 
-def in_continuous_session(now: datetime | None = None) -> bool:
-    """VN30F1M continuous trading: Mon-Fri 09:15-11:30 and 13:00-14:30 ICT."""
+def session_phase(now: datetime | None = None) -> str:
+    """Which VN30F1M trading phase we are in — this gates what is SAFE to place.
+
+    Measured 2026-08-13, the hard way: L0 placed its two band-edge market orders at
+    14:37, inside the ATC auction. DNSE refused every cancel with
+    ``CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION`` (18 attempts over 7 minutes), and both
+    orders FILLED in the closing auction at 1901.1. They offset exactly, so the cost was
+    only fees — but a marketable order you cannot cancel is exactly what this probe must
+    never leave behind.
+
+    Phases:
+      "continuous" 09:15-11:30, 13:00-14:30 — market orders WOULD FILL; stops rest fine.
+      "lunch"      11:30-13:00              — the only phase where a market order both
+                                              queues harmlessly AND can be cancelled.
+      "atc"        14:30-14:45              — cancels are REFUSED; anything resting fills
+                                              in the auction. Place nothing.
+      "closed"     everything else          — conditionals are rejected outright
+                                              (CO-ORD-006 Validate Order Failed).
+    """
     now = now or datetime.now(ICT)
     if now.weekday() > 4:
-        return False
+        return "closed"
     minutes = now.hour * 60 + now.minute
-    return (9 * 60 + 15) <= minutes < (11 * 60 + 30) or \
-           (13 * 60) <= minutes < (14 * 60 + 30)
+    if (9 * 60 + 15) <= minutes < (11 * 60 + 30) or (13 * 60) <= minutes < (14 * 60 + 30):
+        return "continuous"
+    if (11 * 60 + 30) <= minutes < (13 * 60):
+        return "lunch"
+    if (14 * 60 + 30) <= minutes < (14 * 60 + 45):
+        return "atc"
+    return "closed"
+
+
+def in_continuous_session(now: datetime | None = None) -> bool:
+    """Back-compat helper: are we in a continuous trading block?"""
+    return session_phase(now) == "continuous"
 
 
 def envelope(tag: str) -> SimpleNamespace:
@@ -128,10 +168,18 @@ async def part1_market(broker: DNSEBroker, result: Result, *,
     through the market. Either outcome (refused, or accepted-and-cancelled)
     passes; a FILL or an uncancellable order fails.
     """
-    print("\n[1] MARKET long + short — after hours: must NOT fill, must be cancellable")
-    if in_continuous_session() and not allow_in_session:
-        result.add("market long", None, "session is OPEN — would FILL; skipped")
-        result.add("market short", None, "session is OPEN — would FILL; skipped")
+    print("\n[1] MARKET long + short — must NOT fill, must be cancellable")
+    phase = session_phase()
+    if phase != "lunch" and not allow_in_session:
+        why = {
+            "continuous": "session is OPEN — a market order would FILL",
+            "atc":        "ATC auction — cancels are REFUSED and anything resting FILLS "
+                          "in the auction (measured 2026-08-13)",
+            "closed":     "outside trading hours — an order left here cannot be cancelled "
+                          "until the next session and fills at the open/auction",
+        }[phase]
+        result.add("market long", None, f"skipped: {why}")
+        result.add("market short", None, f"skipped: {why}")
         return
 
     for side in ("buy", "sell"):
@@ -172,6 +220,16 @@ async def part_resting(broker: DNSEBroker, result: Result, ref: float, *,
     label = "STOP-LIMIT" if stop_limit else "STOP"
     part = "3" if stop_limit else "2"
     print(f"\n[{part}] {label} long + short — expect RESTING, then cancellable")
+    phase = session_phase()
+    if phase in ("atc", "closed"):
+        # Measured 2026-08-13 14:37: every conditional place is refused with
+        # CO-ORD-006 "Validate Order Failed" once the trading day is over. Conditionals
+        # DO work during the lunch break, so L0 is not strictly "any hour".
+        for side in ("buy", "sell"):
+            result.add(f"{label.lower()} {'long' if side == 'buy' else 'short'}", None,
+                       f"skipped: {phase} — DNSE rejects conditionals outside the "
+                       f"trading day (CO-ORD-006)")
+        return
 
     for side in ("buy", "sell"):
         way = "long" if side == "buy" else "short"
