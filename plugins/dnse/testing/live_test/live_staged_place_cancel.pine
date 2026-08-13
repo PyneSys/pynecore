@@ -1,0 +1,156 @@
+//@version=6
+// LIVE TEST LEVEL 1 (staged) — four place/cancel probes driven by a state machine.
+//
+// Every order is 1 contract and priced +/-5% or further from market: inside the +/-7%
+// daily band so the venue ACCEPTS and RESTS it, far enough that it cannot fill in a
+// session. Nothing should ever fill, so no position is ever held.
+//
+//   state 0 -> TEST 1  long  entry, limit -5%          (green candle only)
+//   state 1 -> TEST 2  short entry, limit +5%
+//   state 2 -> TEST 3  long  entry, limit -5%  + exit(stop -6%)      (green candle only)
+//   state 3 -> TEST 4  short entry, limit +5%  + exit(stop +5.5%), BOTH in one OCA group
+//   state 4 -> done, nothing further is placed
+//
+// Each stage places on one candle and cancels on the NEXT closed candle (any colour),
+// then advances the state. Tests 1-3 cancel every order they placed; TEST 4 deliberately
+// cancels ONLY THE ENTRY, to observe whether DNSE also removes the OCA-linked exit.
+//
+// EVERYTHING IS GATED ON barstate.isrealtime — NOT decoration. Live warmup replays ~500
+// historical bars through this same code: order dispatch is suppressed by the engine, but
+// the Pine logic still runs, so an ungated state machine would burn through all four
+// stages during warmup and place nothing at all once live. The gate also keeps the log
+// clean: no output until the live phase starts.
+//
+// KNOWN RISK — read before trusting tests 3/4:
+// PyneCore holds a bracket in LEG_STATE_PENDING_ENTRY while its entry is unfilled and does
+// NOT dispatch it to the venue until the entry fills (sync_engine.py:8010). Our entries
+// cannot fill by design, so the exit() legs of TEST 3 and TEST 4 will most likely never
+// reach DNSE. That is a valid finding in itself, but it means TEST 4 cannot observe OCA
+// removal of a venue-side exit unless the entry is made fillable (Level 2/3 territory).
+//
+// TEST 4 stop direction: a short entered at +5% has its stop ABOVE, so +5.5% is used.
+// A literal -5.5% would sit ~10.5% below the entry — profit side, not a stop. For the
+// literal reading change `close * 1.055` to `close * 0.945`.
+//
+// Reading the results: grep the run log for "[L1]" to get the whole story in order, and
+// cross-check each stage against the "[BROKER] dispatched / event CANCELLED" lines around
+// it. plot() values also land in workdir/output/<script>.csv during the live run.
+strategy("LIVE staged place+cancel", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     slippage=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+var int   state     = 0    // which test is running / next to run
+var int   placedBar = na   // bar_index the current stage placed on; na = nothing pending
+var float lvlEntry  = na   // frozen entry limit  (never re-derived -> never amended)
+var float lvlStop   = na   // frozen protective stop level
+var bool  announced = false
+
+isGreen = close > open
+pending = not na(placedBar)
+
+// Everything below runs ONLY on live bars (see header).
+if barstate.isrealtime
+
+    if not announced
+        log.info("[L1] === LIVE STAGED PLACE/CANCEL — start. 4 tests, 1 contract each, " +
+                 "all orders >=5% away so none can fill. ===")
+        log.info("[L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) " +
+                 "| T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only")
+        announced := true
+
+    // per-bar heartbeat so the running phase is always readable
+    log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5}",
+             bar_index, str.tostring(close, format.mintick), isGreen ? "GREEN" : "RED",
+             state, pending ? "yes" : "no", strategy.position_size)
+
+    // ------------------------------------------------------------ placement
+    if not pending and state < 4
+        if state == 0 and isGreen
+            lvlEntry := close * 0.95
+            strategy.entry("T1", strategy.long, limit=lvlEntry,
+                           comment="T1 long lim@" + str.tostring(lvlEntry, format.mintick))
+            placedBar := bar_index
+            log.info("[L1] TEST 1 PLACE id=T1 LONG limit={0} (close {1}, -5%) — expect: " +
+                     "one NORMAL LO resting, filled=0, int order id",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(close, format.mintick))
+
+        else if state == 1
+            lvlEntry := close * 1.05
+            strategy.entry("T2", strategy.short, limit=lvlEntry,
+                           comment="T2 short lim@" + str.tostring(lvlEntry, format.mintick))
+            placedBar := bar_index
+            log.info("[L1] TEST 2 PLACE id=T2 SHORT limit={0} (close {1}, +5%) — expect: " +
+                     "one NORMAL LO resting, filled=0",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(close, format.mintick))
+
+        else if state == 2 and isGreen
+            lvlEntry := close * 0.95
+            lvlStop  := close * 0.94
+            strategy.entry("T3", strategy.long, limit=lvlEntry,
+                           comment="T3 long lim@" + str.tostring(lvlEntry, format.mintick))
+            strategy.exit("X3", from_entry="T3", stop=lvlStop,
+                          comment_loss="T3 SL@" + str.tostring(lvlStop, format.mintick))
+            placedBar := bar_index
+            log.info("[L1] TEST 3 PLACE id=T3 LONG limit={0} + exit X3 stop={1} (-6%) — " +
+                     "expect: entry rests; the exit likely NEVER reaches DNSE " +
+                     "(bracket parked pending_entry until the entry fills)",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
+
+        else if state == 3
+            lvlEntry := close * 1.05
+            lvlStop  := close * 1.055
+            // Both legs share one oca_name. strategy.exit has no oca_type parameter
+            // (Pine rejects it — CE10120); its legs always form a reduce group.
+            strategy.entry("T4", strategy.short, limit=lvlEntry,
+                           oca_name="t4", oca_type=strategy.oca.cancel,
+                           comment="T4 short lim@" + str.tostring(lvlEntry, format.mintick))
+            strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4",
+                          comment_loss="T4 SL@" + str.tostring(lvlStop, format.mintick))
+            placedBar := bar_index
+            log.info("[L1] TEST 4 PLACE id=T4 SHORT limit={0} + exit X4 stop={1} (+5.5%), " +
+                     "oca_name=t4 — next bar cancels ONLY T4, to see whether X4 goes with it",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
+
+    // ------------------------------------------------------------ cancel + advance
+    // Fires on the first candle CLOSE after the placing candle, whatever its colour.
+    if pending and bar_index > placedBar
+        if state == 0
+            strategy.cancel("T1")
+            log.info("[L1] TEST 1 CANCEL id=T1 — expect: [BROKER] event CANCELLED, book clear")
+        else if state == 1
+            strategy.cancel("T2")
+            log.info("[L1] TEST 2 CANCEL id=T2 — expect: [BROKER] event CANCELLED, book clear")
+        else if state == 2
+            strategy.cancel("T3")
+            strategy.cancel("X3")
+            log.info("[L1] TEST 3 CANCEL id=T3 and id=X3 (both) — expect: entry CANCELLED; " +
+                     "X3 may be a no-op if it never reached the venue")
+        else if state == 3
+            strategy.cancel("T4")
+            log.info("[L1] TEST 4 CANCEL id=T4 ONLY (X4 deliberately left alone) — " +
+                     "KEY OBSERVATION: does X4 also disappear from DNSE?")
+        log.info("[L1] TEST {0} DONE — entry_lvl={1} stop_lvl={2}; state {3}->{4}",
+                 state + 1, str.tostring(lvlEntry, format.mintick),
+                 na(lvlStop) ? "n/a" : str.tostring(lvlStop, format.mintick),
+                 state, state + 1)
+        placedBar := na
+        state     := state + 1
+        if state == 4
+            log.info("[L1] === ALL 4 TESTS DONE. Verify at the venue that NOTHING of ours " +
+                     "is still working, then stop the run. ===")
+
+    // ------------------------------------------------------------ safety
+    // Nothing above can fill by design. If one ever does (a >5% move), cancel everything
+    // still working and flatten at once — this test never intends to hold a position.
+    if strategy.position_size != 0
+        log.error("[L1] !!! UNEXPECTED FILL: pos={0} avg={1} — cancelling all and flattening",
+                  strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
+        strategy.cancel_all()
+        strategy.close_all(comment="SAFETY-FLATTEN")
+
+plot(state, "state", display=display.data_window)
+plot(strategy.position_size, "pos", display=display.data_window)
+plot(lvlEntry, "entry_lvl", display=display.data_window)
+plot(lvlStop, "stop_lvl", display=display.data_window)
