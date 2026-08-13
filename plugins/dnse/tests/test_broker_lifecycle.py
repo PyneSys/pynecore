@@ -601,3 +601,98 @@ def __test_cancel_confirmed_when_the_order_vanishes_from_the_book__(fake_client,
     b._cancel_verify_attempts, b._cancel_verify_delay = 3, 0.0
 
     assert b._cancel_one("ID1") is True
+
+
+# === cascade: an entry's exit legs must go with it ============================
+# DNSE does NOT cascade. Measured live 2026-08-13 (rubycell/pynecore#19): T4's entry
+# and its strategy.exit stop shared one OCA group; cancelling only the entry left the
+# exit `New` at the venue as a naked buy-stop above market. With no position to protect,
+# triggering would OPEN one — protection inverted into exposure.
+
+def _cancelled_detail(*a, **k):
+    return (200, {"id": "X", "symbol": "VN30F1M", "side": "NB",
+                  "quantity": 1, "orderStatus": "Canceled"})
+
+
+def __test_cancelling_an_entry_cascades_to_its_exit_legs__(fake_client, tmp_path):
+    b = _broker(fake_client, tmp_path, cancel_order=(200, {"orderStatus": "Canceled"}),
+                get_order_detail=_cancelled_detail)
+    b._cancel_verify_attempts, b._cancel_verify_delay = 1, 0.0
+    b._order_ids["K"] = ["ENTRY1"]
+    b._identity["ENTRY1"] = ("L", None, LegType.ENTRY)
+    b._identity["SL1"] = ("X", "L", LegType.STOP_LOSS)     # bound to entry "L"
+    b._identity["TP1"] = ("X", "L", LegType.TAKE_PROFIT)   # ditto
+    b._identity["OTHER"] = ("Z", "M", LegType.STOP_LOSS)   # a different entry — untouched
+
+    assert asyncio.run(b.execute_cancel(_cancel_envelope("K"))) is True
+
+    cancelled = [c[1][1] for c in b._client.calls if c[0] == "cancel_order"]
+    assert "SL1" in cancelled and "TP1" in cancelled, \
+        "both exit legs bound to the cancelled entry must be cancelled too"
+    assert "OTHER" not in cancelled, "a leg bound to a DIFFERENT entry must not be touched"
+
+
+def __test_cascade_does_not_fire_when_cancelling_an_exit_leg__(fake_client, tmp_path):
+    """Only an ENTRY has dependants — cancelling an exit must not cascade anywhere."""
+    b = _broker(fake_client, tmp_path, cancel_order=(200, {"orderStatus": "Canceled"}),
+                get_order_detail=_cancelled_detail)
+    b._cancel_verify_attempts, b._cancel_verify_delay = 1, 0.0
+    b._order_ids["K"] = ["SL1"]
+    b._identity["SL1"] = ("X", "L", LegType.STOP_LOSS)
+    b._identity["ENTRY1"] = ("L", None, LegType.ENTRY)
+
+    asyncio.run(b.execute_cancel(_cancel_envelope("K")))
+
+    cancelled = [c[1][1] for c in b._client.calls if c[0] == "cancel_order"]
+    assert cancelled == ["SL1"], "cancelling an exit must not cascade into its entry"
+
+
+def __test_cascade_survives_a_failing_leg__(fake_client, tmp_path):
+    """One un-cancellable leg must not stop the others or raise out of execute_cancel."""
+    def _cancel(account, order_id, market, token, order_category=None):
+        if order_id == "SL1":
+            raise RuntimeError("boom")
+        return (200, {"orderStatus": "Canceled"})
+
+    b = _broker(fake_client, tmp_path, cancel_order=_cancel,
+                get_order_detail=_cancelled_detail)
+    b._cancel_verify_attempts, b._cancel_verify_delay = 1, 0.0
+    b._order_ids["K"] = ["ENTRY1"]
+    b._identity["ENTRY1"] = ("L", None, LegType.ENTRY)
+    b._identity["SL1"] = ("X", "L", LegType.STOP_LOSS)
+    b._identity["TP1"] = ("X", "L", LegType.TAKE_PROFIT)
+
+    assert asyncio.run(b.execute_cancel(_cancel_envelope("K"))) is True
+    cancelled = [c[1][1] for c in b._client.calls if c[0] == "cancel_order"]
+    assert "TP1" in cancelled, "a failing leg must not abort the remaining cascade"
+
+
+def __test_replays_the_measured_live_cancel_trace__(fake_client, tmp_path):
+    """Replay of the exact 2026-08-13 live trace that exposed #20.
+
+    Observed on order d9umsv21a4skcecmf4ag: `cancel[STOP] -> 200 OK` three times in a
+    row, each followed by a readback of `orderStatus=New`, and only then did the venue
+    flip it to `Canceled` (>12s later). The old code returned True on the FIRST 200 and
+    reported the order gone while it was still live.
+
+    Pinned here so the trace itself is the regression: the plugin must keep polling
+    across the New readbacks and only confirm on the flip.
+    """
+    reads = {"n": 0}
+
+    def _detail(*a, **k):
+        reads["n"] += 1
+        # three New readbacks, exactly as measured, then the venue applies the cancel
+        status = "New" if reads["n"] <= 3 else "Canceled"
+        return (200, {"id": "d9umsv21a4skcecmf4ag", "symbol": "VN30F1M", "side": "NB",
+                      "quantity": 1, "orderStatus": status})
+
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(200, {"orderStatus": "New"}), get_order_detail=_detail)
+    b._order_category["d9umsv21a4skcecmf4ag"] = "STOP"
+    b._cancel_verify_attempts, b._cancel_verify_delay = 6, 0.0
+
+    assert b._cancel_one("d9umsv21a4skcecmf4ag") is True, \
+        "must confirm once the venue finally reports Canceled"
+    assert reads["n"] == 4, \
+        "must poll through all three New readbacks and stop on the flip (measured trace)"
