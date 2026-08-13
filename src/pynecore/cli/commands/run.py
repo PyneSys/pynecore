@@ -1005,8 +1005,12 @@ def _print_data_requirements(requirements: DataRequirements, script_name: str) -
         lines.append("")
         lines.append("Same symbol, other timeframe (resampled from the chart base data):")
         for r in requirements.same_symbol_other_tf:
-            suffix = (" [mapping present]" if r.has_security_mapping
-                      else f" [needs --security '{r.timeframe}=<base file>' in backtest]")
+            if r.has_security_mapping:
+                suffix = " [mapping present]"
+            elif r.derived_from_chart:
+                suffix = " [served from the chart data, nothing to supply]"
+            else:
+                suffix = f" [needs --security '{r.timeframe}=<base file>' in backtest]"
             lines.append(f"  -> {r.symbol} @ {r.timeframe}{_tags(r)}{suffix}")
 
     if requirements.cross_symbol:

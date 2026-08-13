@@ -682,11 +682,44 @@ class CloseIntent:
     # Same invariant as :attr:`ExitIntent.reduce_only` — a close can never
     # flip the book to the other side in one-way Pine mode.
     reduce_only: bool = True
+    # Engine-owned routing provenance. ``None`` means a script close;
+    # synthetic close producers set this explicitly so broker plugins never
+    # infer authority from a Pine-controlled string prefix.
+    synthetic_kind: str | None = None
+    target_entry_id: str | None = None
+    target_position_coid: str | None = None
+    target_exchange_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.reduce_only:
             raise ValueError(
                 "CloseIntent.reduce_only must be True — one-way Pine semantics."
+            )
+        if self.synthetic_kind is None:
+            if (self.target_entry_id is not None
+                    or self.target_position_coid is not None
+                    or self.target_exchange_id is not None):
+                raise ValueError(
+                    "CloseIntent synthetic targets require synthetic_kind."
+                )
+            return
+        if self.synthetic_kind not in {
+            'partial_trigger', 'marketable_exit', 'defensive_close',
+        }:
+            raise ValueError(
+                f"CloseIntent.synthetic_kind is invalid: {self.synthetic_kind!r}"
+            )
+        if self.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
+            if (not self.target_entry_id
+                    or self.target_position_coid is not None
+                    or self.target_exchange_id is not None):
+                raise ValueError(
+                    f"CloseIntent {self.synthetic_kind} requires target_entry_id only."
+                )
+        elif (not self.target_position_coid
+              or self.target_entry_id is not None):
+            raise ValueError(
+                "CloseIntent defensive_close requires position COID and no entry target."
             )
 
     @property

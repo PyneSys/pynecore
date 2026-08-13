@@ -1623,12 +1623,16 @@ def setup_security_states(
     :param chart_symbol: The chart's ticker (e.g. ``"AAPL"``). Drives same-symbol
                         gating for the live HTF transport — a cross-symbol HTF
                         context gets no ``HTFAggregator`` because the chart-side
-                        OHLCV would be the wrong instrument. ``None`` (unit-test
-                        / legacy callers without symbol context) is treated as
-                        "every HTF is same-symbol".
+                        OHLCV would be the wrong instrument. A context naming the
+                        chart qualified (``"NASDAQ:AAPL"``) or empty counts as
+                        same-symbol too. ``None`` (unit-test / legacy callers
+                        without symbol context) is treated as "every HTF is
+                        same-symbol".
     :param chart_syminfo: The chart symbol's ``SymInfo``, used as the session
-                        source for same-symbol HTF anchoring. ``None`` disables
-                        anchoring unless a per-security syminfo is supplied.
+                        source for same-symbol HTF anchoring and as the source of
+                        the exchange prefix of the qualified chart symbol.
+                        ``None`` disables anchoring unless a per-security syminfo
+                        is supplied.
     :param sec_syminfos: ``sec_id → SymInfo`` for cross-symbol contexts, used so
                         each security anchors to its own session/timezone. ``None``
                         falls back to ``chart_syminfo``.
@@ -1657,6 +1661,18 @@ def setup_security_states(
     if chart_mod in ('D', 'W', 'M') and chart_mult == 1:
         chart_ltf_resampler = Resampler.get_resampler(chart_timeframe)
         chart_ltf_modifier = chart_mod
+
+    # Every spelling of the chart instrument, for the same-symbol gating below:
+    # bare (``syminfo.ticker``), exchange qualified (``syminfo.tickerid``, the
+    # form a literal ``"BINANCE:BTCUSDT"`` also takes) and empty (an empty symbol
+    # IS the chart's own instrument in Pine). ``None`` keeps the "every HTF is
+    # same-symbol" fallback of callers without symbol context.
+    chart_symbols: set[str] | None = None
+    if chart_symbol is not None:
+        _symbols = {'', chart_symbol}
+        if chart_syminfo is not None and chart_syminfo.prefix:
+            _symbols.add(f"{chart_syminfo.prefix}:{chart_symbol}")
+        chart_symbols = _symbols
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)
@@ -1721,9 +1737,9 @@ def setup_security_states(
                     from ..lib.ticker import _split_chart_type
                     sym, _ = _split_chart_type(str(sym))
                 is_same_symbol = (
-                    chart_symbol is None
+                    chart_symbols is None
                     or sym is None
-                    or str(sym) == chart_symbol
+                    or str(sym) in chart_symbols
                 )
 
                 # Intraday session anchoring: align HTF bars to the session open

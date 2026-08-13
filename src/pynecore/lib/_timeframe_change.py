@@ -40,6 +40,12 @@ def change(timeframe: str) -> bool:
     last_signal: Persistent[datetime | None] = None
     last_period: Persistent[object] = None
 
+    # An empty timeframe string is the chart's own timeframe (measured: over a
+    # full history TradingView's timeframe.change("") never differs from
+    # timeframe.change(timeframe.period))
+    if not timeframe:
+        timeframe = str(_syminfo.period)
+
     tf_sec = _timeframe.in_seconds(timeframe)
     xchg_tf_sec = _timeframe.in_seconds(_syminfo.period)
 

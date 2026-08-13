@@ -197,6 +197,16 @@ NON_TRANSFORMABLE_FUNCTIONS = {
 _SKIP = 'skip'
 _DIRECT = 'direct'
 _FAST = 'fast'
+# Cross-module state-carrying callee marked ``__pyne_shared_call_site__``:
+# emitted on the fast route, but a loop-shaped site keeps ONE instance instead
+# of a child per iteration. TradingView is not uniform here — the percentile
+# machines advance one shared per-call-site state on every execution, loop
+# iterations included, while ``ta.ema``/``ta.sma`` in the same position
+# re-derive each call from bar-keyed series state (measured with
+# window-content and per-iteration probes; see
+# ``ta.percentile_nearest_rank``). Only the measured-shared builtins carry the
+# marker; everything else keeps the child-per-iteration route.
+_FAST_SHARED = 'fast-shared'
 _UNIFORM = 'uniform'
 
 _Route = str | tuple[str, str]
@@ -387,7 +397,12 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             if is_stdlib(entry[0]):
                 return _SKIP
             obj = self._resolve_imported(path, parts)
-            return self._classify_object(obj) if obj is not None else _UNIFORM
+            if obj is None:
+                return _UNIFORM
+            route = self._classify_object(obj)
+            if route == _FAST and getattr(obj, '__pyne_shared_call_site__', False):
+                return _FAST_SHARED
+            return route
         if len(parts) == 1 and base in vars(builtins):
             return _SKIP
         if base.startswith('_'):
@@ -496,7 +511,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                 if carrier[scope]:
                     continue
                 for route in routes:
-                    if (route in (_FAST, _UNIFORM)
+                    if (route in (_FAST, _FAST_SHARED, _UNIFORM)
                             or (isinstance(route, tuple) and carrier.get(route[1], False))):
                         carrier[scope] = True
                         changed = True
@@ -856,7 +871,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
 
         route = self.route_for_callee(node.func, self._scope_stack)
         if not self._scope_stack:
-            if route == _FAST or (isinstance(route, tuple) and self._is_carrier(route[1])):
+            if route in (_FAST, _FAST_SHARED) \
+                    or (isinstance(route, tuple) and self._is_carrier(route[1])):
                 raise SyntaxError("Stateful function calls are not supported at module level")
             return node
         if isinstance(route, tuple):
@@ -869,6 +885,11 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             # Loop counters would bind lambda-local; the straight-line
             # anchor is the only emission that stays correct inside a lambda
             route, in_loop = _UNIFORM, False
+        elif route == _FAST_SHARED:
+            # A marked builtin's state is per call site on TradingView, loop
+            # iterations included (see ``_FAST_SHARED``): one shared instance,
+            # never a child list.
+            route, in_loop = _FAST, False
         else:
             in_loop = self._loop_depth > 0
 

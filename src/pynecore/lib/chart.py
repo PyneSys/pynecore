@@ -77,17 +77,17 @@ class _ChartPoint:
 
     # noinspection PyProtectedMember
     @staticmethod
-    def now(price: float) -> ChartPoint:
+    def now(price: float | None = None) -> ChartPoint:
         """
         Creates a new ``chart.point`` at the current bar, using its index and time.
 
-        :param price: The y-coordinate
+        :param price: The y-coordinate; the current ``close`` when omitted
         :return: A new chart.point object with the current bar's index and time
         """
         return ChartPoint(
             index=int(lib.bar_index),
             time=int(lib._datetime.timestamp() * 1000),
-            price=price
+            price=lib.close if price is None else price
         )
 
     @staticmethod

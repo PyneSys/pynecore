@@ -2181,6 +2181,9 @@ def __test_marketable_whole_row_limit_exit_dispatches_close__():
     # collide in the diff's ``new_map`` with the persistent parent EntryIntent
     # (both would otherwise key on the entry id "L").
     assert b.close_calls[0].intent.pine_id == "__pyne_marketable_exit__TP\0L"
+    assert b.close_calls[0].intent.synthetic_kind == "marketable_exit"
+    assert b.close_calls[0].intent.target_entry_id == "L"
+    assert b.close_calls[0].intent.target_position_coid is None
     assert b.close_calls[0].intent.side == "sell"
     assert b.close_calls[0].intent.qty == 1.0
     # The Pine exit slot is retired so the next bar does not re-emit it.
@@ -2281,6 +2284,8 @@ def __test_marketable_whole_row_stop_exit_dispatches_close__():
     assert len(b.close_calls) == 1
     assert len(b.exit_calls) == 0
     assert b.close_calls[0].intent.pine_id == "__pyne_marketable_exit__SL\0L"
+    assert b.close_calls[0].intent.synthetic_kind == "marketable_exit"
+    assert b.close_calls[0].intent.target_entry_id == "L"
     assert b.close_calls[0].intent.side == "sell"
     assert b.close_calls[0].intent.qty == 1.0
     assert ("SL", "L") not in pos.exit_orders
@@ -4891,8 +4896,36 @@ def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
     assert close_env.intent.qty == 1.0
     assert close_env.intent.symbol == SYMBOL
     assert close_env.intent.immediately is True
+    assert close_env.intent.synthetic_kind == 'defensive_close'
+    assert close_env.intent.target_position_coid == 'coid-entry'
+    assert close_env.intent.target_exchange_id == 'deal-L'
+    assert close_env.intent.target_entry_id is None
 
     # Did not halt — no manual-intervention record on the engine.
+    assert engine.halted is False
+
+
+def __test_bracket_reject_without_exchange_id_still_dispatches_close__():
+    """Generic defensive closing does not require a broker position id."""
+    b = MockBroker()
+    b.raise_on_next_exit = BracketAttachAfterFillRejectedError(
+        "bracket attach reject",
+        position_coid='coid-entry',
+        symbol=SYMBOL,
+        position_side='buy',
+        qty=1.0,
+        from_entry='Long',
+    )
+    engine, _pos = _mk_engine(b)
+
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(_bracket_reject_exit_intent())
+
+    assert len(b.close_calls) == 1
+    close_intent = b.close_calls[0].intent
+    assert isinstance(close_intent, CloseIntent)
+    assert close_intent.target_position_coid == 'coid-entry'
+    assert close_intent.target_exchange_id is None
     assert engine.halted is False
 
 

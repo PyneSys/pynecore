@@ -51,7 +51,7 @@ def __test_heikinashi_developing_snapshot__(log):
         ho0, _, _, hc0 = ha_apply(100.0, 105.0, 99.0, 104.0)
         ha_commit()
         snap.save()  # batch save after the historical bar
-        assert ha_root == [ho0, hc0]
+        assert ha_root[:-1] == [ho0, hc0]  # trailing element is the layout reference
         assert math.isclose(ho0, (100.0 + 104.0) / 2.0)                 # seed open
         assert math.isclose(hc0, (100.0 + 105.0 + 99.0 + 104.0) / 4.0)  # ohlc4
 

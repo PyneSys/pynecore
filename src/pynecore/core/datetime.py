@@ -301,3 +301,50 @@ def parse_datestring(datestring: str) -> datetime:
         "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'\n"
         "- Numeric, month first: '01-01-2023', '03/04/2023', '03.04.2023 10:20:30'"
     )
+
+
+# The Gregorian calendar repeats exactly every 400 years
+GREGORIAN_CYCLE_DAYS = 146097
+
+# First day of the Gregorian calendar in TradingView's (Java's) hybrid calendar
+# -- 1582-10-15 -- counted in days from the Unix epoch
+GREGORIAN_CUTOVER_DAY = -141427
+
+# Anchor making julian_civil_days() agree with civil_days() on the cutover:
+# the Julian date 1582-10-05 is the same day as the Gregorian 1582-10-15
+_JULIAN_EPOCH_DAY = -719470
+
+
+def civil_days(year: int, month: int, day: int) -> int:
+    """
+    Days from the Unix epoch for a proleptic Gregorian date.
+
+    ``day`` enters linearly, so out-of-range values roll over like Pine's do.
+
+    :param year: Year (unbounded, may be zero or negative)
+    :param month: Month, 1-12
+    :param day: Day of month
+    :return: Whole days from 1970-01-01
+    """
+    y = year - (month <= 2)
+    era = y // 400
+    yoe = y - era * 400
+    doy = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    return era * GREGORIAN_CYCLE_DAYS + yoe * 365 + yoe // 4 - yoe // 100 + doy - 719468
+
+
+def julian_civil_days(year: int, month: int, day: int) -> int:
+    """
+    Days from the Unix epoch for a Julian-calendar date.
+
+    Same shape as :func:`civil_days` without the century rule: every fourth
+    year is a leap year.
+
+    :param year: Year (unbounded, may be zero or negative)
+    :param month: Month, 1-12
+    :param day: Day of month
+    :return: Whole days from 1970-01-01
+    """
+    y = year - (month <= 2)
+    doy = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    return y * 365 + y // 4 + doy + _JULIAN_EPOCH_DAY

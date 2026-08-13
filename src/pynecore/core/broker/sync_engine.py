@@ -8142,6 +8142,8 @@ class OrderSyncEngine:
             side=leg.side,
             qty=leg.qty,
             immediately=True,
+            synthetic_kind='partial_trigger',
+            target_entry_id=leg.from_entry,
             comment=(
                 f"engine-trigger partial bracket "
                 f"({leg.leg_kind} for {leg.pine_id!r} "
@@ -9366,6 +9368,8 @@ class OrderSyncEngine:
             side=intent.side,
             qty=intent.qty,
             immediately=True,
+            synthetic_kind='marketable_exit',
+            target_entry_id=intent.from_entry,
             comment=comment,
             alert_message=intent.alert_message,
         )
@@ -12821,6 +12825,9 @@ class OrderSyncEngine:
             side=close_side,
             qty=e.qty,
             immediately=True,
+            synthetic_kind='defensive_close',
+            target_position_coid=e.position_coid,
+            target_exchange_id=e.position_deal_id,
             comment=f"defensive close after bracket attach reject: {e}",
         )
 

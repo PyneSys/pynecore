@@ -1,3 +1,4 @@
+from ..core.module_property import module_property
 from ..types.base import next_vid
 from ..types.linefill import LineFill
 from ..types.line import Line
@@ -37,6 +38,17 @@ def new(line1: Line, line2: Line, color: _color.Color) -> LineFill:
     linefill_obj.vid = next_vid()
     _registry.append(linefill_obj)
     return linefill_obj
+
+
+# noinspection PyShadowingBuiltins
+@module_property
+def all() -> list[LineFill]:
+    """
+    Returns an array filled with all the current linefills drawn by the script.
+
+    :return: Array of all linefill objects
+    """
+    return list(_registry)
 
 
 # noinspection PyShadowingBuiltins

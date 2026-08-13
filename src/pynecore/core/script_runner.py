@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, UTC
 
 from pynecore import lib
+from pynecore.lib import timeframe as timeframe_lib
 from pynecore.lib.log import broker_debug, broker_info, broker_warning, ohlcv_info, sim_info
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
@@ -431,6 +432,46 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     return str(out)
 
 
+def _derives_from_chart_feed(symbol: str, timeframe: str, is_ltf: bool,
+                             chart_symbol: str, chart_tf: str) -> bool:
+    """Whether a security context is served by resampling the chart's own feed.
+
+    TradingView builds an INTRADAY-notated context on the chart's instrument by
+    aggregating the chart's own bars: measured with ``bar_index`` and ``time``
+    read inside the context, such a context holds exactly
+    ``ceil(chart_bars / (sec_tf / chart_tf))`` bars, starts at the chart's first
+    bar and has neither pre-chart values nor pre-chart forward-fill. Its volume
+    is the plain sum of the chart bars' volumes, which a separately downloaded
+    feed at the context resolution does NOT reproduce (measured ~9e-7 relative
+    on BTCUSDT@360). So the chart feed is not merely a convenient stand-in here,
+    it is the more faithful source.
+
+    A ``D``/``W``/``M``-notated context is a different feed with the
+    instrument's full history and pre-chart forward-fill, so it is excluded —
+    the split follows the NOTATION, which makes ``"1440"`` and ``"D"``
+    behave differently despite the equal nominal resolution.
+
+    :param symbol: The context's resolved symbol.
+    :param timeframe: The context's resolved timeframe.
+    :param is_ltf: ``True`` for ``request.security_lower_tf()``, which needs
+        sub-bars the chart feed does not contain.
+    :param chart_symbol: The chart's ``PREFIX:TICKER``.
+    :param chart_tf: The chart's timeframe.
+    :return: ``True`` when the chart feed is the correct source.
+    """
+    if is_ltf or symbol != chart_symbol or not timeframe:
+        return False
+    # A TradingView timeframe carries its modifier as the trailing letter, and is
+    # all-digits for plain minutes. Only minutes and seconds aggregate from time
+    # bars: D/W/M read another feed and ticks have no duration to compare.
+    if timeframe[-1] in 'DWMT':
+        return False
+    try:
+        return timeframe_lib.in_seconds(timeframe) >= timeframe_lib.in_seconds(chart_tf)
+    except (AssertionError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class SecurityRequirement:
     """A single ``request.security()`` / ``request.security_lower_tf()`` data
@@ -448,6 +489,9 @@ class SecurityRequirement:
         module rather than the main script.
     :ivar has_security_mapping: ``True`` when a matching ``--security`` key was
         provided for this symbol/timeframe.
+    :ivar derived_from_chart: ``True`` when the context is served by resampling
+        the chart's own feed (:func:`_derives_from_chart_feed`) and therefore
+        needs no data of its own.
     :ivar has_global_map: ``True`` when the global ``config/symbol_map.toml``
         maps this symbol (optionally per-timeframe).
     :ivar mapped_provider: Provider name of the global-map hit, or ``None``.
@@ -469,6 +513,7 @@ class SecurityRequirement:
     ignore_invalid_symbol: bool
     from_library: bool
     has_security_mapping: bool
+    derived_from_chart: bool = False
     has_global_map: bool = False
     mapped_provider: str | None = None
     mapped_native_symbol: str | None = None
@@ -1223,6 +1268,16 @@ class ScriptRunner:
             _mod_contexts: dict[str, dict] | None = getattr(_sec_mod, '__security_contexts__', None)
             if _mod_contexts:
                 _merged_contexts.update(_mod_contexts)
+        # Pine reads an empty symbol as the chart's own instrument -- the rule
+        # symmetric to an empty timeframe meaning the chart's timeframe. Resolve
+        # it once here so every consumer (same-context detection, same-symbol vs
+        # cross-symbol classification, data resolution) sees a real symbol; a
+        # bare '' would be classified as another instrument by all of them. The
+        # replacement is a copy, leaving the script module's own dict untouched.
+        _chart_tickerid = f"{self.syminfo.prefix}:{self.syminfo.ticker}"
+        for _sec_id, _sec_ctx in _merged_contexts.items():
+            if _sec_ctx.get('symbol') == '':
+                _merged_contexts[_sec_id] = {**_sec_ctx, 'symbol': _chart_tickerid}
         sec_contexts: dict[str, dict] | None = _merged_contexts or None
         sec_processes: 'dict[str, BaseProcess]' = {}
         # Abnormally died children, filled by ``watch_security_child`` — lets
@@ -1311,7 +1366,9 @@ class ScriptRunner:
                 # request for the chart's own bars would go looking for a data file.
                 chart_ticker = str(lib.syminfo.ticker)
                 chart_tf = str(lib.syminfo.period)
-                own_symbols = {chart_ticker, f"{lib.syminfo.prefix}:{chart_ticker}"}
+                # '' is the chart's own instrument in Pine, so a runtime-deferred
+                # empty symbol short-circuits here too
+                own_symbols = {'', chart_ticker, f"{lib.syminfo.prefix}:{chart_ticker}"}
                 same_context_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
                     sym = ctx.get('symbol')
@@ -1599,8 +1656,11 @@ class ScriptRunner:
                     # ⇒ same-symbol; reverse that decision if the resolved symbol
                     # is cross-symbol, or attach one if the timeframe just
                     # promoted from chart-TF to HTF.
+                    # Every spelling of the chart instrument (bare, exchange
+                    # qualified, empty) is the same instrument, so all of them
+                    # keep the chart-side HTF transport
                     is_same_symbol = (chart_ticker is None
-                                      or str(base_symbol) == chart_ticker)
+                                      or str(base_symbol) in own_symbols)
                     needs_aggregator = (not same_tf) and (not plain_ltf) and is_same_symbol
                     if needs_aggregator and sec_state.htf_aggregator is None:
                         from .htf_aggregator import HTFAggregator
@@ -1740,13 +1800,21 @@ class ScriptRunner:
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
             coof_active = (is_strat and self.script.calc_on_order_fills
                            and not self.script.process_orders_on_close)
+            # Companion to the var snapshot: a discarded re-execution advances
+            # the function instances' internal state too (``ta.tr``'s previous
+            # close and friends), and the committed run must see the bar-start
+            # state — dropping the instances via ``reset()`` loses their
+            # history instead (see ``RootChildSnapshot``).
+            child_snapshot: instance_state.RootChildSnapshot | None = None
             if coof_active:
                 var_snapshot = instance_state.RootVarSnapshot(root_keys)
+                child_snapshot = instance_state.RootChildSnapshot(root_keys)
             elif is_live:
                 # Not only for every-tick execution: the live feed also continues
                 # the last warmup bar under its own timestamp, and that bar's
                 # warmup run has to be rolled back like any other discarded one.
                 var_snapshot = instance_state.RootVarSnapshot(root_keys)
+                child_snapshot = instance_state.RootChildSnapshot(root_keys)
             # Rolled back wherever ``var_snapshot`` is, but never gated on
             # ``has_vars``: a script with no var slots still draws.
             drawing_snapshot = DrawingSnapshot()
@@ -1758,7 +1826,7 @@ class ScriptRunner:
                     yield from self._run_iter_magnified(
                         lib, barstate, position, run_main, lib_mains, var_snapshot,
                         drawing_snapshot, is_strat=is_strat, on_progress=on_progress,
-                        string=string,
+                        string=string, child_snapshot=child_snapshot,
                     )
                     return
                 else:
@@ -1868,21 +1936,33 @@ class ScriptRunner:
                 new_fills = sim._fill_counter
                 if new_fills <= old_fills:
                     return
-                # Nothing of this bar's body has run yet, so the drawings are still
-                # exactly what the bar started with. Saving here and not at the call
-                # site keeps a bar without a fill free of the cost.
+                # ``process_orders`` clears ``new_closed_trades`` on entry — it is
+                # this BAR's closes, not this pass's — so each pass's closes are
+                # collected before the next pass wipes them, and the whole bar is
+                # put back at the end for the writers and the yielded value.
+                bar_closed_trades = list(sim.new_closed_trades)
+                # Nothing of this bar's body has run yet, so the drawings and the
+                # function instances are still exactly what the bar started with.
+                # Saving here and not at the call site keeps a bar without a fill
+                # free of the cost.
                 drawing_snapshot.save()
+                child_snapshot.save()  # type: ignore[union-attr]
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     _drop_discarded_run(drawing_snapshot)
-                    instance_state.reset()
+                    child_snapshot.restore()  # type: ignore[union-attr]
+                    sim._mark_to_last_fill()
                     _run_libs_and_main()
                     old_fills = new_fills
                     sim.process_orders()
+                    bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
-                # The real execution of this bar follows
+                sim.new_closed_trades[:] = bar_closed_trades
+                # The real execution of this bar follows — it must see the
+                # bar-start instance state, not the discarded runs' advances.
                 _drop_discarded_run(drawing_snapshot)
+                child_snapshot.restore()  # type: ignore[union-attr]
 
             # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
@@ -1899,17 +1979,23 @@ class ScriptRunner:
                 new_fills = sim._fill_counter
                 if new_fills <= old_fills:
                     return
+                bar_closed_trades = list(sim.new_closed_trades)  # see _coof_loop
                 drawing_snapshot.save()  # see _coof_loop
+                child_snapshot.save()  # type: ignore[union-attr]
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     _drop_discarded_run(drawing_snapshot)
-                    instance_state.reset()
+                    child_snapshot.restore()  # type: ignore[union-attr]
+                    sim._mark_to_last_fill()
                     _run_libs_and_main()
                     old_fills = new_fills
                     sim.process_orders_magnified(sub_bars_list, aggregated_candle)
+                    bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
+                sim.new_closed_trades[:] = bar_closed_trades
                 _drop_discarded_run(drawing_snapshot)
+                child_snapshot.restore()  # type: ignore[union-attr]
 
             # --- Peek-ahead pattern: historical bars ---
             # LIVE_TRANSITION doubles as end-of-data sentinel → next() always returns OHLCV
@@ -1991,6 +2077,8 @@ class ScriptRunner:
                     if var_snapshot and var_snapshot.has_vars:
                         var_snapshot.save()
                     drawing_snapshot.save()
+                    if child_snapshot:
+                        child_snapshot.save()
 
                 # Execute libraries + script
                 _run_libs_and_main()
@@ -2145,6 +2233,8 @@ class ScriptRunner:
                         if var_snapshot and var_snapshot.has_vars:
                             var_snapshot.save()
                         drawing_snapshot.save()
+                        if child_snapshot:
+                            child_snapshot.save()
                         if run_on_every_tick:
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
@@ -2163,7 +2253,8 @@ class ScriptRunner:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.restore()
                             _drop_discarded_run(drawing_snapshot)
-                            instance_state.reset()
+                            if child_snapshot:
+                                child_snapshot.restore()
                             if is_strat and position and self._broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
@@ -2178,18 +2269,20 @@ class ScriptRunner:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.save()
                             drawing_snapshot.save()
+                            if child_snapshot:
+                                child_snapshot.save()
                         else:
                             sub_bars.append(candle)
                             # Not ``run_on_every_tick``: without it the only run to
                             # discard here is the warmup's own execution of this bar,
-                            # which the live feed is now continuing. ``reset()`` drops
-                            # the child function instances, so it must not fire when
-                            # nothing has run.
+                            # which the live feed is now continuing. The rollback
+                            # must not fire when nothing has run.
                             if bar_executed:
                                 if var_snapshot and var_snapshot.has_vars:
                                     var_snapshot.restore()
                                 _drop_discarded_run(drawing_snapshot)
-                                instance_state.reset()
+                                if child_snapshot:
+                                    child_snapshot.restore()
 
                         # Strategy not running on ticks: bar close is first execution
                         if not run_on_every_tick:
@@ -2543,14 +2636,13 @@ class ScriptRunner:
 
     # noinspection PyProtectedMember
     def _run_iter_magnified(self, lib, barstate, position, run_main, lib_mains, var_snapshot,
-                            drawing_snapshot, is_strat, on_progress, string):
+                            drawing_snapshot, is_strat, on_progress, string,
+                            child_snapshot=None):
         """
         Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
         resolution, execute script once per chart bar.
         """
         from .bar_magnifier import BarMagnifier
-        # Needed for COOF re-execution path (already loaded by run_iter, safe to re-import)
-        from pynecore.core import instance_state
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
@@ -2595,11 +2687,15 @@ class ScriptRunner:
                 re_executed = new_fills > old_fills
                 if re_executed:
                     drawing_snapshot.save()
+                    if child_snapshot:
+                        child_snapshot.save()
                 while new_fills > old_fills:
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                     _drop_discarded_run(drawing_snapshot)
-                    instance_state.reset()
+                    if child_snapshot:
+                        child_snapshot.restore()
+                    position._mark_to_last_fill()
                     lib._lib_semaphore = True
                     for run_lib_main in lib_mains:
                         run_lib_main()
@@ -2613,6 +2709,8 @@ class ScriptRunner:
                     var_snapshot.restore()
                 if re_executed:
                     _drop_discarded_run(drawing_snapshot)
+                    if child_snapshot:
+                        child_snapshot.restore()
             elif position:
                 position.process_orders_magnified(window.sub_bars, window.aggregated)
 
@@ -2811,6 +2909,8 @@ class ScriptRunner:
                 sec_id=sec_id, symbol=sym_str, timeframe=tf_str, is_ltf=is_ltf,
                 ignore_invalid_symbol=ignore_invalid, from_library=from_library,
                 has_security_mapping=has_mapping,
+                derived_from_chart=_derives_from_chart_feed(
+                    sym_str, tf_str, is_ltf, chart_symbol, chart_tf),
                 **map_fields,
             )
             if sym_str == chart_symbol and tf_str == chart_tf:
@@ -2959,6 +3059,11 @@ class ScriptRunner:
             # per bar from ``SecurityState.chart_type``.
             symbol, chart_type = _split_chart_type(str(ctx.get('symbol', '')))
             timeframe = str(ctx.get('timeframe', ''))
+            # A runtime-deferred symbol may still arrive empty, which Pine reads
+            # as the chart's own instrument (static contexts are normalized when
+            # they are merged)
+            if not symbol:
+                symbol = f"{self.syminfo.prefix}:{self.syminfo.ticker}"
 
             entry: str | Path | PluginSymbol | None = None
             map_hint = ''
@@ -2993,17 +3098,25 @@ class ScriptRunner:
                 result[sec_id] = str(self._chart_data_path)
                 continue
 
-            # The chart's own symbol at a DIFFERENT timeframe deliberately has no
-            # branch here: a coarser (HTF) resample of the chart feed would start
-            # at the chart's first bar while TradingView's HTF context carries its
-            # own deep history, and a finer (LTF) request needs sub-bars the chart
-            # feed does not contain. The resolver cannot know how much warmup the
-            # expression wants, so such a context falls through to the explicit
-            # "no data" error and the caller supplies a real feed via
-            # ``--security`` — exactly what ``pyne run --list-data`` asks for. The
-            # chart's own symbol AT the chart timeframe never reaches here;
+            # The chart's own symbol at a COARSER intraday timeframe: serve it
+            # from the chart's own feed, which ``_spawn_security_process``
+            # aggregates to the context resolution. This is what TradingView
+            # itself does (see :func:`_derives_from_chart_feed`), so the context
+            # needs no separate file and no warmup guesswork. A finer (LTF)
+            # request still falls through to the "no data" error — it needs
+            # sub-bars the chart feed does not contain — and so does a D/W/M
+            # context, which reads a different feed with its own deep history.
+            # The chart's own symbol AT the chart timeframe never reaches here;
             # ``_deferred_resolve`` short-circuits it to the inline same-context
             # path.
+            if (self._chart_provider_instance is None
+                    and self._chart_data_path is not None
+                    and _derives_from_chart_feed(
+                        symbol, timeframe, bool(ctx.get('is_ltf')),
+                        f"{self.syminfo.prefix}:{self.syminfo.ticker}",
+                        str(self.syminfo.period))):
+                result[sec_id] = str(self._chart_data_path)
+                continue
 
             # Global workdir symbol_map.toml (backtest): translate the
             # TradingView-style symbol to a provider-native one and derive the

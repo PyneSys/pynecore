@@ -48,7 +48,7 @@ __all__ = [
 from ...types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
-    from ...core.script import Script
+    from ...core import script as _core_script
     from .closedtrades import closedtrades
     from .opentrades import opentrades
     # Static-only public aliases: at runtime the submodule import above already
@@ -732,7 +732,7 @@ class SimPosition(PositionBase):
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
-        '_deferred_margin_call', '_fill_counter', '_partial_close_bar',
+        '_deferred_margin_call', '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_open_ledger', '_deferred_immediate_closes'
     )
 
@@ -814,6 +814,9 @@ class SimPosition(PositionBase):
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
         self._fill_counter: int = 0
+        # Price of the most recent fill — the broker emulator's "current price"
+        # for a calc_on_order_fills body run (see _mark_to_last_fill).
+        self._last_fill_price: float = 0.0
         # Monotonic stamp source for same-bar stacking of partial closes.
         self._close_seq_counter: int = 0
         # bar_index of the most recent filled partial strategy.close() (a stamped
@@ -983,6 +986,7 @@ class SimPosition(PositionBase):
             self._partial_close_bar = int(lib.bar_index)
 
         self._fill_counter += 1
+        self._last_fill_price = price
 
         # Save the original order size before any modifications
         filled_size = abs(order.size)
@@ -2464,6 +2468,22 @@ class SimPosition(PositionBase):
             return True
         return False
 
+    def _mark_to_last_fill(self) -> None:
+        """Reprice the emulator at the last fill for a calc_on_order_fills run.
+
+        A COOF body execution sees the broker emulator AT THE FILL MOMENT: a
+        default-sized market entry it places is sized — and the equity it reads
+        is marked — at the triggering fill's price, not the bar close (measured
+        2026-08-13, SUPERTREND ATR WITH TRAILING STOP LOSS, BINANCE:BTCUSDT
+        30m: the 2026-06-24 11:30 COOF re-entry sizes at the exit fill
+        62382.48, where the bar close 62921.19 gives one lot step less).
+        ``process_orders`` re-anchors ``c`` and the open P&L to the bar close
+        at the start of the next pass, so nothing needs undoing.
+        """
+        self.c = self._last_fill_price
+        if self.size != 0.0:
+            self.openprofit = self.size * (self.c - self.avg_price) * _account_point_value()
+
     def process_orders(self):
         """ Process orders """
         # We need to round to the nearest tick to get the same results as in TradingView.
@@ -3402,7 +3422,11 @@ class SimPosition(PositionBase):
         the same as in broker mode, where an immediate close does not take effect
         until after the script.
 
-        The fill price is ``self.c``, the bar close.
+        The fill is a market order at the bar close, so the synthetic slippage
+        applies against the position — but TradingView's trade list still shows
+        the RAW close as the exit price while the cash effect is slipped
+        (measured 2026-08-13, Triple CCI corpus: every immediate-close P&L is
+        qty * slippage * mintick below the exported-price arithmetic).
         """
         orders = self._deferred_immediate_closes
         if not orders:
@@ -3417,7 +3441,16 @@ class SimPosition(PositionBase):
                 self._remove_order(order)
                 continue
             closed_before = len(self.new_closed_trades)
-            self.fill_order(order, self.c, self.h, self.l)
+            price = self.c
+            slippage = lib._script.slippage
+            if slippage > 0:
+                # Closing a long sells (worse = lower), closing a short buys
+                # (worse = higher).
+                price += -syminfo.mintick * slippage if self.sign > 0 \
+                    else syminfo.mintick * slippage
+            self.fill_order(order, price, self.h, self.l)
+            for closed_trade in self.new_closed_trades[closed_before:]:
+                closed_trade.exit_price = self.c
             self._settle_close_pass_trades(closed_before)
 
     def _discard_deferred_immediate_closes(self):
@@ -3636,11 +3669,18 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     if not (qty == qty):  # is_na_arg
         if qty_percent == qty_percent:
-            size = _size_round(-bound_size * (qty_percent * 0.01))
+            size = -bound_size * (qty_percent * 0.01)
         else:
             size = -bound_size
     else:
-        size = _size_round(-position.sign * min(qty, abs(bound_size)))
+        size = -position.sign * min(qty, abs(bound_size))
+
+    # The Pine-side lot floor is a backtest-only quantization, as with
+    # strategy.entry/order. Broker positions can be smaller than syminfo.mincontract
+    # after venue-domain conversion (notably inverse contracts), so preserve the raw
+    # close size and let the plugin quantize it onto the venue grid.
+    if isinstance(position, SimPosition):
+        size = _size_round(size)
 
     if size == 0.0:
         return
@@ -3731,7 +3771,7 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
 # per bar. Three forms are kept: the raw value the Pine builtins must return (na when
 # there is no rate data), the safe multiplier the ledger uses (an unusable rate degrades
 # to 1.0, which leaves an unconverted run bit-identical), and the scaled point value.
-_conv_script: 'Script | None' = None
+_conv_script: '_core_script.Script | None' = None
 _conv_bar: int = -1
 _conv_rate: float = 1.0
 _conv_safe: float = 1.0
@@ -4198,7 +4238,11 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # BINANCE:BTCUSDT 30m: flat entries 13281/13281, reversal flips
     # 26560/26561 exact). The sizing price is the price the order would
     # execute at NOW — the current price when immediately executable, the
-    # limit/stop price while it rests.
+    # limit/stop price while it rests. "Would execute at" includes slippage:
+    # a market entry is sized at the placement close pushed the adverse way
+    # for its direction (measured 2026-08-13, Triple CCI BINANCE:BTCUSDT
+    # 240m, slippage=5: close+signed-slip fits 47/47 sized entries, raw
+    # close only 44/47 — the misses are all one lot step high).
     deferred_default = not (qty == qty)  # is_na_arg
     market_sizing_price: float | None = None
     if deferred_default:
@@ -4208,6 +4252,9 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         elif stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
         else:
+            slippage = lib._script.slippage
+            if slippage > 0 and isinstance(position, SimPosition):
+                exec_price = float(exec_price) + direction_sign * syminfo.mintick * slippage
             market_sizing_price = float(exec_price)
         qty = _default_entry_qty(exec_price)
 
@@ -4448,7 +4495,11 @@ def exit(id: str, from_entry: str = "",
             # over-closes the position.
             reserved = unreserved
 
-        reserved = _size_round(reserved)
+        # The Pine-side lot floor is a backtest-only quantization. Broker
+        # positions can be smaller than syminfo.mincontract after venue-domain
+        # conversion, so preserve the raw reservation for plugin quantization.
+        if isinstance(position, SimPosition):
+            reserved = _size_round(reserved)
         if reserved <= 0.0:
             return
         size = -direction * reserved
@@ -4701,7 +4752,8 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # (TradingView sizes percent_of_equity / cash when the order executes).
     # The size computed here is the placement estimate, taken at the price the
     # order would execute at NOW — the current price when immediately
-    # executable, the limit/stop price while it rests.
+    # executable (including slippage, see strategy.entry), the limit/stop
+    # price while it rests.
     deferred_default = not (qty == qty)  # is_na_arg
     market_sizing_price: float | None = None
     if deferred_default:
@@ -4711,6 +4763,9 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         elif stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
         else:
+            slippage = lib._script.slippage
+            if slippage > 0 and isinstance(position, SimPosition):
+                exec_price += direction_sign * syminfo.mintick * slippage
             market_sizing_price = exec_price
         qty = _default_entry_qty(exec_price)
 

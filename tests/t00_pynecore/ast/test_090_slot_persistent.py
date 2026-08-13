@@ -47,7 +47,8 @@ def main():
     state = _make_state(layout)
     assert ns['main'](state) == 1
     assert ns['main'](state) == 2
-    assert state == [2]
+    assert state[:-1] == [2]
+    assert state[-1] is layout  # trailing layout reference (see _make_state)
     assert '__state__[0] += 1' in dump
     assert 'Persistent' not in dump  # import stripped, annotation removed
 
@@ -67,7 +68,7 @@ def main(length):
     state = _make_state(layout)
     assert ns['main'](state, 5) == 5.0
     assert ns['main'](state, 7) == 5.0  # initializer must not run again
-    assert state == [5.0, True]
+    assert state[:-1] == [5.0, True]
 
 
 def __test_add_assign__():
@@ -90,7 +91,7 @@ def main(x):
     for value in [0.1] * 10 + [1e16, 1.0, -1e16]:
         ref = ref + value
         assert ns['main'](state, value) == ref
-    assert state == [ref]
+    assert state[:-1] == [ref]
     assert ref == 0.0  # the naive sum loses the 1.0, exactly like Pine's
     assert '__state__[0] += x' in dump
 
@@ -139,7 +140,7 @@ def main():
     inner_state = _make_state(layouts['main·test'])
     assert inner(inner_state) == 2
     assert inner(inner_state) == 3
-    assert state == [3.5]  # parent's own p is untouched by the shadow
+    assert state[:-1] == [3.5]  # parent's own p is untouched by the shadow
 
 
 def __test_parent_access_from_nested__():
@@ -160,7 +161,7 @@ def main():
     state = _make_state(layouts['main'])
     assert ns['main'](state) == 2
     assert ns['main'](state) == 4
-    assert state == [4]
+    assert state[:-1] == [4]
 
 
 def __test_walrus_write__():
@@ -177,7 +178,7 @@ def main():
     state = _make_state(layout)
     assert ns['main'](state) == 2
     assert ns['main'](state) == 4
-    assert state == [2]
+    assert state[:-1] == [2]
     assert '__setitem__' in dump
 
 
@@ -213,7 +214,7 @@ def main():
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state) == 7  # inner's local write must not touch the slot
-    assert state == [7]
+    assert state[:-1] == [7]
 
 
 def __test_annotated_local_shadows_parent_persistent__():
@@ -231,7 +232,7 @@ def main():
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state) == 7  # inner's annotated local must not touch the slot
-    assert state == [7]
+    assert state[:-1] == [7]
 
 
 def __test_module_level_persistent_rejected__():

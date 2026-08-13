@@ -264,9 +264,14 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     # operators, not by this function.
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
     # per-series default max_bars_back (500); otherwise it reads na and the change is na.
-    max_bars_back(source, length)
+    # The resize is monotonic: a series ``length`` that dips low must not shrink the
+    # buffer, or the history a later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
 
     prev_val = source[length]  # noqa
 
@@ -325,6 +330,7 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     summ: Persistent[float] = 0.0
     weighted_summ: Persistent[float] = 0.0
     val: Persistent[float] = na_float
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     if not (source == source):  # is_na_arg
         # An NA bar leaves the window unchanged; hold the last full value
@@ -338,8 +344,12 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     src: Series[float] = source
     # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
     # beyond the per-series default max_bars_back (500); otherwise the window-drop
-    # read returns na and poisons ``summ`` permanently.
-    max_bars_back(src, length)
+    # read returns na and poisons ``summ`` permanently. The resize is monotonic: a
+    # series ``length`` that dips low must not shrink the buffer, or the history a
+    # later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(src, capacity)
 
     # Warming up phase — only non-NA samples advance the window
     if count < length:
@@ -500,9 +510,14 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     if length == 1:
         return 0.0
     length = int(length)
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # The loop below reads ``source[length - 1]``; grow the buffer so that index
-    # stays addressable for lengths beyond the per-series default max_bars_back.
-    max_bars_back(source, length)
+    # stays addressable for lengths beyond the per-series default max_bars_back. The
+    # resize is monotonic: a series ``length`` that dips low must not shrink the
+    # buffer, or the history a later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
 
     mean = _mean if _mean is not None else sma(source, length)
     if not (mean == mean):
@@ -817,6 +832,7 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     const_len: Persistent[int] = 0
     sum_x: Persistent[float] = 0.0
     denom: Persistent[float] = 0.0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     if not (source == source):  # is_na_arg
         # An NA bar leaves the window unchanged; hold the last full value
@@ -829,8 +845,12 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     src: Series[float] = source
     # Grow the na-compacted buffer so the oldest window slot stays addressable for
     # lengths beyond the per-series default max_bars_back; otherwise the window
-    # read returns na and the whole regression collapses to na.
-    max_bars_back(src, length)
+    # read returns na and the whole regression collapses to na. The resize is
+    # monotonic: a series ``length`` that dips low must not shrink the buffer, or
+    # the history a later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(src, capacity)
 
     if count < length:
         count += 1
@@ -1291,7 +1311,6 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # exact order misses TradingView on up to 44% of the bars.
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
-    prev_length: Persistent[int] = 0
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # The percentile machines are the only rolling ``ta`` functions that accept an
@@ -1300,11 +1319,10 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # ``percentile_linear_interpolation``, ``median`` and ``mode`` all export an
     # all-na plot, while sma/stdev/wma/linreg/change/highest/percentrank and the
     # rest raise RE10003 "must not be na"). A length of exactly 0 raises RE10001
-    # in this family too, so only the na case is let through.
+    # in this family too, so only the na case is let through. A na-length call
+    # leaves the machine untouched (measured on a shared loop call site: the
+    # next valid-length call continues the very same window).
     if not (length == length):  # is_na_arg
-        # The window is frozen while the length is na; ``-1`` marks it for a
-        # rebuild so a valid length coming back does not inherit a short window.
-        prev_length = -1
         return na_float
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``. It
@@ -1312,8 +1330,8 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # rather than a value that passes ``> 0`` and then answers na forever.
     length = int(length)
     assert length > 0, "Invalid length, length must be greater than 0!"
-    # History is only read on a mid-run length change (window rebuild); keep the
-    # buffer large enough for that. Done before the warmup guard so the oldest
+    # The underfull top-up below reads up to ``length - 1`` bars of history; keep
+    # the buffer large enough for that. Done before the warmup guard so the oldest
     # candles are kept from the first bar on. The resize is monotonic and floored
     # at the series' own default: a series ``length`` that dips low must not
     # shrink the buffer, or the history a later increase needs would already be
@@ -1322,25 +1340,26 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
         capacity = length
         max_bars_back(source, capacity)
 
-    if length != prev_length and prev_length != 0:
-        # ``length`` is a series value and changed: rebuild the window from
-        # the source history, oldest first, without the current bar (bars
-        # beyond the buffer come back as na). Replayed in arrival order so the
-        # ties land where a bar-by-bar fill would have put them.
-        rebuilt = []
-        for i in builtins.range(length - 1, 0, -1):
-            rebuilt.append(source[i])
-        window = deque(rebuilt)
-        sorted_buf = []
-        for v in rebuilt:
-            if v == v:
-                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
-    prev_length = length
-
     window.append(source)
     if source == source:
         sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
-    if len(window) > length:
+    if len(window) < length:
+        # Underfull window — the first bars, a longer length arriving on a
+        # shared call-site machine, or a resume after na-length calls:
+        # TradingView tops the window up to ``length`` from the source's BAR
+        # history (``source[i]`` for ``i = len(window)..length - 1``, na beyond
+        # the buffer), prepended as older entries that PERSIST in the window —
+        # they are evicted like ordinary pushes, never replaced. See
+        # ``percentile_nearest_rank`` for the measurement.
+        fills = []
+        for i in builtins.range(len(window), length):
+            fills.append(source[i])
+        for v in fills:
+            window.appendleft(v)
+        for v in fills:
+            if v == v:
+                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
+    while len(window) > length:
         old = window.popleft()
         if old == old:
             pos = _tol_upper_bound(sorted_buf, old) - 1
@@ -1358,6 +1377,16 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # TradingView's own (probe m554: a percentage sweep over a window of four
     # separated values walks the ranks in exact half steps).
     return array._select_linear_interpolation(sorted_buf, length, percentage)
+
+
+# TradingView advances this machine once per EXECUTION of its call site — loop
+# iterations share it (measured: a [5,9] / [5,na,9] length loop reproduces
+# every exported value bit-exactly on the shared machine, while per-iteration
+# instances miss 83% of the bars) — so the isolation transformer must not give
+# loop iterations their own instances. Not a family-wide builtin law:
+# ``ta.ema``/``ta.sma`` measured the opposite way (see ``_FAST_SHARED`` in the
+# function_isolation transformer).
+percentile_linear_interpolation.__pyne_shared_call_site__ = True
 
 
 # noinspection PyUnusedLocal,PyProtectedMember
@@ -1384,17 +1413,27 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # is where the divergence lives: a tie needs the two values to be within the
     # comparison tolerance of each other, which a spacing sweep confirmed at the
     # expected 1e-10 (1e-11 apart still ties, 1e-10 apart no longer does).
+    #
+    # The machine is shared by every execution of the call site — loop
+    # iterations included — and each call advances it once: push the current
+    # value, top an underfull window up from the source's bar history, evict
+    # while over the CURRENT call's length. Measured (BINANCE:BTCUSDT 30m,
+    # min/median/max order statistics on a bar_index-coded source): a loop over
+    # lengths [5,9] / [9,5] / [5,na,9] / [14,28,42,84,98,na,na] reproduces
+    # every window boundary and rank bit-exactly under this law, while
+    # per-iteration instances, a rebuild-on-length-change and every trim-only
+    # variant miss by thousands of bars. The top-up entries persist as ordinary
+    # window elements (two consecutive top-ups leave two separate history
+    # blocks with a one-bar gap between them — observed, not an artifact).
     window: Persistent[deque[float]] = deque()
     sorted_buf: Persistent[list[float]] = []
-    prev_length: Persistent[int] = 0
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # na length is an all-na series here, not an error; see
-    # ``percentile_linear_interpolation`` for the measured family law.
+    # ``percentile_linear_interpolation`` for the measured family law. The
+    # machine stays untouched (measured: on a shared loop call site the next
+    # valid-length call continues the very same window).
     if not (length == length):  # is_na_arg
-        # The window is frozen while the length is na; ``-1`` marks it for a
-        # rebuild so a valid length coming back does not inherit a short window.
-        prev_length = -1
         return na_float
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``. It
@@ -1402,7 +1441,7 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # rather than a value that passes ``> 0`` and then answers na forever.
     length = int(length)
     assert length > 0, "Invalid length, length must be greater than 0!"
-    # History is only read on a mid-run length change (window rebuild); keep the
+    # The underfull top-up reads up to ``length - 1`` bars of history; keep the
     # buffer large enough for that. Done before the warmup guard so the oldest
     # candles are kept from the first bar on. The resize is monotonic and floored
     # at the series' own default: a series ``length`` that dips low must not
@@ -1412,25 +1451,23 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
         capacity = length
         max_bars_back(source, capacity)
 
-    if length != prev_length and prev_length != 0:
-        # ``length`` is a series value and changed: rebuild the window from
-        # the source history, oldest first, without the current bar (bars
-        # beyond the buffer come back as na). Replayed in arrival order so the
-        # ties land where a bar-by-bar fill would have put them.
-        rebuilt = []
-        for i in builtins.range(length - 1, 0, -1):
-            rebuilt.append(source[i])
-        window = deque(rebuilt)
-        sorted_buf = []
-        for v in rebuilt:
-            if v == v:
-                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
-    prev_length = length
-
     window.append(source)
     if source == source:
         sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
-    if len(window) > length:
+    if len(window) < length:
+        # Top the window up to ``length`` with the source's bar history —
+        # ``source[i]`` for ``i = len(window)..length - 1``, na beyond the
+        # buffer — prepended as older entries, nearest bar innermost, so the
+        # deque stays chronological.
+        fills = []
+        for i in builtins.range(len(window), length):
+            fills.append(source[i])
+        for v in fills:
+            window.appendleft(v)
+        for v in fills:
+            if v == v:
+                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
+    while len(window) > length:
         old = window.popleft()
         if old == old:
             # Tolerant equality is not transitive, so a long enough chain of ties
@@ -1452,6 +1489,12 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     return array._select_nearest_rank(sorted_buf, length, percentage)
 
 
+# Shared per-call-site machine on TradingView, loop iterations included — see
+# the docstring's measured law and ``percentile_linear_interpolation``'s
+# matching marker.
+percentile_nearest_rank.__pyne_shared_call_site__ = True
+
+
 def percentrank(source: Series[float], length: int) -> PyneFloat:
     """
     Percent rank is the percents of how many previous values was less than or equal to the current
@@ -1463,10 +1506,15 @@ def percentrank(source: Series[float], length: int) -> PyneFloat:
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # The final slice reads ``length + 1`` candles of history; a buffer of
     # ``max_bars_back == length`` (capacity ``length + 1``) holds exactly that.
-    # Done before the warmup guard so the oldest candles are kept from bar 0.
-    max_bars_back(source, length)
+    # Done before the warmup guard so the oldest candles are kept from bar 0. The
+    # resize is monotonic: a series ``length`` that dips low must not shrink the
+    # buffer, or the slice a later increase needs would run off its end.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
     if not (source == source):  # is_na_arg
         return na_float
 
@@ -1807,10 +1855,15 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # The slice below reads ``length`` candles of history; grow the source
     # buffer to fit it (the per-series default may be smaller). Done before the
-    # warmup guard so the oldest candles are kept from the first bar on.
-    max_bars_back(source, length)
+    # warmup guard so the oldest candles are kept from the first bar on. The resize
+    # is monotonic: a series ``length`` that dips low must not shrink the buffer, or
+    # the slice a later increase needs would run off its end.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
     if not (source == source):  # is_na_arg
         return na_float
 
@@ -1944,9 +1997,14 @@ def roc(source: Series[float], length: int) -> PyneFloat:
     if not (source == source):  # is_na_arg
         return na_float
     length = int(length)
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
     # per-series default max_bars_back (500); otherwise it reads na and the roc is na.
-    max_bars_back(source, length)
+    # The resize is monotonic: a series ``length`` that dips low must not shrink the
+    # buffer, or the history a later increase needs would already be gone.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
 
     prev_val = source[length]
     chg = change(source, length)
@@ -2497,6 +2555,7 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     last: Persistent[float] = na_float
     const_len: Persistent[int] = 0
     norm: Persistent[float] = 0.0
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     source_na = not (source == source)  # is_na_arg
     if not source_na:
@@ -2506,8 +2565,13 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     # The forward-filled window must advance on every bar, na ones included.
     ff: Series[float] = last
     # Grow the buffer so the deepest read stays addressable for lengths beyond the
-    # per-series default max_bars_back (500), which would otherwise return na.
-    max_bars_back(ff, length)
+    # per-series default max_bars_back (500), which would otherwise return na. The
+    # resize is monotonic and floored at the series' own default: a series ``length``
+    # that dips low must not shrink the buffer, or the window a later increase needs
+    # would already be gone (and the oldest-first walk would run off its end).
+    if length > capacity:
+        capacity = length
+        max_bars_back(ff, capacity)
 
     if source_na or count < length:
         return na_float

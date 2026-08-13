@@ -52,7 +52,7 @@ def all() -> list[Table]:
 
     :return: Array of all table objects
     """
-    return _registry
+    return list(_registry)
 
 
 # noinspection PyShadowingBuiltins

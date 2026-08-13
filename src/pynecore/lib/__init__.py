@@ -11,7 +11,8 @@ import sys
 import math as _math
 
 from functools import lru_cache as _lru_cache
-from datetime import datetime, timedelta, time as dt_time, date, UTC
+from datetime import datetime, timedelta, time as dt_time, date, UTC, \
+    MINYEAR as _MINYEAR, MAXYEAR as _MAXYEAR
 
 from pynecore.types.source import Source
 
@@ -31,7 +32,8 @@ from ._fixnan import fixnan
 
 from pynecore.core.overload import overload
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
-    TimezoneNotFoundError
+    TimezoneNotFoundError, civil_days as _civil_days, julian_civil_days as _julian_civil_days, \
+    GREGORIAN_CUTOVER_DAY as _GREGORIAN_CUTOVER_DAY, GREGORIAN_CYCLE_DAYS as _GREGORIAN_CYCLE_DAYS
 from ..core.resampler import (
     Resampler, ObservedDayCounter as _ObservedDayCounter,
     grid_mode as _grid_mode, overnight_opens as _overnight_opens,
@@ -44,6 +46,14 @@ from ..core.resampler import (
 # The interned typeless na: bare ``na`` in compiled scripts evaluates through
 # ``is_na()`` on every bar, so its result must be a constant, not an allocation
 _na_none: NA = NA(None)
+
+# One full Gregorian leap cycle in milliseconds -- the period ``timestamp()``
+# folds by to reach dates datetime cannot represent -- and the span it folds
+# into: the 400 years starting at 2000-01-01
+_GREGORIAN_CYCLE_MS: int = _GREGORIAN_CYCLE_DAYS * 86_400_000
+_CYCLE_ANCHOR_DAY: int = _civil_days(2000, 1, 1)
+_MIN_DATETIME_DAY: int = _civil_days(_MINYEAR, 1, 1)
+_MAX_DATETIME_DAY: int = _civil_days(_MAXYEAR, 12, 31)
 
 __all__ = [
     # Other modules
@@ -237,16 +247,53 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     tz = _parse_timezone(timezone)
     # Pine accepts out-of-range components and rolls them over (e.g. hour 26 ->
     # next day + 2h, month 13 -> next January). Normalize the month into the
-    # year, then carry day/hour/minute/second through timedelta so the wall
-    # clock overflows before the timezone conversion.
+    # year, then carry the day through timedelta so the wall clock overflows
+    # before the timezone conversion.
     y = int(year)
     m = int(month)
     y += (m - 1) // 12
     m = (m - 1) % 12 + 1
+    d = int(day)
+    # The clock components roll over into days too, so they are carried into the
+    # day count before every calendar decision below. The wall clock is not moved
+    # by the carry (the timedelta at the end shifts wall time, not absolute time),
+    # but a rollover that leaves datetime's range -- hour 24 on the last
+    # representable day -- now folds like any other out-of-range date instead of
+    # raising OverflowError.
+    clock_seconds = int(hour) * 3600 + int(minute) * 60 + int(second)
+    day_carry, second_of_day = divmod(clock_seconds, 86400)
+    d += day_carry
+    # TradingView runs the Julian calendar before 1582-10-15 and the Gregorian
+    # one from that day on, the same hybrid Java's GregorianCalendar keeps, and
+    # reads the ten dates the switch skipped as Julian too (measured:
+    # timestamp(1582, 10, 5, 0, 0) == timestamp(1582, 10, 15, 0, 0), and
+    # timestamp(1, 1, 1, 0, 0) is two days before the proleptic Gregorian
+    # instant). datetime only knows the proleptic Gregorian calendar, so the
+    # difference is carried as whole days on the wall clock -- exact, because
+    # no zone observes DST that far back.
+    gregorian_day = _civil_days(y, m, d)
+    calendar_shift = 0
+    if gregorian_day < _GREGORIAN_CUTOVER_DAY:
+        calendar_shift = _julian_civil_days(y, m, d) - gregorian_day
+    # The date may also fall outside datetime's 1..9999 years, which Pine does
+    # not limit at all: TradingView keeps counting in both directions and
+    # clamps nothing (measured: timestamp(9999, 31, 12, 23, 59) ==
+    # timestamp(10001, 7, 12, 23, 59) == 253450598340000, and
+    # timestamp(1000000, 1, 1, 0, 0) == 31494784780800000). The Gregorian
+    # calendar repeats exactly every 400 years, so an unrepresentable date is
+    # folded into 2000..2399 by whole cycles and their length added back to the
+    # result. Month, day and weekday are preserved, so a named zone's DST rules
+    # land on the same wall clock as the unfolded date would. Representable
+    # dates keep their own year, and with it the zone's real offset history.
+    target_day = gregorian_day + calendar_shift
+    cycles = 0
+    if not (_MINYEAR <= y <= _MAXYEAR and _MIN_DATETIME_DAY <= target_day <= _MAX_DATETIME_DAY):
+        cycles = (target_day - _CYCLE_ANCHOR_DAY) // _GREGORIAN_CYCLE_DAYS
+        y -= cycles * 400
     dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
-        days=int(day) - 1, hours=int(hour), minutes=int(minute), seconds=int(second)
+        days=d - 1 + calendar_shift, seconds=second_of_day
     )
-    return int(dt.timestamp() * 1000)
+    return int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS
 
 
 # noinspection PyShadowingNames

@@ -114,7 +114,7 @@ __all__ = [
     '__slot_state__', '__next_state__', '__bind_slot__', '__bind_next__',
     '__attach_layout__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
-    'RootVarSnapshot', 'RootSeriesSnapshot', 'explain_state',
+    'RootVarSnapshot', 'RootSeriesSnapshot', 'RootChildSnapshot', 'explain_state',
 ]
 
 # Sentinel for dynamic parameter defaults (DynamicDefaultTransformer). A
@@ -170,6 +170,12 @@ def _make_state(layout: dict[str, Any]) -> list:
     for slot, _call_id, in_loop in layout['children']:
         if in_loop:
             state[slot] = []
+    # Trailing layout reference: slot addressing uses literal non-negative
+    # indexes only, so the extra element is invisible to emitted code. It lets
+    # a walker that meets a bare child state vector (fast-path slots hold the
+    # list with no callee at hand) recover the vector's layout — the child
+    # snapshot of the calc_on_order_fills rollback needs exactly that.
+    state.append(layout)
     return state
 
 
@@ -571,6 +577,147 @@ class RootSeriesSnapshot:
                 state[i]._restore(snap)
 
 
+def _snap_vector(state: list, layout: dict[str, Any]) -> tuple:
+    """Deep snapshot of one state vector and its child subtree.
+
+    varip slots are excluded on purpose: a varip keeps its intra-bar advances
+    across discarded re-executions (calc_on_order_fills, live ticks), exactly
+    like TradingView's realtime rollback keeps them.
+    """
+    var_vals = tuple((i, _copy_value(state[i])) for i in _var_slots(layout))
+    series_vals = tuple((slot, state[slot]._snapshot())
+                        for slot, _max_bars_back, _elem in layout['series'])
+    return var_vals, series_vals, _snap_children(state, layout)
+
+
+def _snap_children(state: list, layout: dict[str, Any]) -> tuple:
+    """Snapshot only the child slots of a state vector."""
+    child_vals = []
+    for slot, _call_id, in_loop in layout['children']:
+        val = state[slot]
+        if in_loop:
+            child_vals.append((slot, True, tuple(_snap_child(e) for e in val)))
+        else:
+            child_vals.append((slot, False, _snap_child(val)))
+    return tuple(child_vals)
+
+
+def _snap_child(entry: Any) -> tuple:
+    """Snapshot one child-slot entry.
+
+    A bare list is a fast-path child state vector (its layout rides in the
+    trailing element, see :func:`_make_state`); an anchored ``(callee, bound)``
+    pair whose bound is a state-carrying partial exposes its vector as
+    ``bound.args[0]``. Anything else (an overload dispatcher's or method
+    binder's opaque closure) cannot be walked — it is DROPPED on restore, which
+    re-binds it fresh, exactly what :func:`reset` did for every child.
+    """
+    if entry is None:
+        return ('none',)
+    if type(entry) is list:
+        return ('vec', entry, _snap_vector(entry, entry[-1]))
+    if type(entry) is tuple and len(entry) == 2:
+        bound = entry[1]
+        if type(bound) is partial and bound.args:
+            layout = getattr(bound.func, '__pyne_layout__', None)
+            if layout is not None:
+                return ('pair', entry, bound.args[0], _snap_vector(bound.args[0], layout))
+    return ('drop',)
+
+
+def _restore_vector(state: list, snap: tuple) -> None:
+    """Restore one state vector (in place) from its :func:`_snap_vector` form."""
+    var_vals, series_vals, child_vals = snap
+    for i, value in var_vals:
+        state[i] = _copy_value(value)
+    for slot, series_snap in series_vals:
+        state[slot]._restore(series_snap)
+    _restore_children(state, child_vals)
+
+
+def _restore_children(state: list, child_vals: tuple) -> None:
+    """Restore the child slots of a state vector from :func:`_snap_children`."""
+    for slot, in_loop, child_snap in child_vals:
+        if in_loop:
+            lst = state[slot]
+            # An element that cannot be restored in place ends the reusable
+            # prefix: the per-invocation counter binds strictly sequentially,
+            # so truncating there re-creates it and everything after fresh.
+            keep = 0
+            for saved in child_snap:
+                if not _restore_child(lst, keep, saved):
+                    break
+                keep += 1
+            del lst[keep:]
+        else:
+            kind = child_snap[0]
+            if kind == 'none' or kind == 'drop':
+                state[slot] = None
+            elif kind == 'vec':
+                state[slot] = child_snap[1]
+                _restore_vector(child_snap[1], child_snap[2])
+            else:  # pair
+                state[slot] = child_snap[1]
+                _restore_vector(child_snap[2], child_snap[3])
+
+
+def _restore_child(lst: list, index: int, saved: tuple) -> bool:
+    """Restore one loop-list element in place; ``False`` if it must be dropped
+    (the caller truncates the list from there)."""
+    kind = saved[0]
+    if kind == 'vec':
+        lst[index] = saved[1]
+        _restore_vector(saved[1], saved[2])
+        return True
+    if kind == 'pair':
+        lst[index] = saved[1]
+        _restore_vector(saved[2], saved[3])
+        return True
+    return False
+
+
+class RootChildSnapshot:
+    """Snapshot/restore of the child-instance subtrees of the root vectors,
+    for discarded re-executions (calc_on_order_fills fills, live intra-bar
+    ticks).
+
+    :func:`reset` DROPS every function instance instead, which loses the
+    builtin machines' internal state: ``ta.tr``'s previous close, a ``ta.rma``
+    accumulator — measured on TradingView (SUPERTREND ATR corpus script,
+    2026-08-13), the committed bar calculation after a fill sees the clean
+    bar-start state, so the instances must be rolled back, not re-created.
+
+    Series slots inside instances are restored too (a discarded run may have
+    conditionally written them); root-level series stay untouched, matching
+    :class:`RootVarSnapshot` (same-bar re-adds overwrite in place). Shared
+    bound caches are cleared on restore — the entries walkable through anchor
+    pairs are restored, the opaque ones re-bind fresh, both no worse than the
+    :func:`reset` behavior they replace.
+    """
+
+    __slots__ = ('_roots', '_snapshots')
+
+    def __init__(self, keys: Iterable[str] | None = None):
+        self._roots: list[tuple[list, dict[str, Any]]] = []
+        self._snapshots: list[tuple] = []
+        entries = (_root_vectors.values() if keys is None
+                   else (_root_vectors[key] for key in keys if key in _root_vectors))
+        for state, layout in entries:
+            self._roots.append((state, layout))
+
+    def save(self) -> None:
+        """Snapshot the child subtrees of all roots (bar-start state)."""
+        self._snapshots = [_snap_children(state, layout)
+                           for state, layout in self._roots]
+
+    def restore(self) -> None:
+        """Restore all roots' child subtrees to the saved snapshot."""
+        for (state, _layout), snap in zip(self._roots, self._snapshots):
+            _restore_children(state, snap)
+        for cache in _shared_caches:
+            cache.clear()
+
+
 def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
     """Render a state vector as a readable name -> value dict (debug helper;
     callable from a debugger watch window).
@@ -586,7 +733,8 @@ def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
     series_slots = {slot for slot, _max_bars_back, _elem in layout['series']}
     child_ids = {slot: call_id for slot, call_id, _in_loop in layout['children']}
     out: dict[str, Any] = {}
-    for i, value in enumerate(state):
+    # The trailing element is the vector's layout reference, not a slot.
+    for i, value in enumerate(state[:len(layout['init'])]):
         if names and i < len(names) and names[i]:
             label = names[i]
         elif i in child_ids:

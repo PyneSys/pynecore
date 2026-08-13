@@ -69,11 +69,11 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
 
 
 # noinspection PyShadowingBuiltins
-def delete(id: Polyline) -> None:
+def delete(id: Polyline | NA[Polyline]) -> None:
     """
     Deletes the specified polyline object. It has no effect if the id doesn't exist.
 
-    :param id: The polyline ID to delete
+    :param id: The polyline ID to delete, or na
     """
     if isinstance(id, NA):
         return

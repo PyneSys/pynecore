@@ -1386,6 +1386,9 @@
     "NA": {
       "type": "variable"
     },
+    "all": {
+      "type": "property"
+    },
     "delete": {
       "type": "variable"
     },

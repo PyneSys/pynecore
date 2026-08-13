@@ -4,6 +4,8 @@ Unit tests for the broker plugin data models.
 Focus on the stable diff keys (:attr:`intent_key`) used by the Order Sync
 Engine and the tick-unresolved flag on :class:`ExitIntent`.
 """
+import pytest
+
 from pynecore.core.broker.models import (
     OrderType,
     EntryIntent,
@@ -57,6 +59,32 @@ def __test_exit_intent_has_unresolved_ticks__():
                             side="sell", qty=1.0, profit_ticks=100.0)
     assert resolved.has_unresolved_ticks is False
     assert unresolved.has_unresolved_ticks is True
+
+
+def __test_close_intent_synthetic_provenance_validates__():
+    close = CloseIntent(
+        pine_id='synthetic', symbol='BTCUSDT', side='sell', qty=1.0,
+        synthetic_kind='marketable_exit', target_entry_id='L',
+    )
+    assert close.synthetic_kind == 'marketable_exit'
+    assert close.target_entry_id == 'L'
+    assert close.target_position_coid is None
+
+    with pytest.raises(ValueError, match='requires target_entry_id'):
+        CloseIntent(
+            pine_id='synthetic', symbol='BTCUSDT', side='sell', qty=1.0,
+            synthetic_kind='marketable_exit',
+        )
+    with pytest.raises(ValueError, match='require synthetic_kind'):
+        CloseIntent(
+            pine_id='script', symbol='BTCUSDT', side='sell', qty=1.0,
+            target_position_coid='coid',
+        )
+    defensive = CloseIntent(
+        pine_id='defensive', symbol='BTCUSDT', side='sell', qty=1.0,
+        synthetic_kind='defensive_close', target_position_coid='coid',
+    )
+    assert defensive.target_exchange_id is None
 
 
 def __test_close_intent_key_is_pine_id__():

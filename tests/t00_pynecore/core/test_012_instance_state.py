@@ -54,7 +54,8 @@ def __test_make_state__():
     """ _make_state: shared immutables, fresh series and loop lists """
     s1 = _make_state(LAYOUT_PARENT)
     s2 = _make_state(LAYOUT_PARENT)
-    assert s1 == [0, s1[1], None, [], False]
+    assert s1[:-1] == [0, s1[1], None, [], False]
+    assert s1[-1] is LAYOUT_PARENT  # trailing layout reference (see _make_state)
     assert isinstance(s1[1], SeriesImpl)
     assert s1[1] is not s2[1]
     assert s1[3] is not s2[3]
