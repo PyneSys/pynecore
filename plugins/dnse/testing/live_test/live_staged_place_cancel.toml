@@ -54,3 +54,14 @@ value = 1786604280000
 #    confirm: false
 # Change here to modify the input value
 value = 1786605900000
+
+[inputs.startState]
+# Input metadata, cannot be modified
+# input_type: "int"
+#     defval: 0
+#      title: "Start at state (0=T1, 1=T2, 2=T3, 3=T4)"
+#     minval: 0
+#     maxval: 3
+#    confirm: false
+# Change here to modify the input value
+#value =

@@ -83,6 +83,12 @@ _SESSION_PLACE = frozenset({
 _SESSION_CANCEL = frozenset({
     "CAN_NOT_CANCEL_THAT_ORDER_ON_THIS_SESSION",
     "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION",  # observed live
+    # The ATC twin, observed live 2026-08-13: DNSE refused 18 cancels over 7 minutes
+    # during the closing auction, then both orders filled in it. Identical in nature to
+    # the ATO code above — the order still rests, so this is transient and retryable once
+    # the phase flips, NOT a terminal reject. It was falling through to REJECT while its
+    # ATO twin was already CONNECTION.
+    "CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION",
     "CAN_NOT_CANCEL_ATO_ORDER", "CAN_NOT_CANCEL_MARKET_ORDER",
     "CAN_NOT_CANCEL_PENDINGNEW_ORDER_IN_OPEN_SESSION",
     "CAN_NOT_REPLACE_PLO_ORDER", "CAN_NOT_REPLACE_THAT_ORDER_ON_THIS_SESSION",

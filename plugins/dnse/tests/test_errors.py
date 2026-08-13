@@ -137,3 +137,23 @@ def __test_cancel_one__(name, behavior, attrs, want):
     # in test_broker_lifecycle.py, so here the venue simply agrees.
     stub._cancel_took_effect = lambda *_args: True
     assert (stub._cancel_one("X"), fake.calls) == want
+
+
+# === session-phase cancel codes ===============================================
+
+@pytest.mark.parametrize("code", [
+    "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION",
+    "CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION",
+])
+def __test_auction_cancel_refusals_are_transient_not_terminal__(code):
+    """Both auction twins must be retryable: the order STILL RESTS after the refusal.
+
+    Measured live 2026-08-13 — DNSE refused 18 cancels across the 15-minute ATC window
+    and both orders then filled in the auction. The ATO code was already classified
+    transient while its ATC twin fell through to REJECT, so the engine would have given
+    up on an order that was merely un-cancellable *for now*.
+    """
+    classified = errors.classify(400, {"code": code, "message": "x"}, is_write=True)
+    assert classified is not None
+    assert classified.disposition is errors.Disposition.CONNECTION, \
+        f"{code} must be transient (retry after the phase flips), not a terminal reject"

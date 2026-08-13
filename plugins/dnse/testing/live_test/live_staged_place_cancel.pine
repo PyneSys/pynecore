@@ -37,12 +37,16 @@
 // would be stranded at the venue.
 // ---------------------------------------------------------------------------------
 //
-// KNOWN RISK — read before trusting tests 3/4:
-// PyneCore holds a bracket in LEG_STATE_PENDING_ENTRY while its entry is unfilled and does
-// NOT dispatch it to the venue until the entry fills (sync_engine.py:8010). Our entries
-// cannot fill by design, so the exit() legs of TEST 3 and TEST 4 will most likely never
-// reach DNSE. That is a valid finding in itself, but it means TEST 4 cannot observe OCA
-// removal of a venue-side exit unless the entry is made fillable (Level 2/3 territory).
+// MEASURED 2026-08-13 (this probe's first live run) — exits DO reach the venue before
+// their entry fills. Both exit legs were accepted as real resting conditional orders while
+// their entries sat unfilled: X3 -> id d9ums1i1a4skcecmf450, X4 -> id d9umsv21a4skcecmf4ag,
+// both STRING ids (conditional book), filled=0. An earlier reading of
+// LEG_STATE_PENDING_ENTRY (sync_engine.py:8010) suggested brackets are withheld until the
+// entry fills; that was WRONG, and tests 3/4 are valid as written.
+//
+// TEST 4's answer, same run: cancelling ONLY the entry does NOT remove the OCA-linked exit.
+// T4's entry went Canceled while X4 stayed `New` at DNSE as a live buy-stop @ 2020.2 — the
+// shared oca_name did not make the venue drop the sibling. See rubycell/pynecore#19.
 //
 // TEST 4 stop direction: a short entered at +5% has its stop ABOVE, so +5.5% is used.
 // A literal -5.5% would sit ~10.5% below the entry — profit side, not a stop. For the
