@@ -1,5 +1,6 @@
 //@version=6
-// LIVE TEST LEVEL 1 (staged) — four place/cancel probes driven by a state machine.
+// LIVE TEST LEVEL 1 (staged) — four place/cancel probes driven by a state machine,
+// bounded by an explicit TRADE WINDOW.
 //
 // Every order is 1 contract and priced +/-5% or further from market: inside the +/-7%
 // daily band so the venue ACCEPTS and RESTS it, far enough that it cannot fill in a
@@ -15,11 +16,26 @@
 // then advances the state. Tests 1-3 cancel every order they placed; TEST 4 deliberately
 // cancels ONLY THE ENTRY, to observe whether DNSE also removes the OCA-linked exit.
 //
-// EVERYTHING IS GATED ON barstate.isrealtime — NOT decoration. Live warmup replays ~500
-// historical bars through this same code: order dispatch is suppressed by the engine, but
-// the Pine logic still runs, so an ungated state machine would burn through all four
-// stages during warmup and place nothing at all once live. The gate also keeps the log
-// clean: no output until the live phase starts.
+// ---------------------------------------------------------------------------------
+// THE TRADE WINDOW — set `winStart` / `winEnd` in the script's .toml before each run.
+//
+// Placement happens only inside [winStart, winEnd]. This replaces a barstate.isrealtime
+// gate and is better for two reasons: it is explicit (you choose exactly when the probe
+// may trade), and it is REPRODUCIBLE OFFLINE — set the window over a past session and a
+// plain `dnse:` backtest replays the whole 4-stage sequence with full logging, so the
+// logic and the log output can be checked without touching the venue.
+//
+// The window matters beyond convenience: live warmup replays ~500 historical bars through
+// this code. Order dispatch is suppressed by the engine during warmup, but the Pine logic
+// still runs — so for a LIVE run `winStart` MUST be at or after the moment you start it,
+// otherwise the state machine burns through all four stages on warmup bars and places
+// nothing. The default is deliberately far in the future so an unconfigured run does
+// nothing at all rather than something surprising.
+//
+// CANCELS ARE NOT BOUNDED BY winEnd — only placement is. Once a stage has placed, its
+// cancel must be able to fire even if the window has since closed; otherwise a live order
+// would be stranded at the venue.
+// ---------------------------------------------------------------------------------
 //
 // KNOWN RISK — read before trusting tests 3/4:
 // PyneCore holds a bracket in LEG_STATE_PENDING_ENTRY while its entry is unfilled and does
@@ -41,32 +57,37 @@ strategy("LIVE staged place+cancel", overlay=true, pyramiding=0, initial_capital
      slippage=1,
      calc_on_every_tick=false, process_orders_on_close=false)
 
+// --- trade window (edit in the generated .toml, not here) ---
+winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
+winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+
 var int   state     = 0    // which test is running / next to run
 var int   placedBar = na   // bar_index the current stage placed on; na = nothing pending
 var float lvlEntry  = na   // frozen entry limit  (never re-derived -> never amended)
 var float lvlStop   = na   // frozen protective stop level
 var bool  announced = false
 
-isGreen = close > open
-pending = not na(placedBar)
+isGreen  = close > open
+pending  = not na(placedBar)
+started  = time >= winStart          // the window has opened
+canPlace = started and time <= winEnd  // ... and has not closed yet
 
-// Everything below runs ONLY on live bars (see header).
-if barstate.isrealtime
+if started
 
     if not announced
-        log.info("[L1] === LIVE STAGED PLACE/CANCEL — start. 4 tests, 1 contract each, " +
-                 "all orders >=5% away so none can fill. ===")
+        log.info("[L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, " +
+                 "every order >=5% away so none can fill. ===")
         log.info("[L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) " +
                  "| T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only")
         announced := true
 
     // per-bar heartbeat so the running phase is always readable
-    log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5}",
+    log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5} canPlace={6}",
              bar_index, str.tostring(close, format.mintick), isGreen ? "GREEN" : "RED",
-             state, pending ? "yes" : "no", strategy.position_size)
+             state, pending ? "yes" : "no", strategy.position_size, canPlace ? "yes" : "no")
 
     // ------------------------------------------------------------ placement
-    if not pending and state < 4
+    if canPlace and not pending and state < 4
         if state == 0 and isGreen
             lvlEntry := close * 0.95
             strategy.entry("T1", strategy.long, limit=lvlEntry,
@@ -114,7 +135,7 @@ if barstate.isrealtime
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
     // ------------------------------------------------------------ cancel + advance
-    // Fires on the first candle CLOSE after the placing candle, whatever its colour.
+    // Deliberately NOT gated by winEnd: a placed order must always be cancellable.
     if pending and bar_index > placedBar
         if state == 0
             strategy.cancel("T1")
