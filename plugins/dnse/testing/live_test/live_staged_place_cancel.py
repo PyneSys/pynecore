@@ -5,12 +5,15 @@ This code was compiled by Pine2Pyne — the Pine Script to PyneCore's Python com
 """
 
 from pynecore.lib import (
-    NA, bar_index, barstate, close, display, format, log, na, open, plot, script, strategy, string
+    NA, bar_index, close, display, format, input, log, na, open, plot, script, strategy, string, time, timestamp
 )
 from pynecore.types import PersistentSeries, Series
 
 @script.strategy('LIVE staged place+cancel', overlay=True, pyramiding=0, initial_capital=500000000, default_qty_type=strategy.fixed, default_qty_value=1, margin_long=18.48, margin_short=18.48, slippage=1, calc_on_every_tick=False, process_orders_on_close=False)
-def main():
+def main(
+    winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
+    winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+):
     state: PersistentSeries[int] = 0
     placedBar: PersistentSeries[int] = na(int)
     lvlEntry: PersistentSeries[float] = na(float)
@@ -19,14 +22,15 @@ def main():
 
     isGreen = close > open
     pending = not na(placedBar)
-
-    if barstate.isrealtime:
+    started = time >= winStart
+    canPlace = started and time <= winEnd
+    if started:
         if not announced:
-            log.info("[L1] === LIVE STAGED PLACE/CANCEL — start. 4 tests, 1 contract each, " + "all orders >=5% away so none can fill. ===")
+            log.info("[L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, " + "every order >=5% away so none can fill. ===")
             log.info("[L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) " + "| T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only")
             announced = True
-        log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5}", bar_index, string.tostring(close, format.mintick), ("GREEN" if isGreen else "RED"), state, ("yes" if pending else "no"), strategy.position_size)
-        if (not pending) and state < 4:
+        log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5} canPlace={6}", bar_index, string.tostring(close, format.mintick), ("GREEN" if isGreen else "RED"), state, ("yes" if pending else "no"), strategy.position_size, ("yes" if canPlace else "no"))
+        if canPlace and (not pending) and state < 4:
             if state == 0 and isGreen:
                 lvlEntry = close * 0.95
                 strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1 long lim@" + string.tostring(lvlEntry, format.mintick))
