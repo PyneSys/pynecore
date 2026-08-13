@@ -48,8 +48,9 @@ if barstate.isrealtime and not traded
     tpLevel := close * 1.002
     slLevel := close * 0.998
     strategy.entry("E", strategy.long, comment="MKT 1-lot")
-    strategy.exit("X", from_entry="E", limit=tpLevel, stop=slLevel,
-                  oca_name="brk", oca_type=strategy.oca.cancel,
+    // NOTE: no oca_type — Pine's strategy.exit has no such parameter (TradingView
+    // rejects it with CE10120), and its legs always form a reduce group anyway.
+    strategy.exit("X", from_entry="E", limit=tpLevel, stop=slLevel, oca_name="brk",
                   comment_profit="TP@" + str.tostring(tpLevel, format.mintick),
                   comment_loss="SL@" + str.tostring(slLevel, format.mintick))
     traded := true

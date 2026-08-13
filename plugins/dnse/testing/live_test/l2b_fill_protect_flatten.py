@@ -20,7 +20,7 @@ def main():
         tpLevel = close * 1.002
         slLevel = close * 0.998
         strategy.entry("E", strategy.long, comment="MKT 1-lot")
-        strategy.exit("X", from_entry="E", limit=tpLevel, stop=slLevel, oca_name="brk", oca_type=strategy.oca.cancel, comment_profit="TP@" + string.tostring(tpLevel, format.mintick), comment_loss="SL@" + string.tostring(slLevel, format.mintick))
+        strategy.exit("X", from_entry="E", limit=tpLevel, stop=slLevel, oca_name="brk", comment_profit="TP@" + string.tostring(tpLevel, format.mintick), comment_loss="SL@" + string.tostring(slLevel, format.mintick))
         traded = True
 
     DOUBLE_CHECK_PCT = -0.3
