@@ -5355,6 +5355,48 @@ def __test_bracket_reject_defensive_close_pending_state_set_before_dispatch__(
         assert persisted['close_intent_key'] == "__pyne_defensive_close__coid-entry"
 
 
+def __test_bracket_reject_defensive_close_without_broker_order_drops_marker__():
+    """A defensive close the one-way fan sends nowhere drops its marker instead of timing out.
+
+    The hedging emulator FIFO-closes legs on the position side. When the
+    venue holds nothing there — the exposure the reject named is already
+    gone, or the position flipped between the entry fill and the bracket
+    attach — the fan dispatches zero legs and ``_order_mapping`` gets an
+    EMPTY list: no close order exists on the wire. A
+    :class:`PendingDefensiveClose` armed in that state can only be
+    resolved by a FILL that will never arrive, so the grace window would
+    halt the run with a manual-intervention error for a position that is
+    not there. The marker must be dropped at dispatch time instead.
+    """
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("9", "buy", 1.0)]
+
+    async def _reject_amend(symbol, leg_id, *, side, tp_price, sl_price,
+                            trail_offset, coid):
+        # The venue flipped the position between the entry fill and the
+        # bracket attach: the long the reject names is gone, a short sits
+        # in its place, so the defensive close finds no leg to reduce.
+        b.raw_legs = [_pleg("10", "sell", 1.0)]
+        raise _bracket_reject_error()
+
+    b.amend_bracket = _reject_amend  # type: ignore[method-assign]
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        engine._dispatch_new(intent)
+
+    assert exc.value.reason == "bracket_reject_defensive_close"
+    # The close fanned out to nothing — no leg reduced, no order on the wire.
+    assert b.close_leg_calls == []
+    assert engine.order_mapping[
+        f"__pyne_defensive_close____pyne_orphan__{SYMBOL}__Long"] == []
+    # No marker survives to time out into a manual-intervention halt.
+    assert engine.pending_defensive_close == {}
+    assert engine.halted is False
+
+
 def __test_bracket_reject_defensive_close_cleanup_deferred_to_fill__(
         tmp_path,
 ):

@@ -501,6 +501,29 @@ def __test_run_exit_bracket_flat_skips__():
     assert port.amended == []
 
 
+def __test_run_exit_bracket_opposite_net_side_skips__():
+    """An exit whose parent was reversed away skips instead of bracketing the new side.
+
+    ``intent.side`` is the closing direction, so a ``sell`` exit belongs to a
+    long. When the book has since flipped short, the exit's levels are upside
+    down for that side (a long's take-profit sits above the price, a short's
+    must sit below) and the venue rejects the attach — which escalates into a
+    defensive close for a parent that no longer exists. The protected position
+    is simply gone, so this is the same non-halting skip as a flat book.
+    """
+    port = _FakePort([_leg("2", "sell", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    assert res == BracketFanResult(legs=(), skipped=True)
+    assert port.amended == []
+    # The mirror case still attaches: a buy exit protects the short book.
+    res = _run(eng.run_exit_bracket(
+        _exit_env("TP", "Short", side="buy", tp=1.00, sl=1.20), port,
+    ))
+    assert res.legs == ("2",) and res.skipped is False
+    assert _amended_levels(port) == [("2", 1.00, 1.20)]
+
+
 def __test_run_exit_bracket_protects_only_net_survivor_legs__():
     """The bracket is amended onto only the net-survivor legs, not the gross majority side."""
     # Mixed book net long 2 (3 buys, 1 sell): the opposing sell virtually

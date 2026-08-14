@@ -474,7 +474,8 @@ class OneWayEmulator:
         in the ownership index (keyed by the exit's ``intent_key``) BEFORE its
         amend, so :meth:`run_exit_bracket_clear` later clears ONLY the legs this
         exit owns and :meth:`restart_replay` can re-assert or release them. A flat
-        symbol is a non-halting skip.
+        symbol — or a book whose net side is the opposite of the one this exit
+        protects — is a non-halting skip.
 
         Re-running it (a modify, or a re-attach after pyramiding) upserts the
         same per-leg rows idempotently: the row key is STABLE per (exit
@@ -504,7 +505,18 @@ class OneWayEmulator:
             )
         legs = await port.fetch_raw_positions(intent.symbol)
         side, on_side = net_survivor_legs(legs)
-        if side == 'flat' or not on_side:
+        # The net side must be the one this exit protects: ``intent.side`` is
+        # the CLOSING direction, so a sell-side exit belongs to a long. When
+        # the book has flipped since the exit was placed — the parent entry was
+        # reversed away and the stale exit is re-dispatched against the new
+        # opposite position — the levels are upside down for that side (a
+        # long's take-profit sits ABOVE the price, a short's must sit below).
+        # Venues reject that outright, which escalates into a defensive close
+        # for a parent that no longer exists. The position this exit protects
+        # is simply not there, so it is the same non-halting skip as a flat
+        # book: no bracket, re-evaluated on the next bar.
+        protected_side = 'buy' if intent.side == 'sell' else 'sell'
+        if side == 'flat' or not on_side or side != protected_side:
             return BracketFanResult(legs=(), skipped=True)
         survivors = {leg.leg_id for leg in on_side}
         # A re-attach can narrow the survivor set: a manual hedge or an

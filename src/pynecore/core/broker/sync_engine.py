@@ -13087,16 +13087,15 @@ class OrderSyncEngine:
             # event back to its marker even when the FILL routes
             # through the polled-orders path rather than the WS
             # stream (where ``OrderEvent.pine_id`` is reliable).
-            if marker_armed and entry_id:
-                refs = self._order_mapping.get(close_intent.intent_key, [])
-                if refs:
-                    self._set_pending_defensive_close(
-                        entry_id,
-                        dataclasses.replace(
-                            self._pending_defensive_close[entry_id],
-                            close_order_ref=refs[0],
-                        ),
-                    )
+            refs = self._order_mapping.get(close_intent.intent_key, [])
+            if marker_armed and entry_id and refs:
+                self._set_pending_defensive_close(
+                    entry_id,
+                    dataclasses.replace(
+                        self._pending_defensive_close[entry_id],
+                        close_order_ref=refs[0],
+                    ),
+                )
             if entry_id:
                 # Fire the OCA-cancel cascade BEFORE removing the
                 # parent ENTRY intent. We are running inside
@@ -13150,6 +13149,30 @@ class OrderSyncEngine:
                 # we just flattened. The set is per-sync and harmless
                 # outside the loop context (event-driven callers ignore it).
                 self._defensively_closed_entries_this_sync.add(entry_id)
+                # The dispatch reached the broker but produced NO order
+                # ref: the one-way emulator's close fan found no leg to
+                # reduce, i.e. the venue does not hold the exposure this
+                # close targets (``CloseFanResult`` documents empty
+                # ``legs`` with ``skipped=False`` as "already flat on
+                # that side"). Nothing is on the wire, so no FILL can
+                # ever settle the marker — keeping it armed only
+                # guarantees a manual-intervention halt once the grace
+                # window expires, for a position that is already gone.
+                # Drop it and let the next bar's reconcile re-derive the
+                # size from the broker snapshot. The marker SURVIVES a
+                # transient residual-cleanup failure: live residual
+                # orders can still rebuild the exposure, and the grace
+                # probe is the retry vehicle that cancels them.
+                if marker_armed and not refs and residual_clean:
+                    _blog_warning(
+                        "defensive close for entry %r dispatched no broker "
+                        "order — the venue holds no %s exposure to close "
+                        "(deal_id=%s); dropping the pending marker instead "
+                        "of waiting for a FILL that cannot arrive, position "
+                        "re-derived from the broker on the next reconcile",
+                        entry_id, e.position_side, e.position_deal_id,
+                    )
+                    self._clear_pending_defensive_close(entry_id)
 
         raise OrderSkippedByPlugin(
             f"Bracket attach rejected after entry fill — parent position "
