@@ -2238,6 +2238,31 @@ class ScriptRunner:
                             on_tick(candle)
                         continue
 
+                    # A CLOSED bar at or before the last one the live stream
+                    # closed is history arriving a second time. A reconnect
+                    # backfill is the usual source: the provider replays the
+                    # window it missed and re-serves bars this run already
+                    # executed, sometimes after a newer one has landed. Pine's
+                    # model is strictly monotonic — ``time`` never moves
+                    # backwards — so running it would rebuild every series
+                    # from a bar that is behind the ones already folded in,
+                    # and the strategy would see its own history change under
+                    # it. The bar cannot be executed out of order at all, so
+                    # drop it and say so: a provider re-serving settled bars
+                    # is a feed defect, and swallowing it quietly would leave
+                    # a genuinely skipped bar looking exactly the same.
+                    if (candle.is_closed
+                            and last_confirmed_timestamp is not None
+                            and candle.timestamp <= last_confirmed_timestamp):
+                        broker_warning(
+                            "feed re-served an already-closed bar (ts=%d) "
+                            "after closing ts=%d — dropped: replaying it "
+                            "would move the strategy's clock backwards and "
+                            "rebuild its series from settled history",
+                            candle.timestamp, last_confirmed_timestamp,
+                        )
+                        continue
+
                     if is_new_bar:
                         # Pre-increment on bar open; intra-bar ticks for the
                         # same bar reuse the index already assigned here.

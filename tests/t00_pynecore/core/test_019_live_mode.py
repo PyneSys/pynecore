@@ -231,3 +231,36 @@ def __test_ticks_under_a_closed_bar_timestamp_do_not_corrupt_history__(
     # The confirmed close of bar 60 — not the 110.0 quote tick that followed it.
     assert results[2][1]["conf"] == 1 and results[2][1]["c"] == 102.0
     assert results[2][1]["c1"] == 101.0
+
+
+def __test_a_reserved_closed_bar_does_not_move_the_clock_backwards__(
+        script_path, module_key, syminfo,
+):
+    """A reconnect backfill must not replay bars the run already executed.
+
+    After a dropped link the provider re-serves the window it missed, and the
+    replay can carry bars this run has already closed — sometimes after a
+    newer one has landed. Pine's clock only moves forward, so executing one
+    would rebuild every series from settled history: the strategy would watch
+    its own past change. The stale bar is dropped and the sequence the script
+    sees stays monotonic.
+    """
+    historical = [_make_ohlcv(0, 100.0)]
+    live = [
+        _make_ohlcv(60, is_closed=True, close=101.0),
+        _make_ohlcv(120, is_closed=True, close=102.0),
+        _make_ohlcv(60, is_closed=True, close=99.0),    # backfill replay
+        _make_ohlcv(180, is_closed=True, close=103.0),
+    ]
+
+    runner = _create_live_runner(
+        script_path, module_key, syminfo,
+        _chain_live(historical, live),
+    )
+    results = [(c, dict(p)) for c, p in runner.run_iter()]
+
+    assert [candle.timestamp for candle, _ in results] == [0, 60, 120, 180]
+    # Bar 120's close is what bar 180 compares against — not the 99.0 replay
+    # that arrived between them.
+    assert results[3][1]["c"] == 103.0
+    assert results[3][1]["c1"] == 102.0

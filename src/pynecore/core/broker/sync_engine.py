@@ -168,6 +168,27 @@ Intent = EntryIntent | ExitIntent | CloseIntent
 
 CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
 
+#: Multiplier on ``execute_timeout`` for the write bridge's second wait: after
+#: the first window expires, :meth:`OrderSyncEngine._run_async_write` keeps
+#: waiting this many more windows for the plugin's OWN venue-call timeout to
+#: fire and classify the disposition. Sized above every plugin's worst-case
+#: request bound (Capital.com order POST: 50 s) so a mid-outage dispatch parks
+#: through the normal machinery instead of dying on a raw bridge timeout; only
+#: a write still unresolved after the grace — a wedged loop or an unbounded
+#: plugin call — escalates to the controlled halt.
+_WRITE_CLASSIFICATION_GRACE_MULT = 3.0
+
+#: Seconds the periodic reconcile keeps waiting after first observing the
+#: venue flat against a non-flat book WHILE intents are active, before
+#: concluding an external flatten. An in-flight fill of our own (a close /
+#: TP / SL we dispatched) flattens ``/positions`` seconds before its
+#: OrderEvent arrives, so an immediate clear would double-book it; a venue
+#: still flat past this window with the book unmoved — no fill reconciled
+#: it, including the ~60 s-cadence execution backfill after a reconnect —
+#: is an external flatten and the book must stop trading on a position
+#: that no longer exists.
+EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
+
 #: Seconds a broker read may stay unresolved past its bridge timeout before the
 #: engine stops dispatching. A read that outran ``execute_timeout`` is retained
 #: (see :meth:`OrderSyncEngine._submit_read`) and every later read parks behind
@@ -940,6 +961,31 @@ class OrderSyncEngine:
         # owned by the plugins' persisted ``filled_qty`` cursors (this gate is
         # defence-in-depth over the plugins' own per-fill dedup).
         self._seen_fill_ids = _BoundedIdSet(_SEEN_FILL_IDS_CAP)
+
+        # External-flatten confirmation clock: first ``monotonic()`` moment a
+        # periodic reconcile observed the venue flat while the book was not
+        # AND ``_active_intents`` was non-empty (an in-flight close/exit fill
+        # of our own flattens ``/positions`` seconds before its OrderEvent
+        # arrives, so the observation alone proves nothing). ``0.0`` = not
+        # observing. If the venue stays flat past
+        # :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S` with no fill having
+        # reconciled the book, the flatten is external and the position
+        # state is cleared — an armed bracket keeps an ``ExitIntent`` in
+        # ``_active_intents`` for the position's whole life, so returning
+        # unconditionally on any active intent left external-flatten
+        # detection permanently dead for every protected bot (measured on
+        # the Bybit lane: a venue-closed position kept a stale book for 47
+        # minutes and mis-sized the next folded reversal).
+        self._flat_observed_with_intents_since = 0.0
+
+        # Entry ids whose tracking the external-flatten clear above retired.
+        # Their close-leg fill may still arrive late (a reconnect backfill
+        # attributing the venue-side close after the grace expired); booking
+        # it against the already-cleared book would walk an empty FIFO and
+        # mint a phantom opposite position, so :meth:`_route_event` drops
+        # exactly those late close legs. A subsequent ENTRY fill for the
+        # same pine id re-arms normal routing (Pine ids are reused).
+        self._external_flatten_cleared_entry_ids: set[str] = set()
 
         # Broker order ids of ENTRY orders superseded by a cancel + re-execute
         # modify (:meth:`_dispatch_modify`). A late fill from the retired order
@@ -3242,15 +3288,30 @@ class OrderSyncEngine:
                             entry_price=broker_entry_price,
                         )
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
-            # Skip while bot-initiated work is in flight — a close we
+            # Wait while bot-initiated work may be in flight — a close we
             # dispatched ourselves will flatten /positions seconds before
             # the matching ``OrderEvent`` reaches the queue. Pre-empting the
             # event here would zero the position; the closing fill (which
             # arrives with a non-zero ``signed_delta``) would then enter
             # ``record_fill``'s ``Opening`` branch and be miscounted as a
-            # fresh entry in the opposite direction.
+            # fresh entry in the opposite direction. The wait is BOUNDED:
+            # an armed bracket keeps an ``ExitIntent`` in
+            # ``_active_intents`` for the position's whole life, so an
+            # unconditional return here would disable external-flatten
+            # detection for every protected bot — a venue-closed position
+            # whose fill the plugin failed to attribute then keeps a stale
+            # book for the rest of the cycle and mis-sizes every later
+            # folded reversal. An in-flight fill of our own arrives within
+            # seconds; a venue still flat after the grace with the book
+            # unmoved is an external flatten.
             if self._active_intents:
-                return
+                now = time.monotonic()
+                if self._flat_observed_with_intents_since == 0.0:
+                    self._flat_observed_with_intents_since = now
+                if (now - self._flat_observed_with_intents_since
+                        < EXTERNAL_FLATTEN_CONFIRM_GRACE_S):
+                    return
+            self._flat_observed_with_intents_since = 0.0
             spot_port = getattr(self._broker, 'spot_inventory_port', None)
             dust_threshold = getattr(
                 spot_port, 'position_dust_threshold', Decimal(0),
@@ -3271,12 +3332,31 @@ class OrderSyncEngine:
                     "clearing position state",
                     self._position.size,
                 )
+            # Retire the flattened entries' tracking BEFORE the clear:
+            # leaving the slots would make the diff call Pine's next
+            # re-emission of the same entry "unchanged" (signal swallowed)
+            # and keep amending its orphaned exit against a position the
+            # venue no longer holds. Remember the ids so a late-arriving
+            # close fill for them (a reconnect backfill attributing the
+            # venue-side close after the grace) is dropped instead of
+            # walking the now-empty FIFO into a phantom opposite position.
+            cleared_entry_ids = {
+                trade.entry_id for trade in self._position.open_trades
+                if trade.entry_id
+            }
             self._position.size = 0.0
             self._position.sign = 0.0
             self._position.avg_price = na_float
             self._position.open_trades.clear()
             self._position.openprofit = 0.0
             self._position.open_commission = 0.0
+            for entry_id in cleared_entry_ids:
+                self._external_flatten_cleared_entry_ids.add(entry_id)
+                self._cleanup_position_tracking(entry_id)
+        else:
+            # Venue and book agree (or the book is already flat): any earlier
+            # flat observation is obsolete.
+            self._flat_observed_with_intents_since = 0.0
 
     def _adopt_size_with_replayed_close(
             self,
@@ -3728,6 +3808,30 @@ class OrderSyncEngine:
                     event.fill_id,
                     event.pine_id,
                     event.order.id if event.order is not None else None,
+                )
+                return
+            # Late close leg of an entry the external-flatten clear already
+            # retired (:meth:`reconcile`): its exposure left the book when
+            # the clear ran, so booking the fill now would walk an empty
+            # FIFO into a phantom opposite position. A fresh ENTRY fill for
+            # the same pine id re-arms normal routing first — Pine reuses
+            # entry ids across trades.
+            if event.leg_type is LegType.ENTRY and event.pine_id:
+                self._external_flatten_cleared_entry_ids.discard(event.pine_id)
+            elif (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                     LegType.TRAILING_STOP, LegType.CLOSE)
+                    and self._external_flatten_cleared_entry_ids
+                    and ((event.from_entry or '')
+                         in self._external_flatten_cleared_entry_ids)):
+                # The id stays in the set: the venue-side close may arrive
+                # as several partial slices, and every one of them belongs
+                # to the already-cleared exposure. Only a fresh ENTRY fill
+                # (above) re-arms the id.
+                _blog_warning(
+                    "late close fill for externally flattened entry %r "
+                    "dropped — its exposure was already cleared from the "
+                    "book by the external-flatten reconcile",
+                    event.from_entry,
                 )
                 return
             # Post-restart settling-close guard. When a defensive close
@@ -4234,10 +4338,44 @@ class OrderSyncEngine:
             # longer exists on the broker (which on Capital.com fails
             # because the bracket-attached entry row is naturally
             # closed).
+            # ``record_fill`` already told us exactly which entries this fill
+            # consumed — that FIFO evidence is authoritative: it is
+            # independent of leg type, of where the book ended up, and of how
+            # the plugin labelled the event. Leaving a consumed entry behind
+            # is what strands a bot — the dead entry's slot still compares
+            # equal to Pine's next re-emission, so the diff calls a genuine
+            # re-entry "unchanged" and silently never dispatches it, while
+            # its orphaned exit keeps being modified against a position the
+            # venue has closed (the reject that halts Capital.com).
+            fifo_closed = [
+                closed_entry_id
+                for closed_entry_id in self._last_fifo_closed_entry_ids
+                # This fill's own entry: a same-id flatten-and-reopen puts it
+                # in the FIFO slice while the entry itself is live.
+                if closed_entry_id != event.pine_id
+                # Pyramiding: another trade under this entry survives, so its
+                # bracket and diff slot are still owed.
+                and not any(trade.entry_id == closed_entry_id
+                            for trade in self._position.open_trades)
+            ]
+            # The label-derived cleanup is only the FALLBACK for fills whose
+            # FIFO walk produced nothing (an adopted position with no
+            # reconstructable parent, or a plugin event ``record_fill``
+            # skipped). It must not run alongside the FIFO evidence: a
+            # netting fold's closing leg is labelled with the REVERSING
+            # intent's ``from_entry`` — the id that is about to open — so
+            # trusting the label there tears down the live new entry's
+            # tracking (measured on the cTrader lane: the folded close fill
+            # arrived as ``from_entry='S'`` while ``S`` was opening, wiping
+            # ``S``'s intent and bracket and later swallowing four re-entry
+            # signals as "unchanged").
             if (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
                                     LegType.TRAILING_STOP, LegType.CLOSE)
-                    and self._position.size == 0):
+                    and self._position.size == 0
+                    and not fifo_closed):
                 self._cleanup_closed_position(event)
+            for closed_entry_id in fifo_closed:
+                self._cleanup_position_tracking(closed_entry_id)
             # Defensive-close FILL: when a defensive-close marker is in
             # flight, the FILL event arrives carrying the synthetic
             # CloseIntent's pine_id rather than the parent entry id, so
@@ -16169,11 +16307,19 @@ class OrderSyncEngine:
         review — strictly better than an unhandled crash, and only reachable for a
         contract-violating plugin (a conforming one never lets these escape).
 
-        Unlike :meth:`_run_async_read`, a stdlib :class:`TimeoutError` is
-        deliberately NOT caught: the dispatch-bridge ``result(timeout=...)`` does
-        not cancel the still-running coroutine, so the order may yet land —
-        silently halting (or retrying) a wedged write could mis-handle a fill that
-        completes late. That case stays fatal, the pre-existing safe choice. A
+        Unlike :meth:`_run_async_read`, the dispatch bridge never abandons a
+        write on the first ``result(timeout=...)`` expiry: ``result`` does not
+        cancel the still-running coroutine, and every plugin bounds its own
+        venue calls (HTTP / wire timeouts) and then classifies the outcome —
+        Capital.com's slowest order POST bound is 50 s, above the default 30 s
+        window, so giving up at the first expiry would discard exactly the
+        classification the park machinery needs (measured live 2026-08-14: a
+        mid-outage EXIT dispatch outran the bridge and the raw ``TimeoutError``
+        killed the bot). The bridge therefore logs and keeps waiting on the
+        SAME future for a grace window sized above every plugin's worst-case
+        request bound; only a write still unresolved after that — a wedged
+        event loop or a plugin call with no timeout of its own, both contract
+        violations — escalates to the controlled halt. A
         non-retryable ``ProviderError`` (a permanent misconfiguration) propagates
         unchanged. The idempotent recovery composites (one-way replay, drain,
         bracket-clear) deliberately do NOT use this — they are wrapped in
@@ -16192,7 +16338,28 @@ class OrderSyncEngine:
         :raises BrokerManualInterventionError: On an untranslated transient fault.
         """
         try:
-            return self._run_async(coro)
+            if self._loop is None:
+                return asyncio.run(coro)
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            try:
+                return future.result(timeout=self._timeout)
+            except TimeoutError:
+                if future.done():
+                    # The COROUTINE itself raised a raw TimeoutError (a plugin
+                    # letting an asyncio timeout escape unclassified) — an
+                    # untranslated fault, not a slow bridge. Halt below.
+                    raise
+                _blog_warning(
+                    "order dispatch outran the %.0fs bridge window — the venue "
+                    "call is still in flight; waiting up to %.0fs more for the "
+                    "plugin's own timeout to classify the disposition",
+                    self._timeout, self._timeout * _WRITE_CLASSIFICATION_GRACE_MULT,
+                )
+                return future.result(
+                    timeout=self._timeout * _WRITE_CLASSIFICATION_GRACE_MULT,
+                )
+        except TimeoutError as exc:
+            raise self._untranslated_dispatch_halt(exc) from exc
         except ProviderError as exc:
             if not is_retryable_provider_error(exc):
                 raise

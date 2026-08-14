@@ -33,6 +33,7 @@ from pynecore.core.broker.exceptions import (
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
+    EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
     OrderSyncEngine,
     READ_STUCK_GRACE_S,
     _SEEN_FILL_IDS_CAP,
@@ -363,6 +364,187 @@ def __test_new_entry_dispatches_execute_entry__():
     assert b.entry_calls[0].intent.limit == 50_000.0
     assert engine.active_intents.keys() == {"L"}
     assert engine.order_mapping["L"] == ["xchg-1"]
+
+
+def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
+    """The fill that reverses a position must retire the entry it closed.
+
+    Pine folds a reversal into ONE opposite-direction entry, so on a netting
+    venue the fill that ends the long arrives as an ENTRY leg and leaves the
+    book short — neither a closing leg nor a flat book, which is all the
+    close-fill cleanup looks for. Left behind, the dead entry's slot compares
+    equal to Pine's next long, so the diff calls a genuine re-entry
+    "unchanged": the bot stops entering without raising anything, and its
+    orphaned exit keeps being modified against a position the venue closed.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -1.0, "S-X", stop=51_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id="S"))
+    assert pos.size == -1.0
+    assert b.exit_calls and b.modify_exit_calls == []
+
+    # Pine reverses long with ONE folded double-size buy. Its order book still
+    # carries the short and the short's bracket: in broker mode nothing prunes
+    # them, the engine's close-fill cleanup is what has to.
+    pos.entry_orders["L"] = _entry_order("L", 2.0)
+    engine.sync(BAR_TS + 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 2.0, 50_000.0, pine_id="L", xchg_id="xchg-2"))
+    assert pos.size == 1.0
+
+    assert "S" not in engine.active_intents
+    assert not [intent for intent in engine.active_intents.values()
+                if isinstance(intent, ExitIntent) and intent.from_entry == "S"]
+    assert ("S-X", "S") not in pos.exit_orders
+
+    # Pine goes short again with a fresh bracket. It has to go out as a NEW
+    # exit: amending the retired one is a modify against a position the venue
+    # closed, which is the reject that halted the bot.
+    pos.entry_orders["S"] = _entry_order("S", -2.0)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -2.0, "S-X", stop=51_500.0)
+    engine.sync(BAR_TS + 120_000)
+
+    assert [call.intent.pine_id for call in b.entry_calls] == ["S", "L", "S"]
+    assert b.modify_exit_calls == []
+
+
+def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
+    """Retiring on the FIFO frontier must not drop an entry that still holds.
+
+    With two trades under one id, a close that consumes only the older one
+    leaves the entry live — its bracket and its diff slot are still owed.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="L", entry_bar_index=0, entry_time=0,
+        entry_price=50_000.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+    pos.size = 2.0
+
+    # A one-unit close consumes the older trade only.
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-2"),
+        pine_id=None, from_entry="L",
+    ))
+
+    assert any(trade.entry_id == "L" for trade in pos.open_trades)
+    assert "L" in engine.active_intents
+
+
+def __test_folded_close_labelled_with_the_reversing_id_spares_the_new_entry__():
+    """A fold's closing leg labelled with the REVERSING id must not wipe it.
+
+    On a netting fold some venues (cTrader) report the closing leg under the
+    reversing intent's ``from_entry`` — the id that is about to OPEN. The
+    label-derived cleanup would tear down the live new entry's tracking and
+    bracket; the FIFO evidence (``record_fill`` consumed 'L') is authoritative
+    and the label is only a fallback for fills with no FIFO walk. Measured on
+    the cTrader lane: the wiped 'S' later swallowed four re-entry signals.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    # Pine reverses short: ONE folded SELL under 'S', with S's fresh bracket.
+    pos.entry_orders["S"] = _entry_order("S", -2.0)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -2.0, "S-X", stop=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+
+    # The venue reports the fold as TWO fills; the closing leg carries the
+    # reversing id 'S', not the entry it actually consumed ('L').
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_100.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-2"),
+        pine_id=None, from_entry="S",
+    ))
+    assert pos.size == 0.0
+    assert "L" not in engine.active_intents
+    assert "S" in engine.active_intents, \
+        "the mislabelled close tore down the live reversing entry"
+    assert ("S-X", "S") in pos.exit_orders
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_100.0, pine_id="S", xchg_id="xchg-3"))
+    assert pos.size == -1.0
+
+    # The next reversal back to long must dispatch — 'L' was retired, so the
+    # re-emitted entry is genuinely new to the diff.
+    pos.entry_orders["L"] = _entry_order("L", 2.0)
+    engine.sync(BAR_TS + 120_000)
+    assert [call.intent.pine_id for call in b.entry_calls] == ["L", "S", "L"]
+
+
+def __test_external_flatten_is_detected_despite_an_armed_bracket__():
+    """An armed bracket must not blind the engine to an external flatten.
+
+    The external-flatten branch used to return on ANY active intent — but a
+    protected position always holds an armed ``ExitIntent``, so the branch
+    was dead for every real bot: a venue-closed position whose fill was never
+    attributed kept a stale book for the rest of the cycle (measured on the
+    Bybit lane: 47 minutes blind, then a mis-sized folded reversal). The wait
+    is now BOUNDED: past the grace with the book unmoved, the flatten is
+    external — the state clears, the dead slots retire so the next signal
+    dispatches, and the close's late attribution cannot phantom-book.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+    assert engine.active_intents, "armed bracket should keep intents live"
+
+    # The venue flattens externally; reads show no position. The first
+    # observation only starts the confirmation clock — an in-flight fill of
+    # our own would look identical for a few seconds.
+    b.position = None
+    engine.reconcile()
+    assert pos.size == 1.0, "flat observation must not clear immediately"
+
+    # Still flat past the grace, no fill moved the book: external flatten.
+    engine._flat_observed_with_intents_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine.reconcile()
+    assert pos.size == 0.0
+    assert "L" not in engine.active_intents
+    assert ("L-X", "L") not in pos.exit_orders
+
+    # The venue-side close attributed LATE (reconnect backfill) must be
+    # dropped — booking it would walk the empty FIFO into a phantom short.
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-9"),
+        pine_id=None, from_entry="L",
+    ))
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+
+    # A fresh 'L' entry afterwards re-arms normal routing for the id.
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_200.0, pine_id="L", xchg_id="xchg-10"))
+    assert pos.size == 1.0
 
 
 def __test_entry_exchange_reject_does_not_halt_and_retries__():
@@ -1458,6 +1640,106 @@ def __test_late_rate_limit_from_timed_out_read_still_paces__():
         assert engine._read_backoff_until > time.monotonic(), \
             "late retry_after was discarded"
     finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_write_outrunning_the_bridge_waits_for_the_plugins_classification__():
+    """
+    A write that outruns the bridge window must NOT die on a raw
+    ``TimeoutError``: the venue call is still in flight and every plugin bounds
+    it with its own timeout, whose classification is exactly what the park
+    machinery needs (Capital.com's order POST bound is 50 s against the 30 s
+    default window — a mid-outage EXIT dispatch outran the bridge live and the
+    raw timeout killed the bot). The bridge keeps waiting on the same future
+    and delivers the plugin's late ``OrderDispositionUnknownError`` verbatim.
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+
+    async def _slow_classifying_write():
+        await release.wait()
+        raise OrderDispositionUnknownError(
+            "submit timed out mid-flight", client_order_id="coid-1",
+        )
+
+    b = MockBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.2,
+    )
+
+    try:
+        # Released only AFTER the first bridge window has expired but well
+        # inside the classification grace — the shape of a venue call whose
+        # own request timeout is longer than the engine's bridge window.
+        loop.call_soon_threadsafe(loop.call_later, 0.35, release.set)
+        with pytest.raises(OrderDispositionUnknownError):
+            engine._run_async_write(_slow_classifying_write())
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
+def __test_write_unresolved_past_the_grace_halts_controlled__():
+    """
+    A write still unresolved after the classification grace — a wedged loop or
+    a plugin venue call with no timeout of its own — must escalate to the
+    controlled :class:`BrokerManualInterventionError` halt, never escape as a
+    raw ``TimeoutError`` crash.
+    """
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+
+    release = asyncio.Event()
+
+    async def _wedged_write():
+        await release.wait()
+
+    b = MockBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b,  # type: ignore[arg-type]
+        position=pos,
+        symbol=SYMBOL,
+        run_tag=RUN_TAG,
+        event_loop=loop,
+        execute_timeout=0.1,
+    )
+
+    try:
+        with pytest.raises(BrokerManualInterventionError):
+            engine._run_async_write(_wedged_write())
+    finally:
+        # Release the wedged coroutine and let it finish BEFORE stopping the
+        # loop, so teardown never destroys a still-pending task.
+        loop.call_soon_threadsafe(release.set)
+
+        async def _drain():
+            return None
+
+        asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=5.0)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5.0)
         loop.close()
