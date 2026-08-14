@@ -9,13 +9,20 @@
 
 Only tracked files exist there. Consequences:
 
-- **pine2pyne is absent** (it is a sibling repo on the dev machine). The transpiled
-  `.py` files ARE committed next to every `.pine` — run those. NEVER use
-  `pyne compile` / `pyne run x.pine` (cloud compiler, no API key).
-- **`workdir/` config and the DNSE trading token are absent** → anything live
-  (`--broker`, the L0 gate, provider-mode data download) is IMPOSSIBLE. What still
-  works offline: `pytest plugins/dnse/tests/` (incl. the fake-venue e2e), and the
-  staged probes in backtest mode if OHLCV data is available.
+- **The pine2pyne transpiler installs from PyPI** — `pip install opencode-pine2pyne`,
+  then `python -m pine2pyne in.pine -o out.py`. (Transpiled `.py` files are also
+  committed next to every `.pine`.) Still NEVER `pyne compile` / `pyne run x.pine` —
+  that is the CLOUD compiler and needs an API key we don't have.
+- **OHLCV data IS tracked** in `workdir/data/` (force-added `.ohlcv` + `.toml` pairs:
+  dnse VN30F1M @1/3/5/15/1D, dnsebroker @1/3/5, HPG 1D, a ccxt BTC sample, replay
+  DEMO). Backtests therefore work offline in FILE MODE — pass the dataset name, e.g.
+  `pyne run script.py dnse_VN30F1M_1`. Provider mode (`dnse:VN30F1M@1`) still needs
+  API credentials and re-downloads, so avoid it in the sandbox. Note the tracked
+  files are snapshots from the dev machine; a provider-mode run there rewrites them.
+- **Credentials and the DNSE trading token are absent** → anything live (`--broker`,
+  the L0 gate) is IMPOSSIBLE. What works offline: `pytest plugins/dnse/tests/`
+  (incl. the fake-venue e2e), transpiling, and the staged probes in backtest/oracle
+  mode over the tracked data.
 - **The dev machine's memory/notes are absent.** The durable venue facts (cancel-ACK,
   no cascade, amend-500, GTD clamp, session phases) live in
   `plugins/dnse/testing/live_test/README.md` — read it before touching the plugin.
