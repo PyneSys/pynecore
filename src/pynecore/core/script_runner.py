@@ -2178,6 +2178,13 @@ class ScriptRunner:
                 # is recognised as a continuation of the last warmup bar
                 # instead of a fresh one.
                 last_bar_timestamp: int | None = last_warmup_timestamp
+                # Timestamp of the most recent bar the LIVE stream closed.
+                # Deliberately not seeded from the warmup: the last warmup bar
+                # may be the still-open current one ``download_ohlcv``
+                # returned, which the first live update legitimately refines
+                # under the same timestamp.
+                last_confirmed_timestamp: int | None = None
+                warned_about_stale_tick = False
                 sub_bars: list[OHLCV] = []
                 # The warmup loop just executed that bar, so an update continuing
                 # it has a run to discard.
@@ -2197,6 +2204,39 @@ class ScriptRunner:
 
                     candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
+
+                    # A non-closed update under an ALREADY-CLOSED bar's
+                    # timestamp carries a price from the NEXT period wearing
+                    # the previous period's clothes. Some feeds emit exactly
+                    # that: they push the close, then keep sending quote
+                    # updates against the same slot instead of opening the
+                    # next one. Executing it would re-run the confirmed bar
+                    # and overwrite its OHLC, so every series derived from
+                    # that bar — an EMA, an ATR, the ``close[1]`` a crossover
+                    # compares against — would end up built from a tick that
+                    # belongs to a later bar. The bar is settled: feed the UI
+                    # hook (the price itself is current and the callback owns
+                    # no series state) and drop the update. Warned once per
+                    # run — the provider is mis-stamping its intra-bar
+                    # updates, and silently dropping them would turn a feed
+                    # defect into "the strategy just runs less often".
+                    if (not candle.is_closed
+                            and last_confirmed_timestamp is not None
+                            and candle.timestamp <= last_confirmed_timestamp):
+                        if not warned_about_stale_tick:
+                            warned_about_stale_tick = True
+                            broker_warning(
+                                "feed sends intra-bar updates under the "
+                                "timestamp of the bar it already closed "
+                                "(ts=%d); dropping them so the confirmed bar "
+                                "keeps its own OHLC — the strategy runs on "
+                                "bar closes only until the provider stamps "
+                                "them with the forming bar's slot",
+                                candle.timestamp,
+                            )
+                        if on_tick is not None:
+                            on_tick(candle)
+                        continue
 
                     if is_new_bar:
                         # Pre-increment on bar open; intra-bar ticks for the
@@ -2263,6 +2303,7 @@ class ScriptRunner:
 
                     elif bar_update.is_closed:
                         # ── Bar close ──
+                        last_confirmed_timestamp = candle.timestamp
                         if is_new_bar:
                             sub_bars = []
                             bar_executed = False

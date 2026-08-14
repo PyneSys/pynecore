@@ -82,18 +82,20 @@ def __test_live_continuation_of_warmup_bar_drops_its_drawings__(
     assert [r['lines'] for r in results] == [1, 2, 2]
 
 
-def __test_update_after_bar_close_replaces_that_bars_run__(
+def __test_update_after_bar_close_leaves_that_bars_run_alone__(
         script_path, module_key, syminfo):
-    """ A non-closed update repeating a closed bar's timestamp replaces its run """
+    """ A non-closed update repeating a closed bar's timestamp is dropped """
     from pynecore.core import viz
     from pynecore.lib import line as line_mod
 
     historical = [_make_ohlcv(0, 100.0), _make_ohlcv(60, 101.0)]
     live = [
         _make_ohlcv(120, 102.0, is_closed=True),
-        # Providers keep emitting intra-bar updates under the closed bar's
-        # timestamp until the next one opens; only duplicate CLOSED bars are
-        # filtered out upstream, so this reaches the runner
+        # Some providers keep emitting intra-bar updates under the closed
+        # bar's timestamp instead of opening the next slot; only duplicate
+        # CLOSED bars are filtered out upstream, so this reaches the runner.
+        # Its price belongs to the NEXT period, so re-running the settled bar
+        # with it would overwrite that bar's committed OHLC.
         _make_ohlcv(120, 102.5, is_closed=False),
         _make_ohlcv(180, 103.0, is_closed=True),
     ]
@@ -109,12 +111,10 @@ def __test_update_after_bar_close_replaces_that_bars_run__(
     finally:
         viz.reset_state()
 
-    # One line per bar: bar 2's post-close update re-executes that bar instead
-    # of stacking a second line on top of the run it already committed
+    # One line per bar, and no extra run for the dropped update.
     assert [r['lines'] for r in results] == [1, 2, 3, 4]
-    # ...and the surviving line of bar 2 is the LAST run's, so the update did
-    # re-execute the body rather than being ignored
-    assert drawn == [(0, 100.0), (1, 101.0), (2, 102.5), (3, 103.0)]
+    # Bar 2 keeps the line its own confirmed run drew, at its own close.
+    assert drawn == [(0, 100.0), (1, 101.0), (2, 102.0), (3, 103.0)]
 
 
 def __test_new_live_bar_keeps_its_own_drawing__(script_path, module_key, syminfo):

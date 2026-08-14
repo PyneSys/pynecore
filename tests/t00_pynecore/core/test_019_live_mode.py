@@ -4,7 +4,7 @@
 import sys
 import itertools
 
-from pynecore.lib import script, barstate
+from pynecore.lib import script, barstate, close
 from pynecore.types import Persistent, IBPersistent
 
 
@@ -22,6 +22,8 @@ def main():
         "conf": 1 if barstate.isconfirmed else 0,
         "new": 1 if barstate.isnew else 0,
         "lch": 1 if barstate.islastconfirmedhistory else 0,
+        "c": close,
+        "c1": close[1],
     }
 
 
@@ -194,3 +196,38 @@ def __test_no_live_bars_unchanged_behavior__(script_path, module_key, syminfo):
         assert plot_data["rt"] == 0
         assert plot_data["var"] == i + 1
         assert plot_data["varip"] == i + 1
+
+
+def __test_ticks_under_a_closed_bar_timestamp_do_not_corrupt_history__(
+        script_path, module_key, syminfo,
+):
+    """Intra-bar ticks reusing a closed bar's timestamp must not rewrite its close.
+
+    Some feeds (Capital.com) push the bar close first and then keep sending
+    intra-bar quote updates under that SAME timestamp until the next close
+    arrives, instead of opening the next bar's slot. Those updates re-execute
+    the already-confirmed bar, so the ``close`` the script sees for it must
+    still be the confirmed value when the NEXT bar closes — otherwise every
+    series built on it (an EMA, a crossover) is computed from a quote tick
+    that belongs to the following period.
+    """
+    historical = [_make_ohlcv(0, 100.0)]
+    live = [
+        _make_ohlcv(60, is_closed=True, close=101.0),    # bar 60 closes
+        _make_ohlcv(60, is_closed=False, close=105.0),   # tick under bar 60's ts
+        _make_ohlcv(60, is_closed=False, close=110.0),   # another one
+        _make_ohlcv(120, is_closed=True, close=102.0),   # bar 120 closes
+    ]
+
+    runner = _create_live_runner(
+        script_path, module_key, syminfo,
+        _chain_live(historical, live),
+    )
+    results = [(c, dict(p)) for c, p in runner.run_iter()]
+
+    # Only the closed bars yield: historical 0, live 60, live 120.
+    assert len(results) == 3
+    assert results[1][1]["conf"] == 1 and results[1][1]["c"] == 101.0
+    # The confirmed close of bar 60 — not the 110.0 quote tick that followed it.
+    assert results[2][1]["conf"] == 1 and results[2][1]["c"] == 102.0
+    assert results[2][1]["c1"] == 101.0
