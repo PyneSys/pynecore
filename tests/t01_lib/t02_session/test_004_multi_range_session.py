@@ -51,6 +51,25 @@ def __test_overnight_range_beside_daytime_range__():
     assert _is_bar_in_session(_ms(2021, 1, 4, 11), infos, "60") is True
 
 
+def __test_overnight_range_covers_its_boundary_bars__():
+    """An overnight session follows the same overlap rule as a same-day one
+
+    A bar counts when any part of it falls inside the session, so the last bar
+    of the night (starting before the end, ending after it) and the first one
+    (starting before the start, ending after it) are both in session.
+    """
+    infos = _parse_session_string("2200-0600", "UTC")
+    # 05:30 starts inside, ends at 06:30 -- the last bar of the session.
+    assert _is_bar_in_session(_ms(2021, 1, 4, 5, 30), infos, "60") is True
+    # 21:30 starts before the session, ends at 22:30 -- the first bar.
+    assert _is_bar_in_session(_ms(2021, 1, 4, 21, 30), infos, "60") is True
+    # 20:00 with a 4h bar runs to midnight, well into the session.
+    assert _is_bar_in_session(_ms(2021, 1, 4, 20), infos, "240") is True
+    # Fully outside on both ends stays out.
+    assert _is_bar_in_session(_ms(2021, 1, 4, 6), infos, "60") is False
+    assert _is_bar_in_session(_ms(2021, 1, 4, 12), infos, "60") is False
+
+
 def __test_malformed_range_still_rejected__():
     """A broken range anywhere in the list invalidates the whole specification"""
     for session in ("0400-0700,0900", "0400-0700,09000-1300", "0400-0700,2500-2600"):

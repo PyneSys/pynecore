@@ -991,6 +991,9 @@ def second(time: int | None = None, timezone: str | None = None) -> int:
 
 ### Session parsing and validation helpers ###
 
+_MINUTES_PER_DAY = 24 * 60
+
+
 def _parse_session_string(session: str, timezone: str | None = None) -> tuple['SessionInfo', ...]:
     """
     Parse a session string into one SessionInfo per time range.
@@ -1062,13 +1065,29 @@ def _parse_session_string_cached(session: str, timezone: str) -> tuple['SessionI
             end_hour = int(end_str[:2])
             end_minute = int(end_str[2:])
 
-            # Validate time values
-            if not (0 <= start_hour <= 23 and 0 <= start_minute <= 59):
+            # Validate time values -- hour 24 is a legal "end of day" hour ("0000-2400"
+            # is the usual all-day session), hour 25 and above is rejected.
+            if not (0 <= start_hour <= 24 and 0 <= start_minute <= 59):
                 raise ValueError(f"Invalid start time: {start_str}")
-            if not (0 <= end_hour <= 23 and 0 <= end_minute <= 59):
+            if not (0 <= end_hour <= 24 and 0 <= end_minute <= 59):
                 raise ValueError(f"Invalid end time: {end_str}")
 
-            ranges.append((dt_time(start_hour, start_minute), dt_time(end_hour, end_minute)))
+            # The start is wrapped into the day, the end is not: measured on
+            # TradingView, "2430-1200" runs 00:30-12:00 while "0930-2430" runs to 00:30
+            # of the NEXT day. An end at or before the start is the next day's, and a
+            # range covering 24 hours or more is the whole day -- encoded as equal
+            # endpoints, which :func:`_is_bar_in_session` reads as the all-day session.
+            start_minutes = (start_hour * 60 + start_minute) % _MINUTES_PER_DAY
+            end_minutes = end_hour * 60 + end_minute
+            if end_minutes <= start_minutes:
+                end_minutes += _MINUTES_PER_DAY
+            if end_minutes - start_minutes >= _MINUTES_PER_DAY:
+                end_minutes = start_minutes
+            else:
+                end_minutes %= _MINUTES_PER_DAY
+
+            ranges.append((dt_time(*divmod(start_minutes, 60)),
+                           dt_time(*divmod(end_minutes, 60))))
 
         except ValueError as e:
             raise ValueError(f"Invalid time values in session: {session}") from e
@@ -1140,6 +1159,10 @@ def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]
     # Calculate bar end time
     bar_end_dt = bar_dt_local + timedelta(seconds=tf_seconds)
     bar_end_time = bar_end_dt.time()
+    # A bar ending at or past midnight wraps its time-of-day back to 00:00 or later,
+    # which would read as "before the session start" in the same-day comparison. Such
+    # a bar runs to the end of the day, so it ends after every session start.
+    bar_ends_next_day = bar_end_dt.date() != bar_dt_local.date()
 
     for session_info in session_infos:
         # Check if the day is in the session days
@@ -1154,16 +1177,23 @@ def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]
 
         # Handle overnight sessions
         if session_info.is_overnight:
-            # Session spans midnight (e.g., 22:00-06:00)
-            # Bar is in session if it starts after session start OR ends before session end
+            # Session spans midnight (e.g., 22:00-06:00): on any given day it
+            # covers [start, 24:00) plus the previous session's [00:00, end).
+            # Same overlap contract as the same-day branch below -- the bar is in
+            # session when any part of it falls inside one of those two spans:
+            # it starts in the evening part, it starts in the early-morning part,
+            # or it starts before the start and runs into it (a bar ending past
+            # midnight always does, and its wrapped end time cannot be compared).
             in_session = (bar_time >= session_info.start_time or
-                          bar_end_time <= session_info.end_time)
+                          bar_time < session_info.end_time or
+                          bar_ends_next_day or
+                          bar_end_time > session_info.start_time)
         else:
             # Normal session within same day
             # Bar is in session if it overlaps with the session time range
             # Bar overlaps if: bar_start < session_end AND bar_end > session_start
             in_session = (bar_time < session_info.end_time and
-                          bar_end_time > session_info.start_time)
+                          (bar_ends_next_day or bar_end_time > session_info.start_time))
 
         if in_session:
             return True

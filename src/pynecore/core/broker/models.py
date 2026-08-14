@@ -546,6 +546,16 @@ class EntryIntent:
     # keeps it out of the diff equality: it is a dispatch route selector derived
     # by the engine, not Pine-level state the diff needs to sync.
     stop_fired_market: bool = field(default=False, compare=False)
+    # ``True`` when the Pine ``Order`` behind this intent re-placed an unfilled
+    # same-bar entry under the same id. TradingView modifies the standing order
+    # with the RAW quantity — the reversal flip the replaced order carried is not
+    # computed again — so the MARKET stop-and-reverse fold in
+    # :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._dispatch_new`
+    # must be skipped for it, exactly as ``strategy.entry`` skips it in the
+    # simulator. ``compare=False`` for the same reason as above: it is a dispatch
+    # route selector, and letting it flip the diff would re-dispatch an entry the
+    # broker already holds.
+    skip_flip: bool = field(default=False, compare=False)
 
     @property
     def intent_key(self) -> str:

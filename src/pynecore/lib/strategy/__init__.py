@@ -170,10 +170,12 @@ class Order:
         "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
+        "skip_flip",  # Entry re-placed on the same bar: it keeps its raw qty, no flip augmentation
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
         "reserved_size",  # Exit-leg slice of the entry's original size (frozen at creation)
+        "bound_size",  # Size of everything bound to the entry when this leg reserved its slice
         "rest_leg",  # Exit leg with no explicit qty/qty_percent: closes the WHOLE bound entry
         "consumed",  # True once an exit leg fired its slice while its entry is still open
         "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
@@ -252,10 +254,12 @@ class Order:
         # bound-size reservation must not double-count the filled slice.
         self.filled_qty = 0.0
         self.flip_extra = 0.0
+        self.skip_flip = False
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
         self.from_entry_na = False
         self.reserved_size = abs(size)
+        self.bound_size = 0.0
         self.rest_leg = False
         self.consumed = False
         # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
@@ -1260,8 +1264,12 @@ class SimPosition(PositionBase):
             self.new_closed_trades.extend(new_closed_trades)
 
             # close_all overshoot: when deferred MC reduced position, close_all
-            # captures original size and overshoots → create opposite position
-            if (order.order_id is None and order.size != 0.0 and
+            # captures original size and overshoots → create opposite position.
+            # The leftover must be a real lot: a reversal's closing leg ends on a
+            # sub-lot float residue (the position is snapped to the grid before it
+            # can be absorbed into the last fill), and opening that as a trade
+            # leaves a ~1e-18 ghost holding a pyramiding slot the next entry needs.
+            if (order.order_id is None and _size_round(order.size) != 0.0 and
                     order.order_type == _order_type_close):
                 entry_id = order.exit_id
                 overshoot_trade = Trade(
@@ -2343,6 +2351,7 @@ class SimPosition(PositionBase):
                     and not o.consumed and o.book_seq is None and o.size != 0.0):
                 grown = _size_round(o.reserved_size + extra)
                 o.reserved_size = grown
+                o.bound_size = _size_round(o.bound_size + extra)
                 o.size = math.copysign(grown, o.size)
 
     def _cancel_unaffordable_entries(self) -> None:
@@ -2746,7 +2755,7 @@ class SimPosition(PositionBase):
                             # Pyramiding limit reached - don't add the order
                             self._remove_order(order)
                             continue
-                    elif self.size != 0.0:
+                    elif self.size != 0.0 and not order.skip_flip:
                         # TradingView calculates the flip quantity 1st order processing
                         # then open a new one in the opposite direction.
                         order.size -= self.size  # Subtract because position.size has opposite sign
@@ -3355,7 +3364,7 @@ class SimPosition(PositionBase):
                         if script.pyramiding <= len(self.open_trades):
                             self._remove_order(order)
                             return
-                    elif self.size != 0.0:
+                    elif self.size != 0.0 and not order.skip_flip:
                         order.size -= self.size
 
             # Slippage: market + stop fills get slipped against the order direction,
@@ -4489,6 +4498,16 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             elif margin_needed > equity:
                 return
 
+    # Re-placing an entry under an id that already has an unfilled order from this
+    # same bar MODIFIES that order, and the modification carries the raw qty only:
+    # the reversal flip the replaced order was built with is not computed again.
+    # Measured on TradingView (BINANCE:BTCUSDT 30m): with a 10-contract long open,
+    # one strategy.entry(short, 4) reverses to 4 short, while the SAME call issued
+    # twice on one bar sells only 4 and leaves 6 long.
+    existing_entry = position.entry_orders.get(id)
+    skip_flip = (existing_entry is not None and not existing_entry.cancelled
+                 and existing_entry.bar_index == int(lib.bar_index))
+
     # If it is not a market order, we should check pyramiding and flip conditions here
     # Market orders are checked at the order processing time
     flip_extra = 0.0
@@ -4500,7 +4519,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
                 # Pyramiding limit reached - don't add the order
                 return
 
-        elif position.size != 0.0:
+        elif position.size != 0.0 and not skip_flip:
             # TradingView calculates the flip quantity at order creation time,
             # not at execution time. If we have an opposite direction position,
             # we need to add the position size to the order size to flip it.
@@ -4511,6 +4530,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
+    order.skip_flip = skip_flip
     # Only price-based orders re-size at execution; a market entry keeps its
     # placement-time (signal close) quantity — TV rejects it at the next open
     # when that quantity can no longer be margined, rather than re-sizing.
@@ -4602,10 +4622,24 @@ def exit(id: str, from_entry: str = "",
         # closes). Only sticky exit legs (book_seq is None) count as siblings;
         # a stacked strategy.close()/close_all() partial (book_seq set) is an
         # immediate market close, not a reservation against this leg.
+        # A sibling that reserved its slice against a DIFFERENT bound size holds a
+        # stale share: the entry it is bound to has since grown (a pyramid add) or
+        # shrunk (an entry order re-placed at a smaller size). It re-derives its own
+        # slice the next time the script issues it, so it must not block this leg in
+        # the meantime -- otherwise a shrunk bracket stays frozen at its first size
+        # and stops tracking the stop level the script keeps moving.
+        # A leg restored by ``BrokerPosition.reconstruct_exit_order`` after a restart
+        # carries no basis at all (``bound_size`` stays 0.0, which no issued leg can
+        # have -- a zero bound reserves nothing and returns above). It still holds a
+        # real live broker reservation, so it counts until the script re-issues it
+        # and stamps its own basis; skipping it would let the reissued sibling
+        # reserve the whole entry and protect more exposure than the script allocated.
+        bound = abs(init_size)
         sibling = sum(o.reserved_size for o in position.exit_orders.values()
                       if o.order_id == from_entry and o is not existing
-                      and o.book_seq is None)
-        unreserved = abs(init_size) - sibling
+                      and o.book_seq is None
+                      and (o.bound_size == bound or o.bound_size == 0.0))
+        unreserved = bound - sibling
         # A qty/qty_percent leg is capped at the unreserved remainder --
         # TradingView never lets a later exit call take a slice a pre-existing
         # leg already holds. Verified on live TV (BINANCE:BTCUSDT 30m probes):
@@ -4734,6 +4768,7 @@ def exit(id: str, from_entry: str = "",
                 order.trail_stop = existing.trail_stop
 
         order.rest_leg = is_rest_leg
+        order.bound_size = bound
         position._add_order(order)
         # A brand-new trailing leg (first issue, or trailing added to a live
         # bracket) and an identical re-issue fold the issue bar's extreme into
@@ -4774,6 +4809,18 @@ def exit(id: str, from_entry: str = "",
                                 and position.sign == pending.sign
                                 and lib._script.pyramiding <= len(position.open_trades))
             unfilled = 0.0 if rejected_pyramid else abs(pending.size) - pending.filled_qty
+            # Only the part of a reversal order that actually OPENS is bindable: the
+            # rest closes the opposite position, which carries its own bracket. A
+            # market order whose flip is still added at processing already carries
+            # the openable size; an order that has the flip baked in (a price-based
+            # entry, or one whose flip was consumed by the order it replaced) does
+            # not. Counting the closing leg here reserved half of the ORDER instead
+            # of half of the position, so a sibling leg then found nothing left and
+            # the whole sticky bracket stopped re-issuing its updated stop.
+            flip_pending = (pending.limit is None and pending.stop is None
+                            and not pending.skip_flip)
+            if not flip_pending and position.size != 0.0 and position.sign != pending.sign:
+                unfilled -= abs(position.size)
             if unfilled > 0.0:
                 total += unfilled
         for open_trade in position.open_trades:

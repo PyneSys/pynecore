@@ -117,6 +117,23 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
 
     The async methods run in a background thread; the framework bridges them
     to the synchronous :class:`ScriptRunner` via a :class:`queue.Queue`.
+
+    Every blocking call these methods hand to a worker thread (``asyncio.to_thread``
+    and any other default-executor use) must carry its own enforceable timeout.
+    Shutdown cancels the awaiting *task*, never the worker running the call, and
+    such a worker is not a daemon thread: one blocking SDK call that never returns
+    keeps the interpreter from exiting even after the runner's own thread is gone.
+    An SDK without a timeout parameter therefore belongs behind something that can
+    be terminated from outside, not in the event loop's executor.
+    """
+
+    initial_connect_timeout: float = 30.0
+    """Total seconds allowed for the initial connection and its transient retries.
+
+    Providers whose authenticated startup can legitimately include a longer
+    venue-requested backoff may raise this bound. A single ``connect()`` attempt
+    is also cancelled at the remaining deadline so broker startup cannot proceed
+    while the provider is still half-connected.
     """
 
     reconnect_delay: float = 1.0
@@ -183,6 +200,38 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
         :param timeframe: Timeframe in TradingView format (e.g. ``"1D"``, ``"1"``, ``"4H"``).
         :return: An :class:`OHLCV` with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
+
+    # --- Startup gap recovery ---
+
+    # noinspection PyMethodMayBeStatic
+    async def backfill_closed_bars(
+            self, symbol: str, timeframe: str, since_ms: int,
+    ) -> list[OHLCV]:
+        """Return closed bars the venue produced after ``since_ms``.
+
+        Historical warmup data is downloaded *before* the live subscription is
+        established, so every bar that closes while the subscription is being
+        set up falls into a hole: the download no longer covers it and the
+        stream does not reach back to it. The framework calls this right after
+        the subscription comes up and splices the result between the warmup and
+        the stream. A slow handshake is enough to lose a bar — measured on a
+        live cTrader lane, a 20 s subscribe silently dropped one M1 bar while
+        the same run on Bybit (1 s subscribe) lost none.
+
+        Implementations should return only bars that are genuinely closed,
+        strictly after ``since_ms``, in ascending timestamp order. Returning
+        the still-forming bar would hand the strategy a partial bar as final.
+
+        The default returns nothing, which keeps the historical behaviour for
+        providers that cannot query history on the live connection.
+
+        :param symbol: The symbol in provider-specific format.
+        :param timeframe: Timeframe in TradingView format.
+        :param since_ms: Opening timestamp of the last bar the framework
+            already has; only later bars are wanted.
+        :return: Closed bars in ascending order, possibly empty.
+        """
+        return []
 
     # --- Reconnection hooks (override for custom behavior) ---
 

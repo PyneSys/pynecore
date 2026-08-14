@@ -129,3 +129,27 @@ def __test_no_qty_exit_sizes_to_net_position_not_double__(live_env):
     assert exit_intents[0].qty == pytest.approx(0.001)
     # A whole-row bracket, not a partial-qty one.
     assert exit_intents[0].is_partial_qty_bracket is False
+
+
+def __test_restart_reconstructed_sibling_still_caps_a_reissued_leg__(live_env):
+    """A restart-restored bracket keeps reserving its slice against later legs.
+
+    ``reconstruct_exit_order`` rebuilds the leg from the durable ledger, which
+    does not carry the bound size the original reservation was derived from. The
+    leg still holds a live broker reservation, so a sibling issued afterwards
+    must be capped at the remainder instead of arming protection for the whole
+    position.
+    """
+    entry = Order("Long", 10.0, order_type=_order_type_entry)
+    live_env.entry_orders["Long"] = entry
+    live_env.record_fill(_buy_fill(10.0, 50_000.0, pine_id="Long"))
+
+    live_env.reconstruct_exit_order(
+        pine_id="SL", from_entry="Long", side="sell", qty=3.0,
+        tp_price=None, sl_price=48_000.0, trail_price=None, trail_offset=None,
+    )
+
+    strategy.exit("TP", from_entry="Long", qty=8.0, limit=52_000.0)
+
+    reissued = live_env.exit_orders[("TP", "Long")]
+    assert abs(reissued.size) == pytest.approx(7.0)

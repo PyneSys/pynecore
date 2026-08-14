@@ -123,6 +123,11 @@ def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
     exactly once per fresh intent — folding here would make a stale
     retained order's qty flap with the net position and re-trigger the
     diff (measured on the Capital.com demo E2E, 2026-07-10).
+
+    ``Order.skip_flip`` rides along so that fold can be suppressed for an entry
+    re-placed on its own bar: TV modifies the standing order with the raw
+    quantity and never recomputes the flip, so folding it at dispatch would
+    reverse a position the script only meant to reduce.
     """
     oca_name, oca_type_str = _coerce_oca(order)
     return EntryIntent(
@@ -138,6 +143,7 @@ def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
         comment=_na_to_none(order.comment),
         alert_message=_na_to_none(order.alert_message),
         is_strategy_order=(order.order_type == _order_type_normal),
+        skip_flip=order.skip_flip,
     )
 
 

@@ -735,6 +735,19 @@ class OrderSyncEngine:
         # conservatively reserves the full quantity — the safe direction on a
         # short-incapable venue.
         self._active_entry_filled_qty: dict[str, float] = {}
+        # Live MARKET entry dispatches that carry the stop-and-reverse fold
+        # (:meth:`_dispatch_new` sizes them as ``raw qty + |opposite
+        # position|``), keyed by ``intent_key``; the value is the FOLDED intent
+        # actually sent to the broker. ``_active_intents`` deliberately keeps
+        # the RAW intent, and ``EntryIntent.skip_flip`` is ``compare=False``, so
+        # a same-bar re-placement of that very order (TradingView amends the
+        # standing order with the raw quantity and does NOT recompute the flip)
+        # is invisible to the equality diff. This map is what lets
+        # :meth:`_diff_and_dispatch` still notice it and resize the working
+        # order back down to the raw quantity. Written on a fresh dispatch,
+        # retired when the order is amended (:meth:`_dispatch_modify`) or when
+        # its envelope dies (:meth:`_drop_envelope`).
+        self._flip_folded_entry_dispatches: dict[str, EntryIntent] = {}
         # Intents the engine decided to cancel but whose cancel did NOT
         # provably complete. Two feeders: the fill-time short-gate reconcile
         # (:meth:`_reconcile_short_gate_after_fill`) parks on a dropped link
@@ -4962,6 +4975,11 @@ class OrderSyncEngine:
         # reservation): seeded in :meth:`_dispatch_new`, read by
         # :meth:`_enforce_short_gate`, retired here with the envelope.
         self._active_entry_filled_qty.pop(key, None)
+        # Same lifecycle for the stop-and-reverse fold record: written in
+        # :meth:`_dispatch_new` when the folded MARKET entry goes live, read by
+        # :meth:`_diff_and_dispatch` to unwind a same-bar re-placement, retired
+        # here with the envelope.
+        self._flip_folded_entry_dispatches.pop(key, None)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 
@@ -10752,6 +10770,85 @@ class OrderSyncEngine:
                     # arming the engine legs.
                     continue
                 self._active_intents[key] = intent
+            elif (isinstance(intent, EntryIntent)
+                  and intent.skip_flip
+                  and key in self._flip_folded_entry_dispatches):
+                # Same-bar re-placement of the very MARKET entry whose live
+                # dispatch carries the stop-and-reverse fold. TradingView amends
+                # the standing order with the RAW quantity — it does not
+                # recompute the flip — and the simulator mirrors that through
+                # ``Order.skip_flip``. Reaching this branch means the raw intent
+                # compares EQUAL to the active slot (``skip_flip`` is
+                # ``compare=False``), so without it the diff would call the
+                # re-placement "unchanged" and leave the reversing quantity
+                # working at the broker: the live account flips to the opposite
+                # side where TV and the simulator merely reduce. The window is
+                # real under ``calc_on_every_tick``: the first tick dispatches
+                # the fold, a later tick on the same bar re-emits the same call
+                # and only then sets ``skip_flip``.
+                #
+                # Resizing is exactly what a same-bar qty CHANGE already does on
+                # this key (``_dispatch_modify`` dispatches the new intent raw,
+                # it never folds) — this branch only extends that to the
+                # quantity-identical case the equality diff cannot see.
+                folded = self._flip_folded_entry_dispatches[key]
+                if folded.qty <= intent.qty:
+                    # Nothing was actually added on the wire — leave it be.
+                    self._active_intents[key] = intent
+                    continue
+                # A slice of the folded dispatch may already be done. The done
+                # part cannot be taken back, but the excess REMAINDER must not
+                # keep working: it is what would carry the account past the
+                # reduction the script asked for into the reversal it did not.
+                # What may still work is the simulator's own notion of an
+                # entry's live remainder (``abs(order.size) - filled_qty``, see
+                # the bindable-size accounting in ``strategy.exit``): the raw
+                # quantity minus the confirmed fills. Once the fills reach the
+                # raw quantity that remainder is zero and the rest is cancelled
+                # outright.
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+                remaining = round(intent.qty - filled, 12)
+                if remaining <= 1e-9:
+                    _blog_info(
+                        "same-bar re-placement of %s is already satisfied by "
+                        "the fold's fills (filled=%s raw=%s) — cancelling the "
+                        "working remainder of the stop-and-reverse fold",
+                        format_intent_key(key), filled, intent.qty,
+                    )
+                    self._dispatch_cancel(folded)
+                    # Keep the slot as the sticky diff sentinel (same role as
+                    # the consumed-market-entry slots above): dropping it would
+                    # make the next sync see a brand-new key and re-dispatch
+                    # the very exposure just cancelled.
+                    self._flip_folded_entry_dispatches.pop(key, None)
+                    self._active_intents[key] = intent
+                    continue
+                replacement = (intent if filled <= 0.0
+                               else dataclasses.replace(intent, qty=remaining))
+                _blog_info(
+                    "same-bar re-placement of %s unwinds the stop-and-reverse "
+                    "fold (working=%s -> raw=%s filled=%s -> dispatching %s)",
+                    format_intent_key(key), folded.qty, intent.qty, filled,
+                    replacement.qty,
+                )
+                try:
+                    self._dispatch_modify(folded, replacement)
+                except OrderSkippedByPlugin as e:
+                    # Same contract as the modify branch above: the old order is
+                    # already cancelled and the plugin declined the replacement,
+                    # so the exchange holds nothing for this key.
+                    _blog_warning("%s", e)
+                    self._active_intents.pop(key, None)
+                    continue
+                except (_QuarantineModifyDeferred,
+                        OrderDispositionUnknownError):
+                    # No replacement was dispatched and the folded order is
+                    # still working. Keep the slot on the OLD intent so the next
+                    # sync re-enters this branch and retries the unwind (the
+                    # fold record survives — only a successful amend retires
+                    # it).
+                    continue
+                self._active_intents[key] = intent
             # else: unchanged — skip
 
     def _build_envelope(self, intent: Intent) -> DispatchEnvelope:
@@ -11885,11 +11982,24 @@ class OrderSyncEngine:
         # raw quantity simply nets against the venue position (an opposite-
         # side order(qty=3) on a 5-long reduces to 2, it does not target a
         # 3-short), so folding it would oversell by the position size.
+        # ``skip_flip`` excludes an entry that re-placed an unfilled same-bar
+        # order under the same id: TV modifies the standing order with the raw
+        # quantity and does NOT recompute the flip (the simulator mirrors this
+        # in ``strategy.entry``), so folding it here would open the opposite
+        # side where both TV and the simulator merely reduce.
+        if _coid_spent_retry == 0 and isinstance(intent, EntryIntent):
+            # A fresh dispatch cycle supersedes whatever the previous cycle on
+            # this key was folded to. The internal COID-spent retries below
+            # recurse with the ALREADY folded intent, so they must neither
+            # clear nor re-record it — hence the ``_coid_spent_retry == 0``
+            # guard on both halves.
+            self._flip_folded_entry_dispatches.pop(intent.intent_key, None)
         if (_coid_spent_retry == 0
                 and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
                 and not intent.stop_fired_market
                 and not intent.is_strategy_order
+                and not intent.skip_flip
                 and self._position.size != 0.0
                 and ((intent.side == 'buy') == (self._position.size < 0.0))):
             # Round to 12 decimals — finer than any real lot step, but
@@ -11898,6 +12008,11 @@ class OrderSyncEngine:
                 intent,
                 qty=round(intent.qty + abs(self._position.size), 12),
             )
+            # Remember what actually went on the wire: the diff needs it to
+            # unwind the fold if the script re-places this very order on the
+            # same bar (see the ``skip_flip`` branch in
+            # :meth:`_diff_and_dispatch`).
+            self._flip_folded_entry_dispatches[intent.intent_key] = intent
         # Short gate: judged on the folded quantity, before the envelope is
         # built (nothing to clean up on a halt).
         if isinstance(intent, EntryIntent):
@@ -15052,6 +15167,13 @@ class OrderSyncEngine:
                 # amend that preserves ``filled_qty`` only over-reserves by the
                 # pre-amend slice — the safe direction, never a short.
                 self._active_entry_filled_qty[new.intent_key] = 0.0
+                # The amend replaced the working order with ``new`` verbatim —
+                # ``_dispatch_modify`` never folds — so whatever
+                # stop-and-reverse fold the superseded dispatch carried is no
+                # longer on the wire. Retire the record; leaving it would let a
+                # later same-bar re-placement try to unwind a fold that no
+                # longer exists.
+                self._flip_folded_entry_dispatches.pop(new.intent_key, None)
                 # Keep the both-set entry's software STOP leg in step with the
                 # amended native LIMIT. modify_entry preserves the LIMIT's
                 # KIND_ENTRY coid (the envelope anchor is pinned across amend

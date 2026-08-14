@@ -391,6 +391,537 @@ def __test_initial_connect_permanent_error_fails_fast__():
     assert provider.connect_calls == 1
 
 
+def __test_initial_connect_uses_provider_timeout_and_cancels_stalled_attempt__():
+    """A provider-specific startup bound cancels a connect that never returns."""
+    import pytest
+
+    class StalledProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        async def connect(self):
+            await asyncio.Event().wait()
+
+    provider = StalledProvider([])
+    started = time.monotonic()
+
+    with pytest.raises(
+        TimeoutError,
+        match="initial provider connection exceeded its timeout",
+    ):
+        list(
+            live_ohlcv_generator(
+                provider,
+                "BTC/USDT",
+                "1D",
+                raise_on_connect_failure=True,
+            )
+        )
+
+    assert time.monotonic() - started < 1.0
+    assert not provider.is_connected
+
+
+def __test_initial_connect_timeout_ignores_a_swallowed_cancellation__():
+    """A connect that suppresses its cancellation is still a startup failure.
+
+    The deadline is decided on "did ``connect()`` finish in time", not on how it
+    reacted to the cancellation — otherwise a provider that catches the
+    ``CancelledError`` and returns would be reported as connected long after the
+    bound, and the broker would start trading against it.
+    """
+    import pytest
+
+    class CancellationSwallowingProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        async def connect(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+
+    provider = CancellationSwallowingProvider([])
+    started = time.monotonic()
+
+    with pytest.raises(
+        TimeoutError,
+        match="initial provider connection exceeded its timeout",
+    ):
+        list(
+            live_ohlcv_generator(
+                provider,
+                "BTC/USDT",
+                "1D",
+                raise_on_connect_failure=True,
+            )
+        )
+
+    assert time.monotonic() - started < 1.0
+    assert not provider.is_connected
+
+
+def __test_late_landing_connect_is_disconnected_after_teardown__():
+    """A handshake that lands AFTER the deadline must not survive teardown.
+
+    The cancellation sent to a timed-out ``connect()`` is best-effort, so a
+    provider that swallows it can still open the connection once the startup
+    failure has already been reported and ``disconnect()`` has run. On a
+    caller-owned loop that task stays alive, so the runner chains a closing
+    ``disconnect()`` onto it instead of leaving a live venue connection behind a
+    failed startup.
+    """
+    import pytest
+
+    second_disconnect = threading.Event()
+
+    class LateConnectProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        def __init__(self, bar_updates):
+            super().__init__(bar_updates)
+            self.disconnect_calls = 0
+
+        async def connect(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Swallow it and finish the handshake anyway — past the bound.
+                self._connected = True
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+            self._connected = False
+            if self.disconnect_calls >= 2:
+                second_disconnect.set()
+
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def _drive_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop.call_soon(loop_ready.set)
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=_drive_loop, daemon=True)
+    loop_thread.start()
+    loop_ready.wait(timeout=2.0)
+
+    provider = LateConnectProvider([])
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="initial provider connection exceeded its timeout",
+        ):
+            list(
+                live_ohlcv_generator(
+                    provider,
+                    "BTC/USDT",
+                    "1D",
+                    event_loop=loop,
+                    raise_on_connect_failure=True,
+                )
+            )
+
+        assert second_disconnect.wait(timeout=2.0)
+        assert not provider.is_connected
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2.0)
+        loop.close()
+
+
+def __test_late_landing_connect_cleanup_completes_on_the_owned_loop__():
+    """The closing ``disconnect()`` must finish before the runner's own loop dies.
+
+    On the default ``event_loop=None`` path the producer thread runs
+    ``asyncio.run``, which closes the loop right after its exit-time task sweep.
+    A disconnect merely *scheduled* from a done-callback at that point is
+    destroyed while pending — the venue connection would stay open behind a
+    startup that reported failure — so teardown has to drive it to completion
+    while the loop is still its own.
+    """
+    import pytest
+
+    class LateConnectProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        def __init__(self, bar_updates):
+            super().__init__(bar_updates)
+            self.disconnect_completions = 0
+
+        async def connect(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Swallow it and finish the handshake anyway — past the bound.
+                self._connected = True
+
+        async def disconnect(self):
+            # A real close is a multi-step handshake (unsubscribe, close frame,
+            # socket teardown); every step needs a loop that is still running.
+            # ``asyncio.run``'s post-sweep phase only turns the loop a handful of
+            # times, so a close scheduled that late cannot get through this.
+            for _ in range(500):
+                await asyncio.sleep(0)
+            self._connected = False
+            self.disconnect_completions += 1
+
+    provider = LateConnectProvider([])
+
+    with pytest.raises(
+        TimeoutError,
+        match="initial provider connection exceeded its timeout",
+    ):
+        list(
+            live_ohlcv_generator(
+                provider,
+                "BTC/USDT",
+                "1D",
+                raise_on_connect_failure=True,
+            )
+        )
+
+    assert provider.disconnect_completions == 2
+    assert not provider.is_connected
+
+
+def __test_late_landing_connect_closes_itself_past_the_grace_window__():
+    """A handshake landing after teardown's window must still close itself.
+
+    Teardown can only hold the provider loop open for a bounded window — a
+    handshake that never finishes must not hold the shutdown. What lands after
+    that window used to be left to a done-callback, which on the
+    ``event_loop=None`` path fires while ``asyncio.run`` is already tearing the
+    loop down: the disconnect it schedules is not part of the exit-time task
+    sweep, so it is destroyed while pending and the venue connection survives a
+    startup that reported failure. Carrying the closing ``disconnect()`` inside
+    the connect task instead makes it part of what that sweep already awaits.
+    """
+    import pytest
+    from pynecore.core import live_runner as _live_runner_mod
+
+    closed_after_landing = threading.Event()
+
+    class _SlowLateConnectProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        async def connect(self):
+            # Swallow every cancellation and finish the handshake anyway, well
+            # past the window teardown is willing to wait for it.
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    continue
+            self._connected = True
+
+        async def disconnect(self):
+            # A real close is a multi-step handshake (unsubscribe, close frame,
+            # socket teardown); every step needs a loop that is still turning.
+            for _ in range(500):
+                await asyncio.sleep(0)
+            if self._connected:
+                # Only the close that follows the LATE landing has anything to
+                # do — teardown's own disconnect ran before the handshake
+                # completed, on a provider that was not connected yet.
+                self._connected = False
+                closed_after_landing.set()
+
+    provider = _SlowLateConnectProvider([])
+    _orig_grace = _live_runner_mod._LATE_CONNECT_GRACE_S
+    # Shorter than the handshake, so the landing is guaranteed to fall OUTSIDE
+    # the window teardown waits out inline.
+    _live_runner_mod._LATE_CONNECT_GRACE_S = 0.05
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="initial provider connection exceeded its timeout",
+        ):
+            list(
+                live_ohlcv_generator(
+                    provider,
+                    "BTC/USDT",
+                    "1D",
+                    raise_on_connect_failure=True,
+                )
+            )
+
+        assert closed_after_landing.wait(timeout=5.0), \
+            "late handshake stayed connected past teardown"
+        assert not provider.is_connected
+    finally:
+        _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_grace
+
+
+def __test_uncancelling_late_connect_is_still_closed__():
+    """A handshake that ``uncancel()``s itself is still an abandoned one.
+
+    Suppressing a ``CancelledError`` and then calling
+    :meth:`asyncio.Task.uncancel` is the documented way for a coroutine to adopt
+    a cancellation — and it zeroes the ``Task.cancelling()`` counter. Reading
+    abandonment off that counter therefore let such a handshake pass for an
+    ordinary success: no closing ``disconnect()`` ran and the venue connection
+    outlived a startup that had already reported failure. The runner marks the
+    handshake abandoned itself, before it cancels, so ``uncancel()`` cannot
+    erase the decision.
+    """
+    import pytest
+    from pynecore.core import live_runner as _live_runner_mod
+
+    closed_after_landing = threading.Event()
+
+    class _UncancellingConnectProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        @staticmethod
+        def _adopt_cancellation() -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                task.uncancel()
+
+        async def connect(self):
+            # Land well past the window teardown waits out inline, so the
+            # provider's own disconnect() has definitely already run against a
+            # not-yet-connected provider by the time the handshake completes.
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                try:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    self._adopt_cancellation()
+            self._connected = True
+
+        async def disconnect(self):
+            if self._connected:
+                self._connected = False
+                closed_after_landing.set()
+
+    provider = _UncancellingConnectProvider([])
+    _orig_grace = _live_runner_mod._LATE_CONNECT_GRACE_S
+    _live_runner_mod._LATE_CONNECT_GRACE_S = 0.05
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="initial provider connection exceeded its timeout",
+        ):
+            list(
+                live_ohlcv_generator(
+                    provider,
+                    "BTC/USDT",
+                    "1D",
+                    raise_on_connect_failure=True,
+                )
+            )
+
+        assert closed_after_landing.wait(timeout=5.0), \
+            "handshake that uncancelled itself kept its connection open"
+        assert not provider.is_connected
+    finally:
+        _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_grace
+
+
+def __test_wedged_hook_does_not_hold_the_provider_thread__():
+    """A hook that never stops suppressing its cancel must not pin teardown.
+
+    Detaching the hook lets ``_graceful_shutdown`` run, but it does not end the
+    provider thread: the owned loop's exit sweep used to gather every leftover
+    task without a deadline, so the wedged hook kept the thread alive — and with
+    ``shutdown_timeout=0`` ("wait forever") the consumer's join has no bound of
+    its own, so ``close()`` never returned. The sweep is bounded now: the loop
+    closes without the hook and the thread ends.
+    """
+    from pynecore.core import live_runner as _live_runner_mod
+
+    class _WedgedReconnectProvider(MockLiveProvider):
+        def __init__(self):
+            super().__init__([])
+            self.reconnect_entered = threading.Event()
+            self._connect_calls = 0
+
+        async def connect(self):
+            self._connect_calls += 1
+            if self._connect_calls == 1:
+                self._connected = True
+                return
+            self.reconnect_entered.set()
+            # Never finishes, and never lets a cancellation through.
+            while True:
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    continue
+
+        async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+            self._connected = False
+            raise ConnectionError("feed dropped")
+
+    provider = _WedgedReconnectProvider()
+    _orig_hook_grace = _live_runner_mod._HOOK_CANCEL_GRACE_S
+    _orig_late_grace = _live_runner_mod._LATE_CONNECT_GRACE_S
+    _orig_sweep_grace = _live_runner_mod._LOOP_SWEEP_GRACE_S
+    _live_runner_mod._HOOK_CANCEL_GRACE_S = 0.05
+    _live_runner_mod._LATE_CONNECT_GRACE_S = 0.05
+    _live_runner_mod._LOOP_SWEEP_GRACE_S = 0.05
+    try:
+        before = {t.ident for t in threading.enumerate()}
+        # ``shutdown_timeout=0`` = wait forever: the join below has no bound, so
+        # only a thread that really ends can let ``close()`` return.
+        gen = live_ohlcv_generator(
+            provider, "BTC/USDT", "1D", shutdown_timeout=0,
+        )
+        producer = next(
+            t for t in threading.enumerate()
+            if t.name == "live-provider" and t.ident not in before
+        )
+        it = iter(gen)
+        next(it)  # LIVE_TRANSITION — the first connect() succeeded
+
+        assert provider.reconnect_entered.wait(timeout=5.0), \
+            "runner never reached the wedged reconnect"
+
+        # Closing on another thread so a regression fails the test instead of
+        # hanging it: the pre-fix behaviour blocks here forever.
+        closed = threading.Event()
+
+        def _close_generator() -> None:
+            gen.close()
+            closed.set()
+
+        closer = threading.Thread(target=_close_generator, daemon=True)
+        closer.start()
+        assert closed.wait(timeout=10.0), \
+            "shutdown hung on a hook that never stops suppressing its cancel"
+
+        producer.join(timeout=2.0)
+        assert not producer.is_alive(), "provider thread outlived the shutdown"
+    finally:
+        _live_runner_mod._HOOK_CANCEL_GRACE_S = _orig_hook_grace
+        _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_late_grace
+        _live_runner_mod._LOOP_SWEEP_GRACE_S = _orig_sweep_grace
+
+
+def __test_blocking_hook_in_executor_does_not_hold_the_provider_thread__():
+    """A hook's blocking SDK call must not pin teardown from the executor.
+
+    Cancelling a hook that ran its blocking call through ``asyncio.to_thread``
+    ends the TASK at once but not the executor WORKER, so the bounded task sweep
+    sees nothing pending — and the loop wind-down that follows used to JOIN that
+    worker without a deadline, keeping the provider thread (and with
+    ``shutdown_timeout=0`` the consumer's join) alive for as long as the SDK call
+    ran. Neither wind-down step can outlast its window now.
+    """
+    from pynecore.core import live_runner as _live_runner_mod
+
+    class _ExecutorWedgedProvider(MockLiveProvider):
+        def __init__(self):
+            super().__init__([])
+            self.reconnect_entered = threading.Event()
+            self.release = threading.Event()
+            self._connect_calls = 0
+
+        async def connect(self):
+            self._connect_calls += 1
+            if self._connect_calls == 1:
+                self._connected = True
+                return
+            self.reconnect_entered.set()
+            # Blocking SDK call parked in the loop's default executor: the
+            # cancellation below reaches the task, never this worker.
+            await asyncio.to_thread(self.release.wait)
+
+        async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+            self._connected = False
+            raise ConnectionError("feed dropped")
+
+    provider = _ExecutorWedgedProvider()
+    _orig_hook_grace = _live_runner_mod._HOOK_CANCEL_GRACE_S
+    _orig_late_grace = _live_runner_mod._LATE_CONNECT_GRACE_S
+    _orig_sweep_grace = _live_runner_mod._LOOP_SWEEP_GRACE_S
+    _live_runner_mod._HOOK_CANCEL_GRACE_S = 0.05
+    _live_runner_mod._LATE_CONNECT_GRACE_S = 0.05
+    _live_runner_mod._LOOP_SWEEP_GRACE_S = 0.05
+    try:
+        before = {t.ident for t in threading.enumerate()}
+        # ``shutdown_timeout=0`` = wait forever: nothing but a thread that really
+        # ends can let ``close()`` return.
+        gen = live_ohlcv_generator(
+            provider, "BTC/USDT", "1D", shutdown_timeout=0,
+        )
+        producer = next(
+            t for t in threading.enumerate()
+            if t.name == "live-provider" and t.ident not in before
+        )
+        it = iter(gen)
+        next(it)  # LIVE_TRANSITION — the first connect() succeeded
+
+        assert provider.reconnect_entered.wait(timeout=5.0), \
+            "runner never reached the blocking reconnect"
+
+        # Closing on another thread so a regression fails the test instead of
+        # hanging it: the pre-fix behaviour blocks here until the worker returns.
+        closed = threading.Event()
+
+        def _close_generator() -> None:
+            gen.close()
+            closed.set()
+
+        closer = threading.Thread(target=_close_generator, daemon=True)
+        closer.start()
+        assert closed.wait(timeout=10.0), \
+            "shutdown hung on a blocking hook parked in the default executor"
+
+        producer.join(timeout=2.0)
+        assert not producer.is_alive(), "provider thread outlived the shutdown"
+    finally:
+        # Let the executor worker go: it is NOT a daemon thread, so leaving it
+        # blocked would wedge interpreter exit rather than just this test.
+        provider.release.set()
+        _live_runner_mod._HOOK_CANCEL_GRACE_S = _orig_hook_grace
+        _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_late_grace
+        _live_runner_mod._LOOP_SWEEP_GRACE_S = _orig_sweep_grace
+
+
+def __test_startup_failure_does_not_wait_for_the_shutdown_budget__():
+    """A ``connect()`` that never stops cancelling must not hold up startup.
+
+    Such a task keeps the producer thread's loop alive forever, so the reap on
+    the failure path is bounded by the startup window — not by
+    ``shutdown_timeout``, whose "0 = wait forever" setting would otherwise hang
+    the caller instead of handing it the real connect error.
+    """
+    import pytest
+
+    class NeverStoppingProvider(MockLiveProvider):
+        initial_connect_timeout = 0.05
+
+        async def connect(self):
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    continue
+
+    provider = NeverStoppingProvider([])
+    started = time.monotonic()
+
+    with pytest.raises(
+        TimeoutError,
+        match="initial provider connection exceeded its timeout",
+    ):
+        list(
+            live_ohlcv_generator(
+                provider,
+                "BTC/USDT",
+                "1D",
+                shutdown_timeout=0.0,  # "wait forever" for a real shutdown
+                raise_on_connect_failure=True,
+            )
+        )
+
+    assert time.monotonic() - started < 3.0
+
+
 # --- Queue overflow tests ---
 
 class FloodProvider(MockLiveProvider):
@@ -1414,3 +1945,92 @@ def __test_shutdown_during_reconnect_is_prompt__():
     # shutdown_timeout + 5 producer join. A few seconds of slack absorbs the
     # loop teardown; the pre-fix behaviour blocked ~35 s.
     assert elapsed < 10.0, f"shutdown blocked for {elapsed:.1f}s during reconnect"
+
+
+class _CancelResistantReconnectProvider(MockLiveProvider):
+    """Connects once, then swallows the shutdown's cancel on the reconnect.
+
+    Cancellation is a request, not a guarantee: a provider hook that catches its
+    ``CancelledError`` and keeps working (the "adopted cancel" shape seen on
+    real broker SDKs) goes on running long after teardown asked it to stop.
+    """
+
+    def __init__(self):
+        super().__init__([])
+        self.reconnect_entered = threading.Event()
+        self.disconnect_times: list[float] = []
+        self._connect_calls = 0
+
+    async def connect(self):
+        self._connect_calls += 1
+        if self._connect_calls == 1:
+            self._connected = True
+            return
+        self.reconnect_entered.set()
+        # Reconnect attempt: keeps running for well over the grace window no
+        # matter how often it is cancelled.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                continue
+
+    async def disconnect(self):
+        self.disconnect_times.append(time.monotonic())
+        self._connected = False
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        # First live pull fails -> drives the reconnect path.
+        self._connected = False
+        raise ConnectionError("feed dropped")
+
+
+def __test_shutdown_detaches_a_cancel_resistant_reconnect_hook__():
+    """Teardown must not be pinned by a hook that ignores its cancellation.
+
+    ``_await_or_stop`` cancels the in-flight hook and then waits for it, but the
+    cancel is only a request: a ``connect()`` / ``on_reconnect()`` that swallows
+    it kept ``_async_loop`` parked on that wait, so ``_graceful_shutdown`` never
+    ran — the provider was never disconnected and no sentinel reached the
+    consumer. With ``shutdown_timeout=0`` ("wait forever") the caller's join has
+    no bound either, so the whole shutdown hung on the provider's goodwill. The
+    wait is now bounded: the hook is detached, and teardown proceeds.
+    """
+    from pynecore.core import live_runner as _live_runner_mod
+
+    provider = _CancelResistantReconnectProvider()
+    _orig_hook_grace = _live_runner_mod._HOOK_CANCEL_GRACE_S
+    _orig_late_grace = _live_runner_mod._LATE_CONNECT_GRACE_S
+    # Both windows shorter than the hook's 2 s of cancel-resistance, so the
+    # test measures the bound rather than the hook.
+    _live_runner_mod._HOOK_CANCEL_GRACE_S = 0.05
+    _live_runner_mod._LATE_CONNECT_GRACE_S = 0.05
+    try:
+        gen = live_ohlcv_generator(
+            provider, "BTC/USDT", "1D", shutdown_timeout=1.0,
+        )
+        it = iter(gen)
+        next(it)  # LIVE_TRANSITION — connect() succeeded, feed is live
+
+        assert provider.reconnect_entered.wait(timeout=5.0), \
+            "runner never reached the cancel-resistant reconnect"
+
+        start = time.monotonic()
+        gen.close()
+
+        # The reconnect path already disconnected once before its attempt, so
+        # only the closes that follow the shutdown signal are teardown's. The
+        # first of them is ``_graceful_shutdown``'s — the one that used to be
+        # unreachable until the hook felt like returning. (A later one belongs
+        # to the detached hook closing what it opened, hence "first", not
+        # "last".)
+        after_shutdown = [t - start for t in provider.disconnect_times if t >= start]
+        assert after_shutdown, "graceful shutdown never disconnected the provider"
+        assert after_shutdown[0] < 1.0, (
+            "teardown waited out the cancel-resistant hook before disconnecting "
+            f"({after_shutdown[0]:.1f}s)"
+        )
+    finally:
+        _live_runner_mod._HOOK_CANCEL_GRACE_S = _orig_hook_grace
+        _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_late_grace

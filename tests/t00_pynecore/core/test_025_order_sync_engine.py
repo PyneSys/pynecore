@@ -8315,6 +8315,120 @@ def __test_market_add_dispatch_keeps_raw_qty__():
     assert b.entry_calls[0].intent.qty == 0.0002
 
 
+def __test_same_bar_replaced_market_entry_is_not_folded__():
+    """An entry re-placed on its own bar carries the RAW quantity: TV modifies
+    the standing order without recomputing the flip, so the dispatch must sell
+    only the replacement size instead of reversing the whole position."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    order = _entry_order("S", -4.0)
+    order.skip_flip = True
+    pos.entry_orders["S"] = order
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 4.0
+
+
+def __test_same_bar_replacement_unwinds_an_already_dispatched_fold__():
+    """``calc_on_every_tick``: the first sync of the bar dispatches the folded
+    reversal, a later sync of the SAME bar sees the order re-placed with the raw
+    quantity (``skip_flip``). ``skip_flip`` is excluded from intent equality, so
+    the diff would call it unchanged — the engine must still resize the working
+    order down to the raw quantity, or the live account reverses where TV and the
+    simulator merely reduce."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -4.0)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert b.entry_calls[0].intent.qty == 14.0  # 4 + |10|, the reversal fold
+
+    # Same bar, next tick: the script re-places the same entry. Nothing filled
+    # yet, so the position the fold was computed against is unchanged.
+    replaced = _entry_order("S", -4.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1  # no second entry dispatch
+    assert len(b.modify_entry_calls) == 1
+    old_env, new_env = b.modify_entry_calls[0]
+    assert old_env.intent.qty == 14.0
+    assert new_env.intent.qty == 4.0
+    # A further tick with the same re-placed order is a genuine no-op.
+    engine.sync(BAR_TS)
+    assert len(b.modify_entry_calls) == 1
+
+
+def __test_partially_filled_fold_is_resized_to_the_remaining_raw_qty__():
+    """A slice of the fold already filled: the done part cannot be taken back,
+    but the working remainder must be cut to what the raw replacement still has
+    left to fill (raw - filled), never left at the reversal size."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -4.0)
+
+    engine.sync(BAR_TS)
+    assert b.entry_calls[0].intent.qty == 14.0
+
+    engine._active_entry_filled_qty["S"] = 1.5  # noqa - partial fill landed
+
+    replaced = _entry_order("S", -4.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert len(b.modify_entry_calls) == 1
+    old_env, new_env = b.modify_entry_calls[0]
+    assert old_env.intent.qty == 14.0
+    assert new_env.intent.qty == 2.5  # raw 4 - filled 1.5
+    assert b.cancel_calls == []
+
+
+def __test_fold_filled_past_the_raw_qty_cancels_the_remainder__():
+    """The fold already filled more than the whole raw replacement, so nothing
+    is left for it to work: the remainder is cancelled outright instead of being
+    allowed to carry the account into the reversal."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -4.0)
+
+    engine.sync(BAR_TS)
+    assert b.entry_calls[0].intent.qty == 14.0
+
+    engine._active_entry_filled_qty["S"] = 6.0  # noqa - partial fill landed
+
+    replaced = _entry_order("S", -4.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
+
+    engine.sync(BAR_TS)
+
+    assert b.modify_entry_calls == []
+    assert len(b.cancel_calls) == 1
+    assert b.cancel_calls[0].intent.pine_id == "S"
+    # The slot stays occupied: a further tick must not re-dispatch the very
+    # exposure that was just cancelled.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    assert len(b.cancel_calls) == 1
+
+
 def __test_limit_reversal_dispatch_is_not_folded_again__():
     """LIMIT/STOP entries fold at creation (``strategy.entry`` subtracts the
     position size) — the dispatch fold must not double-count them."""

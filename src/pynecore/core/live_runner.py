@@ -41,13 +41,14 @@ the bar simply gets one more execution with the refined OHLC values.
 """
 import asyncio
 import logging
+import sys
 import time
 import threading
 from collections.abc import Coroutine, Generator
 from datetime import datetime
 from queue import Queue, Empty, Full
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
@@ -112,10 +113,11 @@ class LiveBarStreamer:
             syminfo=self._syminfo,
             last_historical_timestamp=self._last_historical_timestamp,
         )
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._drain, daemon=True, name=f"sec-stream-{self._symbol}",
         )
-        self._thread.start()
+        self._thread = thread
+        thread.start()
 
     def _drain(self) -> None:
         assert self._gen is not None
@@ -308,6 +310,27 @@ _FEED_STALE_FLOOR_S = 90.0
 # the first synth of a streak warns, then every Nth; the rest are DEBUG.
 _SYNTH_WARN_EVERY = 10
 
+# How long teardown keeps the provider loop alive for an abandoned
+# ``connect()`` to land (see ``_graceful_shutdown``). Bounded on purpose: a
+# handshake that never finishes must not hold the shutdown. Exposed at module
+# scope so tests can shrink it instead of spending the full window.
+_LATE_CONNECT_GRACE_S = 5.0
+
+# How long the reconnect path waits for a CANCELLED provider hook (``connect``
+# / ``disconnect`` / ``on_disconnect`` / ``on_reconnect``) to actually finish
+# before detaching it. Without a bound a hook that swallows its
+# ``CancelledError`` pins ``_async_loop`` before it can reach
+# ``_graceful_shutdown``, and with ``shutdown_timeout=0`` (wait forever) the
+# consumer's join never returns. Exposed at module scope so tests can shrink it.
+_HOOK_CANCEL_GRACE_S = 5.0
+
+# How long the runner-owned loop's exit sweep waits for whatever is still
+# pending after ``_graceful_shutdown`` has run (see :func:`_close_owned_loop`).
+# Bounded for the same reason as the two windows above: a task that never
+# finishes cancelling must not keep the provider thread — and with it the
+# consumer's join — alive. Exposed at module scope so tests can shrink it.
+_LOOP_SWEEP_GRACE_S = 5.0
+
 
 def _warn_this_attempt(attempts: int) -> bool:
     """Reconnect-log rate policy: WARNING for the first attempts of an
@@ -346,6 +369,127 @@ def _is_transient_connect_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _discard_task_outcome(task: 'asyncio.Task') -> None:
+    """Consume a detached task's result so asyncio never logs it as unretrieved.
+
+    Used for a ``provider.connect()`` task abandoned at its deadline: the
+    cancellation may take arbitrarily long (or never complete) in a provider that
+    swallows it, so the caller must not await it — but the eventual exception
+    still has to be retrieved somewhere.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+class _AbandonMarker:
+    """Runner-owned "this handshake was given up on" flag.
+
+    Abandonment cannot be read back off the task itself: suppressing a
+    ``CancelledError`` and then calling :meth:`asyncio.Task.uncancel` is the
+    documented way for a coroutine to adopt a cancellation, and it zeroes the
+    :meth:`asyncio.Task.cancelling` counter — a handshake doing that would look
+    like an ordinary success and keep its connection open. So the runner records
+    the decision itself, before it cancels.
+    """
+
+    __slots__ = ('abandoned',)
+
+    def __init__(self) -> None:
+        self.abandoned = False
+
+
+async def _connect_closing_if_abandoned(provider: LiveProviderPlugin,
+                                        opening: Coroutine[Any, Any, None],
+                                        marker: _AbandonMarker) -> None:
+    """Run a connection-opening handshake, closing it again if it was abandoned.
+
+    The runner never awaits a ``connect()`` it gave up on — that unbounded wait
+    is exactly what the deadline race exists to avoid — so the cancellation it
+    sends instead is best-effort: a provider that swallows it goes on and
+    finishes the handshake after teardown has already disconnected, leaving a
+    live venue connection behind a run that reported failure. Closing that from
+    a done-callback is not enough, because the callback fires while the loop is
+    already being torn down (the exit-time task sweep runs right before the loop
+    is closed) and nothing awaits what the callback schedules. Doing it INSIDE
+    the connect task keeps the close part of the very task that sweep already
+    waits for, so it survives however late the handshake lands.
+
+    :param provider: Provider whose connection has to be closed again.
+    :param opening: The ``connect()`` coroutine to run.
+    :param marker: Flag the runner sets before cancelling this handshake.
+    """
+    await opening
+    if not marker.abandoned:
+        return
+    try:
+        await provider.disconnect()
+    except (OSError, RuntimeError):
+        pass
+
+
+def _close_owned_loop(loop: 'asyncio.AbstractEventLoop') -> None:
+    """Close the runner-owned provider loop, sweeping leftovers with a bound.
+
+    ``asyncio.run`` does this for us on the way out, but its sweep gathers every
+    remaining task with no deadline: a single detached hook that keeps
+    suppressing its ``CancelledError`` (see :data:`_HOOK_CANCEL_GRACE_S`) parks
+    the provider thread there indefinitely, and since ``shutdown_timeout=0``
+    ("wait forever") leaves the consumer's join unbounded too, the whole shutdown
+    hangs on that provider's goodwill. Everything that matters — ``can_shutdown``
+    polling, ``disconnect()``, the window for late handshakes to close themselves
+    — has already run in ``_graceful_shutdown`` by the time we get here, so what
+    is still pending gets a grace window and then the loop closes without it.
+
+    :param loop: The loop this runner created and therefore owns.
+    """
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        if pending:
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(
+                asyncio.wait(pending, timeout=_LOOP_SWEEP_GRACE_S))
+            for task in pending:
+                if task.done() and not task.cancelled():
+                    task.exception()  # consume, never logged as unretrieved
+            stuck = sum(1 for t in pending if not t.done())
+            if stuck:
+                logger.warning(
+                    "%d provider task(s) ignored their cancellation; closing the "
+                    "provider loop without them", stuck)
+        # The two wind-down steps ``asyncio.run`` also performs — bounded here,
+        # because provider code reaches both. ``shutdown_asyncgens`` runs the
+        # ``aclose()`` finalisation of the provider's own feed generators, and
+        # ``shutdown_default_executor`` JOINS the default executor's workers, so
+        # a hook that put its blocking SDK call there (``asyncio.to_thread``)
+        # pins this thread for as long as that call runs — cancelling the task
+        # does not stop the worker. CPython bounds the join too (``asyncio.run``
+        # passes ``THREAD_JOIN_TIMEOUT``); this is the same idea on the runner's
+        # own, much shorter window.
+        def _bounded(coro: Coroutine[Any, Any, None], what: str) -> None:
+            try:
+                loop.run_until_complete(
+                    asyncio.wait_for(coro, _LOOP_SWEEP_GRACE_S))
+            except TimeoutError:
+                logger.warning(
+                    "%s did not finish within %.1fs; closing the provider loop "
+                    "without it", what, _LOOP_SWEEP_GRACE_S)
+
+        _bounded(loop.shutdown_asyncgens(), "Provider async generator shutdown")
+        # Only from 3.12 does the executor step survive being cut short: there
+        # the join sits in an ``else`` branch that a cancellation skips, while
+        # 3.11 runs it from a ``finally`` no timeout can escape — wrapping THAT
+        # in ``wait_for`` would still block right here. On 3.11 the step is
+        # therefore skipped outright; ``loop.close()`` below ends in the very
+        # same non-blocking ``executor.shutdown(wait=False)`` the bounded path
+        # falls back to, it just forgoes the grace window for work that is, by
+        # this point, orphaned anyway (its awaiting task is already gone).
+        if sys.version_info >= (3, 12):
+            _bounded(loop.shutdown_default_executor(), "Executor thread shutdown")
+    finally:
+        loop.close()
 
 
 def live_ohlcv_generator(
@@ -433,14 +577,28 @@ def live_ohlcv_generator(
     # ``call_soon_threadsafe`` (see ``_consumer``), keeping teardown event-driven
     # and bounded even when a reconnect is in flight. Populated by ``_async_loop``
     # with its running loop + event once it starts.
-    shutdown_signal: dict[str, Any] = {}
+    shutdown_loop: asyncio.AbstractEventLoop | None = None
+    shutdown_event: asyncio.Event | None = None
     # Signalled by ``_async_loop`` once ``provider.connect()`` has either
     # succeeded (WS subscribed, ready to receive bars) or failed (with
     # the exception already pushed into ``bar_queue``). Used to make
     # ``live_ohlcv_generator`` block until the WS is up before returning
     # — see module docstring for why warmup must follow connect.
     connected_event = threading.Event()
-    connect_timeout_seconds = 30.0
+    connect_timeout_seconds = max(
+        0.1,
+        float(getattr(provider, "initial_connect_timeout", 30.0)),
+    )
+    # How long the construction site reaps the producer thread when STARTUP
+    # fails (connect timed out or failed fast). Deliberately independent of
+    # ``shutdown_timeout``: that budget belongs to an operator-requested
+    # shutdown of a RUNNING bot that may have work to wind down, while here the
+    # run never started and there is nothing to drain. The fault being handled
+    # is also precisely a producer that may never stop — a ``connect()`` that
+    # swallows its cancellation keeps the loop's exit-time task sweep, and with
+    # it the thread, alive for the whole grace window — so an unbounded (or
+    # two-minute) join would only delay handing the caller the real error.
+    startup_join_timeout = min(max(connect_timeout_seconds, 1.0), 10.0)
     # Holds the exception from a fast-failing ``provider.connect()``. Appended
     # before ``connected_event`` is set (so the construction-site read below
     # synchronises on the event and observes it), letting the caller re-raise
@@ -448,6 +606,36 @@ def live_ohlcv_generator(
     # only surfaces on the first pull — too late, by which point
     # ``start_broker()`` has masked it. See ``raise_on_connect_failure``.
     connect_failure: list[BaseException] = []
+    # Connection-opening handshakes abandoned when they outlived their bound:
+    # the startup deadline (``_connect_with_initial_backoff``) or a shutdown
+    # request during a reconnect (``_await_or_stop``). Each one runs wrapped in
+    # :func:`_connect_closing_if_abandoned`, so a provider that swallows its
+    # cancellation and finishes the handshake anyway closes it again from inside
+    # the task itself. They are never awaited unbounded — that wait is exactly
+    # what the deadline race exists to avoid — but teardown gives them a bounded
+    # window to run that cleanup while the loop is still ours
+    # (:func:`_graceful_shutdown`).
+    abandoned_connects: list[asyncio.Task] = []
+
+    def _signal_loop_shutdown() -> None:
+        """Mirror ``stop_event`` onto the loop-side ``asyncio.Event``.
+
+        Setting the threading Event alone is invisible to an in-flight ``await``,
+        so a handshake blocked on ``provider.connect()`` would keep the producer
+        thread alive for the whole connect timeout. Called from the consumer
+        thread — the set itself is scheduled onto the provider loop.
+        """
+        if shutdown_loop is None or shutdown_event is None:
+            return
+
+        def set_shutdown_event(event: asyncio.Event) -> None:
+            event.set()
+
+        try:
+            shutdown_loop.call_soon_threadsafe(set_shutdown_event, shutdown_event)
+        except RuntimeError:
+            # Loop already closed — nothing left to wake.
+            pass
 
     async def _graceful_shutdown():
         """Poll can_shutdown(), then disconnect. Respects shutdown_timeout."""
@@ -474,10 +662,29 @@ def live_ohlcv_generator(
 
             await asyncio.sleep(1.0)
 
+        # Snapshot the abandoned handshakes that are STILL in flight before
+        # disconnecting: a provider that swallowed its cancellation can finish
+        # the handshake after the disconnect below and re-open what it just
+        # closed. Each of them carries its own closing ``disconnect()``
+        # (:func:`_connect_closing_if_abandoned`) — what is missing is loop time
+        # to run it, which only this coroutine can still hand out.
+        in_flight = [t for t in abandoned_connects if not t.done()]
+        abandoned_connects.clear()
+
         try:
             await provider.disconnect()
         except (OSError, RuntimeError):
             pass
+
+        # This coroutine is the last thing that runs while the provider loop is
+        # still driven by us: on the ``event_loop=None`` path the loop is closed
+        # right after its exit-time task sweep. So give a handshake that is still
+        # cleaning up a bounded window to finish here, where it is awaited
+        # properly. Whatever exceeds the window keeps its self-closing cleanup
+        # and is left to that sweep — a task the sweep gathers (for its own
+        # bounded window), unlike anything a done-callback could schedule then.
+        if in_flight:
+            await asyncio.wait(in_flight, timeout=_LATE_CONNECT_GRACE_S)
 
     # Idle-bar synthesis: providers whose WS feed only emits ohlc.event when
     # a bar contained at least one tick (Capital.com is the documented
@@ -523,7 +730,7 @@ def live_ohlcv_generator(
     if syminfo is not None and syminfo.opening_hours:
         try:
             _sym_tz = ZoneInfo(syminfo.timezone)
-        except Exception:  # noqa: BLE001
+        except (ValueError, ZoneInfoNotFoundError):
             logger.warning("Unknown syminfo.timezone=%r; session-gate disabled",
                            syminfo.timezone)
     _has_calendar = (
@@ -568,15 +775,17 @@ def live_ohlcv_generator(
         return is_point_in_session(syminfo.opening_hours, local_dt)
 
     async def _async_loop():
+        nonlocal shutdown_loop, shutdown_event
         # Loop-side shutdown signal: ``_consumer`` sets it (cross-thread, via
         # ``call_soon_threadsafe``) alongside ``stop_event`` so a reconnect
         # handshake awaiting ``provider.connect()`` here is abandoned at once
         # rather than blocking teardown for the whole connect timeout.
         stop_aevent = asyncio.Event()
-        shutdown_signal['loop'] = asyncio.get_running_loop()
-        shutdown_signal['event'] = stop_aevent
+        shutdown_loop = asyncio.get_running_loop()
+        shutdown_event = stop_aevent
 
-        async def _await_or_stop(awaitable) -> bool:
+        async def _await_or_stop(awaitable: Coroutine[Any, Any, None], *,
+                                 opens_connection: bool = False) -> bool:
             """Await ``awaitable`` but abandon it if a shutdown is requested.
 
             Races the awaitable against ``stop_aevent``. Returns ``True`` when
@@ -585,7 +794,24 @@ def live_ohlcv_generator(
             awaitable finished on its own. Any exception it raised is
             re-propagated so a genuine connect / reconnect failure still drives
             the backoff-retry path.
+
+            The wait on the cancelled hook is bounded: cancellation is a
+            request, not a guarantee, and a provider hook that swallows its
+            ``CancelledError`` would otherwise pin teardown here — before
+            ``_graceful_shutdown`` ever runs — for as long as it likes, which
+            with ``shutdown_timeout=0`` ("wait forever") means the consumer's
+            join never returns either.
+
+            :param awaitable: The provider hook to run.
+            :param opens_connection: Whether the hook can leave a live venue
+                                     connection behind, so an abandoned one has
+                                     to close itself and be handed to teardown.
             """
+            marker: _AbandonMarker | None = None
+            if opens_connection:
+                marker = _AbandonMarker()
+                awaitable = _connect_closing_if_abandoned(
+                    provider, awaitable, marker)
             task = asyncio.ensure_future(awaitable)
             stop_waiter = asyncio.ensure_future(stop_aevent.wait())
             try:
@@ -601,13 +827,19 @@ def live_ohlcv_generator(
             if task.done():
                 task.result()  # re-raise a connect/reconnect failure
                 return False
+            if marker is not None:
+                marker.abandoned = True
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # noqa: BLE001 - teardown must not surface it
-                pass
+            done, _ = await asyncio.wait({task}, timeout=_HOOK_CANCEL_GRACE_S)
+            if done:
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                # Detached: its outcome still has to be consumed, and if it can
+                # open a connection teardown keeps holding the loop open for the
+                # self-closing cleanup it carries.
+                task.add_done_callback(_discard_task_outcome)
+                if opens_connection:
+                    abandoned_connects.append(task)
             return True
 
         # Declared before ``try`` so the ``finally`` branch can reference
@@ -670,8 +902,45 @@ def live_ohlcv_generator(
             attempt = 0
             delay = provider.reconnect_delay
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "initial provider connection exceeded its timeout"
+                    )
+                # The deadline is enforced by racing the connect task, NOT by
+                # ``asyncio.wait_for``: that helper decides on the cancellation
+                # it injected, so a ``connect()`` that swallows the
+                # ``CancelledError`` and returns normally is reported as a
+                # SUCCESS past the deadline (and one that never finishes
+                # cancelling hangs the startup barrier outright). Deciding on
+                # "did it finish in time" instead makes the bound hard: the
+                # abandoned task is cancelled best-effort and detached, never
+                # awaited. The handshake runs wrapped so that an attempt lost
+                # this way closes whatever it still manages to open.
+                connect_marker = _AbandonMarker()
+                connect_task = asyncio.ensure_future(
+                    _connect_closing_if_abandoned(
+                        provider, provider.connect(), connect_marker))
                 try:
-                    await provider.connect()
+                    done, _ = await asyncio.wait({connect_task}, timeout=remaining)
+                except BaseException:
+                    connect_marker.abandoned = True
+                    connect_task.cancel()
+                    connect_task.add_done_callback(_discard_task_outcome)
+                    abandoned_connects.append(connect_task)
+                    raise
+                if not done:
+                    connect_marker.abandoned = True
+                    connect_task.cancel()
+                    connect_task.add_done_callback(_discard_task_outcome)
+                    # The cancel is best-effort, so this handshake may still
+                    # land; teardown holds the loop open for its self-close.
+                    abandoned_connects.append(connect_task)
+                    raise TimeoutError(
+                        "initial provider connection exceeded its timeout"
+                    )
+                try:
+                    connect_task.result()
                     return
                 except BaseException as exc:
                     if not _is_transient_connect_error(exc):
@@ -713,6 +982,52 @@ def live_ohlcv_generator(
                         type(provider).__name__, symbol, timeframe)
             connected_event.set()
             last_real_update = time.time()
+
+            # Startup gap: the warmup download stopped at
+            # ``last_historical_timestamp`` and the stream only delivers from
+            # now on, so every bar that closed while the subscription was
+            # coming up belongs to neither side. Ask the provider for them
+            # before the first live bar, so the strategy sees one unbroken
+            # series. Providers that cannot query history return nothing and
+            # keep the previous behaviour.
+            if last_historical_timestamp is not None and tf_ms > 0:
+                elapsed_ms = time.time() * 1000.0 - last_historical_timestamp
+                # A whole bar must have closed past the warmup before anything
+                # can be missing.
+                if elapsed_ms >= 2 * tf_ms:
+                    try:
+                        recovered = await provider.backfill_closed_bars(
+                            watch_symbol, timeframe, last_historical_timestamp,
+                        )
+                    except Exception as exc:
+                        # Recovery is best-effort: a bot that refuses to start
+                        # because a history query failed is worse than one that
+                        # starts with a logged hole.
+                        recovered = []
+                        broker_warning(
+                            "startup gap recovery failed: %s — starting anyway,"
+                            " any bar missed during subscribe stays missing",
+                            exc,
+                        )
+                    recovered_count = 0
+                    for recovered_bar in recovered:
+                        if (not recovered_bar.is_closed
+                                or recovered_bar.timestamp
+                                <= last_historical_timestamp):
+                            continue
+                        if (last_closed_bar is not None
+                                and recovered_bar.timestamp
+                                <= last_closed_bar.timestamp):
+                            continue
+                        last_closed_bar = recovered_bar
+                        bar_queue.put(recovered_bar)
+                        recovered_count += 1
+                    if recovered_count:
+                        broker_info(
+                            "startup gap: recovered %d closed bar(s) between "
+                            "the warmup history and the live stream",
+                            recovered_count,
+                        )
 
             # Broker mode: attach the Order Sync Engine's event stream as
             # a background task so OrderEvents land in its queue without
@@ -815,7 +1130,8 @@ def live_ohlcv_generator(
                             disc_err,
                         )
                     try:
-                        if await _await_or_stop(provider.connect()):
+                        if await _await_or_stop(provider.connect(),
+                                                opens_connection=True):
                             return attempts, True
                         if await _await_or_stop(provider.on_reconnect()):
                             return attempts, True
@@ -1266,7 +1582,19 @@ def live_ohlcv_generator(
                     # The caller owns the loop; don't close it here.
                     pass
         else:
-            asyncio.run(_async_loop())
+            # Deliberately NOT ``asyncio.run``: its exit-time sweep gathers the
+            # leftover tasks without a deadline, so one hook that never finishes
+            # cancelling keeps this thread — and the consumer's join — alive
+            # forever. :func:`_close_owned_loop` does the same sweep on a bound.
+            own_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(own_loop)
+            try:
+                own_loop.run_until_complete(_async_loop())
+            finally:
+                try:
+                    _close_owned_loop(own_loop)
+                finally:
+                    asyncio.set_event_loop(None)
 
     # Start the provider thread, then block until ``provider.connect()``
     # has completed (or timed out / failed). The warmup that follows
@@ -1277,7 +1605,19 @@ def live_ohlcv_generator(
     # an unsubscribed window in which the next bar close is lost.
     thread = threading.Thread(target=_thread_target, daemon=True, name="live-provider")
     thread.start()
-    if not connected_event.wait(timeout=connect_timeout_seconds):
+    if not connected_event.wait(timeout=connect_timeout_seconds + 1.0):
+        if raise_on_connect_failure:
+            # ``_async_loop`` never reported back — a ``connect()`` that ignores
+            # its cancellation is still running on the provider loop. ``_consumer``
+            # is not created on this path, so nothing else would signal the
+            # loop-side shutdown or reap the thread: tear down here, with a BOUNDED
+            # join (the very fault being handled is a producer that will not stop).
+            stop_event.set()
+            _signal_loop_shutdown()
+            thread.join(timeout=startup_join_timeout)
+            raise TimeoutError(
+                "provider connection did not report completion within its timeout"
+            )
         broker_info(
             "WS connect did not confirm within %.0fs — proceeding; "
             "any underlying error will surface on the first bar pull",
@@ -1296,8 +1636,7 @@ def live_ohlcv_generator(
         # half-open connection. Signal and join here so the teardown finishes
         # while the loop is still alive.
         stop_event.set()
-        join_timeout = (shutdown_timeout + 5.0) if shutdown_timeout > 0 else None
-        thread.join(timeout=join_timeout)
+        thread.join(timeout=startup_join_timeout)
         raise connect_failure[0]
 
     def _consumer() -> Generator[OHLCV, None, None]:
@@ -1356,19 +1695,14 @@ def live_ohlcv_generator(
         finally:
             stop_event.set()
             # Wake a reconnect handshake blocked on ``provider.connect()`` on the
-            # broker loop: setting the threading Event alone is invisible to an
-            # in-flight ``await``, so mirror it onto the loop-side asyncio Event
-            # (see ``_async_loop._await_or_stop``) or teardown waits out the whole
-            # connect timeout before the producer thread can exit.
-            _sd_loop = shutdown_signal.get('loop')
-            _sd_event = shutdown_signal.get('event')
-            if _sd_loop is not None and _sd_event is not None:
-                try:
-                    _sd_loop.call_soon_threadsafe(_sd_event.set)
-                except RuntimeError:
-                    # Loop already closed — nothing left to wake.
-                    pass
-            join_timeout = (shutdown_timeout + 5.0) if shutdown_timeout > 0 else None
-            thread.join(timeout=join_timeout)
+            # broker loop (see ``_async_loop._await_or_stop``), or teardown waits
+            # out the whole connect timeout before the producer thread can exit.
+            _signal_loop_shutdown()
+            consumer_join_timeout = (
+                shutdown_timeout + 5.0
+                if shutdown_timeout > 0
+                else None
+            )
+            thread.join(timeout=consumer_join_timeout)
 
     return _consumer()
