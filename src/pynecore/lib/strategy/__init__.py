@@ -412,6 +412,46 @@ class PriceOrderBook:
                     del self.orders_at_price[price]
         del self.order_prices[order]
 
+    def _range_levels(self, desc: bool, min_price: float | None, max_price: float | None) -> list[float]:
+        """Price levels a walk covers, in walk order.
+
+        Always a copy of the level list: fills remove levels from the book while
+        the walk is in flight.
+        """
+        if min_price is not None and max_price is not None:
+            # Range query - ascending from min to max (or descending when desc=True,
+            # e.g. the open->low price walk, where the level nearest the open is
+            # reached first in time).
+            min_idx = bisect_left(self.price_levels, min_price)
+            max_idx = bisect_left(self.price_levels, max_price)
+            # Include max_price if it matches exactly
+            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
+                max_idx += 1
+            levels = self.price_levels[min_idx:max_idx]
+            if desc:
+                levels.reverse()
+            return levels
+
+        if min_price is not None:
+            # Ascending from min_price
+            min_idx = bisect_left(self.price_levels, min_price)
+            return self.price_levels[min_idx:]
+
+        if max_price is not None:
+            # Descending from max_price
+            max_idx = bisect_left(self.price_levels, max_price)
+            # Include max_price if it matches exactly
+            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
+                max_idx += 1
+            levels = self.price_levels[:max_idx]
+            levels.reverse()
+            return levels
+
+        levels = list(self.price_levels)
+        if desc:
+            levels.reverse()
+        return levels
+
     def iter_orders(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
         """
         Iterate over orders within price range.
@@ -423,62 +463,34 @@ class PriceOrderBook:
             iter_orders(max_price=60.0)  # 60, 59, 58, ... (descending)
             iter_orders(min_price=50.0, max_price=60.0)  # 50, 51, ..., 60 (ascending)
 
+        Within a level the insertion order is preserved, so same-price ties keep
+        their sequence.
+
         :param desc: If True, iterate in descending order, only if no min_price or max_price is set
         :param min_price: If set, iterate from this price upward (ascending)
         :param max_price: If set, iterate from this price downward (descending)
         :return: Generator yielding Order objects
         """
-        if min_price is not None and max_price is not None:
-            # Range query - ascending from min to max (or descending when desc=True,
-            # e.g. the open->low price walk, where the level nearest the open is
-            # reached first in time). Price levels reverse; within a level the
-            # insertion order is preserved so same-price ties keep their sequence.
-            min_idx = bisect_left(self.price_levels, min_price)
-            max_idx = bisect_left(self.price_levels, max_price)
-            # Include max_price if it matches exactly
-            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
-                max_idx += 1
-            # Create a copy of price levels to avoid iteration issues when levels are removed
-            levels = list(self.price_levels[min_idx:max_idx])
-            if desc:
-                levels.reverse()
-            for p in levels:
-                # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price.get(p, ()))
+        for p in self._range_levels(desc, min_price, max_price):
+            # Create a copy to avoid iteration issues when orders are removed during iteration
+            yield from list(self.orders_at_price.get(p, ()))
 
-        elif min_price is not None:
-            # Ascending from min_price
-            min_idx = bisect_left(self.price_levels, min_price)
-            # Create a copy of price levels to avoid iteration issues when levels are removed
-            for p in list(self.price_levels[min_idx:]):
-                # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price.get(p, ()))
+    def iter_levels(self, *, desc=False, min_price: float | None = None, max_price: float | None = None):
+        """Walk the same range as :meth:`iter_orders`, one price level at a time.
 
-        elif max_price is not None:
-            # Descending from max_price
-            max_idx = bisect_left(self.price_levels, max_price)
-            # Include max_price if it matches exactly
-            if max_idx < len(self.price_levels) and self.price_levels[max_idx] == max_price:
-                max_idx += 1
-            # Iterate in reverse order (high to low prices)
-            # Create a copy of price levels to avoid iteration issues when levels are removed
-            # Note: reversed() already creates an iterator over a copy of the slice
-            for p in reversed(list(self.price_levels[:max_idx])):
-                # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price.get(p, ()))
+        The intrabar price walk needs the level it currently stands on: a fill
+        can materialize new levels (a tick-based bracket whose entry just
+        filled), and the walk has to resume at that level to keep the new ones
+        in chronological order.
 
-        elif desc:
-            # All orders, descending
-            # Create a copy of price levels to avoid iteration issues when levels are removed
-            for p in reversed(list(self.price_levels)):
-                # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price.get(p, ()))
-        else:
-            # All orders, ascending
-            # Create a copy of price levels to avoid iteration issues when levels are removed
-            for p in list(self.price_levels):
-                # Create a copy to avoid iteration issues when orders are removed during iteration
-                yield from list(self.orders_at_price.get(p, ()))
+        :param desc: If True, iterate in descending order, only if no min_price or max_price is set
+        :param min_price: If set, iterate from this price upward (ascending)
+        :param max_price: If set, iterate from this price downward (descending)
+        :return: Generator yielding ``(price, orders_at_that_price)`` pairs
+        """
+        for p in self._range_levels(desc, min_price, max_price):
+            # Create a copy to avoid iteration issues when orders are removed during iteration
+            yield p, list(self.orders_at_price.get(p, ()))
 
     def clear(self):
         """Clear all orders"""
@@ -1659,6 +1671,157 @@ class SimPosition(PositionBase):
             return False
         return order.order_id not in self._entry_open_ledger
 
+    def _entry_fill_price(self, entry_id: str | None) -> float | None:
+        """Fill price of the open trade that ``entry_id`` opened, if it has one.
+
+        :param entry_id: The ``from_entry`` an exit leg is bound to
+        :return: The entry price, or None while the entry has no open trade
+        """
+        for trade in self.open_trades:
+            if trade.entry_id == entry_id:
+                return trade.entry_price
+        return None
+
+    def _resolve_tick_exit(self, order: Order, entry_price: float) -> bool:
+        """Turn an exit's tick offsets into concrete price levels.
+
+        ``strategy.exit(profit=/loss=/trail_points=)`` states its levels as tick
+        distances from the entry price, so they cannot exist before the entry
+        fills. Resolving them also indexes the order in ``PriceOrderBook``:
+        without a level the order sits in no price bucket at all, and no leg of
+        the intrabar walk can ever yield it.
+
+        :param order: The exit order carrying the tick offsets
+        :param entry_price: Fill price of the entry the exit is bound to
+        :return: True when a level was created — False for an already-resolved exit
+        """
+        direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
+        changed = False
+
+        if order.profit_ticks is not None and order.limit is None:
+            order.limit = _price_round(
+                entry_price + direction * syminfo.mintick * order.profit_ticks, direction)
+            changed = True
+
+        if order.loss_ticks is not None and order.stop is None:
+            order.stop = _price_round(
+                entry_price - direction * syminfo.mintick * order.loss_ticks, -direction)
+            changed = True
+
+        if order.trail_points_ticks is not None and order.trail_price is None:
+            order.trail_price = _price_round(
+                entry_price + direction * syminfo.mintick * order.trail_points_ticks, direction)
+            changed = True
+
+        # Update orderbook only when prices were actually calculated
+        if changed:
+            self.orderbook.add_order(order)
+        return changed
+
+    def _resolve_filled_entry_exits(self) -> bool:
+        """Resolve every tick-based exit whose bound entry already has an open trade.
+
+        :return: True when at least one exit gained a price level it did not have
+        """
+        resolved = False
+        for order in self.exit_orders.values():
+            entry_price = self._entry_fill_price(order.order_id)
+            if entry_price is not None and self._resolve_tick_exit(order, entry_price):
+                resolved = True
+        return resolved
+
+    def _activate_trails_on_fill(self, entry_id: str | None, ohlc: bool, rising: bool,
+                                 awaiting: set[Order], close_leg_queue: list[Order]) -> None:
+        """Start the trailing legs an entry fill just activated, at the fill price.
+
+        A trailing leg bound to a ``from_entry`` cannot act before that entry
+        fills, so the trailing pre-walk in :meth:`_process_limit_stop_orders`
+        passes over it. An entry filling INTRABAR activates it partway through
+        the bar, and TradingView runs it from there over the rest of the assumed
+        path — including the same-bar fill that usually follows.
+
+        :param entry_id: ``from_entry`` id of the entry that just filled
+        :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`)
+        :param rising: True when the entry filled on an open -> high leg
+        :param awaiting: Trailing legs still waiting for their entry; one started
+            here is dropped, so a later fill of the same entry cannot restart it
+        :param close_leg_queue: Legs left pending join the closing-leg pass
+        """
+        if not awaiting:
+            return
+        entry_price = self._entry_fill_price(entry_id)
+        if entry_price is None:
+            return
+        for order in [o for o in awaiting if o.order_id == entry_id]:
+            awaiting.discard(order)
+            if order.cancelled or order.filled_by_type is not None or order.trail_price is None:
+                continue
+            if self._process_trailing_stop(
+                    order, ohlc, start=entry_price, rising=rising) == _trail_pending:
+                close_leg_queue.append(order)
+
+    def _walk_leg(self, start: float, leg_end: float, rising: bool, ohlc: bool,
+                  trail_awaiting: set[Order], trail_close_leg: list[Order]) -> None:
+        """Walk one leg of the assumed intrabar path, level by level.
+
+        A tick-based bracket has no price level until its entry fills, so an
+        entry filling mid-leg materializes levels the walk in flight can never
+        yield: :meth:`PriceOrderBook.iter_levels` snapshots the level list
+        before its first yield. When that happens the walk resumes at the level
+        it stopped on, so the fresh bracket takes its chronological place among
+        the levels still ahead of the price instead of being appended after the
+        whole leg — a later entry level between the two would otherwise be
+        reached while the bracket's own trade is still open.
+
+        Orders already offered at the resume level are skipped, so each
+        (order, level) pair gets exactly one shot per leg, as it does without a
+        resume. A bracket stated as an explicit ``limit=`` / ``stop=`` price
+        needs none of this: it was indexed before the walk started.
+
+        :param start: Price the leg starts at (the bar open)
+        :param leg_end: The extreme this leg runs to (the bar's high or low)
+        :param rising: True for an open -> high leg, False for an open -> low leg
+        :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`)
+        :param trail_awaiting: Trailing legs whose entry has not filled yet
+        :param trail_close_leg: Collects trailing legs left for the closing-leg pass
+        """
+        book = self.orderbook
+        resume = start
+        # Orders of the resume level already offered before the walk stopped there
+        offered: tuple[Order, ...] = ()
+        while True:
+            resumed = False
+            if rising:
+                levels = book.iter_levels(min_price=resume, max_price=leg_end)
+            else:
+                levels = book.iter_levels(max_price=resume, min_price=leg_end, desc=True)
+            for price, orders in levels:
+                for i, order in enumerate(orders):
+                    if order in offered:
+                        continue
+                    if rising:
+                        filled = self._check_high_stop(order) or self._check_high(order)
+                    else:
+                        filled = self._check_low_stop(order) or self._check_low(order)
+                    # An entry fill can activate a bracket bound to it: resolving
+                    # indexes it at a level this generator cannot reach, and its
+                    # trailing leg starts here, at the fill price. A closing fill
+                    # never opens a trade, so it can activate nothing.
+                    if filled and order.order_type != _order_type_close:
+                        materialized = self._resolve_filled_entry_exits()
+                        self._activate_trails_on_fill(order.order_id, ohlc, rising,
+                                                      trail_awaiting, trail_close_leg)
+                        if materialized:
+                            resume, offered = price, tuple(orders[:i + 1])
+                            resumed = True
+                            break
+                if resumed:
+                    break
+            # Every resume consumes at least one still-unresolved tick offset, so
+            # the loop is bounded by the number of pending bracket legs.
+            if not resumed:
+                return
+
     def _check_high_stop(self, order: Order) -> bool:
         """ Check high stop and trailing trigger """
         if order.stop is None:
@@ -1715,7 +1878,8 @@ class SimPosition(PositionBase):
             return True
         return False
 
-    def _process_trailing_stop(self, order: Order, ohlc: bool, close_leg: bool = False) -> int:
+    def _process_trailing_stop(self, order: Order, ohlc: bool, close_leg: bool = False,
+                               start: float | None = None, rising: bool = False) -> int:
         """Process a trailing-stop exit for the current bar (TradingView model).
 
         TradingView's broker emulator moves the market price along the assumed
@@ -1756,10 +1920,20 @@ class SimPosition(PositionBase):
         chronologically after a margin call at the adverse extreme, which may
         have already trimmed the position by then.
 
+        A bracket its own entry activates partway through the bar starts at
+        ``start`` -- the entry's fill price -- instead of the bar open, and only
+        the segments still ahead of that point are walked. The water mark starts
+        there too: an extreme the bar reached BEFORE the fill belongs to a
+        stretch the trail was not live for.
+
         :param order: The exit order carrying ``trail_price``.
         :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`).
         :param close_leg: If True, walk only the closing (second extreme ->
             close) segment, resuming the state a prior default call persisted.
+        :param start: Price the walk begins at when the order was activated
+            mid-bar; None starts it at the bar open.
+        :param rising: With ``start``, True when the entry filled on an
+            open -> high leg -- it selects the segments still ahead.
         :return: ``_trail_filled`` if the order filled, ``_trail_deferred`` if
             the walk defers to the price walk (or cannot act this bar),
             ``_trail_pending`` if the closing leg is still outstanding.
@@ -1771,6 +1945,9 @@ class SimPosition(PositionBase):
         round_to_mintick = lib.math.round_to_mintick
         offset_price = syminfo.mintick * order.trail_offset
         slippage = lib._script.slippage
+        # The walk's first tick: the bar open, or the fill price that activated
+        # this bracket mid-bar.
+        start_tick = self.o if start is None else start
 
         if order.sign < 0:
             # Long position: trailing sell-stop riding under the high-water mark.
@@ -1778,32 +1955,33 @@ class SimPosition(PositionBase):
             stop = order.trail_stop if armed else None
 
             if not close_leg and armed and stop is not None:
-                # A carried stop gapped through between bars fills at the open.
-                if self.o <= stop:
-                    p = self.o
+                # A carried stop already passed at the first tick fills there --
+                # an inter-bar gap through the stop, or an entry filling past it.
+                if start_tick <= stop:
+                    p = start_tick
                     if slippage > 0:
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, self.h, p)
                     return _trail_filled
-                # The open tick advances the water mark; with trail_offset == 0
-                # the stop lands on the open itself and fills there.
-                new_stop = round_to_mintick(self.o - offset_price)
+                # The first tick advances the water mark; with trail_offset == 0
+                # the stop lands on that tick itself and fills there.
+                new_stop = round_to_mintick(start_tick - offset_price)
                 if new_stop > stop:
                     stop = new_stop
-                    if self.o <= stop:
+                    if start_tick <= stop:
                         p = stop
                         if slippage > 0:
                             p -= syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, self.h, p)
                         return _trail_filled
-            elif not close_leg and not armed and self.o >= order.trail_price:
-                # The bar opens beyond the activation level: the trail arms on
-                # the first tick with the open as its water mark.
+            elif not close_leg and not armed and start_tick >= order.trail_price:
+                # The walk starts beyond the activation level: the trail arms on
+                # its first tick with that tick as its water mark.
                 armed = True
-                stop = round_to_mintick(self.o - offset_price)
-                if self.o <= stop:
+                stop = round_to_mintick(start_tick - offset_price)
+                if start_tick <= stop:
                     p = stop
                     if slippage > 0:
                         p -= syminfo.mintick * slippage
@@ -1818,8 +1996,18 @@ class SimPosition(PositionBase):
                 prev = self.l if ohlc else self.h
                 path: tuple[float, ...] = (self.c,)
             else:
-                prev = self.o
+                prev = start_tick
                 path = (self.h, self.l) if ohlc else (self.l, self.h)
+                if start is not None and rising != ohlc:
+                    # Activated on the path's SECOND leg: that leg's own extreme is
+                    # behind the fill already, only the other one is still ahead.
+                    # Measured on CAPITALCOM:EURUSD 30m with a buy-limit entry (the
+                    # fill lands on a descending leg, so the high can precede it):
+                    # on open -> high -> low -> close bars TV closed 0 of 2063 trades
+                    # on the entry bar -- the pre-fill high never enters the water
+                    # mark -- while on open -> low -> high -> close bars it closed
+                    # 1497 of 1526, every one at exactly `high - trail_offset`.
+                    path = path[1:]
             for nxt in path:
                 if nxt > prev:
                     if order.limit is not None and nxt >= order.limit and not (
@@ -1892,32 +2080,33 @@ class SimPosition(PositionBase):
             stop = order.trail_stop if armed else None
 
             if not close_leg and armed and stop is not None:
-                # A carried stop gapped through between bars fills at the open.
-                if self.o >= stop:
-                    p = self.o
+                # A carried stop already passed at the first tick fills there --
+                # an inter-bar gap through the stop, or an entry filling past it.
+                if start_tick >= stop:
+                    p = start_tick
                     if slippage > 0:
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
                     self.fill_order(order, p, p, self.l)
                     return _trail_filled
-                # The open tick advances the water mark; with trail_offset == 0
-                # the stop lands on the open itself and fills there.
-                new_stop = round_to_mintick(self.o + offset_price)
+                # The first tick advances the water mark; with trail_offset == 0
+                # the stop lands on that tick itself and fills there.
+                new_stop = round_to_mintick(start_tick + offset_price)
                 if new_stop < stop:
                     stop = new_stop
-                    if self.o >= stop:
+                    if start_tick >= stop:
                         p = stop
                         if slippage > 0:
                             p += syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p, p, self.l)
                         return _trail_filled
-            elif not close_leg and not armed and self.o <= order.trail_price:
-                # The bar opens beyond the activation level: the trail arms on
-                # the first tick with the open as its water mark.
+            elif not close_leg and not armed and start_tick <= order.trail_price:
+                # The walk starts beyond the activation level: the trail arms on
+                # its first tick with that tick as its water mark.
                 armed = True
-                stop = round_to_mintick(self.o + offset_price)
-                if self.o >= stop:
+                stop = round_to_mintick(start_tick + offset_price)
+                if start_tick >= stop:
                     p = stop
                     if slippage > 0:
                         p += syminfo.mintick * slippage
@@ -1932,8 +2121,12 @@ class SimPosition(PositionBase):
                 prev = self.l if ohlc else self.h
                 path = (self.c,)
             else:
-                prev = self.o
+                prev = start_tick
                 path = (self.h, self.l) if ohlc else (self.l, self.h)
+                if start is not None and rising != ohlc:
+                    # Second-leg activation drops the extreme already behind the
+                    # fill -- see the mirrored comment in the long branch.
+                    path = path[1:]
             for nxt in path:
                 if nxt < prev:
                     if order.limit is not None and nxt <= order.limit and not (
@@ -2055,11 +2248,14 @@ class SimPosition(PositionBase):
         # intrabar extreme: TradingView only carries a trailing stop out of the
         # entry-fill bar when that bar closes past the activation level. A bar
         # whose extreme pierces the activation level but closes back inside it does
-        # NOT arm here -- it arms later, intrabar, in the normal price walk (which
-        # also performs the same-bar fill that is suppressed on the entry-fill
-        # bar). On every later bar a close past the level implies the high already
-        # pierced it, so process_orders has already armed the carried order and
-        # this gate never fires there.
+        # NOT arm here -- it arms later, intrabar, in the normal price walk, which
+        # fills on its arming bar too. Only a leg first issued AFTER the fill gets
+        # here in that state: one that already existed during the entry-fill bar's
+        # walk armed (and possibly filled) inside it, from the fill price onward --
+        # see ``_activate_trails_on_fill`` -- so it reaches this gate already
+        # triggered. On every later bar a close past the level implies the high
+        # already pierced it, so process_orders has already armed the carried order
+        # and this gate never fires there.
         if order.sign < 0:
             # Long position: trailing sell-stop riding under the high-water mark.
             if not order.trail_triggered:
@@ -2651,41 +2847,7 @@ class SimPosition(PositionBase):
                     self._remove_order(order)
 
         # For exit orders, calculate limit/stop from entry price if ticks are specified
-        for order in self.exit_orders.values():
-            # Try to find the trade with matching entry_id
-            entry_price: float | None = None
-            for trade in self.open_trades:
-                if trade.entry_id == order.order_id:
-                    entry_price = trade.entry_price
-                    break
-
-            # If we found the entry price and have tick values, calculate the actual prices
-            if entry_price is not None:
-                # Determine direction from the order
-                direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
-                changed = False
-
-                # Calculate limit from profit_ticks if specified
-                if order.profit_ticks is not None and order.limit is None:
-                    order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
-                    order.limit = _price_round(order.limit, direction)
-                    changed = True
-
-                # Calculate stop from loss_ticks if specified
-                if order.loss_ticks is not None and order.stop is None:
-                    order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
-                    order.stop = _price_round(order.stop, -direction)
-                    changed = True
-
-                # Calculate trail_price from trail_points_ticks if specified
-                if order.trail_points_ticks is not None and order.trail_price is None:
-                    order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
-                    order.trail_price = _price_round(order.trail_price, direction)
-                    changed = True
-
-                # Update orderbook only when prices were actually calculated
-                if changed:
-                    self.orderbook.add_order(order)
+        self._resolve_filled_entry_exits()
 
         # Check for stop/limit orders that should be converted to market orders.
         # The leg that the gap triggered decides how the fill is priced below, so
@@ -2859,29 +3021,7 @@ class SimPosition(PositionBase):
                 same_bar_entry_sign = order.sign
 
         # Convert tick-based exit prices for entries that just filled this bar
-        for order in self.exit_orders.values():
-            entry_price = None
-            for trade in self.open_trades:
-                if trade.entry_id == order.order_id:
-                    entry_price = trade.entry_price
-                    break
-            if entry_price is not None:
-                direction = 1.0 if order.size < 0 else -1.0
-                changed = False
-                if order.profit_ticks is not None and order.limit is None:
-                    order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
-                    order.limit = _price_round(order.limit, direction)
-                    changed = True
-                if order.loss_ticks is not None and order.stop is None:
-                    order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
-                    order.stop = _price_round(order.stop, -direction)
-                    changed = True
-                if order.trail_points_ticks is not None and order.trail_price is None:
-                    order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
-                    order.trail_price = _price_round(order.trail_price, direction)
-                    changed = True
-                if changed:
-                    self.orderbook.add_order(order)
+        self._resolve_filled_entry_exits()
 
         # Adapt orphaned exits from rejected entries to new position (TradingView behavior)
         # When strategy.exit() is called without from_entry, TV keeps the exit even after
@@ -3022,9 +3162,18 @@ class SimPosition(PositionBase):
         # TV fires at the adverse extreme (verified against a TV export where
         # a partial 'Margin call' at the high preceded the trailing exit
         # filling near the low of the same bar).
+        trail_close_leg: list[Order] = []
+        # Trailing legs still waiting for their entry cannot be walked here: a
+        # tick-based one has no ``trail_price`` to be indexed at yet, and an
+        # explicit one is in the book but inactive. An entry filling intrabar
+        # activates them mid-walk instead (see ``_activate_trails_on_fill``).
+        trail_awaiting: set[Order] = set()
+        for order in self.exit_orders.values():
+            if ((order.trail_price is not None or order.trail_points_ticks is not None)
+                    and not order.cancelled and self._exit_awaits_entry(order)):
+                trail_awaiting.add(order)
         # Iterate a snapshot since fills mutate the order book; an order indexed at
         # several price levels is yielded once per level, so dedupe by identity.
-        trail_close_leg: list[Order] = []
         if self.orderbook.price_levels:
             seen: set[Order] = set()
             for order in list(self.orderbook.iter_orders()):
@@ -3038,11 +3187,8 @@ class SimPosition(PositionBase):
         if ohlc:
             # open -> high
             if self.orderbook.price_levels:
-                for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
-                    if self._check_high_stop(order):
-                        continue
-                    if self._check_high(order):
-                        continue
+                self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
+                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
             mc_deferred = self.sign < 0 and self._check_margin_call(self.h, for_short=True)
             if not mc_deferred:
@@ -3058,11 +3204,8 @@ class SimPosition(PositionBase):
 
                 # open -> low (descending: the level nearest the open fills first)
                 if self.orderbook.price_levels:
-                    for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
-                        if self._check_low_stop(order):
-                            continue
-                        if self._check_low(order):
-                            continue
+                    self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
+                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
                 if self.sign > 0:
                     self._check_margin_call(self.l, for_short=False, can_defer=False)
@@ -3090,11 +3233,8 @@ class SimPosition(PositionBase):
         else:
             # open -> low (descending: the level nearest the open fills first)
             if self.orderbook.price_levels:
-                for order in self.orderbook.iter_orders(max_price=self.o, min_price=self.l, desc=True):
-                    if self._check_low_stop(order):
-                        continue
-                    if self._check_low(order):
-                        continue
+                self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
+                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
             mc_deferred = self.sign > 0 and self._check_margin_call(self.l, for_short=False)
             if not mc_deferred:
@@ -3106,11 +3246,8 @@ class SimPosition(PositionBase):
 
                 # open -> high
                 if self.orderbook.price_levels:
-                    for order in self.orderbook.iter_orders(min_price=self.o, max_price=self.h):
-                        if self._check_high_stop(order):
-                            continue
-                        if self._check_high(order):
-                            continue
+                    self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
+                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
                 if self.sign < 0:
                     self._check_margin_call(self.h, for_short=True, can_defer=False)
@@ -3227,9 +3364,9 @@ class SimPosition(PositionBase):
             price. (Non-current-bar limit/stop orders already had their fair shake in
             `_process_limit_stop_orders` during the H/L walk.)
         Tick-based exit orders submitted on the current bar (`strategy.exit(profit=...,
-        loss=...)`) only carry `profit_ticks` / `loss_ticks` until the next bar's
-        `_process_at_bar_open` resolves them against the entry price. The close-pass
-        materializes those into `limit` / `stop` first so the trigger check sees them.
+        loss=...)`) still carry raw `profit_ticks` / `loss_ticks` when their entry has
+        not filled yet, so the close pass resolves them through `_resolve_tick_exit`
+        first — the trigger check needs concrete `limit` / `stop` prices.
 
         Fill price in every case is `self.c` — price-based orders fill where their
         limit or stop price is hit on the close, with no trigger-price snap on the
@@ -3259,47 +3396,6 @@ class SimPosition(PositionBase):
         candidates: list[tuple[Order, str]] = []
         seen: set[int] = set()
 
-        def _materialize_tick_exit(order: Order) -> None:
-            """Resolve profit_ticks/loss_ticks against the matching open trade.
-
-            Mirrors `_process_at_bar_open`: exits submitted during this bar's main()
-            still carry the raw tick offsets — the close-pass trigger check needs
-            them as concrete limit/stop prices.
-            """
-            if order.profit_ticks is None and order.loss_ticks is None:
-                return
-            if order.limit is not None and order.stop is not None:
-                return
-            entry_price: float | None = None
-            for trade in self.open_trades:
-                if trade.entry_id == order.order_id:
-                    entry_price = trade.entry_price
-                    break
-            if entry_price is None:
-                return
-            direction = 1.0 if order.size < 0 else -1.0
-            changed = False
-            if order.profit_ticks is not None and order.limit is None:
-                order.limit = _price_round(
-                    entry_price + direction * syminfo.mintick * order.profit_ticks,
-                    direction,
-                )
-                changed = True
-            if order.loss_ticks is not None and order.stop is None:
-                order.stop = _price_round(
-                    entry_price - direction * syminfo.mintick * order.loss_ticks,
-                    -direction,
-                )
-                changed = True
-            # If we just resolved the order's price levels, index it in the
-            # orderbook (mirrors `_process_at_bar_open`). Without this, an order
-            # that fails the close-pass trigger check would persist with
-            # `limit`/`stop` set but absent from `PriceOrderBook`, so next bar's
-            # H/L walk would never see it (next bar's tick conversion is skipped
-            # because `limit`/`stop` are already non-None).
-            if changed:
-                self.orderbook.add_order(order)
-
         def _add_market(order: Order):
             oid = id(order)
             if oid in seen or order.cancelled or order.bar_index != current_bar:
@@ -3316,7 +3412,11 @@ class SimPosition(PositionBase):
             if order.order_type == _order_type_close:
                 if self._exit_awaits_entry(order):
                     return
-                _materialize_tick_exit(order)
+                # Exits submitted during this bar's main() still carry raw tick
+                # offsets — the trigger check below needs concrete price levels.
+                entry_price = self._entry_fill_price(order.order_id)
+                if entry_price is not None:
+                    self._resolve_tick_exit(order, entry_price)
             trigger: str | None = None
             if order.stop is not None:
                 if order.sign > 0 and close >= order.stop:
@@ -3396,7 +3496,7 @@ class SimPosition(PositionBase):
         # Phase 2: a current-bar entry may have just filled in Phase 1, opening a
         # trade whose `entry_price` lets us resolve a same-bar `strategy.exit(...,
         # profit=..., loss=...)` order whose ticks were unresolved before Phase 1.
-        # Mirror `_process_at_bar_open` line 1467-1490 — re-scan exit_orders for
+        # Mirror `_resolve_filled_entry_exits` — re-scan exit_orders for
         # current-bar tick exits, materialize, and fill any newly executable.
         for order in list(self.exit_orders.values()):
             oid = id(order)
@@ -3406,7 +3506,9 @@ class SimPosition(PositionBase):
                 continue
             if order.profit_ticks is None and order.loss_ticks is None:
                 continue
-            _materialize_tick_exit(order)
+            entry_price = self._entry_fill_price(order.order_id)
+            if entry_price is not None:
+                self._resolve_tick_exit(order, entry_price)
             trigger2: str | None = None
             if order.stop is not None:
                 if order.sign > 0 and close >= order.stop:
