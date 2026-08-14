@@ -319,11 +319,36 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         except Exception:                                          # noqa: BLE001
             return 0.1
 
-    @staticmethod
-    def _gtd(days: int = 7) -> str:
-        """A far-future RFC3339 expiry for a GTD STOP (engine cancels earlier)."""
-        return (datetime.now(timezone.utc) + timedelta(days=days)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
+    def _gtd(self, days: int = 7) -> str:
+        """RFC3339 expiry for a GTD STOP, CLAMPED to the contract's final trade date.
+
+        A derivatives contract stops trading on its ``finalTradeDate``; DNSE rejects any
+        order whose GTD reaches past it with ``CO-ORD-006 Validate Order Failed``.
+        Blindly adding 7 days therefore makes every native STOP/OCO — including protective
+        stop-losses — unplaceable during the last week of each contract month.
+
+        Measured 2026-08-14: VN30F1M's finalTradeDate was 2026-08-20, +7 days gave
+        2026-08-21, and every conditional place was refused. The same call succeeded on
+        2026-08-13 (+7 = 2026-08-20, exactly the final trade date), which is why this
+        surfaced as a sudden, whole-day failure rather than a gradual one.
+
+        Falls back to the plain +days window when the secdef carries no usable date, so a
+        missing field cannot make the plugin unable to place anything at all.
+        """
+        target = datetime.now(timezone.utc) + timedelta(days=days)
+        try:
+            final = str(self._secdef(self.symbol or "").get("finalTradeDate") or "")[:10]
+            if final:
+                # Cap at MIDNIGHT UTC of the final trade date, which is how DNSE itself
+                # reports it. Not 23:59Z: the venue reads the date in ICT (UTC+7), so
+                # 23:59Z on the final date is already 07:00 the NEXT day there and is
+                # refused. Measured 2026-08-14 — GTD 2026-08-20T04:00Z was accepted,
+                # 2026-08-20T23:59Z was not.
+                last = datetime.strptime(final, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                target = min(target, last)
+        except Exception:                                           # noqa: BLE001
+            pass                        # no usable expiry -> keep the plain window
+        return target.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _loan_package_id(self) -> int:
         if self._loan_id is None:

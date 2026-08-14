@@ -399,14 +399,46 @@ def __test_marketable_price_raises_without_ceiling_or_floor__(fake_client, tmp_p
         b._marketable_price("buy")
 
 
-def __test_gtd_is_rfc3339_about_a_week_out__():
+def __test_gtd_is_rfc3339_about_a_week_out__(fake_client, tmp_path):
+    """No expiry in reach -> the plain ~7-day window."""
+    far = (datetime.now(timezone.utc) + timedelta(days=60)).strftime("%Y-%m-%dT00:00:00Z")
+    b = _broker(fake_client, tmp_path, get_security_definition=(200, [
+        {"ceilingPrice": "1550", "floorPrice": "1450", "securityGroupId": "FU",
+         "finalTradeDate": far}]))
     before = datetime.now(timezone.utc)
-    result = broker.DNSEBroker._gtd(days=7)
+    result = b._gtd(days=7)
     after = datetime.now(timezone.utc)
     assert result.endswith("Z"), "GTD expiry must be RFC3339 Zulu-suffixed"
     parsed = datetime.strptime(result, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     assert before + timedelta(days=6, hours=23) <= parsed <= after + timedelta(days=7, minutes=1), \
         f"expected ~7 days out, got {parsed} (bounds around {before}..{after})"
+
+
+def __test_gtd_is_clamped_to_the_contract_final_trade_date__(fake_client, tmp_path):
+    """A GTD past finalTradeDate is what DNSE refuses with CO-ORD-006.
+
+    Measured 2026-08-14: VN30F1M's finalTradeDate was 2026-08-20, the unclamped +7 days
+    gave 2026-08-21, and EVERY conditional place was rejected — so native STOP/OCO,
+    protective stop-losses included, became unplaceable for the last week of the contract.
+    """
+    soon = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
+    b = _broker(fake_client, tmp_path, get_security_definition=(200, [
+        {"ceilingPrice": "1550", "floorPrice": "1450", "securityGroupId": "FU",
+         "finalTradeDate": f"{soon}T00:00:00Z"}]))
+
+    parsed = datetime.strptime(b._gtd(days=7), "%Y-%m-%dT%H:%M:%SZ")
+
+    assert parsed.strftime("%Y-%m-%d") == soon, \
+        "GTD must be clamped to the final trade date, never past it"
+
+
+def __test_gtd_falls_back_when_the_secdef_has_no_expiry__(fake_client, tmp_path):
+    """A missing field must not make the plugin unable to place anything at all."""
+    b = _broker(fake_client, tmp_path)          # default secdef row: no finalTradeDate
+    parsed = datetime.strptime(b._gtd(days=7), "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    assert parsed > datetime.now(timezone.utc) + timedelta(days=6), \
+        "with no usable expiry the plain +days window must still be produced"
 
 
 def __test_loan_package_id_caches_after_first_resolve__(fake_client, tmp_path):
