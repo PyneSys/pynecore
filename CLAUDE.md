@@ -122,6 +122,8 @@ oracle). Both staged probes are driven by `winStart`/`winEnd`/`startState` in th
 `.toml` — for a live run `winStart` must be AFTER launch or warmup consumes the stages.
 Grade live results from the VENUE record, never the run log alone. Measured venue facts
 (cancel-ACK, no cascade, amend-500, GTD clamp, session phases) are listed in that README.
+Trading-token workflow (OTP mint, ~8h TTL, status check): `plugins/dnse/tools/README.md`
+— live runs need a GOOD token first (`tools/token_status.py`).
 
 ## Pine Script language reference
 
