@@ -1,0 +1,15 @@
+[2026-08-14 13:50:39+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-14 13:50:39+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-14 13:50:39+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-14 13:50:39+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-14 13:50:39+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-14 13:49:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-14 13:49:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-14 13:55:00+0700] bar:    506 INFO     [DUAL-A] PLACE id=DUALA limit=1791.7
+[2026-08-14 13:55:00+0700] bar:    506 INFO     [BROKER] dispatching ENTRY BUY id='DUALA' qty=1.0 type=limit limit=1791.7
+[2026-08-14 13:55:00+0700] bar:    506 INFO     [BROKER] dispatched ENTRY BUY id='DUALA' qty=1.0 type=limit limit=1791.7 -> 
+[2026-08-14 13:55:00+0700] bar:    506 INFO     [BROKER] event CREATED id=950436 side=buy qty=1.0 filled=0.0 pine='DUALA' leg=entry
+[2026-08-14 13:56:00+0700] bar:    507 INFO     [DUAL-A] CANCEL step done (cancel by id)
+[2026-08-14 13:56:00+0700] bar:    507 INFO     [BROKER] cancelling CANCEL id='DUALA'
+[2026-08-14 13:56:00+0700] bar:    507 INFO     [BROKER] event CANCELLED id=950436 side=buy qty=1.0 filled=0.0 pine='DUALA' leg=entry
+[2026-08-14 13:57:37+0700] bar:    507 INFO     [BROKER] run stopped (completed) position=1 equity=424,842,662.00 VND
