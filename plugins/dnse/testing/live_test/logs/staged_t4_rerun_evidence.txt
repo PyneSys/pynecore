@@ -1,0 +1,24 @@
+[2026-08-14 11:23:09+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-14 11:23:09+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-14 11:23:09+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-14 11:23:09+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-14 11:23:09+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-14 11:22:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-14 11:22:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, every order >=5% away so none can fill. ===
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) | T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [L1] TEST 4 PLACE id=T4 SHORT limit=1985.3 + exit X4 stop=1994.8 (+5.5%), oca_name=t4 — next bar cancels ONLY T4, to see whether X4 goes with it
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] dispatching ENTRY SELL id='T4' qty=1.0 type=limit limit=1985.4
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] dispatched ENTRY SELL id='T4' qty=1.0 type=limit limit=1985.4 -> 
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] dispatching EXIT id='X4' from='T4' qty=1.0 sl=1994.8
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] dispatched EXIT id='X4' from='T4' qty=1.0 sl=1994.8 -> 
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] event CREATED id=499436 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-14 11:24:00+0700] bar:    502 INFO     [BROKER] event CREATED id=d9v9h786p09g1n1vee30 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [L1] TEST 4 CANCEL id=T4 ONLY (X4 deliberately left alone) — KEY OBSERVATION: does X4 also disappear from DNSE?
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [L1] TEST 4 DONE — entry_lvl=1985.3 stop_lvl=1994.8; state 3->4
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [L1] === ALL 4 TESTS DONE. Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [BROKER] cancelling CANCEL id='T4'
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [BROKER] cascading cancel to exit leg d9v9h786p09g1n1vee30 (from_entry=T4) — DNSE does not remove it with the entry, and a stranded exit can OPEN a     
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [BROKER] event CANCELLED id=499436 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-14 11:25:00+0700] bar:    503 INFO     [BROKER] event CANCELLED id=d9v9h786p09g1n1vee30 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-14 11:26:25+0700] bar:    503 INFO     [BROKER] run stopped (completed) position=1 equity=424,752,662.00 VND
