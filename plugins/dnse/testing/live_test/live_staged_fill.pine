@@ -1,0 +1,169 @@
+//@version=6
+// STAGED FILL TEST (Level 3 + the backtest oracle, merged) — eight FILL cases driven by
+// one `var int state` machine, bounded by a trade window.
+//
+// ONE file, two modes:
+//   * window over a PAST session + plain `dnse:` backtest  -> the ORACLE: every stage
+//     must fill, flatten and advance, trade CSV balanced (replaces t1-t8).
+//   * window ahead of now + `dnse_broker:... --broker`     -> LEVEL 3 live: the same
+//     byte-identical logic against the venue (replaces l3a-l3h).
+// Oracle and live test are therefore the SAME state machine and cannot drift apart.
+//
+//   state 0  F1  long  MARKET
+//   state 1  F2  short MARKET
+//   state 2  F3  long  STOP        (trigger high[1])
+//   state 3  F4  short STOP        (trigger low[1])
+//   state 4  F5  long  STOP-LIMIT  (stop high[1], limit +2 ticks-ish)   <- #14 evidence
+//   state 5  F6  short STOP-LIMIT  (stop low[1],  limit -2 ticks-ish)
+//   state 6  F7  OCA both sides — UP leg near (fills), DOWN far (must CANCEL)
+//   state 7  F8  OCA both sides — DOWN leg near (fills), UP far (must CANCEL)
+//   state 8  done
+//
+// Per-stage lifecycle: PLACE (entry "E" [+ sibling "B" for OCA] + protection exit "P",
+// armed at placement — exits reach the venue pre-fill, measured 2026-08-13) -> FILL
+// (position != 0) -> FLATTEN (close "E"; cancel "P" and "B" EXPLICITLY — the #19 interim
+// rule: never rely on a cascade) -> FLAT (position == 0) -> advance.
+//
+// A stage that does not fill within FILL_TIMEOUT_BARS cancels everything, re-places once
+// with fresh levels, then SKIPs with a log — a quiet tape cannot wedge the sequence.
+//
+// SAFETY: 1 contract, pyramiding=0, frozen levels (a moving level would amend — DNSE
+// 500s on conditional amends, #18), the -0.3% double-check (cancel_all THEN close_all),
+// and no new placements after winEnd (mid-flight stages still complete their flatten).
+// LIVE PRECONDITION: FLAT account, supervised, DNSE app open (see LIVE_TEST_PLAN_L3).
+strategy("STAGED FILL (L3+oracle)", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48, slippage=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+winStart   = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
+winEnd     = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+startState = input.int(0, "Start at state (0=F1 .. 7=F8)", minval=0, maxval=7)
+
+FILL_TIMEOUT_BARS = 6
+MAX_RETRIES       = 1
+
+var int   state      = startState
+var int   placedBar  = na       // na = nothing placed for this stage yet
+var int   retries    = 0
+var bool  flattening = false
+var float protLvl    = na
+var bool  announced  = false
+
+isLongStage = state == 0 or state == 2 or state == 4 or state == 6
+started     = time >= winStart
+canPlace    = started and time <= winEnd
+pending     = not na(placedBar)
+
+if started
+    if not announced
+        log.info("[F] === STAGED FILL — window open. 8 fill cases, 1 contract each, " +
+                 "flatten on sight, protection armed at placement. startState={0} ===", startState)
+        announced := true
+    log.info("[F] bar={0} close={1} state={2} pending={3} flattening={4} retries={5} pos={6}",
+             bar_index, str.tostring(close, format.mintick), state,
+             pending ? "yes" : "no", flattening ? "yes" : "no", retries,
+             strategy.position_size)
+
+// ---------------------------------------------------------------- placement
+if canPlace and not pending and not flattening and state < 8
+    protLvl := isLongStage ? low[1] : high[1]
+    if state == 0
+        strategy.entry("E", strategy.long, comment="F1 mkt long")
+        log.info("[F] F1 PLACE long MARKET — expect marketable LO at the band edge, fills next bar")
+    else if state == 1
+        strategy.entry("E", strategy.short, comment="F2 mkt short")
+        log.info("[F] F2 PLACE short MARKET")
+    else if state == 2
+        strategy.entry("E", strategy.long, stop=high[1], comment="F3 stop long")
+        log.info("[F] F3 PLACE long STOP trigger={0} — fills on a break of the prior high",
+                 str.tostring(high[1], format.mintick))
+    else if state == 3
+        strategy.entry("E", strategy.short, stop=low[1], comment="F4 stop short")
+        log.info("[F] F4 PLACE short STOP trigger={0}", str.tostring(low[1], format.mintick))
+    else if state == 4
+        strategy.entry("E", strategy.long, stop=high[1], limit=high[1] * 1.0002,
+                       comment="F5 stoplim long")
+        log.info("[F] F5 PLACE long STOP-LIMIT stop={0} limit={1} — #14: must go out as ONE " +
+                 "STOP carrying a limit, not an OCO pair",
+                 str.tostring(high[1], format.mintick),
+                 str.tostring(high[1] * 1.0002, format.mintick))
+    else if state == 5
+        strategy.entry("E", strategy.short, stop=low[1], limit=low[1] * 0.9998,
+                       comment="F6 stoplim short")
+        log.info("[F] F6 PLACE short STOP-LIMIT stop={0} limit={1}",
+                 str.tostring(low[1], format.mintick),
+                 str.tostring(low[1] * 0.9998, format.mintick))
+    else if state == 6
+        strategy.entry("E", strategy.long, stop=high[1],
+                       oca_name="f", oca_type=strategy.oca.cancel, comment="F7 oca up-near")
+        strategy.entry("B", strategy.short, stop=low[1] * 0.95,
+                       oca_name="f", oca_type=strategy.oca.cancel, comment="F7 oca dn-far")
+        log.info("[F] F7 PLACE OCA: near up-stop {0} (fills) + far dn-stop {1} — on the " +
+                 "fill the FAR leg must be CANCELLED (one-cancels-other on a real fill)",
+                 str.tostring(high[1], format.mintick),
+                 str.tostring(low[1] * 0.95, format.mintick))
+    else if state == 7
+        strategy.entry("E", strategy.short, stop=low[1],
+                       oca_name="f", oca_type=strategy.oca.cancel, comment="F8 oca dn-near")
+        strategy.entry("B", strategy.long, stop=high[1] * 1.05,
+                       oca_name="f", oca_type=strategy.oca.cancel, comment="F8 oca up-far")
+        log.info("[F] F8 PLACE OCA mirror: near dn-stop {0} + far up-stop {1}",
+                 str.tostring(low[1], format.mintick),
+                 str.tostring(high[1] * 1.05, format.mintick))
+    // protection armed at placement (reaches the venue pre-fill; frozen level)
+    strategy.exit("P", from_entry="E", stop=protLvl,
+                  comment_loss="P SL@" + str.tostring(protLvl, format.mintick))
+    placedBar := bar_index
+
+// ---------------------------------------------------------------- fill -> flatten
+if pending and not flattening and strategy.position_size != 0
+    log.info("[F] F{0} FILLED pos={1} avg={2} -> FLATTEN now (close E, cancel P and B " +
+             "explicitly — no reliance on any cascade)",
+             state + 1, strategy.position_size,
+             str.tostring(strategy.position_avg_price, format.mintick))
+    strategy.close("E", comment="FLATTEN")
+    strategy.cancel("P")
+    strategy.cancel("B")
+    flattening := true
+
+// ---------------------------------------------------------------- flat -> advance
+if flattening and strategy.position_size == 0
+    log.info("[F] F{0} DONE — flat again; state {1}->{2}", state + 1, state, state + 1)
+    placedBar  := na
+    flattening := false
+    retries    := 0
+    state      := state + 1
+    if state == 8
+        log.info("[F] === ALL 8 FILL CASES DONE. Verify at the venue: flat, nothing " +
+                 "working. ===")
+
+// ---------------------------------------------------------------- fill timeout
+if pending and not flattening and strategy.position_size == 0 and
+     bar_index - placedBar >= FILL_TIMEOUT_BARS
+    strategy.cancel("E")
+    strategy.cancel("B")
+    strategy.cancel("P")
+    if retries < MAX_RETRIES
+        retries   := retries + 1
+        placedBar := na
+        log.info("[F] F{0} TIMEOUT after {1} bars — cancelled all, RETRY {2}/{3} with " +
+                 "fresh levels next bar", state + 1, FILL_TIMEOUT_BARS, retries, MAX_RETRIES)
+    else
+        log.info("[F] F{0} SKIP — no fill after retry (quiet tape); state {1}->{2}",
+                 state + 1, state, state + 1)
+        placedBar := na
+        retries   := 0
+        state     := state + 1
+
+// ---------------------------------------------------------------- double-check backstop
+DOUBLE_CHECK_PCT = -0.3
+openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
+if strategy.position_size != 0 and openPnlPct < DOUBLE_CHECK_PCT
+    log.error("[F] !!! DOUBLE-CHECK at {0}% — cancel_all + close_all",
+              str.tostring(openPnlPct, "#.##"))
+    strategy.cancel_all()
+    strategy.close_all(comment="DOUBLECHECK")
+
+plot(state, "state", display=display.data_window)
+plot(strategy.position_size, "pos", display=display.data_window)

@@ -24,7 +24,7 @@
 #default_qty_value = 1
 #initial_capital = 500000000
 #currency = "NONE"
-#slippage = 0
+#slippage = 1
 #commission_type = "percent"
 #commission_value = 0.0
 #process_orders_on_close = false
@@ -36,3 +36,32 @@
 #fill_orders_on_standard_ohlc = false
 
 # Input Settings
+
+[inputs.winStart]
+# Input metadata, cannot be modified
+# input_type: "int"
+#     defval: 1893430800000
+#      title: "Trade window START"
+#    confirm: false
+# Change here to modify the input value
+#value =
+
+[inputs.winEnd]
+# Input metadata, cannot be modified
+# input_type: "int"
+#     defval: 1893517140000
+#      title: "Trade window END"
+#    confirm: false
+# Change here to modify the input value
+#value =
+
+[inputs.startState]
+# Input metadata, cannot be modified
+# input_type: "int"
+#     defval: 0
+#      title: "Start at state (0=F1 .. 7=F8)"
+#     minval: 0
+#     maxval: 7
+#    confirm: false
+# Change here to modify the input value
+#value =
