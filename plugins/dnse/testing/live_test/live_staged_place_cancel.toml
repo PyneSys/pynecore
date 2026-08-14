@@ -44,7 +44,7 @@
 #      title: "Trade window START"
 #    confirm: false
 # Change here to modify the input value
-value = 1786604280000
+#value =
 
 [inputs.winEnd]
 # Input metadata, cannot be modified
@@ -53,15 +53,15 @@ value = 1786604280000
 #      title: "Trade window END"
 #    confirm: false
 # Change here to modify the input value
-value = 1786605900000
+#value =
 
 [inputs.startState]
 # Input metadata, cannot be modified
 # input_type: "int"
 #     defval: 0
-#      title: "Start at state (0=T1, 1=T2, 2=T3, 3=T4)"
+#      title: "Start at state (0=T1 .. 8=T9)"
 #     minval: 0
-#     maxval: 3
+#     maxval: 8
 #    confirm: false
 # Change here to modify the input value
 #value =
