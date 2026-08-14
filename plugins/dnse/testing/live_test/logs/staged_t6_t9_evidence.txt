@@ -1,0 +1,58 @@
+[2026-08-14 13:22:34+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-14 13:22:34+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-14 13:22:34+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-14 13:22:34+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-14 13:22:34+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-14 13:21:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-14 13:21:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-14 13:26:00+0700] bar:    505 INFO     [L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=5 ===
+[2026-08-14 13:26:00+0700] bar:    505 INFO     [L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[2026-08-14 13:29:00+0700] bar:    508 INFO     [L1] TEST 6 PLACE id=T6 LONG limit=1795.9 (-5%) — NEXT bar re-issues at 1805.3 (-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on    
+[2026-08-14 13:29:00+0700] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='T6' qty=1.0 type=limit limit=1795.8
+[2026-08-14 13:29:00+0700] bar:    508 INFO     [BROKER] dispatched ENTRY BUY id='T6' qty=1.0 type=limit limit=1795.8 -> 
+[2026-08-14 13:29:00+0700] bar:    508 INFO     [BROKER] event CREATED id=698366 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[2026-08-14 13:30:00+0700] bar:    509 INFO     [L1] TEST 6 AMEND id=T6 -> limit 1805.3 — expect 
+[2026-08-14 13:30:00+0700] bar:    509 INFO     [BROKER] modifying ENTRY BUY id='T6' qty=1.0 type=limit limit=1795.8 -> ENTRY BUY id='T6' qty=1.0 type=limit limit=1805.3
+[2026-08-14 13:31:00+0700] bar:    510 INFO     [L1] TEST 6 CANCEL id=T6 (post-amend)
+[2026-08-14 13:31:00+0700] bar:    510 INFO     [L1] TEST 6 DONE — state 5->6
+[2026-08-14 13:31:00+0700] bar:    510 INFO     [BROKER] cancelling CANCEL id='T6'
+[2026-08-14 13:31:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=698366 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[2026-08-14 13:32:00+0700] bar:    511 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=698366 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry)
+[2026-08-14 13:32:00+0700] bar:    511 INFO     [L1] TEST 7 PLACE id=T7 buy-STOP 1982.5 (+5%) — NEXT bar re-issues at 1973.1 (+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a 
+[2026-08-14 13:32:00+0700] bar:    511 INFO     [BROKER] dispatching ENTRY BUY id='T7' qty=1.0 type=stop stop=1982.6
+[2026-08-14 13:32:00+0700] bar:    511 INFO     [BROKER] dispatched ENTRY BUY id='T7' qty=1.0 type=stop stop=1982.6 -> 
+[2026-08-14 13:32:00+0700] bar:    511 INFO     [BROKER] event CREATED id=d9vbd786p09g1n1vei6g side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[2026-08-14 13:33:00+0700] bar:    512 INFO     [L1] TEST 7 AMEND id=T7 -> stop 1973.1 — expect code=REMOTE_SERVER_ERROR http=500 -> park+verify (#18). KEY: the run must continue, and the order must  
+[2026-08-14 13:33:00+0700] bar:    512 INFO     [BROKER] modifying ENTRY BUY id='T7' qty=1.0 type=stop stop=1982.6 -> ENTRY BUY id='T7' qty=1.0 type=stop stop=1973.1
+[2026-08-14 13:33:00+0700] bar:    512 WARNING  [BROKER] amend code=REMOTE_SERVER_ERROR http=500 -> park+verify | order=d9vbd786p09g1n1vei6g intent=T7 msg="Error in backend service"
+[2026-08-14 13:33:00+0700] bar:    512 WARNING  [BROKER] modify parked (unknown disposition) for ENTRY BUY id='T7' qty=1.0 type=stop stop=1973.1: DNSE disposition unknown on amend: REMOTE_SERVER_ERROR
+[2026-08-14 13:34:00+0700] bar:    513 INFO     [L1] TEST 7 CANCEL id=T7 (post-500) — proves a parked amend does not wedge the order: it must still cancel cleanly
+[2026-08-14 13:34:00+0700] bar:    513 INFO     [L1] TEST 7 DONE — state 6->7
+[2026-08-14 13:34:00+0700] bar:    513 INFO     [BROKER] cancelling CANCEL id='T7'
+[2026-08-14 13:34:00+0700] bar:    513 INFO     [BROKER] event CANCELLED id=d9vbd786p09g1n1vei6g side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[2026-08-14 13:35:00+0700] bar:    514 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=d9vbd786p09g1n1vei6g side=buy qty=1.0 filled=0.0 pine='T7' leg=entry)
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [L1] TEST 8 PLACE T8a limit=1797.2 AND T8b stop=1986.4 — two ids across BOTH books; next bar strategy.cancel_all(), never before fired live
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] dispatching ENTRY BUY id='T8a' qty=1.0 type=limit limit=1797.2
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] dispatched ENTRY BUY id='T8a' qty=1.0 type=limit limit=1797.2 -> 
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] dispatching ENTRY BUY id='T8b' qty=1.0 type=stop stop=1986.4
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] dispatched ENTRY BUY id='T8b' qty=1.0 type=stop stop=1986.4 -> 
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] event CREATED id=753346 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry
+[2026-08-14 13:36:00+0700] bar:    515 INFO     [BROKER] event CREATED id=d9vbf3g6p09g1n1veigg side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [L1] TEST 8 strategy.cancel_all() — BOTH T8a (NORMAL) and T8b (STOP) must go; venue book must be clear of ours
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [L1] TEST 8 DONE — state 7->8
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [BROKER] cancelling CANCEL id='T8a'
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [BROKER] cancelling CANCEL id='T8b'
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [BROKER] event CANCELLED id=753346 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry
+[2026-08-14 13:37:00+0700] bar:    516 INFO     [BROKER] event CANCELLED id=d9vbf3g6p09g1n1veigg side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry
+[2026-08-14 13:38:00+0700] bar:    517 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=753346 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry)
+[2026-08-14 13:38:00+0700] bar:    517 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=d9vbf3g6p09g1n1veigg side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry)
+[2026-08-14 13:39:00+0700] bar:    518 INFO     [L1] TEST 9 PLACE via strategy.order() LONG limit=1795.3 — order() has never touched the broker; expect identical NORMAL-LO routing to entry()
+[2026-08-14 13:39:00+0700] bar:    518 INFO     [BROKER] dispatching ENTRY BUY id='T9' qty=1.0 type=limit limit=1795.4
+[2026-08-14 13:39:00+0700] bar:    518 INFO     [BROKER] dispatched ENTRY BUY id='T9' qty=1.0 type=limit limit=1795.4 -> 
+[2026-08-14 13:39:00+0700] bar:    518 INFO     [BROKER] event CREATED id=777886 side=buy qty=1.0 filled=0.0 pine='T9' leg=entry
+[2026-08-14 13:40:00+0700] bar:    519 INFO     [L1] TEST 9 CANCEL id=T9
+[2026-08-14 13:40:00+0700] bar:    519 INFO     [L1] TEST 9 DONE — state 8->9
+[2026-08-14 13:40:00+0700] bar:    519 INFO     [L1] === ALL 9 TESTS DONE. Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-08-14 13:40:00+0700] bar:    519 INFO     [BROKER] cancelling CANCEL id='T9'
+[2026-08-14 13:40:00+0700] bar:    519 INFO     [BROKER] event CANCELLED id=777886 side=buy qty=1.0 filled=0.0 pine='T9' leg=entry
+[2026-08-14 13:41:26+0700] bar:    519 INFO     [BROKER] run stopped (completed) position=1 equity=425,052,662.00 VND
