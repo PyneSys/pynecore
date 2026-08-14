@@ -1,0 +1,42 @@
+//@version=6
+// LIVE TEST T10 (dual-strategy) — instance A. Two of these run CONCURRENTLY on one
+// account. Each places ONE far limit (cannot fill), then instance A cancels BY ID while
+// instance B fires strategy.cancel_all() with A's order still resting.
+//
+// Questions: does B's cancel_all touch A's order (blast radius)? Does either engine
+// quarantine on seeing the sibling's orders/cancels (cross-process "unexpected cancel")?
+// Does the shared .ohlcv cache survive two simultaneous warmup rewrites (flock)?
+strategy("DUAL A", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48, slippage=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
+winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+
+var int   placedBar = na
+var float lvl       = na
+var bool  done      = false
+
+if time >= winStart
+    log.info("[DUAL-A] bar={0} close={1} placed={2} done={3} pos={4}",
+             bar_index, str.tostring(close, format.mintick),
+             na(placedBar) ? "no" : "yes", done ? "yes" : "no", strategy.position_size)
+
+if time >= winStart and time <= winEnd and na(placedBar) and not done
+    lvl := close * 0.95
+    strategy.entry("DUALA", strategy.long, limit=lvl, comment="DUALA")
+    placedBar := bar_index
+    log.info("[DUAL-A] PLACE id=DUALA limit={0}", str.tostring(lvl, format.mintick))
+
+if not na(placedBar) and bar_index > placedBar and not done
+    strategy.cancel("DUALA")
+    done := true
+    log.info("[DUAL-A] CANCEL step done (cancel by id)")
+
+if strategy.position_size != 0
+    log.error("[DUAL-A] !!! UNEXPECTED FILL pos={0}", strategy.position_size)
+    strategy.cancel_all()
+    strategy.close_all(comment="SAFETY")
+
+plot(strategy.position_size, "pos", display=display.data_window)
