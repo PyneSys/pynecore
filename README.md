@@ -179,15 +179,22 @@ auto-discovered through the `pyne.plugin` entry-point group:
 | **DNSE** — [`plugins/dnse`](plugins/dnse) | `dnse` (data) · `dnse_broker` (broker) | Vietnamese derivatives & stocks: OHLCV history + **native STOP/OCO conditional orders** on DNSE's OpenAPI, built on the vendored `openapi-sdk` 2.0.0. REST-only. |
 
 ```bash
-# historical / live data feed
-pyne run my_strategy.py dnse:VN30F1M@5 --from -500
+# historical / live data feed (no --from: it truncates the shared .ohlcv cache;
+# the built-in -500-real-bars default is both safe and deep enough)
+pyne run my_strategy.py dnse:VN30F1M@5
 
 # live broker — places REAL orders (implies --live)
 pyne run my_strategy.py dnse_broker:VN30F1M@5 --broker
 ```
 
-Unit tests: `pytest plugins/dnse/tests/`. The vendored SDK, a mirror of DNSE's
-OpenAPI docs (`docs/dnse-openapi-documentation/`) with a sync/verify tool, and the
+Testing: `pytest plugins/dnse/tests/` (unit + offline e2e against a fake venue that
+reproduces DNSE's measured quirks), plus a live-test suite — a session-independent
+venue-semantics gate and two staged live probes (no-fill place/amend/cancel/OCA cases
+and a fill matrix whose backtest mode doubles as the oracle). Procedures, safety rules
+and the measured venue facts: [`plugins/dnse/testing/live_test/README.md`](plugins/dnse/testing/live_test/README.md).
+
+The vendored SDK, a mirror of DNSE's OpenAPI docs
+(`docs/dnse-openapi-documentation/`) with a sync/verify tool, and the
 error-handling plan (`docs/plan/`) live alongside the plugin.
 
 **Reference plugins** — the DNSE plugin follows PyneSys's official broker-plugin
