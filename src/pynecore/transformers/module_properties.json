@@ -2193,6 +2193,9 @@
     "ADOPTED_STARTUP_ENTRY_ID": {
       "type": "variable"
     },
+    "Decimal": {
+      "type": "variable"
+    },
     "IntEnum": {
       "type": "variable"
     },
@@ -2221,6 +2224,9 @@
       "type": "variable"
     },
     "QtyType": {
+      "type": "variable"
+    },
+    "ROUND_FLOOR": {
       "type": "variable"
     },
     "SimPosition": {

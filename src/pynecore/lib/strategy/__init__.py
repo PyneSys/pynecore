@@ -6,6 +6,7 @@ import math
 import struct
 from abc import ABC, abstractmethod
 from datetime import datetime, UTC
+from decimal import Decimal, ROUND_FLOOR
 from collections import deque, defaultdict
 from copy import copy
 from bisect import insort, bisect_left
@@ -166,6 +167,7 @@ class Order:
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
+        "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "bar_index",  # Bar index when the order was placed
@@ -242,6 +244,7 @@ class Order:
 
         self.cancelled = False
         self.deferred_qty = False
+        self.budget_money: float | None = None
         # Live-only fill accounting: how much of this retained entry order has
         # already been recorded as an open trade. The simulator removes a
         # market entry order on fill, so it stays 0.0 there; the live broker
@@ -828,6 +831,26 @@ class SimPosition(PositionBase):
         # so position series stay constant for the rest of the bar (TV semantics).
         self._deferred_immediate_closes: list[Order] = []
 
+    def _snap_size_to_lot_grid(self):
+        """
+        Snap the accumulated position size back onto the lot grid after a fill.
+        """
+        # Every simulated fill is lot-quantized, so the position is an exact
+        # lot multiple; only float summation dirties it. TV keeps the position
+        # clean across CLOSE fills: fresh Trend Trader-Remastered pslots
+        # exports show clean lot-decimal doubles through whole TP cascades
+        # (990.0000000000001 = 0.0099*1e5 etc.), while raw += accumulation
+        # drifts ULPs below (0.004289999999999998) and flips the
+        # decimal-floor of a later qty = (position/100)*rate close one lot
+        # low. The ENTRY/flip accumulation is NOT cleaned: snapping there
+        # breaks the barupdn reference (TV's reversal chain keeps the dirty
+        # 88180.78899999999). Nearest-lot snap is exact because the true
+        # value IS the integer lot sum.
+        rfactor = syminfo._size_round_factor  # noqa
+        scaled = self.size * rfactor
+        if abs(scaled) < 2 ** 53:
+            self.size = round(scaled) / rfactor
+
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
         # Set the bar_index when the order is placed
@@ -1084,6 +1107,7 @@ class SimPosition(PositionBase):
                         else:
                             # cash_per_contract: size-proportional, charged per leg
                             commission = abs(size) * commission_value
+                        commission = _round_cash(commission)
 
                         closed_trade.commission += commission
                         # Realize commission
@@ -1103,6 +1127,7 @@ class SimPosition(PositionBase):
 
                     # Modify sizes
                     self.size += size
+                    self._snap_size_to_lot_grid()
                     # Handle too small sizes because of floating point inaccuracy and rounding
                     position_flat = _size_round(self.size) == 0.0
                     if position_flat:
@@ -1110,6 +1135,13 @@ class SimPosition(PositionBase):
                         self.size = 0.0
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
                     trade.size += size
+                    # Keep the residual open-trade size on the lot grid with the
+                    # position (see _snap_size_to_lot_grid): a snapped position
+                    # with a dirty trade residue would leave ±1e-18 dust open
+                    # after the final close and export a ghost 0-qty trade.
+                    trade_scaled = trade.size * syminfo._size_round_factor  # noqa
+                    if abs(trade_scaled) < 2 ** 53:
+                        trade.size = round(trade_scaled) / syminfo._size_round_factor  # noqa
                     if position_flat:
                         # `size` already absorbed the position residual above, so the
                         # trade that flattened the position is fully closed. Snap off
@@ -1265,6 +1297,7 @@ class SimPosition(PositionBase):
                     commission = abs(order.size) * commission_value
                 else:  # Should not be here!
                     assert False, 'Wrong commission type: ' + str(commission_type)
+                commission = _round_cash(commission)
             else:
                 commission = 0.0
 
@@ -2252,18 +2285,30 @@ class SimPosition(PositionBase):
         """Finalize a default-sized entry's quantity at its actual fill price.
 
         TradingView resolves percent_of_equity / cash default sizing of
-        price-based (limit/stop) orders when the order EXECUTES: the
-        investment target is divided by the real fill price, with equity
-        measured at that moment. For those the placement-time size was only
-        the margin-check estimate — a marketable limit filling at the open
-        re-sizes here. Market entries never defer: they keep the
-        placement-close size computed in ``entry`` (TV-probe-verified). The
-        reversal flip component stays frozen from creation (TV computes the
-        flip quantity at order creation time).
+        price-based (limit/stop) orders when the order EXECUTES, dividing the
+        order's money budget by the per-unit cost at the real fill price. The
+        budget itself is FROZEN at the close of the bar where the order was
+        (last) placed or modified — an order resting for many bars keeps the
+        placement-close equity, it is not re-marked at fill (measured on the
+        Trendoscope corpus fork: a buy stop placed 12 bars before its fill
+        sized off the placement bar's equity, reproduced one-shot by probe;
+        an order re-placed every bar degenerates to prev-close equity, which
+        is what earlier fill-time measurements saw). For those the
+        placement-time size was only the margin-check estimate — a marketable
+        limit filling at the open re-sizes here. Market entries never defer:
+        they keep the placement-close size computed in ``entry``
+        (TV-probe-verified). The reversal flip component stays frozen from
+        creation (TV computes the flip quantity at order creation time).
         """
         order.deferred_qty = False
         old_abs = abs(order.size)
-        qty = _default_entry_qty(float(fill_price))
+        budget = _default_entry_budget(float(fill_price))
+        if budget is None:
+            qty = lib._script.default_qty_value
+            money = None
+        else:
+            money = order.budget_money if order.budget_money is not None else budget[0]
+            qty = money / budget[1]
         if not (0.0 < qty < math.inf):  # unsizable_qty
             order.size = 0.0
             return
@@ -2273,7 +2318,7 @@ class SimPosition(PositionBase):
             # the order only; the reversal flip component is the old position,
             # already an exact lot multiple.
             flip = order.flip_extra * order.sign
-            size = _judge_money_entry(size - flip, float(fill_price)) + flip
+            size = _judge_money_entry(size - flip, float(fill_price), money=money) + flip
         order.size = size
         # A default-sized entry that resolves LARGER than its placement estimate
         # would strand a sliver: the bracket's no-qty "rest" leg reserved off the
@@ -3527,6 +3572,57 @@ class SimPosition(PositionBase):
 #
 
 # noinspection PyProtectedMember
+def _round_cash(amount: float) -> float:
+    """
+    Round a booked cash flow to micro units of the account currency.
+
+    :param amount: The raw cash amount
+    :return: The amount rounded half-up to 1e-6
+    """
+    # TV books each commission cash flow rounded HALF-UP to 1e-6 account
+    # currency units; realized gross P&L stays raw. Measured on SuperTrend
+    # STRATEGY d6fba11d (BINANCE:BTCUSDT 30m, 2026-08-13): netprofit after
+    # the first entry is exactly -1499.774913 (raw commission
+    # 1499.7749132048700), all 186 entry/exit netprofit steps reproduce to
+    # sub-ULP with this rounding, and the 2025-08-06 step lands exactly
+    # 1e-6 below the half-even result, pinning half-up.
+    return math.floor(amount * 1e6 + 0.5) / 1e6
+
+
+_explicit_qty_grid: tuple[float, Decimal] | None = None
+
+
+def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
+    """
+    Quantize a user-supplied order quantity down to the mincontract grid.
+
+    :param qty: The requested quantity in contracts (positive, finite)
+    :return: The quantity floored to the lot grid
+    """
+    # TV parses an explicit qty argument through its shortest round-trip
+    # decimal (Double.toString) and floors that decimal on the mincontract
+    # grid — no float-space snap. Measured on Trend Trader-Remastered
+    # (BINANCE:BTCUSDT 30m, 1150 TP/RE partial closes, 2026-08-13):
+    # (0.0109/100)*10 = 0.0010899999999999998 closes 108 lots (float
+    # rounding gives 109), 150.9 closes 150, while a value whose shortest
+    # decimal lands on or above a lot multiple (0.00121, or a dirty
+    # position's 0.0011600000000000002) keeps the full amount. The float
+    # snap in ``_size_round`` stays for internally derived sizes, where the
+    # value is already lot-exact and only the scaling multiply dirties it.
+    # Known gap: TV's compiler folds constant qty expressions in exact
+    # decimal ((0.0109/100)*10 passed literally arrives clean), PyneCore
+    # evaluates them at runtime — only const-expression qty args differ.
+    global _explicit_qty_grid
+    rfactor = syminfo._size_round_factor  # noqa
+    mincontract = 1.0 / rfactor
+    if _explicit_qty_grid is None or _explicit_qty_grid[0] != mincontract:
+        _explicit_qty_grid = (mincontract, Decimal(repr(mincontract)))
+    grid = _explicit_qty_grid[1]
+    lots = int((Decimal(repr(abs(qty))) / grid).to_integral_value(rounding=ROUND_FLOOR))
+    sign = 1 if qty > 0 else -1
+    return sign * lots / rfactor
+
+
 def _size_round(qty: PyneFloat) -> PyneFloat:
     """
     Round a size down to the nearest tradable lot (``1 / _size_round_factor``).
@@ -3680,7 +3776,10 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # after venue-domain conversion (notably inverse contracts), so preserve the raw
     # close size and let the plugin quantize it onto the venue grid.
     if isinstance(position, SimPosition):
-        size = _size_round(size)
+        if qty == qty and qty < abs(bound_size):
+            size = -position.sign * _explicit_qty_round(qty)
+        else:
+            size = _size_round(size)
 
     if size == 0.0:
         return
@@ -4087,7 +4186,8 @@ def _gate_entry_lots(equity_ticks: float, lots: int, rfactor: float,
 
 
 # noinspection PyProtectedMember
-def _judge_money_entry(size: float, price: float, market: bool = False) -> float:
+def _judge_money_entry(size: float, price: float, market: bool = False,
+                       money: float | None = None) -> float:
     """Apply TV's big-money sizing and margin gate to a money-sized entry.
 
     From 1e7 account-currency units of order money upward (equivalently 1e9
@@ -4132,12 +4232,16 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
         fill price for price-based orders resolving at execution)
     :param market: True when judging a market entry at placement (enables
         the sub-1e7 snap-up; price-based fills keep the plain floor)
+    :param money: Placement-frozen money budget of a deferred fill; None
+        derives the budget from the current equity (market entries)
     :return: The granted signed quantity, or 0.0 when the entry is rejected
     """
     budget = _default_entry_budget(price)
     if budget is None:
         return size
-    money, unit_cost = budget
+    if money is None:
+        money = budget[0]
+    unit_cost = budget[1]
     mintick = syminfo.mintick
     if not mintick or mintick <= 0:
         return size
@@ -4148,6 +4252,23 @@ def _judge_money_entry(size: float, price: float, market: bool = False) -> float
     if money < 1e7:
         if not market:
             return size
+        # Sub-1e7 last-lot drop: on a bar whose sizing price is an ODD number
+        # of ticks TV inflates the floored size's cost by 2^-33 and drops one
+        # lot when the money no longer covers it (resize, not cancel) — the
+        # sub-1e7 mirror of the >=1e7 MASTER-X s-slope inflation. Measured by
+        # 20 one-shot equity-injection probes on BINANCE:BTCUSDT 30m
+        # (2026-08-13, SuperTrend d6fba11d fork): on the 2026-03-23 11:00 bar
+        # (C=70702.57, 7070257 ticks, odd) the drop edge is bracketed in
+        # relative headroom (1.10e-10, 1.17e-10] around 2^-33 = 1.164e-10,
+        # while the 2026-07-14 12:30 bar (C=63960.00, even ticks) fills even
+        # at 0.8e-10 headroom. Slope selector below C<1e5 beyond these two
+        # bars is unmeasured; even-tick bars are treated as s=0.
+        if lots > 1 and round(price / mintick) % 2 == 1:
+            floor_cost = lots / rfactor * unit_cost
+            if money < floor_cost * (1.0 + 2.0 ** -33):
+                lots -= 1
+                sign = 1.0 if size > 0 else -1.0
+                size = sign * lots / rfactor
         next_cost = (lots + 1) / rfactor * unit_cost / mintick
         if 1e8 <= next_cost <= 1.16e8:
             snap_grid = 0.05
@@ -4282,7 +4403,8 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # requested qty in broker mode so the sync engine dispatches it and the
     # plugin's quantity preflight reports the skip.
     if isinstance(position, SimPosition):
-        size = _size_round(size)
+        size = _size_round(size) if deferred_default \
+            else direction_sign * _explicit_qty_round(float(qty))
         if size == 0.0:
             return
 
@@ -4392,9 +4514,14 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # Only price-based orders re-size at execution; a market entry keeps its
     # placement-time (signal close) quantity — TV rejects it at the next open
     # when that quantity can no longer be margined, rather than re-sizing.
+    # The money budget is frozen now, at placement — the fill only supplies
+    # the per-unit cost (see _resolve_deferred_qty).
     if deferred_default and (limit is not None or stop is not None):
         order.deferred_qty = True
         order.flip_extra = flip_extra
+        budget = _default_entry_budget(float(exec_price))
+        if budget is not None:
+            order.budget_money = budget[0]
     # Store in entry_orders dict
     position._add_order(order)
 
@@ -4499,7 +4626,10 @@ def exit(id: str, from_entry: str = "",
         # positions can be smaller than syminfo.mincontract after venue-domain
         # conversion, so preserve the raw reservation for plugin quantization.
         if isinstance(position, SimPosition):
-            reserved = _size_round(reserved)
+            if qty == qty and abs(qty) < unreserved:
+                reserved = _explicit_qty_round(abs(qty))
+            else:
+                reserved = _size_round(reserved)
         if reserved <= 0.0:
             return
         size = -direction * reserved
@@ -4785,7 +4915,8 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # qty and let the plugin's preflight report a below-minimum skip instead of
     # silently dropping a live signal here.
     if isinstance(position, SimPosition):
-        size = _size_round(size)
+        size = _size_round(size) if deferred_default \
+            else direction_sign * _explicit_qty_round(float(qty))
         if size == 0.0:
             return
 
@@ -4802,9 +4933,13 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     order = Order(id, size, order_type=_order_type_normal, limit=limit, stop=stop,
                   oca_name=oca_name, oca_type=oca_type, comment=comment,
                   alert_message=alert_message)
-    # Only price-based orders re-size at execution (see strategy.entry)
+    # Only price-based orders re-size at execution (see strategy.entry);
+    # the money budget is frozen at placement (see _resolve_deferred_qty)
     if deferred_default and (limit is not None or stop is not None):
         order.deferred_qty = True
+        budget = _default_entry_budget(float(exec_price))
+        if budget is not None:
+            order.budget_money = budget[0]
     position._add_order(order)
 
 
