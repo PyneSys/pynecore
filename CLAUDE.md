@@ -125,6 +125,18 @@ Grade live results from the VENUE record, never the run log alone. Measured venu
 Trading-token workflow (OTP mint, ~8h TTL, status check): `plugins/dnse/tools/README.md`
 — live runs need a GOOD token first (`tools/token_status.py`).
 
+### Live-run session mechanics (Claude Code specifics)
+
+- Background bash jobs die at ~10 min — a 1m staged run fits; 3m+ does not.
+  Relaunch with `startState` to resume instead of stretching one job.
+- Watch logs with `timeout N bash -c 'until grep -aq "X" f.log; do sleep 5; done'`
+  — bare or chained `sleep` is blocked by the harness.
+- Kill runs via `pgrep -f "live_[s]taged" | xargs -r kill` (bracket avoids matching
+  your own wrapper shell). Exit 144 after your own kill is EXPECTED, not a failure.
+- Raw `--broker` logs are ~500K ANSI spinner noise. Commit only stripped evidence:
+  `sed 's/\x1b\[[0-9;]*m//g' f.log | grep -aoE '\[(L1|F|BROKER)\][^[]*' > f_evidence.txt`
+  and park the raw log in `backup/deleteable/`.
+
 ## Pine Script language reference
 
 Authoritative Pine v6 reference (syntax, built-ins, `strategy.*` semantics):
