@@ -1,0 +1,182 @@
+[symbol]
+prefix = "DNSE"
+description = "VN30F1M (DNSE derivative)"
+ticker = "VN30F1M"
+currency = "VND"
+#basecurrency =
+period = "5"
+type = "futures"
+mintick = 0.10000000
+pricescale = 10
+minmove = 1
+pointvalue = 100000
+mincontract = 1
+timezone = "Asia/Ho_Chi_Minh"
+volumetype = "base"
+#avg_spread =
+taker_fee = 0.00000000
+maker_fee = 0.00000000
+#country =
+#sector =
+#industry =
+#isin =
+#expiration_date =
+#current_contract =
+#employees =
+#shareholders =
+#shares_outstanding_total =
+#shares_outstanding_float =
+#recommendations_buy =
+#recommendations_buy_strong =
+#recommendations_date =
+#recommendations_hold =
+#recommendations_sell =
+#recommendations_sell_strong =
+#recommendations_total =
+#target_price_average =
+#target_price_high =
+#target_price_low =
+#target_price_median =
+#target_price_date =
+#target_price_estimates =
+
+# Opening hours
+[[opening_hours]]
+day = 1
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 1
+start = "13:00:00"
+end = "14:45:00"
+
+[[opening_hours]]
+day = 2
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 2
+start = "13:00:00"
+end = "14:45:00"
+
+[[opening_hours]]
+day = 3
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 3
+start = "13:00:00"
+end = "14:45:00"
+
+[[opening_hours]]
+day = 4
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 4
+start = "13:00:00"
+end = "14:45:00"
+
+[[opening_hours]]
+day = 5
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 5
+start = "13:00:00"
+end = "14:45:00"
+
+# Session starts
+[[session_starts]]
+day = 1
+time = "09:00:00"
+
+[[session_starts]]
+day = 2
+time = "09:00:00"
+
+[[session_starts]]
+day = 3
+time = "09:00:00"
+
+[[session_starts]]
+day = 4
+time = "09:00:00"
+
+[[session_starts]]
+day = 5
+time = "09:00:00"
+
+# Session ends
+[[session_ends]]
+day = 1
+time = "14:45:00"
+
+[[session_ends]]
+day = 2
+time = "14:45:00"
+
+[[session_ends]]
+day = 3
+time = "14:45:00"
+
+[[session_ends]]
+day = 4
+time = "14:45:00"
+
+[[session_ends]]
+day = 5
+time = "14:45:00"
+
+# Effective-dated session history (optional).
+#
+# Markets occasionally change their trading hours. A single static schedule then
+# mis-confirms the part of a backtest that falls on the other side of the change.
+# Add [[session_schedules]] blocks below -- oldest first, each self-contained --
+# to describe that history. `effective_from` MUST be the first line of its block
+# (an exchange-local trading-day date). A bar whose trading day is on or after a
+# block's date uses that block; a date before the earliest block uses the
+# earliest block. The flat opening_hours / session_starts / session_ends above
+# are regenerated from the NEWEST variant on save, so edit the variants here, not
+# the flat blocks.
+#
+# Example -- a market whose night session END moved 23:30 -> 23:00 on 2026-01-12:
+#
+# [[session_schedules]]
+# effective_from = 2025-06-01
+# [[session_schedules.opening_hours]]
+# day = 0
+# start = "10:00:00"
+# end = "18:00:00"
+# [[session_schedules.opening_hours]]
+# day = 0
+# start = "21:00:00"
+# end = "23:30:00"
+# [[session_schedules.session_starts]]
+# day = 0
+# time = "10:00:00"
+# [[session_schedules.session_ends]]
+# day = 0
+# time = "23:30:00"
+#
+# [[session_schedules]]
+# effective_from = 2026-01-12
+# [[session_schedules.opening_hours]]
+# day = 0
+# start = "10:00:00"
+# end = "18:00:00"
+# [[session_schedules.opening_hours]]
+# day = 0
+# start = "21:00:00"
+# end = "23:00:00"
+# [[session_schedules.session_starts]]
+# day = 0
+# time = "10:00:00"
+# [[session_schedules.session_ends]]
+# day = 0
+# time = "23:00:00"
