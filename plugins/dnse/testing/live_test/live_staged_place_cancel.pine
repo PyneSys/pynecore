@@ -1,176 +1,250 @@
 //@version=6
-// LIVE TEST LEVEL 1 (staged) — four place/cancel probes driven by a state machine,
-// bounded by an explicit TRADE WINDOW.
-//
-// Every order is 1 contract and priced +/-5% or further from market: inside the +/-7%
-// daily band so the venue ACCEPTS and RESTS it, far enough that it cannot fill in a
-// session. Nothing should ever fill, so no position is ever held.
+// LIVE TEST LEVEL 1 (staged) — NINE place/cancel probes driven by a state machine,
+// bounded by an explicit TRADE WINDOW. Every order is 1 contract and priced >=4.5% from
+// market: inside the +/-7% band so the venue ACCEPTS and RESTS it, far enough that it
+// cannot fill. Nothing should ever fill, so no position is ever held.
 //
 //   state 0 -> TEST 1  long  entry, limit -5%          (green candle only)
 //   state 1 -> TEST 2  short entry, limit +5%
 //   state 2 -> TEST 3  long  entry, limit -5%  + exit(stop -6%)      (green candle only)
-//   state 3 -> TEST 4  short entry, limit +5%  + exit(stop +5.5%), BOTH in one OCA group
-//   state 4 -> done, nothing further is placed
-//
-// Each stage places on one candle and cancels on the NEXT closed candle (any colour),
-// then advances the state. Tests 1-3 cancel every order they placed; TEST 4 deliberately
-// cancels ONLY THE ENTRY, to observe whether DNSE also removes the OCA-linked exit.
+//   state 3 -> TEST 4  short entry, limit +5%  + exit(stop +5.5%), one OCA group;
+//                      cancel ENTRY only -> the cascade must remove the exit (verified
+//                      live 2026-08-14 on a STOP leg)
+//   state 4 -> TEST 5  long  entry, limit -5%  + exit(limit +5%, stop -6%) -> native OCO;
+//                      cancel ENTRY only -> does the cascade also clear an OCO leg?
+//                      (2026-08-14 verified STOP only; the OCO umbrella book is otherwise
+//                      untouched by Level 1)
+//   state 5 -> TEST 6  long  entry, limit -5%; NEXT bar re-issue at -4.5% (an AMEND on
+//                      the NORMAL book — worked live 2026-08-10, re-verify on 6.8.5);
+//                      then cancel
+//   state 6 -> TEST 7  long  STOP entry +5%; NEXT bar re-issue at +4.5% (an AMEND on a
+//                      CONDITIONAL — DNSE answers HTTP 500, rubycell/pynecore#18; expect
+//                      "park+verify", NOT a crash); then cancel — proving the order is
+//                      still cancellable after the failed amend
+//   state 7 -> TEST 8  long limit -5% AND long STOP +5% (two ids, both books), then
+//                      strategy.cancel_all() — the safety backstop nothing has ever
+//                      fired live, sweeping both books at once
+//   state 8 -> TEST 9  strategy.order() long limit -5% — order() has never touched the
+//                      broker; expect identical routing to entry(); then cancel
+//   state 9 -> done, nothing further is placed
 //
 // ---------------------------------------------------------------------------------
-// THE TRADE WINDOW — set `winStart` / `winEnd` in the script's .toml before each run.
+// THE TRADE WINDOW — set `winStart` / `winEnd` (and optionally `startState`) in the
+// script's .toml before each run. Placement happens only inside [winStart, winEnd].
 //
-// Placement happens only inside [winStart, winEnd]. This replaces a barstate.isrealtime
-// gate and is better for two reasons: it is explicit (you choose exactly when the probe
-// may trade), and it is REPRODUCIBLE OFFLINE — set the window over a past session and a
-// plain `dnse:` backtest replays the whole 4-stage sequence with full logging, so the
-// logic and the log output can be checked without touching the venue.
+// For a LIVE run winStart MUST be at or after the moment you start it: live warmup
+// replays ~500 historical bars through this code (dispatch suppressed, logic running),
+// so an early winStart burns stages on warmup bars — measured 2026-08-13. The far-future
+// default makes an unconfigured run do nothing. Offline, point the window at a past
+// session and a plain `dnse:` backtest replays every stage with full logging.
 //
-// The window matters beyond convenience: live warmup replays ~500 historical bars through
-// this code. Order dispatch is suppressed by the engine during warmup, but the Pine logic
-// still runs — so for a LIVE run `winStart` MUST be at or after the moment you start it,
-// otherwise the state machine burns through all four stages on warmup bars and places
-// nothing. The default is deliberately far in the future so an unconfigured run does
-// nothing at all rather than something surprising.
-//
-// CANCELS ARE NOT BOUNDED BY winEnd — only placement is. Once a stage has placed, its
-// cancel must be able to fire even if the window has since closed; otherwise a live order
-// would be stranded at the venue.
+// MID-STAGE STEPS AND CANCELS ARE NOT BOUNDED BY winEnd — only fresh placements are.
+// Once a stage has placed, its amend/cancel steps must run even if the window closes,
+// otherwise a live order would be stranded at the venue.
 // ---------------------------------------------------------------------------------
 //
-// MEASURED 2026-08-13 (this probe's first live run) — exits DO reach the venue before
-// their entry fills. Both exit legs were accepted as real resting conditional orders while
-// their entries sat unfilled: X3 -> id d9ums1i1a4skcecmf450, X4 -> id d9umsv21a4skcecmf4ag,
-// both STRING ids (conditional book), filled=0. An earlier reading of
-// LEG_STATE_PENDING_ENTRY (sync_engine.py:8010) suggested brackets are withheld until the
-// entry fills; that was WRONG, and tests 3/4 are valid as written.
+// MEASURED 2026-08-13/14 (kept for the record):
+//   * exits DO reach the venue before their entry fills (string ids, conditional book);
+//   * cancelling an entry did NOT remove its exit at DNSE (#19) — the plugin now
+//     cascades, verified live 2026-08-14 11:25 on a STOP leg;
+//   * a 2xx cancel is an ACK, not a completion (#20) — the plugin now re-reads until
+//     the venue agrees, verified live 2026-08-14 11:21;
+//   * a GTD past the contract's finalTradeDate -> CO-ORD-006 (fixed: clamped).
 //
-// TEST 4's answer, same run: cancelling ONLY the entry does NOT remove the OCA-linked exit.
-// T4's entry went Canceled while X4 stayed `New` at DNSE as a live buy-stop @ 2020.2 — the
-// shared oca_name did not make the venue drop the sibling. See rubycell/pynecore#19.
+// TEST 4/5 stop directions: a short entered at +5% stops ABOVE (+5.5%); a long entered
+// at -5% stops BELOW (-6%) and takes profit ABOVE (+5% — a sell limit above market, so
+// it rests).
 //
-// TEST 4 stop direction: a short entered at +5% has its stop ABOVE, so +5.5% is used.
-// A literal -5.5% would sit ~10.5% below the entry — profit side, not a stop. For the
-// literal reading change `close * 1.055` to `close * 0.945`.
-//
-// Reading the results: grep the run log for "[L1]" to get the whole story in order, and
-// cross-check each stage against the "[BROKER] dispatched / event CANCELLED" lines around
-// it. plot() values also land in workdir/output/<script>.csv during the live run.
+// Reading the results: grep the run log for "[L1]"; cross-check each stage against the
+// "[BROKER] ..." lines around it. plot() values land in workdir/output/<script>.csv.
 strategy("LIVE staged place+cancel", overlay=true, pyramiding=0, initial_capital=500000000,
      default_qty_type=strategy.fixed, default_qty_value=1,
      margin_long=18.48, margin_short=18.48,
      slippage=1,
      calc_on_every_tick=false, process_orders_on_close=false)
 
-// --- trade window (edit in the generated .toml, not here) ---
+// --- inputs (edit in the generated .toml, not here) ---
 winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
 winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
-// Resume point: 0 = run all four, 2 = start at TEST 3, 3 = start at TEST 4.
-startState = input.int(0, "Start at state (0=T1, 1=T2, 2=T3, 3=T4)", minval=0, maxval=3)
+// Resume point: 0=T1 .. 8=T9.
+startState = input.int(0, "Start at state (0=T1 .. 8=T9)", minval=0, maxval=8)
 
 var int   state     = startState  // which test is running / next to run
-var int   placedBar = na   // bar_index the current stage placed on; na = nothing pending
-var float lvlEntry  = na   // frozen entry limit  (never re-derived -> never amended)
-var float lvlStop   = na   // frozen protective stop level
+var int   placedBar = na   // bar_index of this stage's LAST action; na = nothing pending
+var int   stageStep = 0    // 0 = just placed; 1 = mid-stage action done (T6/T7 amends)
+var float lvlEntry  = na   // frozen levels — a moving level would amend every bar
+var float lvlStop   = na
+var float lvlTP     = na
+var float lvlAmend  = na
 var bool  announced = false
 
 isGreen  = close > open
 pending  = not na(placedBar)
-started  = time >= winStart          // the window has opened
-canPlace = started and time <= winEnd  // ... and has not closed yet
+started  = time >= winStart
+canPlace = started and time <= winEnd
 
 if started
 
     if not announced
-        log.info("[L1] === STAGED PLACE/CANCEL — window open. 4 tests, 1 contract each, " +
-                 "every order >=5% away so none can fill. ===")
-        log.info("[L1] plan: T1 long lim-5% | T2 short lim+5% | T3 long lim-5%+exit(stop-6%) " +
-                 "| T4 short lim+5%+exit(stop+5.5%) in one OCA, cancel ENTRY only")
+        log.info("[L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract " +
+                 "each, every order >=4.5% away so none can fill. startState={0} ===", startState)
+        log.info("[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only " +
+                 "| T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18 500) " +
+                 "| T8 cancel_all both books | T9 strategy.order()")
         announced := true
 
-    // per-bar heartbeat so the running phase is always readable
-    log.info("[L1] bar={0} close={1} candle={2} state={3} pending={4} pos={5} canPlace={6}",
+    log.info("[L1] bar={0} close={1} candle={2} state={3} step={4} pending={5} pos={6}",
              bar_index, str.tostring(close, format.mintick), isGreen ? "GREEN" : "RED",
-             state, pending ? "yes" : "no", strategy.position_size, canPlace ? "yes" : "no")
+             state, stageStep, pending ? "yes" : "no", strategy.position_size)
 
     // ------------------------------------------------------------ placement
-    if canPlace and not pending and state < 4
+    if canPlace and not pending and state < 9
         if state == 0 and isGreen
             lvlEntry := close * 0.95
-            strategy.entry("T1", strategy.long, limit=lvlEntry,
-                           comment="T1 long lim@" + str.tostring(lvlEntry, format.mintick))
+            strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
             placedBar := bar_index
-            log.info("[L1] TEST 1 PLACE id=T1 LONG limit={0} (close {1}, -5%) — expect: " +
-                     "one NORMAL LO resting, filled=0, int order id",
-                     str.tostring(lvlEntry, format.mintick), str.tostring(close, format.mintick))
+            log.info("[L1] TEST 1 PLACE id=T1 LONG limit={0} (-5%) — expect one NORMAL LO, filled=0",
+                     str.tostring(lvlEntry, format.mintick))
 
         else if state == 1
             lvlEntry := close * 1.05
-            strategy.entry("T2", strategy.short, limit=lvlEntry,
-                           comment="T2 short lim@" + str.tostring(lvlEntry, format.mintick))
+            strategy.entry("T2", strategy.short, limit=lvlEntry, comment="T2")
             placedBar := bar_index
-            log.info("[L1] TEST 2 PLACE id=T2 SHORT limit={0} (close {1}, +5%) — expect: " +
-                     "one NORMAL LO resting, filled=0",
-                     str.tostring(lvlEntry, format.mintick), str.tostring(close, format.mintick))
+            log.info("[L1] TEST 2 PLACE id=T2 SHORT limit={0} (+5%)",
+                     str.tostring(lvlEntry, format.mintick))
 
         else if state == 2 and isGreen
             lvlEntry := close * 0.95
             lvlStop  := close * 0.94
-            strategy.entry("T3", strategy.long, limit=lvlEntry,
-                           comment="T3 long lim@" + str.tostring(lvlEntry, format.mintick))
-            strategy.exit("X3", from_entry="T3", stop=lvlStop,
-                          comment_loss="T3 SL@" + str.tostring(lvlStop, format.mintick))
+            strategy.entry("T3", strategy.long, limit=lvlEntry, comment="T3")
+            strategy.exit("X3", from_entry="T3", stop=lvlStop, comment_loss="X3")
             placedBar := bar_index
-            log.info("[L1] TEST 3 PLACE id=T3 LONG limit={0} + exit X3 stop={1} (-6%) — " +
-                     "expect: entry rests; the exit likely NEVER reaches DNSE " +
-                     "(bracket parked pending_entry until the entry fills)",
+            log.info("[L1] TEST 3 PLACE id=T3 limit={0} + X3 stop={1} — exit reaches the venue " +
+                     "pre-fill (measured); both cancelled explicitly next bar",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
         else if state == 3
             lvlEntry := close * 1.05
             lvlStop  := close * 1.055
-            // Both legs share one oca_name. strategy.exit has no oca_type parameter
-            // (Pine rejects it — CE10120); its legs always form a reduce group.
             strategy.entry("T4", strategy.short, limit=lvlEntry,
-                           oca_name="t4", oca_type=strategy.oca.cancel,
-                           comment="T4 short lim@" + str.tostring(lvlEntry, format.mintick))
-            strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4",
-                          comment_loss="T4 SL@" + str.tostring(lvlStop, format.mintick))
+                           oca_name="t4", oca_type=strategy.oca.cancel, comment="T4")
+            strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4", comment_loss="X4")
             placedBar := bar_index
-            log.info("[L1] TEST 4 PLACE id=T4 SHORT limit={0} + exit X4 stop={1} (+5.5%), " +
-                     "oca_name=t4 — next bar cancels ONLY T4, to see whether X4 goes with it",
+            log.info("[L1] TEST 4 PLACE id=T4 limit={0} + X4 stop={1} (oca) — next bar cancels " +
+                     "ENTRY ONLY; the cascade must remove X4 (verified 2026-08-14)",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
-    // ------------------------------------------------------------ cancel + advance
-    // Deliberately NOT gated by winEnd: a placed order must always be cancellable.
+        else if state == 4 and isGreen
+            lvlEntry := close * 0.95
+            lvlTP    := close * 1.05
+            lvlStop  := close * 0.94
+            strategy.entry("T5", strategy.long, limit=lvlEntry, comment="T5")
+            strategy.exit("X5", from_entry="T5", limit=lvlTP, stop=lvlStop,
+                          comment_profit="X5tp", comment_loss="X5sl")
+            placedBar := bar_index
+            log.info("[L1] TEST 5 PLACE id=T5 limit={0} + X5 tp={1}/sl={2} -> NATIVE OCO — first " +
+                     "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: does the " +
+                     "cascade clear the OCO leg too? (only STOP was verified this morning)",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlTP, format.mintick),
+                     str.tostring(lvlStop, format.mintick))
+
+        else if state == 5 and isGreen
+            lvlEntry := close * 0.95
+            lvlAmend := close * 0.955
+            strategy.entry("T6", strategy.long, limit=lvlEntry, comment="T6")
+            placedBar := bar_index
+            log.info("[L1] TEST 6 PLACE id=T6 LONG limit={0} (-5%) — NEXT bar re-issues at {1} " +
+                     "(-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on 6.8.5)",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlAmend, format.mintick))
+
+        else if state == 6
+            lvlStop  := close * 1.05
+            lvlAmend := close * 1.045
+            strategy.entry("T7", strategy.long, stop=lvlStop, comment="T7")
+            placedBar := bar_index
+            log.info("[L1] TEST 7 PLACE id=T7 buy-STOP {0} (+5%) — NEXT bar re-issues at {1} " +
+                     "(+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a [BROKER] " +
+                     "park+verify WARNING, not a crash — then prove it still cancels",
+                     str.tostring(lvlStop, format.mintick), str.tostring(lvlAmend, format.mintick))
+
+        else if state == 7 and isGreen
+            lvlEntry := close * 0.95
+            lvlStop  := close * 1.05
+            strategy.entry("T8a", strategy.long, limit=lvlEntry, comment="T8a")
+            strategy.entry("T8b", strategy.long, stop=lvlStop, comment="T8b")
+            placedBar := bar_index
+            log.info("[L1] TEST 8 PLACE T8a limit={0} AND T8b stop={1} — two ids across BOTH " +
+                     "books; next bar strategy.cancel_all(), never before fired live",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
+
+        else if state == 8 and isGreen
+            lvlEntry := close * 0.95
+            strategy.order("T9", strategy.long, limit=lvlEntry, comment="T9")
+            placedBar := bar_index
+            log.info("[L1] TEST 9 PLACE via strategy.order() LONG limit={0} — order() has never " +
+                     "touched the broker; expect identical NORMAL-LO routing to entry()",
+                     str.tostring(lvlEntry, format.mintick))
+
+    // ------------------------------------------------------------ mid-stage + cancel + advance
+    // Deliberately NOT gated by winEnd: a placed order must always reach its cancel.
     if pending and bar_index > placedBar
-        if state == 0
-            strategy.cancel("T1")
-            log.info("[L1] TEST 1 CANCEL id=T1 — expect: [BROKER] event CANCELLED, book clear")
-        else if state == 1
-            strategy.cancel("T2")
-            log.info("[L1] TEST 2 CANCEL id=T2 — expect: [BROKER] event CANCELLED, book clear")
-        else if state == 2
-            strategy.cancel("T3")
-            strategy.cancel("X3")
-            log.info("[L1] TEST 3 CANCEL id=T3 and id=X3 (both) — expect: entry CANCELLED; " +
-                     "X3 may be a no-op if it never reached the venue")
-        else if state == 3
-            strategy.cancel("T4")
-            log.info("[L1] TEST 4 CANCEL id=T4 ONLY (X4 deliberately left alone) — " +
-                     "KEY OBSERVATION: does X4 also disappear from DNSE?")
-        log.info("[L1] TEST {0} DONE — entry_lvl={1} stop_lvl={2}; state {3}->{4}",
-                 state + 1, str.tostring(lvlEntry, format.mintick),
-                 na(lvlStop) ? "n/a" : str.tostring(lvlStop, format.mintick),
-                 state, state + 1)
-        placedBar := na
-        state     := state + 1
-        if state == 4
-            log.info("[L1] === ALL 4 TESTS DONE. Verify at the venue that NOTHING of ours " +
-                     "is still working, then stop the run. ===")
+        if state == 5 and stageStep == 0
+            // T6 mid-stage: the NORMAL-book amend
+            strategy.entry("T6", strategy.long, limit=lvlAmend, comment="T6amend")
+            stageStep := 1
+            placedBar := bar_index
+            log.info("[L1] TEST 6 AMEND id=T6 -> limit {0} — expect [BROKER] 'modifying ...' " +
+                     "then the venue accepting the new price",
+                     str.tostring(lvlAmend, format.mintick))
+        else if state == 6 and stageStep == 0
+            // T7 mid-stage: the conditional amend that 500s
+            strategy.entry("T7", strategy.long, stop=lvlAmend, comment="T7amend")
+            stageStep := 1
+            placedBar := bar_index
+            log.info("[L1] TEST 7 AMEND id=T7 -> stop {0} — expect code=REMOTE_SERVER_ERROR " +
+                     "http=500 -> park+verify (#18). KEY: the run must continue, and the order " +
+                     "must still cancel next bar", str.tostring(lvlAmend, format.mintick))
+        else
+            if state == 0
+                strategy.cancel("T1")
+                log.info("[L1] TEST 1 CANCEL id=T1")
+            else if state == 1
+                strategy.cancel("T2")
+                log.info("[L1] TEST 2 CANCEL id=T2")
+            else if state == 2
+                strategy.cancel("T3")
+                strategy.cancel("X3")
+                log.info("[L1] TEST 3 CANCEL id=T3 and id=X3 (both, explicitly)")
+            else if state == 3
+                strategy.cancel("T4")
+                log.info("[L1] TEST 4 CANCEL id=T4 ONLY — cascade must also CANCEL X4")
+            else if state == 4
+                strategy.cancel("T5")
+                log.info("[L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade " +
+                         "clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after")
+            else if state == 5
+                strategy.cancel("T6")
+                log.info("[L1] TEST 6 CANCEL id=T6 (post-amend)")
+            else if state == 6
+                strategy.cancel("T7")
+                log.info("[L1] TEST 7 CANCEL id=T7 (post-500) — proves a parked amend does not " +
+                         "wedge the order: it must still cancel cleanly")
+            else if state == 7
+                strategy.cancel_all()
+                log.info("[L1] TEST 8 strategy.cancel_all() — BOTH T8a (NORMAL) and T8b (STOP) " +
+                         "must go; venue book must be clear of ours")
+            else if state == 8
+                strategy.cancel("T9")
+                log.info("[L1] TEST 9 CANCEL id=T9")
+            log.info("[L1] TEST {0} DONE — state {1}->{2}", state + 1, state, state + 1)
+            placedBar := na
+            stageStep := 0
+            state     := state + 1
+            if state == 9
+                log.info("[L1] === ALL 9 TESTS DONE. Verify at the venue that NOTHING of ours " +
+                         "is still working, then stop the run. ===")
 
     // ------------------------------------------------------------ safety
-    // Nothing above can fill by design. If one ever does (a >5% move), cancel everything
-    // still working and flatten at once — this test never intends to hold a position.
     if strategy.position_size != 0
         log.error("[L1] !!! UNEXPECTED FILL: pos={0} avg={1} — cancelling all and flattening",
                   strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
