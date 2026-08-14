@@ -1,0 +1,39 @@
+[2026-08-14 13:02:33+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-14 13:02:33+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-14 13:02:33+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-14 13:02:33+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-14 13:02:33+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-14 13:01:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-14 13:01:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=4 ===
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [L1] TEST 5 PLACE id=T5 limit=1803.1 + X5 tp=1992.9/sl=1784.1 -> NATIVE OCO — first Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY:  
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='T5' qty=1.0 type=limit limit=1803.1
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='T5' qty=1.0 type=limit limit=1803.1 -> 
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=1992.9 sl=1784.1
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=1992.9 sl=1784.1 -> 
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] event CREATED id=555316 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-14 13:06:00+0700] bar:    505 INFO     [BROKER] event CREATED id=555256 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [L1] TEST 5 DONE — state 4->5
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [BROKER] cancelling CANCEL id='T5'
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [BROKER] cascading cancel to exit leg 555316 (from_entry=T5) — DNSE does not remove it with the entry, and a stranded exit can OPEN a position on a flat
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [BROKER] event CANCELLED id=555316 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-14 13:07:00+0700] bar:    506 INFO     [BROKER] event CANCELLED id=555256 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-14 13:08:00+0700] bar:    507 ERROR    [BROKER] unexpected cancel for intent X5|T5 (CANCELLED id=555316 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp)
+[2026-08-14 13:08:00+0700] bar:    507 ERROR    [BROKER] sync engine quarantined: Bot-owned order cancelled unexpectedly on the venue: coid=None ref='555316' intent='X5\x00T5' (intent_key=None,       
+[2026-08-14 13:08:00+0700] bar:    507 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=555256 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry)
+[2026-08-14 13:08:00+0700] bar:    507 INFO     [BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=1992.9 sl=1784.1
+[2026-08-14 13:08:00+0700] bar:    507 INFO     [BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=1992.9 sl=1784.1 -> 
+[2026-08-14 13:08:00+0700] bar:    507 INFO     [BROKER] event CREATED id=575506 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-14 13:12:00+0700] bar:    511 INFO     [L1] TEST 6 PLACE id=T6 LONG limit=1798.3 (-5%) — NEXT bar re-issues at 1807.8 (-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on    
+[2026-08-14 13:12:00+0700] bar:    511 WARNING  [BROKER] entry dispatch ENTRY BUY id='T6' qty=1.0 type=limit limit=1798.3 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-14 13:12:00+0700] bar:    511 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T6'); signal dropped, no broker call.
+[2026-08-14 13:13:00+0700] bar:    512 INFO     [L1] TEST 6 AMEND id=T6 -> limit 1807.8 — expect 
+[2026-08-14 13:13:00+0700] bar:    512 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T6'); signal dropped, no broker call.
+[2026-08-14 13:14:00+0700] bar:    513 INFO     [L1] TEST 6 CANCEL id=T6 (post-amend)
+[2026-08-14 13:14:00+0700] bar:    513 INFO     [L1] TEST 6 DONE — state 5->6
+[2026-08-14 13:15:00+0700] bar:    514 INFO     [L1] TEST 7 PLACE id=T7 buy-STOP 1986.9 (+5%) — NEXT bar re-issues at 1977.5 (+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a 
+[2026-08-14 13:15:00+0700] bar:    514 WARNING  [BROKER] entry dispatch ENTRY BUY id='T7' qty=1.0 type=stop stop=1987.0 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-14 13:15:00+0700] bar:    514 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T7'); signal dropped, no broker call.
+[2026-08-14 13:16:52+0700] bar:    514 INFO     [BROKER] run stopped (completed) position=1 equity=425,072,662.00 VND
