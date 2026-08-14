@@ -2034,3 +2034,76 @@ def __test_shutdown_detaches_a_cancel_resistant_reconnect_hook__():
     finally:
         _live_runner_mod._HOOK_CANCEL_GRACE_S = _orig_hook_grace
         _live_runner_mod._LATE_CONNECT_GRACE_S = _orig_late_grace
+
+
+class _BackfillProvider(MockLiveProvider):
+    """Provider that reports the bars which closed while it was subscribing."""
+
+    def __init__(self, bar_updates: list[OHLCV], recovered: list[OHLCV],
+                 failure: Exception | None = None):
+        super().__init__(bar_updates)
+        self._recovered = recovered
+        self._failure = failure
+        self.backfill_calls: list[tuple[str, str, int]] = []
+
+    async def backfill_closed_bars(self, symbol: str, timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        self.backfill_calls.append((symbol, timeframe, since_ms))
+        if self._failure is not None:
+            raise self._failure
+        return self._recovered
+
+
+def __test_startup_gap_bars_are_spliced_before_the_live_stream__():
+    """Bars that closed during subscribe reach the script, in order, once.
+
+    The warmup download ends at ``last_historical_timestamp`` and the stream
+    starts from whenever the subscription came up; without this recovery the
+    bars in between are lost to both.
+    """
+    recovered = [_make_ohlcv(2000, close=200.0), _make_ohlcv(3000, close=300.0)]
+    provider = _BackfillProvider([_make_ohlcv(4000, close=400.0)], recovered)
+
+    catchup, live = _drain(provider, "BTC/USDT", "1D",
+                           last_historical_timestamp=1000)
+
+    assert [bar.timestamp for bar in catchup + live] == [2000, 3000, 4000]
+    assert provider.backfill_calls == [("BTC/USDT", "1D", 1000)]
+
+
+def __test_startup_gap_drops_stale_and_unclosed_recovered_bars__():
+    """A provider may over-answer; only genuinely new closed bars are accepted."""
+    recovered = [
+        _make_ohlcv(500, close=50.0),                    # older than the warmup
+        _make_ohlcv(1000, close=100.0),                  # the warmup's own bar
+        _make_ohlcv(2000, close=200.0, is_closed=False),  # still forming
+        _make_ohlcv(3000, close=300.0),                  # the only real gap bar
+    ]
+    provider = _BackfillProvider([_make_ohlcv(4000, close=400.0)], recovered)
+
+    catchup, live = _drain(provider, "BTC/USDT", "1D",
+                           last_historical_timestamp=1000)
+
+    assert [bar.timestamp for bar in catchup + live] == [3000, 4000]
+
+
+def __test_startup_gap_failure_does_not_stop_the_run__():
+    """A failed history query logs and continues — it must not strand the bot."""
+    provider = _BackfillProvider(
+        [_make_ohlcv(4000, close=400.0)], [], failure=RuntimeError("history down"),
+    )
+
+    catchup, live = _drain(provider, "BTC/USDT", "1D",
+                           last_historical_timestamp=1000)
+
+    assert [bar.timestamp for bar in catchup + live] == [4000]
+
+
+def __test_startup_gap_skipped_when_no_full_bar_could_have_closed__():
+    """No query is made when the warmup already reaches the current bar."""
+    now_ms = int(time.time() * 1000)
+    provider = _BackfillProvider([_make_ohlcv(now_ms + 60_000, close=400.0)], [])
+
+    _drain(provider, "BTC/USDT", "1D", last_historical_timestamp=now_ms)
+
+    assert provider.backfill_calls == []

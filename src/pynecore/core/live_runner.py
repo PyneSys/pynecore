@@ -990,13 +990,15 @@ def live_ohlcv_generator(
             # before the first live bar, so the strategy sees one unbroken
             # series. Providers that cannot query history return nothing and
             # keep the previous behaviour.
-            if last_historical_timestamp is not None and tf_ms > 0:
+            backfill_closed_bars = getattr(provider, "backfill_closed_bars", None)
+            if (last_historical_timestamp is not None and tf_ms > 0
+                    and backfill_closed_bars is not None):
                 elapsed_ms = time.time() * 1000.0 - last_historical_timestamp
                 # A whole bar must have closed past the warmup before anything
                 # can be missing.
                 if elapsed_ms >= 2 * tf_ms:
                     try:
-                        recovered = await provider.backfill_closed_bars(
+                        recovered = await backfill_closed_bars(
                             watch_symbol, timeframe, last_historical_timestamp,
                         )
                     except Exception as exc:
