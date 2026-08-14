@@ -599,15 +599,27 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             return False
         ok = True
         for order_id in ids:
-            cancelled = self._cancel_one(str(order_id))
-            if cancelled:
-                # DNSE does not remove an entry's exit legs with it (#19).
-                self._cancel_dependent_exits(str(order_id))
-            ok = cancelled and ok
+            ok = self._cancel_one(str(order_id)) and ok
         return ok
 
     def _cancel_dependent_exits(self, entry_order_id: str) -> None:
-        """Cancel any exit legs bound to a just-cancelled ENTRY.
+        """RETIRED — do not call. Kept only as documentation of a measured dead end.
+
+        This plugin-side cascade was reverted on 2026-08-14 after test T5 measured it
+        breaking the ENGINE's ownership model live: the engine never asked for the exit
+        leg's cancel, so its next sync saw a bot-owned order cancelled on the venue,
+        RE-PLACED the exit (a brand-new orphan, id 575506 — the very thing the cascade
+        was meant to prevent) and QUARANTINED the account, refusing every further
+        dispatch ("Entry dispatch blocked by quarantine ... signal dropped").
+
+        A cancel of a dependent exit must be ENGINE-initiated so its order ids land in
+        ``sync_engine._strategy_cancel_expected_ids`` and its intent is retired — i.e.
+        the fix for rubycell/pynecore#19 belongs in the engine's diff/cancel path, not
+        here. Until then: strategies must cancel exit ids explicitly, as staged test T3
+        does.
+
+        Original rationale (still true, just mis-layered): DNSE does not cascade an
+        entry cancel to its exit legs.
 
         DNSE does NOT cascade. Measured 2026-08-13 (rubycell/pynecore#19): an entry and
         its ``strategy.exit`` stop were placed in one OCA group; cancelling only the entry
@@ -713,12 +725,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         ids = self._ids_for(envelope)
         if not ids:
             return CancelDispositionOutcome.UNKNOWN
-        confirmed = self._cancel_one(str(ids[0]))
-        if confirmed:
-            # DNSE does not remove an entry's exit legs with it (#19) — do it here, or a
-            # naked stop is left able to OPEN a position on a flat account.
-            self._cancel_dependent_exits(str(ids[0]))
-        return (CancelDispositionOutcome.CANCEL_CONFIRMED if confirmed
+        return (CancelDispositionOutcome.CANCEL_CONFIRMED
+                if self._cancel_one(str(ids[0]))
                 else CancelDispositionOutcome.UNKNOWN)
 
     @override

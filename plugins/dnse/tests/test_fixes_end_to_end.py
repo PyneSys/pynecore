@@ -101,55 +101,21 @@ def __test_20_reports_failure_when_the_venue_never_applies_the_cancel__():
     assert venue.orders[oid]["orderStatus"] == "New"
 
 
-# === #19 — the venue does not cascade ========================================
+# === #19 — the venue does not cascade, and neither may the PLUGIN =============
+# The plugin-side cascade was measured live (T5, 2026-08-14) breaking the engine's
+# ownership model: quarantine + a re-placed orphan. Until the engine-side fix lands,
+# the correct plugin behaviour is to cancel ONLY the requested intent's ids; the naked
+# exit is then the ENGINE's known #19 gap, tracked on the card.
 
-def __test_19_bug_reproduced_when_the_cascade_is_disabled__():
-    """Without the cascade, cancelling the entry strands the exit — the live T4 result."""
-    venue = FakeDNSEVenue()
-    b = _broker(venue)
-    entry_id, exit_id = _place_entry_with_exit(b, venue)
-
-    b._cancel_dependent_exits = lambda *_a: None    # <- pre-07f00bc behaviour
-
-    assert asyncio.run(b.execute_cancel(_cancel_env("L"))) is True
-    assert venue.orders[entry_id]["orderStatus"] == "Canceled"
-    assert venue.orders[exit_id]["orderStatus"] == "New", \
-        "the exit survives as a naked stop — this is bug #19, exactly as seen live"
-    assert exit_id in venue.working_ids()
-
-
-def __test_19_fixed_cascades_to_the_exit_leg__():
+def __test_19_entry_cancel_leaves_the_exit_to_the_engine__():
+    """Reverted contract: the exit leg survives at the venue (the engine owns it)."""
     venue = FakeDNSEVenue()
     b = _broker(venue)
     entry_id, exit_id = _place_entry_with_exit(b, venue)
 
     assert asyncio.run(b.execute_cancel(_cancel_env("L"))) is True
     assert venue.orders[entry_id]["orderStatus"] == "Canceled"
-    assert venue.orders[exit_id]["orderStatus"] == "Canceled", \
-        "the fix must take the bound exit leg down with its entry"
-    assert venue.working_ids() == [], "nothing may be left working at the venue"
-
-
-def __test_19_cascade_works_through_the_ack_lag_too__():
-    """The two fixes must compose: cascade + a venue that only ACKs the cancel."""
-    venue = FakeDNSEVenue(ack_lag=2)
-    b = _broker(venue)
-    b._cancel_verify_attempts = 6
-    entry_id, exit_id = _place_entry_with_exit(b, venue)
-
-    assert asyncio.run(b.execute_cancel(_cancel_env("L"))) is True
-    assert venue.working_ids() == [], \
-        "both legs must be confirmed gone even when each cancel is only ACKed at first"
-
-
-def __test_19_get_open_orders_agrees_the_book_is_clear__():
-    """The plugin's own view of the venue must match: no working orders left."""
-    venue = FakeDNSEVenue(ack_lag=1)
-    b = _broker(venue)
-    b._cancel_verify_attempts = 6
-    _place_entry_with_exit(b, venue)
-
-    asyncio.run(b.execute_cancel(_cancel_env("L")))
-
-    assert asyncio.run(b.get_open_orders("VN30F1M")) == [], \
-        "get_open_orders must report an empty book after a cascaded cancel"
+    assert venue.orders[exit_id]["orderStatus"] == "New", (
+        "the plugin must NOT unilaterally cancel the engine-owned exit leg — doing so "
+        "made the engine re-place it and quarantine (measured live)")
+    assert [c for c in venue.calls if c[0] == "cancel_order" and c[1] == exit_id] == []
