@@ -26,7 +26,15 @@
 //                      fired live, sweeping both books at once
 //   state 8 -> TEST 9  strategy.order() long limit -5% — order() has never touched the
 //                      broker; expect identical routing to entry(); then cancel
-//   state 9 -> done, nothing further is placed
+//   state 9 -> TEST 11 oca.cancel group of THREE far entries across BOTH books (two
+//                      limits + one conditional stop). Cancel ONE member -> the other
+//                      two must REMAIN resting (Pine OCA fires on FILL, not on cancel);
+//                      then cancel the rest.
+//   state 10-> TEST 12 oca.reduce pair — both must rest FULL qty at the venue (reduce
+//                      acts only on a fill); then cancel_all.
+//   state 11-> TEST 13 oca.none with a SHARED name — fully independent: cancel one,
+//                      the sibling must be untouched; then cancel it too.
+//   state 12-> done, nothing further is placed
 //
 // ---------------------------------------------------------------------------------
 // THE TRADE WINDOW — set `winStart` / `winEnd` (and optionally `startState`) in the
@@ -66,8 +74,8 @@ strategy("LIVE staged place+cancel", overlay=true, pyramiding=0, initial_capital
 // --- inputs (edit in the generated .toml, not here) ---
 winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
 winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
-// Resume point: 0=T1 .. 8=T9.
-startState = input.int(0, "Start at state (0=T1 .. 8=T9)", minval=0, maxval=8)
+// Resume point: 0=T1 .. 8=T9, 9=T11(oca.cancel) 10=T12(oca.reduce) 11=T13(oca.none).
+startState = input.int(0, "Start at state (0=T1 .. 11=T13)", minval=0, maxval=11)
 
 var int   state     = startState  // which test is running / next to run
 var int   placedBar = na   // bar_index of this stage's LAST action; na = nothing pending
@@ -98,7 +106,7 @@ if started
              state, stageStep, pending ? "yes" : "no", strategy.position_size)
 
     // ------------------------------------------------------------ placement
-    if canPlace and not pending and state < 9
+    if canPlace and not pending and state < 12
         if state == 0 and isGreen
             lvlEntry := close * 0.95
             strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
@@ -185,6 +193,48 @@ if started
                      "touched the broker; expect identical NORMAL-LO routing to entry()",
                      str.tostring(lvlEntry, format.mintick))
 
+        else if state == 9 and isGreen
+            lvlEntry := close * 0.95
+            lvlAmend := close * 1.05
+            lvlStop  := close * 1.05
+            strategy.entry("Ga", strategy.long,  limit=lvlEntry,
+                           oca_name="g11", oca_type=strategy.oca.cancel, comment="Ga")
+            strategy.entry("Gb", strategy.short, limit=lvlAmend,
+                           oca_name="g11", oca_type=strategy.oca.cancel, comment="Gb")
+            strategy.entry("Gc", strategy.long,  stop=lvlStop,
+                           oca_name="g11", oca_type=strategy.oca.cancel, comment="Gc")
+            placedBar := bar_index
+            log.info("[L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit={0} (NORMAL) + " +
+                     "Gb limit={1} (NORMAL) + Gc stop={2} (CONDITIONAL) — next bar cancels " +
+                     "ONLY Ga. KEY: Gb and Gc must REMAIN resting (OCA fires on FILL, not cancel)",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlAmend, format.mintick),
+                     str.tostring(lvlStop, format.mintick))
+
+        else if state == 10 and isGreen
+            lvlEntry := close * 0.95
+            lvlStop  := close * 1.05
+            strategy.entry("Ra", strategy.long, limit=lvlEntry,
+                           oca_name="g12", oca_type=strategy.oca.reduce, comment="Ra")
+            strategy.entry("Rb", strategy.long, stop=lvlStop,
+                           oca_name="g12", oca_type=strategy.oca.reduce, comment="Rb")
+            placedBar := bar_index
+            log.info("[L1] TEST 12 PLACE oca.reduce x2: Ra limit={0} + Rb stop={1} — BOTH must " +
+                     "rest FULL qty=1 at the venue (reduce acts only on a fill); next bar " +
+                     "cancel_all sweeps them",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
+
+        else if state == 11 and isGreen
+            lvlEntry := close * 0.95
+            lvlAmend := close * 1.05
+            strategy.entry("Na", strategy.long,  limit=lvlEntry,
+                           oca_name="g13", oca_type=strategy.oca.none, comment="Na")
+            strategy.entry("Nb", strategy.short, limit=lvlAmend,
+                           oca_name="g13", oca_type=strategy.oca.none, comment="Nb")
+            placedBar := bar_index
+            log.info("[L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit={0} + Nb limit={1} " +
+                     "— next bar cancels ONLY Na; Nb must be untouched (none = independent)",
+                     str.tostring(lvlEntry, format.mintick), str.tostring(lvlAmend, format.mintick))
+
     // ------------------------------------------------------------ mid-stage + cancel + advance
     // Deliberately NOT gated by winEnd: a placed order must always reach its cancel.
     if pending and bar_index > placedBar
@@ -196,6 +246,17 @@ if started
             log.info("[L1] TEST 6 AMEND id=T6 -> limit {0} — expect [BROKER] 'modifying ...' " +
                      "then the venue accepting the new price",
                      str.tostring(lvlAmend, format.mintick))
+        else if state == 9 and stageStep == 0
+            strategy.cancel("Ga")
+            stageStep := 1
+            placedBar := bar_index
+            log.info("[L1] TEST 11 CANCEL Ga ONLY — [BROKER] must show exactly ONE cancel; " +
+                     "Gb (NORMAL) and Gc (STOP book) must still be resting at the venue")
+        else if state == 11 and stageStep == 0
+            strategy.cancel("Na")
+            stageStep := 1
+            placedBar := bar_index
+            log.info("[L1] TEST 13 CANCEL Na ONLY — Nb must be untouched (oca.none)")
         else if state == 6 and stageStep == 0
             // T7 mid-stage: the conditional amend that 500s
             strategy.entry("T7", strategy.long, stop=lvlAmend, comment="T7amend")
@@ -236,12 +297,26 @@ if started
             else if state == 8
                 strategy.cancel("T9")
                 log.info("[L1] TEST 9 CANCEL id=T9")
-            log.info("[L1] TEST {0} DONE — state {1}->{2}", state + 1, state, state + 1)
+            else if state == 9
+                strategy.cancel("Gb")
+                strategy.cancel("Gc")
+                log.info("[L1] TEST 11 CANCEL Gb and Gc (the survivors) — book must then be " +
+                         "clear of the whole g11 group")
+            else if state == 10
+                strategy.cancel_all()
+                log.info("[L1] TEST 12 cancel_all — Ra and Rb must both go")
+            else if state == 11
+                strategy.cancel("Nb")
+                log.info("[L1] TEST 13 CANCEL Nb (the survivor)")
+            // T1-T9 live at states 0-8; the OCA tests are T11-T13 at states 9-11
+            // (T10 is the dual-strategy runner), so the label skips one past state 8.
+            log.info("[L1] TEST {0} DONE — state {1}->{2}",
+                     state >= 9 ? state + 2 : state + 1, state, state + 1)
             placedBar := na
             stageStep := 0
             state     := state + 1
-            if state == 9
-                log.info("[L1] === ALL 9 TESTS DONE. Verify at the venue that NOTHING of ours " +
+            if state == 12
+                log.info("[L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours " +
                          "is still working, then stop the run. ===")
 
     // ------------------------------------------------------------ safety

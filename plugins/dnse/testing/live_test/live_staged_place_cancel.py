@@ -13,7 +13,7 @@ from pynecore.types import PersistentSeries, Series
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
-    startState=input.int(0, "Start at state (0=T1 .. 8=T9)", minval=0, maxval=8)
+    startState=input.int(0, "Start at state (0=T1 .. 11=T13)", minval=0, maxval=11)
 ):
     state: PersistentSeries[int] = startState
     placedBar: PersistentSeries[int] = na(int)
@@ -34,7 +34,7 @@ def main(
             log.info("[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only " + "| T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18 500) " + "| T8 cancel_all both books | T9 strategy.order()")
             announced = True
         log.info("[L1] bar={0} close={1} candle={2} state={3} step={4} pending={5} pos={6}", bar_index, string.tostring(close, format.mintick), ("GREEN" if isGreen else "RED"), state, stageStep, ("yes" if pending else "no"), strategy.position_size)
-        if canPlace and (not pending) and state < 9:
+        if canPlace and (not pending) and state < 12:
             if state == 0 and isGreen:
                 lvlEntry = close * 0.95
                 strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
@@ -91,12 +91,45 @@ def main(
                 strategy.order("T9", strategy.long, limit=lvlEntry, comment="T9")
                 placedBar = bar_index
                 log.info("[L1] TEST 9 PLACE via strategy.order() LONG limit={0} — order() has never " + "touched the broker; expect identical NORMAL-LO routing to entry()", string.tostring(lvlEntry, format.mintick))
+            elif state == 9 and isGreen:
+                lvlEntry = close * 0.95
+                lvlAmend = close * 1.05
+                lvlStop = close * 1.05
+                strategy.entry("Ga", strategy.long, limit=lvlEntry, oca_name="g11", oca_type=strategy.oca.cancel, comment="Ga")
+                strategy.entry("Gb", strategy.short, limit=lvlAmend, oca_name="g11", oca_type=strategy.oca.cancel, comment="Gb")
+                strategy.entry("Gc", strategy.long, stop=lvlStop, oca_name="g11", oca_type=strategy.oca.cancel, comment="Gc")
+                placedBar = bar_index
+                log.info("[L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit={0} (NORMAL) + " + "Gb limit={1} (NORMAL) + Gc stop={2} (CONDITIONAL) — next bar cancels " + "ONLY Ga. KEY: Gb and Gc must REMAIN resting (OCA fires on FILL, not cancel)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlAmend, format.mintick), string.tostring(lvlStop, format.mintick))
+            elif state == 10 and isGreen:
+                lvlEntry = close * 0.95
+                lvlStop = close * 1.05
+                strategy.entry("Ra", strategy.long, limit=lvlEntry, oca_name="g12", oca_type=strategy.oca.reduce, comment="Ra")
+                strategy.entry("Rb", strategy.long, stop=lvlStop, oca_name="g12", oca_type=strategy.oca.reduce, comment="Rb")
+                placedBar = bar_index
+                log.info("[L1] TEST 12 PLACE oca.reduce x2: Ra limit={0} + Rb stop={1} — BOTH must " + "rest FULL qty=1 at the venue (reduce acts only on a fill); next bar " + "cancel_all sweeps them", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
+            elif state == 11 and isGreen:
+                lvlEntry = close * 0.95
+                lvlAmend = close * 1.05
+                strategy.entry("Na", strategy.long, limit=lvlEntry, oca_name="g13", oca_type=strategy.oca.none, comment="Na")
+                strategy.entry("Nb", strategy.short, limit=lvlAmend, oca_name="g13", oca_type=strategy.oca.none, comment="Nb")
+                placedBar = bar_index
+                log.info("[L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit={0} + Nb limit={1} " + "— next bar cancels ONLY Na; Nb must be untouched (none = independent)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlAmend, format.mintick))
         if pending and bar_index > placedBar:
             if state == 5 and stageStep == 0:
                 strategy.entry("T6", strategy.long, limit=lvlAmend, comment="T6amend")
                 stageStep = 1
                 placedBar = bar_index
                 log.info("[L1] TEST 6 AMEND id=T6 -> limit {0} — expect [BROKER] 'modifying ...' " + "then the venue accepting the new price", string.tostring(lvlAmend, format.mintick))
+            elif state == 9 and stageStep == 0:
+                strategy.cancel("Ga")
+                stageStep = 1
+                placedBar = bar_index
+                log.info("[L1] TEST 11 CANCEL Ga ONLY — [BROKER] must show exactly ONE cancel; " + "Gb (NORMAL) and Gc (STOP book) must still be resting at the venue")
+            elif state == 11 and stageStep == 0:
+                strategy.cancel("Na")
+                stageStep = 1
+                placedBar = bar_index
+                log.info("[L1] TEST 13 CANCEL Na ONLY — Nb must be untouched (oca.none)")
             elif state == 6 and stageStep == 0:
                 strategy.entry("T7", strategy.long, stop=lvlAmend, comment="T7amend")
                 stageStep = 1
@@ -131,12 +164,22 @@ def main(
                 elif state == 8:
                     strategy.cancel("T9")
                     log.info("[L1] TEST 9 CANCEL id=T9")
-                log.info("[L1] TEST {0} DONE — state {1}->{2}", state + 1, state, state + 1)
+                elif state == 9:
+                    strategy.cancel("Gb")
+                    strategy.cancel("Gc")
+                    log.info("[L1] TEST 11 CANCEL Gb and Gc (the survivors) — book must then be " + "clear of the whole g11 group")
+                elif state == 10:
+                    strategy.cancel_all()
+                    log.info("[L1] TEST 12 cancel_all — Ra and Rb must both go")
+                elif state == 11:
+                    strategy.cancel("Nb")
+                    log.info("[L1] TEST 13 CANCEL Nb (the survivor)")
+                log.info("[L1] TEST {0} DONE — state {1}->{2}", (state + 2 if state >= 9 else state + 1), state, state + 1)
                 placedBar = na
                 stageStep = 0
                 state += 1
-                if state == 9:
-                    log.info("[L1] === ALL 9 TESTS DONE. Verify at the venue that NOTHING of ours " + "is still working, then stop the run. ===")
+                if state == 12:
+                    log.info("[L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours " + "is still working, then stop the run. ===")
         if strategy.position_size != 0:
             log.error("[L1] !!! UNEXPECTED FILL: pos={0} avg={1} — cancelling all and flattening", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
             strategy.cancel_all()
