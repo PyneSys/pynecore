@@ -84,8 +84,10 @@ def __test_percent_commission_uses_entry_and_exit_notional__(script_path, module
     assert len(trades) == 1
 
     trade = trades[0]
-    assert trade.entry_price == 50000.0
-    assert trade.exit_price == 51000.0
+    # Fills are booked on the symbol's tick grid (strategy._tick_snap), so a stored
+    # price can sit an ULP away from the bar price it was triggered at.
+    assert math.isclose(trade.entry_price, 50000.0, rel_tol=0.0, abs_tol=1e-9)
+    assert math.isclose(trade.exit_price, 51000.0, rel_tol=0.0, abs_tol=1e-9)
     assert trade.size == 1.0
 
     expected_commission = (50000.0 + 51000.0) * 0.055 * 0.01

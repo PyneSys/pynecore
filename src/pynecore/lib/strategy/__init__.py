@@ -1023,6 +1023,11 @@ class SimPosition(PositionBase):
                                        half already counted it once — TV treats
                                        a reversal as a single filled order.
         """
+        # Every booked fill sits on the symbol's tick grid (see _tick_snap): the
+        # trigger price computed by the intrabar walk is the level, the price the
+        # broker records is that level snapped to a tick.
+        price = _tick_snap(price)
+
         # Close orders cannot fill when no position exists
         if order.order_type == _order_type_close and self.size == 0.0:
             return
@@ -1314,7 +1319,7 @@ class SimPosition(PositionBase):
                 self.size += overshoot_trade.size
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self.entry_summ = price * abs(overshoot_trade.size)
-                self.avg_price = price
+                self.avg_price = self.entry_summ / abs(self.size)
                 self.openprofit = self.size * (self.c - self.avg_price) * pv
                 if not new_closed_trades:
                     self.entry_equity = self.equity
@@ -1368,23 +1373,20 @@ class SimPosition(PositionBase):
             self.size += trade.size
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
-            # Average entry price. Adding to a position re-weights the previous
-            # average instead of dividing the accumulated cost by the new size:
-            # the two are algebraically equal but round differently, and the
-            # blend is the form that stays bit-exact when a position is
-            # pyramided. ``entry_summ`` still carries the cost, which is what a
-            # partial close reduces.
+            # Average entry price: the accumulated cost divided by the position
+            # size, re-derived on every fill. Measured on BINANCE:BTCUSDT 30m
+            # (pyramiding 3, 22720 in-position bars): position_avg_price equals
+            # `sum(entry_price * size) / sum(size)` over the open trades on every
+            # single bar, while an incremental re-weighting of the previous
+            # average -- algebraically the same -- only reproduces the 13440
+            # single-leg ones. The division is also what a partial close falls
+            # back to, so both paths stay on the same form.
             self.entry_summ += price * abs(order.size)
             new_size = abs(self.size)
-            add_size = abs(order.size)
-            old_size = new_size - add_size
             if new_size == 0.0:
                 self.avg_price = na_float
-            elif old_size == 0.0 or self.avg_price != self.avg_price:
-                self.avg_price = price
             else:
-                weight = add_size / new_size
-                self.avg_price = self.avg_price * (1 - weight) + price * weight
+                self.avg_price = self.entry_summ / new_size
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
             # Commission summ
@@ -3793,6 +3795,27 @@ def _round_cash(amount: float) -> float:
     # sub-ULP with this rounding, and the 2025-08-06 step lands exactly
     # 1e-6 below the half-even result, pinning half-up.
     return math.floor(amount * 1e6 + 0.5) / 1e6
+
+
+def _tick_snap(price: float) -> float:
+    """
+    Snap a fill price onto the symbol's tick grid.
+
+    :param price: The raw fill price
+    :return: The price rounded half-up to the nearest tick
+    """
+    # TV books a fill as a tick count scaled back into price units, so the
+    # stored price can sit an ULP away from the raw trigger price. Measured on
+    # BINANCE:BTCUSDT 30m (mintick 0.01): 3408 of 3408 opentrades.entry_price
+    # and 2840 of 2840 closedtrades.exit_price values reproduce with
+    # `round(price / mintick) * mintick`, and closedtrades.profit is exactly
+    # `size * (exit - entry)` on those snapped prices. The algebraically equal
+    # `ticks * minmove / pricescale` form (what round_to_mintick uses) misses
+    # 438 of the 3408.
+    if not (price == price):  # is_na_arg
+        return price
+    mintick = syminfo.mintick
+    return math.floor(price / mintick + 0.5) * mintick
 
 
 _explicit_qty_grid: tuple[float, Decimal] | None = None

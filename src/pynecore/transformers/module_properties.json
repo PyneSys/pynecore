@@ -1541,9 +1541,6 @@
     }
   },
   "lib.math": {
-    "Decimal": {
-      "type": "variable"
-    },
     "NA": {
       "type": "variable"
     },
@@ -1551,9 +1548,6 @@
       "type": "variable"
     },
     "PyneInt": {
-      "type": "variable"
-    },
-    "ROUND_HALF_UP": {
       "type": "variable"
     },
     "abs": {
@@ -1587,9 +1581,6 @@
       "type": "variable"
     },
     "floor": {
-      "type": "variable"
-    },
-    "localcontext": {
       "type": "variable"
     },
     "log": {

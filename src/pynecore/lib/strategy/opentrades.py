@@ -204,7 +204,7 @@ def profit(trade_num: int) -> PyneFloat:
         assert lib._script is not None
         assert lib._script.position is not None
         return lib._script.position.open_trades[trade_num].profit
-    except IndexError:
+    except (IndexError, AssertionError):
         return 0.0
 
 

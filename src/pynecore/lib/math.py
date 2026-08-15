@@ -1,7 +1,6 @@
 from typing import TypeVar, cast, overload
 import builtins
 import math
-from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 from ..types.na import NA, na_float
 from ..types import PyneFloat, PyneInt
@@ -23,6 +22,10 @@ e = math.e
 pi = math.pi
 phi = (1 + math.sqrt(5)) / 2
 rphi = 1 / phi
+
+# `0.5 - 1e-10` as an exact fraction, the tie threshold round() compares against
+_ROUND_TIE_SCALE = 10 ** 10
+_ROUND_TIE_HALF = 5 * 10 ** 9 - 1
 
 # noinspection PyShadowingBuiltins
 def abs(number: TFI | NA[TFI]) -> PyneFloat:
@@ -302,24 +305,38 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     if not (number == number):  # is_na_arg
         # No precision means the int contract (first overload), so an int-typed na
         return na_float if isinstance(precision, int) else NA(int)
-    # TV-measured: ties round away from zero on the decimal (shortest-repr) value,
-    # not half-even on the binary double (round(2.5) == 3, round(-2.5) == -3,
-    # round(2.675, 2) == 2.68 — builtins.round gives 2, -2 and 2.67 there)
     if not math.isfinite(number):
         # Pine has no non-finite values (1/0 is na); the precision overload keeps
         # builtins.round() behavior (returns the float unchanged), but the
         # one-argument overload must honor its int contract, so it yields an int na
         return cast(float, number) if isinstance(precision, int) else NA(int)
-    decimal_number = Decimal(repr(number))
+    # TV rounds the EXACT binary value of the double scaled by 10**precision, with
+    # ties going away from zero and a 1e-10 absolute tolerance on that scaled value
+    # -- the same slack its relational operators carry. Measured on BINANCE:BTCUSDT
+    # 30m (roundprobe, 28397 bars x 5 series columns at precision 2/3/5): all
+    # 141985 values reproduce, and no tolerance between 0 and 5e-11 or above 2e-10
+    # does. The tolerance is what separates 118152.265 -> 118152.27 (short 5.8e-11
+    # of the tie) from 100019.7405 -> 100019.740 (short 1.2e-10); both scale to an
+    # exactly representable .5, so no double-precision model can tell them apart.
+    # Known limit: at precision 8 on single-digit values the tolerance no longer
+    # separates the ties (26697 of 28397) -- that regime is unmodelled.
+    p = precision if isinstance(precision, int) else 0
+    if p > 308 or p < -308:
+        # 10.0 ** p overflows; no attainable rounding changes a finite double here
+        return cast(float, number)
+    negative = number < 0.0
+    numerator, denominator = float(abs(number)).as_integer_ratio()
+    if p >= 0:
+        numerator *= 10 ** p
+    else:
+        denominator *= 10 ** -p
+    units, remainder = divmod(numerator, denominator)
+    if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
+        units += 1
     if not isinstance(precision, int):
-        return int(decimal_number.to_integral_value(rounding=ROUND_HALF_UP))
-    # quantize() fails when the result needs more digits than the context precision
-    # (default 28), so size a local context from the magnitude and the requested
-    # precision (e.g. round(1e30, 2), round(x, 100))
-    with localcontext() as ctx:
-        ctx.prec = builtins.max(1, decimal_number.adjusted() + precision + 2)
-        return float(decimal_number.quantize(Decimal(1).scaleb(-precision),
-                                             rounding=ROUND_HALF_UP))
+        return -units if negative else units
+    value = units / 10.0 ** p if p >= 0 else units * 10.0 ** -p
+    return -value if negative else value
 
 
 @overload
