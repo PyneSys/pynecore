@@ -6,7 +6,7 @@ import math
 import struct
 from abc import ABC, abstractmethod
 from datetime import datetime, UTC
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, Context, ROUND_FLOOR, ROUND_HALF_UP
 from collections import deque, defaultdict
 from copy import copy
 from bisect import insort, bisect_left
@@ -180,6 +180,7 @@ class Order:
         "consumed",  # True once an exit leg fired its slice while its entry is still open
         "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
                      # (backtest only); None for non-stacking sticky-exit / risk / live orders
+        "comm_booking",  # Commission pool shared by the two legs of a reversal (see _fill_order)
     )
 
     def __init__(
@@ -265,6 +266,10 @@ class Order:
         # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
         # left None everywhere else so the order-book key keeps its bare shape.
         self.book_seq: int | None = None
+        # ``[Decimal qty_total, booked, leg_qtys, order_qty]`` commission pool, set only
+        # where one TradingView order is executed as two PyneCore fills (the
+        # reversal split in _process_order).
+        self.comm_booking: list | None = None
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -1054,6 +1059,19 @@ class SimPosition(PositionBase):
         script = lib._script
         commission_type = script.commission_type
         commission_value = script.commission_value
+        # TradingView books ONE commission per order, rounded once — not one per
+        # closed leg. Measured on Acrypto - Weighted Strategy (BINANCE:BTCUSDT 30m,
+        # currency.USD): its 2025-01-02 17:00 reversal charges
+        # round10(0.02058 * 97229.76 * rate * 0.00075) = 1.497574781, where the two
+        # separately rounded legs give 1.4975747813 and put netprofit 3e-10 off for
+        # the rest of the run. The pool accumulates the leg quantities and books the
+        # DIFFERENCE between the rounded running total and what was booked already,
+        # so a single-leg order is bit-identical to rounding it on its own. A
+        # reversal executes as two fills here but is one TradingView order, so its
+        # pool is created at the split and shared by both legs.
+        comm_booking = order.comm_booking
+        if comm_booking is None:
+            comm_booking = [Decimal(0), 0.0, [], 0.0]
         # Account-currency value of a 1.0-point move on 1 contract: the futures point
         # value scaled by this bar's symbol-to-account rate. Every money amount below
         # rides it, so each is booked at the rate of the bar it is booked on.
@@ -1131,6 +1149,12 @@ class SimPosition(PositionBase):
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
+                    # Realize profit or loss. This lands in netprofit BEFORE the exit
+                    # commission: on the Acrypto - Weighted Strategy 2025-01-02 17:00
+                    # reversal the two orders differ by one ULP and only gross-first
+                    # reproduces TradingView's -7.635611411154892.
+                    self.netprofit += pnl
+
                     # cash_per_order is a flat fee per order: defer realization
                     # until the order is removed so it can be split across all
                     # closed trades it actually filled (see delete block below).
@@ -1139,12 +1163,12 @@ class SimPosition(PositionBase):
                     else:
                         # Calculate exit commission based on commission type
                         if commission_type == _commission.percent:
-                            # For percentage commission, multiply by exit price
-                            commission = abs(size) * price * pv * commission_value * 0.01
+                            commission = _book_commission(comm_booking, abs(size), price,
+                                                          commission_value, True)
                         else:
                             # cash_per_contract: size-proportional, charged per leg
-                            commission = abs(size) * commission_value
-                        commission = _round_cash(commission)
+                            commission = _book_commission(comm_booking, abs(size), price,
+                                                          commission_value, False)
 
                         closed_trade.commission += commission
                         # Realize commission
@@ -1158,9 +1182,6 @@ class SimPosition(PositionBase):
                         closed_trade.profit_percent = (closed_trade.profit / entry_value) * 100.0
                     except ZeroDivisionError:
                         closed_trade.profit_percent = 0.0
-
-                    # Realize profit or loss
-                    self.netprofit += pnl
 
                     # Modify sizes
                     self.size += size
@@ -1265,10 +1286,15 @@ class SimPosition(PositionBase):
                     self._remove_order(order)
 
                 if commission_type == _commission.cash_per_order:
+                    # This leg's share of the order's single flat fee: a reversal
+                    # is one TradingView order, so its closing leg only carries
+                    # the part proportional to the quantity it closed.
+                    leg_commission = _book_flat_commission(comm_booking, closed_trade_size,
+                                                           commission_value)
                     # Realize commission
-                    self.netprofit -= commission_value
+                    self.netprofit -= leg_commission
                     for trade in new_closed_trades:
-                        commission = (commission_value * abs(trade.size)) / closed_trade_size
+                        commission = (leg_commission * abs(trade.size)) / closed_trade_size
                         trade.commission += commission
                         # The percent/cash_per_contract path subtracts the trade's
                         # total commission (entry leg carried on the open trade +
@@ -1331,14 +1357,16 @@ class SimPosition(PositionBase):
             # Calculate commission
             if commission_value:
                 if commission_type == _commission.cash_per_order:
-                    commission = commission_value
+                    commission = _book_flat_commission(comm_booking, abs(order.size),
+                                                       commission_value)
                 elif commission_type == _commission.percent:
-                    commission = abs(order.size) * price * pv * commission_value * 0.01
+                    commission = _book_commission(comm_booking, abs(order.size), price,
+                                                  commission_value, True)
                 elif commission_type == _commission.cash_per_contract:
-                    commission = abs(order.size) * commission_value
+                    commission = _book_commission(comm_booking, abs(order.size), price,
+                                                  commission_value, False)
                 else:  # Should not be here!
                     assert False, 'Wrong commission type: ' + str(commission_type)
-                commission = _round_cash(commission)
             else:
                 commission = 0.0
 
@@ -1479,9 +1507,14 @@ class SimPosition(PositionBase):
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
         # Note: The flip quantity is already calculated in entry() for entry orders
-        new_size = self.size + order.size
-        if _size_round(new_size) == 0.0:
-            new_size = 0.0
+        # A reversal order carries the old position as its flip component, so what
+        # is left after the closing leg is the entry quantity itself -- an exact lot
+        # multiple. Deriving it by subtraction loses an ULP (-0.01616 + 0.03206 =
+        # 0.015899999999999997), and `strategy.close(qty = position_size/100*rate)`
+        # decimal-floors that one lot low for the whole TP cascade that follows.
+        # The tolerant floor returns the exact lot value, so this is a re-derivation,
+        # not a correction.
+        new_size = _size_round(self.size + order.size)
         new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
         if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
             # Exit orders should never reverse position direction; only entry
@@ -1499,6 +1532,21 @@ class SimPosition(PositionBase):
                 self._fill_order(order, price, h, l)
                 return False
 
+            # Check if new direction is allowed by risk management
+            # According to Pine Script docs: "long exit trades will be made instead of reverse trades"
+            new_direction_sign = 1.0 if new_size > 0.0 else -1.0
+            direction_allowed = self._is_direction_allowed(new_direction_sign)
+
+            # Both legs are one TradingView order, so they share one commission
+            # booking and its single rounding (see _book_commission). The whole
+            # order quantity goes in too: a flat cash_per_order fee is size
+            # independent, so its closing leg can only size its share against it.
+            # When risk management suppresses the opening leg the order executes
+            # as a plain close, so the closing quantity is the whole order and it
+            # carries the entire flat fee.
+            order_qty = abs(self.size) + (abs(new_size) if direction_allowed else 0.0)
+            order.comm_booking = [Decimal(0), 0.0, [], order_qty]
+
             # Create a copy for closing existing position
             order1 = copy(order)
             order1.order_type = _order_type_close
@@ -1510,10 +1558,7 @@ class SimPosition(PositionBase):
             # Fill the closing order first
             self._fill_order(order1, price, h, l)
 
-            # Check if new direction is allowed by risk management
-            # According to Pine Script docs: "long exit trades will be made instead of reverse trades"
-            new_direction_sign = 1.0 if new_size > 0.0 else -1.0
-            if not self._is_direction_allowed(new_direction_sign):
+            if not direction_allowed:
                 # Direction not allowed - convert entry to exit only
                 # Don't open new position in restricted direction
                 self._remove_order(order)
@@ -1528,6 +1573,7 @@ class SimPosition(PositionBase):
             # reversal toward the intraday filled-orders cap, so the open half
             # must not count it a second time.
             self._fill_order(order, price, h, l, counts_as_filled_order=False)
+            order.comm_booking = None
             # A reversal that hits the cap is flattened too — same as the
             # non-flip path. Without this the cap-close never fires for a
             # position-reversing strategy, the common TradingView idiom.
@@ -3779,22 +3825,153 @@ class SimPosition(PositionBase):
 # Functions
 #
 
+# Decimal context of TV's cash rounding. Ten significant digits, half-up,
+# applied to the double's shortest repr — see _round_cash.
+_CASH_CTX = Context(prec=10, rounding=ROUND_HALF_UP)
+# Exact multiply for the split shares: two shortest doubles are at most 17
+# digits each, so 40 digits keeps the product unrounded (the thread context's
+# 28 would clip it).
+_SPLIT_CTX = Context(prec=40)
+_DEC_CENT = Decimal('0.01')
+
+
 # noinspection PyProtectedMember
 def _round_cash(amount: float) -> float:
     """
-    Round a booked cash flow to micro units of the account currency.
+    Round a booked cash flow to ten significant digits.
 
     :param amount: The raw cash amount
-    :return: The amount rounded half-up to 1e-6
+    :return: The amount rounded half-up to 10 significant digits
     """
-    # TV books each commission cash flow rounded HALF-UP to 1e-6 account
-    # currency units; realized gross P&L stays raw. Measured on SuperTrend
-    # STRATEGY d6fba11d (BINANCE:BTCUSDT 30m, 2026-08-13): netprofit after
-    # the first entry is exactly -1499.774913 (raw commission
-    # 1499.7749132048700), all 186 entry/exit netprofit steps reproduce to
-    # sub-ULP with this rounding, and the 2025-08-06 step lands exactly
-    # 1e-6 below the half-even result, pinning half-up.
-    return math.floor(amount * 1e6 + 0.5) / 1e6
+    # TV books each commission cash flow rounded HALF-UP to TEN SIGNIFICANT
+    # DIGITS; realized gross P&L stays raw. Measured on SuperTrend STRATEGY
+    # d6fba11d (BINANCE:BTCUSDT 30m): netprofit after the first entry is
+    # exactly -1499.774913 (raw commission 1499.7749132048700), all 186
+    # entry/exit netprofit steps reproduce to sub-ULP, and the 2025-08-06 step
+    # lands exactly one unit below the half-even result, pinning half-up.
+    # The digit count — not a fixed 1e-6 grid — is what Acrypto - Weighted
+    # Strategy pins: with currency.USD on a USDT-quoted symbol its first
+    # commission is 0.750695772375 USDT * 0.99789 = 0.7491118042952888, and TV
+    # books exactly 0.7491118043. A 1e-6 grid would give 0.749112 and a grid in
+    # the symbol's own currency 0.74911203144; both are wrong, and at the
+    # SuperTrend magnitude ten digits coincide with the 1e-6 grid.
+    # The rounding operates on the double's shortest decimal repr, BigDecimal
+    # style: a 2830/2830 bit-exact single-order probe run (CommProbe3,
+    # BINANCE:BTCUSDT 30m) pins that exact-half raws resolve by the repr tail,
+    # which a float floor(x*scale + 0.5) misrounds on either side.
+    if amount == 0.0 or not math.isfinite(amount):
+        return amount
+    return float(_CASH_CTX.create_decimal(repr(amount)))
+
+
+def _book_commission(booking: list, qty: float, price: float,
+                     commission_value: float, is_percent: bool) -> float:
+    """
+    Add a fill leg to an order's commission pool and return the amount to realize now.
+
+    :param booking: The order's ``[Decimal qty_total, booked_total, leg_qtys]`` pool
+    :param qty: The absolute quantity of this leg
+    :param price: The order's fill price
+    :param commission_value: The strategy's commission value
+    :param is_percent: True for percent commission, False for cash per contract
+    :return: The incremental amount to book, so the pool's total stays rounded
+    """
+    # TV charges ONE commission per order over the order's total quantity — a
+    # reversal executes as two PyneCore fills but is one TV order, and an exit
+    # covering several pyramided trades is likewise one order. Probe-measured
+    # on CommProbe1/3/4 (BINANCE:BTCUSDT 30m, 2830 single orders bit-exact,
+    # 2818/2829 reversals): the percent rate is the fill price times the rate
+    # in EXACT DECIMAL arithmetic, converted to a double, and the order total
+    # is round_cash(rate * qty_total) with qty_total the DECIMAL sum of the leg
+    # quantities (float sums lose the lot grid: 0.01333 + 0.0137 != 0.02703).
+    # The account-currency conversion multiplies the double product afterwards
+    # (measured net-positive, zero regressions, on Acrypto - Weighted Strategy).
+    # The rounded total is then SPLIT back over the legs in qty proportion and
+    # each share is re-rounded on its own scale; what netprofit sees is the sum
+    # of the shares, which sits one grid step off the rounded total whenever
+    # the share roundings do not cancel (CommProbe4 pins the split on 2819/2829
+    # reversals via the per-trade commission fields). The pool books the
+    # DIFFERENCE between that running target and what was booked already, so a
+    # single-leg order rounds exactly on its own.
+    booking[0] += Decimal(repr(qty))
+    booking[2].append(qty)
+    qty_total = float(booking[0])
+    if is_percent:
+        # The account-currency conversion happens on the PRICE, as a plain
+        # double multiply, and the cash rounding lands on the double of the
+        # decimal price*pct product (CommProbe5, currency.USD on
+        # BINANCE:BTCUSDT: 2829/2829 reversal + 2830/2830 single orders
+        # reproduce both per-trade commission fields bit-exactly). Rate-level
+        # decimal fx placements fail on the exact repr ties the float price
+        # conversion breaks the other way (4 orders in the probe corpus).
+        # Without conversion the raw double rate is the measured law, so the
+        # extra rounding is skipped.
+        fx = _conv_safe  # fresh: the caller sampled pv on this bar
+        base = price * fx if fx != 1.0 else price
+        rate = float(Decimal(repr(base)) * Decimal(repr(commission_value)) * _DEC_CENT)
+        pointvalue = syminfo.pointvalue
+        if pointvalue != 1.0:
+            rate *= pointvalue
+        if fx != 1.0:
+            rate = _round_cash(rate)
+        total = _round_cash(rate * qty_total)
+    else:
+        total = _round_cash(commission_value * qty_total)
+    return _apply_booking(booking, total, qty_total)
+
+
+def _book_flat_commission(booking: list, qty: float, commission_value: float) -> float:
+    """
+    Add a fill leg to a ``cash_per_order`` commission pool and return the amount to realize now.
+
+    :param booking: The order's ``[Decimal qty_total, booked_total, leg_qtys, order_qty]`` pool
+    :param qty: The absolute quantity of this leg
+    :param commission_value: The strategy's flat per-order fee
+    :return: The incremental amount to book, so the pool's total stays rounded
+    """
+    # A flat fee is charged ONCE per TradingView order, independent of the
+    # quantity — so a reversal, which is one TV order executed here as two
+    # fills, pays it once and splits it over the two legs in qty proportion.
+    # Probe-measured on CommCashOrderProbe (BINANCE:BTCUSDT 30m, fee 10,
+    # 1-contract long -> short -> long -> close_all): netprofit steps by
+    # -10 per reversal (total commission 40 over 4 orders), and the closed
+    # trades report 15 / 10 / 15 — the two reversals each split their single
+    # fee 5/5 between the closing and the opening leg.
+    # Unlike the size-proportional modes, the total does not grow with the legs,
+    # so the closing leg cannot derive its share from its own quantity: the pool
+    # carries the whole order's quantity (booking[3]), stamped at the split.
+    booking[0] += Decimal(repr(qty))
+    booking[2].append(qty)
+    qty_total = booking[3] or float(booking[0])
+    return _apply_booking(booking, _round_cash(commission_value), qty_total)
+
+
+def _apply_booking(booking: list, total: float, qty_total: float) -> float:
+    """
+    Split an order's rounded commission over its legs and return what is still unbooked.
+
+    :param booking: The order's ``[Decimal qty_total, booked_total, leg_qtys, order_qty]`` pool
+    :param total: The order's rounded total commission
+    :param qty_total: The quantity the total is spread over
+    :return: The incremental amount to book
+    """
+    if len(booking[2]) == 1 and booking[2][0] == qty_total:
+        target = total
+    else:
+        # The split is decimal division rounded straight to the cash grid:
+        # total*q/qty_total computed on the shortest reprs resolves the exact
+        # split-half ties upward, where the double quotient falls a hair short
+        # and misrounds them down (Acrypto - Weighted Strategy 2026-06-30, a
+        # perfect half-half reversal; no probe order distinguishes the two).
+        total_dec = Decimal(repr(total))
+        qty_dec = Decimal(repr(qty_total))
+        target = 0.0
+        for leg_qty in booking[2]:
+            share = _SPLIT_CTX.multiply(total_dec, Decimal(repr(leg_qty)))
+            target += float(_CASH_CTX.divide(share, qty_dec))
+    amount = target - booking[1]
+    booking[1] = target
+    return amount
 
 
 def _tick_snap(price: float) -> float:
@@ -3881,6 +4058,8 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     scaled = abs(qty) * rfactor
     nearest = round(scaled)
     lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
+    if lots == 0:
+        return 0.0
     sign = 1 if qty > 0 else -1
     return sign * lots / rfactor
 

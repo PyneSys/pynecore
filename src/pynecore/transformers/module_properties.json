@@ -2184,6 +2184,9 @@
     "ADOPTED_STARTUP_ENTRY_ID": {
       "type": "variable"
     },
+    "Context": {
+      "type": "variable"
+    },
     "Decimal": {
       "type": "variable"
     },
@@ -2218,6 +2221,9 @@
       "type": "variable"
     },
     "ROUND_FLOOR": {
+      "type": "variable"
+    },
+    "ROUND_HALF_UP": {
       "type": "variable"
     },
     "SimPosition": {
