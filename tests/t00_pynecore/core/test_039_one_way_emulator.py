@@ -40,10 +40,14 @@ from pynecore.core.broker.one_way_emulator import (
 from pynecore.core.broker.storage import BrokerStore, RunContext, RunIdentity
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_STATE,
     EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
+    STATE_CONFIRMED,
     create_close_leg_row,
+    create_entry_order_row,
     create_residual_open_row,
     iter_active_bracket_ownerships,
     iter_active_close_legs,
@@ -540,6 +544,76 @@ def __test_run_exit_bracket_protects_only_net_survivor_legs__():
     assert [leg_id for leg_id, *_rest in port.amended] == ["11", "12"]
 
 
+def _entry_row(ctx, coid, *, side, qty, pine_id, kind=ENTRY_KIND_POSITION,
+               leg_id=None, filled=0.0, symbol="EURUSD"):
+    create_entry_order_row(
+        ctx, coid=coid, symbol=symbol, side=side, qty=qty,
+        intent_key=pine_id, pine_entry_id=pine_id,
+        kind=kind, order_type="market" if kind == ENTRY_KIND_POSITION else "limit",
+    )
+    if leg_id is not None or filled:
+        ctx.upsert_order(coid, state=STATE_CONFIRMED,
+                         exchange_order_id=leg_id, filled_qty=filled)
+
+
+def __test_run_exit_bracket_defers_while_a_sibling_entry_fill_is_pending__(tmp_path):
+    """A protected-side position entry with an unprocessed fill defers the fan.
+
+    The live pyramiding incident: L1's leg is open and fetchable, L2's market
+    entry was dispatched in the same sync but its FILL has not been processed
+    yet, so neither the ownership index nor the venue snapshot can be tied to
+    L2's leg. Fanning now would attach L2-X onto L1's leg only and the intent
+    would go active without ever re-fanning — L2's own leg would stay
+    permanently unprotected. The fan must instead skip (the same non-halting
+    defer as a flat book) and cover BOTH legs on the re-run after the fill.
+    """
+    store, ctx = _make_store(tmp_path)
+    _entry_row(ctx, "e-l1", side="buy", qty=1.0, pine_id="L1", leg_id="10", filled=1.0)
+    _entry_row(ctx, "e-l2", side="buy", qty=1.0, pine_id="L2")  # fill pending
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_exit_bracket(
+        _exit_env("L2-X", "L2", qty=1.0, tp=1.20, sl=1.00), port,
+    ))
+    assert res.skipped is True and res.legs == ()
+    assert res.skip_reason is not None
+    assert port.amended == []
+    assert list(iter_active_bracket_ownerships(ctx)) == []
+    # The fill lands (leg "11" journaled + fetchable): the re-run covers both.
+    ctx.upsert_order("e-l2", state=STATE_CONFIRMED,
+                     exchange_order_id="11", filled_qty=1.0)
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("11", "buy", 1.0, open_time=1.0)])
+    res = _run(eng.run_exit_bracket(
+        _exit_env("L2-X", "L2", qty=1.0, tp=1.20, sl=1.00), port,
+    ))
+    assert res.legs == ("10", "11") and res.skipped is False
+    assert _amended_levels(port) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
+    store.close()
+
+
+def __test_run_exit_bracket_ignores_resting_and_opposite_side_entries__(tmp_path):
+    """Unfilled rows that cannot hide a protected-side leg do not defer the fan.
+
+    A resting (working) entry has no venue leg until it fills, and an
+    opposite-side entry's future leg is irrelevant to this exit's protected
+    side — neither may hold the bracket back from the legs that ARE open.
+    """
+    store, ctx = _make_store(tmp_path)
+    _entry_row(ctx, "e-l1", side="buy", qty=1.0, pine_id="L1", leg_id="10", filled=1.0)
+    _entry_row(ctx, "e-rest", side="buy", qty=1.0, pine_id="L9",
+               kind=ENTRY_KIND_WORKING, leg_id="order-77")
+    _entry_row(ctx, "e-s1", side="sell", qty=1.0, pine_id="S1")  # fill pending
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_exit_bracket(
+        _exit_env("L1-X", "L1", qty=1.0, tp=1.20, sl=1.00), port,
+    ))
+    assert res.legs == ("10",) and res.skipped is False
+    assert _amended_levels(port) == [("10", 1.20, 1.00)]
+    store.close()
+
+
 def __test_clear_only_owns__(tmp_path):
     """Clearing one exit wipes only its own legs; a co-located exit's bracket survives."""
     # THE regression test: a TP-exit and an SL-exit on the SAME legs. Cancelling
@@ -557,7 +631,7 @@ def __test_clear_only_owns__(tmp_path):
     assert set(res.legs) == {"10", "11"}
     # The clearing amends wipe the whole protection set on each owned leg.
     assert all(tp is None and sl is None and trail is None
-               for _leg, _side, tp, sl, trail, _coid in port.amended)
+               for _leg_id, _side, tp, sl, trail, _coid in port.amended)
     surviving = list(iter_active_bracket_ownerships(ctx))
     assert len(surviving) == 2
     assert all(row.intent_key == "SL\0Long" for row in surviving)

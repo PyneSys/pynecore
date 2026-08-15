@@ -66,6 +66,7 @@ from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
     BRACKET_OWN_STATE_RELEASED,
     CLOSE_LEG_STATE_DISPATCHED,
+    ENTRY_KIND_POSITION,
     EXTRAS_KEY_BRACKET_OWN_ATTACH_COID,
     EXTRAS_KEY_BRACKET_OWN_CLEAR_COID,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
@@ -146,11 +147,16 @@ class BracketFanResult:
     """Outcome of one exit-bracket replication across a position's legs.
 
     :ivar legs: Broker leg ids the bracket was replicated onto, in FIFO order.
-    :ivar skipped: ``True`` when the symbol was flat (no position-side legs to
-        protect) — a non-halting no-op; the caller re-evaluates next bar.
+    :ivar skipped: ``True`` when nothing was amended — the symbol was flat (no
+        position-side legs to protect) or the position book is incomplete (a
+        protected-side entry's fill is not yet journaled) — a non-halting
+        no-op; the caller re-evaluates next bar.
+    :ivar skip_reason: Human-readable cause for an incomplete-book skip, for
+        the caller's skip message; ``None`` for the flat / flipped-side skips.
     """
     legs: tuple[str, ...]
     skipped: bool
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -486,6 +492,11 @@ class OneWayEmulator:
         leg (the dispatch coid alone would collide — it encodes pine_id but not
         from_entry). Legs that have since closed are released by the restart /
         reconcile pass, not here.
+
+        The fan is also deferred (``skipped=True`` with a ``skip_reason``)
+        while any protected-side position entry's fill is still pending in the
+        journal — see :meth:`_pending_position_entry` — so it always runs over
+        a complete book and covers a same-sync pyramid entry's own leg.
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
@@ -518,6 +529,30 @@ class OneWayEmulator:
         protected_side = 'buy' if intent.side == 'sell' else 'sell'
         if side == 'flat' or not on_side or side != protected_side:
             return BracketFanResult(legs=(), skipped=True)
+        # Incomplete-book gate: a protected-side position entry whose FILL is
+        # not yet journaled means the snapshot above cannot be tied to that
+        # entry's venue leg yet (the leg id is only learned from the fill, and
+        # on a same-sync pyramid the fill event has not been drained when this
+        # fan runs). Fanning now would attach the bracket onto the OLDER legs
+        # only, the intent would go active, and nothing ever re-fans — the
+        # newest leg of a pyramid round would stay permanently unprotected. A
+        # mixed book is worse: netting computed over the incomplete snapshot
+        # can mis-drop a true survivor and the clear below would strip its live
+        # bracket. Defer the WHOLE fan — the same non-halting skip as a flat
+        # book — until every position-opening dispatch on this side has its
+        # fill on the books; the re-run then covers all legs.
+        if self._store_ctx is not None:
+            pending_coid = self._pending_position_entry(
+                intent.symbol, protected_side,
+            )
+            if pending_coid is not None:
+                return BracketFanResult(
+                    legs=(), skipped=True,
+                    skip_reason=(
+                        f"position book incomplete — entry dispatch "
+                        f"{pending_coid!r} has not journaled its fill yet"
+                    ),
+                )
         survivors = {leg.leg_id for leg in on_side}
         # A re-attach can narrow the survivor set: a manual hedge or an
         # interrupted reversal opens an opposing leg that virtually FIFO-consumes
@@ -602,6 +637,32 @@ class OneWayEmulator:
                 ) from exc
             replicated.append(leg.leg_id)
         return BracketFanResult(legs=tuple(replicated), skipped=False)
+
+    def _pending_position_entry(self, symbol: str, protected_side: str) -> str | None:
+        """Client-order-id of a protected-side position entry awaiting its fill.
+
+        A live journal row with ``extras['kind'] == ENTRY_KIND_POSITION`` opens
+        a venue leg immediately (MARKET dispatch or an adopted position), so
+        while its cumulative ``filled_qty`` is short of ``qty`` the book
+        snapshot is incomplete for ``protected_side``. Working (LIMIT / STOP)
+        rows are excluded — they hold no leg until their fill promotes them to
+        ``ENTRY_KIND_POSITION`` — and so are entries opening the opposite side.
+
+        :param symbol: The exit's canonical broker symbol.
+        :param protected_side: Position side the exit protects (``'buy'`` /
+            ``'sell'``).
+        :return: The first pending row's ``client_order_id``, or ``None`` when
+            every protected-side position entry has its fill on the books.
+        """
+        assert self._store_ctx is not None
+        for row in self._store_ctx.iter_live_orders(symbol=symbol):
+            if (row.extras or {}).get('kind') != ENTRY_KIND_POSITION:
+                continue
+            if row.side != protected_side:
+                continue
+            if row.filled_qty < row.qty - 1e-9:
+                return row.client_order_id
+        return None
 
     async def _clear_dropped_survivor_legs(
             self, envelope: 'DispatchEnvelope', intent: ExitIntent, *,

@@ -547,6 +547,44 @@ def __test_external_flatten_is_detected_despite_an_armed_bracket__():
     assert pos.size == 1.0
 
 
+def __test_a_flat_snapshot_right_after_a_fill_only_starts_the_clock__():
+    """A stale flat venue snapshot must not clear a just-booked fill.
+
+    The live Bybit resting-lane incident: the bot's 3-bar cancel raced the
+    venue fill and lost — the fill was booked (position -0.01) while the
+    cancel had already emptied the intent slots, and the script had not seen
+    the position yet so no exit was armed. The very next reconcile read a
+    /positions snapshot taken BEFORE the fill (the poll raced the execution
+    stream) and, gated on ``_active_intents`` alone, the external-flatten
+    branch cleared the fresh book instantly: engine flat, Pine flat, venue
+    short — the leg invisible until the cycle-end reconciliation stopped the
+    lane. A fill booked within the grace must start the SAME bounded
+    confirmation clock; a venue still flat past the grace clears as before.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id="S"))
+    assert pos.size == -1.0
+
+    # The raced cancel emptied the slots; the venue read predates the fill.
+    engine._active_intents.clear()  # type: ignore[attr-defined]
+    b.position = None
+    engine.reconcile()
+    assert pos.size == -1.0, \
+        "a flat snapshot within the fill grace must not clear the book"
+
+    # Bounded: the venue is STILL flat past the grace and the fill is no
+    # longer recent — the flatten really was external, the state clears.
+    aged = time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0
+    engine._flat_observed_with_intents_since = aged  # type: ignore[attr-defined]
+    engine._last_position_fill_monotonic = aged  # type: ignore[attr-defined]
+    engine.reconcile()
+    assert pos.size == 0.0
+
+
 def __test_entry_exchange_reject_does_not_halt_and_retries__():
     """An entry exchange reject does not halt the bot; the next sync re-attempts."""
     # An exchange reject on an ENTRY (e.g. a risk-engine veto / insufficient

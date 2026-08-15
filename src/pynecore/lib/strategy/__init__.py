@@ -252,7 +252,7 @@ class Order:
         # market entry order on fill, so it stays 0.0 there; the live broker
         # keeps the entry Order in ``entry_orders`` for intent stability, so the
         # bound-size reservation must not double-count the filled slice.
-        self.filled_qty = 0.0
+        self.filled_qty: float = 0.0
         self.flip_extra = 0.0
         self.skip_flip = False
         self.bar_index = -1  # Will be set when order is added to position
@@ -3821,9 +3821,11 @@ def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
     global _explicit_qty_grid
     rfactor = syminfo._size_round_factor  # noqa
     mincontract = 1.0 / rfactor
-    if _explicit_qty_grid is None or _explicit_qty_grid[0] != mincontract:
-        _explicit_qty_grid = (mincontract, Decimal(repr(mincontract)))
-    grid = _explicit_qty_grid[1]
+    cached_grid = _explicit_qty_grid
+    if cached_grid is None or cached_grid[0] != mincontract:
+        cached_grid = (mincontract, Decimal(repr(mincontract)))
+        _explicit_qty_grid = cached_grid
+    grid = cached_grid[1]
     lots = int((Decimal(repr(abs(qty))) / grid).to_integral_value(rounding=ROUND_FLOOR))
     sign = 1 if qty > 0 else -1
     return sign * lots / rfactor
@@ -4572,6 +4574,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # close only 44/47 — the misses are all one lot step high).
     deferred_default = not (qty == qty)  # is_na_arg
     market_sizing_price: float | None = None
+    exec_price = 0.0  # only meaningful when deferred_default
     if deferred_default:
         exec_price = position.c
         if limit is not None:
@@ -5130,6 +5133,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # price while it rests.
     deferred_default = not (qty == qty)  # is_na_arg
     market_sizing_price: float | None = None
+    exec_price = 0.0  # only meaningful when deferred_default
     if deferred_default:
         exec_price = float(lib.close)
         if limit is not None:

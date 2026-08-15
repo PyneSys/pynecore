@@ -978,6 +978,16 @@ class OrderSyncEngine:
         # minutes and mis-sized the next folded reversal).
         self._flat_observed_with_intents_since = 0.0
 
+        # ``monotonic()`` moment the last fill was booked into the position
+        # (:meth:`_route_event` → ``record_fill``). The external-flatten
+        # branch consults it for the mirror freshness race: a venue snapshot
+        # read within the grace of a just-booked ENTRY fill can predate that
+        # fill (the /positions poll raced the execution stream) and shows the
+        # pre-fill flat — with the cancel-raced entry's intents already gone,
+        # gating the wait on ``_active_intents`` alone cleared the fresh
+        # position instantly and left the venue leg unowned.
+        self._last_position_fill_monotonic = 0.0
+
         # Entry ids whose tracking the external-flatten clear above retired.
         # Their close-leg fill may still arrive late (a reconnect backfill
         # attributing the venue-side close after the grace expired); booking
@@ -3304,8 +3314,21 @@ class OrderSyncEngine:
             # folded reversal. An in-flight fill of our own arrives within
             # seconds; a venue still flat after the grace with the book
             # unmoved is an external flatten.
-            if self._active_intents:
-                now = time.monotonic()
+            #
+            # The mirror race also needs the grace: a just-recorded ENTRY
+            # fill can precede the venue snapshot reflecting it (the
+            # /positions read raced the execution stream), so the snapshot
+            # still shows the PRE-fill flat. With no active intents — the
+            # bot's cancel lost to the fill and emptied the slots, and the
+            # script has not seen the position yet so no exit is armed —
+            # gating on intents alone cleared the freshly-booked position
+            # instantly, leaving a live venue leg nobody owned (measured on
+            # the Bybit resting lane). A fill recorded within the grace
+            # therefore starts the SAME bounded confirmation clock.
+            now = time.monotonic()
+            recent_fill = (now - self._last_position_fill_monotonic
+                           < EXTERNAL_FLATTEN_CONFIRM_GRACE_S)
+            if self._active_intents or recent_fill:
                 if self._flat_observed_with_intents_since == 0.0:
                     self._flat_observed_with_intents_since = now
                 if (now - self._flat_observed_with_intents_since
@@ -3340,10 +3363,10 @@ class OrderSyncEngine:
             # close fill for them (a reconnect backfill attributing the
             # venue-side close after the grace) is dropped instead of
             # walking the now-empty FIFO into a phantom opposite position.
-            cleared_entry_ids = {
-                trade.entry_id for trade in self._position.open_trades
-                if trade.entry_id
-            }
+            cleared_entry_ids: set[str] = set()
+            for trade in self._position.open_trades:
+                if trade.entry_id:
+                    cleared_entry_ids.add(trade.entry_id)
             self._position.size = 0.0
             self._position.sign = 0.0
             self._position.avg_price = na_float
@@ -4170,6 +4193,7 @@ class OrderSyncEngine:
             # of entry ids the FIFO walk consumed.
             closed_count_before = len(self._position.new_closed_trades)
             self._position.record_fill(event)
+            self._last_position_fill_monotonic = time.monotonic()
             self._last_fifo_closed_entry_ids = [
                 trade.entry_id
                 for trade in self._position.new_closed_trades[closed_count_before:]
@@ -6327,12 +6351,11 @@ class OrderSyncEngine:
         # and a close fill in that window must still sweep both software-OCA
         # legs. The plugin resolves the cancel through its durable ownership
         # rows even when the in-memory mapping is already gone.
-        exits_to_retire: dict[str, ExitIntent] = {
-            key: intent
-            for key, intent in self._active_intents.items()
-            if (isinstance(intent, ExitIntent)
-                and intent.from_entry == closed_entry_id)
-        }
+        exits_to_retire: dict[str, ExitIntent] = {}
+        for key, active in self._active_intents.items():
+            if (isinstance(active, ExitIntent)
+                    and active.from_entry == closed_entry_id):
+                exits_to_retire[key] = active
         for intent in build_intents(
                 {}, self._position.exit_orders, self._symbol,
                 self._position.open_trades):
@@ -8884,7 +8907,7 @@ class OrderSyncEngine:
                 continue
             if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
                 continue
-            entry_id = row.pine_entry_id
+            entry_id = row.pine_entry_id or ''
             if not entry_id or entry_id == ADOPTED_STARTUP_ENTRY_ID:
                 # Unmapped exposure — cannot tie it to a real entry id, so the
                 # per-entry reconstruction would be a guess. Fall back.
@@ -10799,9 +10822,8 @@ class OrderSyncEngine:
                     # sentinel without any broker round-trip.
                     entry_order = self._position.entry_orders.get(intent.pine_id)
                     filled_entry = self._active_entry_filled_qty.get(key, 0.0)
-                    if (entry_order is not None
-                            and entry_order.filled_qty > filled_entry):
-                        filled_entry = entry_order.filled_qty
+                    if entry_order is not None:
+                        filled_entry = max(filled_entry, entry_order.filled_qty or 0.0)
                     if filled_entry >= intent.qty - 1e-9:
                         _blog_info(
                             "re-emitted entry %s already consumed "
@@ -11127,7 +11149,7 @@ class OrderSyncEngine:
         is_buy = intent.side == 'buy'
         if is_buy != (self._position.size > 0.0):
             return None
-        pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)
+        pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)  # noqa
         if len(self._position.open_trades) < max(1, pyramiding):
             return None
         filled = 0.0
@@ -12435,17 +12457,21 @@ class OrderSyncEngine:
                             self._one_way_emulator.run_exit_bracket(envelope, port),
                         )
                         if bracket.skipped:
-                            # Flat position (a close raced the exit): nothing to
-                            # protect. Surface the non-halting skip the same way a
+                            # Flat position (a close raced the exit) or an
+                            # incomplete book (a same-sync pyramid entry's fill
+                            # not yet drained): nothing safe to protect yet.
+                            # Surface the non-halting skip the same way a
                             # below-grid plugin decline does, so the intent stays
                             # out of ``_active_intents`` and the next bar
                             # re-evaluates (run_exit_bracket is idempotent).
                             raise OrderSkippedByPlugin(
-                                f"Exit {intent.intent_key} skipped: no open "
-                                f"position-side legs to attach a bracket to; "
+                                f"Exit {intent.intent_key} skipped: "
+                                f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                                 f"re-evaluating next bar.",
                                 intent_key=intent.intent_key,
-                                reason="no_position_to_protect",
+                                reason=("position_book_incomplete"
+                                        if bracket.skip_reason is not None
+                                        else "no_position_to_protect"),
                                 context={'symbol': intent.symbol,
                                          'from_entry': intent.from_entry},
                             )
@@ -15382,11 +15408,13 @@ class OrderSyncEngine:
                     )
                     if bracket.skipped:
                         raise OrderSkippedByPlugin(
-                            f"Exit modify {new.intent_key} skipped: no open "
-                            f"position-side legs to attach a bracket to; "
+                            f"Exit modify {new.intent_key} skipped: "
+                            f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                             f"re-evaluating next bar.",
                             intent_key=new.intent_key,
-                            reason="no_position_to_protect",
+                            reason=("position_book_incomplete"
+                                    if bracket.skip_reason is not None
+                                    else "no_position_to_protect"),
                             context={'symbol': new.symbol,
                                      'from_entry': new.from_entry},
                         )
