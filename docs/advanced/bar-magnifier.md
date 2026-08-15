@@ -182,7 +182,7 @@ for each bar:
     committed = snapshot(var globals)
     process_orders()                        # fills from previous bar's orders
 
-    while new fills detected:
+    while new fills detected and re-executions < limit:
         restore var globals to committed    # rollback (varip excluded)
         main()                              # re-execution
         process_orders()                    # process new orders from re-execution
@@ -190,6 +190,22 @@ for each bar:
     restore var globals to committed        # final rollback
     main()                                  # definitive bar-close execution
 ```
+
+### Re-execution limit
+
+TradingView bounds the body at **four executions per tick source**, and that is what keeps a
+body that closes and re-enters on every pass — each pass filling again — from never leaving
+the bar.
+
+Without the magnifier the tick source is the chart bar's own assumed OHLC path — open, the
+extreme nearest it, the other extreme, close. A re-execution stands on one of those points:
+on the one its triggering fill happened at, and at least one point further along than the
+previous pass. The closing point belongs to the definitive execution, so reaching it ends the
+loop by itself — which is exactly the three fill-driven re-executions per chart bar.
+
+With the magnifier every lower-timeframe bar contributes its own four ticks, so the bound
+scales with the number of sub-bars and the body can run **more than four times on a single
+chart bar**.
 
 ### Persistent vs IBPersistent
 

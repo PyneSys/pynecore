@@ -752,7 +752,8 @@ class SimPosition(PositionBase):
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
         '_deferred_margin_call', '_fill_counter', '_last_fill_price', '_partial_close_bar',
-        '_entry_open_ledger', '_deferred_immediate_closes'
+        '_entry_open_ledger', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
+        '_walk_node', '_path_node'
     )
 
     def __init__(self):
@@ -836,6 +837,20 @@ class SimPosition(PositionBase):
         # Price of the most recent fill — the broker emulator's "current price"
         # for a calc_on_order_fills body run (see _mark_to_last_fill).
         self._last_fill_price: float = 0.0
+        # Node of the bar's assumed path a calc_on_order_fills re-execution stands
+        # at, -1 outside one. Set by the runner's COOF loop; picks both the price
+        # the body is marked at and the one its market orders fill at.
+        self._coof_cursor: int = -1
+        # Price a market order fills at in this pass — the bar open outside a COOF
+        # re-execution, a later point of the bar's assumed path inside one.
+        self._market_fill_price: float = 0.0
+        # Step of the tick source the walk currently stands at, and the step the
+        # most recent fill happened at. On the assumed intrabar path a step is a
+        # node of it: 0 the open, 1 the extreme nearest it, 2 the other extreme,
+        # 3 the close (see _path_price). Under the bar magnifier the sub-bars are
+        # the tick source, so a step is a sub-bar index instead.
+        self._walk_node: int = 0
+        self._path_node: int = 0
         # Monotonic stamp source for same-bar stacking of partial closes.
         self._close_seq_counter: int = 0
         # bar_index of the most recent filled partial strategy.close() (a stamped
@@ -1026,6 +1041,7 @@ class SimPosition(PositionBase):
 
         self._fill_counter += 1
         self._last_fill_price = price
+        self._path_node = self._walk_node
 
         # Save the original order size before any modifications
         filled_size = abs(order.size)
@@ -2009,6 +2025,7 @@ class SimPosition(PositionBase):
                     # 1497 of 1526, every one at exactly `high - trail_offset`.
                     path = path[1:]
             for nxt in path:
+                self._walk_node = 3 if close_leg else (1 if (nxt == self.h) == ohlc else 2)
                 if nxt > prev:
                     if order.limit is not None and nxt >= order.limit and not (
                             not armed and offset_price <= 0
@@ -2128,6 +2145,7 @@ class SimPosition(PositionBase):
                     # fill -- see the mirrored comment in the long branch.
                     path = path[1:]
             for nxt in path:
+                self._walk_node = 3 if close_leg else (1 if (nxt == self.h) == ohlc else 2)
                 if nxt < prev:
                     if order.limit is not None and nxt <= order.limit and not (
                             not armed and offset_price <= 0
@@ -2718,19 +2736,48 @@ class SimPosition(PositionBase):
             return True
         return False
 
-    def _mark_to_last_fill(self) -> None:
-        """Reprice the emulator at the last fill for a calc_on_order_fills run.
+    def _path_price(self, node: int) -> float:
+        """Price of a node of the bar's assumed path.
 
-        A COOF body execution sees the broker emulator AT THE FILL MOMENT: a
-        default-sized market entry it places is sized — and the equity it reads
-        is marked — at the triggering fill's price, not the bar close (measured
-        2026-08-13, SUPERTREND ATR WITH TRAILING STOP LOSS, BINANCE:BTCUSDT
-        30m: the 2026-06-24 11:30 COOF re-entry sizes at the exit fill
-        62382.48, where the bar close 62921.19 gives one lot step less).
-        ``process_orders`` re-anchors ``c`` and the open P&L to the bar close
-        at the start of the next pass, so nothing needs undoing.
+        The emulator walks open -> the extreme nearest it -> the other extreme ->
+        close, and a calc_on_order_fills re-execution sees it standing on one of
+        those nodes: the one :attr:`_coof_cursor` names.
+
+        Measured 2026-08-15 on BINANCE:BTCUSDT 30m with a body whose only way
+        into a position is a stop placed 0.3% off the close — so its fill is
+        provably never at the open. All 1087 entries, both sides, no exception:
+        the pass the fill triggers marks the open position at the extreme that
+        ends the leg the stop filled on (the high for a buy stop, the low for a
+        sell stop), NOT at the bar open and NOT at the stop price itself. Where
+        the cursor goes from there is decided by the runner's COOF loop.
         """
-        self.c = self._last_fill_price
+        if node <= 0:
+            return self.o
+        if node >= 3:
+            return self.c
+        near, far = (self.h, self.l) if self.h - self.o < self.o - self.l else (self.l, self.h)
+        return near if node == 1 else far
+
+    def _mark_to_last_fill(self) -> None:
+        """Reprice the emulator for a calc_on_order_fills re-execution.
+
+        A COOF body execution sees the broker emulator AT THE POINT OF THE BAR
+        IT HAS REACHED, not at the bar close: a default-sized market entry it
+        places is sized — and the equity it reads is marked — there. Measured
+        2026-08-13 on SUPERTREND ATR WITH TRAILING STOP LOSS (BINANCE:BTCUSDT
+        30m), whose 2026-06-24 11:30 COOF re-entry sizes at 62382.48 where the
+        bar close 62921.19 gives one lot step less; and 2026-08-15 on Hull
+        Moving Average Swing Trader, where the entry a pass places is sized at
+        the very price that pass fills it at. Which point of the bar that is,
+        is decided by :attr:`_coof_cursor` and :meth:`_path_price`.
+        ``process_orders`` re-anchors ``c`` and the open P&L to the bar close at
+        the start of the next pass, so nothing needs undoing.
+
+        On the magnified path real sub-bars replace the assumed one, there is no
+        cursor, and the last fill stays the emulator's current price.
+        """
+        self.c = (self._path_price(self._coof_cursor) if self._coof_cursor >= 0
+                  else self._last_fill_price)
         if self.size != 0.0:
             self.openprofit = self.size * (self.c - self.avg_price) * _account_point_value()
 
@@ -2748,6 +2795,10 @@ class SimPosition(PositionBase):
         self.h = int(lib.high / mintick + 0.5) * minmove / pricescale
         self.l = int(lib.low / mintick + 0.5) * minmove / pricescale
         self.c = int(lib.close / mintick + 0.5) * minmove / pricescale
+
+        # The path walk restarts with the bar; the COOF passes of one bar share it.
+        if self._coof_cursor < 0:
+            self._path_node = 0
 
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
@@ -2771,6 +2822,21 @@ class SimPosition(PositionBase):
 
         # If the order is open → high → low → close or open → low → high → close
         ohlc = self.h - self.o < self.o - self.l
+
+        # A calc_on_order_fills re-execution does not get the bar open again: the
+        # emulator has already walked part of the bar, so the market order it
+        # placed fills at the node the walk has reached — the same node the body
+        # is marked at, see ``_path_price``. Measured on the wild script
+        # `Hull Moving Average Swing Trader` (BINANCE:BTCUSDT 30m), whose body
+        # closes and re-enters on every pass, over all 590 of its four-entry bars
+        # with no exception: the four in-bar fill moments price at
+        # ``open, open, near, far`` — where ``near`` is the extreme the path
+        # visits first, the same one ``ohlc`` above selects. (The orders the
+        # definitive execution places fill at the NEXT bar's open, which is what
+        # already happens.)
+        self._walk_node = self._coof_cursor if self._coof_cursor > 0 else 0
+        self._market_fill_price = (self._path_price(self._coof_cursor)
+                                   if self._coof_cursor >= 0 else self.o)
 
         self._process_at_bar_open(ohlc)
         self._process_limit_stop_orders(ohlc)
@@ -2939,7 +3005,9 @@ class SimPosition(PositionBase):
             # and the setting moved none of them.
             gap_trigger = gap_triggers.get(_market_order_key(order))
             limit = order.limit
-            fill_price = self.o
+            # Outside a COOF re-execution this IS the bar open; a gap is a bar-open
+            # notion, so that branch keeps reading the open itself.
+            fill_price = self._market_fill_price
             if gap_trigger == 'limit' and limit is not None:
                 fill_price = max(limit, self.o) if order.size < 0 else min(limit, self.o)
             elif script.slippage > 0:
@@ -2947,7 +3015,7 @@ class SimPosition(PositionBase):
                 # For long orders (buying), slippage increases the price
                 # For short orders (selling), slippage decreases the price
                 slippage_amount = syminfo.mintick * script.slippage * order.sign
-                fill_price = self.o + slippage_amount
+                fill_price = self._market_fill_price + slippage_amount
 
             # Pre-fill margin check for entry orders (TradingView behavior)
             # TV rejects entry orders BEFORE filling if the position would exceed margin
@@ -3186,6 +3254,7 @@ class SimPosition(PositionBase):
         # Process orders: open → high → low → close
         if ohlc:
             # open -> high
+            self._walk_node = 1
             if self.orderbook.price_levels:
                 self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
                                trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
@@ -3199,6 +3268,7 @@ class SimPosition(PositionBase):
                 # can trip there: TV liquidated one contract of a LONG at
                 # H=120300 (Hybrid 2025-10-02 16:00) before the exit limit at
                 # 120290.7 — lower on the same leg — filled the rest.
+                self._walk_node = 2
                 if self.sign < 0:
                     self._check_margin_call(self.l, for_short=True, can_defer=False)
 
@@ -3224,6 +3294,7 @@ class SimPosition(PositionBase):
                 # low -> close (ascending): the walk's closing leg. Orders that
                 # became active mid-bar — an exit whose entry filled on an
                 # earlier leg — get the path's final segment, like TV does.
+                self._walk_node = 3
                 if self.orderbook.price_levels:
                     for order in self.orderbook.iter_orders(min_price=self.l, max_price=self.c):
                         if self._check_close_leg_up(order):
@@ -3232,6 +3303,7 @@ class SimPosition(PositionBase):
         # Process orders: open → low → high → close
         else:
             # open -> low (descending: the level nearest the open fills first)
+            self._walk_node = 1
             if self.orderbook.price_levels:
                 self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
                                trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
@@ -3241,6 +3313,7 @@ class SimPosition(PositionBase):
                 # Favorable-extreme checkpoint before this leg's fills — see
                 # the mirrored comment in the OHLC branch (TV-verified on the
                 # Hybrid 2025-10-02 16:00 long margin call at the high).
+                self._walk_node = 2
                 if self.sign > 0:
                     self._check_margin_call(self.h, for_short=False, can_defer=False)
 
@@ -3266,6 +3339,7 @@ class SimPosition(PositionBase):
                 # high -> close (descending): the walk's closing leg. Orders that
                 # became active mid-bar — an exit whose entry filled on an
                 # earlier leg — get the path's final segment, like TV does.
+                self._walk_node = 3
                 if self.orderbook.price_levels:
                     for order in self.orderbook.iter_orders(max_price=self.h, min_price=self.c, desc=True):
                         if self._check_close_leg_down(order):
@@ -3626,13 +3700,23 @@ class SimPosition(PositionBase):
             self._remove_order(order)
         self._deferred_immediate_closes = []
 
-    def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV):
+    def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV,
+                                 start: int = 0):
         """
         Process orders using bar magnifier — check fills against each sub-bar's OHLC.
 
         Phase 1 (at-open) runs once using first sub-bar.
         Phase 2 (limit/stop) runs on each sub-bar sequentially.
         Phase 3 (P&L) runs once using aggregated bar values.
+
+        :param sub_bars: The chart bar's lower-timeframe bars, in time order.
+        :param aggregated: The chart bar itself, for the P&L phase.
+        :param start: Sub-bar to resume the walk at. A calc_on_order_fills
+            re-execution passes the sub-bar its triggering fill happened in, so
+            the orders it places are offered the rest of the bar and not the
+            sub-bars that are already behind them. :attr:`_path_node` carries
+            that index — the same bookkeeping the assumed path uses for its own
+            nodes, over sub-bar indexes here.
         """
         # ``lib.math.round_to_mintick`` inlined — sub-bar OHLC are plain floats, and
         # this runs per sub-bar. Expression shape must stay left-to-right (see the
@@ -3640,25 +3724,36 @@ class SimPosition(PositionBase):
         mintick = syminfo.mintick
         minmove = syminfo.minmove
         pricescale = syminfo.pricescale
-        # Setup from first sub-bar (= chart bar open)
-        first = sub_bars[0]
-        self.o = int(first.open / mintick + 0.5) * minmove / pricescale
-        self.h = int(first.high / mintick + 0.5) * minmove / pricescale
-        self.l = int(first.low / mintick + 0.5) * minmove / pricescale
-        # Use aggregated close for margin deferral checks
-        self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
         self.drawdown_summ = self.runup_summ = 0.0
         self.new_closed_trades.clear()
         # Undo any immediate close a COOF trial body run enqueued (position-side
         # analog of the restored ``var`` state); no-op in the common case.
         self._discard_deferred_immediate_closes()
 
-        # Phase 1: at-open processing (gap detection, market orders, margin at open)
-        ohlc = self.h - self.o < self.o - self.l
-        self._process_at_bar_open(ohlc)
+        if start <= 0:
+            self._path_node = 0
+            # Setup from first sub-bar (= chart bar open)
+            first = sub_bars[0]
+            self.o = int(first.open / mintick + 0.5) * minmove / pricescale
+            self.h = int(first.high / mintick + 0.5) * minmove / pricescale
+            self.l = int(first.low / mintick + 0.5) * minmove / pricescale
+            # Use aggregated close for margin deferral checks
+            self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
+
+            # Phase 1: at-open processing (gap detection, market orders, margin at open)
+            ohlc = self.h - self.o < self.o - self.l
+            # Real sub-bars replace the assumed intrabar path, so a COOF pass claims
+            # no path point here — a market order fills at the sub-bar open like any
+            # other. The chart bar's open is behind a resuming pass, which is why
+            # this whole phase belongs to the first one only.
+            self._market_fill_price = self.o
+            self._walk_node = 0
+            self._process_at_bar_open(ohlc)
 
         # Phase 2: process limit/stop orders on each sub-bar
-        for sub_bar in sub_bars:
+        for idx in range(max(start, 0), len(sub_bars)):
+            sub_bar = sub_bars[idx]
+            self._walk_node = idx
             self.o = int(sub_bar.open / mintick + 0.5) * minmove / pricescale
             self.h = int(sub_bar.high / mintick + 0.5) * minmove / pricescale
             self.l = int(sub_bar.low / mintick + 0.5) * minmove / pricescale

@@ -50,6 +50,51 @@ __all__ = [
 LIVE_TRANSITION = OHLCV(timestamp=-1, open=-1, high=-1, low=-1, close=-1, volume=-1)
 """Sentinel inserted between historical and live OHLCV data in the iterator."""
 
+_LAST_PATH_NODE = 2
+"""Last node of the assumed intrabar path a COOF re-execution can stand on.
+
+The emulator walks open (0) -> the extreme nearest it (1) -> the other extreme
+(2) -> close (3), and a fill-driven re-execution stands on one of those nodes.
+Node 3 is the definitive execution's own place, so a pass would have nothing left
+of the bar to see there — reaching it ends the loop. That is also where the "at
+most FOUR body runs per bar" observation comes from: the ordinary run plus nodes
+0, 1 and 2. Measured with a ``varip`` execution counter plotted as
+``execs - execs[1]``: a body that closes and re-enters on every pass — which
+would otherwise fill forever — flatlines at 4, and caps at four entries per bar
+in its TradingView trade list; while a body entering on a stop and closing at
+once reports 2 when both fills land on node 2 and 3 when they land on node 1
+(1100 entry bars on BINANCE:BTCUSDT 30m, no exception).
+
+MAX_COOF_RE_EXECUTIONS below is the magnified path's fallback: there real
+sub-bars replace the assumed one, so there are no nodes to run out of.
+"""
+
+MAX_COOF_RE_EXECUTIONS = 3
+"""Fill-driven re-executions allowed on one MAGNIFIED bar per sub-bar.
+
+TradingView runs the body at most four times per tick source: the ordinary
+execution plus three. The emulator's four ticks are the chart bar's own OHLC only
+while the assumed intrabar path is in use — that case is bounded by
+``_LAST_PATH_NODE`` instead.
+With the bar magnifier the ticks come from the lower-timeframe bars instead, and a
+script "can execute more than four times per chart bar" there — see
+:func:`_max_coof_re_executions`.
+"""
+
+
+def _max_coof_re_executions(sub_bar_count: int) -> int:
+    """Re-execution bound for a magnified chart bar.
+
+    Each lower-timeframe bar contributes its own four ticks, so the body may run
+    four times per sub-bar rather than four times per chart bar. The bound is
+    therefore scaled by the sub-bar count; it only has to keep a body that fills
+    on every pass from never leaving the bar.
+
+    :param sub_bar_count: Number of lower-timeframe bars inside this chart bar.
+    :return: Maximum number of fill-driven re-executions for the chart bar.
+    """
+    return (MAX_COOF_RE_EXECUTIONS + 1) * max(1, sub_bar_count) - 1
+
 
 def _close_price_or_none() -> float | None:
     """Best-effort current bar close, ``None`` before any bar is ingested.
@@ -1932,6 +1977,7 @@ class ScriptRunner:
                     return
                 sim = cast('SimPosition', position)
                 old_fills = sim._fill_counter
+                sim._coof_cursor = -1
                 sim.process_orders()
                 new_fills = sim._fill_counter
                 if new_fills <= old_fills:
@@ -1947,17 +1993,30 @@ class ScriptRunner:
                 # free of the cost.
                 drawing_snapshot.save()
                 child_snapshot.save()  # type: ignore[union-attr]
-                while new_fills > old_fills:
+                # The first re-execution stands where the fill that triggered it
+                # happened; each further one moves at least one node along, since
+                # a pass that fills where it already stands cannot leave the
+                # emulator there for the next. Past the second extreme only the
+                # closing leg is left, which belongs to the definitive execution
+                # below — that is what ends the loop, no arbitrary cap needed.
+                cursor = sim._path_node
+                while new_fills > old_fills and cursor <= _LAST_PATH_NODE:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     _drop_discarded_run(drawing_snapshot)
                     child_snapshot.restore()  # type: ignore[union-attr]
+                    # The cursor is set BEFORE the body: it selects the point of
+                    # the bar the emulator stands at, which prices both what this
+                    # body sizes and what its orders fill at below.
+                    sim._coof_cursor = cursor
                     sim._mark_to_last_fill()
                     _run_libs_and_main()
                     old_fills = new_fills
                     sim.process_orders()
                     bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
+                    cursor = max(cursor + 1, sim._path_node)
+                sim._coof_cursor = -1
                 sim.new_closed_trades[:] = bar_closed_trades
                 # The real execution of this bar follows — it must see the
                 # bar-start instance state, not the discarded runs' advances.
@@ -1982,15 +2041,22 @@ class ScriptRunner:
                 bar_closed_trades = list(sim.new_closed_trades)  # see _coof_loop
                 drawing_snapshot.save()  # see _coof_loop
                 child_snapshot.save()  # type: ignore[union-attr]
-                while new_fills > old_fills:
+                re_executions = 0
+                max_re_executions = _max_coof_re_executions(len(sub_bars_list))
+                while new_fills > old_fills and re_executions < max_re_executions:
                     if var_snapshot.has_vars:  # type: ignore
                         var_snapshot.restore()  # type: ignore
                     _drop_discarded_run(drawing_snapshot)
                     child_snapshot.restore()  # type: ignore[union-attr]
                     sim._mark_to_last_fill()
                     _run_libs_and_main()
+                    re_executions += 1
                     old_fills = new_fills
-                    sim.process_orders_magnified(sub_bars_list, aggregated_candle)
+                    # Resume where the fill that triggered this pass happened: the
+                    # sub-bars before it are already behind the orders this body
+                    # just placed, and offering them would fill in the past.
+                    sim.process_orders_magnified(sub_bars_list, aggregated_candle,
+                                                 sim._path_node)
                     bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
                 sim.new_closed_trades[:] = bar_closed_trades
@@ -2755,7 +2821,15 @@ class ScriptRunner:
                     drawing_snapshot.save()
                     if child_snapshot:
                         child_snapshot.save()
-                while new_fills > old_fills:
+                # ``process_orders_magnified`` clears ``new_closed_trades`` on
+                # entry — it is this BAR's closes, not this pass's — so each
+                # pass's closes are collected before the next pass wipes them,
+                # and the whole bar is put back for the yielded value and the
+                # trade writer below (see ``_coof_magnified_loop``).
+                bar_closed_trades = list(position.new_closed_trades) if re_executed else []
+                re_executions = 0
+                max_re_executions = _max_coof_re_executions(len(window.sub_bars))
+                while new_fills > old_fills and re_executions < max_re_executions:
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                     _drop_discarded_run(drawing_snapshot)
@@ -2767,13 +2841,19 @@ class ScriptRunner:
                         run_lib_main()
                     lib._lib_semaphore = False
                     run_main()
+                    re_executions += 1
                     old_fills = new_fills
-                    position.process_orders_magnified(window.sub_bars, window.aggregated)
+                    # Resume at the triggering fill's sub-bar (see
+                    # ``_coof_magnified_loop``).
+                    position.process_orders_magnified(window.sub_bars, window.aggregated,
+                                                      position._path_node)
+                    bar_closed_trades.extend(position.new_closed_trades)
                     new_fills = position._fill_counter
 
                 if var_snapshot.has_vars:
                     var_snapshot.restore()
                 if re_executed:
+                    position.new_closed_trades[:] = bar_closed_trades
                     _drop_discarded_run(drawing_snapshot)
                     if child_snapshot:
                         child_snapshot.restore()
