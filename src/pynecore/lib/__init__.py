@@ -1129,76 +1129,380 @@ def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]
     :param timeframe: Timeframe string for calculating bar duration
     :return: True if bar is within session, False otherwise
     """
-    from datetime import datetime, timedelta
-
-    if not session_infos:
-        return False
-
-    # Convert bar time to datetime in session timezone
-    bar_dt = datetime.fromtimestamp(bar_time_ms / 1000)
-    session_tz = _parse_timezone(session_infos[0].timezone)
-    bar_dt_local = bar_dt.astimezone(session_tz)
-
-    # Get the day of week in TradingView format (1=Sunday, 2=Monday, ..., 7=Saturday)
-    # Python weekday: 0=Monday, 6=Sunday
-    python_weekday = bar_dt_local.weekday()
-    tv_weekday = (python_weekday + 2) % 7
-    if tv_weekday == 0:
-        tv_weekday = 7
-
-    # Get bar time components
-    bar_time = bar_dt_local.time()
-
-    # Get timeframe duration for checking bar overlap
     try:
         tf_seconds = timeframe_module.in_seconds(timeframe)
     except (ValueError, AssertionError):
         # If timeframe is invalid, assume 1-minute bars
         tf_seconds = 60
+    return _session_occurrence(bar_time_ms, session_infos, tf_seconds) is not None
 
-    # Calculate bar end time
-    bar_end_dt = bar_dt_local + timedelta(seconds=tf_seconds)
-    bar_end_time = bar_end_dt.time()
-    # A bar ending at or past midnight wraps its time-of-day back to 00:00 or later,
-    # which would read as "before the session start" in the same-day comparison. Such
-    # a bar runs to the end of the day, so it ends after every session start.
-    bar_ends_next_day = bar_end_dt.date() != bar_dt_local.date()
 
+@_lru_cache(maxsize=512)
+def _session_occurrences_opening_on(day: date,
+                                    session_infos: 'tuple[SessionInfo, ...]'
+                                    ) -> tuple[tuple[int, int], ...]:
+    """
+    Every occurrence of a session specification that OPENS on a calendar date.
+
+    An occurrence is one concrete run of a session range: the "0300-1200" range
+    on a given date, or -- for an overnight range -- the run that opens on this
+    date and closes on the next one.
+
+    The opening endpoint is plain wall clock on its own date and the closing one
+    is the end of the run's LAST MINUTE, so a run crossing a daylight-saving
+    change keeps its nominal clock times and changes length in real time.
+    MEASURED (BINANCE:BTCUSDT@30, New York, daily requests over both 2025
+    changes): "1900-0400" ran 19:00 EST -> 04:00 EDT across the spring change
+    (eight hours) and ten hours across the fall-back, "0100-0500" three and
+    five, "0200-1000" seven and eight, "0130-0230" one and two. The sessions
+    closing at 02:00 -- the hour the clock jumps at -- kept their nominal span
+    on both nights instead: 01:59 is the LAST minute of "1700-0200", and on the
+    fall-back date that is the first, still-EDT 01:59, an hour before the
+    unambiguous 02:00 EST the closing wall clock alone would name.
+
+    KNOWN DIVERGENCE: on a change night TradingView's INTRADAY session mask
+    contradicts its OWN daily bounds whenever an endpoint lands on the changing
+    hour, and it does so in three mutually inconsistent ways. MEASURED (same
+    symbol, thirteen session shapes at 30 minutes over both 2025 changes and the
+    2026 spring one):
+
+    - A run closing at 02:00 keeps the pre-change offset on both endpoints in the
+      daily bounds and the POST-change one intraday, so the whole occurrence sits
+      an hour earlier in spring and an hour later in the fall: daily
+      2025-03-08 17:00 EST -> 03:00 EDT against intraday 16:00 EST -> 01:00 EST.
+    - An endpoint inside the spring gap is resolved with the pre-change offset
+      daily and the post-change one intraday, which shortens "1700-0300" and
+      "0200-1000" by an hour and leaves "0130-0230" with NO intraday occurrence
+      at all on the gap date.
+    - On the EVENING BEFORE the fall change, where nothing shifts at all,
+      TradingView appends an extra hour to the intraday close of every run with
+      an 02:00 endpoint, returning na from ``time()`` and a value from
+      ``time_close()`` on the very same bar (2025-11-01 06:00, and 14:00 for
+      "0200-1000").
+
+    The last one no single occurrence can reproduce and the other two contradict
+    the daily request, so the measured daily bounds win. The cost, of 28396 bars:
+    14 for "1700-0200", "1000-0200" and "2200-0200" each, 6 for "0200-1000", 4
+    for "0130-0230" and "1700-0300", and 0 for every session -- "1700-0100",
+    "1900-0400", "0100-0500" among them -- that keeps clear of the changing hour.
+
+    :param day: Opening date of the runs, in the session's timezone
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)`` pairs, ordered by opening time
+    """
+    from datetime import datetime, timedelta
+
+    if not session_infos:
+        return ()
+    tz = _parse_timezone(session_infos[0].timezone)
+    occurrences: list[tuple[int, int]] = []
     for session_info in session_infos:
-        # Check if the day is in the session days
-        if tv_weekday not in session_info.days:
-            continue
+        start_minutes = session_info.start_time.hour * 60 + session_info.start_time.minute
+        end_minutes = session_info.end_time.hour * 60 + session_info.end_time.minute
+        # An end at or before the start closes on the next date. Equal endpoints
+        # are Pine's all-day session ("0000-0000", the default of input.session),
+        # which spans the full 24 hours and closes on the next date too.
+        close_day = day + timedelta(days=1) if end_minutes <= start_minutes else day
+        start_ms = int(datetime.combine(day, session_info.start_time,
+                                        tzinfo=tz).timestamp() * 1000)
+        # The close is the end of the session's LAST MINUTE rather than the
+        # closing wall clock itself, which only differs when the change falls
+        # inside that minute: a session closing at 02:00 on a fall-back date
+        # runs to the FIRST 01:59, an hour before the unambiguous 02:00.
+        last_minute = datetime.combine(close_day, session_info.end_time,
+                                       tzinfo=tz) - timedelta(minutes=1)
+        end_ms = int(last_minute.timestamp() * 1000) + 60_000
+        # The day mask names the weekday the occurrence's LAST minute falls on,
+        # not its opening one. MEASURED (BINANCE:BTCUSDT@60): "1700-0200:23456"
+        # ran Sunday 17:00 -> Monday 02:00 up to Thursday 17:00 -> Friday 02:00,
+        # and "1700-1700:23456" ran Sunday 17:00 -> Monday 17:00 up to Thursday
+        # -> Friday, both leaving the Friday evening out. "0000-0000:23456" --
+        # whose close lands exactly on midnight -- still ran Monday through
+        # Friday, which the last minute gets right and the closing instant would
+        # not.
+        last_dt = datetime.fromtimestamp((end_ms - 60_000) / 1000, tz)
+        tv_weekday = (last_dt.weekday() + 2) % 7 or 7
+        if tv_weekday in session_info.days:
+            occurrences.append((start_ms, end_ms))
+    occurrences.sort()
+    return tuple(occurrences)
 
-        # A session whose start equals its end spans the full 24 hours -- this is
-        # Pine's "0000-0000" all-day session (the default of ``input.session``).
-        # The day of week is already validated above, so every bar on it qualifies.
-        if session_info.start_time == session_info.end_time:
-            return True
 
-        # Handle overnight sessions
-        if session_info.is_overnight:
-            # Session spans midnight (e.g., 22:00-06:00): on any given day it
-            # covers [start, 24:00) plus the previous session's [00:00, end).
-            # Same overlap contract as the same-day branch below -- the bar is in
-            # session when any part of it falls inside one of those two spans:
-            # it starts in the evening part, it starts in the early-morning part,
-            # or it starts before the start and runs into it (a bar ending past
-            # midnight always does, and its wrapped end time cannot be compared).
-            in_session = (bar_time >= session_info.start_time or
-                          bar_time < session_info.end_time or
-                          bar_ends_next_day or
-                          bar_end_time > session_info.start_time)
-        else:
-            # Normal session within same day
-            # Bar is in session if it overlaps with the session time range
-            # Bar overlaps if: bar_start < session_end AND bar_end > session_start
-            in_session = (bar_time < session_info.end_time and
-                          (bar_ends_next_day or bar_end_time > session_info.start_time))
+@_lru_cache(maxsize=256)
+def _session_occurrence(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]',
+                        chart_tf_seconds: int) -> tuple[int, int] | None:
+    """
+    Bounds of the single session occurrence a chart bar falls into.
 
-        if in_session:
-            return True
+    The bar belongs to the occurrence it overlaps, the same contract
+    :func:`_is_bar_in_session` answers yes/no to; the latest overlapping one
+    wins when ranges touch.
 
-    return False
+    :param bar_time_ms: Chart bar open in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :param chart_tf_seconds: Chart bar length in seconds
+    :return: ``(open_ms, close_ms)`` of the occurrence, or ``None`` when the bar
+             is outside every range
+    """
+    from datetime import datetime, timedelta
+
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    bar_dt = datetime.fromtimestamp(bar_time_ms / 1000, tz)
+    bar_end_ms = bar_time_ms + chart_tf_seconds * 1000
+
+    best: tuple[int, int] | None = None
+    # An overnight range that opened yesterday still covers this bar, so both
+    # dates have to be offered to the overlap test.
+    for day_offset in (-1, 0):
+        day = (bar_dt + timedelta(days=day_offset)).date()
+        for start_ms, end_ms in _session_occurrences_opening_on(day, session_infos):
+            if bar_time_ms < end_ms and bar_end_ms > start_ms:
+                if best is None or start_ms > best[0]:
+                    best = (start_ms, end_ms)
+    return best
+
+
+@_lru_cache(maxsize=256)
+def _previous_session_occurrence(before_ms: int,
+                                 session_infos: 'tuple[SessionInfo, ...]'
+                                 ) -> tuple[int, int] | None:
+    """
+    The latest session occurrence opening strictly before an instant.
+
+    Walking ``timeframe_bars_back`` over session bars leaves the current
+    occurrence, so the series has to be continued backwards one run at a time.
+
+    :param before_ms: Instant the occurrence has to open before, in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)``, or ``None`` when no day in the previous
+             two months runs the session
+    """
+    from datetime import datetime, timedelta
+
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    day = datetime.fromtimestamp(before_ms / 1000, tz).date()
+    for day_offset in range(60):
+        best: tuple[int, int] | None = None
+        for occurrence in _session_occurrences_opening_on(day - timedelta(days=day_offset),
+                                                          session_infos):
+            if occurrence[0] < before_ms and (best is None or occurrence[0] > best[0]):
+                best = occurrence
+        if best is not None:
+            return best
+    return None
+
+
+@_lru_cache(maxsize=64)
+def _session_period_anchor(period_date: date,
+                           session_infos: 'tuple[SessionInfo, ...]') -> int | None:
+    """
+    Opening time of the first session occurrence belonging to a calendar period.
+
+    Weekly and monthly session bars open at the period's first session open, so
+    a period whose first days are masked out (a Saturday-starting month against
+    a ``:23456`` session) walks forward to the first day the session runs on. An
+    occurrence belongs to the day its LAST MINUTE falls on -- the same rule the
+    day mask uses -- so an overnight session anchors the period on the EVENING
+    BEFORE its first session day, while one closing exactly at midnight still
+    anchors on the day itself. MEASURED (BINANCE:BTCUSDT@30, New York): the
+    weekly bar of "1700-0200:23456" opened Sunday 17:00, and its monthly bar
+    opened 2024-12-31 17:00 for January 2025 and 2025-02-02 17:00 for February;
+    "0000-0000:23456" opened Monday 00:00 weekly, 2025-01-01 00:00 for January
+    and 2025-02-03 00:00 for February -- the first two February days being a
+    masked-out weekend.
+
+    :param period_date: First calendar date of the period, in exchange time
+    :param session_infos: Session ranges of one session specification
+    :return: Opening time in milliseconds, or ``None`` when no day in the next
+             six weeks runs the session
+    """
+    from datetime import datetime, timedelta
+
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    # The opening date is not derivable from the period's first date by clock
+    # arithmetic -- a run closing at midnight ends on its own opening date, an
+    # overnight one on the next -- so the runs themselves are enumerated and the
+    # earliest one whose last minute lands inside the period wins. Only the day
+    # before the period can reach into it, no range being longer than a day.
+    for day_offset in range(-1, 42):
+        day = period_date + timedelta(days=day_offset)
+        best: int | None = None
+        for start_ms, end_ms in _session_occurrences_opening_on(day, session_infos):
+            last_dt = datetime.fromtimestamp((end_ms - 60_000) / 1000, tz)
+            if last_dt.date() < period_date:
+                continue
+            if best is None or start_ms < best:
+                best = start_ms
+        if best is not None:
+            return best
+    return None
+
+
+def _period_start_date(period_date: date, modifier: str, steps: int) -> date:
+    """
+    First calendar date of the period ``steps`` periods away from another one.
+
+    :param period_date: First calendar date of the reference period
+    :param modifier: Period modifier, ``'W'`` or ``'M'``
+    :param steps: Periods to move, negative walks back
+    :return: First calendar date of the requested period
+    """
+    from datetime import timedelta
+
+    if modifier == 'W':
+        return period_date + timedelta(days=7 * steps)
+    month_index = period_date.month - 1 + steps
+    return period_date.replace(year=period_date.year + month_index // 12,
+                               month=month_index % 12 + 1, day=1)
+
+
+def _session_bucket_count(occurrence: tuple[int, int], step_ms: int) -> int:
+    """
+    Number of intraday session bars an occurrence is tiled into.
+
+    :param occurrence: ``(open_ms, close_ms)`` of the occurrence
+    :param step_ms: Requested bar length in milliseconds
+    :return: Bucket count, at least one -- the last bucket may be cut short
+    """
+    return max(1, -(-(occurrence[1] - occurrence[0]) // step_ms))
+
+
+def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, ...]',
+                        modifier: str, multiplier: int,
+                        bar_start_ms: int, bar_close_ms: int,
+                        steps: int = 0) -> tuple[int, int] | None:
+    """
+    Open and close of the session bar ``time``/``time_close`` report.
+
+    MEASURED LAW (BINANCE:BTCUSDT@30, ``0300-1200``/``1700-0200``/``0930-1600``
+    New York and ``0900-1130``/``0930-1600`` exchange time): a session does not
+    merely filter the requested timeframe's grid, it replaces that grid with a
+    series of session bars.
+
+    - The na gate always tests the CURRENT CHART BAR, whatever the requested
+      timeframe is: ``"D"``, ``"60"`` and the chart's own period each left
+      exactly the same 10647 of 28391 bars defined.
+    - A daily request reports the session's own bounds -- 08:00 open and 17:00
+      close for that day's occurrence -- not the calendar day's.
+    - An intraday request tiles the occurrence: buckets are counted from the
+      session open, so an off-grid session shifts the whole series, and the
+      final bucket is truncated at the session close.
+    - Weekly and monthly requests are never na: their session bars run from the
+      period's first session open to the NEXT period's first session open
+      (weekly close landed on the following Monday's open, not on Friday's
+      close), so consecutive bars tile the whole timeline.
+
+    Multi-period daily/weekly/monthly requests ("3D", "2W") keep the plain grid:
+    their session anchoring is unmeasured.
+
+    :param chart_time_ms: Chart bar open the call is evaluated on, in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :param modifier: Requested timeframe modifier ('', 'S', 'D', 'W' or 'M')
+    :param multiplier: Requested timeframe multiplier
+    :param bar_start_ms: Plain grid bar open of the requested timeframe
+    :param bar_close_ms: Plain grid bar close of the requested timeframe
+    :param steps: Session bars to walk back, the positive ``timeframe_bars_back``
+    :return: ``(open_ms, close_ms)``, or ``None`` when the bar is out of session
+    """
+    from datetime import datetime
+
+    if modifier in ('W', 'M'):
+        if multiplier == 1:
+            exchange_tz = _parse_timezone(getattr(syminfo, 'timezone', None) or 'UTC')
+            # ``bar_start_ms`` has already walked ``steps`` periods back, so the
+            # period the CHART bar sits in is recovered before the walk below and
+            # the offset is re-applied to its result.
+            period_date = _period_start_date(
+                datetime.fromtimestamp(bar_start_ms / 1000, exchange_tz).date(),
+                modifier, steps)
+            # A session anchor can fall on either side of its calendar period's
+            # first date -- an overnight session opens the evening BEFORE its
+            # first session day -- so the period holding the chart bar is walked
+            # to instead of assumed.
+            for _ in range(4):
+                open_ms = _session_period_anchor(period_date, session_infos)
+                if open_ms is None:
+                    break
+                if chart_time_ms < open_ms:
+                    period_date = _period_start_date(period_date, modifier, -1)
+                    continue
+                next_ms = _session_period_anchor(_period_start_date(period_date, modifier, 1),
+                                                 session_infos)
+                if next_ms is not None and chart_time_ms >= next_ms:
+                    period_date = _period_start_date(period_date, modifier, 1)
+                    continue
+                break
+            period_date = _period_start_date(period_date, modifier, -steps)
+            open_ms = _session_period_anchor(period_date, session_infos)
+            close_ms = _session_period_anchor(_period_start_date(period_date, modifier, 1),
+                                              session_infos)
+            if open_ms is not None and close_ms is not None:
+                return open_ms, close_ms
+        return bar_start_ms, bar_close_ms
+
+    if modifier not in ('', 'S', 'D') or (modifier == 'D' and multiplier != 1):
+        return bar_start_ms, bar_close_ms
+
+    chart_period = str(syminfo.period)
+    try:
+        chart_tf_seconds = timeframe_module.in_seconds(chart_period)
+    except (ValueError, AssertionError):
+        chart_tf_seconds = 60
+    occurrence = _session_occurrence(chart_time_ms, session_infos, chart_tf_seconds)
+    if occurrence is None and steps <= 0:
+        return None
+
+    if modifier == 'D':
+        if occurrence is None:
+            # MEASURED: out of session a daily request is NOT na once an offset
+            # is given, it reports the occurrence the offset lands on counted
+            # from the one the chart bar is heading into -- which is one step
+            # further than the last one that ran.
+            occurrence = _previous_session_occurrence(chart_time_ms + 1, session_infos)
+            steps -= 1
+        while occurrence is not None and steps > 0:
+            occurrence = _previous_session_occurrence(occurrence[0], session_infos)
+            steps -= 1
+        return occurrence
+
+    # An intraday request tiles the occurrence itself instead of filtering the
+    # plain grid: the first bucket opens at the session open even when that is
+    # off the grid, and the last one is cut short at the session close. MEASURED
+    # (BINANCE:BTCUSDT@30, requested "60"): "0930-1600" ran 09:30-10:30,
+    # 10:30-11:30, ... and closed 15:30-16:00, while "0900-1130" closed its
+    # 11:00 bucket at 11:30, not at 12:00.
+    step_ms = (multiplier if modifier == 'S' else multiplier * 60) * 1000
+    in_session = occurrence is not None
+    if occurrence is not None:
+        # A bar straddling the open belongs to the session's first bucket.
+        index = max(0, (chart_time_ms - occurrence[0]) // step_ms) - steps
+    else:
+        # MEASURED (both "0930-1600" with seven buckets and "0900-1130" with
+        # three, requested "60", offsets 1..8): out of session the walk starts
+        # from the LAST bucket of the run that has already closed, and whichever
+        # run it lands in is reported by its OPENING bucket -- the within-run
+        # position of a bar that is not in the run does not carry over.
+        occurrence = _previous_session_occurrence(chart_time_ms + 1, session_infos)
+        if occurrence is None:
+            return None
+        index = _session_bucket_count(occurrence, step_ms) - 1 - steps
+    while index < 0:
+        previous = _previous_session_occurrence(occurrence[0], session_infos)
+        if previous is None:
+            index = 0
+            break
+        occurrence = previous
+        index += _session_bucket_count(occurrence, step_ms)
+    if not in_session:
+        index = 0
+    start_ms = occurrence[0] + index * step_ms
+    return start_ms, min(start_ms + step_ms, occurrence[1])
 
 
 def _intraday_session_args(timeframe: str) -> tuple:
@@ -1650,12 +1954,13 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         # Invalid session string
         return NA(int)
 
-    # Check if the bar is within the session
+    # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
-        if _is_bar_in_session(bar_time, session_infos, timeframe):
-            return bar_time
-        else:
+        bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
+                                     bar_time, bar_time, max(timeframe_bars_back, 0))
+        if bounds is None:
             return NA(int)
+        return bounds[0]
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
@@ -1950,12 +2255,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # Invalid session string
         return NA(int)
 
-    # Check if the bar is within the session (using bar start time for session validation)
+    # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
-        if _is_bar_in_session(bar_start_time, session_infos, timeframe):
-            return bar_close_time
-        else:
+        bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
+                                     bar_start_time, bar_close_time,
+                                     max(timeframe_bars_back, 0))
+        if bounds is None:
             return NA(int)
+        return bounds[1]
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
