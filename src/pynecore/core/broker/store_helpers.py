@@ -26,10 +26,14 @@ shape.
 See ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``
 section §4 for the rationale.
 """
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from time import time as epoch_time
 from typing import Any, TYPE_CHECKING
 
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
+
 if TYPE_CHECKING:
+    from pynecore.core.broker.models import PositionLeg
     from pynecore.core.broker.storage import OrderRow, RunContext
 
 __all__ = [
@@ -87,6 +91,7 @@ __all__ = [
     'mark_disposition_unknown',
     'mark_rejected',
     'find_pending_dispatch',
+    'adopt_untracked_position_legs',
     'create_close_target_row',
     'record_close_server_ref',
     'mark_closing',
@@ -845,6 +850,115 @@ def find_pending_dispatch(store: 'RunContext') -> Iterator['OrderRow']:
     for row in store.iter_live_orders():
         if row.state in PENDING_DISPATCH_STATES:
             yield row
+
+
+# === Startup position adoption =============================================
+
+def adopt_untracked_position_legs(
+        store: 'RunContext',
+        legs: 'Iterable[PositionLeg]',
+        *,
+        symbol: str,
+        ref_kind: str = 'deal_id',
+) -> int:
+    """Seed confirmed ``position`` rows for untracked live venue legs.
+
+    For venues that close positions by addressing a broker-native
+    position handle (Capital.com / IG-style ``DELETE
+    /positions/{dealId}``), ``execute_close`` / ``execute_exit`` derive
+    their targets from confirmed ``position`` rows. A fresh process (or
+    a run under a new ``run_id``) that finds existing venue exposure has
+    no such row — the engine's startup reconcile adopts the net size
+    into the in-memory position, but a subsequent
+    ``strategy.close_all()`` would find no confirmed row to route the
+    close through and strand the adopted exposure. Seeding one confirmed
+    row per untracked leg restores the normal close/exit paths.
+
+    Hedging accounts must NOT call this: there the core one-way emulator
+    closes per leg via ``close_leg`` reading ``fetch_raw_positions``
+    directly, and a seeded row would double-count against the emulator's
+    virtual FIFO.
+
+    ``legs`` must be symbol-scoped — the output of the plugin's
+    ``fetch_raw_positions(symbol)`` transport primitive or an equivalent
+    parse of an already-fetched snapshot, NEVER a raw account-wide
+    payload. The scoping is enforced structurally: a leg whose
+    ``symbol`` differs raises :class:`ValueError`, because adopting a
+    foreign instrument plants a row that same-``run_id`` adoption then
+    copies into every later restart (observed live on Capital.com when a
+    lane switched instruments over a weekend).
+
+    Idempotent: a leg already tracked by a live store row (matched on
+    ``exchange_order_id`` or a ``ref_kind`` ref — e.g. an entry row
+    adopted across a same-``run_id`` restart, or a row just promoted by
+    in-flight recovery), or owned by another run on the same account
+    (:meth:`~pynecore.core.broker.storage.RunContext.foreign_live_exchange_order_ids`),
+    is skipped, so no duplicate row is created. Rows are seeded
+    ``filled_qty == qty`` with ``kind=ENTRY_KIND_POSITION`` +
+    ``entry_filled_at`` so fill/activity classification treats the
+    eventual close leg as a reduction, and a ``ref_kind`` ref mirrors
+    the normal entry path so venue events can route back to the row. A
+    ``startup_position_adopted`` audit event is written per seeded row.
+
+    :param store: The active run context (``plugin.store_ctx``).
+    :param legs: Symbol-scoped candidate legs (untracked ones are seeded).
+    :param symbol: The single symbol this run trades.
+    :param ref_kind: Ref namespace for the broker-native leg id
+        (``'deal_id'`` for Capital.com-style venues).
+    :return: Number of legs actually adopted after dedup.
+    """
+    tracked_ids: set[str] = set()
+    for row in store.iter_live_orders():
+        if row.exchange_order_id:
+            tracked_ids.add(str(row.exchange_order_id))
+    foreign_ids = store.foreign_live_exchange_order_ids(symbol=symbol)
+
+    adopted_count = 0
+    for leg in legs:
+        if leg.symbol != symbol:
+            raise ValueError(
+                f"adopt_untracked_position_legs: leg {leg.leg_id!r} is on "
+                f"{leg.symbol!r} but this run trades {symbol!r} — pass only "
+                f"symbol-scoped legs (fetch_raw_positions output), never an "
+                f"account-wide snapshot"
+            )
+        if leg.qty <= 0.0 or leg.side not in ('buy', 'sell'):
+            continue
+        leg_id = str(leg.leg_id)
+        if not leg_id or leg_id in tracked_ids or leg_id in foreign_ids:
+            continue
+        if store.find_by_ref(ref_kind, leg_id) is not None:
+            continue
+        synthetic_coid = f"__pyne_adopted__{symbol}__{leg_id}"
+        store.upsert_order(
+            synthetic_coid,
+            symbol=symbol,
+            side=leg.side,
+            qty=leg.qty,
+            filled_qty=leg.qty,
+            state=STATE_CONFIRMED,
+            exchange_order_id=leg_id,
+            extras={
+                'kind': ENTRY_KIND_POSITION,
+                'entry_filled_at': epoch_time(),
+                ADOPTED_STARTUP_EXTRA_KEY: True,
+            },
+        )
+        store.add_ref(synthetic_coid, ref_kind, leg_id)
+        store.log_event(
+            'startup_position_adopted',
+            client_order_id=synthetic_coid,
+            exchange_order_id=leg_id,
+            payload={
+                'symbol': symbol,
+                'side': leg.side,
+                'qty': leg.qty,
+            },
+        )
+        tracked_ids.add(leg_id)
+        adopted_count += 1
+
+    return adopted_count
 
 
 # === Close lifecycle =======================================================

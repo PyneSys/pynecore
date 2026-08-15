@@ -25,7 +25,7 @@ _PYNE_HEAD_RE = re.compile(
     rb'^(?:\s*#[^\r\n]*(?:\r?\n|$))*\s*[rRbBuUfF]*("""|\'\'\'|"|\')\s*@pyne(?:\s|\1|$)')
 
 
-def _source_starts_with_pyne(head: bytes) -> bool:
+def source_starts_with_pyne(head: bytes) -> bool:
     """Return whether a source head is a Pyne module (docstring begins with ``@pyne``).
 
     :param head: First bytes of the source file.
@@ -197,7 +197,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # Only transformed modules carry the sentinel; leave everything else untouched.
         # ``get_code`` is typed Optional, but a real source file always yields a code
         # object — the ``None`` guard just narrows the type for the checks below.
-        if code is None or not _source_starts_with_pyne(head):
+        if code is None or not source_starts_with_pyne(head):
             return code
 
         pipeline_hash = _get_transform_pipeline_hash()

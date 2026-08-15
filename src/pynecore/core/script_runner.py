@@ -122,20 +122,20 @@ def import_script(script_path: Path) -> ModuleType:
     # import hook lets a valid foreign ``.pyc`` bypass every AST transform.
     # Import the hook at the actual script-import boundary as the definitive
     # installation point; the module import is idempotent in normal installs.
-    from . import import_hook as _import_hook  # noqa: F401
+    from . import import_hook as _import_hook
     from importlib import import_module
-    import re
 
     # Check for @pyne magic doc comment before importing (prevents import errors)
-    # Without this user may get strange errors which are very hard to debug
+    # Without this user may get strange errors which are very hard to debug.
+    # The import hook's head detector is the single source of truth here: it
+    # matches a docstring that BEGINS with ``@pyne`` without needing the
+    # closing quotes in the window, so a module docstring longer than the
+    # read-ahead cannot fail the check (a 1KB closed-docstring regex once
+    # rejected valid scripts whose docstring closed past the window).
     try:
-        with open(script_path, 'r') as f:
-            # Read only the first few lines to check for docstring
-            content = f.read(1024)  # Read first 1KB, should be enough for docstring check
-
-        # Check if file starts with a docstring containing @pyne
-        if not re.search(r'^(""".*?@pyne.*?"""|\'\'\'.*?@pyne.*?\'\'\')',
-                         content, re.DOTALL | re.MULTILINE):
+        with open(script_path, 'rb') as f:
+            head = f.read(4096)
+        if not _import_hook.source_starts_with_pyne(head):
             raise ImportError(
                 f"Script '{script_path}' must have a magic doc comment containing "
                 f"'@pyne' at the beginning of the file!"
