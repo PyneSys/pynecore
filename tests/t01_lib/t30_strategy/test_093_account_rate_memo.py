@@ -152,16 +152,22 @@ def __test_the_memo_key_is_the_script_and_the_bar__(script_path, module_key):
 
     strat = sys.modules['pynecore.lib.strategy']
     saved = (lib._script, lib.bar_index, lib.barstate.isrealtime)
-    # With no script the account is the symbol's own currency, so a resample returns the
-    # bare point value and is unmistakable next to the planted memo
+
+    class _ConvertingScript:
+        """An account currency the chart symbol does not share, so the memo is live."""
+        currency = 'USD'  # the chart symbol is quoted in USDT
+
+    converting = _ConvertingScript()
+    # Outside a run there is no rate source, so a resample degrades to the bare point
+    # value — unmistakable next to the planted memo
     unconverted = lib.syminfo.pointvalue
     planted = unconverted + 122.0
     try:
-        lib._script = None
+        lib._script = converting
         lib.bar_index = 7
         lib.barstate.isrealtime = False
 
-        strat._conv_script = None
+        strat._conv_script = converting
         strat._conv_bar = 7
         strat._conv_pv = planted
         assert strat._account_point_value() == planted, "same script, same bar: memo hit"
@@ -174,11 +180,59 @@ def __test_the_memo_key_is_the_script_and_the_bar__(script_path, module_key):
         strat._conv_script = object()
         assert strat._account_point_value() == unconverted, "other script: resampled"
 
-        strat._conv_script = None
+        strat._conv_script = converting
         strat._conv_bar = 8
         strat._conv_pv = planted
         lib.barstate.isrealtime = True
         assert strat._account_point_value() == unconverted, "realtime bar: resampled"
+    finally:
+        lib._script, lib.bar_index, lib.barstate.isrealtime = saved
+        strat._reset_currency_state()
+
+
+# noinspection PyShadowingNames
+def __test_a_non_converting_run_never_consults_the_memo__(script_path, module_key):
+    """An account currency equal to the symbol's own skips the memo on every bar."""
+    import sys
+    from pynecore import lib
+
+    strat = sys.modules['pynecore.lib.strategy']
+    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime)
+
+    class _PlainScript:
+        currency = 'NONE'  # what an undeclared strategy(currency=...) carries
+
+    class _SameCurrencyScript:
+        currency = 'USDT'  # spelled out, but still the chart symbol's own
+
+    unconverted = lib.syminfo.pointvalue
+    planted = unconverted + 122.0
+    try:
+        for script_obj in (_PlainScript(), _SameCurrencyScript(), None):
+            strat._reset_currency_state()
+            lib._script = script_obj
+            lib.bar_index = 7
+            lib.barstate.isrealtime = False
+
+            # First read latches the run as non-converting
+            assert strat._account_point_value() == unconverted, f"{script_obj}: bare pv"
+            assert strat._conv_identity_script is script_obj, f"{script_obj}: latched"
+
+            # A stale memo planted afterwards must never be handed out, on any bar and
+            # in any bar state — there is no rate, so the point value cannot move
+            strat._conv_script = script_obj
+            strat._conv_bar = 7
+            strat._conv_pv = planted
+            assert strat._account_point_value() == unconverted, f"{script_obj}: memo skipped"
+
+            lib.bar_index = 8
+            assert strat._account_point_value() == unconverted, f"{script_obj}: new bar"
+
+            lib.barstate.isrealtime = True
+            assert strat._account_point_value() == unconverted, f"{script_obj}: realtime"
+
+            # The rate the Pine builtins report stays the identity
+            assert strat._account_rate() == 1.0, f"{script_obj}: rate is 1.0"
     finally:
         lib._script, lib.bar_index, lib.barstate.isrealtime = saved
         strat._reset_currency_state()

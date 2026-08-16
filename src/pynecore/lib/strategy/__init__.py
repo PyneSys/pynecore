@@ -4286,17 +4286,25 @@ _conv_rate: float = 1.0
 _conv_safe: float = 1.0
 _conv_pv: float = 0.0
 _conv_warned: bool = False
+# The script whose account currency was found to be the symbol's own. Whether a run
+# converts at all is fixed by the script and the symbol, never by the bar, so the
+# first sample latches it here and every later point value is one identity test away
+# from ``syminfo.pointvalue`` — no bar memo, no resample. Holding the script object
+# rather than a flag keeps the multi-script guard below in the same single test.
+_conv_identity_script: '_core_script.Script | None' = None
 
 
 def _reset_currency_state() -> None:
     """Drop the per-bar account-rate memo between script runs."""
     global _conv_script, _conv_bar, _conv_rate, _conv_safe, _conv_pv, _conv_warned
+    global _conv_identity_script
     _conv_script = None
     _conv_bar = -1
     _conv_rate = 1.0
     _conv_safe = 1.0
     _conv_pv = 0.0
     _conv_warned = False
+    _conv_identity_script = None
 
 
 # noinspection PyProtectedMember
@@ -4307,14 +4315,21 @@ def _sample_account_currency() -> float:
     :return: The point value scaled into the account currency
     """
     global _conv_script, _conv_bar, _conv_rate, _conv_safe, _conv_pv, _conv_warned
+    global _conv_identity_script
 
     script = lib._script
     symbol_cur = syminfo.currency
-    # With no script the account is the symbol's own currency, so nothing converts.
-    account = symbol_cur if script is None else script.currency
+    # With no script the account is the symbol's own currency, so nothing converts --
+    # and so does an undeclared ``strategy(currency=...)``, which Pine spells NONE.
+    # Folding both into the symbol's own currency here leaves ONE comparison to decide
+    # whether this run converts at all.
+    account = (symbol_cur if script is None or script.currency == 'NONE'
+               else script.currency)
     rate = 1.0
-    if account != 'NONE' and account != symbol_cur:
+    if account != symbol_cur:
         rate = request.currency_rate(symbol_cur, account)
+    else:
+        _conv_identity_script = script
 
     # A zero or negative rate can only come from a damaged feed, and a sign flip would
     # invert the whole ledger, so it degrades the same way na does.
@@ -4343,6 +4358,11 @@ def _account_point_value() -> float:
 
     :return: ``syminfo.pointvalue`` scaled by the symbol-to-account rate
     """
+    # A run whose account currency IS the symbol's own has no rate to sample on any
+    # bar, so it skips the memo and the resample entirely. The test doubles as the
+    # multi-script guard below: the latch holds the script it was decided for.
+    if _conv_identity_script is lib._script:
+        return syminfo.pointvalue
     # The script identity is part of the key, not just the bar: PyneAPI runs several
     # scripts in one process and re-applies syminfo every bar, so a bar_index-only memo
     # could hand one script the rate sampled for another. A realtime bar skips the memo
