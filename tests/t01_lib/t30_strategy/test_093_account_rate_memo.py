@@ -236,3 +236,50 @@ def __test_a_non_converting_run_never_consults_the_memo__(script_path, module_ke
     finally:
         lib._script, lib.bar_index, lib.barstate.isrealtime = saved
         strat._reset_currency_state()
+
+
+# noinspection PyShadowingNames
+def __test_percent_commission_ignores_another_scripts_rate__(script_path, module_key):
+    """A latched run books its percent commission unconverted, whoever sampled last."""
+    import sys
+    from decimal import Decimal
+    from pynecore import lib
+    from pynecore.lib import request
+
+    # The identity latch returns the point value without refreshing the rate globals, so
+    # in a process running several scripts the module-level rate can still belong to a
+    # converting one. A non-converting run's commission must not pick it up.
+    strat = sys.modules['pynecore.lib.strategy']
+    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime)
+    saved_rate = request.currency_rate
+
+    class _PlainScript:
+        currency = 'NONE'
+
+    class _ConvertingScript:
+        currency = 'USD'  # the chart symbol is quoted in USDT
+
+    plain, converting = _PlainScript(), _ConvertingScript()
+    try:
+        request.currency_rate = lambda from_cur, to_cur: 0.85
+        strat._reset_currency_state()
+        lib.bar_index = 5
+        lib.barstate.isrealtime = False
+
+        lib._script = plain
+        strat._account_point_value()  # latches the plain run as non-converting
+        lib._script = converting
+        strat._account_point_value()  # leaves 0.85 in the shared rate globals
+        assert strat._conv_safe == 0.85, "the converting script did sample"
+
+        lib._script = plain
+        strat._account_point_value()  # latch hit: the globals stay the other script's
+        booked = strat._book_commission([Decimal(0), 0.0, [], 0.0], 1.0, 100.0, 1.0, True)
+
+        # 1% of an unconverted price of 100.0. At the other script's 0.85 the base would
+        # be 85.0 and an extra cash rounding would apply, so the two cannot collide.
+        assert booked == 1.0, f"expected 1.0 unconverted, got {booked}"
+    finally:
+        request.currency_rate = saved_rate
+        lib._script, lib.bar_index, lib.barstate.isrealtime = saved
+        strat._reset_currency_state()

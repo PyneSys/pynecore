@@ -1787,6 +1787,8 @@ class SimPosition(PositionBase):
 
         :return: True when at least one exit gained a price level it did not have
         """
+        if not self.exit_orders:
+            return False
         resolved = False
         for order in self.exit_orders.values():
             entry_price = self._entry_fill_price(order.order_id)
@@ -2386,7 +2388,10 @@ class SimPosition(PositionBase):
 
         quantity = abs(self.size)
         # Convert price * quantity to account-currency for margin/equity comparisons.
-        pv = _account_point_value()
+        # Identity latch of ``_account_point_value`` inlined: this runs up to four
+        # times a bar on an open position, and a non-converting run is the norm.
+        pv = (syminfo.pointvalue if _conv_identity_script is lib._script
+              else _account_point_value())
 
         money_spent = quantity * self.avg_price * pv
         mvs = quantity * check_price * pv
@@ -2946,7 +2951,7 @@ class SimPosition(PositionBase):
         script = lib._script
 
         # Skip market exit order processing if there's no open position (TradingView behavior)
-        if not self.open_trades:
+        if not self.open_trades and self.exit_orders:
             # Remove orphan exit orders when position is flat. An exit is orphan
             # when its ``order_id`` (the ``from_entry`` it was bound to) no longer
             # has a pending entry — the entry was cancelled, margin-rejected, or
@@ -2967,7 +2972,10 @@ class SimPosition(PositionBase):
         # The leg that the gap triggered decides how the fill is priced below, so
         # it is carried over to the market loop instead of being re-derived there.
         gap_triggers: dict[_MarketOrderKey, Literal['stop', 'limit']] = {}
-        for order in self.orderbook.iter_orders():
+        # An empty book yields nothing, so the generator is skipped rather than
+        # created and immediately exhausted — every bar of an open position with
+        # no resting order passes here.
+        for order in (self.orderbook.iter_orders() if self.orderbook.price_levels else ()):
             # Check if the order would be filled immediately (e.g. due to a gap)
             gap_trigger = self._check_already_filled(order)
             if gap_trigger is not None:
@@ -3018,8 +3026,9 @@ class SimPosition(PositionBase):
         # so it keeps the normal net-margin reversal.
         same_bar_entry_sign = 0.0
 
-        # Process Market orders
-        for order in list(self.market_orders.values()):
+        # Process Market orders. The snapshot exists because fills mutate the dict;
+        # an empty one has nothing to mutate, so it is not copied at all.
+        for order in (list(self.market_orders.values()) if self.market_orders else ()):
             if order.cancelled:
                 continue
             if order.order_type == _order_type_entry:
@@ -3142,7 +3151,7 @@ class SimPosition(PositionBase):
         # Adapt orphaned exits from rejected entries to new position (TradingView behavior)
         # When strategy.exit() is called without from_entry, TV keeps the exit even after
         # its entry is rejected by margin. The exit adapts to close any new position that opens.
-        if self.open_trades:
+        if self.open_trades and self.exit_orders:
             for order in list(self.exit_orders.values()):
                 if order.is_market_order:
                     continue
@@ -3212,7 +3221,7 @@ class SimPosition(PositionBase):
                     break
 
         # Fill gap-through exits whose entries just filled
-        for order in list(self.exit_orders.values()):
+        for order in (list(self.exit_orders.values()) if self.exit_orders else ()):
             if order.is_market_order:
                 continue
             if order.order_id not in self._entry_open_ledger:
@@ -3284,7 +3293,7 @@ class SimPosition(PositionBase):
         # explicit one is in the book but inactive. An entry filling intrabar
         # activates them mid-walk instead (see ``_activate_trails_on_fill``).
         trail_awaiting: set[Order] = set()
-        for order in self.exit_orders.values():
+        for order in (self.exit_orders.values() if self.exit_orders else ()):
             if ((order.trail_price is not None or order.trail_points_ticks is not None)
                     and not order.cancelled and self._exit_awaits_entry(order)):
                 trail_awaiting.add(order)
@@ -3399,8 +3408,10 @@ class SimPosition(PositionBase):
         if self.open_trades:
             # Account-currency value of a 1.0-point move on 1 contract. Re-read every bar,
             # so an open position's unrealized P&L and its run-up/draw-down extremes are
-            # marked at the rate of the bar they occur on.
-            pv = _account_point_value()
+            # marked at the rate of the bar they occur on. Identity latch inlined as in
+            # ``_check_margin_call`` — every bar with an open position lands here.
+            pv = (syminfo.pointvalue if _conv_identity_script is lib._script
+                  else _account_point_value())
 
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
@@ -3906,7 +3917,12 @@ def _book_commission(booking: list, qty: float, price: float,
         # conversion breaks the other way (4 orders in the probe corpus).
         # Without conversion the raw double rate is the measured law, so the
         # extra rounding is skipped.
-        fx = _conv_safe  # fresh: the caller sampled pv on this bar
+        # The caller sampled pv on this bar, but a non-converting run takes the
+        # identity latch in _account_point_value and never refreshes _conv_safe --
+        # in a process running several scripts that global can still hold the rate
+        # another, converting script sampled. The latch itself is the authority:
+        # when it holds this script, this run does not convert and fx IS 1.0.
+        fx = 1.0 if _conv_identity_script is lib._script else _conv_safe
         base = price * fx if fx != 1.0 else price
         rate = float(Decimal(repr(base)) * Decimal(repr(commission_value)) * _DEC_CENT)
         pointvalue = syminfo.pointvalue

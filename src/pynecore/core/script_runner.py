@@ -1155,10 +1155,6 @@ class ScriptRunner:
             position.process_deferred_margin_call()
 
     @property
-    def _broker_mode(self) -> bool:
-        return self._order_sync_engine is not None
-
-    @property
     def plot_meta(self) -> dict:
         """The registered plot-family metadata for the current/last run.
 
@@ -1298,6 +1294,14 @@ class ScriptRunner:
         # Position shortcut — ``SimPosition`` in backtest, ``BrokerPosition``
         # in broker mode, ``None`` for indicators
         position = self.script.position
+
+        # Run invariants, hoisted out of the per-bar sites below. The sync engine
+        # is fixed in ``__init__`` and never reassigned, so a bar re-deriving it
+        # only pays for the property call. ``sim_position`` is the same object as
+        # ``position`` — the cast is what the simulator-only call sites need, and
+        # it costs nothing once.
+        broker_mode: bool = self._order_sync_engine is not None
+        sim_position = cast('SimPosition', position)
 
         # --- Security contexts setup ---
         # Imported library modules can call request.security() too: merge their
@@ -1934,7 +1938,7 @@ class ScriptRunner:
                     # clears it (it is the session-wide closed-trade log), so slice
                     # off only the tail appended since the last write to avoid
                     # re-emitting every prior trade on each subsequent bar.
-                    if self._broker_mode:
+                    if broker_mode:
                         new_trades = position.new_closed_trades[broker_trades_closed_written:]
                         broker_trades_closed_written = len(position.new_closed_trades)
                     else:
@@ -1972,10 +1976,10 @@ class ScriptRunner:
                 # ``var_snapshot`` also exists for a live every-tick script that
                 # has calc_on_order_fills off, so the flag — not the snapshot —
                 # decides whether a fill re-runs the body.
-                if self._broker_mode or not coof_active:
+                if broker_mode or not coof_active:
                     self._process_orders(position)
                     return
-                sim = cast('SimPosition', position)
+                sim = sim_position
                 old_fills = sim._fill_counter
                 sim._coof_cursor = -1
                 sim.process_orders()
@@ -2026,13 +2030,13 @@ class ScriptRunner:
             # noinspection PyProtectedMember
             def _coof_magnified_loop(sub_bars_list, aggregated_candle):
                 """COOF re-execution loop with magnified order processing."""
-                if self._broker_mode:
+                if broker_mode:
                     self._process_orders(position)
                     return
                 if not coof_active:  # see _coof_loop
                     self._process_orders_magnified(position, sub_bars_list, aggregated_candle)
                     return
-                sim = cast('SimPosition', position)
+                sim = sim_position
                 old_fills = sim._fill_counter
                 sim.process_orders_magnified(sub_bars_list, aggregated_candle)
                 new_fills = sim._fill_counter
@@ -2152,19 +2156,19 @@ class ScriptRunner:
                 # Fill strategy.close(_all)(immediately=true) orders enqueued during
                 # the body, at this bar's close — after the body so position series
                 # stayed constant for the rest of the bar. Simulator-only.
-                if (is_strat and position and not self._broker_mode
+                if (is_strat and position and not broker_mode
                         and not lib._strategy_suppressed):
-                    cast('SimPosition', position).settle_immediate_closes()
+                    sim_position.settle_immediate_closes()
 
                 # Pine `process_orders_on_close=true` — extra fill attempt at the bar
                 # close for current-bar orders, before the next bar's open arrives.
                 # No COOF re-run here: Pine disables `calc_on_order_fills` when this
                 # flag is set (var_snapshot is None whenever both are true).
                 # Simulator-only; in broker mode the exchange owns fill timing.
-                if (is_strat and position and not self._broker_mode
+                if (is_strat and position and not broker_mode
                         and not lib._strategy_suppressed
                         and self.script.process_orders_on_close):
-                    cast('SimPosition', position).process_orders_at_close()
+                    sim_position.process_orders_at_close()
 
                 # Process deferred margin calls
                 if is_strat and position and not lib._strategy_suppressed:
@@ -2220,7 +2224,7 @@ class ScriptRunner:
                     for _sec_state in sec_states.values():
                         _sec_state.is_live = True
 
-                if self._broker_mode:
+                if broker_mode:
                     # ``bar_index`` and ``lib._time`` are still pointing at
                     # the last warmup bar (e.g. 499) — this log line marks
                     # the transition AT that boundary; the next live bar
@@ -2370,7 +2374,7 @@ class ScriptRunner:
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
                             # become visible to this script run via record_fill.
-                            if is_strat and position and self._broker_mode \
+                            if is_strat and position and broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                             _run_libs_and_main()
@@ -2386,7 +2390,7 @@ class ScriptRunner:
                             _drop_discarded_run(drawing_snapshot)
                             if child_snapshot:
                                 child_snapshot.restore()
-                            if is_strat and position and self._broker_mode \
+                            if is_strat and position and broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                             _run_libs_and_main()
@@ -2448,7 +2452,7 @@ class ScriptRunner:
                                     candle.volume,
                                 )
 
-                        if self._broker_mode:
+                        if broker_mode:
                             # Broker mode: run the script FIRST (this bar's
                             # close queues new orders) and THEN sync the
                             # exchange so dispatch happens *on the same bar*.
@@ -2604,7 +2608,7 @@ class ScriptRunner:
                 # shutdown). ``_write_bar_output`` runs only on closed bars, so
                 # without this the closing rows of such a trade would be lost even
                 # though the strategy statistics already count it as closed.
-                if self.trades_writer and self._broker_mode:
+                if self.trades_writer and broker_mode:
                     pending_closed = position.new_closed_trades[broker_trades_closed_written:]
                     broker_trades_closed_written = len(position.new_closed_trades)
                     for t in pending_closed:
