@@ -119,7 +119,7 @@ from pynecore.core.broker.software_entry_stop_engine import (
     EntryStopWatch,
     SoftwareEntryStopEngine,
 )
-from pynecore.core.broker.one_way_emulator import OneWayEmulator
+from pynecore.core.broker.one_way_emulator import CloseFanResult, OneWayEmulator
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
     PendingRecord,
@@ -151,7 +151,11 @@ from pynecore.core.broker.store_helpers import (
     iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
-from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID, ADOPTED_STARTUP_EXTRA_KEY
+from pynecore.types.strategy import (
+    ADOPTED_STARTUP_ENTRY_ID,
+    ADOPTED_STARTUP_EXTRA_KEY,
+    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition
@@ -455,6 +459,94 @@ class _BoundedIdSet:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+def _is_composed_leg_coid(event_coid: str, parent_coid: str | None) -> bool:
+    """``True`` if ``event_coid`` is a per-leg child of ``parent_coid``.
+
+    ``parent_coid`` is ``None`` for a marker whose dispatch never
+    surfaced a canonical id — nothing can be a child of it.
+
+    The one-way emulator fans a single close across the hedge legs under
+    composed ids (``{parent_coid}:{leg_id}``, see
+    :meth:`OneWayEmulator.run_close`), and a plugin whose wire charset
+    forbids the colon maps it deterministically to an underscore (Bybit
+    ``wire_link_id``). The leg FILL therefore arrives under the parent
+    coid plus a ``:``/``_`` separator and never equals the parent coid
+    exactly — without this suffix match a must-settle marker starves and
+    the stale-pending grace halts a run whose close DID fill (measured on
+    the Bybit demo lane, 2026-08-16). Canonical dispatch ids never contain
+    ``:`` or ``_``, so a composed id cannot alias another dispatch.
+    """
+    if parent_coid is None:
+        return False
+    return (len(event_coid) > len(parent_coid)
+            and event_coid.startswith(parent_coid)
+            and event_coid[len(parent_coid)] in (':', '_'))
+
+
+@dataclasses.dataclass(slots=True)
+class _FlipFoldGuard:
+    """Fill ledger for one MARKET stop-and-reverse fold dispatch.
+
+    The fold sizes the reversing entry as ``qty + |opposite position|`` at
+    dispatch time, assuming the whole opposite exposure is still there for
+    the venue to net against. That assumption can break in flight: the
+    opposite position's own protective legs (native SL/TP/trailing) stay
+    armed at the venue until the flip settles, and one of them can fill
+    concurrently with the folded entry. Both executions then land — the
+    bracket closes the old position AND the folded quantity opens in full —
+    leaving the book over-exposed on the new side by exactly the amount the
+    bracket closed (measured on the Capital.com demo lane, 2026-08-15: SL
+    fill + folded SELL on the same bar → venue −0.02 where Pine holds
+    −0.01, and the next whole-row exit crashed the run).
+
+    The guard records what the fold consumed (``consumed_qty`` /
+    ``consumed_entry_ids`` — the open trades snapshot at dispatch) and
+    accumulates two independent fill streams: the folded entry's own fills
+    and any OTHER order's fills that close the consumed trades. Whenever
+    both streams together exceed what the venue could net, the engine
+    dispatches a targeted partial defensive close for the overshoot (see
+    :meth:`OrderSyncEngine._maybe_correct_flip_fold_surplus`).
+
+    In-memory only: a restart between the fold dispatch and its fills loses
+    the guard, in which case the startup adoption clamp and the cycle-end
+    reconciliation surface the residual divergence instead of this
+    corrective path.
+    """
+
+    entry_intent_key: str
+    entry_side: str
+    folded_qty: float
+    consumed_qty: float
+    consumed_entry_ids: frozenset[str]
+    entry_filled_qty: float = 0.0
+    external_closed_qty: float = 0.0
+    corrected_qty: float = 0.0
+    correction_seq: int = 0
+
+
+@dataclasses.dataclass(slots=True)
+class _PendingFlipSurplusClose:
+    """Must-settle record of one in-flight flip-fold surplus correction.
+
+    The correction's overshoot is booked into
+    :attr:`_FlipFoldGuard.corrected_qty` at dispatch time, so nothing
+    re-dispatches it: the close MUST be proven settled or the run halts
+    for manual intervention.
+
+    ``expected_qty`` is the quantity the correction was dispatched for and
+    ``filled_qty`` accumulates every usable fill slice matched to it. The
+    marker is only retired once the two meet, because a terminal ``filled``
+    event alone proves neither that the event carried a usable quantity
+    (``BrokerPosition.record_fill`` ignores zero/absent qty or price) nor
+    that a one-way-emulated fan-out (``{parent_coid}:{leg_id}`` children)
+    settled every leg — a sibling leg can still be rejected afterwards.
+    """
+
+    client_order_id: str
+    expected_qty: float
+    filled_qty: float = 0.0
 
 
 class _PartialBracketModifyDeferred(Exception):
@@ -769,6 +861,34 @@ class OrderSyncEngine:
         # retired when the order is amended (:meth:`_dispatch_modify`) or when
         # its envelope dies (:meth:`_drop_envelope`).
         self._flip_folded_entry_dispatches: dict[str, EntryIntent] = {}
+        # Per-fold fill ledgers guarding the netting fold's "the opposite
+        # position is still there to net against" assumption. Armed at the
+        # fold dispatch, consumed by :meth:`_track_flip_fold_fill`; the
+        # entry for a key is replaced when a fresh fold cycle dispatches
+        # under the same key. See :class:`_FlipFoldGuard`.
+        self._flip_fold_guards: dict[str, _FlipFoldGuard] = {}
+        # Fold state of a superseded dispatch whose amend parked with an
+        # unknown disposition: ``intent_key`` -> (folded dispatch, guard).
+        # The park retires the fold state eagerly (an applied amend carries
+        # the RAW quantity, so a folded-size guard could only mis-attribute
+        # the replacement's fills), but a ``'rejected'`` resolution proves
+        # the amend never landed and the ORIGINAL folded order is still
+        # live — :meth:`_process_plugin_resolutions` re-arms the stashed
+        # state there. Dropped on an ``'attached'`` resolution and with the
+        # envelope (:meth:`_drop_envelope`).
+        self._modify_parked_fold_state: \
+            dict[str, tuple[EntryIntent | None, _FlipFoldGuard | None]] = {}
+        # In-flight flip-fold surplus corrections: close ``intent_key`` ->
+        # :class:`_PendingFlipSurplusClose`. Armed right before the
+        # corrective close is dispatched
+        # (:meth:`_maybe_correct_flip_fold_surplus`), fed by
+        # :meth:`_track_flip_surplus_close_fill` and read by
+        # :meth:`_halt_if_flip_surplus_close_terminal` /
+        # :meth:`_escalate_rejected_flip_surplus_close` so a cancelled,
+        # rejected or provably-absent correction halts instead of silently
+        # leaving the surplus exposure open (the guard's ``corrected_qty``
+        # already booked it, so nothing would retry).
+        self._pending_flip_surplus_closes: dict[str, _PendingFlipSurplusClose] = {}
         # Intents the engine decided to cancel but whose cancel did NOT
         # provably complete. Two feeders: the fill-time short-gate reconcile
         # (:meth:`_reconcile_short_gate_after_fill`) parks on a dropped link
@@ -2528,6 +2648,142 @@ class OrderSyncEngine:
         self._record_halt(halt)
         raise halt
 
+    def _match_pending_flip_surplus_close(
+            self, event: OrderEvent,
+    ) -> str | None:
+        """Resolve ``event`` to an in-flight flip-fold surplus close key.
+
+        Same identity ladder as
+        :meth:`_match_pending_defensive_close`, minus the broker order
+        ref (the correction is dispatched on a synthetic key whose only
+        stable identity is its ``pine_id`` / ``client_order_id``):
+
+        - ``event.pine_id`` against the close ``intent_key`` — the WS path;
+        - ``event.order.client_order_id`` against the dispatch's canonical
+          COID, including the one-way emulator's composed per-leg ids
+          (``{parent_coid}:{leg_id}``, ``_`` on charset-restricted wires).
+        """
+        if not self._pending_flip_surplus_closes:
+            return None
+        pine_id = event.pine_id
+        if pine_id is not None and pine_id in self._pending_flip_surplus_closes:
+            return pine_id
+        order = event.order
+        if order is None:
+            return None
+        event_coid = order.client_order_id
+        if event_coid is None:
+            return None
+        for close_key, pending in self._pending_flip_surplus_closes.items():
+            close_coid = pending.client_order_id
+            if close_coid == event_coid:
+                return close_key
+            if _is_composed_leg_coid(event_coid, close_coid):
+                return close_key
+        return None
+
+    def _track_flip_surplus_close_fill(self, event: OrderEvent) -> None:
+        """Accumulate a fill slice onto a flip-fold surplus close marker.
+
+        The marker is a must-settle record, so it is retired only once the
+        dispatched correction quantity is *provably* filled — never on the
+        bare arrival of a terminal ``filled`` event:
+
+        - a status-only terminal (no ``fill_qty`` / ``fill_price``) applies
+          nothing in :meth:`BrokerPosition.record_fill`, so the surplus is
+          still on the book;
+        - the one-way emulator can fan one close across several
+          ``{parent_coid}:{leg_id}`` children, each with its own terminal
+          event — the first child settling proves nothing about its
+          siblings, one of which may still be rejected.
+
+        Runs from :meth:`_route_event` after the ``_seen_fill_ids`` dedup
+        gate, so a replayed fill cannot double-credit the marker.
+        """
+        close_key = self._match_pending_flip_surplus_close(event)
+        if close_key is None:
+            return
+        pending = self._pending_flip_surplus_closes[close_key]
+        fill_qty = event.fill_qty or 0.0
+        fill_price = event.fill_price or 0.0
+        # Credit only what :meth:`BrokerPosition.record_fill` actually
+        # applies: it drops a slice with a non-positive qty OR price without
+        # touching ``position.size``, so crediting it here would retire the
+        # must-settle marker over a correction the book never saw.
+        if fill_qty > 0.0 and fill_price > 0.0:
+            pending.filled_qty = round(pending.filled_qty + fill_qty, 12)
+        if pending.filled_qty + 1e-9 >= pending.expected_qty:
+            # The whole correction is confirmed gone from the book: a later
+            # cancel / reject echo for the same order must not halt the run.
+            del self._pending_flip_surplus_closes[close_key]
+
+    def _halt_if_flip_surplus_close_terminal(
+            self, event: OrderEvent, *, terminal: str,
+    ) -> bool:
+        """Halt when a flip-fold surplus correction ends without filling.
+
+        Mirrors :meth:`_halt_if_defensive_close_terminal` for the
+        stop-and-reverse surplus close dispatched by
+        :meth:`_maybe_correct_flip_fold_surplus`. The overshoot is booked
+        into the guard's ``corrected_qty`` at dispatch time, so a
+        cancelled / rejected correction is terminal for the automated
+        path: the book keeps surplus exposure Pine does not know about
+        and nothing would re-dispatch. Returns ``False`` (and lets the
+        caller's generic handling continue) when the event belongs to
+        some other order.
+        """
+        close_key = self._match_pending_flip_surplus_close(event)
+        if close_key is None:
+            return False
+        order = event.order
+        order_id = order.id if order is not None else None
+        self._pending_flip_surplus_closes.pop(close_key, None)
+        halt = BrokerManualInterventionError(
+            f"Flip-fold surplus close {close_key} was {terminal} by the "
+            f"broker (order_id={order_id}): the book still holds the "
+            f"surplus exposure the stop-and-reverse fold over-opened and "
+            f"no correcting order is live — manual intervention required",
+            intent_key=close_key,
+            context={
+                'terminal_event': terminal,
+                'order_id': order_id,
+                'symbol': self._symbol,
+            },
+        )
+        self._record_halt(halt)
+        raise halt
+
+    def _escalate_rejected_flip_surplus_close(
+            self, intent_key: str, *, was_armed: bool = False,
+    ) -> None:
+        """Halt when the plugin rejects a parked flip-fold surplus close.
+
+        Counterpart of
+        :meth:`_escalate_rejected_defensive_close_resolution` for the
+        surplus correction: a ``rejected`` plugin resolution proves the
+        correcting order never reached the exchange, so the surplus
+        exposure stays open with nothing in flight to remove it.
+
+        ``was_armed`` carries the marker state captured BEFORE the
+        resolution loop retired the envelope: :meth:`_drop_envelope` pops
+        the marker with the envelope, so by the time the caller escalates
+        the ledger lookup alone would no longer see it and the halt would
+        be silently skipped.
+        """
+        if not was_armed and intent_key not in self._pending_flip_surplus_closes:
+            return
+        self._pending_flip_surplus_closes.pop(intent_key, None)
+        halt = BrokerManualInterventionError(
+            f"Flip-fold surplus close {intent_key} was rejected by the "
+            f"broker: the book still holds the surplus exposure the "
+            f"stop-and-reverse fold over-opened and no correcting order "
+            f"is live — manual intervention required",
+            intent_key=intent_key,
+            context={'symbol': self._symbol},
+        )
+        self._record_halt(halt)
+        raise halt
+
     def _consume_plugin_resolutions(self) -> None:
         """Apply plugin-driven resolutions written via ``record_resolution``.
 
@@ -2734,7 +2990,45 @@ class OrderSyncEngine:
                 # silent stale trap); the pop here is now idempotent
                 # belt-and-suspenders.
                 self._persisted_envelope_anchors.pop(key, None)
+                # ``_drop_envelope`` retires the flip-fold surplus
+                # must-settle marker together with the envelope, so capture
+                # its state first: the escalation below is the only thing
+                # that turns a proven-missing correction into a halt, and it
+                # must not lose that evidence to envelope teardown.
+                surplus_close_was_armed = key in self._pending_flip_surplus_closes
+                # Same capture-before-teardown for the fold state stashed by
+                # an ambiguous entry->entry amend: ``_drop_envelope`` pops
+                # the stash, and a modify-rejected resolution is exactly the
+                # case where the original folded order survived the failed
+                # amend and its guard must come back.
+                parked_fold_state = self._modify_parked_fold_state.get(key)
+                # ``_maybe_correct_flip_fold_surplus`` resolves its
+                # corrective close against ``_envelopes[key]``, which
+                # ``_drop_envelope`` is about to pop — without the capture
+                # the re-armed guard below would find no dispatch anchor
+                # and log the overshoot instead of closing it.
+                parked_fold_anchor = self._envelopes.get(key)
                 self._drop_envelope(key)
+                if kind_is_modify and parked_fold_state is not None:
+                    # The amend never applied: the pre-amend folded order is
+                    # still live at the venue, so re-arm the guard that was
+                    # retired when the modify parked. ``_order_mapping[key]``
+                    # is deliberately kept above for the very same reason.
+                    parked_folded, parked_guard = parked_fold_state
+                    if parked_folded is not None:
+                        self._flip_folded_entry_dispatches[key] = parked_folded
+                    if parked_guard is not None:
+                        self._flip_fold_guards[key] = parked_guard
+                        # Fills that landed while the amend was unresolved
+                        # were booked onto the stashed ledger but could not
+                        # dispatch a correction (:meth:`_track_flip_fold_fill`).
+                        # Now that the original folded order is proven to
+                        # have been the live one all along, evaluate the
+                        # accumulated overshoot once: if no further fill
+                        # ever arrives for this key nothing else would.
+                        self._maybe_correct_flip_fold_surplus(
+                            parked_guard, anchor=parked_fold_anchor,
+                        )
                 # Drop any in-flight attached-adoption marker placed by
                 # an earlier sync (or this loop iteration before the
                 # grouping rewrite). Without this the next call to
@@ -2755,6 +3049,12 @@ class OrderSyncEngine:
                 # ``OrderSkippedByPlugin`` branch of
                 # :meth:`_handle_bracket_attach_after_fill_reject`.
                 self._escalate_rejected_defensive_close_resolution(key)
+                # Same contract for the stop-and-reverse surplus correction:
+                # its overshoot is already booked as corrected, so a proven
+                # missing order leaves the surplus open with no retry path.
+                self._escalate_rejected_flip_surplus_close(
+                    key, was_armed=surplus_close_was_armed,
+                )
                 continue
 
             # All resolutions for this key are 'attached' — install
@@ -2771,6 +3071,10 @@ class OrderSyncEngine:
             # rejected.
             if any(r.dispatch_kind == 'modify' for r in records):
                 self._modify_old_intents.pop(key, None)
+                # The amend DID land: the replacement carries the raw
+                # quantity, so the stashed fold state of the superseded
+                # dispatch is terminally dead — never re-arm it.
+                self._modify_parked_fold_state.pop(key, None)
             newly_consumed_any = False
             for record in records:
                 coid = record.coid
@@ -2955,6 +3259,13 @@ class OrderSyncEngine:
         ``self._symbol`` holds the provider ticker (e.g. ``ETHUSDT.P``) —
         filtering on the provider ticker would match zero rows.
 
+        Rows may also carry a :data:`JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY`
+        counter: exposure the venue no longer holds under this row even
+        though the ``filled_qty`` watermark must stay monotonic (partial
+        closes executed under the venue's own order id — cTrader — or an
+        adoption-baseline shrink). The owned slice is the watermark minus
+        that retirement, clamped to ``[0, filled_qty]``.
+
         Pure-local: read-only over the persisted journal.
         """
         if self._store_ctx is None:
@@ -2964,8 +3275,14 @@ class OrderSyncEngine:
             filled = row.filled_qty
             if filled == 0.0:
                 continue
-            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
+            extras = row.extras or {}
+            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
                 continue
+            retired_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
+            if isinstance(retired_raw, (int, float)):
+                filled = max(0.0, filled - min(filled, float(retired_raw)))
+                if filled == 0.0:
+                    continue
             owned += filled if row.side == 'buy' else -filled
         return owned
 
@@ -3906,9 +4223,55 @@ class OrderSyncEngine:
                 # the cache before ``_route_defensive_close_fill`` drops
                 # the marker.
                 if t == 'filled':
-                    self._mark_parent_entry_neutralised(
-                        self._pending_defensive_close[no_fifo_matched_id],
+                    no_fifo_marker = self._pending_defensive_close[
+                        no_fifo_matched_id
+                    ]
+                    no_fifo_fill_qty = event.fill_qty or 0.0
+                    # A quantity-less terminal event on a FANNED close
+                    # (:meth:`_record_defensive_close_fan`) says nothing
+                    # about how much of the fan landed. The fallback below
+                    # would synthesise the whole PARENT close qty from
+                    # ``reject_context.qty`` — over-reducing
+                    # :attr:`_position` by the siblings' share — and then
+                    # settle the marker with the fan still short. Mirror
+                    # the FIFO-path guard instead: leave the marker armed
+                    # so a later leg event, the stale-grace timer
+                    # (:meth:`_raise_if_stale_pending_defensive_close`) or
+                    # the next reconcile resolves it. Single-order closes
+                    # keep the fallback: their terminal event is
+                    # conclusive and plugins that report only the final
+                    # aggregate depend on it.
+                    if (no_fifo_marker.expected_close_qty is not None
+                            and no_fifo_fill_qty <= 0.0):
+                        _blog_warning(
+                            "fanned defensive-close leg FILL without qty "
+                            "(pine=%r, order_id=%s) — marker stays armed, "
+                            "the fan applied %s of %s so far",
+                            event.pine_id,
+                            event.order.id if event.order is not None else None,
+                            no_fifo_marker.applied_close_qty,
+                            no_fifo_marker.expected_close_qty,
+                        )
+                        return
+                    # Does THIS leg complete the fan? The parent entry may
+                    # only be neutralised once the whole parent exposure is
+                    # closed: the cache is identity-keyed (pine id / position
+                    # COID), so it drops the parent's ENTRY fill WHOLE. Seeding
+                    # it on the first leg of a still-incomplete fan would
+                    # discard a legitimate parent fill while the siblings'
+                    # share is still open at the broker, leaving
+                    # :attr:`_position` flat against a live position. Mirrors
+                    # the ``partial`` reasoning above and the fan guard in
+                    # :meth:`_replay_pending_defensive_closes`.
+                    no_fifo_fan_incomplete = (
+                        self._is_defensive_close_fan_incomplete(
+                            no_fifo_marker,
+                            extra_applied=no_fifo_fill_qty,
+                            extra_booked_leg=no_fifo_fill_qty > 0.0,
+                        )
                     )
+                    if not no_fifo_fan_incomplete:
+                        self._mark_parent_entry_neutralised(no_fifo_marker)
                     _blog_warning(
                         "defensive-close FILL routed without FIFO trade state "
                         "(pine=%r, order_id=%s, size=%s) — settling re-armed "
@@ -4025,7 +4388,36 @@ class OrderSyncEngine:
                             self._position.avg_price = na_float
                             self._position.openprofit = 0.0
                             self._position.open_commission = 0.0
-                    self._route_defensive_close_fill(event)
+                    elif no_fifo_fan_incomplete:
+                        # Flat engine view + an incomplete fan: the parent
+                        # ENTRY fill has not routed yet AND it will NOT be
+                        # neutralised (the siblings' share is still open), so
+                        # it will land on :attr:`_position` in full. Stash
+                        # this leg's quantity the same way the ``partial``
+                        # branch below does, so
+                        # :meth:`_drain_unapplied_defensive_close_partials`
+                        # subtracts it the moment the parent fill arrives —
+                        # without it the engine would carry the whole parent
+                        # size while the broker already holds less.
+                        self._set_pending_defensive_close(
+                            no_fifo_matched_id,
+                            dataclasses.replace(
+                                no_fifo_marker,
+                                unapplied_partial_qty=(
+                                    no_fifo_marker.unapplied_partial_qty
+                                    + no_fifo_fill_qty
+                                ),
+                            ),
+                        )
+                    # Credit the broker-reported leg quantity, not what
+                    # ``record_fill`` would have gated: this branch books
+                    # the close against :attr:`_position` itself and never
+                    # calls ``record_fill``, so a leg reported without a
+                    # fill price still moved the position and still
+                    # counts toward the fan's completion.
+                    self._route_defensive_close_fill(
+                        event, applied_qty=no_fifo_fill_qty,
+                    )
                     return
                 # ``t == 'partial'`` for the same no-FIFO defensive close.
                 # Running :meth:`BrokerPosition.record_fill` here would
@@ -4090,7 +4482,14 @@ class OrderSyncEngine:
                     # missing/zero ``fill_qty`` fallback subtracts only
                     # the remainder. This matches the historical
                     # contract: ``partial_filled_qty`` reflects slices
-                    # already applied to :attr:`_position`.
+                    # already applied to :attr:`_position`. The same slice
+                    # also counts toward ``applied_close_qty``: on a
+                    # fanned close the terminal event of a leg carries
+                    # only its LAST segment, so without the partials the
+                    # cumulative total could never reach
+                    # ``expected_close_qty`` and the marker would stay
+                    # armed until stale-grace even after every leg
+                    # completed.
                     if matched_id is not None:
                         existing = self._pending_defensive_close[matched_id]
                         self._set_pending_defensive_close(
@@ -4099,6 +4498,9 @@ class OrderSyncEngine:
                                 existing,
                                 partial_filled_qty=(
                                     existing.partial_filled_qty + fill_qty
+                                ),
+                                applied_close_qty=round(
+                                    existing.applied_close_qty + fill_qty, 12,
                                 ),
                             ),
                         )
@@ -4116,6 +4518,14 @@ class OrderSyncEngine:
                     # subtract only the remainder, leaving
                     # :attr:`_position` long/short by the deferred slice
                     # while the broker is flat.
+                    #
+                    # ``applied_close_qty`` IS credited here: the fan's
+                    # completion check tracks how much CLOSE quantity the
+                    # broker reported, and a deferred slice is a leg that
+                    # landed — it is merely waiting for the parent fill to
+                    # book against. Withholding it would leave a fully
+                    # filled fan short of ``expected_close_qty`` whenever
+                    # the parent fill is the last event to arrive.
                     if matched_id is not None:
                         existing = self._pending_defensive_close[matched_id]
                         self._set_pending_defensive_close(
@@ -4124,6 +4534,9 @@ class OrderSyncEngine:
                                 existing,
                                 unapplied_partial_qty=(
                                     existing.unapplied_partial_qty + fill_qty
+                                ),
+                                applied_close_qty=round(
+                                    existing.applied_close_qty + fill_qty, 12,
                                 ),
                             ),
                         )
@@ -4170,6 +4583,19 @@ class OrderSyncEngine:
                     # falsely declaring the close settled.
                     if fill_qty_value > 0.0 and fill_price_value > 0.0:
                         existing = self._pending_defensive_close[matched_id]
+                        # A corrected redelivery of a previously dropped
+                        # slice books the quantity after all, so its entry
+                        # in the drop ledger must be discharged here — see
+                        # :meth:`_discharge_dropped_close_slice`.
+                        existing = self._discharge_dropped_close_slice(
+                            existing, event.fill_id,
+                        )
+                        # ``applied_close_qty`` tracks the same slices for
+                        # the fan accounting: a leg that fills in several
+                        # ``partial`` segments reports only its remainder
+                        # on the terminal ``filled``, so the cumulative
+                        # total must include the partials to ever reach
+                        # ``expected_close_qty``.
                         self._set_pending_defensive_close(
                             matched_id,
                             dataclasses.replace(
@@ -4177,8 +4603,63 @@ class OrderSyncEngine:
                                 partial_filled_qty=(
                                     existing.partial_filled_qty + fill_qty_value
                                 ),
+                                applied_close_qty=round(
+                                    existing.applied_close_qty + fill_qty_value,
+                                    12,
+                                ),
                             ),
                         )
+                    elif fill_qty_value > 0.0:
+                        # The broker DID execute this slice, the engine just
+                        # cannot book it without a price. Record the gap:
+                        # the local view is now short of the real execution
+                        # and the leg-count completion signal cannot see it
+                        # (every leg may still report terminally), so
+                        # :meth:`_is_defensive_close_fan_incomplete` must
+                        # keep the marker armed until the stale grace or the
+                        # next reconcile escalates the divergence.
+                        existing = self._pending_defensive_close[matched_id]
+                        dropped_fill_id = event.fill_id
+                        # The unbookable slice's id is deliberately NOT
+                        # burned in :attr:`_seen_fill_ids`, so the broker may
+                        # redeliver it — either still price-less (already
+                        # ledgered, must not be counted twice) or corrected
+                        # (discharged in the branch above). Slices without a
+                        # ``fill_id`` have no redelivery identity: they are
+                        # only ever added to the aggregate, which is the
+                        # conservative direction.
+                        already_ledgered = dropped_fill_id is not None and any(
+                            slice_id == dropped_fill_id
+                            for slice_id, _ in existing.dropped_fill_slices
+                        )
+                        if not already_ledgered:
+                            dropped_slices = existing.dropped_fill_slices
+                            if dropped_fill_id is not None:
+                                dropped_slices = dropped_slices + (
+                                    (dropped_fill_id, fill_qty_value),
+                                )
+                            self._set_pending_defensive_close(
+                                matched_id,
+                                dataclasses.replace(
+                                    existing,
+                                    dropped_close_qty=round(
+                                        existing.dropped_close_qty
+                                        + fill_qty_value,
+                                        12,
+                                    ),
+                                    dropped_fill_slices=dropped_slices,
+                                ),
+                            )
+                            _blog_warning(
+                                "defensive-close partial fill without a fill "
+                                "price (pine=%r, order_id=%s, fill_qty=%s) — "
+                                "slice NOT booked, marker stays armed for "
+                                "reconcile",
+                                event.pine_id,
+                                event.order.id
+                                if event.order is not None else None,
+                                fill_qty_value,
+                            )
             # Snapshot the FIFO frontier BEFORE :meth:`record_fill` walks
             # ``open_trades``. ``record_fill`` closes the OLDEST trades
             # first (Pine FIFO semantics), which in pyramiding can differ
@@ -4291,6 +4772,20 @@ class OrderSyncEngine:
                         if total > active_entry.qty:
                             total = active_entry.qty
                         self._active_entry_filled_qty[event.pine_id] = total
+            # Feed the stop-and-reverse fold guards: both the folded
+            # entry's own fills and any external close of the trades the
+            # fold consumed (a still-armed venue-native SL/TP/trailing leg
+            # filling in flight). Runs after the ``_seen_fill_ids`` dedup
+            # gate and after ``record_fill``, so a detected overshoot can
+            # be corrected against the already-updated book.
+            self._track_flip_fold_fill(event)
+            # Feed the must-settle marker of a flip-fold surplus correction
+            # with this slice. Every partial counts towards the dispatched
+            # quantity and the marker is retired only when they add up (see
+            # :meth:`_track_flip_surplus_close_fill`) — a terminal event on
+            # one fanned-out leg is not proof the whole correction settled.
+            if self._pending_flip_surplus_closes:
+                self._track_flip_surplus_close_fill(event)
             # Persist defensive-close ``partial`` FIFO closures onto the
             # marker. The transient ``_last_fifo_closed_entry_ids`` list is
             # reset at the top of every :meth:`_route_event`, so a
@@ -4450,6 +4945,10 @@ class OrderSyncEngine:
                     event, terminal='cancelled',
             ):
                 return
+            if self._halt_if_flip_surplus_close_terminal(
+                    event, terminal='cancelled',
+            ):
+                return
             key = self._find_key_for_order_id(event.order.id)
             if event.order.id in self._native_cancel_all_expected_ids:
                 # A native bulk cancel (``execute_cancel_all``) removed this
@@ -4599,6 +5098,10 @@ class OrderSyncEngine:
             # so the operator learns about the unprotected position
             # immediately.
             if self._halt_if_defensive_close_terminal(
+                    event, terminal='rejected',
+            ):
+                return
+            if self._halt_if_flip_surplus_close_terminal(
                     event, terminal='rejected',
             ):
                 return
@@ -5142,6 +5645,20 @@ class OrderSyncEngine:
         # :meth:`_diff_and_dispatch` to unwind a same-bar re-placement, retired
         # here with the envelope.
         self._flip_folded_entry_dispatches.pop(key, None)
+        # Same lifecycle for the fold's fill ledger: armed in
+        # :meth:`_dispatch_new` next to the fold record, fed by
+        # :meth:`_track_flip_fold_fill`. A guard outliving its entry
+        # envelope could only mis-attribute a later generation's fills (and
+        # its correction path has no dispatch anchor left anyway).
+        self._flip_fold_guards.pop(key, None)
+        # The ambiguous-amend fold stash dies with the envelope too: once the
+        # key is retired no ``'rejected'`` resolution can arrive for it, and a
+        # stale stash could only re-arm a dead fold onto a later generation.
+        self._modify_parked_fold_state.pop(key, None)
+        # A surplus correction dispatched under this key is retired with it:
+        # the terminal-halt lookups key off the close intent, and the close
+        # envelope dying means the correction is no longer in flight.
+        self._pending_flip_surplus_closes.pop(key, None)
         if self._store_ctx is not None:
             self._store_ctx.record_complete(key)
 
@@ -5571,7 +6088,9 @@ class OrderSyncEngine:
         The no-FIFO ``partial`` branch in :meth:`_route_event` stashes
         slices it could not apply (because ``_position.size == 0.0`` —
         the parent entry fill had not routed yet) on
-        :attr:`PendingDefensiveClose.unapplied_partial_qty`. Now that
+        :attr:`PendingDefensiveClose.unapplied_partial_qty`; so does a
+        terminal leg of an INCOMPLETE fan, whose parent will not be
+        neutralised and therefore still has to be booked. Now that
         the parent fill has landed, we apply the accumulated signed
         delta against :attr:`_position.size` AND the freshly-opened
         FIFO trade so the terminal defensive-close ``filled`` event
@@ -5582,7 +6101,15 @@ class OrderSyncEngine:
         :attr:`_position` long/short by the previously-skipped partial
         qty while the broker is flat.
 
-        ``partial_filled_qty`` is bumped by the same amount so the
+        The applied delta is CLAMPED to the parent-side exposure
+        :attr:`_position` currently carries, because the parent ENTRY fill
+        may itself arrive in slices: draining more than the first slice
+        opened would push ``size`` past zero into a phantom opposite-side
+        position and empty ``open_trades`` while later slices keep
+        appending trades. Whatever does not fit stays on
+        ``unapplied_partial_qty`` for the next slice.
+
+        ``partial_filled_qty`` is bumped by the applied amount so the
         no-FIFO ``fill_qty <= 0`` fallback (used when the plugin omits
         per-segment qty on the terminal) computes ``remaining ==
         reject_context.qty - partial_filled_qty`` correctly.
@@ -5605,9 +6132,9 @@ class OrderSyncEngine:
         # signed delta needed to REDUCE that position.
         parent_side = marker.reject_context.position_side
         if parent_side == "buy":
-            signed_delta = -deferred  # close = sell → shrink long
+            sign = -1.0  # close = sell → shrink long
         elif parent_side == "sell":
-            signed_delta = deferred  # close = buy → shrink short
+            sign = 1.0  # close = buy → shrink short
         else:
             _blog_warning(
                 "defensive-close partial drain: unknown parent side %r "
@@ -5615,6 +6142,31 @@ class OrderSyncEngine:
                 parent_side, entry_pine_id, deferred,
             )
             return
+        # Clamp to the parent-side exposure the engine currently carries.
+        # The parent ENTRY fill can itself arrive in SLICES: draining the
+        # whole deferred qty against the first slice would drive
+        # :attr:`_position.size` past zero into a phantom opposite-side
+        # position, empty ``open_trades``, and discard the excess — the
+        # later parent slices would then rebuild ``open_trades`` to a total
+        # that no longer matches ``size``. Apply only what is available now
+        # and keep the rest deferred for the next slice.
+        size = self._position.size
+        if parent_side == "buy":
+            available = size if size > 0.0 else 0.0
+        else:
+            available = -size if size < 0.0 else 0.0
+        applicable = round(min(deferred, available), 12)
+        leftover = round(deferred - applicable, 12)
+        if applicable <= 0.0:
+            if leftover > 0.0:
+                _blog_info(
+                    "defensive-close partial drain for entry %r: no "
+                    "parent-side exposure yet (size=%s) — keeping qty=%s "
+                    "deferred for the next parent slice",
+                    entry_pine_id, size, leftover,
+                )
+            return
+        signed_delta = sign * applicable
         # Mirror :meth:`BrokerPosition.record_fill`'s arithmetic on
         # :attr:`_position.size`. We update ``open_trades`` separately
         # below because the parent ENTRY fill has just opened a fresh
@@ -5638,7 +6190,7 @@ class OrderSyncEngine:
         # trades), the FIFO close that would normally absorb the
         # deferred partial would consume the OLDEST trade first — to
         # mirror that, walk ``open_trades`` from the front.
-        remaining = deferred
+        remaining = applicable
         survivors: list = []
         for trade in self._position.open_trades:
             if remaining <= 0.0:
@@ -5666,22 +6218,36 @@ class OrderSyncEngine:
         self._position.open_trades[:] = survivors
         if remaining > 1e-12:
             _blog_warning(
-                "defensive-close partial drain for entry %r: deferred "
+                "defensive-close partial drain for entry %r: applied "
                 "qty=%s exceeded ``open_trades`` total by %s — leftover "
                 "discarded (broker likely netted multiple entries)",
-                entry_pine_id, deferred, remaining,
+                entry_pine_id, applicable, remaining,
+            )
+        if leftover > 0.0:
+            _blog_info(
+                "defensive-close partial drain for entry %r: applied %s of "
+                "the deferred %s (parent-side exposure was the limit) — "
+                "qty=%s stays deferred for the next parent slice",
+                entry_pine_id, applicable, deferred, leftover,
             )
         # Move the now-applied qty from ``unapplied_partial_qty`` to
         # ``partial_filled_qty`` so the terminal close FILL's
         # ``fill_qty <= 0`` fallback derives the correct ``remaining``.
+        # The bump tracks the ``_position.size`` delta (``applicable``),
+        # not the FIFO-applied part: a ``remaining`` leftover means
+        # ``open_trades`` ran short of a size reduction that still
+        # happened. ``applied_close_qty`` is NOT touched: the deferring
+        # branches credited these slices when the broker reported them, so
+        # crediting again here would double-count them and could settle a
+        # fan whose siblings are still working.
         self._set_pending_defensive_close(
             entry_pine_id,
             dataclasses.replace(
                 marker,
-                partial_filled_qty=(
-                    marker.partial_filled_qty + (deferred - remaining)
+                partial_filled_qty=round(
+                    marker.partial_filled_qty + applicable, 12,
                 ),
-                unapplied_partial_qty=0.0,
+                unapplied_partial_qty=leftover,
             ),
         )
 
@@ -5726,12 +6292,390 @@ class OrderSyncEngine:
             event_coid = order.client_order_id
             if event_coid is not None:
                 for entry_id, marker in self._pending_defensive_close.items():
-                    if (marker.close_client_order_id is not None
-                            and marker.close_client_order_id == event_coid):
+                    marker_coid = marker.close_client_order_id
+                    if (marker_coid == event_coid
+                            or _is_composed_leg_coid(event_coid, marker_coid)):
                         return entry_id
         return None
 
-    def _route_defensive_close_fill(self, event: OrderEvent) -> None:
+    def _track_flip_fold_fill(self, event: OrderEvent) -> None:
+        """Feed armed stop-and-reverse fold guards from a fill event.
+
+        Two independent streams per guard (see :class:`_FlipFoldGuard`):
+
+        * the folded entry's OWN fills (ENTRY leg under the fold's
+          ``intent_key``) — how much of the folded quantity actually
+          executed;
+        * EXTERNAL closes of the trades the fold consumed — a non-entry
+          leg (SL/TP/trailing/close) whose Pine attribution points at one
+          of the consumed entry ids, on the fold's own side. This is the
+          venue's still-armed protective leg racing the flip; its fill
+          removes exposure the fold was sized to net against.
+
+        The engine's own corrective close (see
+        :meth:`_maybe_correct_flip_fold_surplus`) can never re-enter the
+        external stream: it reduces the NEW position, so its side is the
+        opposite of ``entry_side`` and its attribution never matches a
+        consumed entry id.
+
+        Runs after the ``_seen_fill_ids`` dedup gate, so a replayed fill
+        cannot double-feed a ledger.
+
+        Guards stashed by an ambiguous entry->entry amend
+        (:attr:`_modify_parked_fold_state`) are fed too, but never
+        dispatch a correction: while the amend is unresolved nothing
+        proves which generation is live at the venue, and a corrective
+        market close against the raw replacement's legitimate exposure
+        would be the wrong order. The ledger still has to keep counting —
+        a ``'rejected'`` resolution proves the ORIGINAL folded order was
+        live the whole time, and its guard is re-armed with the fills
+        that landed meanwhile (see :meth:`_consume_plugin_resolutions`);
+        without this the deduped fills would be lost for good and the
+        restored ledger would under-report the overshoot.
+        """
+        if not self._flip_fold_guards and not self._modify_parked_fold_state:
+            return
+        fill_qty = event.fill_qty or 0.0
+        if fill_qty <= 0.0:
+            return
+        for guard in list(self._flip_fold_guards.values()):
+            if self._credit_flip_fold_guard(guard, event, fill_qty):
+                self._maybe_correct_flip_fold_surplus(guard)
+        for _parked_folded, parked_guard in self._modify_parked_fold_state.values():
+            if parked_guard is not None:
+                self._credit_flip_fold_guard(parked_guard, event, fill_qty)
+
+    @staticmethod
+    def _credit_flip_fold_guard(
+            guard: _FlipFoldGuard, event: OrderEvent, fill_qty: float,
+    ) -> bool:
+        """Book ``fill_qty`` onto ``guard``'s matching ledger stream.
+
+        Returns ``True`` when the event belonged to one of the guard's two
+        streams (the folded entry's own fills, or an external close of a
+        consumed trade) — the caller decides whether that warrants a
+        corrective dispatch.
+        """
+        if (event.leg_type is LegType.ENTRY
+                and event.pine_id == guard.entry_intent_key):
+            guard.entry_filled_qty = min(
+                guard.folded_qty,
+                round(guard.entry_filled_qty + fill_qty, 12),
+            )
+            return True
+        if (event.leg_type is not LegType.ENTRY
+                and event.order is not None
+                and event.order.side == guard.entry_side
+                and (event.pine_id in guard.consumed_entry_ids
+                     or event.from_entry in guard.consumed_entry_ids)):
+            guard.external_closed_qty = min(
+                guard.consumed_qty,
+                round(guard.external_closed_qty + fill_qty, 12),
+            )
+            return True
+        return False
+
+    def _maybe_correct_flip_fold_surplus(
+            self, guard: _FlipFoldGuard,
+            anchor: DispatchEnvelope | None = None,
+    ) -> None:
+        """Close the exposure a double-settled netting fold over-opened.
+
+        The fold dispatched ``folded_qty = raw + consumed_qty`` expecting
+        the venue to net ``consumed_qty`` of it against the opposite
+        position. Every unit of the consumed trades that an EXTERNAL fill
+        closed instead (``external_closed_qty``) shrinks what the venue
+        can still net, so the fold's fills beyond
+        ``folded_qty - min(external_closed_qty, consumed_qty)`` opened
+        surplus exposure on the new side. The book (venue and
+        ``_position`` alike) genuinely holds that surplus while Pine does
+        not — dispatch a targeted partial defensive close for it
+        immediately, before a later Pine-sized exit trips over the
+        mismatch (Capital.com's full-row-only bracket guard turned
+        exactly this into a fatal crash).
+
+        Incremental and idempotent: ``corrected_qty`` accumulates what was
+        already dispatched, so partial fill orderings correct in slices
+        and a re-derived overshoot of zero is a no-op.
+
+        ``anchor`` supplies the entry's dispatch envelope explicitly for
+        the one caller that evaluates a guard AFTER its envelope was torn
+        down: the modify-rejected resolution in
+        :meth:`_consume_plugin_resolutions` re-arms the stash that
+        :meth:`_drop_envelope` just popped. The rejected amend proves the
+        ORIGINAL folded order was live the whole time — the same reason
+        ``_order_mapping[key]`` is kept there — so its captured envelope
+        is exactly the right correction target.
+        """
+        nettable = guard.folded_qty - min(
+            guard.external_closed_qty, guard.consumed_qty,
+        )
+        overshoot = round(
+            guard.entry_filled_qty - nettable - guard.corrected_qty, 12,
+        )
+        if overshoot <= 1e-9:
+            return
+        entry_key = guard.entry_intent_key
+        envelope = anchor if anchor is not None else self._envelopes.get(entry_key)
+        refs = self._order_mapping.get(entry_key) or []
+        if envelope is None or not refs:
+            # No dispatch anchor to target — the entry envelope died (e.g.
+            # the key was retired between the fills). The overshoot is
+            # real; without a provable target a corrective close could hit
+            # the wrong exposure, so surface it loudly and let the
+            # reconciliation checks own the divergence.
+            _blog_error(
+                "stop-and-reverse fold for %s over-opened by %s (external "
+                "close of the consumed position raced the folded fill) but "
+                "no dispatch anchor survives to target a corrective close "
+                "— leaving the divergence to reconciliation",
+                format_intent_key(entry_key), overshoot,
+            )
+            return
+        guard.corrected_qty = round(guard.corrected_qty + overshoot, 12)
+        guard.correction_seq += 1
+        position_coid = envelope.client_order_id(KIND_ENTRY)
+        close_side = 'sell' if guard.entry_side == 'buy' else 'buy'
+        _blog_error(
+            "stop-and-reverse fold for %s double-settled: the consumed "
+            "position was closed externally (%s of %s) while the folded "
+            "entry filled %s of %s — closing the %s surplus defensively "
+            "(target deal %s)",
+            format_intent_key(entry_key), guard.external_closed_qty,
+            guard.consumed_qty, guard.entry_filled_qty, guard.folded_qty,
+            overshoot, refs[0],
+        )
+        close_intent = CloseIntent(
+            pine_id=(
+                f"__pyne_flip_surplus_close__{position_coid}"
+                f"__{guard.correction_seq}"
+            ),
+            symbol=self._symbol,
+            side=close_side,
+            qty=overshoot,
+            immediately=True,
+            synthetic_kind='defensive_close',
+            target_position_coid=position_coid,
+            target_exchange_id=refs[0],
+            comment="flip-fold surplus close: external close of the "
+                    "consumed position raced the folded reversal fill",
+        )
+        # Arm the must-settle marker BEFORE the dispatch, with the exact
+        # COID ``_dispatch_new`` will submit (``_build_envelope`` caches the
+        # envelope on ``intent_key``, so the id built here is the one that
+        # goes on the wire). Without it a cancelled / rejected / provably
+        # absent correction would be dropped by the generic terminal
+        # routing while ``corrected_qty`` blocks any re-dispatch, leaving
+        # the surplus exposure open and unnoticed.
+        close_key = close_intent.intent_key
+        self._pending_flip_surplus_closes[close_key] = _PendingFlipSurplusClose(
+            client_order_id=self._build_envelope(close_intent).client_order_id(
+                KIND_CLOSE,
+            ),
+            expected_qty=overshoot,
+        )
+        try:
+            self._dispatch_new(close_intent)
+        except OrderDispositionUnknownError:
+            # Parked (network-ambiguous). ``_park_pending`` owns the
+            # retry; the surplus stays booked as corrected so the ledger
+            # does not double-dispatch while the park resolves. The marker
+            # stays armed so a later ``rejected`` plugin resolution still
+            # escalates (:meth:`_escalate_rejected_flip_surplus_close`).
+            pass
+        except OrderSkippedByPlugin as skipped:
+            self._pending_flip_surplus_closes.pop(close_key, None)
+            # No order went out and none will — the surplus exposure is
+            # open and unprotected with no automated path left. Same
+            # escalation contract as the bracket-attach-reject defensive
+            # close.
+            halt = BrokerManualInterventionError(
+                f"Flip-fold surplus close for {entry_key} was skipped by "
+                f"the plugin (reason={skipped.reason!r}): the book holds "
+                f"{overshoot} surplus exposure on the {close_side} side "
+                f"that could not be closed — manual intervention "
+                f"required: {skipped}",
+                intent_key=entry_key,
+                context={
+                    'position_coid': position_coid,
+                    'target_exchange_id': refs[0],
+                    'symbol': self._symbol,
+                    'qty': overshoot,
+                    'skipped_reason': skipped.reason,
+                },
+            )
+            self._record_halt(halt)
+            raise halt from skipped
+
+    @staticmethod
+    def _discharge_dropped_close_slice(
+            marker: PendingDefensiveClose, fill_id: str | None,
+    ) -> PendingDefensiveClose:
+        """Clear ``fill_id``'s entry from ``marker``'s drop ledger.
+
+        A slice dropped for a missing fill price
+        (:attr:`PendingDefensiveClose.dropped_close_qty`) is not
+        necessarily lost: :meth:`_is_duplicate_fill` deliberately keeps an
+        unbookable fill's id OUT of :attr:`_seen_fill_ids` so the broker
+        can redeliver the same execution with a corrected price, and that
+        redelivery books the quantity. Without discharging the ledger here
+        the aggregate would stay positive forever, permanently disabling
+        the leg-count completion signal in
+        :meth:`_is_defensive_close_fan_incomplete` — an off-grid fan whose
+        grid-snapped fills legitimately total less than the Pine-unit plan
+        would then stay armed to the stale grace even though every leg
+        settled and every quantity was booked.
+
+        Called from the paths that actually BOOK a slice. Returns
+        ``marker`` unchanged when there is nothing to discharge (no
+        ``fill_id``, empty ledger, or no matching entry) — drops recorded
+        without a ``fill_id`` have no redelivery identity and stay in the
+        aggregate, which is the conservative direction.
+        """
+        if fill_id is None or not marker.dropped_fill_slices:
+            return marker
+        remaining = tuple(
+            entry for entry in marker.dropped_fill_slices
+            if entry[0] != fill_id
+        )
+        if len(remaining) == len(marker.dropped_fill_slices):
+            return marker
+        discharged = sum(
+            qty for slice_id, qty in marker.dropped_fill_slices
+            if slice_id == fill_id
+        )
+        return dataclasses.replace(
+            marker,
+            dropped_close_qty=max(
+                round(marker.dropped_close_qty - discharged, 12), 0.0,
+            ),
+            dropped_fill_slices=remaining,
+        )
+
+    @staticmethod
+    def _is_defensive_close_fan_incomplete(
+            marker: PendingDefensiveClose, *,
+            extra_applied: float = 0.0,
+            extra_booked_leg: bool = False,
+    ) -> bool:
+        """Are sibling legs of ``marker``'s fanned close still outstanding?
+
+        Two independent completion signals, because neither alone covers
+        every venue:
+
+        - **Quantity.** :attr:`PendingDefensiveClose.applied_close_qty`
+          (plus ``extra_applied``, the slice the caller is about to
+          credit) reaching :attr:`expected_close_qty`.
+        - **Booked leg count.**
+          :attr:`PendingDefensiveClose.booked_leg_count` (plus the leg the
+          caller is about to book, ``extra_booked_leg``) reaching
+          :attr:`expected_leg_count`.
+
+        ``expected_close_qty`` is the PINE-unit close plan, while the
+        broker executes that plan snapped to its integer volume grid: with
+        a floor-style quantizer the fills legitimately total slightly LESS
+        than the plan, so the quantity check alone would keep a fully
+        filled fan armed until the stale grace. The leg count settles that
+        case exactly. Conversely a plugin that reports terminal legs
+        without an ``order.id`` never grows ``booked_leg_count``, so the
+        quantity check remains the fallback there.
+
+        Only legs that BOOKED quantity count: a terminal leg event that
+        applied nothing says nothing about the outstanding sibling
+        quantity, which is exactly what the marker exists to protect.
+
+        The leg count is also disarmed entirely while a slice stands
+        DROPPED (:attr:`PendingDefensiveClose.dropped_close_qty`): a
+        dropped slice is quantity the broker really executed, so the local
+        view is short for a reason the leg count cannot observe. A
+        corrected redelivery of that execution books the quantity and
+        clears its ledger entry (:meth:`_discharge_dropped_close_slice`),
+        which re-arms the leg count.
+
+        Always ``False`` for a single-order close (``expected_close_qty is
+        None``) — its one terminal FILL is conclusive.
+        """
+        expected_qty = marker.expected_close_qty
+        if expected_qty is None:
+            return False
+        applied = round(marker.applied_close_qty + extra_applied, 12)
+        if applied + 1e-9 >= expected_qty:
+            return False
+        expected_legs = marker.expected_leg_count
+        if expected_legs <= 0:
+            return True
+        # A slice the broker executed but the engine could not book
+        # (:attr:`PendingDefensiveClose.dropped_close_qty` — positive qty,
+        # missing fill price) makes the local view genuinely short of the
+        # real execution. The leg count only certifies that every dispatched
+        # leg reported terminally; it is blind to that missing quantity, so
+        # settling on it here would retire the marker with real exposure
+        # un-booked. Fall back to the quantity signal, which keeps the
+        # marker armed until the stale grace or the next reconcile
+        # escalates the divergence.
+        if marker.dropped_close_qty > 0.0:
+            return True
+        booked = marker.booked_leg_count + (1 if extra_booked_leg else 0)
+        return booked < expected_legs
+
+    def _record_defensive_close_fan(
+            self, intent: CloseIntent, fan: CloseFanResult,
+    ) -> None:
+        """Record a multi-leg fan-out on the close's must-settle marker.
+
+        The one-way emulator can fan a single defensive close across
+        several hedge legs (``{parent_coid}:{leg_id}`` children), each a
+        separate broker order with its own terminal event. The FILL of
+        the first child says nothing about its siblings — one of them may
+        still be working, or be rejected afterwards — so the marker must
+        not retire on it. Persist the quantity the fan actually
+        dispatched (:attr:`CloseFanResult.dispatched_qty`, so a
+        broker-holds-less shortfall is already accounted for) as
+        :attr:`PendingDefensiveClose.expected_close_qty`;
+        :meth:`_route_defensive_close_fill` keeps the marker armed until
+        :attr:`PendingDefensiveClose.applied_close_qty` reaches it.
+
+        ``dispatched_qty`` — never ``sum(fan.legs)`` — is the usable
+        source here: :attr:`CloseFanResult.legs` carries BROKER-grid
+        volumes (cTrader centi-units, Capital.com lot-step counts) while
+        ``applied_close_qty`` accumulates Pine-unit fill quantities. On
+        any non-identity volume grid the summed legs are a 100x-scaled
+        number the applied total could never reach, so a fully completed
+        fan would stay armed until stale-grace.
+
+        The leg COUNT is persisted alongside it as
+        :attr:`PendingDefensiveClose.expected_leg_count`. ``dispatched_qty``
+        is the Pine-unit close PLAN, but the broker executes that plan on
+        its integer volume grid, so the fills can total slightly less than
+        the plan (a floor-style quantizer drops the sub-grid remainder) and
+        the quantity check alone would never be satisfied. See
+        :meth:`_is_defensive_close_fan_incomplete`.
+
+        Single-leg fans are left alone: their one terminal FILL is
+        conclusive and the marker settles on it exactly as before.
+        """
+        if len(fan.legs) < 2:
+            return
+        close_key = intent.intent_key
+        for entry_id, marker in self._pending_defensive_close.items():
+            if marker.close_intent_key != close_key:
+                continue
+            expected = fan.dispatched_qty
+            if expected <= 0.0:
+                return
+            self._set_pending_defensive_close(
+                entry_id,
+                dataclasses.replace(
+                    marker,
+                    expected_close_qty=expected,
+                    expected_leg_count=len(fan.legs),
+                ),
+            )
+            return
+
+    def _route_defensive_close_fill(
+            self, event: OrderEvent, applied_qty: float | None = None,
+    ) -> None:
         """Run deferred-cleanup for a defensive-close FILL, if any.
 
         The synthetic close dispatched by
@@ -5754,11 +6698,73 @@ class OrderSyncEngine:
           settled.
 
         Idempotent: a second invocation finds no marker and returns.
+
+        :param event: The terminal defensive-close FILL event.
+        :param applied_qty: Quantity this event actually booked, when the
+            caller applied it outside :meth:`BrokerPosition.record_fill`.
+            The no-FIFO branch of :meth:`_route_event` books the close
+            against :attr:`_position` itself under different gates than
+            ``record_fill`` (no fill-price requirement), so it passes the
+            quantity it booked instead of letting the fan accounting
+            below re-derive it from the event. ``None`` keeps the
+            ``record_fill`` gate (positive qty AND price).
         """
         matched_entry_id = self._match_pending_defensive_close(event)
         if matched_entry_id is None:
             return
         marker = self._pending_defensive_close[matched_entry_id]
+        # Fan-out accounting. Credit only what
+        # :meth:`BrokerPosition.record_fill` actually applied (it drops a
+        # slice whose qty OR price is non-positive without touching
+        # ``position.size``), then compare against the quantity the fan
+        # was dispatched for (:meth:`_record_defensive_close_fan`). While
+        # the applied total is short of it, sibling legs of the same
+        # close are still outstanding: this FILL settles its own leg, not
+        # the close, so the marker must stay armed.
+        if applied_qty is None:
+            fill_qty = event.fill_qty or 0.0
+            fill_price = event.fill_price or 0.0
+            applied_now = (
+                fill_qty if fill_qty > 0.0 and fill_price > 0.0 else 0.0
+            )
+        else:
+            applied_now = applied_qty if applied_qty > 0.0 else 0.0
+        if applied_now > 0.0:
+            # The broker may redeliver a previously unbookable slice with a
+            # corrected price as the leg's terminal event; booking it here
+            # discharges the drop ledger so the leg-count completion signal
+            # is re-armed (see :meth:`_discharge_dropped_close_slice`). The
+            # persist cannot wait for the ``dataclasses.replace`` branches
+            # below — neither runs for an already-``fill_observed``
+            # single-order close.
+            discharged = self._discharge_dropped_close_slice(
+                marker, event.fill_id,
+            )
+            if discharged is not marker:
+                marker = discharged
+                self._set_pending_defensive_close(marker.entry_id, marker)
+        expected_close_qty = marker.expected_close_qty
+        new_applied = round(marker.applied_close_qty + applied_now, 12)
+        # A leg event that booked nothing (``applied_now == 0``) must not
+        # promote a short fan to "settled" — the outstanding sibling
+        # quantity is exactly what the marker exists to protect. When no
+        # further leg event arrives, the stale-grace timer
+        # (:meth:`_raise_if_stale_pending_defensive_close`) or the next
+        # reconcile resolves the marker instead. Legs that DID book count
+        # toward :attr:`PendingDefensiveClose.expected_leg_count`, which
+        # completes a fan whose grid-snapped fills legitimately total less
+        # than the Pine-unit plan (see
+        # :meth:`_is_defensive_close_fan_incomplete`).
+        books_new_leg = applied_now > 0.0 and (
+            event.order is None
+            or event.order.id not in marker.settled_leg_order_ids
+        )
+        fan_incomplete = self._is_defensive_close_fan_incomplete(
+            marker,
+            extra_applied=applied_now,
+            extra_booked_leg=books_new_leg,
+        )
+        booked_leg_count = marker.booked_leg_count + (1 if books_new_leg else 0)
         # Seed the duplicate-fill cache BEFORE attempting residual
         # cleanup. ``record_fill`` has already applied this FILL to
         # ``BrokerPosition`` (we run from :meth:`_route_event` after
@@ -5770,7 +6776,30 @@ class OrderSyncEngine:
         # whether the residual-cancel step below succeeds. The audit
         # log + marker drop further down still depend on residual
         # cancel success.
-        self._mark_defensive_close_settled(marker, event)
+        #
+        # With sibling legs still outstanding only THIS leg's own
+        # identities may enter the cache: the shared parent ids
+        # (``close_intent_key`` / parent COID) are carried by every leg
+        # of the fan, so seeding them now would make the next leg's FILL
+        # look like a replay of this one and drop it before
+        # ``record_fill`` — losing the very quantity the marker is
+        # waiting for.
+        self._mark_defensive_close_settled(
+            marker, event, shared_ids=not fan_incomplete,
+        )
+        # Durable per-leg dedup identity for a fanned close. The shared
+        # parent ids stay out of the settled caches until the last leg
+        # lands (see above), so only the leg's OWN ``order.id`` can keep a
+        # delayed replay of this already-applied leg out of
+        # ``record_fill`` after a restart mid-fan — and the in-memory
+        # caches do not survive that restart. Persisted on the marker
+        # below; :meth:`_replay_pending_defensive_closes` re-seeds
+        # :attr:`_settled_defensive_close_order_refs` from it.
+        settled_leg_order_ids = marker.settled_leg_order_ids
+        if (expected_close_qty is not None
+                and event.order is not None
+                and event.order.id not in settled_leg_order_ids):
+            settled_leg_order_ids = settled_leg_order_ids + (event.order.id,)
         # Persist ``fill_observed=True`` on the marker BEFORE attempting
         # the final residual cancel. The in-memory duplicate-fill caches
         # seeded above do NOT survive a restart — without a durable
@@ -5845,20 +6874,38 @@ class OrderSyncEngine:
             # live cache only holds THIS terminal fill's slice, so
             # overwriting would drop entries an earlier partial FIFO
             # walk consumed (e.g. LongA via partial, LongB via terminal).
-            merged_fifo_closed = list(marker.fifo_closed_entry_ids)
-            seen_fifo_closed = set(merged_fifo_closed)
-            for entry_id in self._last_fifo_closed_entry_ids:
-                if entry_id not in seen_fifo_closed:
-                    merged_fifo_closed.append(entry_id)
-                    seen_fifo_closed.add(entry_id)
-            fifo_closed_snapshot = tuple(merged_fifo_closed)
             marker = dataclasses.replace(
                 marker,
                 fill_observed=True,
                 fill_exchange_order_id=observed_fill_order_id,
-                fifo_closed_entry_ids=fifo_closed_snapshot,
+                fifo_closed_entry_ids=self._merged_fifo_closed_entry_ids(marker),
+                applied_close_qty=new_applied,
+                settled_leg_order_ids=settled_leg_order_ids,
+                booked_leg_count=booked_leg_count,
             )
             self._set_pending_defensive_close(marker.entry_id, marker)
+        elif expected_close_qty is not None:
+            # A later leg of a fanned-out close: ``fill_observed`` was
+            # already flipped by an earlier leg, but this leg's quantity,
+            # its dedup identity and its own FIFO closures still have to
+            # reach the marker — the final leg's cleanup targets are
+            # derived from the merged snapshot, not from the per-event
+            # cache.
+            marker = dataclasses.replace(
+                marker,
+                fifo_closed_entry_ids=self._merged_fifo_closed_entry_ids(marker),
+                applied_close_qty=new_applied,
+                settled_leg_order_ids=settled_leg_order_ids,
+                booked_leg_count=booked_leg_count,
+            )
+            self._set_pending_defensive_close(marker.entry_id, marker)
+        if fan_incomplete:
+            _blog_info(
+                "defensive-close leg fill for entry %s applied %s of %s — "
+                "marker stays armed until the remaining fan legs settle",
+                marker.entry_id, new_applied, expected_close_qty,
+            )
+            return
         # Final residual-cancel retry before the marker is dropped. The
         # dispatch-time loop in :meth:`_cancel_bracket_reject_residuals`
         # swallows transient
@@ -6164,8 +7211,28 @@ class OrderSyncEngine:
         if ctx.position_coid:
             self._neutralised_parent_entry_coids.add(ctx.position_coid)
 
+    def _merged_fifo_closed_entry_ids(
+            self, marker: PendingDefensiveClose,
+    ) -> tuple[str, ...]:
+        """Union of ``marker``'s FIFO closures with this event's slice.
+
+        The live ``_last_fifo_closed_entry_ids`` cache is reset at the top
+        of every :meth:`_route_event`, so it only holds the closures of
+        the event being routed right now. Merging keeps the closures an
+        earlier ``partial`` event (or an earlier leg of a fanned-out
+        close) consumed — order-preserving, duplicates dropped.
+        """
+        merged = list(marker.fifo_closed_entry_ids)
+        seen = set(merged)
+        for entry_id in self._last_fifo_closed_entry_ids:
+            if entry_id not in seen:
+                merged.append(entry_id)
+                seen.add(entry_id)
+        return tuple(merged)
+
     def _mark_defensive_close_settled(
-            self, marker: PendingDefensiveClose, event: OrderEvent,
+            self, marker: PendingDefensiveClose, event: OrderEvent, *,
+            shared_ids: bool = True,
     ) -> None:
         """Record a settled defensive close in the duplicate-fill cache.
 
@@ -6175,15 +7242,27 @@ class OrderSyncEngine:
         ref that actually filled — usually identical, but the polled-
         orders fallback can deliver a FILL whose ``order.id`` differs
         from the dispatch-time ref when the broker assigned a fresh id).
+
+        ``shared_ids=False`` records only the identities of the order that
+        actually filled and leaves the marker's own (parent) ids out. A
+        one-way-emulated close fans across several children that all
+        share those parent ids, so caching them while siblings are still
+        outstanding would make the next child's FILL look like a replay
+        of this one.
         """
-        if marker.close_intent_key:
-            self._settled_defensive_close_pine_ids.add(marker.close_intent_key)
-        if marker.close_order_ref is not None:
-            self._settled_defensive_close_order_refs.add(marker.close_order_ref)
-        if marker.close_client_order_id is not None:
-            self._settled_defensive_close_client_order_ids.add(
-                marker.close_client_order_id,
-            )
+        if shared_ids:
+            if marker.close_intent_key:
+                self._settled_defensive_close_pine_ids.add(
+                    marker.close_intent_key,
+                )
+            if marker.close_order_ref is not None:
+                self._settled_defensive_close_order_refs.add(
+                    marker.close_order_ref,
+                )
+            if marker.close_client_order_id is not None:
+                self._settled_defensive_close_client_order_ids.add(
+                    marker.close_client_order_id,
+                )
         if event.order is not None:
             self._settled_defensive_close_order_refs.add(event.order.id)
             event_coid = event.order.client_order_id
@@ -12154,6 +13233,11 @@ class OrderSyncEngine:
             # clear nor re-record it — hence the ``_coid_spent_retry == 0``
             # guard on both halves.
             self._flip_folded_entry_dispatches.pop(intent.intent_key, None)
+            self._flip_fold_guards.pop(intent.intent_key, None)
+            # A fresh dispatch also supersedes any fold state an earlier
+            # ambiguous amend stashed for a possible rejection re-arm: the
+            # order that state described is no longer the one on the wire.
+            self._modify_parked_fold_state.pop(intent.intent_key, None)
         if (_coid_spent_retry == 0
                 and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
@@ -12173,6 +13257,25 @@ class OrderSyncEngine:
             # same bar (see the ``skip_flip`` branch in
             # :meth:`_diff_and_dispatch`).
             self._flip_folded_entry_dispatches[intent.intent_key] = intent
+            # Arm the fold's fill ledger BEFORE the broker round-trip: the
+            # opposite position's protective legs are still live at the
+            # venue while the folded entry is in flight, and one of them
+            # filling concurrently double-closes the consumed exposure.
+            # :meth:`_track_flip_fold_fill` watches both fill streams and
+            # corrects the overshoot with a targeted partial defensive
+            # close. The snapshot of the consumed trades is taken here —
+            # after the fold's fills these ids are gone from
+            # ``open_trades``, so a later event could not reconstruct it.
+            self._flip_fold_guards[intent.intent_key] = _FlipFoldGuard(
+                entry_intent_key=intent.intent_key,
+                entry_side=intent.side,
+                folded_qty=intent.qty,
+                consumed_qty=abs(self._position.size),
+                consumed_entry_ids=frozenset(
+                    trade.entry_id for trade in self._position.open_trades
+                    if trade.entry_id is not None
+                ),
+            )
         # Short gate: judged on the folded quantity, before the envelope is
         # built (nothing to clean up on a halt).
         if isinstance(intent, EntryIntent):
@@ -12515,6 +13618,7 @@ class OrderSyncEngine:
                     self._order_mapping[intent.intent_key] = [
                         f"close-leg:{leg_id}" for leg_id, _vol in fan.legs
                     ]
+                    self._record_defensive_close_fan(intent, fan)
                 else:
                     order = self._run_async_write(self._broker.execute_close(envelope))
                     self._order_mapping[intent.intent_key] = [order.id]
@@ -13874,6 +14978,39 @@ class OrderSyncEngine:
                 )
                 self._record_halt(halt)
                 raise halt
+            # A fanned close (one-way emulator ``{parent_coid}:{leg_id}``
+            # children) whose applied quantity is still short of the
+            # dispatched total: the prior instance flipped
+            # ``fill_observed`` on the FIRST leg's FILL while its siblings
+            # were still working. Running the settled-close branch below
+            # would seed the SHARED parent identities into the
+            # duplicate-fill caches — every leg carries them, so the
+            # outstanding sibling's FILL would be discarded as a replay —
+            # and :meth:`_retry_residual_cleanup_after_transient_fill`
+            # would see ``cache_seeded`` and retire the marker while real
+            # close quantity is still in flight (losing the sibling-reject
+            # escalation and cleaning the parent's tracking early).
+            fan_incomplete = self._is_defensive_close_fan_incomplete(marker)
+            if marker.fill_observed and fan_incomplete:
+                _blog_warning(
+                    "defensive_close_pending replay: %s applied %s of %s "
+                    "close quantity in the prior run instance — re-arming "
+                    "the marker and waiting for the outstanding fan legs",
+                    marker.entry_id, marker.applied_close_qty,
+                    marker.expected_close_qty,
+                )
+                # Only the legs that actually filled may enter the dedup
+                # cache, mirroring the ``shared_ids=False`` contract of
+                # :meth:`_route_defensive_close_fill`.
+                for leg_order_id in marker.settled_leg_order_ids:
+                    self._settled_defensive_close_order_refs.add(leg_order_id)
+                if marker.fill_exchange_order_id is not None:
+                    self._settled_defensive_close_order_refs.add(
+                        marker.fill_exchange_order_id,
+                    )
+                self._pending_defensive_close[marker.entry_id] = marker
+                self._replayed_defensive_close_entry_ids.add(marker.entry_id)
+                continue
             if marker.fill_observed:
                 # Prior instance observed the defensive-close FILL (and
                 # seeded the in-memory duplicate-fill caches via
@@ -14055,7 +15192,16 @@ class OrderSyncEngine:
             marker = self._pending_defensive_close.get(entry_id)
             if marker is None:
                 continue
-            cache_seeded = (
+            # A fanned close whose applied quantity is still short of the
+            # dispatched total has sibling legs outstanding: the post-FILL
+            # finalization must NOT run for it — retiring the marker here
+            # would clean the parent's tracking and drop the sibling-reject
+            # escalation while real close quantity is still in flight. The
+            # pre-FILL residual retry below stays available (it only
+            # cancels the parent/TP/SL residual set, which is orthogonal to
+            # how many close legs have landed).
+            fan_incomplete = self._is_defensive_close_fan_incomplete(marker)
+            cache_seeded = not fan_incomplete and (
                 marker.close_intent_key in self._settled_defensive_close_pine_ids
                 or (marker.close_order_ref is not None
                     and marker.close_order_ref
@@ -14340,6 +15486,17 @@ class OrderSyncEngine:
             qty = float(marker.reject_context.qty)
             partial = float(marker.partial_filled_qty)
             remaining = qty - partial
+            if marker.expected_close_qty is not None:
+                # Multi-leg fan-out (:meth:`_record_defensive_close_fan`):
+                # everything that already landed is reflected in
+                # ``_position.size``; only the outstanding legs may be
+                # expected from the snapshot.
+                # ``applied_close_qty`` is the single cumulative counter
+                # here — it already contains the ``partial`` slices, so
+                # subtracting ``partial_filled_qty`` on top would
+                # double-count them and understate the expected
+                # post-close size.
+                remaining = qty - float(marker.applied_close_qty)
             if remaining < 0.0:
                 remaining = 0.0
             if side == "buy":
@@ -15361,6 +16518,16 @@ class OrderSyncEngine:
                 # later same-bar re-placement try to unwind a fold that no
                 # longer exists.
                 self._flip_folded_entry_dispatches.pop(new.intent_key, None)
+                # Same lifecycle for the fold's fill ledger: it is sized against
+                # the folded quantity and the opposite exposure the fold was
+                # dispatched to net against. The replacement carries the RAW
+                # quantity, so keeping the guard armed would evaluate the
+                # replacement's fills against a folded quantity that is no
+                # longer on the wire and dispatch a bogus corrective close.
+                self._flip_fold_guards.pop(new.intent_key, None)
+                # An applied amend also invalidates any fold state a previous
+                # ambiguous amend stashed for a rejection re-arm.
+                self._modify_parked_fold_state.pop(new.intent_key, None)
                 # Keep the both-set entry's software STOP leg in step with the
                 # amended native LIMIT. modify_entry preserves the LIMIT's
                 # KIND_ENTRY coid (the envelope anchor is pinned across amend
@@ -15514,6 +16681,41 @@ class OrderSyncEngine:
             _blog_warning(
                 "modify parked (unknown disposition) for %s: %s", new, e,
             )
+            # Retire the stop-and-reverse fold state of the superseded
+            # dispatch, exactly as the success path does. The replacement
+            # carries the RAW quantity, so a guard sized against the folded
+            # quantity can only mis-attribute the replacement's fills and
+            # dispatch a corrective market close against legitimate
+            # exposure. Whichever way the park resolves the folded order is
+            # not what is on the wire under this key any more: 'attached'
+            # means the raw replacement landed, and 'rejected' retires the
+            # envelope (which pops these ledgers anyway). A fold overshoot
+            # that slips through in the meantime is left to the cycle-end
+            # reconciliation — the passive divergence report, never a wrong
+            # order.
+            #
+            # The retirement is not final though: a ``'rejected'``
+            # resolution proves the amend never applied, so the ORIGINAL
+            # folded order is still live at the venue and needs its guard
+            # back. Stash the popped state under the key;
+            # :meth:`_process_plugin_resolutions` re-arms it on rejection
+            # and drops it once the raw replacement is authoritatively
+            # attached.
+            #
+            # Entry->entry amends only, mirroring the success path: the
+            # cancel + re-execute branch reaches ``_dispatch_new``, which
+            # arms its OWN fold state for this key before it can park, and a
+            # keyed ``strategy.close`` shares its intent key with the parent
+            # entry — popping there would disarm a live, unrelated guard.
+            if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
+                parked_folded = self._flip_folded_entry_dispatches.pop(
+                    new.intent_key, None,
+                )
+                parked_guard = self._flip_fold_guards.pop(new.intent_key, None)
+                if parked_folded is not None or parked_guard is not None:
+                    self._modify_parked_fold_state[new.intent_key] = (
+                        parked_folded, parked_guard,
+                    )
             # The default plugin modify is cancel + re-execute
             # (:meth:`BrokerPlugin.modify_entry` / ``modify_exit``): by the
             # time the REPLACEMENT submission turned ambiguous, the

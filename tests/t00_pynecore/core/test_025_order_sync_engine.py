@@ -413,6 +413,191 @@ def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
     assert b.modify_exit_calls == []
 
 
+def __test_racing_sl_fill_on_a_folded_reversal_closes_the_surplus__():
+    """A still-armed SL filling in flight must not leave the fold's surplus open.
+
+    The MARKET stop-and-reverse fold sizes the reversal as raw + |position|,
+    assuming the venue nets the consumed exposure. When the old position's
+    native SL fills concurrently (it stays armed at the venue until the flip
+    settles), BOTH executions land: the book goes to -2.0 where Pine holds
+    -1.0, and the next Pine-sized exit trips over the mismatch (measured on
+    the Capital.com demo lane, 2026-08-15: fatal full-row guard crash). The
+    engine must detect the double-settle and close the surplus defensively.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    # Pine reverses short with the RAW quantity; the engine folds to 2.0.
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    folded = b.entry_calls[-1].intent
+    assert folded.pine_id == "S" and folded.qty == 2.0
+    s_deal_id = engine.order_mapping["S"][0]
+
+    # The venue's still-armed SL closes the long concurrently...
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    assert pos.size == 0.0
+    assert b.close_calls == []  # nothing over-opened yet
+
+    # ...and the folded entry still fills in FULL: nothing was left to net.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    assert pos.size == -2.0
+
+    assert len(b.close_calls) == 1
+    corrective = b.close_calls[0].intent
+    assert isinstance(corrective, CloseIntent)
+    assert corrective.synthetic_kind == 'defensive_close'
+    assert corrective.side == 'buy'
+    assert corrective.qty == 1.0
+    assert corrective.target_exchange_id == s_deal_id
+
+    # The corrective fill converges the book back onto Pine's -1.0 and must
+    # not re-trigger the guard (its side is the reducing one).
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 48_995.0, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-corr",
+                    fill_id="corr-1"),
+        pine_id=corrective.pine_id,
+    ))
+    assert pos.size == -1.0
+    assert len(b.close_calls) == 1
+
+
+def __test_fold_surplus_corrects_when_the_entry_fill_lands_first__():
+    """Same double-settle, opposite delivery order: entry fill, then the SL."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    assert b.close_calls == []  # fully explained by the netting assumption
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+
+    assert len(b.close_calls) == 1
+    corrective = b.close_calls[0].intent
+    assert corrective.side == 'buy' and corrective.qty == 1.0
+    assert corrective.target_exchange_id == s_deal_id
+
+
+def __test_a_clean_fold_never_dispatches_a_corrective_close__():
+    """Without an external close the fold's fills are fully netted — no-op."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+
+    assert pos.size == -1.0
+    assert b.close_calls == []
+
+
+def __test_a_replayed_sl_fill_does_not_double_the_corrective_close__():
+    """The dedup gate must keep a redelivered SL fill out of the fold ledger."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+
+    sl_fill = replace(
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    )
+    engine._route_event(sl_fill)  # type: ignore[attr-defined]
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    assert len(b.close_calls) == 1
+
+    # WS replay of the same execution: same fill_id, dropped by the gate.
+    engine._route_event(sl_fill)  # type: ignore[attr-defined]
+    assert len(b.close_calls) == 1
+
+
+def __test_partial_fold_fills_correct_the_surplus_in_slices__():
+    """Overshoot accrues incrementally as the folded entry fills in parts."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    # First half of the folded fill is still covered by the raw quantity.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1", event_type='partial', filled_qty=1.0,
+                    remaining_qty=1.0))
+    assert b.close_calls == []
+    # The second half is the surplus.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 48_985.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-2"))
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 1.0
+
+
 def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
     """Retiring on the FIFO frontier must not drop an entry that still holds.
 
@@ -4036,6 +4221,695 @@ def __test_reconcile_clears_open_trades_when_exchange_flat__():
     assert pos.open_trades == []
     assert pos.openprofit == 0.0
     assert pos.open_commission == 0.0
+
+
+def __test_emulated_leg_close_fill_settles_the_defensive_close_marker__():
+    """A per-leg composed coid FILL must settle the marker, not starve it.
+
+    The one-way emulator fans a defensive close across hedge legs under
+    composed ids (``{parent_coid}:{leg_id}``; Bybit's wire charset maps
+    the colon to an underscore), with no ``pine_id`` on the resulting
+    fill. The marker stores the PARENT coid — an exact-match-only lookup
+    never recognises the leg fill, the marker starves, and the
+    stale-pending grace halts a run whose close DID fill (measured on
+    the Bybit demo lane, 2026-08-16, cycle 25).
+    """
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    for wire_sep in (':', '_'):
+        b = MockBroker()
+        engine, pos = _mk_engine(b)
+        pos.size = 1.0
+        pos.open_trades.append(Trade(
+            size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+            entry_price=50_000.0, commission=0.0, entry_comment=None,
+            entry_equity=1_000_000.0,
+        ))
+        engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+            entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-1',
+            close_order_ref=None,
+            pending_since=_time.time(),
+            reject_context=BracketAttachRejectContext(
+                intent_key='Bracket\0Long', position_coid='coid-1',
+                position_side='buy', qty=1.0, symbol=SYMBOL,
+            ),
+            close_client_order_id='CLOSE-COID-1',
+        )
+        fill = _fill_event('sell', 1.0, 50_000.0, pine_id="",
+                           leg=LegType.CLOSE, xchg_id="xchg-leg",
+                           fill_id=f"leg-{wire_sep}")
+        fill = replace(
+            fill,
+            pine_id=None,
+            order=replace(fill.order,
+                          client_order_id=f'CLOSE-COID-1{wire_sep}1'),
+        )
+        engine._route_event(fill)  # type: ignore[attr-defined]
+        assert 'Long' not in engine._pending_defensive_close, \
+            f"leg fill with separator {wire_sep!r} did not settle the marker"
+
+
+def __test_a_foreign_coid_fill_does_not_settle_the_marker__():
+    """Only the marker's own coid (exact or leg-composed) may settle it."""
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref=None,
+        pending_since=_time.time(),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+        close_client_order_id='CLOSE-COID-1',
+    )
+    for foreign in ('CLOSE-COID-1X', 'CLOSE-COID-2_1', 'CLOSE-COID-'):
+        fill = _fill_event('sell', 1.0, 50_000.0, pine_id="",
+                           leg=LegType.CLOSE, xchg_id="xchg-leg",
+                           fill_id=f"f-{foreign}")
+        fill = replace(
+            fill,
+            pine_id=None,
+            order=replace(fill.order, client_order_id=foreign),
+        )
+        engine._route_event(fill)  # type: ignore[attr-defined]
+    assert 'Long' in engine._pending_defensive_close
+
+
+def _mk_fanned_defensive_close_engine(expected_close_qty: float | None,
+                                      with_fifo: bool = True):
+    """Engine holding a long 2.0 with a (possibly fanned) close marker.
+
+    ``with_fifo=False`` reproduces the adopted-position state (size
+    without ``open_trades``) that routes close FILLs through the no-FIFO
+    branch of ``_route_event``.
+    """
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 2.0
+    if with_fifo:
+        pos.open_trades.append(Trade(
+            size=2.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+            entry_price=50_000.0, commission=0.0, entry_comment=None,
+            entry_equity=1_000_000.0,
+        ))
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref=None,
+        pending_since=_time.time(),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=2.0, symbol=SYMBOL,
+        ),
+        close_client_order_id='CLOSE-COID-1',
+        expected_close_qty=expected_close_qty,
+    )
+    return engine, pos
+
+
+def _leg_close_fill(leg: int, qty: float):
+    """A per-leg defensive-close FILL under a composed child coid."""
+    fill = _fill_event('sell', qty, 50_000.0, pine_id="",
+                       leg=LegType.CLOSE, xchg_id=f"xchg-leg-{leg}",
+                       fill_id=f"leg-fill-{leg}")
+    return replace(
+        fill,
+        pine_id=None,
+        order=replace(fill.order, client_order_id=f'CLOSE-COID-1:{leg}'),
+    )
+
+
+def __test_fanned_defensive_close_survives_its_first_leg_fill__():
+    """One leg of a fanned close must not settle the whole close.
+
+    The one-way emulator fans a defensive close across several hedge
+    legs, each its own broker order with its own terminal event. Retiring
+    the marker on the first child would leave a sibling that is still
+    working (or later rejected) without any must-settle record — the
+    unprotected remainder of the position would then stay open silently.
+    """
+    engine, _pos = _mk_fanned_defensive_close_engine(2.0)
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close.get('Long')
+    assert marker is not None, "first leg fill retired the whole close"
+    assert marker.applied_close_qty == 1.0
+    # The shared parent identities must stay out of the settled cache —
+    # they are carried by every child, so caching them would make the
+    # next leg's FILL look like a replay and drop its quantity.
+    assert ('__pyne_defensive_close__coid-1'
+            not in engine._settled_defensive_close_pine_ids)
+
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close, \
+        "the completing leg did not settle the close"
+
+
+def __test_fanned_defensive_close_leg_reject_after_a_filled_leg_halts__():
+    """A sibling leg rejected after another filled must escalate."""
+    engine, _pos = _mk_fanned_defensive_close_engine(2.0)
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+
+    reject = replace(
+        _leg_close_fill(2, 1.0), event_type='rejected', fill_qty=0.0,
+        fill_price=0.0, fill_id="leg-reject-2",
+    )
+    with pytest.raises(BrokerManualInterventionError) as excinfo:
+        engine._route_event(reject)  # type: ignore[attr-defined]
+    assert "Defensive close after bracket attach reject" in str(excinfo.value)
+
+
+def __test_single_order_defensive_close_still_settles_on_its_fill__():
+    """Without a fan-out the one terminal FILL settles the marker."""
+    engine, _pos = _mk_fanned_defensive_close_engine(None)
+
+    engine._route_event(_leg_close_fill(1, 2.0))  # type: ignore[attr-defined]
+
+    assert 'Long' not in engine._pending_defensive_close
+
+
+def __test_fanned_close_leg_without_qty_neither_settles_nor_over_reduces__():
+    """A quantity-less leg terminal must not stand in for the whole fan.
+
+    On the no-FIFO (adopted position) path a terminal ``filled`` without
+    per-segment qty falls back to the marker's recorded close qty. For a
+    fanned close that qty covers ALL legs: applying it on the first
+    child would over-reduce the in-memory position by the siblings'
+    share, and settling the marker on it would drop must-settle
+    protection while those siblings are still working.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0, with_fifo=False)
+
+    blank = replace(_leg_close_fill(1, 1.0), fill_qty=0.0, fill_price=0.0)
+    engine._route_event(blank)  # type: ignore[attr-defined]
+
+    marker = engine._pending_defensive_close.get('Long')
+    assert marker is not None, "a qty-less leg fill settled the whole fan"
+    assert marker.applied_close_qty == 0.0
+    assert pos.size == 2.0, "the fan's parent close qty was applied on one leg"
+
+
+def __test_fanned_close_completes_across_partial_and_terminal_slices__():
+    """Partial slices count toward the fan's applied total.
+
+    A leg that fills in several segments reports only its remainder on
+    the terminal ``filled`` event. Without crediting the ``partial``
+    slices the cumulative total could never reach ``expected_close_qty``,
+    so a fully completed close would stay armed until stale-grace.
+    """
+    engine, _pos = _mk_fanned_defensive_close_engine(2.0)
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _leg_close_fill(1, 0.6), event_type='partial',
+        fill_id='leg-partial-1',
+    ))
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _leg_close_fill(1, 0.4), fill_id='leg-fill-1b',
+    ))
+
+    marker = engine._pending_defensive_close.get('Long')
+    assert marker is not None, "leg 1 settled the whole fan"
+    assert marker.applied_close_qty == 1.0
+
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close, \
+        "the completing leg did not settle the close"
+
+
+def _parent_entry_fill():
+    """The parent ENTRY fill of the defensive close, carrying its COID."""
+    fill = _fill_event('buy', 2.0, 50_000.0, pine_id='Long',
+                       xchg_id='xchg-parent', fill_id='parent-fill')
+    return replace(fill, order=replace(fill.order, client_order_id='coid-1'))
+
+
+def __test_incomplete_fan_leg_keeps_the_parent_entry_fill_alive__():
+    """A mid-fan leg must not neutralise the whole parent ENTRY fill.
+
+    The neutralisation cache is identity-keyed, so it drops the parent's
+    ENTRY fill WHOLE. Seeding it on the first leg of a two-leg fan would
+    discard a legitimate fill while the sibling's share is still open at
+    the broker — the engine would run flat against a live position. The
+    leg's quantity is deferred instead and drained onto the parent fill
+    when it arrives.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0, with_fifo=False)
+    pos.size = 0.0  # the parent ENTRY fill has not routed yet
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close.get('Long')
+    assert marker is not None, "one leg settled the whole fan"
+    assert 'coid-1' not in engine._neutralised_parent_entry_coids, \
+        "an incomplete fan neutralised the parent entry"
+    assert marker.unapplied_partial_qty == 1.0
+    assert marker.applied_close_qty == 1.0
+
+    # The delayed parent fill is applied, then reduced by the leg that
+    # already closed part of it: broker holds 1.0, so must the engine.
+    engine._route_event(_parent_entry_fill())  # type: ignore[attr-defined]
+    assert pos.size == 1.0
+
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert pos.size == 0.0
+    assert 'Long' not in engine._pending_defensive_close, \
+        "the completing leg did not settle the close"
+
+
+def __test_completing_fan_leg_neutralises_the_parent_entry_fill__():
+    """Once the fan is whole the late parent fill must still be dropped.
+
+    The neutralisation contract is unchanged for a COMPLETE fan: every
+    leg landed, so the broker is flat and a delayed parent ENTRY fill
+    would open a phantom trade.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0, with_fifo=False)
+    pos.size = 0.0
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close
+    assert 'coid-1' in engine._neutralised_parent_entry_coids
+
+    engine._route_event(_parent_entry_fill())  # type: ignore[attr-defined]
+    assert pos.size == 0.0, "a late parent fill opened a phantom position"
+
+
+def __test_fan_expected_qty_is_recorded_in_pine_units__():
+    """The fan's target must be comparable with the fills that come back.
+
+    ``CloseFanResult.legs`` carries BROKER-grid volumes (centi-units on a
+    cTrader-like venue, lot-step counts on Capital.com) while
+    ``applied_close_qty`` accumulates Pine-unit fill quantities. Recording
+    the summed leg volumes would leave a fully filled fan permanently
+    short of its target — armed until stale-grace, blocking cleanup and
+    risking a false manual-intervention halt.
+    """
+    from pynecore.core.broker.one_way_emulator import CloseFanResult
+
+    engine, _pos = _mk_fanned_defensive_close_engine(None)
+    intent = CloseIntent(pine_id='__pyne_defensive_close__coid-1',
+                         symbol=SYMBOL, side='sell', qty=2.0)
+    # A 2-unit close on a centi-unit grid: legs report 100+100, the fills
+    # will report 1.0+1.0.
+    fan = CloseFanResult(legs=(("1", 100), ("2", 100)), dispatched_qty=2.0,
+                         shortfall=0.0, skipped=False)
+    engine._record_defensive_close_fan(intent, fan)  # type: ignore[attr-defined]
+    assert engine._pending_defensive_close['Long'].expected_close_qty == 2.0
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' in engine._pending_defensive_close, \
+        "the first leg settled the fan"
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close, \
+        "Pine-unit fills never reached a broker-grid expected quantity"
+
+
+def __test_deferred_fan_qty_is_applied_across_parent_entry_slices__():
+    """A sliced parent ENTRY fill must not over-apply the deferred close.
+
+    The delayed parent entry can arrive in partials. Draining the whole
+    deferred close quantity against the FIRST slice would push
+    ``_position.size`` past zero into a phantom opposite-side position,
+    empty ``open_trades``, and discard the excess — the later slices then
+    rebuild ``open_trades`` to a total that no longer matches ``size``.
+    Only the currently available parent-side exposure may be applied; the
+    rest stays deferred for the next slice.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0, with_fifo=False)
+    pos.size = 0.0  # the parent ENTRY fill has not routed yet
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.unapplied_partial_qty == 1.0
+
+    # First parent slice: only 0.5 of the deferred 1.0 can be applied.
+    slice_1 = _fill_event('buy', 0.5, 50_000.0, pine_id='Long',
+                          xchg_id='xchg-parent', fill_id='parent-slice-1',
+                          event_type='partial', remaining_qty=1.5)
+    slice_1 = replace(
+        slice_1, order=replace(slice_1.order, client_order_id='coid-1'),
+    )
+    engine._route_event(slice_1)  # type: ignore[attr-defined]
+    assert pos.size == 0.0, "the drain pushed the position past flat"
+    assert not pos.open_trades, "a phantom trade survived the drain"
+    marker = engine._pending_defensive_close['Long']
+    assert marker.unapplied_partial_qty == 0.5, \
+        "the un-appliable remainder was discarded instead of deferred"
+
+    # Second parent slice completes the entry; the deferred remainder is
+    # applied against it, so the engine matches the 1.0 the broker holds.
+    slice_2 = _fill_event('buy', 1.5, 50_000.0, pine_id='Long',
+                          xchg_id='xchg-parent', fill_id='parent-slice-2')
+    slice_2 = replace(
+        slice_2, order=replace(slice_2.order, client_order_id='coid-1'),
+    )
+    engine._route_event(slice_2)  # type: ignore[attr-defined]
+    assert pos.size == 1.0
+    assert sum(t.size for t in pos.open_trades) == 1.0, \
+        "open_trades diverged from position.size across the slices"
+    assert engine._pending_defensive_close['Long'].unapplied_partial_qty == 0.0
+
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+    assert pos.size == 0.0
+    assert 'Long' not in engine._pending_defensive_close
+
+
+def __test_fan_settles_when_grid_snapped_fills_undershoot_the_plan__():
+    """A floor-style volume grid makes the fills total less than the plan.
+
+    ``dispatched_qty`` is the PINE-unit close plan, but the broker
+    executes it snapped to its integer volume grid: a floor-style
+    quantizer drops the sub-grid remainder, so the fills legitimately
+    total slightly LESS than the plan. Comparing quantities alone would
+    keep a fully filled fan armed until the stale grace, blocking cleanup
+    and risking a false manual-intervention halt. The dispatched leg
+    COUNT settles it.
+    """
+    from pynecore.core.broker.one_way_emulator import CloseFanResult
+
+    engine, _pos = _mk_fanned_defensive_close_engine(None)
+    intent = CloseIntent(pine_id='__pyne_defensive_close__coid-1',
+                         symbol=SYMBOL, side='sell', qty=2.0)
+    # Plan slices 0.504 + 0.505; a floor x100 grid dispatches 50 + 50,
+    # so the fills come back as 0.50 + 0.50 == 1.00, never 1.009.
+    fan = CloseFanResult(legs=(("1", 50), ("2", 50)), dispatched_qty=1.009,
+                         shortfall=0.0, skipped=False)
+    engine._record_defensive_close_fan(intent, fan)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.expected_close_qty == 1.009
+    assert marker.expected_leg_count == 2
+
+    engine._route_event(_leg_close_fill(1, 0.5))  # type: ignore[attr-defined]
+    assert 'Long' in engine._pending_defensive_close, \
+        "the first leg settled the fan"
+    engine._route_event(_leg_close_fill(2, 0.5))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close, \
+        "a fully filled fan stayed armed on the sub-grid remainder"
+
+
+def __test_a_qty_less_fan_leg_does_not_complete_the_leg_count__():
+    """Only legs that BOOKED quantity may count toward the fan's legs.
+
+    A terminal leg event that applied nothing says nothing about the
+    outstanding sibling quantity — counting it would settle a short fan.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0)
+    engine._pending_defensive_close['Long'] = replace(
+        engine._pending_defensive_close['Long'], expected_leg_count=2,
+    )
+
+    engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
+    assert 'Long' in engine._pending_defensive_close
+    zero_leg = replace(_leg_close_fill(2, 1.0), fill_qty=0.0, fill_price=0.0)
+    engine._route_event(zero_leg)  # type: ignore[attr-defined]
+    assert 'Long' in engine._pending_defensive_close, \
+        "a leg that booked nothing completed the fan's leg count"
+    assert pos.size == 1.0
+
+
+def __test_a_dropped_price_less_slice_disarms_the_fan_leg_count__():
+    """An unbookable slice must not be papered over by the leg count.
+
+    ``record_fill`` discards a slice whose ``fill_price`` is missing even
+    though the broker really executed it, so the local view is short of
+    the real execution. Every leg can still report terminally afterwards
+    — if the leg count settled the fan on that, the marker would retire
+    with the dropped quantity left as phantom exposure. The drop is
+    recorded and disarms the leg-count signal, so the quantity check
+    keeps the marker armed for the stale grace / next reconcile.
+    """
+    engine, pos = _mk_fanned_defensive_close_engine(2.0)
+    engine._pending_defensive_close['Long'] = replace(
+        engine._pending_defensive_close['Long'], expected_leg_count=2,
+    )
+
+    # Leg 1 reports 0.5 without a fill price: nothing may be booked.
+    price_less = replace(
+        _leg_close_fill(1, 0.5), event_type='partial', fill_price=0.0,
+        fill_id='leg-partial-1',
+    )
+    engine._route_event(price_less)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.applied_close_qty == 0.0, "a price-less slice was booked"
+    assert marker.dropped_close_qty == 0.5
+    assert pos.size == 2.0
+
+    # Both legs now report terminally with valid prices: 0.5 + 1.0 = 1.5
+    # applied against a 2.0 fan, but two of two legs booked quantity.
+    engine._route_event(  # type: ignore[attr-defined]
+        replace(_leg_close_fill(1, 0.5), fill_id='leg-fill-1b'),
+    )
+    engine._route_event(_leg_close_fill(2, 1.0))  # type: ignore[attr-defined]
+
+    assert 'Long' in engine._pending_defensive_close, \
+        "the leg count settled a fan with an unbooked slice"
+    assert engine._pending_defensive_close['Long'].applied_close_qty == 1.5
+
+
+def __test_a_corrected_redelivery_discharges_the_dropped_slice__():
+    """A price-less slice redelivered with a price must re-arm the fan.
+
+    An unbookable fill's id is deliberately kept OUT of the seen-set so
+    the broker can redeliver the same execution with a corrected price.
+    Once that redelivery books the quantity, nothing is missing any more:
+    the drop ledger has to be discharged, otherwise the leg-count signal
+    stays disabled forever and an off-grid fan (grid-snapped fills total
+    less than the Pine-unit plan) never settles.
+    """
+    from pynecore.core.broker.one_way_emulator import CloseFanResult
+
+    engine, pos = _mk_fanned_defensive_close_engine(None)
+    intent = CloseIntent(pine_id='__pyne_defensive_close__coid-1',
+                         symbol=SYMBOL, side='sell', qty=2.0)
+    # Off-grid plan: the fills can only ever total 1.0 against a 1.009 plan.
+    fan = CloseFanResult(legs=(("1", 50), ("2", 50)), dispatched_qty=1.009,
+                         shortfall=0.0, skipped=False)
+    engine._record_defensive_close_fan(intent, fan)  # type: ignore[attr-defined]
+
+    # Leg 1 reports 0.25 without a fill price: nothing may be booked.
+    price_less = replace(
+        _leg_close_fill(1, 0.25), event_type='partial', fill_price=0.0,
+        fill_id='leg-1-slice-a',
+    )
+    engine._route_event(price_less)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.dropped_close_qty == 0.25
+    assert marker.dropped_fill_slices == (('leg-1-slice-a', 0.25),)
+
+    # The very same slice is redelivered price-less once more: it must not
+    # be counted twice.
+    engine._route_event(price_less)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.dropped_close_qty == 0.25, \
+        "a redelivered price-less slice was ledgered twice"
+
+    # Now the corrected redelivery arrives with the same fill id.
+    corrected = replace(price_less, fill_price=50_000.0)
+    engine._route_event(corrected)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['Long']
+    assert marker.applied_close_qty == 0.25
+    assert marker.dropped_close_qty == 0.0, \
+        "the corrected redelivery left the drop ledger armed"
+    assert marker.dropped_fill_slices == ()
+
+    # Leg 1's remainder and leg 2 report terminally: 1.0 of the 1.009 plan
+    # is applied, but both legs booked — the leg count settles the fan.
+    engine._route_event(  # type: ignore[attr-defined]
+        replace(_leg_close_fill(1, 0.25), fill_id='leg-1-slice-b'),
+    )
+    engine._route_event(_leg_close_fill(2, 0.5))  # type: ignore[attr-defined]
+    assert 'Long' not in engine._pending_defensive_close, \
+        "a fully booked off-grid fan stayed armed on a discharged drop"
+    assert pos.size == 1.0
+
+
+def __test_fills_during_a_parked_amend_reach_the_stashed_fold_guard__():
+    """An ambiguous entry->entry amend must not lose the fold ledger.
+
+    The guard is retired from the live ledger while the amend is
+    unresolved (a correction dispatched against the raw replacement's
+    legitimate exposure would be the wrong order), but the fills that
+    land meanwhile still have to be counted: a ``'rejected'`` resolution
+    proves the original folded order was live all along and re-arms the
+    guard.
+    """
+    from pynecore.core.broker.sync_engine import _FlipFoldGuard
+
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    guard = _FlipFoldGuard(
+        entry_intent_key='L',
+        entry_side='sell',
+        folded_qty=2.0,
+        consumed_qty=1.0,
+        consumed_entry_ids=frozenset({'Long'}),
+    )
+    engine._modify_parked_fold_state['L'] = (None, guard)
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 50_000.0, pine_id='L', fill_id='folded-1'),
+    )
+
+    assert guard.entry_filled_qty == 2.0, \
+        "fill during the parked amend was lost from the stashed ledger"
+    # No corrective order may be dispatched while the amend is unresolved.
+    assert not b.close_calls
+
+
+def __test_rejected_parked_amend_corrects_the_accumulated_overshoot__(tmp_path):
+    """The re-armed guard must still find a dispatch anchor.
+
+    A ``'rejected'`` resolution proves the original folded order was live
+    all along, so the overshoot booked while the amend was unresolved has
+    to be closed. The resolution branch tears the envelope down before
+    re-arming the guard — without capturing it first the correction finds
+    no dispatch anchor and only logs the divergence.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.sync_engine import _FlipFoldGuard
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Live entry dispatch — its envelope + mapping are the only
+        # anchor the corrective close can target.
+        pos.entry_orders["L"] = _entry_order("L", 2.0)
+        engine.sync(BAR_TS)
+        assert "L" in engine._envelopes
+        parked_coid = engine._envelopes["L"].client_order_id('e')
+
+        # A fold that over-opened by 1.0: the venue could only net 1.0 of
+        # the 2.0 folded quantity because the consumed position was closed
+        # externally, yet the folded entry filled in full.
+        guard = _FlipFoldGuard(
+            entry_intent_key='L',
+            entry_side='buy',
+            folded_qty=2.0,
+            consumed_qty=1.0,
+            consumed_entry_ids=frozenset({'Short'}),
+        )
+        guard.entry_filled_qty = 2.0
+        guard.external_closed_qty = 1.0
+        engine._modify_parked_fold_state['L'] = (None, guard)
+
+        ctx.record_park(
+            parked_coid, 'L', kind='modify',
+            order_ids=list(engine._order_mapping.get('L') or []),
+        )
+        ctx.record_resolution(parked_coid, 'rejected')
+        engine._consume_plugin_resolutions()
+
+        assert engine._flip_fold_guards.get('L') is guard, \
+            "the rejected amend did not re-arm the stashed fold guard"
+        assert b.close_calls, \
+            "the accumulated overshoot was not corrected — the dispatch " \
+            "anchor died with the envelope"
+        assert b.close_calls[-1].intent.qty == 1.0
+        assert guard.corrected_qty == 1.0
+
+
+def __test_restart_between_fan_legs_keeps_the_defensive_close_armed__(tmp_path):
+    """A crash between fan legs must not settle the whole close.
+
+    ``fill_observed`` is flipped by the FIRST leg's FILL, so replay must
+    not classify the marker as a settled close: seeding the SHARED parent
+    identities would drop the outstanding sibling's FILL as a replay, and
+    the residual-cleanup retry would retire the marker (losing the
+    sibling-reject escalation) while real close quantity is still in
+    flight.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src",
+            script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-1', symbol=SYMBOL, side='buy', qty=2.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=2.0,
+            extras={'kind': 'position'},
+        )
+        marker = PendingDefensiveClose(
+            entry_id='Long',
+            close_intent_key='__pyne_defensive_close__coid-1',
+            close_order_ref=None,
+            pending_since=_time.time(),
+            reject_context=BracketAttachRejectContext(
+                intent_key='Bracket\0Long', position_coid='coid-1',
+                position_side='buy', qty=2.0, symbol=SYMBOL,
+            ),
+            close_client_order_id='CLOSE-COID-1',
+            fill_observed=True,
+            fill_exchange_order_id='xchg-leg-1',
+            expected_close_qty=2.0,
+            applied_close_qty=1.0,
+            settled_leg_order_ids=('xchg-leg-1',),
+        )
+        row = ctx.get_order('coid-1')
+        extras = dict(row.extras or {}) if row is not None else {}
+        extras['defensive_close_pending'] = marker.to_extras_dict()
+        ctx.upsert_order('coid-1', extras=extras)
+
+        b = MockBroker()
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(),  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        engine._replay_pending_defensive_closes()
+
+        assert engine.pending_defensive_close.get('Long') is not None, \
+            "replay retired a fan whose sibling legs are still outstanding"
+        assert ('__pyne_defensive_close__coid-1'
+                not in engine._settled_defensive_close_pine_ids)
+        assert ('CLOSE-COID-1'
+                not in engine._settled_defensive_close_client_order_ids)
+        # The leg that already filled stays deduped; its sibling does not.
+        assert engine._is_duplicate_defensive_close_fill(_leg_close_fill(1, 1.0))
+        assert not engine._is_duplicate_defensive_close_fill(_leg_close_fill(2, 1.0))
+
+        # The post-FILL finalization must not retire the marker either.
+        engine._retry_residual_cleanup_after_transient_fill()
+        assert 'Long' in engine.pending_defensive_close
 
 
 def __test_reconcile_pending_defensive_close_within_grace_does_not_halt__():

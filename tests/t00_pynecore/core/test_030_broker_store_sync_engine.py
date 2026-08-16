@@ -39,7 +39,10 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
-from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
+from pynecore.types.strategy import (
+    ADOPTED_STARTUP_EXTRA_KEY,
+    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
+)
 
 
 SYMBOL = "BTCUSDT"
@@ -2117,6 +2120,55 @@ def __test_startup_ownership_excludes_adopted_startup_rows__(
         assert pos.size == 0.01, (
             "only the run's own filled slice is owned — the adopted foreign "
             "leg must not inflate the ownership clamp"
+        )
+        assert pos.sign == 1.0
+        ctx.close()
+
+
+def __test_startup_ownership_subtracts_retired_journal_exposure__(
+        tmp_path: Path,
+) -> None:
+    """A partially closed entry owns only its venue-remaining slice.
+
+    Some venues execute a close under their OWN close order id — never a
+    journal row of the run — so the plugin books the closed quantity into the
+    entry row's ``journal_exposure_retired`` extras counter instead of
+    touching the monotone ``filled_qty`` execution watermark. Ownership
+    reconstruction must subtract that counter (clamped into
+    ``[0, filled_qty]``), or a restart over a partially closed position
+    re-adopts exposure the venue no longer holds.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order(
+            "own-entry", symbol=SYMBOL, side="buy", qty=0.02,
+            state="confirmed", pine_entry_id="L", filled_qty=0.02,
+            extras={"kind": "position",
+                    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY: 0.01},
+        )
+        # An overshooting counter clamps to zero contribution, never flips
+        # the row's sign in the owned sum.
+        ctx.upsert_order(
+            "over-retired", symbol=SYMBOL, side="sell", qty=0.03,
+            state="confirmed", pine_entry_id="S", filled_qty=0.03,
+            extras={"kind": "position",
+                    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY: 0.05},
+        )
+        broker = _PositionMockBroker(
+            position=ExchangePosition(
+                symbol=SYMBOL, side="long", size=0.01, entry_price=1_900.0,
+                unrealized_pnl=0.0, liquidation_price=None,
+                leverage=1.0, margin_mode="isolated",
+            ),
+        )
+        engine, pos = _mk_engine(broker, ctx)
+
+        engine.reconcile()  # startup adoption
+
+        assert pos.size == 0.01, (
+            "the retired slice was already closed on the venue — only the "
+            "remaining 0.01 is owned"
         )
         assert pos.sign == 1.0
         ctx.close()

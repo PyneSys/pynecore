@@ -112,7 +112,15 @@ class CloseFanResult:
     """Outcome of one fanned-out close, for the caller's return shaping / audit.
 
     :ivar legs: ``(leg_id, broker-grid volume)`` pairs actually dispatched, in
-        FIFO order. Empty when nothing was open or the close was skipped.
+        FIFO order. Empty when nothing was open or the close was skipped. The
+        volumes are BROKER-grid integers (cTrader centi-units, Capital.com
+        lot-step counts, ...) — never comparable with a Pine-unit fill
+        quantity; use ``dispatched_qty`` for that.
+    :ivar dispatched_qty: Pine-unit quantity the dispatched legs cover — the
+        summed FIFO plan slices, in the SAME unit as
+        :attr:`~pynecore.core.broker.models.OrderEvent.fill_qty`, so the
+        caller can compare it with the fills that come back. ``0.0`` when
+        nothing was dispatched.
     :ivar shortfall: Pine-unit quantity the open legs could not cover (the
         broker holds less than Pine believes). ``0.0`` in the normal case; a
         positive value is the caller's signal to log, not halt.
@@ -122,6 +130,7 @@ class CloseFanResult:
         ``skipped=False``, which means the symbol was already flat.
     """
     legs: tuple[tuple[str, int], ...]
+    dispatched_qty: float
     shortfall: float
     skipped: bool
 
@@ -224,13 +233,18 @@ class OneWayEmulator:
         pos = aggregate_positions(intent.symbol, legs)
         if pos is None or pos.side == 'flat':
             # Nothing open, or offsetting legs net to flat — benign no-op.
-            return CloseFanResult(legs=(), shortfall=0.0, skipped=False)
+            return CloseFanResult(
+                legs=(), dispatched_qty=0.0, shortfall=0.0, skipped=False,
+            )
         # CloseIntent.side is the close direction ("sell" closes a long); the
         # legs to reduce sit on the opposite side of the book.
         leg_side = 'buy' if intent.side == 'sell' else 'sell'
         closes, shortfall = select_legs_for_close(intent.qty, legs, leg_side)
         if not closes:
-            return CloseFanResult(legs=(), shortfall=shortfall, skipped=False)
+            return CloseFanResult(
+                legs=(), dispatched_qty=0.0, shortfall=shortfall,
+                skipped=False,
+            )
         await self._reject_unsupported_partial_closes(
             closes, legs, symbol=intent.symbol,
             intent_key=intent.intent_key, port=port,
@@ -243,9 +257,16 @@ class OneWayEmulator:
         )
         if not dispatched:
             # Every slice rounded below the broker grid — skip, do not halt.
-            return CloseFanResult(legs=(), shortfall=shortfall, skipped=True)
+            return CloseFanResult(
+                legs=(), dispatched_qty=0.0, shortfall=shortfall, skipped=True,
+            )
         return CloseFanResult(
-            legs=tuple(dispatched), shortfall=shortfall, skipped=False,
+            legs=tuple(dispatched),
+            # Pine units, NOT the broker-grid volumes above: the caller
+            # compares this with the fill quantities the legs report back,
+            # and those arrive in Pine units on every venue.
+            dispatched_qty=round(sum(close.qty for close in closes), 12),
+            shortfall=shortfall, skipped=False,
         )
 
     async def run_reversal(

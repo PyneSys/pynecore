@@ -86,6 +86,9 @@ class _FakePort:
         # Toggle: when True, every amend_bracket raises the ambiguous-timeout
         # error, modelling a clear whose disposition the broker never confirmed.
         self.fail_amend_unknown = False
+        # Broker volume grid: 1 keeps the identity quantizer most tests
+        # rely on, 100 models a centi-unit venue (cTrader-like).
+        self.volume_scale = 1
         self.closed: list[tuple[str, str, int, str]] = []
         self.placed: list[tuple[str, float]] = []
         self.amended: list[tuple[str, str, float | None, float | None, float | None, str]] = []
@@ -99,7 +102,8 @@ class _FakePort:
         return [leg for leg in self._legs if leg.symbol == symbol]
 
     async def get_volume_quantizer(self, symbol: str):
-        return lambda u: int(u)
+        scale = self.volume_scale
+        return lambda u: int(u * scale)
 
     async def close_leg(self, symbol: str, leg_id: str, volume: int, coid: str) -> None:
         if self._fail_close_leg is not None:
@@ -191,7 +195,9 @@ def __test_run_close_flat_is_noop__():
     port = _FakePort([])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_close(_close_env("sell", 1.0), port))
-    assert res == CloseFanResult(legs=(), shortfall=0.0, skipped=False)
+    assert res == CloseFanResult(
+        legs=(), dispatched_qty=0.0, shortfall=0.0, skipped=False,
+    )
     assert port.closed == []
 
 
@@ -202,6 +208,28 @@ def __test_run_close_below_grid_skips_without_order__():
     res = _run(eng.run_close(_close_env("sell", 0.4), port))
     assert res.skipped is True
     assert port.closed == []
+
+
+def __test_run_close_reports_dispatched_qty_in_pine_units__():
+    """``dispatched_qty`` stays in Pine units on a non-identity volume grid.
+
+    ``legs`` carries the broker's integer grid volumes (centi-units here),
+    but the caller compares the fan's size against Pine-unit fill
+    quantities — so the result must expose the plan's Pine total, not the
+    scaled leg volumes.
+    """
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    port.volume_scale = 100
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_close(_close_env("sell", 3.0), port))
+    assert res.legs == (("10", 200), ("11", 100))
+    assert res.dispatched_qty == 3.0
+    # A broker-holds-less plan reports only what the legs could cover.
+    port2 = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    port2.volume_scale = 100
+    res2 = _run(eng.run_close(_close_env("sell", 3.0), port2))
+    assert res2.dispatched_qty == 1.0 and res2.shortfall == 2.0
 
 
 def __test_run_close_shortfall_surfaced_not_halted__():

@@ -28,6 +28,21 @@ run's exposure into ``_position`` — the very cross-run double count the clamp
 exists to prevent.
 """
 
+JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY = "journal_exposure_retired"
+"""``OrderRow.extras`` counter of entry exposure already closed back on the venue.
+
+An entry row's ``filled_qty`` is a MONOTONE cumulative-execution watermark — the
+PUSH / reconcile / recovery de-dup paths all compare the venue's cumulative
+``executedVolume`` against it, so a partial close of the position must never
+decrement it. Plugins whose close fills do not land as separate journal rows
+(cTrader books a close under the venue's own close order id, which is never a
+row of ours) instead accumulate the closed quantity here, on the entry row the
+close reduced. Run-ownership reconstruction
+(:meth:`OrderSyncEngine._durable_owned_signed_size`) subtracts it, clamped into
+``[0, filled_qty]``, so the owned net reflects the venue's remaining exposure
+while the watermark semantics of ``filled_qty`` stay intact.
+"""
+
 
 class QtyType(StrLiteral):
     ...

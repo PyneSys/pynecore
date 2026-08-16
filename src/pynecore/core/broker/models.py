@@ -1006,10 +1006,13 @@ class PendingDefensiveClose:
         qty (which would double-subtract the partial slices already
         accounted for).
     :ivar unapplied_partial_qty: Cumulative ``fill_qty`` from no-FIFO
-        defensive-close ``partial`` events that the engine could NOT
-        apply to :attr:`OrderSyncEngine._position.size` because the
-        parent ENTRY fill had not yet arrived (``_position.size ==
-        0.0``). Tracked separately from :attr:`partial_filled_qty` so
+        defensive-close events that the engine could NOT apply to
+        :attr:`OrderSyncEngine._position.size` because the parent ENTRY
+        fill had not yet arrived (``_position.size == 0.0``) — every
+        ``partial``, plus the terminal event of a leg that leaves a
+        fanned close INCOMPLETE (that parent is not neutralised, so its
+        fill still has to be booked and reduced).
+        Tracked separately from :attr:`partial_filled_qty` so
         the terminal computation does not believe the slice was
         already booked. When the parent ENTRY ``filled`` / ``partial``
         event finally routes through
@@ -1068,6 +1071,92 @@ class PendingDefensiveClose:
         produced no FIFO closures (no-FIFO / degenerate path) or when
         the marker is replayed from an older schema; the retry path
         falls back to ``marker.entry_id`` in that case.
+    :ivar expected_close_qty: Total quantity the close was actually
+        dispatched for when the one-way emulator fanned it across more
+        than one hedge leg, in PINE units (``CloseFanResult`` reports it
+        as ``dispatched_qty``; its ``legs`` volumes sit on the broker's
+        integer grid and are not comparable with fill quantities) and
+        already net of a broker-holds-less shortfall. Each leg is
+        a separate broker order with its own terminal event, so the
+        first leg FILL proves nothing about its siblings: while
+        :attr:`applied_close_qty` is short of this value the marker
+        stays armed (and the shared parent identities stay out of the
+        settled-duplicate caches) so a sibling that is later rejected
+        still escalates. ``None`` for a single-order close — the
+        marker then settles on its one terminal FILL as before.
+    :ivar applied_close_qty: Cumulative close quantity the broker has
+        reported against this marker — the single authoritative counter
+        for fan completion. Every booked slice is credited when it is
+        observed: ``partial`` events (which carry a leg's intermediate
+        segments), terminal ``filled`` events, and slices deferred on
+        :attr:`unapplied_partial_qty` while the parent entry fill is
+        still missing (the later drain does NOT credit them again). A
+        slice the engine drops without booking anything (the
+        ``record_fill`` gate of positive qty AND price on the FIFO path,
+        a zero-qty event on the no-FIFO path) is NOT credited, so a short
+        total keeps the marker armed.
+    :ivar settled_leg_order_ids: Broker-side ``order.id`` of every fan
+        leg whose FILL was already applied to this marker. Only
+        populated for a fanned close (``expected_close_qty is not
+        None``), where the shared parent identities must stay OUT of the
+        settled-duplicate caches until the last leg lands — so the only
+        durable per-leg dedup identity is the leg's own order id.
+        Startup replay seeds
+        :attr:`OrderSyncEngine._settled_defensive_close_order_refs` from
+        this tuple for an incomplete fan, keeping a delayed WS /
+        polled-orders replay of an already-applied leg out of
+        :meth:`BrokerPosition.record_fill` while the remaining legs are
+        still outstanding.
+    :ivar expected_leg_count: Number of legs the fan actually dispatched
+        (``len(CloseFanResult.legs)``), ``0`` for a single-order close.
+        A second, quantity-independent completion signal for
+        :attr:`expected_close_qty`: that value is the PINE-unit plan sum,
+        while the broker executes the plan snapped to its own integer
+        volume grid, so the fills can total slightly less than the plan
+        (a floor-style quantizer drops the sub-grid remainder). The
+        quantity check alone would then never be satisfied and the marker
+        would stay armed to the stale grace even though every dispatched
+        leg filled. Once :attr:`settled_leg_order_ids` reaches this count
+        every dispatched leg has reported its terminal FILL, so the fan is
+        complete regardless of the residual quantity difference.
+    :ivar booked_leg_count: How many fan legs have reported a terminal
+        event that actually BOOKED quantity against this marker. Compared
+        with :attr:`expected_leg_count` by
+        :meth:`OrderSyncEngine._is_defensive_close_fan_incomplete`. Legs
+        whose terminal event carried no quantity are deliberately NOT
+        counted: they say nothing about the outstanding sibling quantity
+        the marker exists to protect.
+    :ivar dropped_close_qty: Cumulative close quantity the broker reported
+        but the engine could NOT book — a ``partial`` slice with positive
+        ``fill_qty`` and a missing/zero ``fill_price``, which
+        :meth:`BrokerPosition.record_fill` discards. Such a slice makes the
+        local view short of the broker's real execution, and the leg-count
+        completion signal cannot see it (every leg may still report
+        terminally). While this is non-zero
+        :meth:`OrderSyncEngine._is_defensive_close_fan_incomplete` therefore
+        ignores :attr:`booked_leg_count` and falls back to the quantity
+        signal, keeping the marker armed so the stale grace or the next
+        reconcile escalates the divergence instead of silently retiring it.
+        Only STILL-UNRESOLVED drops are counted: a corrected redelivery of
+        the same execution subtracts its quantity again (see
+        :attr:`dropped_fill_slices`).
+    :ivar dropped_fill_slices: The still-unresolved drops behind
+        :attr:`dropped_close_qty`, as ``(fill_id, qty)`` pairs. A dropped
+        slice is NOT necessarily permanent: the engine deliberately keeps
+        an unbookable fill's id out of
+        :attr:`OrderSyncEngine._seen_fill_ids`
+        (:meth:`OrderSyncEngine._is_duplicate_fill`) so the broker can
+        redeliver the same execution with a corrected price, and that
+        redelivery books the quantity after all. When it arrives, the
+        matching pair is removed here and its quantity is subtracted from
+        :attr:`dropped_close_qty`, re-arming the leg-count completion
+        signal — without this the aggregate would stay positive forever
+        and keep a fully settled off-grid fan armed to the stale grace.
+        Slices dropped without a ``fill_id`` cannot be discharged (nothing
+        identifies their redelivery) and are counted in the aggregate
+        only, which stays conservative. The pairs also make the drop
+        bookkeeping idempotent: a redelivered price-less slice with an
+        already-recorded id is not counted twice.
     """
     entry_id: str
     close_intent_key: str
@@ -1082,6 +1171,13 @@ class PendingDefensiveClose:
     pre_close_position_size: float | None = None
     fifo_closed_entry_ids: tuple[str, ...] = ()
     unapplied_partial_qty: float = 0.0
+    expected_close_qty: float | None = None
+    applied_close_qty: float = 0.0
+    settled_leg_order_ids: tuple[str, ...] = ()
+    expected_leg_count: int = 0
+    booked_leg_count: int = 0
+    dropped_close_qty: float = 0.0
+    dropped_fill_slices: tuple[tuple[str, float], ...] = ()
 
     def to_extras_dict(self) -> dict:
         """Serialize to a JSON-compatible dict for ``extras`` storage."""
@@ -1099,6 +1195,15 @@ class PendingDefensiveClose:
             'pre_close_position_size': self.pre_close_position_size,
             'fifo_closed_entry_ids': list(self.fifo_closed_entry_ids),
             'unapplied_partial_qty': self.unapplied_partial_qty,
+            'expected_close_qty': self.expected_close_qty,
+            'applied_close_qty': self.applied_close_qty,
+            'settled_leg_order_ids': list(self.settled_leg_order_ids),
+            'expected_leg_count': self.expected_leg_count,
+            'booked_leg_count': self.booked_leg_count,
+            'dropped_close_qty': self.dropped_close_qty,
+            'dropped_fill_slices': [
+                [fill_id, qty] for fill_id, qty in self.dropped_fill_slices
+            ],
         }
 
     @classmethod
@@ -1205,6 +1310,118 @@ class PendingDefensiveClose:
                 f"PendingDefensiveClose.unapplied_partial_qty must be "
                 f"non-negative: {data!r}"
             )
+        expected_close_qty_raw = data.get('expected_close_qty')
+        if expected_close_qty_raw is None:
+            expected_close_qty: float | None = None
+        elif isinstance(expected_close_qty_raw, (int, float)):
+            expected_close_qty = float(expected_close_qty_raw)
+            if expected_close_qty <= 0.0:
+                raise ValueError(
+                    f"PendingDefensiveClose.expected_close_qty must be "
+                    f"positive or None: {data!r}"
+                )
+        else:
+            raise ValueError(
+                f"PendingDefensiveClose.expected_close_qty must be "
+                f"numeric or None: {data!r}"
+            )
+        applied_close_qty_raw = data.get('applied_close_qty', 0.0)
+        if not isinstance(applied_close_qty_raw, (int, float)):
+            raise ValueError(
+                f"PendingDefensiveClose.applied_close_qty must be "
+                f"numeric: {data!r}"
+            )
+        applied_close_qty = float(applied_close_qty_raw)
+        if applied_close_qty < 0.0:
+            raise ValueError(
+                f"PendingDefensiveClose.applied_close_qty must be "
+                f"non-negative: {data!r}"
+            )
+        settled_leg_order_ids_raw = data.get('settled_leg_order_ids', [])
+        if not isinstance(settled_leg_order_ids_raw, (list, tuple)):
+            raise ValueError(
+                f"PendingDefensiveClose.settled_leg_order_ids must be "
+                f"a list or tuple: {data!r}"
+            )
+        settled_leg_order_ids_list: list[str] = []
+        for leg_order_id in settled_leg_order_ids_raw:
+            if not isinstance(leg_order_id, str):
+                raise ValueError(
+                    f"PendingDefensiveClose.settled_leg_order_ids items "
+                    f"must be strings: {data!r}"
+                )
+            settled_leg_order_ids_list.append(leg_order_id)
+        expected_leg_count_raw = data.get('expected_leg_count', 0)
+        if isinstance(expected_leg_count_raw, bool) or not isinstance(
+                expected_leg_count_raw, int,
+        ):
+            raise ValueError(
+                f"PendingDefensiveClose.expected_leg_count must be "
+                f"an int: {data!r}"
+            )
+        if expected_leg_count_raw < 0:
+            raise ValueError(
+                f"PendingDefensiveClose.expected_leg_count must be "
+                f"non-negative: {data!r}"
+            )
+        booked_leg_count_raw = data.get('booked_leg_count', 0)
+        if isinstance(booked_leg_count_raw, bool) or not isinstance(
+                booked_leg_count_raw, int,
+        ):
+            raise ValueError(
+                f"PendingDefensiveClose.booked_leg_count must be "
+                f"an int: {data!r}"
+            )
+        if booked_leg_count_raw < 0:
+            raise ValueError(
+                f"PendingDefensiveClose.booked_leg_count must be "
+                f"non-negative: {data!r}"
+            )
+        dropped_close_qty_raw = data.get('dropped_close_qty', 0.0)
+        if not isinstance(dropped_close_qty_raw, (int, float)):
+            raise ValueError(
+                f"PendingDefensiveClose.dropped_close_qty must be "
+                f"numeric: {data!r}"
+            )
+        dropped_close_qty = float(dropped_close_qty_raw)
+        if dropped_close_qty < 0.0:
+            raise ValueError(
+                f"PendingDefensiveClose.dropped_close_qty must be "
+                f"non-negative: {data!r}"
+            )
+        dropped_fill_slices_raw = data.get('dropped_fill_slices', [])
+        if not isinstance(dropped_fill_slices_raw, (list, tuple)):
+            raise ValueError(
+                f"PendingDefensiveClose.dropped_fill_slices must be "
+                f"a list or tuple: {data!r}"
+            )
+        dropped_fill_slices_list: list[tuple[str, float]] = []
+        for slice_payload in dropped_fill_slices_raw:
+            if (not isinstance(slice_payload, (list, tuple))
+                    or len(slice_payload) != 2):
+                raise ValueError(
+                    f"PendingDefensiveClose.dropped_fill_slices items must "
+                    f"be (fill_id, qty) pairs: {data!r}"
+                )
+            slice_fill_id, slice_qty = slice_payload
+            if not isinstance(slice_fill_id, str):
+                raise ValueError(
+                    f"PendingDefensiveClose.dropped_fill_slices fill ids "
+                    f"must be strings: {data!r}"
+                )
+            if isinstance(slice_qty, bool) or not isinstance(
+                    slice_qty, (int, float),
+            ):
+                raise ValueError(
+                    f"PendingDefensiveClose.dropped_fill_slices quantities "
+                    f"must be numeric: {data!r}"
+                )
+            if slice_qty < 0.0:
+                raise ValueError(
+                    f"PendingDefensiveClose.dropped_fill_slices quantities "
+                    f"must be non-negative: {data!r}"
+                )
+            dropped_fill_slices_list.append((slice_fill_id, float(slice_qty)))
         return cls(
             entry_id=entry_id,
             close_intent_key=close_intent_key,
@@ -1219,6 +1436,13 @@ class PendingDefensiveClose:
             pre_close_position_size=pre_close_position_size,
             fifo_closed_entry_ids=tuple(fifo_closed_entry_ids_list),
             unapplied_partial_qty=unapplied_partial_qty,
+            expected_close_qty=expected_close_qty,
+            applied_close_qty=applied_close_qty,
+            settled_leg_order_ids=tuple(settled_leg_order_ids_list),
+            expected_leg_count=expected_leg_count_raw,
+            booked_leg_count=booked_leg_count_raw,
+            dropped_close_qty=dropped_close_qty,
+            dropped_fill_slices=tuple(dropped_fill_slices_list),
         )
 
 
