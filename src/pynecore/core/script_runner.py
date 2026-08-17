@@ -1630,6 +1630,7 @@ class ScriptRunner:
                     # ``symbol`` keeps the marker for ``_resolve_security_data``
                     # (which needs it to route a same-symbol request to the chart
                     # feed).
+                    # noinspection PyProtectedMember
                     from ..lib.ticker import _split_chart_type
                     base_symbol, chart_type = _split_chart_type(symbol)
                     # Resolve actual timeframe
@@ -3221,6 +3222,7 @@ class ScriptRunner:
         :raises ValueError: If no data found and ignore_invalid_symbol is not True
         """
         from dataclasses import replace as dc_replace
+        # noinspection PyProtectedMember
         from ..lib.ticker import _split_chart_type
         result: dict[str, str | PluginSymbol | None] = {}
         for sec_id, ctx in contexts.items():

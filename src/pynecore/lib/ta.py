@@ -23,7 +23,10 @@ from ..core.series import SeriesImpl as _SeriesImpl
 from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_bound,
                                  upper_bound as _tol_upper_bound)
 
-# We need to use this kind of import to make transformer work
+# We need to use this kind of import to make transformer work. ``_last_close`` is
+# deliberately outside ``lib.__all__``: that list is the public Pine surface, and this
+# is a runner internal, like ``_time`` or ``_script``.
+# noinspection PyProtectedMember
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
                           max_bars_back, math as lib_math, _last_close)
 
@@ -2069,6 +2072,14 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     af: Persistent[float] = start  # Current acceleration factor
     sar_val: Persistent[float] = na_float  # Current SAR value
     ep: Persistent[float] = na_float  # Extreme point
+
+    # Unlike ``tr``, the previous bars here are read from this function's OWN window,
+    # which advances per CALL -- measured (probe m571): a ta.sar() inside an `if` is na
+    # on TradingView for the whole run, even when only every 100th bar is skipped,
+    # while a gated ta.atr() in the same block keeps producing values. The first gated
+    # call has no history yet, so ``high[1]`` is na and the recurrence below carries
+    # that na forward for good, which is exactly what TradingView shows. Reading the
+    # runner's global ``lib._last_*`` windows instead would invent values there.
 
     # Initialize on second bar
     if bar_index == 1:

@@ -290,6 +290,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
             from pynecore.transformers.function_isolation import FunctionIsolationTransformer
             from pynecore.transformers.module_property import ModulePropertyTransformer
+            from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
             from pynecore.transformers.series import SeriesTransformer
             from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
             from pynecore.transformers.unused_series_detector import UnusedSeriesDetectorTransformer
@@ -333,6 +334,13 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             transformed = PersistentSeriesTransformer().visit(transformed)
             transformed = LibrarySeriesTransformer().visit(transformed)
             transformed = ModulePropertyTransformer().visit(transformed)
+            # Stateful ta builtin variables become one unconditional per-bar
+            # evaluation at the top of main (TradingView keeps a single engine
+            # series per builtin variable, gates notwithstanding); must follow
+            # the property transformer (bare reads are calls by now) and precede
+            # the series/persistent/isolation passes so the hoisted call site is
+            # anchored like any hand-written statement
+            transformed = TaVariableHoistTransformer().visit(transformed)
             transformed = ClosureArgumentsTransformer().visit(transformed)
             transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
             transformed = SeriesTransformer(slot_layout).visit(transformed)

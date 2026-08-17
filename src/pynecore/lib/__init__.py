@@ -121,6 +121,8 @@ hlcc4: float = Source("hlcc4")
 # close[1] there, a global series that advances regardless, and this is that series'
 # one-deep window. ``_last_close_bar`` is the bar it was rolled for: the live path
 # republishes the same bar on every tick and must not roll the window with it.
+# Not every builtin wants this: ``ta.sar`` deliberately keeps its own call-gated
+# window, because TradingView's own sar dies on na when a call is skipped.
 _last_close: float = _math.nan
 _last_close_bar: int | None = None
 
