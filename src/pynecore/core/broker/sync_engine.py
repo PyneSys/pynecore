@@ -84,6 +84,8 @@ from pynecore.core.broker.models import (
     CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
+    BrokerNativeFailsafeExternalEditEvent,
+    BrokerNativeFailsafeUnavailableEvent,
     EntryDeferredCancelDispositionPendingEvent,
     EntryIntent,
     ExchangeOrder,
@@ -97,6 +99,7 @@ from pynecore.core.broker.models import (
     ManualInterventionRequiredEvent,
     OcaPartialFillPolicy,
     OcaType,
+    NativeFailsafeStateTransitionEvent,
     OrderEvent,
     OrderType,
     PartialBracketCancelTentativeDegradedEvent,
@@ -8719,7 +8722,35 @@ class OrderSyncEngine:
         ))
 
     def _emit_broker_event(self, event: BrokerEvent) -> None:
-        """Forward a structured broker event to the registered sink, if any."""
+        """Forward a structured broker event to the registered sink, if any.
+
+        The §2.6.7 fail-safe lifecycle events additionally go to the broker
+        log unconditionally: no runner installs a sink in live runs, so
+        without this the only trace of a degradation is the per-signal
+        entry-block warning — a fail-safe that silently degraded and froze a
+        symbol's entry gate for three live cycles was only diagnosable from
+        that secondary symptom.
+        """
+        if isinstance(event, NativeFailsafeStateTransitionEvent):
+            _blog_warning(
+                "native fail-safe %s -> %s on %s (parent %r): %s",
+                event.from_state, event.to_state, event.symbol,
+                event.parent_entry_dispatch_ref, event.reason,
+            )
+        elif isinstance(event, BrokerNativeFailsafeUnavailableEvent):
+            _blog_warning(
+                "native fail-safe DEGRADED on %s (parent %r): %s — entry "
+                "gate engaged until the protection is verified present",
+                event.symbol, event.parent_entry_dispatch_ref, event.reason,
+            )
+        elif isinstance(event, BrokerNativeFailsafeExternalEditEvent):
+            _blog_warning(
+                "native fail-safe ownership -> UNKNOWN on %s (parent %r): "
+                "observed stop %s != desired %s with no PUT in flight — "
+                "manual reset required",
+                event.symbol, event.parent_entry_dispatch_ref,
+                event.actual_level, event.desired_level,
+            )
         if self._broker_event_sink is None:
             _log.info("broker event (no sink): %r", event)
             return

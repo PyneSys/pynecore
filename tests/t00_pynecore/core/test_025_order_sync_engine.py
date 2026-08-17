@@ -11947,3 +11947,43 @@ def __test_strategy_order_market_reduce_is_not_folded_on_margin__():
 
     assert len(b.entry_calls) == 1
     assert b.entry_calls[0].intent.qty == 3.0
+
+
+def __test_failsafe_lifecycle_events_reach_the_broker_log_without_a_sink__(caplog):
+    """§2.6.7 fail-safe lifecycle events must be visible in the broker log.
+
+    Live runs install no broker_event_sink, so these events used to vanish
+    into the module logger — a degradation that froze a symbol's entry gate
+    for three live cycles was only diagnosable from the per-signal
+    entry-block warnings (task #114).
+    """
+    import logging
+    from pynecore.core.broker.models import (
+        BrokerNativeFailsafeExternalEditEvent,
+        BrokerNativeFailsafeUnavailableEvent,
+        NativeFailsafeStateTransitionEvent,
+    )
+
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine._emit_broker_event(NativeFailsafeStateTransitionEvent(
+            parent_entry_dispatch_ref='ref-1', symbol=SYMBOL,
+            from_state='healthy', to_state='degraded',
+            reason='confirmation-timeout',
+        ))
+        engine._emit_broker_event(BrokerNativeFailsafeUnavailableEvent(
+            parent_entry_dispatch_ref='ref-1', symbol=SYMBOL,
+            reason='confirmation-timeout',
+        ))
+        engine._emit_broker_event(BrokerNativeFailsafeExternalEditEvent(
+            parent_entry_dispatch_ref='ref-1', symbol=SYMBOL,
+            desired_level=101.0, actual_level=None,
+        ))
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any('healthy -> degraded' in m for m in messages)
+    assert any('DEGRADED on' in m and 'entry gate engaged' in m
+               for m in messages)
+    assert any('ownership -> UNKNOWN' in m for m in messages)
