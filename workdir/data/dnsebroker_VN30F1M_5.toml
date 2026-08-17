@@ -42,6 +42,16 @@ maker_fee = 0.00000000
 
 # Opening hours
 [[opening_hours]]
+day = 0
+start = "09:00:00"
+end = "11:30:00"
+
+[[opening_hours]]
+day = 0
+start = "13:00:00"
+end = "14:45:00"
+
+[[opening_hours]]
 day = 1
 start = "09:00:00"
 end = "11:30:00"
@@ -78,21 +88,15 @@ end = "11:30:00"
 
 [[opening_hours]]
 day = 4
-start = "13:00:00"
-end = "14:45:00"
-
-[[opening_hours]]
-day = 5
-start = "09:00:00"
-end = "11:30:00"
-
-[[opening_hours]]
-day = 5
 start = "13:00:00"
 end = "14:45:00"
 
 # Session starts
 [[session_starts]]
+day = 0
+time = "09:00:00"
+
+[[session_starts]]
 day = 1
 time = "09:00:00"
 
@@ -106,14 +110,14 @@ time = "09:00:00"
 
 [[session_starts]]
 day = 4
-time = "09:00:00"
-
-[[session_starts]]
-day = 5
 time = "09:00:00"
 
 # Session ends
 [[session_ends]]
+day = 0
+time = "14:45:00"
+
+[[session_ends]]
 day = 1
 time = "14:45:00"
 
@@ -127,10 +131,6 @@ time = "14:45:00"
 
 [[session_ends]]
 day = 4
-time = "14:45:00"
-
-[[session_ends]]
-day = 5
 time = "14:45:00"
 
 # Effective-dated session history (optional).

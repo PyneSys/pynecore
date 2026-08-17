@@ -36,6 +36,10 @@ _DNSE_TO_TV = {"1": "1", "3": "3", "5": "5", "15": "15", "30": "30",
 #: the lunch break — the 17-bars-per-day figure confirms these boundaries.
 _MORNING = (time(9, 0), time(11, 30))
 _AFTERNOON = (time(13, 0), time(14, 45))
+#: HOSE stocks: the 09:00-09:15 ATO auction produces NO OHLC rows — the first row
+#: is the 09:15 auction print (measured HPG 2026-08-14), so the stock morning
+#: opens 09:15; a 09:00 open would trip the feed-staleness watchdog daily.
+_MORNING_STOCK = (time(9, 15), time(11, 30))
 
 
 @dataclass
@@ -257,11 +261,16 @@ class DNSEProvider(ProviderPlugin[DNSEConfig]):
         symbol = (self.symbol or "").upper()
         derivative = self.market_type == "DERIVATIVE"
 
+        morning = _MORNING if derivative else _MORNING_STOCK
         opening_hours, session_starts, session_ends = [], [], []
-        for day in range(1, 6):  # Mon-Fri
-            opening_hours.append(SymInfoInterval(day=day, start=_MORNING[0], end=_MORNING[1]))
+        # Python weekday() numbering (Mon=0 .. Fri=4) — the runtime convention
+        # (core/syminfo.py builds days via date.weekday(); lib/session.py compares
+        # against lib._datetime.weekday()). day=1..5 here shifted every lookup one
+        # weekday and left Mondays matching NOTHING (rubycell/pynecore#30).
+        for day in range(5):
+            opening_hours.append(SymInfoInterval(day=day, start=morning[0], end=morning[1]))
             opening_hours.append(SymInfoInterval(day=day, start=_AFTERNOON[0], end=_AFTERNOON[1]))
-            session_starts.append(SymInfoSession(day=day, time=_MORNING[0]))
+            session_starts.append(SymInfoSession(day=day, time=morning[0]))
             session_ends.append(SymInfoSession(day=day, time=_AFTERNOON[1]))
 
         # DNSE quotes stocks in THOUSANDS of VND (HPG 22,150 VND -> 22.15), so

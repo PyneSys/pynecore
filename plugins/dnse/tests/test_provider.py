@@ -288,8 +288,10 @@ def __test_update_symbol_info_sessions_populated_mon_through_fri__(fake_client):
 
     info = p.update_symbol_info()
 
-    assert [s.day for s in info.session_starts] == [1, 2, 3, 4, 5], "one session-start per weekday"
-    assert [s.day for s in info.session_ends] == [1, 2, 3, 4, 5], "one session-end per weekday"
+    # Python weekday() numbering, Mon=0 .. Fri=4 — the runtime convention. The
+    # previous [1..5] expectation encoded the #30 bug (Mondays matched nothing).
+    assert [s.day for s in info.session_starts] == [0, 1, 2, 3, 4], "one session-start per weekday"
+    assert [s.day for s in info.session_ends] == [0, 1, 2, 3, 4], "one session-end per weekday"
     assert all(s.time.hour == 9 and s.time.minute == 0 for s in info.session_starts), (
         "morning session must start at 09:00"
     )
@@ -557,3 +559,40 @@ def __test_get_expected_price_returns_empty_dict_on_non_200_or_non_dict__(fake_c
     p = _wired(fake, symbol="VN30F1M")
 
     assert p.get_expected_price() == {}, "non-200 or non-dict must degrade to an empty dict"
+
+
+# --- update_symbol_info: session tables (rubycell/pynecore#30) ---
+
+def __test_symbol_info_derivative_sessions_match_measured_venue__(fake_client):
+    fake = fake_client(
+        get_instruments=(200, {"data": [{"symbolType": "VN30F1M", "symbol": "41I1G8000"}]}),
+        get_security_definition=(200, [{"securityGroupId": "FU"}]))
+    p = _wired(fake, symbol="VN30F1M")
+
+    si = p.update_symbol_info()
+
+    assert all(s.time.strftime("%H:%M") == "09:00" for s in si.session_starts), \
+        "derivative morning opens 09:00 (first venue row of the day)"
+    assert all(s.time.strftime("%H:%M") == "14:45" for s in si.session_ends), \
+        "session ends at the 14:45 ATC print"
+    monday = sorted((o.start.strftime("%H:%M"), o.end.strftime("%H:%M"))
+                    for o in si.opening_hours if o.day == 0)
+    assert monday == [("09:00", "11:30"), ("13:00", "14:45")]
+
+
+def __test_symbol_info_stock_morning_opens_at_ato_print__(fake_client):
+    """HOSE stocks: 09:00-09:15 ATO produces no OHLC rows (measured HPG
+    2026-08-14, first row 09:15) — a 09:00 open would false-alarm the
+    staleness watchdog for 15 minutes every morning."""
+    fake = fake_client(
+        get_security_definition=(200, [{"securityGroupId": "ST", "basicPrice": 22.15}]))
+    p = _wired(fake, symbol="HPG")
+
+    si = p.update_symbol_info()
+
+    assert si.type == "stock"
+    assert all(s.time.strftime("%H:%M") == "09:15" for s in si.session_starts)
+    assert all(s.time.strftime("%H:%M") == "14:45" for s in si.session_ends)
+    monday = sorted((o.start.strftime("%H:%M"), o.end.strftime("%H:%M"))
+                    for o in si.opening_hours if o.day == 0)
+    assert monday == [("09:15", "11:30"), ("13:00", "14:45")]
