@@ -11,22 +11,22 @@ Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards 
 conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> Live-L1-Tnn,
 `[F] Fn` -> Live-L3-Fnn.)
 
-| ID | What it does | Live status (2026-08-17) |
+| ID | What it does | Live status |
 |----|--------------|--------------------------|
 | **Live-L0-Gate** | venue-semantics probe; MUST pass before every live run | ✅ passes (run per session) |
-| **Live-L1-T01-LongLimitCancel** | long limit −5% place→cancel | ✅ 08-13 |
-| **Live-L1-T02-ShortLimitCancel** | short limit +5% place→cancel | ✅ 08-13 |
-| **Live-L1-T03-LimitWithStopExit** | limit + `exit(stop)`; both cancelled explicitly | ✅ 08-13 |
-| **Live-L1-T04-OcaCancelEntryOnly** | OCA entry+exit, cancel entry only | ✅ 08-13/14 (found #19) |
-| **Live-L1-T05-NativeOcoCancelEntryOnly** | native-OCO exit, cancel entry only | ✅ 08-14 (forced cascade revert) |
-| **Live-L1-T06-AmendNormal** | amend on the NORMAL book | ✅ 08-14 |
-| **Live-L1-T07-AmendConditional500** | conditional amend → HTTP 500 park (#18) | ✅ 08-14 |
-| **Live-L1-T08-CancelAll** | `cancel_all()` across both books | ✅ 08-14 |
-| **Live-L1-T09-OrderFn** | `strategy.order()` routing | ✅ 08-14 |
-| **Live-L1-T10-DualStrategy** | two engines, one account (`run_t10_dual.sh`) | ✅ 08-14 |
-| **Live-L1-T11-OcaCancelMember** | `oca.cancel` ×3 across books; cancel one member — siblings must remain | ❌ **NOT RUN** |
-| **Live-L1-T12-OcaReduce** | `oca.reduce` pair rests full qty | ❌ **NOT RUN** |
-| **Live-L1-T13-OcaNone** | `oca.none` shared name = independent | ❌ **NOT RUN** |
+| **Live-L1-T01-LongLimitCancel** | long limit −5% place→cancel | ✅ 08-13, re-verified 08-17 |
+| **Live-L1-T02-ShortLimitCancel** | short limit +5% place→cancel | ✅ 08-13, re-verified 08-17 |
+| **Live-L1-T03-LimitWithStopExit** | limit + `exit(stop)`; both cancelled explicitly | ✅ 08-13, re-verified 08-17 |
+| **Live-L1-T04-OcaCancelEntryOnly** | OCA entry+exit, cancel entry only | ✅ 08-13/14/17 (found #19; post-revert the exit orphan is EXPECTED — clean it manually) |
+| **Live-L1-T05-NativeOcoCancelEntryOnly** | native-OCO exit, cancel entry only | ✅ 08-14/17 (forced cascade revert; orphan now expected) |
+| **Live-L1-T06-AmendNormal** | amend on the NORMAL book | ✅ 08-14, re-verified 08-17 |
+| **Live-L1-T07-AmendConditional500** | conditional amend → HTTP 500 park (#18) | ✅ 08-14, re-verified 08-17 |
+| **Live-L1-T08-CancelAll** | `cancel_all()` across both books | ✅ 08-14, re-verified 08-17 |
+| **Live-L1-T09-OrderFn** | `strategy.order()` routing | ✅ 08-14, re-verified 08-17 |
+| **Live-L1-T10-DualStrategy** | two engines, one account (`run_t10_dual.sh`) | ✅ 08-14, re-verified 08-17 |
+| **Live-L1-T11-OcaCancelMember** | `oca.cancel` ×3 across books; cancel one member — siblings must remain | ✅ **08-17** — cancel of one member swept nothing; cross-book group intact |
+| **Live-L1-T12-OcaReduce** | `oca.reduce` pair rests full qty | ✅ **08-17** — both rested full qty; cancel_all swept both |
+| **Live-L1-T13-OcaNone** | `oca.none` shared name = independent | ✅ **08-17** — sibling untouched by member cancel |
 | **Live-L2-SingleFill** | one market fill → flatten (`l2_fill_flatten`) | ✅ 08-12 |
 | **Live-L2-BracketFill** | fill + TP/SL bracket → flatten (`l2b_…`) | ⚠️ 08-12 partial |
 | **Live-L3-F01-LongMarket** … **F02-ShortMarket** | market fills | ❌ NOT RUN |
@@ -113,6 +113,12 @@ near leg fills and the far leg must be CANCELLED.
 - Two id shapes: NORMAL book = int ids, conditional book = string ids; a cancel against
   the wrong book 404s (`RESOURCE_NOT_FOUND`) — that's how the plugin probes.
 - Exits reach the venue **before** their entry fills.
+- **Detail reads can be stale/non-monotonic** — a Canceled order was served as `New`
+  by a lagging replica ~10 s later (08-17); re-read before concluding a cancel failed.
+  DNSE's cancel is **idempotent**: 200+record on an already-Canceled conditional, not
+  `CO-ORD-013`.
+- **A SIGKILLed run leaves a heartbeat row**; the engine's single-instance guard then
+  blocks relaunch ("Active run_id already exists") — resume with `--run-label <x>`.
 
 ## History / older docs
 

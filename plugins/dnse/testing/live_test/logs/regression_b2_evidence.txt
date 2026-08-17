@@ -1,0 +1,206 @@
+[2026-08-17 09:44:55+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-17 09:44:55+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-17 09:44:56+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-17 09:44:56+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-17 09:44:56+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-17 09:43:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-17 09:43:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=4 ===
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [L1] TEST 5 PLACE id=T5 limit=1788.7 + X5 tp=1976.9/sl=1769.8 -> NATIVE OCO — first Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY:  
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='T5' qty=1.0 type=limit limit=1788.6
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='T5' qty=1.0 type=limit limit=1788.6 -> 
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=1977.0 sl=1769.8
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=1977.0 sl=1769.8 -> 
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] event CREATED id=72836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:46:00+0700] bar:    503 INFO     [BROKER] event CREATED id=72826 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-17 09:47:00+0700] bar:    504 INFO     [L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after
+[2026-08-17 09:47:00+0700] bar:    504 INFO     [L1] TEST 5 DONE — state 4->5
+[2026-08-17 09:47:00+0700] bar:    504 INFO     [BROKER] cancelling CANCEL id='T5'
+[2026-08-17 09:47:00+0700] bar:    504 INFO     [BROKER] event CANCELLED id=72826 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-17 09:48:00+0700] bar:    505 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=72826 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry)
+[2026-08-17 09:48:00+0700] bar:    505 INFO     [L1] TEST 6 PLACE id=T6 LONG limit=1789.9 (-5%) — NEXT bar re-issues at 1799.3 (-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on    
+[2026-08-17 09:48:00+0700] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='T6' qty=1.0 type=limit limit=1789.8
+[2026-08-17 09:48:00+0700] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='T6' qty=1.0 type=limit limit=1789.8 -> 
+[2026-08-17 09:48:00+0700] bar:    505 INFO     [BROKER] event CREATED id=75556 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[2026-08-17 09:49:00+0700] bar:    506 INFO     [L1] TEST 6 AMEND id=T6 -> limit 1799.3 — expect 
+[2026-08-17 09:49:00+0700] bar:    506 INFO     [BROKER] modifying ENTRY BUY id='T6' qty=1.0 type=limit limit=1789.8 -> ENTRY BUY id='T6' qty=1.0 type=limit limit=1799.3
+[2026-08-17 09:50:00+0700] bar:    507 INFO     [L1] TEST 6 CANCEL id=T6 (post-amend)
+[2026-08-17 09:50:00+0700] bar:    507 INFO     [L1] TEST 6 DONE — state 5->6
+[2026-08-17 09:50:00+0700] bar:    507 INFO     [BROKER] cancelling CANCEL id='T6'
+[2026-08-17 09:50:00+0700] bar:    507 INFO     [BROKER] event CANCELLED id=75556 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[2026-08-17 09:51:00+0700] bar:    508 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=75556 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry)
+[2026-08-17 09:51:00+0700] bar:    508 INFO     [L1] TEST 7 PLACE id=T7 buy-STOP 1976.1 (+5%) — NEXT bar re-issues at 1966.7 (+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a 
+[2026-08-17 09:51:00+0700] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='T7' qty=1.0 type=stop stop=1976.1
+[2026-08-17 09:51:00+0700] bar:    508 INFO     [BROKER] dispatched ENTRY BUY id='T7' qty=1.0 type=stop stop=1976.1 -> 
+[2026-08-17 09:51:00+0700] bar:    508 INFO     [BROKER] event CREATED id=da17ekg6p09g1n1vgac0 side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[2026-08-17 09:52:00+0700] bar:    509 INFO     [L1] TEST 7 AMEND id=T7 -> stop 1966.7 — expect code=REMOTE_SERVER_ERROR http=500 -> park+verify (#18). KEY: the run must continue, and the order must  
+[2026-08-17 09:52:00+0700] bar:    509 INFO     [BROKER] modifying ENTRY BUY id='T7' qty=1.0 type=stop stop=1976.1 -> ENTRY BUY id='T7' qty=1.0 type=stop stop=1966.7
+[2026-08-17 09:52:00+0700] bar:    509 WARNING  [BROKER] amend code=REMOTE_SERVER_ERROR http=500 -> park+verify | order=da17ekg6p09g1n1vgac0 intent=T7 msg="Error in backend service"
+[2026-08-17 09:52:00+0700] bar:    509 WARNING  [BROKER] modify parked (unknown disposition) for ENTRY BUY id='T7' qty=1.0 type=stop stop=1966.7: DNSE disposition unknown on amend: REMOTE_SERVER_ERROR
+[2026-08-17 09:53:00+0700] bar:    510 INFO     [L1] TEST 7 CANCEL id=T7 (post-500) — proves a parked amend does not wedge the order: it must still cancel cleanly
+[2026-08-17 09:53:00+0700] bar:    510 INFO     [L1] TEST 7 DONE — state 6->7
+[2026-08-17 09:53:00+0700] bar:    510 INFO     [BROKER] cancelling CANCEL id='T7'
+[2026-08-17 09:53:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=da17ekg6p09g1n1vgac0 side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[2026-08-17 09:53:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=72836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:54:00+0700] bar:    511 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=da17ekg6p09g1n1vgac0 side=buy qty=1.0 filled=0.0 pine='T7' leg=entry)
+[2026-08-17 09:54:00+0700] bar:    511 ERROR    [BROKER] unexpected cancel for intent X5|T5 (CANCELLED id=72836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp)
+[2026-08-17 09:54:00+0700] bar:    511 ERROR    [BROKER] sync engine quarantined: Bot-owned order cancelled unexpectedly on the venue: coid=None ref='72836' intent='X5\x00T5' (intent_key=None,        
+[2026-08-17 09:54:00+0700] bar:    511 INFO     [L1] TEST 8 PLACE T8a limit=1788.6 AND T8b stop=1976.8 — two ids across BOTH books; next bar strategy.cancel_all(), never before fired live
+[2026-08-17 09:54:00+0700] bar:    511 WARNING  [BROKER] entry dispatch ENTRY BUY id='T8a' qty=1.0 type=limit limit=1788.5 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 09:54:00+0700] bar:    511 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T8a'); signal dropped, no broker call.
+[2026-08-17 09:54:00+0700] bar:    511 WARNING  [BROKER] entry dispatch ENTRY BUY id='T8b' qty=1.0 type=stop stop=1976.9 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:    
+[2026-08-17 09:54:00+0700] bar:    511 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T8b'); signal dropped, no broker call.
+[2026-08-17 09:54:00+0700] bar:    511 INFO     [BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=1977.0 sl=1769.8
+[2026-08-17 09:54:00+0700] bar:    511 INFO     [BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=1977.0 sl=1769.8 -> 
+[2026-08-17 09:54:00+0700] bar:    511 INFO     [BROKER] event CREATED id=84836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:55:00+0700] bar:    512 INFO     [L1] TEST 8 strategy.cancel_all() — BOTH T8a (NORMAL) and T8b (STOP) must go; venue book must be clear of ours
+[2026-08-17 09:55:00+0700] bar:    512 INFO     [L1] TEST 8 DONE — state 7->8
+[2026-08-17 09:55:00+0700] bar:    512 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:55:00+0700] bar:    512 ERROR    [BROKER] cancel
+[2026-08-17 09:55:00+0700] bar:    512 WARNING  [BROKER] cancel of X5|T5 did not land (execute_cancel returned False); parked for per-sync retry — the diff will not adopt or re-dispatch the key until 
+[2026-08-17 09:55:00+0700] bar:    512 INFO     [BROKER] event CANCELLED id=84836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:56:00+0700] bar:    513 ERROR    [BROKER] unexpected cancel for intent X5|T5 (CANCELLED id=84836 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp)
+[2026-08-17 09:56:00+0700] bar:    513 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:56:00+0700] bar:    513 ERROR    [BROKER] cancel
+[2026-08-17 09:56:00+0700] bar:    513 ERROR    [BROKER] cancel
+[2026-08-17 09:56:00+0700] bar:    513 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 09:56:00+0700] bar:    513 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:56:00+0700] bar:    513 ERROR    [BROKER] cancel
+[2026-08-17 09:56:00+0700] bar:    513 ERROR    [BROKER] cancel
+[2026-08-17 09:56:00+0700] bar:    513 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 09:57:00+0700] bar:    514 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:57:00+0700] bar:    514 ERROR    [BROKER] cancel
+[2026-08-17 09:57:00+0700] bar:    514 ERROR    [BROKER] cancel
+[2026-08-17 09:57:00+0700] bar:    514 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 09:58:00+0700] bar:    515 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:58:00+0700] bar:    515 ERROR    [BROKER] cancel
+[2026-08-17 09:58:00+0700] bar:    515 ERROR    [BROKER] cancel
+[2026-08-17 09:58:00+0700] bar:    515 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 09:59:00+0700] bar:    516 INFO     [L1] TEST 9 PLACE via strategy.order() LONG limit=1788.5 — order() has never touched the broker; expect identical NORMAL-LO routing to entry()
+[2026-08-17 09:59:00+0700] bar:    516 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:59:00+0700] bar:    516 ERROR    [BROKER] cancel
+[2026-08-17 09:59:00+0700] bar:    516 ERROR    [BROKER] cancel
+[2026-08-17 09:59:00+0700] bar:    516 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 09:59:00+0700] bar:    516 WARNING  [BROKER] entry dispatch ENTRY BUY id='T9' qty=1.0 type=limit limit=1788.5 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:59:00+0700] bar:    516 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T9'); signal dropped, no broker call.
+[2026-08-17 10:00:00+0700] bar:    517 INFO     [L1] TEST 9 CANCEL id=T9
+[2026-08-17 10:00:00+0700] bar:    517 INFO     [L1] TEST 9 DONE — state 8->9
+[2026-08-17 10:00:00+0700] bar:    517 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:00:00+0700] bar:    517 ERROR    [BROKER] cancel
+[2026-08-17 10:00:00+0700] bar:    517 ERROR    [BROKER] cancel
+[2026-08-17 10:00:00+0700] bar:    517 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:01:00+0700] bar:    518 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:01:00+0700] bar:    518 ERROR    [BROKER] cancel
+[2026-08-17 10:01:00+0700] bar:    518 ERROR    [BROKER] cancel
+[2026-08-17 10:01:00+0700] bar:    518 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:02:00+0700] bar:    519 INFO     [L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit=1787.9 (NORMAL) + Gb limit=1976.1 (NORMAL) + Gc stop=1976.1 (CONDITIONAL) — next bar cancels    
+[2026-08-17 10:02:00+0700] bar:    519 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:02:00+0700] bar:    519 ERROR    [BROKER] cancel
+[2026-08-17 10:02:00+0700] bar:    519 ERROR    [BROKER] cancel
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] entry dispatch ENTRY BUY id='Ga' qty=1.0 type=limit limit=1787.9 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Ga'); signal dropped, no broker call.
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] entry dispatch ENTRY SELL id='Gb' qty=1.0 type=limit limit=1976.1 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gb'); signal dropped, no broker call.
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] entry dispatch ENTRY BUY id='Gc' qty=1.0 type=stop stop=1976.1 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-17 10:02:00+0700] bar:    519 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gc'); signal dropped, no broker call.
+[2026-08-17 10:03:00+0700] bar:    520 INFO     [L1] TEST 11 CANCEL Ga ONLY — 
+[2026-08-17 10:03:00+0700] bar:    520 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:03:00+0700] bar:    520 ERROR    [BROKER] cancel
+[2026-08-17 10:03:00+0700] bar:    520 ERROR    [BROKER] cancel
+[2026-08-17 10:03:00+0700] bar:    520 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:03:00+0700] bar:    520 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gb'); signal dropped, no broker call.
+[2026-08-17 10:03:00+0700] bar:    520 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gc'); signal dropped, no broker call.
+[2026-08-17 10:04:00+0700] bar:    521 INFO     [L1] TEST 11 CANCEL Gb and Gc (the survivors) — book must then be clear of the whole g11 group
+[2026-08-17 10:04:00+0700] bar:    521 INFO     [L1] TEST 11 DONE — state 9->10
+[2026-08-17 10:04:00+0700] bar:    521 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:04:00+0700] bar:    521 ERROR    [BROKER] cancel
+[2026-08-17 10:04:00+0700] bar:    521 ERROR    [BROKER] cancel
+[2026-08-17 10:04:00+0700] bar:    521 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:05:00+0700] bar:    522 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:05:00+0700] bar:    522 ERROR    [BROKER] cancel
+[2026-08-17 10:05:00+0700] bar:    522 ERROR    [BROKER] cancel
+[2026-08-17 10:05:00+0700] bar:    522 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:06:00+0700] bar:    523 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:06:00+0700] bar:    523 ERROR    [BROKER] cancel
+[2026-08-17 10:06:00+0700] bar:    523 ERROR    [BROKER] cancel
+[2026-08-17 10:06:00+0700] bar:    523 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:07:00+0700] bar:    524 INFO     [L1] TEST 12 PLACE oca.reduce x2: Ra limit=1788.8 + Rb stop=1977.2 — BOTH must rest FULL qty=1 at the venue (reduce acts only on a fill); next bar      
+[2026-08-17 10:07:00+0700] bar:    524 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:07:00+0700] bar:    524 ERROR    [BROKER] cancel
+[2026-08-17 10:07:00+0700] bar:    524 ERROR    [BROKER] cancel
+[2026-08-17 10:07:00+0700] bar:    524 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:07:00+0700] bar:    524 WARNING  [BROKER] entry dispatch ENTRY BUY id='Ra' qty=1.0 type=limit limit=1788.8 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 10:07:00+0700] bar:    524 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Ra'); signal dropped, no broker call.
+[2026-08-17 10:07:00+0700] bar:    524 WARNING  [BROKER] entry dispatch ENTRY BUY id='Rb' qty=1.0 type=stop stop=1977.2 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-17 10:07:00+0700] bar:    524 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Rb'); signal dropped, no broker call.
+[2026-08-17 10:08:00+0700] bar:    525 INFO     [L1] TEST 12 cancel_all — Ra and Rb must both go
+[2026-08-17 10:08:00+0700] bar:    525 INFO     [L1] TEST 12 DONE — state 10->11
+[2026-08-17 10:08:00+0700] bar:    525 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:08:00+0700] bar:    525 ERROR    [BROKER] cancel
+[2026-08-17 10:08:00+0700] bar:    525 ERROR    [BROKER] cancel
+[2026-08-17 10:08:00+0700] bar:    525 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:09:00+0700] bar:    526 INFO     [L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit=1788.8 + Nb limit=1977 — next bar cancels ONLY Na; Nb must be untouched (none = independent)
+[2026-08-17 10:09:00+0700] bar:    526 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:09:00+0700] bar:    526 ERROR    [BROKER] cancel
+[2026-08-17 10:09:00+0700] bar:    526 ERROR    [BROKER] cancel
+[2026-08-17 10:09:00+0700] bar:    526 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:09:00+0700] bar:    526 WARNING  [BROKER] entry dispatch ENTRY BUY id='Na' qty=1.0 type=limit limit=1788.7 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 10:09:00+0700] bar:    526 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Na'); signal dropped, no broker call.
+[2026-08-17 10:09:00+0700] bar:    526 WARNING  [BROKER] entry dispatch ENTRY SELL id='Nb' qty=1.0 type=limit limit=1977.1 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 10:09:00+0700] bar:    526 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Nb'); signal dropped, no broker call.
+[2026-08-17 10:10:00+0700] bar:    527 INFO     [L1] TEST 13 CANCEL Na ONLY — Nb must be untouched (oca.none)
+[2026-08-17 10:10:00+0700] bar:    527 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:10:00+0700] bar:    527 ERROR    [BROKER] cancel
+[2026-08-17 10:10:00+0700] bar:    527 ERROR    [BROKER] cancel
+[2026-08-17 10:10:00+0700] bar:    527 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:10:00+0700] bar:    527 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Nb'); signal dropped, no broker call.
+[2026-08-17 10:11:00+0700] bar:    528 INFO     [L1] TEST 13 CANCEL Nb (the survivor)
+[2026-08-17 10:11:00+0700] bar:    528 INFO     [L1] TEST 13 DONE — state 11->12
+[2026-08-17 10:11:00+0700] bar:    528 INFO     [L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-08-17 10:11:00+0700] bar:    528 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:11:00+0700] bar:    528 ERROR    [BROKER] cancel
+[2026-08-17 10:11:00+0700] bar:    528 ERROR    [BROKER] cancel
+[2026-08-17 10:11:00+0700] bar:    528 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:12:00+0700] bar:    529 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:12:00+0700] bar:    529 ERROR    [BROKER] cancel
+[2026-08-17 10:12:00+0700] bar:    529 ERROR    [BROKER] cancel
+[2026-08-17 10:12:00+0700] bar:    529 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:13:00+0700] bar:    530 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:13:00+0700] bar:    530 ERROR    [BROKER] cancel
+[2026-08-17 10:13:00+0700] bar:    530 ERROR    [BROKER] cancel
+[2026-08-17 10:13:00+0700] bar:    530 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:14:00+0700] bar:    531 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:14:00+0700] bar:    531 ERROR    [BROKER] cancel
+[2026-08-17 10:14:00+0700] bar:    531 ERROR    [BROKER] cancel
+[2026-08-17 10:14:00+0700] bar:    531 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:15:00+0700] bar:    532 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:15:00+0700] bar:    532 ERROR    [BROKER] cancel
+[2026-08-17 10:15:00+0700] bar:    532 ERROR    [BROKER] cancel
+[2026-08-17 10:15:00+0700] bar:    532 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:16:00+0700] bar:    533 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:16:00+0700] bar:    533 ERROR    [BROKER] cancel
+[2026-08-17 10:16:00+0700] bar:    533 ERROR    [BROKER] cancel
+[2026-08-17 10:16:00+0700] bar:    533 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:17:00+0700] bar:    534 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:17:00+0700] bar:    534 ERROR    [BROKER] cancel
+[2026-08-17 10:17:00+0700] bar:    534 ERROR    [BROKER] cancel
+[2026-08-17 10:17:00+0700] bar:    534 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:18:00+0700] bar:    535 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:18:00+0700] bar:    535 ERROR    [BROKER] cancel
+[2026-08-17 10:18:00+0700] bar:    535 ERROR    [BROKER] cancel
+[2026-08-17 10:18:00+0700] bar:    535 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:19:00+0700] bar:    536 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:19:00+0700] bar:    536 ERROR    [BROKER] cancel
+[2026-08-17 10:19:00+0700] bar:    536 ERROR    [BROKER] cancel
+[2026-08-17 10:19:00+0700] bar:    536 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:20:00+0700] bar:    537 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:20:00+0700] bar:    537 ERROR    [BROKER] cancel
+[2026-08-17 10:20:00+0700] bar:    537 ERROR    [BROKER] cancel
+[2026-08-17 10:20:00+0700] bar:    537 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:21:00+0700] bar:    538 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 10:21:00+0700] bar:    538 ERROR    [BROKER] cancel
+[2026-08-17 10:21:00+0700] bar:    538 ERROR    [BROKER] cancel
+[2026-08-17 10:21:00+0700] bar:    538 WARNING  [BROKER] forced cancel retry for 'X5|T5' returned False (still pending); will retry next sync
+[2026-08-17 10:22:21+0700] bar:    538 INFO     [BROKER] run stopped (completed) position=1 equity=424,629,778.00 VND
