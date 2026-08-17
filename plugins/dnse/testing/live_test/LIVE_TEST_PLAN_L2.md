@@ -1,5 +1,9 @@
 # DNSE broker — LIVE TEST LEVEL 2 (first real fill)
 
+> **HISTORICAL DOCUMENT.** The canonical test registry and the ONLY test names to use
+> (`Live-L<level>-<case>`, e.g. `Live-L1-T11-OcaCancelMember`) live in
+> [`live_test/README.md`](README.md). This file predates that naming and is kept for history.
+
 **Gated on Level 1.** Do NOT start this until `live1`/`live2`/`live3` (place → rest →
 cancel, no fills — see `LIVE_TEST_PLAN.md`) have all passed on the live account.
 

@@ -113,8 +113,11 @@ Fork-specific venue plugins, editable-installed (so they import as
 
 ## DNSE testing (read before touching the plugin or running anything live)
 
-The test suite and its rules are documented in
-`plugins/dnse/testing/live_test/README.md` — four types: `pytest plugins/dnse/tests/`
+Test cases are named **`Live-L<level>-<case>`** (e.g. `Live-L1-T11-OcaCancelMember`,
+`Live-L3-F05-LongStopLimit`) — use ONLY these IDs in plans, cards and conversation;
+the canonical registry with live status is the first table in
+`plugins/dnse/testing/live_test/README.md`. The suite's rules are documented in
+that same README — four types: `pytest plugins/dnse/tests/`
 (unit + fake-venue e2e), the L0 venue-semantics gate (MANDATORY, exit 0, before EVERY
 live run), the staged no-fill probe (T1–T13 + the `run_t10_dual.sh` dual-strategy
 runner), and the staged fill test (F1–F8; its backtest mode over a past window IS the

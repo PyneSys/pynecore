@@ -1,0 +1,72 @@
+//@version=6
+// LIVE TEST T27 — duplicate-emission guard under calc_on_every_tick=true.
+// Card rubycell/pynecore#22 Group C; TOP PRIORITY of the card: with per-tick
+// recalculation the script body runs MANY times per bar, and an unguarded placement
+// would hit the venue once per tick. That is the costliest bug class in production.
+//
+// One stage only: place a single far limit (>=4.5% away, 1 contract, cannot fill),
+// hold it for `holdBars` bars while every tick logs, then cancel.
+// PASS = the venue records EXACTLY ONE placement and EXACTLY ONE cancellation,
+// regardless of how many times this body executed. Grade from DNSE's order history,
+// not the log — the log SHOULD show many executions; that is the point.
+//
+// The state guards here are the same var-based ones every real strategy uses
+// (var + na(placedBar)); the test proves the ENGINE+BROKER pipeline does not
+// re-dispatch an already-queued order on intrabar recalcs.
+//
+// Phase-stamped like the param probe; run in continuous only.
+strategy("LIVE T27 tick dedup", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48,
+     slippage=1,
+     calc_on_every_tick=true, process_orders_on_close=false)
+
+winStart = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
+winEnd   = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+holdBars = input.int(3, "Bars to hold before cancel", minval=1, maxval=30)
+
+var int   placedBar = na
+var float lvlEntry  = na
+var bool  cancelled = false
+var int   execCount = 0     // how many times this body ran — expect >> bar count
+
+phaseOf() =>
+    dow = dayofweek(time, "Asia/Ho_Chi_Minh")
+    hm  = hour(time, "Asia/Ho_Chi_Minh") * 100 + minute(time, "Asia/Ho_Chi_Minh")
+    dow == dayofweek.saturday or dow == dayofweek.sunday ? "CLOSED" :
+         hm < 845  ? "CLOSED"   :
+         hm < 900  ? "ATO"      :
+         hm < 915  ? "POST-ATO" :
+         hm < 1130 ? "CONT-AM"  :
+         hm < 1300 ? "LUNCH"    :
+         hm < 1430 ? "CONT-PM"  :
+         hm < 1445 ? "ATC"      : "CLOSED"
+
+phase = phaseOf()
+execCount := execCount + 1
+
+if time >= winStart and time <= winEnd
+    if na(placedBar) and not cancelled and close > open
+        lvlEntry  := close * 0.95
+        strategy.entry("T27", strategy.long, limit=lvlEntry, comment="T27")
+        placedBar := bar_index
+        log.info("[T27] PLACE phase={0} limit={1} exec#{2} — calc_on_every_tick=true: this " +
+                 "body reruns per tick, yet the venue must record EXACTLY ONE placement",
+                 phase, str.tostring(lvlEntry, format.mintick), execCount)
+    if not na(placedBar)
+        log.info("[T27] tick phase={0} bar={1} exec#{2} placedBar={3} — every extra venue " +
+                 "placement after the first is a FAIL", phase, bar_index, execCount, placedBar)
+
+if not na(placedBar) and not cancelled and bar_index >= placedBar + holdBars
+    strategy.cancel("T27")
+    cancelled := true
+    log.info("[T27] CANCEL phase={0} after {1} bars, exec#{2} — venue must show ONE cancel; " +
+             "book clean of ours after. DONE", phase, holdBars, execCount)
+
+if strategy.position_size != 0
+    log.error("[T27] !!! UNEXPECTED FILL phase={0} pos={1} — flatten", phase, strategy.position_size)
+    strategy.cancel_all()
+    strategy.close_all(comment="SAFETY-FLATTEN")
+
+plot(execCount, "exec_count", display=display.data_window)
+plot(strategy.position_size, "pos", display=display.data_window)
