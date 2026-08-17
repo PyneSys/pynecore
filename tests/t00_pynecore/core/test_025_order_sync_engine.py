@@ -4838,6 +4838,678 @@ def __test_rejected_parked_amend_corrects_the_accumulated_overshoot__(tmp_path):
         assert guard.corrected_qty == 1.0
 
 
+def _drive_fold_surplus_with_store(ctx, *, park_close: bool = False):
+    """Drive the racing-SL fold-surplus scenario on a store-backed engine.
+
+    Long 1.0 with a native SL, stop-and-reverse fold to a 2.0 SELL, the SL
+    fills concurrently, the folded entry fills in full — the engine
+    dispatches the 1.0 surplus corrective close and arms its must-settle
+    marker. With ``park_close=True`` the corrective dispatch ends with an
+    unknown disposition instead (parked + persisted park row).
+
+    Returns ``(broker, engine, close_key, marker)``.
+    """
+    b = MockBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b, position=pos,  # type: ignore[arg-type]
+        symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+    )
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    if park_close:
+        async def _timeout_close(envelope):
+            b.close_calls.append(envelope)
+            raise OrderDispositionUnknownError(
+                "close link dropped",
+                client_order_id=envelope.client_order_id('c'),
+            )
+        b.execute_close = _timeout_close  # type: ignore[method-assign]
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    assert len(engine._pending_flip_surplus_closes) == 1
+    close_key, marker = next(iter(engine._pending_flip_surplus_closes.items()))
+    return b, engine, close_key, marker
+
+
+def _restarted_engine(ctx):
+    """Fresh broker + engine on the same store ctx — a process restart."""
+    b = MockBroker()
+    pos = BrokerPosition()
+    engine = OrderSyncEngine(
+        broker=b, position=pos,  # type: ignore[arg-type]
+        symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+    )
+    return b, engine, pos
+
+
+def _open_t025_run(store):
+    from pynecore.core.broker.run_identity import RunIdentity
+    return store.open_run(
+        RunIdentity(
+            strategy_id="t025", symbol=SYMBOL, timeframe="60",
+            account_id="testbroker-demo", label=None,
+        ),
+        script_source="src",
+        script_path="t025.py",
+    )
+
+
+def __test_parked_surplus_close_rejected_after_restart_still_halts__(tmp_path):
+    """A restart must not launder a rejected surplus correction into silence.
+
+    The corrective close parks with unknown disposition, the process
+    restarts, and the plugin's snapshot recovery resolves the park as
+    ``rejected``: the correction never reached the exchange, the book
+    holds surplus exposure Pine does not know about, and nothing will
+    re-dispatch (``corrected_qty`` already booked it). Without the
+    durable marker replay the post-restart resolution loop finds no
+    armed marker and skips the escalation — the exact silent-exposure
+    hole the persistence closes.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(
+            ctx, park_close=True,
+        )
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_armed')
+
+        _b2, engine2, _pos2 = _restarted_engine(ctx)
+        engine2._replay_pending_flip_surplus_closes()
+        replayed = engine2._pending_flip_surplus_closes.get(close_key)
+        assert replayed is not None, "the armed marker did not survive restart"
+        assert replayed.client_order_id == marker.client_order_id
+        assert replayed.expected_qty == marker.expected_qty
+
+        ctx.record_resolution(marker.client_order_id, 'rejected')
+        with pytest.raises(BrokerManualInterventionError):
+            engine2._consume_plugin_resolutions()
+
+
+def __test_restarted_surplus_close_settles_on_its_late_fill__(tmp_path):
+    """The re-armed marker settles when the correction's fill routes post-restart."""
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+        corrective = b1.close_calls[0].intent
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        pos2.size = -2.0
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        assert close_key in engine2._pending_flip_surplus_closes
+
+        engine2._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 48_995.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-corr",
+                        fill_id="corr-1"),
+            pine_id=corrective.pine_id,
+        ))
+        assert engine2._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
+
+
+def __test_surplus_close_settled_before_the_crash_is_not_rearmed__(tmp_path):
+    """The settle audit written at FILL time keeps replay from resurrecting the marker."""
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+        corrective = b1.close_calls[0].intent
+        engine1._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 48_995.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-corr",
+                        fill_id="corr-1"),
+            pine_id=corrective.pine_id,
+        ))
+        assert engine1._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
+
+        _b2, engine2, _pos2 = _restarted_engine(ctx)
+        engine2._replay_pending_flip_surplus_closes()
+        assert engine2._pending_flip_surplus_closes == {}
+
+
+def __test_stale_replayed_surplus_close_halts_when_broker_still_holds_it__(tmp_path):
+    """Grace expired, broker still at the pre-correction size: halt.
+
+    The snapshot matches the marker's persisted pre-close anchor, so the
+    correction provably never executed — the surplus exposure is live
+    with nothing in flight.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+
+        _b2, engine2, _pos2 = _restarted_engine(ctx)
+        engine2._replay_pending_flip_surplus_closes()
+        replayed = engine2._pending_flip_surplus_closes[close_key]
+        replayed.pending_since = (
+            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+        )
+        snapshot = ExchangePosition(
+            symbol=SYMBOL, side="short", size=2.0, entry_price=48_990.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        )
+        with pytest.raises(BrokerManualInterventionError):
+            engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
+
+
+def __test_stale_replayed_surplus_close_settles_from_a_corrected_snapshot__(tmp_path):
+    """Grace expired but the broker already reflects the correction: settle.
+
+    The fill was executed during the downtime and its event lost (polled
+    broker, advanced activity cursor); the snapshot matching the
+    pre-close anchor plus the outstanding delta proves it. The marker is
+    settled with the durable audit instead of halting.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+
+        _b2, engine2, _pos2 = _restarted_engine(ctx)
+        engine2._replay_pending_flip_surplus_closes()
+        replayed = engine2._pending_flip_surplus_closes[close_key]
+        replayed.pending_since = (
+            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+        )
+        snapshot = ExchangePosition(
+            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        )
+        engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
+        assert engine2._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
+
+
+def __test_settled_surplus_close_fill_replayed_after_restart_is_dropped__(tmp_path):
+    """A correction settled before the crash must not be booked twice.
+
+    Replay skips the marker on the strength of its settle audit, so the
+    marker — the only in-memory guard for this synthetic close — is gone
+    and ``_seen_fill_ids`` is empty in the fresh process. A WS reconnect
+    replay / polled-orders resync of the same corrective FILL would then
+    reach ``record_fill`` and close the adopted (already corrected)
+    position a second time.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+        corrective = b1.close_calls[0].intent
+        corrective_fill = replace(
+            _fill_event('buy', 1.0, 48_995.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-corr",
+                        fill_id="corr-1"),
+            pine_id=corrective.pine_id,
+        )
+        engine1._route_event(corrective_fill)  # type: ignore[attr-defined]
+        assert engine1._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        # Startup adopts the broker's already-corrected exposure.
+        pos2.size = -1.0
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        assert engine2._pending_flip_surplus_closes == {}
+
+        engine2._route_event(corrective_fill)  # type: ignore[attr-defined]
+        assert pos2.size == -1.0, \
+            "the replayed corrective fill was booked a second time"
+
+
+def _fan_leg_fill(parent_coid: str, leg_id: int, qty: float):
+    """A one-way-emulated correction child: composed coid, own order id.
+
+    Mirrors what :meth:`OneWayEmulator._fan_out_closes` puts on the wire —
+    the leg carries ``{parent_coid}:{leg_id}`` and its own broker order id,
+    and never the close's ``pine_id``.
+    """
+    event = _fill_event(
+        'buy', qty, 48_995.0, pine_id="", leg=LegType.CLOSE,
+        xchg_id=f"xchg-corr-leg{leg_id}", fill_id=f"corr-leg{leg_id}",
+    )
+    return replace(
+        event,
+        order=replace(
+            event.order, client_order_id=f"{parent_coid}:{leg_id}",
+        ),
+    )
+
+
+def __test_settled_fanned_surplus_close_child_replay_is_dropped__(tmp_path):
+    """An EARLIER fan child of a settled correction must not be booked twice.
+
+    The one-way emulator splits the correction across
+    ``{parent_coid}:{leg_id}`` children, each with its own broker order id.
+    Settlement only ever sees the LAST child, so caching the shared parent
+    ids plus that final order id leaves every earlier child unguarded: after
+    restart its redelivery matches no cache, reaches ``record_fill`` and
+    closes the adopted (already corrected) position a second time.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        parent_coid = marker.client_order_id
+        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
+        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
+        engine1._route_event(leg1)  # type: ignore[attr-defined]
+        engine1._route_event(leg2)  # type: ignore[attr-defined]
+        assert engine1._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        # Startup adopts the broker's already-corrected exposure.
+        pos2.size = -1.0
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        assert engine2._pending_flip_surplus_closes == {}
+
+        engine2._route_event(leg1)  # type: ignore[attr-defined]
+        assert pos2.size == -1.0, \
+            "the replayed fan child was booked a second time"
+
+
+def __test_fanned_surplus_close_child_replay_after_midfan_restart_is_dropped__(tmp_path):
+    """The child booked BEFORE the crash stays guarded once the fan completes.
+
+    The first leg fills, the process restarts mid-fan (the marker re-arms
+    from its cumulative progress record), the second leg settles the
+    correction in the new process, and only then is the first leg
+    redelivered. Its identities live nowhere but the progress event, so
+    without carrying them onto the re-armed marker — and from there into
+    the settle audit — the replay books the slice a second time.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        parent_coid = marker.client_order_id
+        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
+        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
+        engine1._route_event(leg1)  # type: ignore[attr-defined]
+        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        pos2.size = -1.5
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5
+        engine2._route_event(leg2)  # type: ignore[attr-defined]
+        assert engine2._pending_flip_surplus_closes == {}
+
+        _b3, engine3, pos3 = _restarted_engine(ctx)
+        pos3.size = -1.0
+        pos3.sign = -1.0
+        pos3.avg_price = 48_990.0
+        engine3._replay_pending_flip_surplus_closes()
+        assert engine3._pending_flip_surplus_closes == {}
+
+        engine3._route_event(leg1)  # type: ignore[attr-defined]
+        assert pos3.size == -1.0, \
+            "the pre-crash fan child was booked a second time"
+
+
+def __test_midfan_restart_drops_the_redelivered_child_before_the_fan_ends__(tmp_path):
+    """The pre-crash child is guarded while the fan is STILL outstanding.
+
+    The marker is re-armed (siblings pending), so its leg identities must
+    not enter the settled-close caches — an unfanned correction's next
+    partial reuses the same order id / coid and would be dropped. The
+    broker-native ``fill_id`` is the discriminator that survives that
+    constraint: it names one execution, so reseeding the process-local
+    ``_seen_fill_ids`` ring from the progress record drops exactly the
+    redelivery and nothing else.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        parent_coid = marker.client_order_id
+        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
+        engine1._route_event(leg1)  # type: ignore[attr-defined]
+        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        # Startup adopts the broker's partially corrected exposure.
+        pos2.size = -1.5
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5
+
+        # Redelivered BEFORE the second leg completes the fan.
+        engine2._route_event(leg1)  # type: ignore[attr-defined]
+        assert pos2.size == -1.5, \
+            "the redelivered mid-fan child was booked a second time"
+        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5, \
+            "the redelivered mid-fan child was credited to the marker twice"
+
+
+def __test_midfan_restart_still_accepts_a_fresh_partial_of_the_same_order__(tmp_path):
+    """Reseeding must not swallow the NEXT partial of the same order.
+
+    An unfanned correction fills in slices that all carry the same order
+    id and coid and differ only in ``fill_id``. The replay guard keys on
+    ``fill_id`` precisely so this legitimate continuation still books.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
+        corrective = b1.close_calls[0].intent
+        first = replace(
+            _fill_event('buy', 0.5, 48_995.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-corr",
+                        fill_id="corr-1"),
+            pine_id=corrective.pine_id,
+        )
+        second = replace(first, fill_id="corr-2")
+        engine1._route_event(first)  # type: ignore[attr-defined]
+        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        pos2.size = -1.5
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        engine2._route_event(second)  # type: ignore[attr-defined]
+        assert engine2._pending_flip_surplus_closes == {}, \
+            "the second partial of the same order was wrongly deduped"
+        assert pos2.size == -1.0
+
+
+def __test_snapshot_settled_surplus_close_drops_an_unobserved_child__(tmp_path):
+    """A child the engine NEVER saw is still guarded after snapshot settle.
+
+    The stale-grace probe settles the correction from the broker snapshot
+    and consumes the outstanding quantity from the book, but the leg lists
+    only hold the children whose events did arrive. The missing child's
+    composed ``{parent_coid}:{leg_id}`` coid never equals the cached parent
+    coid, so an exact-membership gate lets its delayed event through into
+    ``record_fill``.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        parent_coid = marker.client_order_id
+        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
+        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
+        engine1._route_event(leg1)  # type: ignore[attr-defined]
+
+        _b2, engine2, pos2 = _restarted_engine(ctx)
+        pos2.size = -1.5
+        pos2.sign = -1.0
+        pos2.avg_price = 48_990.0
+        engine2._replay_pending_flip_surplus_closes()
+        replayed = engine2._pending_flip_surplus_closes[close_key]
+        replayed.pending_since = (
+            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+        )
+        # leg2's event was lost; the snapshot proves it executed.
+        engine2._raise_if_stale_pending_flip_surplus_close(ExchangePosition(
+            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        ))
+        assert engine2._pending_flip_surplus_closes == {}
+        assert pos2.size == -1.0
+
+        engine2._route_event(leg2)  # type: ignore[attr-defined]
+        assert pos2.size == -1.0, \
+            "the never-observed fan child was booked after snapshot settle"
+
+
+def __test_snapshot_settled_surplus_close_ignores_its_late_fill__():
+    """The lost FILL the snapshot settled must be a no-op when it arrives.
+
+    Stale-grace settlement consumes the outstanding correction quantity
+    from the book itself, so the delayed original FILL (the WS gap that
+    caused the stale window closing behind it) must be recognised as
+    already applied.
+    """
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    corrective = b.close_calls[0].intent
+    (_close_key, marker), = engine._pending_flip_surplus_closes.items()
+    marker.pending_since = (
+        _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+    )
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+    assert pos.size == -1.0
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 48_995.0, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-corr",
+                    fill_id="corr-late"),
+        pine_id=corrective.pine_id,
+    ))
+    assert pos.size == -1.0, \
+        "the late corrective fill re-applied a correction the snapshot settled"
+
+
+def __test_replayed_surplus_batch_settles_across_incrementally_armed_markers__(tmp_path):
+    """Two corrections armed around a partial fill must share one anchor.
+
+    The second marker's ``pre_close_position_size`` already contains the
+    slice the first correction booked before it was armed. Summing every
+    marker's cumulative ``filled_qty`` on top of that anchor counts the
+    slice twice, so a broker snapshot reflecting BOTH completed
+    corrections matches neither expectation and the run false-halts for
+    manual intervention despite correct venue exposure.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_t025_run(store)
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+        engine.sync(BAR_TS)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+        pos.entry_orders["S"] = _entry_order("S", -1.0)
+        engine.sync(BAR_TS + 60_000)
+        s_deal_id = engine.order_mapping["S"][0]
+        engine._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                        leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                        fill_id="sl-1"),
+            from_entry="L",
+        ))
+        # Folded 2.0 SELL fills in two slices; the SL already consumed the
+        # 1.0 the venue could net, so each slice past 1.0 is surplus.
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 1.5, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                        fill_id="s-1", event_type='partial',
+                        filled_qty=1.5, remaining_qty=0.5))
+        assert pos.size == -1.5
+        (key1, marker1), = engine._pending_flip_surplus_closes.items()
+        assert marker1.expected_qty == 0.5
+        corrective1 = b.close_calls[0].intent
+
+        # First correction partially fills BEFORE the second is armed —
+        # this slice lands inside the second marker's anchor.
+        engine._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('buy', 0.2, 48_995.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-corr-1",
+                        fill_id="corr-1a", event_type='partial',
+                        filled_qty=0.2, remaining_qty=0.3),
+            pine_id=corrective1.pine_id,
+        ))
+        assert round(pos.size, 12) == -1.3
+        assert engine._pending_flip_surplus_closes[key1].filled_qty == 0.2
+
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.5, 48_985.0, pine_id="S", xchg_id=s_deal_id,
+                        fill_id="s-2"))
+        assert round(pos.size, 12) == -1.8
+        assert len(engine._pending_flip_surplus_closes) == 2
+        key2 = [k for k in engine._pending_flip_surplus_closes if k != key1][0]
+
+        _b2, engine2, _pos2 = _restarted_engine(ctx)
+        engine2._replay_pending_flip_surplus_closes()
+        assert set(engine2._pending_flip_surplus_closes) == {key1, key2}
+        # Shift both arm times back past the grace window by the same
+        # amount so their real ordering (which picks the anchor) survives.
+        replayed = list(engine2._pending_flip_surplus_closes.values())
+        shift = max(m.pending_since for m in replayed) - (
+            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+        )
+        for m in replayed:
+            m.pending_since -= shift
+        # Venue executed both corrections during the downtime: -1.8 plus
+        # the 0.3 still outstanding on the first and the whole 0.5 of the
+        # second.
+        snapshot = ExchangePosition(
+            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        )
+        engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
+        assert engine2._pending_flip_surplus_closes == {}
+        assert ctx.find_event_by_intent_key(key1, 'flip_surplus_close_filled')
+        assert ctx.find_event_by_intent_key(key2, 'flip_surplus_close_filled')
+
+
+def __test_stale_in_process_surplus_close_settles_and_books_the_outstanding__():
+    """In-process stale settle consumes the outstanding qty from the FIFO book.
+
+    Same-process fill loss (WS gap on a polled broker): the reconcile
+    grace probe proves the correction landed and must book the missing
+    slice exactly as the lost FILL would have — shrinking the folded
+    trade and adopting the broker size — or the engine view keeps the
+    surplus indefinitely (the periodic reconcile only acts on
+    shrink-to-zero transitions).
+    """
+    from pynecore.core.broker.sync_engine import (
+        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
+    )
+    import time as _time
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    s_deal_id = engine.order_mapping["S"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+                    fill_id="s-1"))
+    assert len(b.close_calls) == 1
+    assert pos.size == -2.0
+    (close_key, marker), = engine._pending_flip_surplus_closes.items()
+    marker.pending_since = (
+        _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
+    )
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+    assert engine.halted is False
+    assert engine._pending_flip_surplus_closes == {}
+    assert pos.size == -1.0
+    assert round(sum(t.size for t in pos.open_trades), 12) == -1.0
+    assert len(b.close_calls) == 1  # no re-dispatch of the correction
+
+
 def __test_restart_between_fan_legs_keeps_the_defensive_close_armed__(tmp_path):
     """A crash between fan legs must not settle the whole close.
 

@@ -1032,6 +1032,13 @@ class ScriptRunner:
         # the next bar against a position the previous instance was
         # already closing defensively.
         engine._replay_pending_defensive_closes()
+        # Same replay contract for the stop-and-reverse fold's surplus
+        # corrections: their must-settle markers are re-armed from the
+        # durable ``flip_surplus_close_armed`` audit events so a parked
+        # correction's post-restart ``rejected`` resolution still
+        # escalates and the stale-grace reconcile keeps demanding proof
+        # of settlement.
+        engine._replay_pending_flip_surplus_closes()
         engine.reconcile()
 
     # === Order-processing dispatch =========================================

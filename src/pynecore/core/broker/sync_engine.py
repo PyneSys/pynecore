@@ -31,7 +31,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable, Iterator
 from concurrent import futures
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, TypeVar, overload
@@ -457,6 +457,9 @@ class _BoundedIdSet:
     def __contains__(self, value: object) -> bool:
         return value in self._items
 
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -483,6 +486,26 @@ def _is_composed_leg_coid(event_coid: str, parent_coid: str | None) -> bool:
     return (len(event_coid) > len(parent_coid)
             and event_coid.startswith(parent_coid)
             and event_coid[len(parent_coid)] in (':', '_'))
+
+
+def _str_tuple_from_payload(data: dict, field: str) -> tuple[str, ...]:
+    """Read a list-of-strings audit payload field as a tuple.
+
+    A missing key yields an empty tuple (payloads written before the
+    field existed). Anything else malformed raises :class:`ValueError`,
+    which the startup replay reports and skips.
+    """
+    raw = data.get(field, ())
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            f"{field} must be a list of strings: {data!r}"
+        )
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"{field} items must be strings: {data!r}"
+            )
+    return tuple(raw)
 
 
 @dataclasses.dataclass(slots=True)
@@ -512,7 +535,10 @@ class _FlipFoldGuard:
     In-memory only: a restart between the fold dispatch and its fills loses
     the guard, in which case the startup adoption clamp and the cycle-end
     reconciliation surface the residual divergence instead of this
-    corrective path.
+    corrective path. A correction that was already DISPATCHED is different:
+    its :class:`_PendingFlipSurplusClose` marker is durable (armed / progress
+    / settled audit events) and survives restart — see
+    :meth:`OrderSyncEngine._replay_pending_flip_surplus_closes`.
     """
 
     entry_intent_key: str
@@ -542,11 +568,229 @@ class _PendingFlipSurplusClose:
     (``BrokerPosition.record_fill`` ignores zero/absent qty or price) nor
     that a one-way-emulated fan-out (``{parent_coid}:{leg_id}`` children)
     settled every leg — a sibling leg can still be rejected afterwards.
+
+    Durable across restart: arming writes a ``flip_surplus_close_armed``
+    audit event (BEFORE the dispatch, so a crash inside the dispatch
+    window cannot lose the record), fill slices append cumulative
+    ``flip_surplus_close_progress`` events, and settlement writes
+    ``flip_surplus_close_filled``. Startup replay
+    (:meth:`OrderSyncEngine._replay_pending_flip_surplus_closes`)
+    re-arms every armed-without-settle marker so a post-restart
+    ``rejected`` plugin resolution still escalates and the stale-grace
+    reconcile (:meth:`OrderSyncEngine._raise_if_stale_pending_flip_surplus_close`)
+    can prove the correction settled — or halt — against a broker
+    snapshot. The parent :class:`_FlipFoldGuard` stays process-local by
+    design; the marker carries everything its own settle proof needs.
+
+    ``pre_close_position_size`` is the engine's signed
+    :attr:`BrokerPosition.size` captured at arm time (the book still
+    holding the surplus). After a restart the live engine view is
+    re-adopted from the broker and can no longer serve as the probe
+    baseline, so the snapshot check anchors on this persisted value
+    instead. ``batch_outstanding_delta`` is its mandatory companion: the
+    signed delta EVERY correction armed at that same moment (this one
+    included) would still apply to the book once fully filled. The pair
+    is what makes a multi-correction replay well-defined — a later
+    marker's ``pre_close_position_size`` already contains the slices the
+    earlier corrections booked before it was armed, so summing the
+    per-marker cumulative ``filled_qty`` on top of it would count those
+    slices twice. Both are arm-time constants and are never updated by
+    later fills. ``replayed`` flags a marker re-armed by startup replay —
+    runtime-only, never serialized.
+
+    ``settled_leg_order_ids`` / ``settled_leg_client_order_ids`` collect
+    the broker-side identities of every slice already booked into the
+    position. A one-way-emulated correction fans across
+    ``{parent_coid}:{leg_id}`` children, each with its OWN order id and
+    composed coid, and only the last of them is visible at settle time —
+    so without these lists a post-restart redelivery of an EARLIER child
+    matches none of the settled-close duplicate caches (parent coid, close
+    intent key, final order id) and reaches ``record_fill`` a second time.
+    They ride the progress / settle audit events, mirroring
+    :attr:`PendingDefensiveClose.settled_leg_order_ids`.
+
+    ``settled_fill_ids`` collects the broker-native
+    :attr:`OrderEvent.fill_id` of every booked slice. It is the only
+    identity that stays usable while the correction is STILL outstanding:
+    the order-level ids above are shared by the next partial of an
+    unfanned dispatch, so caching them mid-flight would drop a legitimate
+    continuation, whereas a ``fill_id`` names one execution and can never
+    collide with a later slice. Startup replay reseeds the process-local
+    :attr:`OrderSyncEngine._seen_fill_ids` ring from it, which is what
+    keeps a redelivered pre-crash child out of ``record_fill`` before the
+    fan completes.
     """
 
     client_order_id: str
     expected_qty: float
     filled_qty: float = 0.0
+    close_side: str = ''
+    position_coid: str = ''
+    entry_intent_key: str = ''
+    pre_close_position_size: float = 0.0
+    batch_outstanding_delta: float = 0.0
+    settled_leg_order_ids: tuple[str, ...] = ()
+    settled_leg_client_order_ids: tuple[str, ...] = ()
+    settled_fill_ids: tuple[str, ...] = ()
+    pending_since: float = 0.0
+    replayed: bool = False
+
+    def to_payload(self) -> dict:
+        """Serialize to a JSON-compatible audit-event payload."""
+        return {
+            'client_order_id': self.client_order_id,
+            'expected_qty': self.expected_qty,
+            'filled_qty': self.filled_qty,
+            'close_side': self.close_side,
+            'position_coid': self.position_coid,
+            'entry_intent_key': self.entry_intent_key,
+            'pre_close_position_size': self.pre_close_position_size,
+            'batch_outstanding_delta': self.batch_outstanding_delta,
+            'settled_leg_order_ids': list(self.settled_leg_order_ids),
+            'settled_leg_client_order_ids': list(
+                self.settled_leg_client_order_ids,
+            ),
+            'settled_fill_ids': list(self.settled_fill_ids),
+            'pending_since': self.pending_since,
+        }
+
+    @classmethod
+    def from_payload(cls, data: dict) -> '_PendingFlipSurplusClose':
+        """Rebuild from a ``to_payload`` dict.
+
+        Raises :class:`ValueError` on malformed input — the startup
+        replay catches this and logs + skips the record.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"_PendingFlipSurplusClose payload must be a dict, "
+                f"got {type(data).__name__}"
+            )
+        try:
+            client_order_id = data['client_order_id']
+            expected_qty = data['expected_qty']
+            close_side = data['close_side']
+            pending_since = data['pending_since']
+        except KeyError as exc:
+            raise ValueError(
+                f"_PendingFlipSurplusClose payload missing required "
+                f"field {exc.args[0]!r}: {data!r}"
+            ) from exc
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise ValueError(
+                f"_PendingFlipSurplusClose.client_order_id must be a "
+                f"non-empty string: {data!r}"
+            )
+        if close_side not in ('buy', 'sell'):
+            raise ValueError(
+                f"_PendingFlipSurplusClose.close_side must be 'buy' or "
+                f"'sell': {data!r}"
+            )
+        if not isinstance(expected_qty, (int, float)) or expected_qty <= 0.0:
+            raise ValueError(
+                f"_PendingFlipSurplusClose.expected_qty must be a "
+                f"positive number: {data!r}"
+            )
+        if not isinstance(pending_since, (int, float)):
+            raise ValueError(
+                f"_PendingFlipSurplusClose.pending_since must be "
+                f"numeric: {data!r}"
+            )
+        filled_qty_raw = data.get('filled_qty', 0.0)
+        if not isinstance(filled_qty_raw, (int, float)) or filled_qty_raw < 0.0:
+            raise ValueError(
+                f"_PendingFlipSurplusClose.filled_qty must be a "
+                f"non-negative number: {data!r}"
+            )
+        position_coid = data.get('position_coid', '')
+        entry_intent_key = data.get('entry_intent_key', '')
+        if not isinstance(position_coid, str) or not isinstance(entry_intent_key, str):
+            raise ValueError(
+                f"_PendingFlipSurplusClose id fields must be strings: "
+                f"{data!r}"
+            )
+        pre_close_raw = data.get('pre_close_position_size', 0.0)
+        if not isinstance(pre_close_raw, (int, float)):
+            raise ValueError(
+                f"_PendingFlipSurplusClose.pre_close_position_size must "
+                f"be numeric: {data!r}"
+            )
+        batch_raw = data.get('batch_outstanding_delta')
+        if batch_raw is None:
+            # No sibling correction was armed alongside this one, so the
+            # marker's own full quantity IS the whole outstanding batch.
+            batch_delta = (
+                -float(expected_qty) if close_side == 'sell'
+                else float(expected_qty)
+            )
+        elif not isinstance(batch_raw, (int, float)):
+            raise ValueError(
+                f"_PendingFlipSurplusClose.batch_outstanding_delta must "
+                f"be numeric: {data!r}"
+            )
+        else:
+            batch_delta = float(batch_raw)
+        return cls(
+            client_order_id=client_order_id,
+            expected_qty=float(expected_qty),
+            filled_qty=float(filled_qty_raw),
+            close_side=close_side,
+            position_coid=position_coid,
+            entry_intent_key=entry_intent_key,
+            pre_close_position_size=float(pre_close_raw),
+            batch_outstanding_delta=batch_delta,
+            settled_leg_order_ids=_str_tuple_from_payload(
+                data, 'settled_leg_order_ids',
+            ),
+            settled_leg_client_order_ids=_str_tuple_from_payload(
+                data, 'settled_leg_client_order_ids',
+            ),
+            settled_fill_ids=_str_tuple_from_payload(
+                data, 'settled_fill_ids',
+            ),
+            pending_since=float(pending_since),
+        )
+
+
+def _merge_leg_ids_from_payload(
+        marker: _PendingFlipSurplusClose, payload: dict, intent_key: str,
+) -> None:
+    """Union a progress event's booked-slice identities onto ``marker``.
+
+    A malformed list is logged and skipped rather than dropping the whole
+    progress record — the cumulative ``filled_qty`` it carries is what the
+    must-settle probe depends on.
+    """
+    try:
+        leg_order_ids = _str_tuple_from_payload(
+            payload, 'settled_leg_order_ids',
+        )
+        leg_coids = _str_tuple_from_payload(
+            payload, 'settled_leg_client_order_ids',
+        )
+        fill_ids = _str_tuple_from_payload(payload, 'settled_fill_ids')
+    except ValueError as exc:
+        _blog_warning(
+            "flip_surplus_close replay: ignoring malformed progress leg "
+            "ids for %s: %s",
+            intent_key, exc,
+        )
+        return
+    merged_order_ids = list(marker.settled_leg_order_ids)
+    for leg_order_id in leg_order_ids:
+        if leg_order_id and leg_order_id not in merged_order_ids:
+            merged_order_ids.append(leg_order_id)
+    marker.settled_leg_order_ids = tuple(merged_order_ids)
+    merged_coids = list(marker.settled_leg_client_order_ids)
+    for leg_coid in leg_coids:
+        if leg_coid and leg_coid not in merged_coids:
+            merged_coids.append(leg_coid)
+    marker.settled_leg_client_order_ids = tuple(merged_coids)
+    merged_fill_ids = list(marker.settled_fill_ids)
+    for fill_id in fill_ids:
+        if fill_id and fill_id not in merged_fill_ids:
+            merged_fill_ids.append(fill_id)
+    marker.settled_fill_ids = tuple(merged_fill_ids)
 
 
 class _PartialBracketModifyDeferred(Exception):
@@ -1065,6 +1309,20 @@ class OrderSyncEngine:
         # polled-orders identity path used by
         # :meth:`_route_defensive_close_fill`.
         self._settled_defensive_close_client_order_ids = \
+            _BoundedIdSet(_SETTLED_DEFENSIVE_CLOSE_IDS_CAP)
+        # PARENT coids of closes whose whole fan is settled. A one-way
+        # emulated close fans across ``{parent_coid}:{leg_id}`` children,
+        # and a child whose event never arrived (lost WS, a polled cursor
+        # that skipped it, a snapshot-proven settlement) leaves no trace in
+        # the exact-membership caches above — its composed coid equals
+        # neither the parent's nor any observed sibling's. Consulted via
+        # :func:`_is_composed_leg_coid` in
+        # :meth:`_is_duplicate_defensive_close_fill`, so such a child's
+        # delayed event is still recognised as already-applied. Only
+        # populated once the close is fully settled (never while siblings
+        # are outstanding), otherwise it would drop the very legs the
+        # marker is waiting for.
+        self._settled_defensive_close_parent_coids = \
             _BoundedIdSet(_SETTLED_DEFENSIVE_CLOSE_IDS_CAP)
 
         # General duplicate-fill gate (superset of the defensive-close caches
@@ -2699,6 +2957,12 @@ class OrderSyncEngine:
 
         Runs from :meth:`_route_event` after the ``_seen_fill_ids`` dedup
         gate, so a replayed fill cannot double-credit the marker.
+
+        Every booked slice also registers its own broker identities on the
+        marker (see :attr:`_PendingFlipSurplusClose.settled_leg_order_ids`)
+        — on a fanned correction those are the ONLY ids a redelivered
+        earlier child carries, and the shared parent ids the settle path
+        caches would never match it.
         """
         close_key = self._match_pending_flip_surplus_close(event)
         if close_key is None:
@@ -2710,12 +2974,90 @@ class OrderSyncEngine:
         # applies: it drops a slice with a non-positive qty OR price without
         # touching ``position.size``, so crediting it here would retire the
         # must-settle marker over a correction the book never saw.
-        if fill_qty > 0.0 and fill_price > 0.0:
+        counted = fill_qty > 0.0 and fill_price > 0.0
+        if counted:
             pending.filled_qty = round(pending.filled_qty + fill_qty, 12)
+            self._record_flip_surplus_close_leg_ids(pending, event)
         if pending.filled_qty + 1e-9 >= pending.expected_qty:
             # The whole correction is confirmed gone from the book: a later
             # cancel / reject echo for the same order must not halt the run.
             del self._pending_flip_surplus_closes[close_key]
+            fill_order_id = event.order.id if event.order is not None else None
+            # The marker was the duplicate-fill guard; it is gone now, so
+            # hand its identities to the shared settled-close cache before
+            # anything can redeliver this fill.
+            self._mark_flip_surplus_close_settled(
+                close_key, pending.client_order_id, fill_order_id,
+                leg_order_ids=pending.settled_leg_order_ids,
+                leg_client_order_ids=pending.settled_leg_client_order_ids,
+            )
+            # Durable settle audit: without it a restart would re-arm the
+            # marker from its ``flip_surplus_close_armed`` event and the
+            # stale-grace probe would have to re-prove settlement against
+            # a broker snapshot every startup.
+            self._log_flip_surplus_close_settled(
+                close_key, pending, settled_via='fill',
+                fill_exchange_order_id=fill_order_id,
+            )
+        elif counted and self._store_ctx is not None:
+            # Durable cumulative progress so a restart re-arms the marker
+            # with the slices already booked into the position — replaying
+            # with ``filled_qty=0`` would make the snapshot probe expect
+            # the FULL correction qty to still be outstanding and
+            # false-halt after the broker settled the remainder.
+            self._store_ctx.log_event(
+                kind='flip_surplus_close_progress',
+                intent_key=close_key,
+                client_order_id=pending.position_coid or None,
+                payload={
+                    'filled_qty': pending.filled_qty,
+                    # Per-slice dedup identities for the restart that
+                    # happens mid-fan: the re-armed marker seeds them so a
+                    # redelivered already-booked child is dropped before
+                    # ``record_fill`` instead of being credited twice.
+                    'settled_leg_order_ids': list(
+                        pending.settled_leg_order_ids,
+                    ),
+                    'settled_leg_client_order_ids': list(
+                        pending.settled_leg_client_order_ids,
+                    ),
+                    'settled_fill_ids': list(pending.settled_fill_ids),
+                },
+            )
+
+    @staticmethod
+    def _record_flip_surplus_close_leg_ids(
+            pending: _PendingFlipSurplusClose, event: OrderEvent,
+    ) -> None:
+        """Register a booked slice's broker identities on the marker.
+
+        Duplicates are dropped, so the lists stay bounded by the number of
+        distinct orders the correction actually filled through (one for a
+        direct dispatch, one per leg for a one-way-emulated fan).
+
+        The slice's own ``fill_id`` is recorded independently of
+        ``event.order`` — it is the execution-level identity the
+        outstanding-marker replay reseeds (see
+        :attr:`_PendingFlipSurplusClose.settled_fill_ids`), and the
+        order-level ids may be absent on a plugin that surfaces only the
+        execution.
+        """
+        fill_id = event.fill_id
+        if fill_id and fill_id not in pending.settled_fill_ids:
+            pending.settled_fill_ids = pending.settled_fill_ids + (fill_id,)
+        order = event.order
+        if order is None:
+            return
+        if order.id and order.id not in pending.settled_leg_order_ids:
+            pending.settled_leg_order_ids = (
+                pending.settled_leg_order_ids + (order.id,)
+            )
+        event_coid = order.client_order_id
+        if (event_coid
+                and event_coid not in pending.settled_leg_client_order_ids):
+            pending.settled_leg_client_order_ids = (
+                pending.settled_leg_client_order_ids + (event_coid,)
+            )
 
     def _halt_if_flip_surplus_close_terminal(
             self, event: OrderEvent, *, terminal: str,
@@ -2783,6 +3125,563 @@ class OrderSyncEngine:
         )
         self._record_halt(halt)
         raise halt
+
+    def _mark_flip_surplus_close_settled(
+            self, close_key: str, close_client_order_id: str | None,
+            fill_exchange_order_id: str | None = None,
+            leg_order_ids: Iterable[str] = (),
+            leg_client_order_ids: Iterable[str] = (),
+    ) -> None:
+        """Cache a settled surplus correction's duplicate-fill identities.
+
+        The correction is dispatched as a synthetic close
+        (``synthetic_kind='defensive_close'``), so it rides the very same
+        :meth:`_is_duplicate_defensive_close_fill` gate ``_route_event``
+        consults BEFORE :meth:`BrokerPosition.record_fill` — seeding the
+        shared ``_settled_defensive_close_*`` trio is all it takes to make
+        a redelivery of an already-settled correction a no-op.
+
+        Without it the marker is the ONLY thing standing between a
+        replayed correction fill and ``record_fill``: once settlement
+        retires the marker (or startup replay skips it on the strength of
+        its ``flip_surplus_close_filled`` audit), a WS reconnect replay or
+        a polled-orders resync of that same fill books the close a second
+        time — flattening or reversing a book the venue still holds.
+        ``_seen_fill_ids`` cannot cover it either: that ring is
+        process-local, so it is empty exactly when the replay is most
+        likely (right after a restart).
+
+        Seeding the marker's own ids is safe here because the marker is
+        retired only once the FULL dispatched quantity is booked — unlike
+        the defensive close's first-terminal settlement, no sibling leg of
+        a one-way-emulated fan-out can still be outstanding.
+
+        Those shared ids are not enough on their own, though: a fanned
+        correction's children each carry their OWN order id and composed
+        ``{parent_coid}:{leg_id}`` coid, and the settle path only ever
+        sees the LAST of them. ``leg_order_ids`` / ``leg_client_order_ids``
+        carry the earlier children's identities (collected by
+        :meth:`_record_flip_surplus_close_leg_ids`, persisted through the
+        progress / settle audit), without which a post-restart redelivery
+        of an earlier child matches nothing and is booked a second time.
+        """
+        if close_key:
+            self._settled_defensive_close_pine_ids.add(close_key)
+        if close_client_order_id:
+            self._settled_defensive_close_client_order_ids.add(
+                close_client_order_id,
+            )
+            # The marker is retired only once the correction is provably
+            # done, so every ``{parent_coid}:{leg_id}`` child of it is
+            # settled too — including one whose event never arrived and
+            # therefore appears in no ``leg_*`` list below (a snapshot
+            # settlement proves the quantity landed without ever showing
+            # the engine the leg).
+            self._settled_defensive_close_parent_coids.add(
+                close_client_order_id,
+            )
+        if fill_exchange_order_id:
+            self._settled_defensive_close_order_refs.add(
+                fill_exchange_order_id,
+            )
+        for leg_order_id in leg_order_ids:
+            if leg_order_id:
+                self._settled_defensive_close_order_refs.add(leg_order_id)
+        for leg_coid in leg_client_order_ids:
+            if leg_coid:
+                self._settled_defensive_close_client_order_ids.add(leg_coid)
+
+    def _log_flip_surplus_close_settled(
+            self, close_key: str, marker: _PendingFlipSurplusClose, *,
+            settled_via: str, fill_exchange_order_id: str | None = None,
+    ) -> None:
+        """Write the durable ``flip_surplus_close_filled`` audit event.
+
+        The event pairs with the arm-time ``flip_surplus_close_armed``
+        record: startup replay re-arms every armed marker whose settle
+        audit is missing, so this write is what keeps a completed
+        correction from resurrecting (and having to be re-proven against
+        a broker snapshot) on every restart.
+
+        It also carries the per-slice broker identities the marker
+        collected, which is what lets the replay reseed the duplicate-fill
+        caches for a fanned correction whose earlier children are invisible
+        in the shared parent ids.
+        """
+        if self._store_ctx is None:
+            return
+        payload: dict[str, object] = {
+            'entry_intent_key': marker.entry_intent_key,
+            'symbol': self._symbol,
+            'close_side': marker.close_side,
+            'expected_qty': marker.expected_qty,
+            'filled_qty': marker.filled_qty,
+            'close_client_order_id': marker.client_order_id,
+            'settled_leg_order_ids': list(marker.settled_leg_order_ids),
+            'settled_leg_client_order_ids': list(
+                marker.settled_leg_client_order_ids,
+            ),
+            'settled_fill_ids': list(marker.settled_fill_ids),
+            'settled_via': settled_via,
+        }
+        if fill_exchange_order_id is not None:
+            payload['fill_exchange_order_id'] = fill_exchange_order_id
+        self._store_ctx.log_event(
+            kind='flip_surplus_close_filled',
+            intent_key=close_key,
+            client_order_id=marker.position_coid or None,
+            exchange_order_id=fill_exchange_order_id,
+            payload=payload,
+        )
+
+    def _replay_pending_flip_surplus_closes(self) -> None:
+        """Re-arm flip-fold surplus must-settle markers across restart.
+
+        Walks the durable ``flip_surplus_close_armed`` audit events for
+        this logical run, restores each marker's cumulative booked slice
+        from the ``flip_surplus_close_progress`` events, and re-arms every
+        marker whose ``flip_surplus_close_filled`` settle audit is
+        missing. Re-arming restores both halves of the must-settle
+        contract across restart:
+
+        - a post-restart ``rejected`` plugin resolution for the parked
+          correction finds the marker armed and escalates
+          (:meth:`_escalate_rejected_flip_surplus_close`) instead of
+          silently dropping the evidence;
+        - the stale-grace reconcile probe
+          (:meth:`_raise_if_stale_pending_flip_surplus_close`) keeps
+          demanding proof of settlement against the broker snapshot.
+
+        The ``flip_surplus_close_filled`` events are walked FIRST, both to
+        decide which markers are done and to reseed the shared
+        duplicate-fill caches via
+        :meth:`_mark_flip_surplus_close_settled`. Skipping an already
+        settled marker restores no in-memory guard at all, so without
+        that reseed a post-restart redelivery of its fill would reach
+        ``record_fill`` and book the correction twice.
+
+        Called once from
+        :meth:`~pynecore.core.script_runner.ScriptRunner.start_broker`
+        next to :meth:`_replay_pending_defensive_closes`, BEFORE the
+        first :meth:`reconcile`. No-op without persistence — a pure
+        in-memory session cannot survive a restart by definition.
+        """
+        if self._store_ctx is None:
+            return
+        try:
+            settled_iter = self._store_ctx.iter_events_by_kind_for_run_id(
+                'flip_surplus_close_filled',
+            )
+        except AttributeError:
+            # Older store contexts without the helper — nothing to replay.
+            return
+        settled_keys: set[str] = set()
+        for intent_key, _coid, exch_id, payload in settled_iter:
+            if not intent_key:
+                continue
+            settled_keys.add(intent_key)
+            # NOT the event's ``client_order_id`` column — that carries the
+            # parent entry's ``position_coid``, and caching it would drop
+            # the fold entry's own (legitimate, still open) fills. The
+            # close's own coid lives in the payload.
+            close_coid = payload.get('close_client_order_id')
+            try:
+                leg_order_ids = _str_tuple_from_payload(
+                    payload, 'settled_leg_order_ids',
+                )
+                leg_coids = _str_tuple_from_payload(
+                    payload, 'settled_leg_client_order_ids',
+                )
+                fill_ids = _str_tuple_from_payload(
+                    payload, 'settled_fill_ids',
+                )
+            except ValueError as exc:
+                # A malformed leg list must not cost the shared ids too —
+                # cache what is well-formed and carry on.
+                _blog_warning(
+                    "flip_surplus_close replay: ignoring malformed settled "
+                    "leg ids for %s: %s",
+                    intent_key, exc,
+                )
+                leg_order_ids = ()
+                leg_coids = ()
+                fill_ids = ()
+            self._seed_seen_fill_ids(fill_ids)
+            self._mark_flip_surplus_close_settled(
+                intent_key,
+                close_coid if isinstance(close_coid, str) else None,
+                exch_id,
+                leg_order_ids=leg_order_ids,
+                leg_client_order_ids=leg_coids,
+            )
+        armed_iter = self._store_ctx.iter_events_by_kind_for_run_id(
+            'flip_surplus_close_armed',
+        )
+        markers: dict[str, _PendingFlipSurplusClose] = {}
+        for intent_key, _coid, _exch_id, payload in armed_iter:
+            if not intent_key:
+                continue
+            try:
+                marker = _PendingFlipSurplusClose.from_payload(payload)
+            except ValueError as exc:
+                _blog_warning(
+                    "flip_surplus_close replay: dropping malformed armed "
+                    "payload for %s: %s",
+                    intent_key, exc,
+                )
+                continue
+            marker.replayed = True
+            markers[intent_key] = marker
+        if not markers:
+            return
+        # Cumulative progress events restore the slices the prior process
+        # already booked into the position; the snapshot probe must only
+        # expect the REMAINDER from the broker. Events iterate in ts
+        # order, but take the max anyway — the counter is monotonic and a
+        # max is immune to same-millisecond reordering.
+        for intent_key, _coid, _exch_id, payload in (
+                self._store_ctx.iter_events_by_kind_for_run_id(
+                    'flip_surplus_close_progress',
+                )):
+            if not intent_key:
+                continue
+            progressed = markers.get(intent_key)
+            if progressed is None:
+                continue
+            filled = payload.get('filled_qty')
+            if (isinstance(filled, (int, float))
+                    and float(filled) > progressed.filled_qty):
+                progressed.filled_qty = float(filled)
+            # Carry the already-booked slices' broker identities onto the
+            # re-armed marker (union — the events are cumulative, but the
+            # merge keeps it order-independent). The ORDER-level ids are
+            # not seeded into the duplicate-fill caches here: the
+            # correction is still outstanding, and a direct (unfanned)
+            # dispatch's next partial arrives under the very same order id
+            # / coid, which the caches would then drop before
+            # ``record_fill``. Their job is to reach the settle audit
+            # complete, so the fanned correction's EARLIER children are
+            # covered once it is provably done. The per-execution
+            # ``fill_id``s carry no such ambiguity and ARE seeded below.
+            _merge_leg_ids_from_payload(progressed, payload, intent_key)
+        for intent_key, marker in markers.items():
+            if intent_key in settled_keys:
+                # Settled in a prior instance — nothing outstanding. Its
+                # duplicate-fill identities were cached by the settle-audit
+                # walk above.
+                continue
+            # Restore the execution-level dedup for the slices the prior
+            # process already booked. ``_seen_fill_ids`` is process-local,
+            # so without this a redelivery arriving BEFORE the fan
+            # completes matches nothing — the marker's order-level ids are
+            # deliberately withheld from the settled-close caches while
+            # siblings are outstanding — and is booked a second time.
+            self._seed_seen_fill_ids(marker.settled_fill_ids)
+            _blog_warning(
+                "re-arming flip-fold surplus close %s across restart "
+                "(expected=%s filled=%s coid=%s) — settlement must still "
+                "be proven",
+                intent_key, marker.expected_qty, marker.filled_qty,
+                marker.client_order_id,
+            )
+            self._pending_flip_surplus_closes[intent_key] = marker
+
+    def _seed_seen_fill_ids(self, fill_ids: Iterable[str]) -> None:
+        """Pre-load the duplicate-fill ring with already-applied executions.
+
+        Startup replay's bridge into :meth:`_is_duplicate_fill`: the ring
+        is in-memory only, so a fresh process has no idea which broker
+        executions the previous one already booked. A ``fill_id`` names a
+        single execution and can never be reused by a later slice of the
+        same order, which makes seeding it safe even while the order is
+        still filling.
+        """
+        for fill_id in fill_ids:
+            if fill_id:
+                self._seen_fill_ids.add(fill_id)
+
+    def _raise_if_stale_pending_flip_surplus_close(
+            self, exch_pos: ExchangePosition | None,
+    ) -> None:
+        """Prove — or halt on — surplus corrections past the grace window.
+
+        Counterpart of :meth:`_raise_if_stale_pending_defensive_close`
+        for the flip-fold surplus correction, sharing its grace source
+        (the plugin's ``defensive_close_resolution_grace_s`` when set,
+        the engine default otherwise). A marker still armed past the
+        grace means the correction's fill channel went silent — a lost
+        WS stream, a polled broker whose activity cursor advanced past
+        the fill during downtime, or an order that never reached the
+        venue. The broker snapshot decides:
+
+        - **Snapshot matches the corrected expectation** (baseline plus
+          the outstanding correction delta): the correction filled and
+          only the event was lost. Settle the marker(s) from the
+          snapshot and adopt the broker size.
+        - **Snapshot matches the uncorrected baseline**: the correction
+          provably did not execute — the surplus exposure is still on
+          the book with nothing in flight. Halt for manual intervention.
+        - **Neither**: other unexplained activity moved the position;
+          settlement cannot be proven either way. Halt (the conservative
+          must-settle choice).
+
+        The baseline is the current engine view for in-process markers
+        (every routed fill is already reflected there). Replayed markers
+        cannot use it — after a restart the engine view is re-adopted
+        from the very snapshot being probed — so they anchor on the
+        last-armed marker's persisted arm-time pair
+        (``pre_close_position_size`` + ``batch_outstanding_delta``)
+        instead. A batch mixing the two provenances has no common anchor
+        and falls through to the conservative halt.
+        """
+        if not self._pending_flip_surplus_closes:
+            return
+        grace = getattr(
+            self._broker, 'defensive_close_resolution_grace_s', None,
+        )
+        if grace is None:
+            grace = DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+        now = time.time()
+        stale = {
+            key: m for key, m in self._pending_flip_surplus_closes.items()
+            if now - m.pending_since > grace
+        }
+        if not stale:
+            return
+        # Decode the broker snapshot to a signed scalar — same convention
+        # as :meth:`_broker_matches_post_close_expectation`.
+        side_unknown = False
+        broker_signed = 0.0
+        if exch_pos is not None:
+            broker_abs = float(exch_pos.size)
+            broker_side = (exch_pos.side or "").lower()
+            if broker_abs == 0.0 or broker_side == "flat":
+                broker_signed = 0.0
+            elif broker_side == "long":
+                broker_signed = broker_abs
+            elif broker_side == "short":
+                broker_signed = -broker_abs
+            else:
+                # Unrecognised side label with non-zero size — refuse to
+                # guess the sign, fall through to the halt.
+                side_unknown = True
+
+        def _signed_close_delta(side: str, magnitude: float) -> float | None:
+            """Signed delta a close of ``magnitude`` applies to the
+            engine's signed size. ``None`` for an unrecognised side."""
+            if magnitude < 0.0:
+                magnitude = 0.0
+            if side == 'sell':
+                return -magnitude
+            if side == 'buy':
+                return magnitude
+            return None
+
+        def _batch_verdict(batch: dict[str, _PendingFlipSurplusClose]) -> str:
+            markers = list(batch.values())
+            replayed = [m for m in markers if m.replayed]
+            if replayed and len(replayed) != len(markers):
+                return 'ambiguous'
+            outstanding_delta = 0.0
+            for m in markers:
+                d_out = _signed_close_delta(
+                    m.close_side, m.expected_qty - m.filled_qty,
+                )
+                if d_out is None:
+                    return 'ambiguous'
+                outstanding_delta += d_out
+            if replayed:
+                # Anchor on the LAST-armed marker. Its
+                # ``pre_close_position_size`` already contains every slice
+                # booked before it was armed — earlier corrections' fills
+                # AND the intervening fold-entry fills alike — and its
+                # ``batch_outstanding_delta`` is the matching "everything
+                # still to come at that instant" figure. Mixing anchors
+                # (or re-adding each marker's cumulative ``filled_qty``)
+                # would double-count the slices that predate the anchor.
+                anchor = max(markers, key=lambda m: m.pending_since)
+                settled_expected = (
+                    anchor.pre_close_position_size
+                    + anchor.batch_outstanding_delta
+                )
+            else:
+                settled_expected = float(self._position.size) + outstanding_delta
+            # "Nothing further landed": the fully-corrected expectation
+            # minus what is still outstanding right now. For an in-process
+            # batch this is exactly the current engine size; for a replayed
+            # one it reconstructs the book from the persisted anchor and
+            # the progress events (exact whenever the batch armed at the
+            # anchor is the batch being replayed — a sibling that settled
+            # after the anchor was captured biases this term only, never
+            # the ``settled`` expectation above, and every non-settled
+            # verdict halts anyway).
+            absent_expected = settled_expected - outstanding_delta
+
+            def _matches(expected: float) -> bool:
+                scale = max(abs(expected), abs(broker_signed), 1.0)
+                return abs(broker_signed - expected) <= scale * 1e-6 + 1e-9
+
+            if _matches(settled_expected):
+                return 'settled'
+            if _matches(absent_expected):
+                return 'absent'
+            return 'ambiguous'
+
+        settle_batch = stale
+        verdict = 'ambiguous' if side_unknown else _batch_verdict(stale)
+        if (verdict == 'ambiguous' and not side_unknown
+                and len(stale) != len(self._pending_flip_surplus_closes)):
+            # Non-stale sibling corrections may have landed too (their
+            # fills travel the same silent channel) — the whole armed
+            # batch can still match the snapshot even when the stale
+            # subset alone cannot.
+            all_armed = dict(self._pending_flip_surplus_closes)
+            if _batch_verdict(all_armed) == 'settled':
+                verdict = 'settled'
+                settle_batch = all_armed
+        if verdict == 'settled':
+            _blog_warning(
+                "stale flip-fold surplus close(s) past grace=%.1fs but "
+                "the broker snapshot matches the expected post-correction "
+                "state — settling %d marker(s) from snapshot instead of "
+                "halting",
+                grace, len(settle_batch),
+            )
+            for key, m in list(settle_batch.items()):
+                self._settle_flip_surplus_close_from_snapshot(key, m)
+            # Adopt the proven snapshot: the periodic reconcile only acts
+            # on shrink-to-zero transitions, so without this catch-up the
+            # engine view would keep the surplus indefinitely.
+            self._sync_position_size_to_broker(exch_pos)
+            return
+        oldest_key, oldest = min(
+            stale.items(), key=lambda kv: kv[1].pending_since,
+        )
+        if verdict == 'absent':
+            reason = (
+                "the broker snapshot still matches the pre-correction "
+                "state — the correction provably did not execute"
+            )
+        else:
+            reason = (
+                "the broker snapshot matches neither the corrected nor "
+                "the uncorrected expectation — settlement cannot be proven"
+            )
+        halt = BrokerManualInterventionError(
+            f"Flip-fold surplus close {oldest_key} did not settle within "
+            f"{grace}s and {reason}: the book may still hold the surplus "
+            f"exposure the stop-and-reverse fold over-opened — manual "
+            f"intervention required",
+            intent_key=oldest_key,
+            context={
+                'symbol': self._symbol,
+                'verdict': verdict,
+                'grace_s': grace,
+                'stale_count': len(stale),
+                'expected_qty': oldest.expected_qty,
+                'filled_qty': oldest.filled_qty,
+                'client_order_id': oldest.client_order_id,
+                'pending_since': oldest.pending_since,
+            },
+        )
+        self._record_halt(halt)
+        raise halt
+
+    def _settle_flip_surplus_close_from_snapshot(
+            self, close_key: str, marker: _PendingFlipSurplusClose,
+    ) -> None:
+        """Finish a surplus-correction lifecycle proven by the snapshot.
+
+        Mirrors :meth:`_settle_marker_from_flat_broker` for the flip-fold
+        correction: consume the outstanding close quantity from the FIFO
+        ``open_trades`` exactly as the lost FILL would have (a no-op in
+        the post-restart no-FIFO state, where the caller's snapshot
+        adoption owns the size), retire the parked-close / verification
+        anchors, write the missing ``flip_surplus_close_filled`` audit so
+        future restarts treat the marker as settled, and drop the marker
+        with its envelope.
+        """
+        outstanding = round(
+            max(marker.expected_qty - marker.filled_qty, 0.0), 12,
+        )
+        fifo_consumed_entry_ids: list[str] = []
+        if outstanding > 0.0 and self._position.open_trades:
+            close_qty_remaining = outstanding
+            surviving: list = []
+            removed_any = False
+            for t in self._position.open_trades:
+                if close_qty_remaining <= 0.0:
+                    surviving.append(t)
+                    continue
+                trade_qty = abs(float(t.size))
+                if trade_qty <= close_qty_remaining + 1e-12:
+                    # Whole tranche absorbed by the correction — drop it.
+                    close_qty_remaining -= trade_qty
+                    removed_any = True
+                    if t.entry_id is not None:
+                        fifo_consumed_entry_ids.append(t.entry_id)
+                else:
+                    # Tranche larger than the residual close qty: shrink
+                    # it in place and prorate the commission alongside,
+                    # mirroring :meth:`Position.record_fill_close`.
+                    new_size = trade_qty - close_qty_remaining
+                    closed_commission = (
+                        t.commission * (close_qty_remaining / trade_qty)
+                    )
+                    if t.sign < 0:
+                        t.size = -new_size
+                    else:
+                        t.size = new_size
+                    t.commission -= closed_commission
+                    close_qty_remaining = 0.0
+                    surviving.append(t)
+                    removed_any = True
+            if removed_any:
+                self._position.open_trades = surviving
+                self._position.open_commission = float(sum(
+                    t.commission for t in self._position.open_trades
+                ))
+        # Clean intents only for entries whose FIFO trade was fully
+        # consumed here AND no surviving tranche still references the id
+        # (pyramiding can keep same-id residuals alive). The fold entry
+        # itself normally survives — the correction only trims the
+        # surplus off its legitimate exposure — so no blanket cleanup on
+        # the marker's own entry key.
+        surviving_entry_ids = {
+            trade.entry_id
+            for trade in self._position.open_trades
+            if trade.entry_id is not None
+        }
+        cleaned: set[str] = set()
+        for entry_id in fifo_consumed_entry_ids:
+            if entry_id not in surviving_entry_ids and entry_id not in cleaned:
+                cleaned.add(entry_id)
+                self._cleanup_position_tracking(entry_id)
+        # The parked-close anchor and verification rows die with the
+        # settled close — a later plugin resolution must not resurrect a
+        # correction the snapshot already proved gone.
+        close_coid = marker.client_order_id
+        self._pending_verification.pop(close_coid, None)
+        self._persisted_pending_anchors.pop(close_coid, None)
+        if self._store_ctx is not None:
+            self._store_ctx.record_unpark(close_coid)
+        # The snapshot proved the correction executed, so its FILL is a
+        # lost event that can still be redelivered (a reconnecting WS
+        # replays its backlog, a polled broker rewinds its cursor). Cache
+        # the identities before dropping the marker — the outstanding
+        # quantity was just consumed from the book above and must not be
+        # consumed a second time.
+        self._mark_flip_surplus_close_settled(
+            close_key, close_coid,
+            leg_order_ids=marker.settled_leg_order_ids,
+            leg_client_order_ids=marker.settled_leg_client_order_ids,
+        )
+        self._log_flip_surplus_close_settled(
+            close_key, marker, settled_via='broker_snapshot',
+        )
+        self._pending_flip_surplus_closes.pop(close_key, None)
+        self._order_mapping.pop(close_key, None)
+        self._drop_envelope(close_key)
 
     def _consume_plugin_resolutions(self) -> None:
         """Apply plugin-driven resolutions written via ``record_resolution``.
@@ -3441,6 +4340,13 @@ class OrderSyncEngine:
             self._position.openprofit = float(exch_pos.unrealized_pnl)
         elif self._position.size == 0.0:
             self._position.openprofit = 0.0
+        # Flip-fold surplus corrections past the resolution grace window
+        # must be proven settled against this snapshot — or halt. Runs
+        # BEFORE the adoption blocks below so a replayed marker's
+        # pre-close anchor is compared against the raw broker view, and
+        # a proven-absent correction halts before the snapshot (which
+        # still contains the surplus) is adopted as truth.
+        self._raise_if_stale_pending_flip_surplus_close(exch_pos)
         # The exchange is the single source of truth for position state.
         # ``get_position`` returns ``None`` when no row exists for the symbol,
         # which is functionally a flat position — fold both branches into one
@@ -6468,12 +7374,49 @@ class OrderSyncEngine:
         # routing while ``corrected_qty`` blocks any re-dispatch, leaving
         # the surplus exposure open and unnoticed.
         close_key = close_intent.intent_key
-        self._pending_flip_surplus_closes[close_key] = _PendingFlipSurplusClose(
+        # Anchor pair for the post-restart snapshot probe: the book as it
+        # stands right now, plus the signed delta every correction armed
+        # at this moment (this one included) would still apply once fully
+        # filled. Captured together so a replayed batch has ONE consistent
+        # (baseline, expectation) pair — ``_position.size`` here already
+        # contains the slices earlier corrections booked, so those must
+        # not be re-added from their markers' cumulative ``filled_qty``.
+        batch_outstanding_delta = (
+            -overshoot if close_side == 'sell' else overshoot
+        )
+        for armed in self._pending_flip_surplus_closes.values():
+            remaining = max(armed.expected_qty - armed.filled_qty, 0.0)
+            batch_outstanding_delta += (
+                -remaining if armed.close_side == 'sell' else remaining
+            )
+        marker = _PendingFlipSurplusClose(
             client_order_id=self._build_envelope(close_intent).client_order_id(
                 KIND_CLOSE,
             ),
             expected_qty=overshoot,
+            close_side=close_side,
+            position_coid=position_coid,
+            entry_intent_key=entry_key,
+            pre_close_position_size=float(self._position.size),
+            batch_outstanding_delta=round(batch_outstanding_delta, 12),
+            pending_since=time.time(),
         )
+        self._pending_flip_surplus_closes[close_key] = marker
+        if self._store_ctx is not None:
+            # Durable arm record, also BEFORE the dispatch: the marker
+            # itself is process-local, so without this event a restart
+            # while the correction is in flight (or parked with unknown
+            # disposition) would silently drop the must-settle contract —
+            # a post-restart ``rejected`` resolution would find no armed
+            # marker and skip the escalation while the surplus exposure
+            # stays open. Startup replay re-arms every armed-without-
+            # settle record from these events.
+            self._store_ctx.log_event(
+                kind='flip_surplus_close_armed',
+                intent_key=close_key,
+                client_order_id=position_coid,
+                payload=marker.to_payload(),
+            )
         try:
             self._dispatch_new(close_intent)
         except OrderDispositionUnknownError:
@@ -7098,7 +8041,15 @@ class OrderSyncEngine:
         - ``event.pine_id`` against the cache of synthetic
           ``__pyne_defensive_close__<coid>`` ids;
         - ``event.order.id`` against the cache of broker order refs
-          captured for settled closes.
+          captured for settled closes;
+        - ``event.order.client_order_id`` against the settled coid cache,
+          exactly and then as a one-way-emulator child of a settled
+          PARENT coid. The composed form is what covers a fan leg the
+          engine never observed — a lost event, or a whole correction
+          proven settled from a broker snapshot: its
+          ``{parent_coid}:{leg_id}`` id was never cached under any exact
+          key, yet the quantity it carries was already consumed from the
+          book.
         """
         pine_id = event.pine_id
         if (pine_id is not None
@@ -7117,9 +8068,12 @@ class OrderSyncEngine:
             # so neither set above can dedupe it — the
             # ``client_order_id`` echo is the only stable identity.
             coid = order.client_order_id
-            if (coid is not None
-                    and coid in self._settled_defensive_close_client_order_ids):
-                return True
+            if coid is not None:
+                if coid in self._settled_defensive_close_client_order_ids:
+                    return True
+                for parent_coid in self._settled_defensive_close_parent_coids:
+                    if _is_composed_leg_coid(coid, parent_coid):
+                        return True
         return False
 
     def _is_neutralised_parent_entry_fill(self, event: OrderEvent) -> bool:
@@ -7261,6 +8215,13 @@ class OrderSyncEngine:
                 )
             if marker.close_client_order_id is not None:
                 self._settled_defensive_close_client_order_ids.add(
+                    marker.close_client_order_id,
+                )
+                # ``shared_ids`` is only true once the fan is complete, so
+                # the parent may now also stand in for a leg the engine
+                # never observed (see
+                # :meth:`_is_duplicate_defensive_close_fill`).
+                self._settled_defensive_close_parent_coids.add(
                     marker.close_client_order_id,
                 )
         if event.order is not None:
@@ -14744,6 +15705,10 @@ class OrderSyncEngine:
             close_coid = audit_payload.get('close_client_order_id')
             if isinstance(close_coid, str) and close_coid:
                 self._settled_defensive_close_client_order_ids.add(close_coid)
+                # The audit only exists once the whole fan settled, so the
+                # parent also covers a ``{parent_coid}:{leg_id}`` child
+                # whose own event never reached the prior instance.
+                self._settled_defensive_close_parent_coids.add(close_coid)
             # Late parent ENTRY fill neutralisation. When the prior process
             # wrote ``defensive_close_filled`` (so the close audit landed)
             # but the parent ENTRY ``filled`` / ``partial`` WS event was
@@ -14841,6 +15806,15 @@ class OrderSyncEngine:
                 # ``record_fill``.
                 if marker.close_client_order_id is not None:
                     self._settled_defensive_close_client_order_ids.add(
+                        marker.close_client_order_id,
+                    )
+                    # The audit is written only after the fan completes
+                    # (the short-fan branch of
+                    # :meth:`_route_defensive_close_fill` returns before
+                    # it), so the parent may stand in for a leg the prior
+                    # instance never observed — same contract as the
+                    # in-process ``shared_ids=True`` settle.
+                    self._settled_defensive_close_parent_coids.add(
                         marker.close_client_order_id,
                     )
                 # Finish the parked-close anchor cleanup the prior instance
