@@ -11987,3 +11987,113 @@ def __test_failsafe_lifecycle_events_reach_the_broker_log_without_a_sink__(caplo
     assert any('DEGRADED on' in m and 'entry gate engaged' in m
                for m in messages)
     assert any('ownership -> UNKNOWN' in m for m in messages)
+
+
+def __test_parent_labelled_tp_fill_retires_the_consumed_entrys_tracking__():
+    """A TP fill labelled with the PARENT's pine_id must retire that parent.
+
+    Plugins with position-attached brackets (Capital.com) report the TP/SL
+    fill under the parent entry's own pine_id. The FIFO-cleanup guard's
+    "own entry" exemption skipped it, so the consumed parent's entry + exit
+    intents stayed active; the next same-name phase's exit then diffed as a
+    MODIFY against a parent the venue closed long ago and the plugin's
+    "no confirmed entry row" reject killed the run (capitalcom cycle 29,
+    task #115). The surviving pyramid sibling must stay tracked.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
+                                                  limit=51_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_010.0, pine_id="L2", xchg_id="xchg-2",
+                    fill_id="l2-1"))
+    assert pos.size == 2.0
+
+    # The venue TP closes L1 in full, labelled with L1 itself; L2 survives.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 51_000.0, pine_id="L1",
+                    leg=LegType.TAKE_PROFIT, xchg_id="xchg-1",
+                    fill_id="tp-1"))
+
+    assert pos.size == 1.0
+    assert "L1" not in engine.active_intents
+    assert not any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "L1"
+        for intent in engine.active_intents.values()
+    )
+    assert any(trade.entry_id == "L2" for trade in pos.open_trades)
+
+
+def __test_moot_exit_modify_reject_retires_instead_of_crashing__():
+    """A rejected exit modify over a tradeless parent must not kill the run.
+
+    When a stale exit intent survives its parent (any residual path) and the
+    next phase re-emits the same exit id, the modify's replacement dispatch
+    hits the plugin's "no confirmed entry row" reject. With no open trade
+    under the parent there is nothing left to protect — the engine must
+    retire the stale tracking and continue, not crash the run.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
+                                                  limit=51_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+
+    # Simulate a venue-side close the engine's cleanup missed: the book is
+    # flat but the L1 / L1-X intents are still active.
+    pos.open_trades.clear()
+    pos.size = 0.0
+    pos.sign = 0.0
+    assert "L1" in engine.active_intents
+
+    # Pine's next phase re-emits L1-X with fresh levels; the diff modifies.
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
+                                                  limit=52_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError(
+        "Capital execute_exit: no confirmed entry row for from_entry='L1'"
+    )
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    # The stale parent's entry intent is gone. The same sync may then
+    # legitimately re-dispatch Pine's current L1-X as a FRESH exit (it is
+    # the script's live intent, not a stale leftover) — so the assertion is
+    # on the retired entry and on the run surviving, not on the exit slot.
+    assert "L1" not in engine.active_intents
+    assert len(b.modify_exit_calls) == 1
+
+
+def __test_exit_modify_reject_over_a_live_parent_still_raises__():
+    """The moot-modify degrade must NOT swallow a live parent's reject.
+
+    With an open trade under the parent, a rejected exit modify means real
+    exposure just lost its protection replacement — that stays a raising
+    condition, not a silent retire.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
+                                                  limit=51_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    assert any(trade.entry_id == "L1" for trade in pos.open_trades)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
+                                                  limit=52_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    with pytest.raises(ExchangeOrderRejectedError):
+        engine.sync(BAR_TS + 60_000)
+    assert "L1" in engine.active_intents

@@ -5775,12 +5775,25 @@ class OrderSyncEngine:
             # re-entry "unchanged" and silently never dispatches it, while
             # its orphaned exit keeps being modified against a position the
             # venue has closed (the reject that halts Capital.com).
+            closing_leg = event.leg_type in (
+                LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                LegType.TRAILING_STOP, LegType.CLOSE,
+            )
             fifo_closed = [
                 closed_entry_id
                 for closed_entry_id in self._last_fifo_closed_entry_ids
-                # This fill's own entry: a same-id flatten-and-reopen puts it
-                # in the FIFO slice while the entry itself is live.
-                if closed_entry_id != event.pine_id
+                # This fill's own entry: a same-id flatten-and-reopen ENTRY
+                # fill puts it in the FIFO slice while the entry itself is
+                # live. A closing leg is exempt from this guard: plugins with
+                # position-attached brackets (Capital.com) label the TP/SL
+                # fill with the PARENT's own pine_id, and skipping the
+                # consumed parent here strands its exit intent — the next
+                # same-name phase's exit then diffs as a modify against a
+                # parent the venue closed long ago, and the plugin's
+                # "no confirmed entry row" reject kills the run. The
+                # open-trades check below still protects a parent that keeps
+                # a surviving trade (partial TP, pyramiding).
+                if (closing_leg or closed_entry_id != event.pine_id)
                 # Pyramiding: another trade under this entry survives, so its
                 # bracket and diff slot are still owed.
                 and not any(trade.entry_id == closed_entry_id
@@ -5797,8 +5810,7 @@ class OrderSyncEngine:
             # arrived as ``from_entry='S'`` while ``S`` was opening, wiping
             # ``S``'s intent and bracket and later swallowing four re-entry
             # signals as "unchanged").
-            if (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
-                                    LegType.TRAILING_STOP, LegType.CLOSE)
+            if (closing_leg
                     and self._position.size == 0
                     and not fifo_closed):
                 self._cleanup_closed_position(event)
@@ -17813,6 +17825,30 @@ class OrderSyncEngine:
                     self._retired_entry_order_ids.add(stale_id)
             self._reanchor_envelope_after_reject(new.intent_key)
             self._dispatch_new(new)
+        except ExchangeOrderRejectedError as e:
+            # An exit modify whose parent entry no longer carries any open
+            # trade is moot: the venue has already closed the position the
+            # replacement bracket would protect, so the reject ("no
+            # confirmed entry row" on Capital.com) proves there is nothing
+            # left to guard. Retire the stale tracking and continue — a
+            # raw raise here kills the whole run over a dead intent. Any
+            # other reject (a live parent losing its protection) still
+            # re-raises: swallowing it would leave real exposure unguarded.
+            if (isinstance(new, ExitIntent)
+                    and new.from_entry is not None
+                    and not any(trade.entry_id == new.from_entry
+                                for trade in self._position.open_trades)):
+                _blog_warning(
+                    "modify rejected for %s but parent %r holds no open "
+                    "trade — retiring the stale exit tracking: %s",
+                    new, new.from_entry, e,
+                )
+                self._cleanup_position_tracking(new.from_entry)
+                return
+            _blog_error(
+                "modify failed for %s: %s: %s", new, type(e).__name__, e,
+            )
+            raise
         except Exception as e:
             _blog_error(
                 "modify failed for %s: %s: %s", new, type(e).__name__, e,
