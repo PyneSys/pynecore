@@ -1,0 +1,49 @@
+{
+ "recorded": {
+  "1": [],
+  "3": [],
+  "5": [
+   {
+    "ts": 1786951200,
+    "o": 1873.9,
+    "h": 1878.5,
+    "l": 1872.3,
+    "c": 1877.3,
+    "v": 4613.0,
+    "arrived": 1786952435.670807
+   },
+   {
+    "ts": 1786951500,
+    "o": 1877.6,
+    "h": 1878.1,
+    "l": 1875.0,
+    "c": 1875.2,
+    "v": 4379.0,
+    "arrived": 1786952702.8585517
+   }
+  ]
+ },
+ "latency": {
+  "1": {
+   "rest_rtt_median": 0.031,
+   "rest_rtt_max": 0.1
+  },
+  "3": {
+   "rest_rtt_median": 0.029,
+   "rest_rtt_max": 0.265
+  },
+  "5": {
+   "n": 1,
+   "median": 902.86,
+   "max": 902.86,
+   "p95": 902.86,
+   "rest_rtt_median": 0.032,
+   "rest_rtt_max": 0.27
+  }
+ },
+ "failures": [
+  "@1: recorded no bars at all",
+  "@3: recorded no bars at all",
+  "@5 14:25: arrived 902.9s after close \u2014 AFTER the next bar closed (red line)"
+ ]
+}

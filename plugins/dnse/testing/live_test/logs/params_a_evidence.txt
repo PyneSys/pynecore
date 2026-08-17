@@ -1,0 +1,114 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] skipping startup size adoption (exchange=3.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[PRM] === PARAM MATRIX — window open. T19-T26/T30 continuous, T16 hold/restart, T14 ATC, T32 ATO. 1 contract unless flagged, >=4.5% away. startState=0  
+[PRM] bar=506 close=1885.5 candle=GREEN phase=CONT-PM state=0 step=0 pending=no pos=0
+[PRM] T19 PLACE phase=CONT-PM buy both-set trigger=1979.8 limit=1791.2 — KEY (#14): per code audit the venue must show exactly ONE NORMAL limit (stop   
+[BROKER] watch-armed line); a conditional stop-limit or an OCO pair at the venue = FINDING                    
+[BROKER] dispatching ENTRY BUY id='T19' qty=1.0 type=limit limit=1791.2 stop=1979.8
+[BROKER] armed entry-stop watch for 'T19': native LIMIT rests, software STOP @ 1979.8 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='T19' qty=1.0 type=limit limit=1791.2 stop=1979.8 -> 
+[BROKER] event CREATED id=da1b0286p09g1n1vglc0 side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[PRM] bar=507 close=1884.1 candle=RED phase=CONT-PM state=0 step=0 pending=yes pos=0
+[PRM] T19 CANCEL
+[PRM] STAGE DONE phase=CONT-PM — state 0->1
+[BROKER] cancelling CANCEL id='T19'
+[BROKER] event CANCELLED id=da1b0286p09g1n1vglc0 side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=da1b0286p09g1n1vglc0 side=buy qty=1.0 filled=0.0 pine='T19' leg=entry)
+[PRM] bar=508 close=1883.4 candle=RED phase=CONT-PM state=1 step=0 pending=no pos=0
+[PRM] T20 PLACE phase=CONT-PM SHORT sell-STOP 1789.2 (-5%) — REGRESSION (sell trigger already proven: L0 daily stop-short + live3 2026-08-12): expect   
+[BROKER] dispatching ENTRY SELL id='T20' qty=1.0 type=stop stop=1789.2
+[BROKER] dispatched ENTRY SELL id='T20' qty=1.0 type=stop stop=1789.2 -> 
+[BROKER] event CREATED id=da1b10o6p09g1n1vgljg side=sell qty=1.0 filled=0.0 pine='T20' leg=entry
+[PRM] bar=509 close=1884.3 candle=GREEN phase=CONT-PM state=1 step=0 pending=yes pos=0
+[PRM] T20 CANCEL
+[PRM] STAGE DONE phase=CONT-PM — state 1->2
+[BROKER] cancelling CANCEL id='T20'
+[BROKER] event CANCELLED id=da1b10o6p09g1n1vgljg side=sell qty=1.0 filled=0.0 pine='T20' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=da1b10o6p09g1n1vgljg side=sell qty=1.0 filled=0.0 pine='T20' leg=entry)
+[PRM] bar=510 close=1883.2 candle=RED phase=CONT-PM state=2 step=0 pending=no pos=0
+[PRM] bar=511 close=1884.2 candle=GREEN phase=CONT-PM state=2 step=0 pending=no pos=0
+[PRM] T21 PLACE phase=CONT-PM qty OMITTED limit=1790 — venue qty must equal default_qty_value=1 (sizing path)
+[BROKER] dispatching ENTRY BUY id='T21' qty=1.0 type=limit limit=1789.9
+[BROKER] dispatched ENTRY BUY id='T21' qty=1.0 type=limit limit=1789.9 -> 
+[BROKER] event CREATED id=422406 side=buy qty=1.0 filled=0.0 pine='T21' leg=entry
+[PRM] bar=512 close=1884.3 candle=GREEN phase=CONT-PM state=2 step=0 pending=yes pos=0
+[PRM] T21 CANCEL
+[PRM] STAGE DONE phase=CONT-PM — state 2->3
+[BROKER] cancelling CANCEL id='T21'
+[BROKER] event CANCELLED id=422406 side=buy qty=1.0 filled=0.0 pine='T21' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=422406 side=buy qty=1.0 filled=0.0 pine='T21' leg=entry)
+[PRM] bar=513 close=1884.2 candle=RED phase=CONT-PM state=3 step=0 pending=no pos=0
+[PRM] bar=514 close=1883.8 candle=RED phase=CONT-PM state=3 step=0 pending=no pos=0
+[PRM] bar=515 close=1883.3 candle=RED phase=CONT-PM state=3 step=0 pending=no pos=0
+[PRM] bar=516 close=1884.1 candle=GREEN phase=CONT-PM state=3 step=0 pending=no pos=0
+[PRM] T22 PLACE phase=CONT-PM entry=1789.9 + exit(profit=1884t loss=188t) — KEY: TP limit must equal 1978.3 EXACTLY; SL leg graded by TRIGGER           
+[BROKER] dispatching ENTRY BUY id='T22' qty=1.0 type=limit limit=1789.8
+[BROKER] dispatched ENTRY BUY id='T22' qty=1.0 type=limit limit=1789.8 -> 
+[BROKER] event CREATED id=433836 side=buy qty=1.0 filled=0.0 pine='T22' leg=entry
+[PRM] bar=517 close=1884.1 candle=RED phase=CONT-PM state=3 step=0 pending=yes pos=0
+[PRM] T22 CANCEL id=T22 and id=X22 (both, explicitly)
+[PRM] STAGE DONE phase=CONT-PM — state 3->4
+[BROKER] cancelling CANCEL id='T22'
+[BROKER] event CANCELLED id=433836 side=buy qty=1.0 filled=0.0 pine='T22' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=433836 side=buy qty=1.0 filled=0.0 pine='T22' leg=entry)
+[PRM] bar=518 close=1884.6 candle=GREEN phase=CONT-PM state=4 step=0 pending=no pos=0
+[PRM] T23 PLACE phase=CONT-PM entry=1790.4 + exit(trail_points=377 ONLY) — NEGATIVE PROBE: trailing is engine-emulated; NOTHING of X23 may reach the    
+[BROKER] dispatching ENTRY BUY id='T23' qty=1.0 type=limit limit=1790.3
+[BROKER] dispatched ENTRY BUY id='T23' qty=1.0 type=limit limit=1790.3 -> 
+[BROKER] event CREATED id=435386 side=buy qty=1.0 filled=0.0 pine='T23' leg=entry
+[PRM] bar=519 close=1884.2 candle=RED phase=CONT-PM state=4 step=0 pending=yes pos=0
+[PRM] T23 CANCEL id=T23 — X23 must never have existed at the venue
+[PRM] STAGE DONE phase=CONT-PM — state 4->5
+[BROKER] cancelling CANCEL id='T23'
+[BROKER] event CANCELLED id=435386 side=buy qty=1.0 filled=0.0 pine='T23' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=435386 side=buy qty=1.0 filled=0.0 pine='T23' leg=entry)
+[PRM] bar=520 close=1883.7 candle=RED phase=CONT-PM state=5 step=0 pending=no pos=0
+[PRM] bar=521 close=1884.5 candle=GREEN phase=CONT-PM state=5 step=0 pending=no pos=0
+[PRM] T24 PLACE phase=CONT-PM entry qty=2 limit=1790.3 + exit(qty_percent=50 stop=1771.4) — KEY: the exit leg must rest at venue qty 1 (50% of 2)
+[BROKER] dispatching ENTRY BUY id='T24' qty=2.0 type=limit limit=1790.2
+[BROKER] dispatched ENTRY BUY id='T24' qty=2.0 type=limit limit=1790.2 -> 
+[BROKER] dispatching EXIT id='X24' from='T24' qty=1.0 sl=1771.4
+[BROKER] dispatched EXIT id='X24' from='T24' qty=1.0 sl=1771.4 -> 
+[BROKER] event CREATED id=437076 side=buy qty=2.0 filled=0.0 pine='T24' leg=entry
+[PRM] bar=522 close=1884.9 candle=GREEN phase=CONT-PM state=5 step=0 pending=yes pos=0
+[PRM] T24 CANCEL id=T24 and id=X24
+[PRM] STAGE DONE phase=CONT-PM — state 5->6
+[BROKER] cancelling CANCEL id='T24'
+[BROKER] event CANCELLED id=437076 side=buy qty=2.0 filled=0.0 pine='T24' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=437076 side=buy qty=2.0 filled=0.0 pine='T24' leg=entry)
+[PRM] bar=523 close=1886.2 candle=GREEN phase=CONT-PM state=6 step=0 pending=no pos=0
+[PRM] T25 PLACE phase=CONT-PM entry qty=2 + TWO exits qty=1 each (stops 1773 / 1763.6) — both must rest, combined qty <= entry qty; then cancel all     
+[BROKER] dispatching ENTRY BUY id='T25' qty=2.0 type=limit limit=1791.8
+[BROKER] dispatched ENTRY BUY id='T25' qty=2.0 type=limit limit=1791.8 -> 
+[BROKER] dispatching EXIT id='X25a' from='T25' qty=1.0 sl=1773.0
+[BROKER] dispatched EXIT id='X25a' from='T25' qty=1.0 sl=1773.0 -> 
+[BROKER] dispatching EXIT id='X25b' from='T25' qty=1.0 sl=1763.5
+[BROKER] dispatched EXIT id='X25b' from='T25' qty=1.0 sl=1763.5 -> 
+[BROKER] event CREATED id=440556 side=buy qty=2.0 filled=0.0 pine='T25' leg=entry
+[PRM] bar=524 close=1883.8 candle=RED phase=CONT-PM state=6 step=0 pending=yes pos=0
+[PRM] T25 CANCEL all three, explicitly
+[PRM] STAGE DONE phase=CONT-PM — state 6->7
+[BROKER] cancelling CANCEL id='T25'
+[BROKER] event CANCELLED id=440556 side=buy qty=2.0 filled=0.0 pine='T25' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=440556 side=buy qty=2.0 filled=0.0 pine='T25' leg=entry)
+[PRM] bar=525 close=1881.4 candle=RED phase=CONT-PM state=7 step=0 pending=no pos=0
+[PRM] T26a close(GHOST) phase=CONT-PM with NO position and NO order — PASS = clean no-op, ZERO 
+[BROKER] activity on this bar
+[PRM] bar=526 close=1878.5 candle=RED phase=CONT-PM state=7 step=0 pending=yes pos=0
+[PRM] T26a DONE — verify the 
+[BROKER] silence on the previous bar
+[PRM] STAGE DONE phase=CONT-PM — state 7->8
+[PRM] bar=527 close=1875.2 candle=RED phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=528 close=1874.4 candle=RED phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=529 close=1873 candle=RED phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=530 close=1873.6 candle=GREEN phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=531 close=1875.1 candle=GREEN phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=532 close=1873.9 candle=RED phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=533 close=1873.7 candle=RED phase=CONT-PM state=8 step=0 pending=no pos=0
+[PRM] bar=534 close=1876 candle=GREEN phase=CONT-PM state=8 step=0 pending=no pos=0
+[BROKER] run stopped (completed) position=2 equity=355,204,052.00 VND
