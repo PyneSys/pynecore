@@ -35,7 +35,11 @@ Only tracked files exist there. Consequences:
 - **Verify you are testing NEW code** — editable installs must resolve to the repo
   (`python -c "import pynecore; print(pynecore.__file__)"`), not site-packages.
 - **Fork policy:** `main` = upstream (PyneSys/pynecore) + a linear fork stack,
-  maintained by REBASE, never merge. Dist name is `opencode-pyneruntime`; the import
+  maintained by REBASE, never merge. NEVER use GitHub's "Sync fork"/update-branch
+  PR on this repo — it merges (and conflicts); upstream updates go through the
+  worktree-rebase flow (scratch worktree, skip superseded fork commits, replay
+  the feature branch, full suites vs a pristine-upstream control, land by
+  reset + force-with-lease). Dist name is `opencode-pyneruntime`; the import
   stays `pynecore`.
 - Tests use `__test_*__` naming (`pytest.ini`); full-suite runs need
   `--ignore=tests/t00_pynecore/ast/test_045_lib_import_normalizer_invalid_alias.py`
