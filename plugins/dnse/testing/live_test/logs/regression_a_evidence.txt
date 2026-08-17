@@ -1,0 +1,135 @@
+[2026-08-17 09:19:54+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-17 09:19:54+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-17 09:19:54+0700] bar:      0 WARNING  [BROKER] skipping startup size adoption (exchange=1.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[2026-08-17 09:19:54+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-17 09:19:54+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-17 09:18:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-17 09:18:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=0 ===
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [L1] TEST 1 PLACE id=T1 LONG limit=1790.6 (-5%) — expect one NORMAL LO, filled=0
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY BUY id='T1' qty=1.0 type=limit limit=1790.5
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY BUY id='T1' qty=1.0 type=limit limit=1790.5 -> 
+[2026-08-17 09:22:00+0700] bar:    504 INFO     [BROKER] event CREATED id=20816 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[2026-08-17 09:23:00+0700] bar:    505 INFO     [L1] TEST 1 CANCEL id=T1
+[2026-08-17 09:23:00+0700] bar:    505 INFO     [L1] TEST 1 DONE — state 0->1
+[2026-08-17 09:23:00+0700] bar:    505 INFO     [BROKER] cancelling CANCEL id='T1'
+[2026-08-17 09:23:00+0700] bar:    505 INFO     [BROKER] event CANCELLED id=20816 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[2026-08-17 09:24:00+0700] bar:    506 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=20816 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry)
+[2026-08-17 09:24:00+0700] bar:    506 INFO     [L1] TEST 2 PLACE id=T2 SHORT limit=1976.9 (+5%)
+[2026-08-17 09:24:00+0700] bar:    506 INFO     [BROKER] dispatching ENTRY SELL id='T2' qty=1.0 type=limit limit=1977.0
+[2026-08-17 09:24:00+0700] bar:    506 INFO     [BROKER] dispatched ENTRY SELL id='T2' qty=1.0 type=limit limit=1977.0 -> 
+[2026-08-17 09:24:00+0700] bar:    506 INFO     [BROKER] event CREATED id=22256 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[2026-08-17 09:25:00+0700] bar:    507 INFO     [L1] TEST 2 CANCEL id=T2
+[2026-08-17 09:25:00+0700] bar:    507 INFO     [L1] TEST 2 DONE — state 1->2
+[2026-08-17 09:25:00+0700] bar:    507 INFO     [BROKER] cancelling CANCEL id='T2'
+[2026-08-17 09:25:00+0700] bar:    507 INFO     [BROKER] event CANCELLED id=22256 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[2026-08-17 09:26:00+0700] bar:    508 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=22256 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry)
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [L1] TEST 3 PLACE id=T3 limit=1787.7 + X3 stop=1768.9 — exit reaches the venue pre-fill (measured); both cancelled explicitly next bar
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] dispatching ENTRY BUY id='T3' qty=1.0 type=limit limit=1787.7
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] dispatched ENTRY BUY id='T3' qty=1.0 type=limit limit=1787.7 -> 
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] dispatching EXIT id='X3' from='T3' qty=1.0 sl=1768.8
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] dispatched EXIT id='X3' from='T3' qty=1.0 sl=1768.8 -> 
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] event CREATED id=24656 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[2026-08-17 09:27:00+0700] bar:    509 INFO     [BROKER] event CREATED id=da173c86p09g1n1vg870 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [L1] TEST 3 CANCEL id=T3 and id=X3 (both, explicitly)
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [L1] TEST 3 DONE — state 2->3
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [BROKER] cancelling CANCEL id='T3'
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [BROKER] cancelling CANCEL id='X3' from='T3'
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=24656 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[2026-08-17 09:28:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=da173c86p09g1n1vg870 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=24656 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry)
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=da173c86p09g1n1vg870 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl)
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [L1] TEST 4 PLACE id=T4 limit=1972.8 + X4 stop=1982.2 (oca) — next bar cancels ENTRY ONLY; the cascade must remove X4 (verified 2026-08-14)
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] dispatching ENTRY SELL id='T4' qty=1.0 type=limit limit=1972.9
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] dispatched ENTRY SELL id='T4' qty=1.0 type=limit limit=1972.9 -> 
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] dispatching EXIT id='X4' from='T4' qty=1.0 sl=1982.3
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] dispatched EXIT id='X4' from='T4' qty=1.0 sl=1982.3 -> 
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] event CREATED id=28186 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-17 09:29:00+0700] bar:    511 INFO     [BROKER] event CREATED id=da174a86p09g1n1vg8f0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-17 09:30:00+0700] bar:    512 INFO     [L1] TEST 4 CANCEL id=T4 ONLY — cascade must also CANCEL X4
+[2026-08-17 09:30:00+0700] bar:    512 INFO     [L1] TEST 4 DONE — state 3->4
+[2026-08-17 09:30:00+0700] bar:    512 INFO     [BROKER] cancelling CANCEL id='T4'
+[2026-08-17 09:30:00+0700] bar:    512 INFO     [BROKER] event CANCELLED id=28186 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[2026-08-17 09:31:00+0700] bar:    513 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=28186 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry)
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [L1] TEST 5 PLACE id=T5 limit=1783.4 + X5 tp=1971.2/sl=1764.7 -> NATIVE OCO — first Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY:  
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] dispatching ENTRY BUY id='T5' qty=1.0 type=limit limit=1783.4
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] dispatched ENTRY BUY id='T5' qty=1.0 type=limit limit=1783.4 -> 
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=1971.2 sl=1764.6
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=1971.2 sl=1764.6 -> 
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] event CREATED id=41226 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] event CREATED id=41216 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-17 09:33:00+0700] bar:    515 INFO     [BROKER] event CANCELLED id=da174a86p09g1n1vg8f0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-17 09:34:00+0700] bar:    516 ERROR    [BROKER] unexpected cancel for intent X4|T4 (CANCELLED id=da174a86p09g1n1vg8f0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl)
+[2026-08-17 09:34:00+0700] bar:    516 ERROR    [BROKER] sync engine quarantined: Bot-owned order cancelled unexpectedly on the venue: coid=None ref='da174a86p09g1n1vg8f0' intent='X4\x00T4'           
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [L1] TEST 5 DONE — state 4->5
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [BROKER] cancelling CANCEL id='T5'
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [BROKER] dispatching EXIT id='X4' from='T4' qty=1.0 sl=1982.3
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [BROKER] dispatched EXIT id='X4' from='T4' qty=1.0 sl=1982.3 -> 
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [BROKER] event CANCELLED id=41216 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[2026-08-17 09:34:00+0700] bar:    516 INFO     [BROKER] event CREATED id=da176lg6p09g1n1vg940 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-17 09:35:00+0700] bar:    517 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=41216 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry)
+[2026-08-17 09:35:00+0700] bar:    517 INFO     [L1] TEST 6 PLACE id=T6 LONG limit=1784.8 (-5%) — NEXT bar re-issues at 1794.2 (-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on    
+[2026-08-17 09:35:00+0700] bar:    517 WARNING  [BROKER] entry dispatch ENTRY BUY id='T6' qty=1.0 type=limit limit=1784.7 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:35:00+0700] bar:    517 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T6'); signal dropped, no broker call.
+[2026-08-17 09:36:00+0700] bar:    518 INFO     [L1] TEST 6 AMEND id=T6 -> limit 1794.2 — expect 
+[2026-08-17 09:36:00+0700] bar:    518 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T6'); signal dropped, no broker call.
+[2026-08-17 09:37:00+0700] bar:    519 INFO     [L1] TEST 6 CANCEL id=T6 (post-amend)
+[2026-08-17 09:37:00+0700] bar:    519 INFO     [L1] TEST 6 DONE — state 5->6
+[2026-08-17 09:38:00+0700] bar:    520 INFO     [L1] TEST 7 PLACE id=T7 buy-STOP 1977.3 (+5%) — NEXT bar re-issues at 1967.8 (+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a 
+[2026-08-17 09:38:00+0700] bar:    520 WARNING  [BROKER] entry dispatch ENTRY BUY id='T7' qty=1.0 type=stop stop=1977.3 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-17 09:38:00+0700] bar:    520 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T7'); signal dropped, no broker call.
+[2026-08-17 09:39:00+0700] bar:    521 INFO     [L1] TEST 7 AMEND id=T7 -> stop 1967.8 — expect code=REMOTE_SERVER_ERROR http=500 -> park+verify (#18). KEY: the run must continue, and the order must  
+[2026-08-17 09:39:00+0700] bar:    521 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T7'); signal dropped, no broker call.
+[2026-08-17 09:40:00+0700] bar:    522 INFO     [L1] TEST 7 CANCEL id=T7 (post-500) — proves a parked amend does not wedge the order: it must still cancel cleanly
+[2026-08-17 09:40:00+0700] bar:    522 INFO     [L1] TEST 7 DONE — state 6->7
+[2026-08-17 09:42:00+0700] bar:    524 INFO     [L1] TEST 8 PLACE T8a limit=1788.3 AND T8b stop=1976.5 — two ids across BOTH books; next bar strategy.cancel_all(), never before fired live
+[2026-08-17 09:42:00+0700] bar:    524 WARNING  [BROKER] entry dispatch ENTRY BUY id='T8a' qty=1.0 type=limit limit=1788.2 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 09:42:00+0700] bar:    524 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T8a'); signal dropped, no broker call.
+[2026-08-17 09:42:00+0700] bar:    524 WARNING  [BROKER] entry dispatch ENTRY BUY id='T8b' qty=1.0 type=stop stop=1976.6 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:    
+[2026-08-17 09:42:00+0700] bar:    524 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T8b'); signal dropped, no broker call.
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [L1] TEST 8 strategy.cancel_all() — BOTH T8a (NORMAL) and T8b (STOP) must go; venue book must be clear of ours
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [L1] TEST 8 DONE — state 7->8
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [BROKER] cancelling CANCEL id='X5' from='T5'
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [BROKER] cancelling CANCEL id='X4' from='T4'
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [BROKER] cancel
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [BROKER] event CANCELLED id=41226 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[2026-08-17 09:43:00+0700] bar:    525 INFO     [BROKER] event CANCELLED id=da176lg6p09g1n1vg940 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[2026-08-17 09:44:00+0700] bar:    526 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=41226 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp)
+[2026-08-17 09:44:00+0700] bar:    526 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=da176lg6p09g1n1vg940 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl)
+[2026-08-17 09:45:00+0700] bar:    527 INFO     [L1] TEST 9 PLACE via strategy.order() LONG limit=1787.8 — order() has never touched the broker; expect identical NORMAL-LO routing to entry()
+[2026-08-17 09:45:00+0700] bar:    527 WARNING  [BROKER] entry dispatch ENTRY BUY id='T9' qty=1.0 type=limit limit=1787.9 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:45:00+0700] bar:    527 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='T9'); signal dropped, no broker call.
+[2026-08-17 09:46:00+0700] bar:    528 INFO     [L1] TEST 9 CANCEL id=T9
+[2026-08-17 09:46:00+0700] bar:    528 INFO     [L1] TEST 9 DONE — state 8->9
+[2026-08-17 09:47:00+0700] bar:    529 INFO     [L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit=1788.8 (NORMAL) + Gb limit=1977.2 (NORMAL) + Gc stop=1977.2 (CONDITIONAL) — next bar cancels    
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] entry dispatch ENTRY BUY id='Ga' qty=1.0 type=limit limit=1788.8 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Ga'); signal dropped, no broker call.
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] entry dispatch ENTRY SELL id='Gb' qty=1.0 type=limit limit=1977.2 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gb'); signal dropped, no broker call.
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] entry dispatch ENTRY BUY id='Gc' qty=1.0 type=stop stop=1977.2 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-17 09:47:00+0700] bar:    529 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gc'); signal dropped, no broker call.
+[2026-08-17 09:48:00+0700] bar:    530 INFO     [L1] TEST 11 CANCEL Ga ONLY — 
+[2026-08-17 09:48:00+0700] bar:    530 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gb'); signal dropped, no broker call.
+[2026-08-17 09:48:00+0700] bar:    530 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Gc'); signal dropped, no broker call.
+[2026-08-17 09:49:00+0700] bar:    531 INFO     [L1] TEST 11 CANCEL Gb and Gc (the survivors) — book must then be clear of the whole g11 group
+[2026-08-17 09:49:00+0700] bar:    531 INFO     [L1] TEST 11 DONE — state 9->10
+[2026-08-17 09:51:00+0700] bar:    533 INFO     [L1] TEST 12 PLACE oca.reduce x2: Ra limit=1787.9 + Rb stop=1976.1 — BOTH must rest FULL qty=1 at the venue (reduce acts only on a fill); next bar      
+[2026-08-17 09:51:00+0700] bar:    533 WARNING  [BROKER] entry dispatch ENTRY BUY id='Ra' qty=1.0 type=limit limit=1787.9 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:51:00+0700] bar:    533 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Ra'); signal dropped, no broker call.
+[2026-08-17 09:51:00+0700] bar:    533 WARNING  [BROKER] entry dispatch ENTRY BUY id='Rb' qty=1.0 type=stop stop=1976.1 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:     
+[2026-08-17 09:51:00+0700] bar:    533 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Rb'); signal dropped, no broker call.
+[2026-08-17 09:52:00+0700] bar:    534 INFO     [L1] TEST 12 cancel_all — Ra and Rb must both go
+[2026-08-17 09:52:00+0700] bar:    534 INFO     [L1] TEST 12 DONE — state 10->11
+[2026-08-17 09:54:00+0700] bar:    536 INFO     [L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit=1788.6 + Nb limit=1976.8 — next bar cancels ONLY Na; Nb must be untouched (none = independent)
+[2026-08-17 09:54:00+0700] bar:    536 WARNING  [BROKER] entry dispatch ENTRY BUY id='Na' qty=1.0 type=limit limit=1788.5 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:   
+[2026-08-17 09:54:00+0700] bar:    536 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Na'); signal dropped, no broker call.
+[2026-08-17 09:54:00+0700] bar:    536 WARNING  [BROKER] entry dispatch ENTRY SELL id='Nb' qty=1.0 type=limit limit=1976.9 blocked by quarantine (Bot-owned order cancelled unexpectedly on the venue:  
+[2026-08-17 09:54:00+0700] bar:    536 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Nb'); signal dropped, no broker call.
+[2026-08-17 09:55:00+0700] bar:    537 INFO     [L1] TEST 13 CANCEL Na ONLY — Nb must be untouched (oca.none)
+[2026-08-17 09:55:00+0700] bar:    537 WARNING  [BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='Nb'); signal dropped, no broker call.
+[2026-08-17 09:56:00+0700] bar:    538 INFO     [L1] TEST 13 CANCEL Nb (the survivor)
+[2026-08-17 09:56:00+0700] bar:    538 INFO     [L1] TEST 13 DONE — state 11->12
+[2026-08-17 09:56:00+0700] bar:    538 INFO     [L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-08-17 10:22:21+0700] bar:    563 INFO     [BROKER] run stopped (completed) position=1 equity=424,629,778.00 VND
