@@ -27,6 +27,9 @@ conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> L
 | **Live-L1-T11-OcaCancelMember** | `oca.cancel` ×3 across books; cancel one member — siblings must remain | ✅ **08-17** — cancel of one member swept nothing; cross-book group intact |
 | **Live-L1-T12-OcaReduce** | `oca.reduce` pair rests full qty | ✅ **08-17** — both rested full qty; cancel_all swept both |
 | **Live-L1-T13-OcaNone** | `oca.none` shared name = independent | ✅ **08-17** — sibling untouched by member cancel |
+| **Live-L1-T14-AtcCancelRefusal** | place late CONT-PM, cancel DURING ATC → venue must refuse every attempt; both orders expire at close. Direct probe (`direct_probes_t14_t15_t17.py --case t14`, launch 14:20–14:29) — Live-L4-T03 proved no bars arrive in ATC, so Pine cannot fire the cancel | ❌ NOT RUN — built 08-17, plan-gated |
+| **Live-L1-T15-CancelReplace** | #18 evidence: conditional cancel-ACK → immediate replacement on the STOP book; measures the exposure gap (`--case t15`, continuous/lunch) | ❌ NOT RUN — built 08-17, plan-gated |
+| **Live-L1-T17-ReplaceUnderAckLag** | identical NORMAL LO re-placed inside the ~10 s stale-replica window after a cancel ACK; final state must be exactly ONE working (`--case t17`, continuous) | ❌ NOT RUN — built 08-17, plan-gated |
 | **Live-L2-SingleFill** | one market fill → flatten (`l2_fill_flatten`) | ✅ 08-12 |
 | **Live-L2-BracketFill** | fill + TP/SL bracket → flatten (`l2b_…`) | ⚠️ 08-12 partial |
 | **Live-L3-F01-LongMarket** … **F02-ShortMarket** | market fills | ❌ NOT RUN |
