@@ -34,8 +34,9 @@ conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> L
 | **Live-L3-F05-LongStopLimit** … **F06-ShortStopLimit** | stop-limit fills (#14 evidence) | ❌ NOT RUN |
 | **Live-L3-F07-OcaLongBreak** … **F08-OcaShortBreak** | OCA sibling-cancel on a real fill | ❌ NOT RUN |
 
-| **Live-L4-T01-BarParity** | live @1/@3/@5 bars vs the venue's delayed OHLC + 1m aggregation cross-check (`level4_data_parity/`) | ✅ 08-17 smoke (8 min, exact match) — full-session run pending |
-| **Live-L4-T02-BarLatency** | arrival delay + REST RTT per bar; red lines: bar later than next close, upward drift | ✅ 08-17 smoke — steady ~1.7–5 s vs 3 s poll |
+| **Live-L4-T01-BarParity** | live @1/@3/@5 bars vs the venue's delayed OHLC + 1m aggregation cross-check (`level4_data_parity/`) | ✅ 08-17 smoke + PM-reopen chunk (exact match incl. aggregation; evidence `level4_data_parity/logs/l4_20260817_1310.json`) |
+| **Live-L4-T02-BarLatency** | arrival delay + REST RTT per bar; red lines: bar later than next close, upward drift | ✅ 08-17 smoke + PM-reopen (≤4 s, no red-line hit; drift heuristic false-alarmed on a poll-phase plateau — probe fix queued on #24) |
+| **Live-L4-T03-AtcBarDelivery** | does `watch_ohlcv` deliver bars DURING ATC (14:30–14:45) and for the auction print after close? Same recorder run over the 14:22–14:50 edge; feeds Live-L1-T14's bar-delivery caveat and the "can we trade the 14:30/14:45 candle" question | ❌ NOT RUN — scheduled 08-17 ~14:22 |
 
 Live-L3 backtest mode (past window) is the ORACLE — a pre-launch gate, never a live result.
 Live-L3 requires a FLAT account. Live-L4 is PASSIVE (no orders, no trading token) but must

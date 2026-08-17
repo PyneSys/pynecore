@@ -8,12 +8,13 @@
 //   state 1 -> TEST 2  short entry, limit +5%
 //   state 2 -> TEST 3  long  entry, limit -5%  + exit(stop -6%)      (green candle only)
 //   state 3 -> TEST 4  short entry, limit +5%  + exit(stop +5.5%), one OCA group;
-//                      cancel ENTRY only -> the cascade must remove the exit (verified
-//                      live 2026-08-14 on a STOP leg)
+//                      cancel ENTRY only -> the exit X4 is EXPECTED TO REMAIN (the
+//                      plugin-side cascade was REVERTED — it broke engine ownership/
+//                      quarantine; #19 stays open for an engine-side fix). Cancel the
+//                      orphan MANUALLY after grading.
 //   state 4 -> TEST 5  long  entry, limit -5%  + exit(limit +5%, stop -6%) -> native OCO;
-//                      cancel ENTRY only -> does the cascade also clear an OCO leg?
-//                      (2026-08-14 verified STOP only; the OCO umbrella book is otherwise
-//                      untouched by Level 1)
+//                      cancel ENTRY only -> the OCO leg X5 is likewise EXPECTED TO
+//                      REMAIN post-revert; cancel it manually after grading.
 //   state 5 -> TEST 6  long  entry, limit -5%; NEXT bar re-issue at -4.5% (an AMEND on
 //                      the NORMAL book — worked live 2026-08-10, re-verify on 6.8.5);
 //                      then cancel
@@ -53,8 +54,10 @@
 //
 // MEASURED 2026-08-13/14 (kept for the record):
 //   * exits DO reach the venue before their entry fills (string ids, conditional book);
-//   * cancelling an entry did NOT remove its exit at DNSE (#19) — the plugin now
-//     cascades, verified live 2026-08-14 11:25 on a STOP leg;
+//   * cancelling an entry did NOT remove its exit at DNSE (#19). A plugin-side
+//     cascade was tried (verified live 2026-08-14 11:25) then REVERTED — it broke
+//     engine ownership/quarantine. Post-revert the orphan exit is EXPECTED and is
+//     cleaned up manually; #19 stays open for an engine-side fix;
 //   * a 2xx cancel is an ACK, not a completion (#20) — the plugin now re-reads until
 //     the venue agrees, verified live 2026-08-14 11:21;
 //   * a GTD past the contract's finalTradeDate -> CO-ORD-006 (fixed: clamped).
@@ -139,7 +142,8 @@ if started
             strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4", comment_loss="X4")
             placedBar := bar_index
             log.info("[L1] TEST 4 PLACE id=T4 limit={0} + X4 stop={1} (oca) — next bar cancels " +
-                     "ENTRY ONLY; the cascade must remove X4 (verified 2026-08-14)",
+                     "ENTRY ONLY; X4 EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel " +
+                     "the orphan manually after grading",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
         else if state == 4 and isGreen
@@ -151,8 +155,8 @@ if started
                           comment_profit="X5tp", comment_loss="X5sl")
             placedBar := bar_index
             log.info("[L1] TEST 5 PLACE id=T5 limit={0} + X5 tp={1}/sl={2} -> NATIVE OCO — first " +
-                     "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: does the " +
-                     "cascade clear the OCO leg too? (only STOP was verified this morning)",
+                     "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: X5 " +
+                     "EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel manually after",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlTP, format.mintick),
                      str.tostring(lvlStop, format.mintick))
 
@@ -278,11 +282,12 @@ if started
                 log.info("[L1] TEST 3 CANCEL id=T3 and id=X3 (both, explicitly)")
             else if state == 3
                 strategy.cancel("T4")
-                log.info("[L1] TEST 4 CANCEL id=T4 ONLY — cascade must also CANCEL X4")
+                log.info("[L1] TEST 4 CANCEL id=T4 ONLY — X4 EXPECTED TO REMAIN (no cascade " +
+                         "post-revert, #19 open); cancel the orphan manually after grading")
             else if state == 4
                 strategy.cancel("T5")
-                log.info("[L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade " +
-                         "clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after")
+                log.info("[L1] TEST 5 CANCEL id=T5 ONLY — X5 (OCO leg) EXPECTED TO REMAIN " +
+                         "(no cascade post-revert, #19 open); cancel it manually after grading")
             else if state == 5
                 strategy.cancel("T6")
                 log.info("[L1] TEST 6 CANCEL id=T6 (post-amend)")

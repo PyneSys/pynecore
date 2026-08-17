@@ -58,7 +58,7 @@ def main(
                 strategy.entry("T4", strategy.short, limit=lvlEntry, oca_name="t4", oca_type=strategy.oca.cancel, comment="T4")
                 strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4", comment_loss="X4")
                 placedBar = bar_index
-                log.info("[L1] TEST 4 PLACE id=T4 limit={0} + X4 stop={1} (oca) — next bar cancels " + "ENTRY ONLY; the cascade must remove X4 (verified 2026-08-14)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
+                log.info("[L1] TEST 4 PLACE id=T4 limit={0} + X4 stop={1} (oca) — next bar cancels " + "ENTRY ONLY; X4 EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel " + "the orphan manually after grading", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
             elif state == 4 and isGreen:
                 lvlEntry = close * 0.95
                 lvlTP = close * 1.05
@@ -66,7 +66,7 @@ def main(
                 strategy.entry("T5", strategy.long, limit=lvlEntry, comment="T5")
                 strategy.exit("X5", from_entry="T5", limit=lvlTP, stop=lvlStop, comment_profit="X5tp", comment_loss="X5sl")
                 placedBar = bar_index
-                log.info("[L1] TEST 5 PLACE id=T5 limit={0} + X5 tp={1}/sl={2} -> NATIVE OCO — first " + "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: does the " + "cascade clear the OCO leg too? (only STOP was verified this morning)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlTP, format.mintick), string.tostring(lvlStop, format.mintick))
+                log.info("[L1] TEST 5 PLACE id=T5 limit={0} + X5 tp={1}/sl={2} -> NATIVE OCO — first " + "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: X5 " + "EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel manually after", string.tostring(lvlEntry, format.mintick), string.tostring(lvlTP, format.mintick), string.tostring(lvlStop, format.mintick))
             elif state == 5 and isGreen:
                 lvlEntry = close * 0.95
                 lvlAmend = close * 0.955
@@ -148,10 +148,10 @@ def main(
                     log.info("[L1] TEST 3 CANCEL id=T3 and id=X3 (both, explicitly)")
                 elif state == 3:
                     strategy.cancel("T4")
-                    log.info("[L1] TEST 4 CANCEL id=T4 ONLY — cascade must also CANCEL X4")
+                    log.info("[L1] TEST 4 CANCEL id=T4 ONLY — X4 EXPECTED TO REMAIN (no cascade " + "post-revert, #19 open); cancel the orphan manually after grading")
                 elif state == 4:
                     strategy.cancel("T5")
-                    log.info("[L1] TEST 5 CANCEL id=T5 ONLY — KEY OBSERVATION: does the cascade " + "clear the OCO leg X5? Venue must show NOTHING of T5/X5 working after")
+                    log.info("[L1] TEST 5 CANCEL id=T5 ONLY — X5 (OCO leg) EXPECTED TO REMAIN " + "(no cascade post-revert, #19 open); cancel it manually after grading")
                 elif state == 5:
                     strategy.cancel("T6")
                     log.info("[L1] TEST 6 CANCEL id=T6 (post-amend)")

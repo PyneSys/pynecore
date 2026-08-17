@@ -4,14 +4,23 @@
 // 1 contract unless a test NEEDS more (T24/T25/T30 are flagged), priced >=4.5% from
 // market so the venue ACCEPTS and RESTS it but it cannot fill. Nothing should ever fill.
 //
-//   state 0 -> T19  stop-limit combo: entry(limit= AND stop=) must rest as ONE
-//                   conditional stop-limit, NOT an OCO pair (evidence for #14)
-//   state 1 -> T20  SHORT sell-stop entry -5% (below market). T7 proved a LONG buy-stop
-//                   places on the conditional book; the SELL trigger direction has
-//                   never been placed. Evidence for #13's "stop entries" claim.
+//   state 0 -> T19  stop-limit combo: entry(limit= AND stop=). Per the code (audited
+//                   2026-08-17: intent_builder.py:67, software_entry_stop_engine.py)
+//                   the engine realises this as ONE native LIMIT at the venue + an
+//                   ENGINE-SIDE software watch for the stop leg. PASS = exactly one
+//                   NORMAL limit resting + [BROKER] watch-armed line; a conditional
+//                   stop-limit OR an OCO pair at the venue would each be a finding (#14)
+//   state 1 -> T20  SHORT sell-stop entry -5% (below market). REGRESSION ONLY — the
+//                   SELL trigger direction is already proven: L0 places a sell-stop
+//                   every day ("stop short") and live3 placed one on 2026-08-12
+//                   (d9u14sa1... CREATED->CANCELLED). Kept in sequence so state
+//                   numbering is stable; grade as a cheap regression, not new evidence.
 //   state 2 -> T21  qty omitted -> venue qty must equal default_qty_value (=1)
-//   state 3 -> T22  exit(profit=/loss= in TICKS): pre-fill legs must rest at exactly
-//                   entry +/- N*mintick (tick->price conversion at the venue boundary)
+//   state 3 -> T22  exit(profit=/loss= in TICKS): pre-fill legs rest at entry +/- N*mintick.
+//                   GRADE THE SL LEG BY ITS TRIGGER (stopPrice): since 5b03bc3 the SL
+//                   ORDER price is deliberately trigger - 2*slippage*mintick, so the
+//                   venue's "order price" field will NOT equal sl exactly — that is
+//                   correct, not a FAIL. TP leg (plain limit) must match exactly.
 //   state 4 -> T23  NEGATIVE probe: exit with ONLY trail_* params must place NOTHING
 //                   at the venue pre-activation. PASS = entry is the only working order.
 //   state 5 -> T24  qty_percent=50 against a resting 2-lot entry -> exit leg rests qty 1
@@ -23,7 +32,9 @@
 //   state 8 -> T26b close() while the entry RESTS unfilled -> must NOT cancel the
 //                   resting entry (close targets positions); verify, then cancel
 //   state 9 -> T30  risk.max_position_size(2) + entry qty=5 -> venue order must rest
-//                   at qty 2 (engine trims at placement, _adjust_for_max_position_size)
+//                   at qty 2 (engine trims at placement, _adjust_for_max_position_size —
+//                   audited 2026-08-17: implemented in BOTH runtimes, lib/strategy
+//                   __init__.py:1493 and core/broker/position.py:229, NOT a stub)
 //   state 10 -> T16a place 1 far limit and HOLD (never advances) — kill the engine here.
 //                   Driven by run_t16_restart.sh.
 //   state 11 -> T16b post-restart observe: relaunch with startState=11 against the SAME
@@ -135,17 +146,19 @@ if started
             lvlTP    := close * 0.95    // limit leg BELOW market — rests, never fills
             strategy.entry("T19", strategy.long, stop=lvlStop, limit=lvlTP, comment="T19")
             placedBar := bar_index
-            log.info("[PRM] T19 PLACE phase={0} buy STOP-LIMIT trigger={1} limit={2} — KEY (#14): " +
-                     "venue must show exactly ONE conditional stop-limit, NOT an OCO pair",
+            log.info("[PRM] T19 PLACE phase={0} buy both-set trigger={1} limit={2} — KEY (#14): " +
+                     "per code audit the venue must show exactly ONE NORMAL limit (stop leg = " +
+                     "engine software watch, look for the [BROKER] watch-armed line); a " +
+                     "conditional stop-limit or an OCO pair at the venue = FINDING",
                      phase, str.tostring(lvlStop, format.mintick), str.tostring(lvlTP, format.mintick))
 
         else if state == 1
             lvlStop := close * 0.95
             strategy.entry("T20", strategy.short, stop=lvlStop, comment="T20")
             placedBar := bar_index
-            log.info("[PRM] T20 PLACE phase={0} SHORT sell-STOP {1} (-5%) — first-ever SELL " +
-                     "trigger direction on the conditional book (#13 evidence): reject loudly, " +
-                     "emulate, or silent drop? Watch [BROKER]",
+            log.info("[PRM] T20 PLACE phase={0} SHORT sell-STOP {1} (-5%) — REGRESSION (sell " +
+                     "trigger already proven: L0 daily stop-short + live3 2026-08-12): expect " +
+                     "conditional-book accept, string id, rests",
                      phase, str.tostring(lvlStop, format.mintick))
 
         else if state == 2 and isGreen
@@ -166,7 +179,8 @@ if started
                           comment_profit="X22tp", comment_loss="X22sl")
             placedBar := bar_index
             log.info("[PRM] T22 PLACE phase={0} entry={1} + exit(profit={2}t loss={3}t) — KEY: " +
-                     "venue legs must rest at EXACTLY tp={4} sl={5} (entry +/- N*mintick)",
+                     "TP limit must equal {4} EXACTLY; SL leg graded by TRIGGER (stopPrice) = {5} " +
+                     "— its order price is trigger minus 2*slippage*mintick BY DESIGN (5b03bc3)",
                      phase, str.tostring(lvlEntry, format.mintick), profitTicks, lossTicks,
                      str.tostring(lvlTP, format.mintick), str.tostring(lvlStop, format.mintick))
 

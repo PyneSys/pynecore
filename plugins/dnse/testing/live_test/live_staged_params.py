@@ -60,12 +60,12 @@ def main(
                 lvlTP = close * 0.95
                 strategy.entry("T19", strategy.long, stop=lvlStop, limit=lvlTP, comment="T19")
                 placedBar = bar_index
-                log.info("[PRM] T19 PLACE phase={0} buy STOP-LIMIT trigger={1} limit={2} — KEY (#14): " + "venue must show exactly ONE conditional stop-limit, NOT an OCO pair", phase, string.tostring(lvlStop, format.mintick), string.tostring(lvlTP, format.mintick))
+                log.info("[PRM] T19 PLACE phase={0} buy both-set trigger={1} limit={2} — KEY (#14): " + "per code audit the venue must show exactly ONE NORMAL limit (stop leg = " + "engine software watch, look for the [BROKER] watch-armed line); a " + "conditional stop-limit or an OCO pair at the venue = FINDING", phase, string.tostring(lvlStop, format.mintick), string.tostring(lvlTP, format.mintick))
             elif state == 1:
                 lvlStop = close * 0.95
                 strategy.entry("T20", strategy.short, stop=lvlStop, comment="T20")
                 placedBar = bar_index
-                log.info("[PRM] T20 PLACE phase={0} SHORT sell-STOP {1} (-5%) — first-ever SELL " + "trigger direction on the conditional book (#13 evidence): reject loudly, " + "emulate, or silent drop? Watch [BROKER]", phase, string.tostring(lvlStop, format.mintick))
+                log.info("[PRM] T20 PLACE phase={0} SHORT sell-STOP {1} (-5%) — REGRESSION (sell " + "trigger already proven: L0 daily stop-short + live3 2026-08-12): expect " + "conditional-book accept, string id, rests", phase, string.tostring(lvlStop, format.mintick))
             elif state == 2 and isGreen:
                 lvlEntry = close * 0.95
                 strategy.entry("T21", strategy.long, limit=lvlEntry, comment="T21")
@@ -80,7 +80,7 @@ def main(
                 strategy.entry("T22", strategy.long, limit=lvlEntry, comment="T22")
                 strategy.exit("X22", from_entry="T22", profit=profitTicks, loss=lossTicks, comment_profit="X22tp", comment_loss="X22sl")
                 placedBar = bar_index
-                log.info("[PRM] T22 PLACE phase={0} entry={1} + exit(profit={2}t loss={3}t) — KEY: " + "venue legs must rest at EXACTLY tp={4} sl={5} (entry +/- N*mintick)", phase, string.tostring(lvlEntry, format.mintick), profitTicks, lossTicks, string.tostring(lvlTP, format.mintick), string.tostring(lvlStop, format.mintick))
+                log.info("[PRM] T22 PLACE phase={0} entry={1} + exit(profit={2}t loss={3}t) — KEY: " + "TP limit must equal {4} EXACTLY; SL leg graded by TRIGGER (stopPrice) = {5} " + "— its order price is trigger minus 2*slippage*mintick BY DESIGN (5b03bc3)", phase, string.tostring(lvlEntry, format.mintick), profitTicks, lossTicks, string.tostring(lvlTP, format.mintick), string.tostring(lvlStop, format.mintick))
             elif state == 4 and isGreen:
                 lvlEntry = close * 0.95
                 trailPts = math.round(close * 0.02 / syminfo.mintick)
