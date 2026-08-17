@@ -91,6 +91,36 @@ def isfirstbar() -> bool:
 
 
 # noinspection PyProtectedMember
+def _is_session_last_bar(dt: datetime, tf_sec: int) -> bool:
+    """
+    Check if the bar starting at ``dt`` is the last bar of the trading session.
+
+    A bar STARTING exactly at the declared session end is the settlement print
+    on auction venues (e.g. VN30F1M's 14:45 ATC row) — the session's last bar.
+    Only when the session end coincides with a session START of the same day
+    (00:00 = 24:00 on 24/7 markets) does it denote the day boundary; then the
+    end is rolled to the next day so it lands on the closing bar's end instead
+    of the day's own start.
+    """
+    for se in syminfo._session_ends:
+        if se.day != dt.weekday():
+            continue
+        sedt = dt.replace(hour=se.time.hour, minute=se.time.minute, second=se.time.second,
+                          microsecond=se.time.microsecond)
+        if sedt == dt:
+            wraps = any(ss.day == se.day and ss.time == se.time
+                        for ss in syminfo._session_starts)
+            if not wraps:
+                return True
+            sedt += timedelta(days=1)
+        elif sedt < dt:
+            sedt += timedelta(days=1)
+        if dt < sedt <= dt + timedelta(seconds=tf_sec):
+            return True
+    return False
+
+
+# noinspection PyProtectedMember
 @module_property
 def islastbar_regular() -> bool:
     """
@@ -99,19 +129,7 @@ def islastbar_regular() -> bool:
 
     :return: True if the current candle is the last of the trading session
     """
-    tf_sec = timeframe.in_seconds(syminfo.period)
-    for se in syminfo._session_ends:
-        if se.day == lib._datetime.weekday():
-            sedt = lib._datetime.replace(hour=se.time.hour, minute=se.time.minute, second=se.time.second,
-                                         microsecond=se.time.microsecond)
-            # A session end at/before the bar's start denotes the day boundary
-            # (00:00 = 24:00 for 24/7 markets); roll it to the next day so it
-            # lands on the closing bar's end instead of the day's own start.
-            if sedt <= lib._datetime:
-                sedt += timedelta(days=1)
-            if lib._datetime < sedt <= lib._datetime + timedelta(seconds=tf_sec):
-                return True
-    return False
+    return _is_session_last_bar(lib._datetime, timeframe.in_seconds(syminfo.period))
 
 
 # noinspection PyProtectedMember
@@ -124,19 +142,7 @@ def islastbar() -> bool:
 
     :return: True if the current candle is the last of the trading session
     """
-    tf_sec = timeframe.in_seconds(syminfo.period)
-    for se in syminfo._session_ends:
-        if se.day == lib._datetime.weekday():
-            sedt = lib._datetime.replace(hour=se.time.hour, minute=se.time.minute, second=se.time.second,
-                                         microsecond=se.time.microsecond)
-            # A session end at/before the bar's start denotes the day boundary
-            # (00:00 = 24:00 for 24/7 markets); roll it to the next day so it
-            # lands on the closing bar's end instead of the day's own start.
-            if sedt <= lib._datetime:
-                sedt += timedelta(days=1)
-            if lib._datetime < sedt <= lib._datetime + timedelta(seconds=tf_sec):
-                return True
-    return False
+    return _is_session_last_bar(lib._datetime, timeframe.in_seconds(syminfo.period))
 
 
 # noinspection PyProtectedMember
