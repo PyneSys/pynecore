@@ -217,6 +217,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # attribute reads below still cover.
     props = vars(lib)
 
+    # Roll ``lib._last_close`` before the new bar overwrites ``close`` — see the
+    # declaration in ``lib`` for why a ta.* machine cannot keep this itself. Only on a
+    # real bar change: the live path re-enters here on every tick of the SAME bar, and
+    # rolling then would hand out this bar's own close as the previous one.
+    last_close_bar = props['_last_close_bar']
+    if last_close_bar != bar_index:
+        # None on the run's first bar, where ``close`` is still the Source placeholder
+        props['_last_close'] = na_float if last_close_bar is None else props['close']
+        props['_last_close_bar'] = bar_index
+
     props['bar_index'] = bar_index
     props['last_bar_index'] = bar_index if last_bar_index is None else last_bar_index
 
@@ -311,6 +321,9 @@ def _reset_lib_vars():
     lib.hlc3 = Source("hlc3")
     lib.ohlc4 = Source("ohlc4")
     lib.hlcc4 = Source("hlcc4")
+
+    lib._last_close = na_float
+    lib._last_close_bar = None
 
     lib._time = 0
     lib._datetime = datetime.fromtimestamp(0, UTC)

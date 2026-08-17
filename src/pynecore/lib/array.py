@@ -279,7 +279,9 @@ def every(id: list[Any]) -> bool:
     :param id: Input array
     :return: True if all elements of the id array are true, false otherwise
     """
-    return all(id)
+    # Measured on TradingView: an EMPTY array yields false here, so this is not
+    # Python's vacuously true all([]) -- array.some() already agrees at false.
+    return len(id) > 0 and all(id)
 
 
 # noinspection PyShadowingBuiltins

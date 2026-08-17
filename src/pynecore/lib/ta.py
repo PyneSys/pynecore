@@ -25,7 +25,7 @@ from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_
 
 # We need to use this kind of import to make transformer work
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
-                          max_bars_back, math as lib_math)
+                          max_bars_back, math as lib_math, _last_close)
 
 TFIB = TypeVar('TFIB', float, int, bool)
 TFI = TypeVar('TFI', float, int)
@@ -2322,14 +2322,18 @@ def tr(handle_na: bool = False) -> PyneFloat:
                       current day high-low. Otherwise (if false) tr would return NaN in such cases
     :return: True Range (TR)
     """
-    prev_close: Persistent[float] = na_float
+    # The runner's window, not this function's own state: TradingView reads close[1]
+    # here, which advances on every bar, while a tr() inside a conditional branch runs
+    # only on some of them. Measured on the "Follow Line Indicator" corpus script,
+    # whose atr() calls sit in `if` branches: the accumulating rma stays per-call-site
+    # and call-gated, only the previous close is global.
+    prev_close = _last_close
 
     if not (prev_close == prev_close):
         val = (high - low) if handle_na else na_float
     else:
         val = builtins.max(high - low, abs(high - prev_close), abs(low - prev_close))
 
-    prev_close = close
     return val  # type: ignore
 
 

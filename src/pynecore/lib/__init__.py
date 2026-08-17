@@ -115,6 +115,15 @@ hlc3: float = Source("hlc3")
 ohlc4: float = Source("ohlc4")
 hlcc4: float = Source("hlcc4")
 
+# Previous bar's close, published by the runner on every bar. A ta.* machine keeps
+# its own state in the function, which advances per CALL — so one sitting inside an
+# `if` branch cannot recover the close of a bar it did not run on. TradingView reads
+# close[1] there, a global series that advances regardless, and this is that series'
+# one-deep window. ``_last_close_bar`` is the bar it was rolled for: the live path
+# republishes the same bar on every tick and must not roll the window with it.
+_last_close: float = _math.nan
+_last_close_bar: int | None = None
+
 # Store time as integer as in Pine Scripts timestamp format
 _time: int = 0
 last_bar_time: int = 0

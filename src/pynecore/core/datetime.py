@@ -36,6 +36,8 @@ PINE_FORMATS = [
     "%d %B %Y %H:%M",  # "01 January 2018 00:00"
     "%B %d %Y",  # "February 01 2020"
     "%d %B %Y",  # "04 December 1995"
+    "%b %Y",  # "Jan 2025" (day defaults to the 1st)
+    "%B %Y",  # "January 2025" (day defaults to the 1st)
     "%Y-%m-%d",  # "2020-02-20"
     "%Y-%m-%d %H:%M:%S",  # "2021-01-01 00:00:00"
     "%Y-%m-%d %H:%M",  # "2021-01-01 00:00"
@@ -263,6 +265,18 @@ def parse_datestring(datestring: str) -> datetime:
         default_tz = parse_timezone(None)  # This will return syminfo.timezone
         return dt.replace(tzinfo=default_tz)
 
+    # Year-only and year-month dates, where TradingView fills the missing components
+    # in with the start of the period -- measured: "2025" -> 2025-01-01 00:00 and
+    # "2025-06" / "2025-6" / "2025/06" / "2025.06" -> 2025-06-01 00:00. Only the
+    # year-first spellings are accepted: a leading month ("06 2025") is rejected by
+    # TradingView outright, so it must keep raising here too.
+    partial_match = re.match(r'^(\d{4})(?:[-/.](\d{1,2}))?$', datestring)
+    if partial_match:
+        year, month = partial_match.groups()
+        # Use exchange timezone (from syminfo) when no timezone is specified
+        return datetime(int(year), int(month) if month else 1, 1,
+                        tzinfo=parse_timezone(None))
+
     # Extract timezone if present at the end for other formats
     # The regex requires whitespace before timezone to avoid matching date parts
     tz_match = re.search(r'\s+((?:UTC|GMT)?[+-]\d{1,2}(?::?\d{2})?)\s*$', datestring)
@@ -299,7 +313,8 @@ def parse_datestring(datestring: str) -> datetime:
         "- With fraction: '2024-08-01T04:38:47.731215+00:00'\n"
         "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200', '1 January 2018 00:00 +0000'\n"
         "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'\n"
-        "- Numeric, month first: '01-01-2023', '03/04/2023', '03.04.2023 10:20:30'"
+        "- Numeric, month first: '01-01-2023', '03/04/2023', '03.04.2023 10:20:30'\n"
+        "- Partial, year first: '2025', '2025-06', '2025.06', 'Jan 2025'"
     )
 
 
