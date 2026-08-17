@@ -5,6 +5,38 @@ Four operational test types; every live verdict is graded from **DNSE's own reco
 (order details / books), never from the run log alone — the log claimed success twice
 while the venue disagreed (see findings below).
 
+## Canonical test registry — the ONLY names to use
+
+Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards and
+conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> Live-L1-Tnn,
+`[F] Fn` -> Live-L3-Fnn.)
+
+| ID | What it does | Live status (2026-08-17) |
+|----|--------------|--------------------------|
+| **Live-L0-Gate** | venue-semantics probe; MUST pass before every live run | ✅ passes (run per session) |
+| **Live-L1-T01-LongLimitCancel** | long limit −5% place→cancel | ✅ 08-13 |
+| **Live-L1-T02-ShortLimitCancel** | short limit +5% place→cancel | ✅ 08-13 |
+| **Live-L1-T03-LimitWithStopExit** | limit + `exit(stop)`; both cancelled explicitly | ✅ 08-13 |
+| **Live-L1-T04-OcaCancelEntryOnly** | OCA entry+exit, cancel entry only | ✅ 08-13/14 (found #19) |
+| **Live-L1-T05-NativeOcoCancelEntryOnly** | native-OCO exit, cancel entry only | ✅ 08-14 (forced cascade revert) |
+| **Live-L1-T06-AmendNormal** | amend on the NORMAL book | ✅ 08-14 |
+| **Live-L1-T07-AmendConditional500** | conditional amend → HTTP 500 park (#18) | ✅ 08-14 |
+| **Live-L1-T08-CancelAll** | `cancel_all()` across both books | ✅ 08-14 |
+| **Live-L1-T09-OrderFn** | `strategy.order()` routing | ✅ 08-14 |
+| **Live-L1-T10-DualStrategy** | two engines, one account (`run_t10_dual.sh`) | ✅ 08-14 |
+| **Live-L1-T11-OcaCancelMember** | `oca.cancel` ×3 across books; cancel one member — siblings must remain | ❌ **NOT RUN** |
+| **Live-L1-T12-OcaReduce** | `oca.reduce` pair rests full qty | ❌ **NOT RUN** |
+| **Live-L1-T13-OcaNone** | `oca.none` shared name = independent | ❌ **NOT RUN** |
+| **Live-L2-SingleFill** | one market fill → flatten (`l2_fill_flatten`) | ✅ 08-12 |
+| **Live-L2-BracketFill** | fill + TP/SL bracket → flatten (`l2b_…`) | ⚠️ 08-12 partial |
+| **Live-L3-F01-LongMarket** … **F02-ShortMarket** | market fills | ❌ NOT RUN |
+| **Live-L3-F03-LongStop** … **F04-ShortStop** | stop-entry fills | ❌ NOT RUN |
+| **Live-L3-F05-LongStopLimit** … **F06-ShortStopLimit** | stop-limit fills (#14 evidence) | ❌ NOT RUN |
+| **Live-L3-F07-OcaLongBreak** … **F08-OcaShortBreak** | OCA sibling-cancel on a real fill | ❌ NOT RUN |
+
+Live-L3 backtest mode (past window) is the ORACLE — a pre-launch gate, never a live result.
+Live-L3 requires a FLAT account.
+
 ## The four test types
 
 | # | Type | Command | Needs |

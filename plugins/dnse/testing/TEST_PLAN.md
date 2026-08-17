@@ -1,5 +1,9 @@
 # DNSE Broker Plugin — Order-Semantics Test Plan (v2)
 
+> **HISTORICAL DOCUMENT.** The canonical test registry and the ONLY test names to use
+> (`Live-L<level>-<case>`, e.g. `Live-L1-T11-OcaCancelMember`) live in
+> [`live_test/README.md`](live_test/README.md). This file predates that naming and is kept for history.
+
 > **v2 corrects a wrong premise in v1.** v1 claimed "the plugin sends EVERY
 > order as a marketable LO at the ±7% band edge." That is false — verified in
 > `broker.py:429` + `execute_entry/exit/close`. The truth changes which tests

@@ -1,5 +1,9 @@
 # DNSE broker — safest live-test plan
 
+> **HISTORICAL DOCUMENT.** The canonical test registry and the ONLY test names to use
+> (`Live-L<level>-<case>`, e.g. `Live-L1-T11-OcaCancelMember`) live in
+> [`live_test/README.md`](README.md). This file predates that naming and is kept for history.
+
 Validate the **live order path** (place → rest → cancel) against the real DNSE account
 with **zero fills and zero position risk**. Every order is placed far enough from market
 that it cannot fill or trigger in a session, so nothing is ever held — the only thing
