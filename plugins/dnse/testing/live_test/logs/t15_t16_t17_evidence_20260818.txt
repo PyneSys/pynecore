@@ -25,3 +25,9 @@ Root cause: plugin has no store/recovery seam (no store_ctx, no reconcile/recove
 VERDICT t17: PASS — exactly ONE working at every read; cleanup clean
 NEW VENUE CODE: re-cancel of Canceled NORMAL order -> 400 ORDER_CANCEL_STATUS_REJECTED
 ("Order status is not valid to cancel") = NORMAL-book twin of CO-ORD-013 -> now classified TERMINAL (errors.py)
+
+=== Live-L1-T18-ImmediateCancel — PASS 2026-08-18 13:20 (continuous) ===
+NORMAL id=367226: place-ack=88ms book-visible=154ms cancel http=200 ack=31ms confirmed-gone=61ms
+STOP   id=da1vj506p09g1n1vim5g: place-ack=38ms book-visible=101ms cancel http=200 ack=100ms confirmed-gone=197ms
+VERDICT: PASS — no minimum-rest rule on either book; sub-second place->cancel->gone round trip.
+(cleanup double-cancels drew ORDER_CANCEL_STATUS_REJECTED / CO-ORD-013 -> both now info treated-gone)

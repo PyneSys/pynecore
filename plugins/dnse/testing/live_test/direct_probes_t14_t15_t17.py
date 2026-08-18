@@ -262,13 +262,83 @@ def t14_atc_cancel_refusal(plan: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--case", required=True, choices=["t14", "t15", "t17"])
+    ap.add_argument("--case", required=True, choices=["t14", "t15", "t17", "t18"])
     ap.add_argument("--plan", action="store_true",
                     help="print the intended steps, touch nothing (offline gate)")
     args = ap.parse_args(argv)
     return {"t14": t14_atc_cancel_refusal,
             "t15": t15_cancel_replace,
-            "t17": t17_replace_under_ack_lag}[args.case](args.plan)
+            "t17": t17_replace_under_ack_lag,
+            "t18": t18_immediate_cancel}[args.case](args.plan)
+
+
+
+
+# ------------------------------------------------------------------ T18
+def t18_immediate_cancel(plan: bool) -> int:
+    """Cancel the instant the order is VISIBLE on the live book — no bar-clock wait.
+
+    The staged suite cancels on the NEXT 1m bar (Pine's clock); this measures the
+    bar-free floor on BOTH books: place -> poll get_open_orders (~100 ms) until the
+    id appears -> cancel immediately -> poll until the venue agrees it is gone.
+    PASS = venue accepts the immediate cancel (no minimum-rest rule) on both books.
+    """
+    if plan:
+        print("[t18/plan] NORMAL leg: place buy LO -5%; poll open orders every ~100 ms "
+              "until visible; cancel IMMEDIATELY; poll detail to Canceled. Repeat with "
+              "a conditional STOP (+5% trigger). Report place-ack / book-visible / "
+              "cancel-ack / confirmed-gone latencies per book. Continuous or lunch "
+              "phase; nothing can fill (>=5% away).")
+        return 0
+    if session_phase() not in ("continuous", "lunch"):
+        stamp("t18", "REFUSING to start — needs continuous/lunch phase")
+        return 1
+    b = new_broker()
+    ref, src = reference_close(b)
+    stamp("t18", f"reference {ref} ({src})")
+    failures = 0
+    for label, category, price, stop in (
+            ("NORMAL", "NORMAL", round(ref * (1 - AWAY), 1), None),
+            ("STOP", "STOP", round(ref * (1 + AWAY), 1), round(ref * (1 + AWAY), 1))):
+        t0 = time.monotonic()
+        oid = place(b, f"t18-{label.lower()}", price=price, category=category,
+                    stop_price=stop)
+        t_place = time.monotonic() - t0
+        ids = [(oid, category)]
+        try:
+            visible = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if asyncio.run(book_has(b, oid)):
+                    visible = time.monotonic() - t0
+                    break
+                time.sleep(0.1)
+            if visible is None:
+                stamp("t18", f"{label}: FAIL — never visible on the book within 15 s")
+                failures += 1
+                continue
+            t1 = time.monotonic()
+            status, body = raw_cancel(b, oid, category)
+            t_ack = time.monotonic() - t1
+            code = body.get("code") if isinstance(body, dict) else ""
+            gone = None
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                st = detail(b, oid, category)
+                if st in ("Canceled", "Cancelled"):
+                    gone = time.monotonic() - t1
+                    break
+                time.sleep(0.2)
+            ok = status in (200, 204) and gone is not None
+            stamp("t18", f"{label}: place-ack={t_place*1000:.0f}ms book-visible={visible*1000:.0f}ms "
+                         f"cancel http={status} code={code or '-'} ack={t_ack*1000:.0f}ms "
+                         f"confirmed-gone={gone*1000:.0f}ms -> {'OK' if ok else 'FAIL'}")
+            if not ok:
+                failures += 1
+        finally:
+            cleanup(b, ids, "t18")
+    print(f"\nVERDICT t18: {'PASS — immediate cancel accepted on both books, no minimum-rest rule' if failures == 0 else 'FAIL'}")
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":
