@@ -5,6 +5,20 @@ Four operational test types; every live verdict is graded from **DNSE's own reco
 (order details / books), never from the run log alone — the log claimed success twice
 while the venue disagreed (see findings below).
 
+## Risk tiers — what may run when (decided 2026-08-18)
+
+Case IDs are stable (never renamed); the TIER is the execution gate:
+
+| Tier | Levels / cases | Precondition | Why |
+|---|---|---|---|
+| **NO-FILL** | L0, all L1 (T01–T17, T32), L4 | open session + GOOD token only — **safe with an open user position** | every order is ≥4.5% away or cancelled before it can fill; ORDER-level isolation is proven (Live-L1-T10 ran two engines on one account with zero cross-contamination) |
+| **FILL** (highest tier) | all L2, all L3 (F01–F11) | **FLAT account or a dedicated sub-account, supervised** — NEVER with an open user position | VN derivatives accounts hold ONE NET position per symbol: a short fill SELLS the user's own contracts (2→1) and the flatten re-buys them — trading their position without consent; even long fills merge into and RECOMPUTE their average entry price; venue-record grading becomes unattributable |
+
+The FILL tier is not about engine capability — order tracking is per-run — it is the
+venue's position netting. Until the operator flattens or provides a sub-account
+(`account_no` in `workdir/config/plugins/dnse_broker.toml`), FILL-tier cases are
+**parked**, not skipped.
+
 ## Canonical test registry — the ONLY names to use
 
 Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards and
