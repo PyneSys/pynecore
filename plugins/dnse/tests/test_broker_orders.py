@@ -482,3 +482,74 @@ def __test_connect_disconnect_lifecycle__(fake_client, tmp_path):
     assert b.is_connected is True
     asyncio.run(b.disconnect())
     assert b.is_connected is False
+
+
+# --- execute_entry: crossed stop at placement (#34) ---------------------------
+
+def _ohlc_last(close_price):
+    return (200, {"t": [1_700_000_000], "o": [close_price], "h": [close_price],
+                  "l": [close_price], "c": [close_price], "v": [1.0]})
+
+
+def __test_crossed_plain_stop_places_marketable_normal_lo__(fake_client, tmp_path):
+    """Buy stop trigger BELOW the last price: Pine = enter NOW (oracle fills at
+    the next open, measured 2026-08-18). Must place a NORMAL band-edge LO —
+    the same shape as a market intent — not a conditional."""
+    b = _broker(fake_client, tmp_path,
+                get_ohlc=_ohlc_last(1904.0),
+                post_order=(201, {"id": "1", "symbol": "VN30F1M", "side": "NB",
+                                  "quantity": 1, "orderStatus": "New"}))
+    envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                                     order_type=OrderType.STOP, stop=1885.0))
+    asyncio.run(b.execute_entry(envelope))
+    args, kwargs = _last_call(b._client, "post_order")
+    payload = args[2]
+    assert kwargs["order_category"] == "NORMAL", "crossed stop must NOT go to the conditional book"
+    assert "stopPrice" not in payload
+    assert payload["price"] == float(_SECDEF_ROW[0]["ceilingPrice"]), \
+        "plain crossed stop fills like a market intent: band-edge LO"
+
+
+def __test_crossed_stop_limit_places_normal_lo_at_users_cap__(fake_client, tmp_path):
+    """Crossed stop-LIMIT: activates immediately but keeps the user's limit cap
+    (may rest — exactly TV's crossed stop-limit semantics)."""
+    b = _broker(fake_client, tmp_path,
+                get_ohlc=_ohlc_last(1904.0),
+                post_order=(201, {"id": "1", "symbol": "VN30F1M", "side": "NB",
+                                  "quantity": 1, "orderStatus": "New"}))
+    envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                                     order_type=OrderType.STOP, limit=1890.0, stop=1885.0))
+    asyncio.run(b.execute_entry(envelope))
+    args, kwargs = _last_call(b._client, "post_order")
+    payload = args[2]
+    assert kwargs["order_category"] == "NORMAL"
+    assert payload["price"] == 1890.0, "the user's cap is honoured, not the band edge"
+    assert "stopPrice" not in payload
+
+
+def __test_uncrossed_stop_keeps_the_conditional_path__(fake_client, tmp_path):
+    """Trigger ABOVE the last price (a normal stop): unchanged conditional STOP."""
+    b = _broker(fake_client, tmp_path,
+                get_ohlc=_ohlc_last(1880.0),
+                post_order=(201, {"id": "1", "symbol": "VN30F1M", "side": "NB",
+                                  "quantity": 1, "orderStatus": "New"}))
+    envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                                     order_type=OrderType.STOP, stop=1885.0))
+    asyncio.run(b.execute_entry(envelope))
+    args, kwargs = _last_call(b._client, "post_order")
+    assert kwargs["order_category"] == "STOP"
+    assert args[2]["stopPrice"] == 1885.0
+
+
+def __test_crossed_detection_fails_open_to_conditional__(fake_client, tmp_path):
+    """A market-data hiccup must NEVER block or reroute the order: unreadable
+    last price -> conditional path, today's behaviour."""
+    b = _broker(fake_client, tmp_path,
+                get_ohlc=(500, {}),
+                post_order=(201, {"id": "1", "symbol": "VN30F1M", "side": "NB",
+                                  "quantity": 1, "orderStatus": "New"}))
+    envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                                     order_type=OrderType.STOP, stop=1885.0))
+    asyncio.run(b.execute_entry(envelope))
+    args, kwargs = _last_call(b._client, "post_order")
+    assert kwargs["order_category"] == "STOP", "fail-open: unreadable price keeps the conditional path"

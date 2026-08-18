@@ -288,6 +288,27 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 f"{self.symbol!r}")
         return ceiling, floor
 
+    def _stop_already_crossed(self, side: str, stop_price: float) -> bool:
+        """Is a stop's trigger condition already TRUE at placement time?
+
+        Pine treats a crossed stop as an IMMEDIATE entry (the backtest oracle
+        fills it at the next open — measured 2026-08-18, #34). Detection reads
+        the venue's last 1-minute close (one REST call, stop entries only).
+        Fails OPEN: any read problem returns False, i.e. the conditional path —
+        today's behaviour — so a market-data hiccup can never block an order.
+        """
+        try:
+            now = int(time.time())
+            status, body = self.client.get_ohlc(self.market_type, {
+                "symbol": self.symbol, "resolution": "1",
+                "from": now - 600, "to": now})
+            if status != 200 or not isinstance(body, dict) or not body.get("c"):
+                return False
+            last = float(body["c"][-1])
+        except Exception:                                          # noqa: BLE001
+            return False
+        return last >= stop_price if side == "buy" else last <= stop_price
+
     def _stop_fill_price(self, side: str, stop_price: float) -> float:
         """Limit price for the LO a triggered stop emits — trigger + 2x slippage.
 
@@ -515,6 +536,22 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         from pynecore.core.broker.models import LegType
         intent = envelope.intent
         if intent.stop is not None:
+            if self._stop_already_crossed(intent.side, intent.stop):
+                # Crossed at placement (#34): Pine semantics = enter NOW (oracle
+                # fills at the next open). A conditional here would either be
+                # refused or emit its LO at trigger±slippage — arbitrarily far
+                # behind the market. Plain stop -> marketable LO (band edge,
+                # the same shape as a market intent); stop-limit -> LO at the
+                # user's cap, which may rest (exactly TV's crossed stop-limit).
+                log.broker_warning(
+                    "crossed stop at placement -> immediate %s LO (Pine: instant "
+                    "entry) | %s stop=%s",
+                    "capped" if intent.limit is not None else "marketable",
+                    self._ident_str(envelope, LegType.ENTRY), intent.stop)
+                return self._place(envelope, intent.side, intent.qty,
+                                   price=(intent.limit if intent.limit is not None
+                                          else self._marketable_price(intent.side)),
+                                   leg_type=LegType.ENTRY)
             # stop or stop-limit entry -> native STOP. An explicit ``limit`` is the
             # user asking for a stop-LIMIT, so it is honoured verbatim; a bare
             # ``stop`` means stop-MARKET, which DNSE cannot express, so the emitted
