@@ -314,9 +314,20 @@ class ClosureVariableCollector(ast.NodeVisitor):
             self.scope_variables[scope_key] = set()
             self.scope_uses[scope_key] = set()
 
-            # Add function parameters to scope variables
+            # Add function parameters to scope variables. An annotated
+            # parameter carries the same type information as an annotated
+            # assignment does — a ``Series[T]`` input of ``main`` is a series
+            # exactly like a ``s: Series[T]`` declaration in its body — so it
+            # is recorded the same way, or ``_drop_series_closures`` cannot see
+            # it and the inner function gets the series value-passed.
             for arg in node.args.args:
                 self.scope_variables[scope_key].add(arg.arg)
+                if arg.annotation is None:
+                    continue
+                arg_key = f"{scope_key}.{arg.arg}"
+                self.closure_var_types[arg_key] = arg.annotation
+                if _is_persistent_annotation(arg.annotation):
+                    self.persistent_vars.add(arg_key)
 
         # Visit function body
         self.generic_visit(node)
