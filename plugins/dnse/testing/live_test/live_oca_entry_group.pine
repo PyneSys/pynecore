@@ -1,0 +1,103 @@
+//@version=6
+// Live-L3-F11-OcaEntryGroupCancel — card rubycell/pynecore#33 (BF7 shape, from the
+// Binance session's finding).
+//
+// QUESTION: when one member of an oca.cancel ENTRY group FILLS, is the sibling
+// cancelled? The ORACLE says yes (measured 2026-08-18: backtest cancels the far
+// leg on the near leg's fill — the engine's fill-time cascade). LIVE, with
+// oca_cancel=NATIVE declared, the engine cascade is suppressed (sync_engine
+// hard-returns) and DNSE holds no group link (Live-L1-T11: members are venue
+// strangers), so pre-fix the far leg STAYS WORKING = bug confirmed; post-fix
+// (oca_cancel=SOFTWARE) the cascade cancels it = PASS.
+//
+// Sequence (single stage):
+//   PLACE  near buy-stop at high[1] (fills on a break) + far SELL-stop at
+//          close*(1-farAwayPct/100), same oca.cancel group, NO exit legs,
+//          NO explicit cancel of the far leg — the cascade is the subject.
+//   FILL   near fills -> observe for OBSERVE_BARS bars, logging the verdict
+//          criterion: the far leg's venue state IS the measurement.
+//   CLEAN  close_all + cancel_all (explicit cleanup AFTER the grading window).
+//
+// farAwayPct: LIVE = 5.0 (far leg unfillable even if the bug leaves it working).
+// ORACLE = 0.2 via the .toml — the backtest then self-proves the cascade: if the
+// far leg survived the near fill, the tape crossing it would FLIP the position
+// short, and the flip guard below screams. No flip over the window = cascade OK.
+//
+// GRADE LIVE FROM THE VENUE: after the near fill, the far order must be GONE
+// (Canceled) within the observe window. Far still working = #33 bug confirmed.
+strategy("LIVE OCA entry group", overlay=true, pyramiding=0, initial_capital=500000000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=18.48, margin_short=18.48, slippage=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+winStart   = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
+winEnd     = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
+farAwayPct = input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0)
+
+OBSERVE_BARS = 2
+
+var int  placedBar  = na
+var int  filledBar  = na
+var bool done       = false
+var bool announced  = false
+
+started  = time >= winStart
+canPlace = started and time <= winEnd
+pending  = not na(placedBar)
+
+if started and not announced
+    log.info("[OCA] === F11 OCA entry-group cancel — near buy-stop + far sell-stop " +
+             "-{0}%, NO explicit far cancel. Oracle: far cancelled on near fill. ===",
+             farAwayPct)
+    announced := true
+
+if started
+    log.info("[OCA] bar={0} close={1} pos={2} pending={3} filledBar={4}",
+             bar_index, str.tostring(close, format.mintick), strategy.position_size,
+             pending ? "yes" : "no", filledBar)
+
+// ---------------------------------------------------------------- place once
+if canPlace and not pending and not done
+    nearTrig = high[1]
+    farTrig  = close * (1 - farAwayPct / 100)
+    strategy.entry("NEAR", strategy.long, stop=nearTrig,
+                   oca_name="g33", oca_type=strategy.oca.cancel, comment="F11near")
+    strategy.entry("FAR", strategy.short, stop=farTrig,
+                   oca_name="g33", oca_type=strategy.oca.cancel, comment="F11far")
+    placedBar := bar_index
+    log.info("[OCA] PLACE near buy-stop={0} + far sell-stop={1} (oca.cancel 'g33') — " +
+             "on the near FILL the far leg must be CANCELLED by the engine cascade; " +
+             "watch [BROKER] for the cascade cancel, then verify at the venue",
+             str.tostring(nearTrig, format.mintick), str.tostring(farTrig, format.mintick))
+
+// ---------------------------------------------------------------- fill -> observe
+if pending and na(filledBar) and strategy.position_size > 0
+    filledBar := bar_index
+    log.info("[OCA] NEAR FILLED pos={0} avg={1} — observing {2} bars: far leg must " +
+             "now be GONE at the venue (pre-#33-fix it stays working = BUG)",
+             strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick),
+             OBSERVE_BARS)
+
+// FLIP GUARD (oracle observability + live safety): a short position here means the
+// far leg FILLED after the near fill — the cascade did not cancel it.
+if strategy.position_size < 0
+    log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — far leg FILLED after the " +
+              "near fill: oca.cancel cascade ABSENT (#33 bug demonstrated). Flattening.",
+              strategy.position_size)
+    strategy.cancel_all()
+    strategy.close_all(comment="F11-flipguard")
+    done := true
+
+// ---------------------------------------------------------------- cleanup
+if not na(filledBar) and bar_index - filledBar >= OBSERVE_BARS and not done
+    log.info("[OCA] OBSERVE window over — grade the far leg's venue state NOW " +
+             "(must be Canceled). Cleaning up: close_all + cancel_all.")
+    strategy.cancel_all()
+    strategy.close_all(comment="F11-clean")
+    done := true
+
+if done and strategy.position_size == 0 and not na(filledBar)
+    log.info("[OCA] === F11 DONE — verify at the venue: flat, nothing working. ===")
+    filledBar := na
+
+plot(strategy.position_size, "pos", display=display.data_window)

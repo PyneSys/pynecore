@@ -181,7 +181,13 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             # one-cancels-other; the plugin tracks the OCO's working LO via
             # externalOrderId. See execute_exit.
             tp_sl_bracket=CapabilityLevel.NATIVE,
-            oca_cancel=CapabilityLevel.NATIVE,
+            # SOFTWARE, not NATIVE (#33): the OCO above is the single-exit
+            # bracket ONLY — no DNSE payload can link separate orders into a
+            # group (Live-L1-T11: oca members are venue-strangers). Declaring
+            # NATIVE suppresses the sync engine's fill-time sibling cancel
+            # (_cascade_oca_cancel), stranding the far leg of an oca.cancel
+            # ENTRY group as a live working order after the near leg fills.
+            oca_cancel=CapabilityLevel.SOFTWARE,
             # Not natively supported by DNSE conditional orders.
             trailing_stop=CapabilityLevel.SOFTWARE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,

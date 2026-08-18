@@ -460,7 +460,15 @@ def __test_get_capabilities_snapshot__(fake_client, tmp_path):
     caps = b.get_capabilities()
     assert caps.stop_order is CapabilityLevel.NATIVE
     assert caps.tp_sl_bracket is CapabilityLevel.NATIVE
-    assert caps.oca_cancel is CapabilityLevel.NATIVE
+    # SOFTWARE, deliberately (#33): DNSE's native OCO is the single-exit bracket
+    # ONLY (one order, side+qty+2 prices) — no payload carries an order-group
+    # link, and Live-L1-T11 measured oca members as venue-strangers. NATIVE here
+    # suppresses the sync engine's fill-time sibling cancel (sync_engine
+    # _cascade_oca_cancel), leaving the far entry leg of an oca.cancel group
+    # WORKING after the near leg fills. The prior NATIVE assertion encoded that
+    # bug. UNSUPPORTED would reject oca scripts at startup — SOFTWARE is the
+    # only honest value.
+    assert caps.oca_cancel is CapabilityLevel.SOFTWARE
     assert caps.watch_orders is CapabilityLevel.SOFTWARE
     assert caps.short_selling is CapabilityLevel.NATIVE
     assert caps.trailing_stop is CapabilityLevel.SOFTWARE
