@@ -12412,6 +12412,37 @@ class OrderSyncEngine:
                         )
                         self._order_mapping.pop(key, None)
                         self._drop_envelope(key)
+                        if expected_parent_ref is None:
+                            # No live envelope and no persisted anchor exists
+                            # for this ``from_entry``: the replayed legs
+                            # belonged to a parent this run never dispatched
+                            # (measured live: the lane rotation re-uses entry
+                            # ids across cycles, so a crashed cycle's leg rows
+                            # replayed into a fresh run whose venue book is
+                            # flat). There is no parent to arm a fresh bracket
+                            # against — the dispatch below would refuse
+                            # deterministically. Drop the reconstructed exit
+                            # slot too: it only exists so the diff re-sees the
+                            # pre-crash bracket, and with the legs cancelled it
+                            # would re-derive a parentless exit every sync. A
+                            # live script that still wants this bracket
+                            # re-emits ``strategy.exit`` and repopulates the
+                            # slot; the bracket then arms after its parent
+                            # entry dispatches.
+                            _blog_warning(
+                                "dropping reconstructed engine-trigger "
+                                "partial bracket %r: no parent envelope or "
+                                "anchor tracked for %r in this run — the "
+                                "replayed legs belonged to a previous run's "
+                                "parent and there is no position to protect",
+                                format_intent_key(intent.intent_key),
+                                intent.from_entry,
+                            )
+                            if intent.from_entry is not None:
+                                self._position.exit_orders.pop(
+                                    (intent.pine_id, intent.from_entry), None,
+                                )
+                            continue
                         # Fall through to the normal dispatch path so a fresh
                         # bracket is armed against the new parent.
                         try:
@@ -14832,19 +14863,32 @@ class OrderSyncEngine:
                 "bracket on the same parent.",
             )
 
-        envelope = self._build_envelope(intent)
         # Key the fail-safe ownership + leg stamping on the COID the parent
         # position opened under (KIND_ENTRY normally, KIND_ENTRY_STOP when the
         # both-set STOP leg won the OCO), live envelope or restart-anchor
         # rebuild — so the broker reconcile feed, which reports the position
-        # under that same COID, confirms the registered state.
+        # under that same COID, confirms the registered state. Resolved BEFORE
+        # the envelope build so the soft-skip below leaves no half-registered
+        # envelope behind.
         parent_dispatch_ref = self._resolve_parent_opening_ref(from_entry)
         if parent_dispatch_ref is None:
-            raise RuntimeError(
-                "engine-trigger partial bracket dispatch refuses: no "
-                f"parent envelope tracked for {from_entry!r} — the "
-                "parent entry must be dispatched before its bracket.",
+            # Soft-skip via :class:`OrderSkippedByPlugin`, not a raw
+            # :class:`RuntimeError`: a raw raise propagates through
+            # ``_dispatch_new`` (generic Exception branch re-raises) and
+            # aborts the whole sync loop — a parentless bracket intent (the
+            # script's sim opened the position during warmup, or a replayed
+            # ledger row from a previous run) would take down the run for a
+            # condition that is recoverable per-intent. Only this intent is
+            # dropped; once the parent entry actually dispatches, the next
+            # sync arms the bracket normally.
+            raise OrderSkippedByPlugin(
+                "engine-trigger partial bracket dispatch skipped: no parent "
+                f"envelope tracked for {from_entry!r} — the parent entry "
+                "must be dispatched before its bracket",
+                intent_key=intent.intent_key,
+                reason="partial_bracket_parent_untracked",
             )
+        envelope = self._build_envelope(intent)
 
         # §2.6.7 gate: a degrading / degraded broker-native fail-safe on
         # this parent blocks *new* partial brackets. Engine close

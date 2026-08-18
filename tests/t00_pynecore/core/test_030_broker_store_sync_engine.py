@@ -30,13 +30,23 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.core.broker.exceptions import OrderSkippedByPlugin
 from pynecore.core.broker.models import (
+    CapabilityLevel,
     DispatchEnvelope,
     ExchangeCapabilities,
     ExchangeOrder,
     ExchangePosition,
+    ExitIntent,
     OrderStatus,
     OrderType,
+)
+from pynecore.core.broker.software_partial_bracket_engine import (
+    PartialBracketLeg,
+)
+from pynecore.core.broker.store_helpers import (
+    LEG_KIND_SL_PARTIAL,
+    LEG_STATE_ARMED,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
 from pynecore.types.strategy import (
@@ -2339,4 +2349,100 @@ def __test_startup_clamped_net_falls_back_to_single_seed__(
         assert pos.size == 1000.0
         assert len(pos.open_trades) == 1
         assert pos.open_trades[0].size == 1000.0
+        ctx.close()
+
+
+# === Replayed engine-trigger partial legs without a parent ================
+
+
+def __test_replayed_partial_legs_without_parent_are_dropped_not_dispatched__(
+        tmp_path: Path,
+) -> None:
+    """Cross-cycle replayed legs with no parent in this run must not crash.
+
+    The lane rotation re-uses Pine entry ids across cycles: a crashed
+    cycle's engine-trigger leg rows replay into a fresh run whose venue
+    book is flat and whose ``from_entry`` has neither a live envelope nor
+    a persisted anchor (``_resolve_parent_opening_ref`` returns ``None``).
+    The stale-parent adoption branch must cancel the legs, drop the
+    reconstructed exit slot and keep the run alive — dispatching a fresh
+    bracket is impossible (there is no parent to arm it against) and used
+    to abort the whole run with a raw RuntimeError.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker(capabilities=ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+    ))
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos = _mk_engine(broker, ctx)
+        pbe = engine._partial_bracket_engine
+        intent_key = "S-X1\x00S"
+        # A replayed leg always has a durable row (restart_replay loads the
+        # ledger FROM these rows); the stale-cancel closes it via upsert.
+        ctx.upsert_order(
+            "prev-leg-sl", symbol=SYMBOL, side="buy", qty=0.5,
+            state="confirmed", pine_entry_id="S",
+        )
+        leg = PartialBracketLeg(
+            coid="prev-leg-sl", symbol=SYMBOL, pine_id="S-X1",
+            from_entry="S", leg_kind=LEG_KIND_SL_PARTIAL,
+            leg_state=LEG_STATE_ARMED, side="buy", qty=0.5,
+            intent_key=intent_key, parent_pine_entry_id="S",
+            parent_entry_dispatch_ref="prev-run-parent-coid",
+            intent_partial_qty=0.5, trigger_level=110.0,
+        )
+        pbe._legs[leg.key] = leg
+        pbe._legs_by_parent.setdefault((SYMBOL, "S"), set()).add(leg.key)
+        # What restart_replay does for a replayed leg group: re-install the
+        # persistent ``strategy.exit`` slot so build_intents re-derives it.
+        pos.reconstruct_exit_order(
+            pine_id="S-X1", from_entry="S", side="buy", qty=0.5,
+            tp_price=None, sl_price=110.0,
+            trail_price=None, trail_offset=None,
+        )
+
+        engine.sync(BAR_TS)  # must not raise
+
+        assert not pbe.has_active_legs_for_intent(intent_key), (
+            "the replayed legs must be cancelled as stale"
+        )
+        assert ("S-X1", "S") not in pos.exit_orders, (
+            "the reconstructed exit slot must be dropped — otherwise every "
+            "later sync re-derives a parentless exit intent"
+        )
+        assert broker.entry_calls == [] and broker.cancel_calls == []
+        assert intent_key not in engine._active_intents
+        ctx.close()
+
+
+def __test_partial_bracket_dispatch_without_parent_soft_skips__(
+        tmp_path: Path,
+) -> None:
+    """The no-parent dispatch guard is a per-intent soft-skip, not a crash.
+
+    ``OrderSkippedByPlugin`` is caught at every ``_dispatch_new`` call
+    site, so only the single bracket intent is dropped; a raw
+    RuntimeError would propagate and abort the whole sync loop (and the
+    run) for a recoverable condition.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker(capabilities=ExchangeCapabilities(
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+    ))
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(broker, ctx)
+        intent = ExitIntent(
+            pine_id="S-X1", from_entry="S", symbol=SYMBOL, side="buy",
+            qty=0.5, sl_price=110.0, is_partial_qty_bracket=True,
+        )
+
+        with pytest.raises(OrderSkippedByPlugin) as exc_info:
+            engine._dispatch_engine_trigger_partial_bracket(intent)
+
+        assert exc_info.value.reason == "partial_bracket_parent_untracked"
+        assert not engine._partial_bracket_engine.has_active_legs_for_intent(
+            intent.intent_key,
+        )
         ctx.close()
