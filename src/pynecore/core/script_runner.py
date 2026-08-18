@@ -1408,7 +1408,10 @@ class ScriptRunner:
                 bound_entries[id(entry_func)] = partial(
                     entry_func, instance_state.create_root(root_key, entry_layout))
             run_main = bound_entries[id(main_func)]
-            lib_mains = [bound_entries[id(f)] for _title, f in script._registered_libraries]
+            # A library file run directly as the script registers its main as a
+            # library entry too — run it once per bar, not twice
+            lib_mains = [bound_entries[id(f)] for _title, f in script._registered_libraries
+                         if id(f) != id(main_func)]
 
             if sec_contexts:
                 import os
