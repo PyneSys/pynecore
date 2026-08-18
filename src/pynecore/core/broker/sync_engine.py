@@ -8535,9 +8535,28 @@ class OrderSyncEngine:
             # close FILL settlement path cleans up the bracket slot.
             return
 
-        filled_qty = event.order.filled_qty
+        gross_filled = event.order.filled_qty
+        filled_qty = gross_filled
         if filled_qty <= 0.0:
             return
+        # ``event.order.filled_qty`` is the GROSS wire cumulative — the
+        # domain order completion is tracked in. On spot venues that charge
+        # the buy-side fee in the BASE coin (Bybit), the inventory actually
+        # received is smaller than the wire fill, and the engine's own entry
+        # fill ledger accumulates exactly that position-moving (fee-netted)
+        # quantity. The bracket must close what the ledger holds, not what
+        # the wire executed: a gross-sized exit leg oversells the run's spot
+        # inventory by the fee and drives the ledger fold negative into a
+        # ``spot_ledger_negative_inventory`` quarantine (bybit-spot cycle 1).
+        # On fee-in-quote venues and derivatives the two domains are equal,
+        # so this is a no-op there; a missing ledger slot (retired fill, no
+        # active entry intent) conservatively keeps the gross figure.
+        # The overfill guard below still judges the GROSS figure: the ledger
+        # is capped at the entry intent's qty, so netting first would mask a
+        # genuine exchange over-report as an ordinary fee adjustment.
+        net_cumulative = self._active_entry_filled_qty.get(pine_id)
+        if net_cumulative is not None and 0.0 < net_cumulative < filled_qty:
+            filled_qty = net_cumulative
 
         bracket_key: str | None = None
         bracket_intent: ExitIntent | None = None
@@ -8566,8 +8585,8 @@ class OrderSyncEngine:
         entry_intent = self._active_intents.get(pine_id)
         target_qty = filled_qty
         overfill = False
-        if isinstance(entry_intent, EntryIntent) and filled_qty > entry_intent.qty:
-            target_qty = entry_intent.qty
+        if isinstance(entry_intent, EntryIntent) and gross_filled > entry_intent.qty:
+            target_qty = min(target_qty, entry_intent.qty)
             overfill = True
 
         if target_qty == bracket_intent.qty:

@@ -6444,6 +6444,50 @@ def __test_partial_entry_fill_amends_bracket_qty__():
     assert repair_events[0].new_qty == 0.4
 
 
+def __test_fee_netted_full_fill_amends_bracket_to_the_net_inventory__():
+    """A base-coin fee shrinks what a spot buy actually received.
+
+    The wire order completes in the GROSS domain (``order.filled_qty`` equals
+    the dispatched qty), but the position-moving ``fill_qty`` the plugin
+    reports is netted by the base-coin fee — the engine's entry fill ledger
+    accumulates that net figure. The bracket must follow the ledger: a
+    gross-sized exit leg sells more base than the run's spot inventory holds
+    and quarantines the ledger (bybit-spot cycle 1, sell 0.01 vs inventory
+    0.009995).
+    """
+    b = MockBroker()
+    events: list[BrokerEvent] = []
+    engine, pos = _mk_engine_with_sink(b, events)
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+    assert b.exit_calls[0].intent.qty == 0.01
+
+    exch = ExchangeOrder(
+        id="xchg-1", symbol=SYMBOL, side="buy",
+        order_type=OrderType.MARKET, qty=0.01,
+        filled_qty=0.01, remaining_qty=0.0,
+        price=None, stop_price=None, average_fill_price=50_000.0,
+        status=OrderStatus.FILLED,
+        timestamp=0.0, fee=0.000005, fee_currency="ETH",
+    )
+    engine.on_order_event(OrderEvent(
+        order=exch, event_type='filled', fill_price=50_000.0,
+        fill_qty=0.009995, timestamp=0.0,
+        pine_id="L", leg_type=LegType.ENTRY,
+    ))
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.modify_exit_calls) == 1
+    old, new = b.modify_exit_calls[0]
+    assert old.intent.qty == 0.01
+    assert new.intent.qty == 0.009995
+    assert engine.active_intents["TP\0L"].qty == 0.009995
+
+
 def __test_subsequent_partial_fill_emits_another_amend__():
     """Each partial fill with a new cumulative qty triggers a fresh amend."""
     b = MockBroker()
