@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynecore-binance"
+version = "0.1.0"
+description = "Binance spot data provider and broker plugin for PyneCore (ccxt transport)"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.5",
+]
+# Framework dep for a standalone install: pynesys-pynecore. Intentionally NOT
+# declared — this plugin is developed inside the pynecore fork (editable
+# install), and declaring it risks pip pulling upstream over the fork.
+
+[project.entry-points."pyne.plugin"]
+binance = "pynecore_binance.provider:BinanceProvider"
+binance_broker = "pynecore_binance.broker:BinanceBroker"
+
+[tool.setuptools.packages.find]
+include = ["pynecore_binance*"]

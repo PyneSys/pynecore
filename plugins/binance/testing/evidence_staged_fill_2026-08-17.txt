@@ -1,0 +1,131 @@
+[2026-08-17 14:34:12+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-17 14:34:12+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-08-17 14:34:12+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-08-17 14:34:13+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-08-17 14:34:13+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-08-17 14:34:13+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-17 14:33:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-08-17 14:33:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BF] === BINANCE STAGED FILL — 5 long-only cases, 0.001 BTC each, flatten on sight. startState=0 ===
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BF] BF1 PLACE long MARKET — fills next bar; protection SL -3%
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=market
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=0.001 type=market -> ['3836314']
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BROKER] dispatching EXIT id='P' from='E' qty=0.001 sl=61740.58
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BROKER] dispatched EXIT id='P' from='E' qty=0.001 sl=61740.58 -> ['3836317']
+[2026-08-17 14:37:00+0000] bar:    503 INFO     [BROKER] event FILLED id=3836314 side=buy qty=0.001 filled=0.001 price=63650.09 pine='E' leg=entry
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] position size=0.001 sign=1.0 avg=63650.09 (after filled pine='E')
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BF] BF state=0 FILLED pos=0.001 avg=63650.09 -> FLATTEN now (close E, cancel P and B explicitly)
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] cancelling CANCEL id='P' from='E'
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] modifying ENTRY BUY id='E' qty=0.001 type=market -> CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] dispatching keyed close E directly over consumed entry (filled=0.001 qty=0.001); dependent protection stays armed
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] dispatching CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] dispatched CLOSE id='E' side=sell qty=0.001 -> ['3836636']
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] event FILLED id=3836636 side=sell qty=0.001 filled=0.001 price=63608.0 pine='E' leg=close
+[2026-08-17 14:38:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=3836317 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl
+[2026-08-17 14:39:00+0000] bar:    505 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='E')
+[2026-08-17 14:39:00+0000] bar:    505 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=3836317 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl)
+[2026-08-17 14:39:00+0000] bar:    505 INFO     [BF] state 0->1 — flat again
+[2026-08-17 14:40:00+0000] bar:    506 INFO     [BF] BF3 PLACE long STOP trigger=63608.01 — fills on a break of the prior high
+[2026-08-17 14:40:00+0000] bar:    506 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63608.01
+[2026-08-17 14:40:00+0000] bar:    506 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:41:00+0000] bar:    507 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63608.01
+[2026-08-17 14:41:00+0000] bar:    507 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:42:00+0000] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63608.01
+[2026-08-17 14:42:00+0000] bar:    508 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:46:00+0000] bar:    512 INFO     [BF] state=1 TIMEOUT after 6 bars — cancelled all, RETRY 1/1
+[2026-08-17 14:47:00+0000] bar:    513 INFO     [BF] BF3 PLACE long STOP trigger=63630.27 — fills on a break of the prior high
+[2026-08-17 14:47:00+0000] bar:    513 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63630.27
+[2026-08-17 14:47:00+0000] bar:    513 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:48:00+0000] bar:    514 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63630.27
+[2026-08-17 14:48:00+0000] bar:    514 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:49:00+0000] bar:    515 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63630.27
+[2026-08-17 14:49:00+0000] bar:    515 WARNING  [BROKER] Entry E rejected by exchange (ExchangeOrderRejectedError: binance place:entry-stop: OrderImmediatelyFillable: binance Stop price would trigger 
+[2026-08-17 14:50:56+0000] bar:    516 INFO     [BROKER] run stopped (completed) position=flat equity=10,000.00 USDT
+[2026-08-17 14:52:28+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-17 14:52:29+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-08-17 14:52:29+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-08-17 14:52:29+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0.000 fills=2 (recovered=0, adopted=0)
+[2026-08-17 14:52:30+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-08-17 14:52:30+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-17 14:52:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-08-17 14:52:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BF] === BINANCE STAGED FILL — 5 long-only cases, 0.001 BTC each, flatten on sight. startState=1 ===
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BF] BF3 PLACE long STOP trigger=63760.01 — fills on a break of the prior high
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63760.01
+[2026-08-17 14:55:00+0000] bar:    502 WARNING  [BROKER] place:entry-stop: trigger already crossed (venue -2010) -> falling back to MARKET (Pine crossed-stop semantics)
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=0.001 type=stop stop=63760.01 -> ['3840968']
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BROKER] dispatching EXIT id='P' from='E' qty=0.001 sl=61901.09
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BROKER] dispatched EXIT id='P' from='E' qty=0.001 sl=61901.09 -> ['3840970']
+[2026-08-17 14:55:00+0000] bar:    502 INFO     [BROKER] event FILLED id=3840968 side=buy qty=0.001 filled=0.001 price=63815.57 pine='E' leg=entry
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] position size=0.001 sign=1.0 avg=63815.57 (after filled pine='E')
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BF] BF state=1 FILLED pos=0.001 avg=63815.57 -> FLATTEN now (close E, cancel P and B explicitly)
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] cancelling CANCEL id='P' from='E'
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] modifying ENTRY BUY id='E' qty=0.001 type=stop stop=63760.01 -> CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] dispatching keyed close E directly over consumed entry (filled=0.001 qty=0.001); dependent protection stays armed
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] dispatching CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] dispatched CLOSE id='E' side=sell qty=0.001 -> ['3841191']
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] event FILLED id=3841191 side=sell qty=0.001 filled=0.001 price=63805.9 pine='E' leg=close
+[2026-08-17 14:56:00+0000] bar:    503 INFO     [BROKER] event CANCELLED id=3840970 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl
+[2026-08-17 14:57:00+0000] bar:    504 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='E')
+[2026-08-17 14:57:00+0000] bar:    504 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=3840970 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl)
+[2026-08-17 14:57:00+0000] bar:    504 INFO     [BF] state 1->2 — flat again
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BF] BF5 PLACE long STOP-LIMIT stop=63824 limit=63836.76 — must go out as ONE STOP_LOSS_LIMIT, not a pair
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=limit limit=63836.76 stop=63824.0
+[2026-08-17 14:58:00+0000] bar:    505 WARNING  [BROKER] place:entry-stop: trigger already crossed (venue -2010) -> falling back to MARKET (Pine crossed-stop semantics)
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 63824.0 fires a market on cross
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=0.001 type=limit limit=63836.76 stop=63824.0 -> ['3841692']
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] dispatching EXIT id='P' from='E' qty=0.001 sl=61920.92
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] dispatched EXIT id='P' from='E' qty=0.001 sl=61920.92 -> ['3841693']
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] entry-stop 'E' crossed (price=63836.0 stop=63824.0): cancelling native LIMIT before firing market
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] entry-stop 'E': native LIMIT already filled — limit won the OCO, no market fired
+[2026-08-17 14:58:00+0000] bar:    505 INFO     [BROKER] event FILLED id=3841692 side=buy qty=0.001 filled=0.001 price=63836.0 pine='E' leg=entry
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] position size=0.001 sign=1.0 avg=63836.0 (after filled pine='E')
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BF] BF state=2 FILLED pos=0.001 avg=63836 -> FLATTEN now (close E, cancel P and B explicitly)
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] cancelling CANCEL id='P' from='E'
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] modifying ENTRY BUY id='E' qty=0.001 type=limit limit=63836.76 stop=63824.0 -> CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] dispatching keyed close E directly over consumed entry (filled=0.001 qty=0.001); dependent protection stays armed
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] dispatching CLOSE id='E' side=sell qty=0.001
+[2026-08-17 14:59:00+0000] bar:    506 INFO     [BROKER] dispatched CLOSE id='E' side=sell qty=0.001 -> ['3842007']
+[2026-08-17 15:00:00+0000] bar:    507 INFO     [BROKER] event FILLED id=3842007 side=sell qty=0.001 filled=0.001 price=63902.62 pine='E' leg=close
+[2026-08-17 15:00:00+0000] bar:    507 INFO     [BROKER] event CANCELLED id=3841693 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl
+[2026-08-17 15:00:00+0000] bar:    507 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='E')
+[2026-08-17 15:00:00+0000] bar:    507 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=3841693 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl)
+[2026-08-17 15:00:00+0000] bar:    507 INFO     [BF] state 2->3 — flat again
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BF] BF7 PLACE entry-OCA long/long: near up-stop 63902.63 (fills) + far up-stop 67097.76 — on the fill the FAR leg must be CANCELLED (engine            
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=stop stop=63902.63
+[2026-08-17 15:01:00+0000] bar:    508 WARNING  [BROKER] place:entry-stop: trigger already crossed (venue -2010) -> falling back to MARKET (Pine crossed-stop semantics)
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=0.001 type=stop stop=63902.63 -> ['3842674']
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='B' qty=0.001 type=stop stop=67097.77
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatched ENTRY BUY id='B' qty=0.001 type=stop stop=67097.77 -> ['3842675']
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatching EXIT id='P' from='E' qty=0.001 sl=61996.58
+[2026-08-17 15:01:00+0000] bar:    508 INFO     [BROKER] dispatched EXIT id='P' from='E' qty=0.001 sl=61996.58 -> ['3842676']
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] event FILLED id=3842674 side=buy qty=0.001 filled=0.001 price=63914.01 pine='E' leg=entry
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] position size=0.001 sign=1.0 avg=63914.01 (after filled pine='E')
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BF] BF state=3 FILLED pos=0.001 avg=63914.01 -> FLATTEN now (close E, cancel P and B explicitly)
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] cancelling CANCEL id='B'
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] cancelling CANCEL id='P' from='E'
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] modifying ENTRY BUY id='E' qty=0.001 type=stop stop=63902.63 -> CLOSE id='E' side=sell qty=0.001
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] dispatching keyed close E directly over consumed entry (filled=0.001 qty=0.001); dependent protection stays armed
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] dispatching CLOSE id='E' side=sell qty=0.001
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] dispatched CLOSE id='E' side=sell qty=0.001 -> ['3842981']
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] event FILLED id=3842981 side=sell qty=0.001 filled=0.001 price=63895.11 pine='E' leg=close
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] event CANCELLED id=3842676 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl
+[2026-08-17 15:02:00+0000] bar:    509 INFO     [BROKER] event CANCELLED id=3842675 side=buy qty=0.001 filled=0.0 pine='B' leg=entry
+[2026-08-17 15:03:00+0000] bar:    510 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='E')
+[2026-08-17 15:03:00+0000] bar:    510 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=3842676 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl)
+[2026-08-17 15:03:00+0000] bar:    510 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=3842675 side=buy qty=0.001 filled=0.0 pine='B' leg=entry)
+[2026-08-17 15:03:00+0000] bar:    510 INFO     [BF] state 3->4 — flat again
+[2026-08-17 15:04:00+0000] bar:    511 INFO     [BF] BF9 PLACE long MARKET — on the fill a NATIVE OCO bracket is armed: tight TP +0.05%% / far SL -3%%; the TP leg must fill and the venue must         
+[2026-08-17 15:04:00+0000] bar:    511 INFO     [BROKER] dispatching ENTRY BUY id='E' qty=0.001 type=market
+[2026-08-17 15:04:00+0000] bar:    511 INFO     [BROKER] dispatched ENTRY BUY id='E' qty=0.001 type=market -> ['3843438']
+[2026-08-17 15:04:00+0000] bar:    511 INFO     [BROKER] event FILLED id=3843438 side=buy qty=0.001 filled=0.001 price=63922.84 pine='E' leg=entry
+[2026-08-17 15:05:00+0000] bar:    512 INFO     [BROKER] position size=0.001 sign=1.0 avg=63922.84 (after filled pine='E')
+[2026-08-17 15:05:00+0000] bar:    512 INFO     [BF] BF9 BRACKET armed: tp=63981.98 sl=62031.5 -> native OCO orderList
+[2026-08-17 15:05:00+0000] bar:    512 INFO     [BROKER] dispatching EXIT id='P' from='E' qty=0.001 tp=63981.98 sl=62031.5
+[2026-08-17 15:05:00+0000] bar:    512 INFO     [BROKER] dispatched EXIT id='P' from='E' qty=0.001 tp=63981.98 sl=62031.5 -> ['3843764', '3843765']
+[2026-08-17 15:06:00+0000] bar:    513 INFO     [BROKER] event FILLED id=3843765 side=sell qty=0.001 filled=0.001 price=63981.98 pine='P' from='E' leg=tp
+[2026-08-17 15:06:00+0000] bar:    513 INFO     [BROKER] event CANCELLED id=3843764 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl
+[2026-08-17 15:06:00+0000] bar:    513 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='P')
+[2026-08-17 15:06:00+0000] bar:    513 INFO     [BROKER] external cancel observed (CANCELLED id=3843764 side=sell qty=0.001 filled=0.0 pine='P' from='E' leg=sl)
+[2026-08-17 15:06:00+0000] bar:    513 INFO     [BF] BF9 DONE — bracket resolved (TP fill expected; verify the SL sibling was CANCELLED at the venue). ALL CASES DONE.
+[2026-08-17 15:07:28+0000] bar:    514 INFO     [BROKER] run stopped (completed) position=flat equity=9,999.96 USDT

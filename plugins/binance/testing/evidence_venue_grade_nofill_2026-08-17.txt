@@ -1,0 +1,29 @@
+ venue id coid                           type             side status    filled
+  3832523 2nde-3e6sx9wk-0msxbptpc-e0     LIMIT            BUY  CANCELED  0.00000000
+  3833039 2nde-9ei1dowb-0msxbseao-e0     LIMIT            BUY  CANCELED  0.00000000
+  3833041 2nde-6r7b5o9a-0msxbseao-e0     LIMIT            BUY  CANCELED  0.00000000
+  3833043 2nde-1xk41m4t-0msxbseao-e0     STOP_LOSS_LIMIT  BUY  CANCELED  0.00000000
+  3833776 2nde-1v7m72ck-0msxbw96o-e0     LIMIT            BUY  CANCELED  0.00000000
+  3833780 2nde-1yoo82v6-0msxbw96o-e0     STOP_LOSS_LIMIT  BUY  CANCELED  0.00000000
+  3834364 2nde-2fzr7lbr-0msxbyts0-e0     LIMIT            BUY  CANCELED  0.00000000
+  3834365 2nde-3egc5cyn-0msxbyts0-e0     LIMIT            BUY  CANCELED  0.00000000
+  3836314 crcn-9bc83ut9-0msxc7tuo-e0     MARKET           BUY  FILLED    0.00100000
+  3836317 crcn-9mwqj2e8-0msxc7tuo-s0     STOP_LOSS_LIMIT  SELL CANCELED  0.00000000
+  3836636 crcn-9bc83ut9-0msxc7tuo-c0     MARKET           SELL FILLED    0.00100000
+  3840968 crcn-9bc83ut9-0msxcuz6o-e0     MARKET           BUY  FILLED    0.00100000
+  3840970 crcn-9mwqj2e8-0msxcuz6o-s0     STOP_LOSS_LIMIT  SELL CANCELED  0.00000000
+  3841191 crcn-9bc83ut9-0msxcuz6o-c0     MARKET           SELL FILLED    0.00100000
+  3841692 crcn-9bc83ut9-0msxcyu2o-e0     MARKET           BUY  FILLED    0.00100000
+  3841693 crcn-9mwqj2e8-0msxcyu2o-s0     STOP_LOSS_LIMIT  SELL CANCELED  0.00000000
+  3842007 crcn-9bc83ut9-0msxcyu2o-c0     MARKET           SELL FILLED    0.00100000
+  3842674 crcn-9bc83ut9-0msxd2oyo-e0     MARKET           BUY  FILLED    0.00100000
+  3842675 crcn-c8yz3nk2-0msxd2oyo-e0     STOP_LOSS_LIMIT  BUY  CANCELED  0.00000000
+  3842676 crcn-9mwqj2e8-0msxd2oyo-s0     STOP_LOSS_LIMIT  SELL CANCELED  0.00000000
+  3842981 crcn-9bc83ut9-0msxd2oyo-c0     MARKET           SELL FILLED    0.00100000
+  3843438 crcn-9bc83ut9-0msxd6juo-e0     MARKET           BUY  FILLED    0.00100000
+  3843764 crcn-9mwqj2e8-0msxd7u5c-s0     STOP_LOSS_LIMIT  SELL EXPIRED   0.00000000
+  3843765 crcn-9mwqj2e8-0msxd7u5c-t0     LIMIT_MAKER      SELL FILLED    0.00100000
+
+status totals: {'CANCELED': 13, 'FILLED': 10, 'EXPIRED': 1}
+open orders now: 0
+fills (myTrades last 45m): 10

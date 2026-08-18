@@ -1,0 +1,15 @@
+[2026-08-17 13:11:46+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-17 13:11:47+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-08-17 13:11:47+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-08-17 13:11:48+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-08-17 13:11:48+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-08-17 13:11:48+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-17 13:11:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-08-17 13:11:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-08-17 13:13:00+0000] bar:    501 INFO     PROBE place: far limit buy @ 44504.593
+[2026-08-17 13:13:00+0000] bar:    501 INFO     [BROKER] dispatching ENTRY BUY id='Probe' qty=0.001 type=limit limit=44504.59
+[2026-08-17 13:13:00+0000] bar:    501 INFO     [BROKER] dispatched ENTRY BUY id='Probe' qty=0.001 type=limit limit=44504.59 -> ['3814673']
+[2026-08-17 13:15:00+0000] bar:    503 INFO     PROBE cancel
+[2026-08-17 13:15:00+0000] bar:    503 INFO     [BROKER] cancelling CANCEL id='Probe'
+[2026-08-17 13:16:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=3814673 side=buy qty=0.001 filled=0.0 pine='Probe' leg=entry
+--- venue record 3814673: CANCELED, clientOrderId=3ylj-3a1yaaip-0msx97syo-e0, LIMIT BUY GTC 0.001@44504.59, executedQty=0, book clean after
