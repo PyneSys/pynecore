@@ -46,3 +46,11 @@ plugin: NO fill event for pine='NEAR' over 2+ min; strategy stayed pos=0; no cas
 operator flattened manually; FAR leg cancelled manually.
 => F11's own question (does the #33 cascade fire on a real fill) remains UNANSWERED — re-run after #39.
 => Two-book mechanic confirmed and recorded in CLAUDE.md.
+
+=== Live-L1-T14-AtcCancelRefusal — provisional PASS 2026-08-18 (final grade next AM) ===
+14:22:26 placed T14=538916 (1786.0) + rider=538926 (1767.2), NORMAL LOs, resting into the auction
+14:30:06..14:44:07 EIGHT cancel attempts on 538916, every one refused:
+  http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION (attempts 1-8, ~120 s apart, phase=atc)
+unexpected-accepts=0; rider never touched. Post-close reads: both still 'New' (settle lag).
+FINAL GRADE next morning: both must read Expired, nothing of ours working.
+Note: first launch's orders (528386/528396) were operator-cancelled at ~14:21 (CONT-PM) — probe relaunched inside the window; measurement unaffected.
