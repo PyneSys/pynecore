@@ -101,6 +101,10 @@ NOT_FOUND_CODES = frozenset({"RESOURCE_NOT_FOUND", "INVALID_ORDER_ID"})
 TERMINAL_CODES = frozenset({
     "ORDER_IS_DONE", "ORDER_STATUS_REJECTED",
     "CO-ORD-013",  # observed: conditional already Activated (it fired -> a NORMAL order)
+    # Observed live 2026-08-18 (Live-L1-T17): cancelling an already-Canceled NORMAL
+    # order -> 400 "Order status is not valid to cancel". The NORMAL-book twin of
+    # CO-ORD-013 — the order is finished, so the cancel is a success, not a reject.
+    "ORDER_CANCEL_STATUS_REJECTED",
 })
 
 _AUTH = frozenset({"OA-401", "OA-403", "FORBIDDEN", "INVALID_OTP", "UNAUTHORIZED"})

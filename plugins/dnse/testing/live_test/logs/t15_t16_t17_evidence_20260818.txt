@@ -1,0 +1,27 @@
+=== Live-L1-T15-CancelReplace — PASS 2026-08-18 09:47 (continuous) ===
+[t15] 09:47:55 reference 1880.0 (daily close)
+[t15A] PLACED id=da1sfmo6p09g1n1viffg cat=STOP price=1974.0 stop=1974.0 filled=0.0
+[t15] CANCEL A ack http=200 in 35 ms
+[t15B] PLACED id=da1sfn86p09g1n1vifg0 cat=STOP price=1964.6 stop=1964.6 filled=0.0
+[t15] GAP cancel-ack -> replacement-placed = 99 ms
+[t15] poll A=Canceled B=New
+VERDICT t15: PASS — exposure-gap=99 ms (feeds #18: cancel+replace IS a viable amend substitute)
+cleanup: re-cancel of A -> CO-ORD-013 -> treated-gone; book clean
+
+=== Live-L1-T16-RestartAdoption — BUG FOUND 2026-08-18 (see issue #36) ===
+09:29 prmB places T16 order 33316 (NORMAL LO 1786.0), HOLDs
+09:30:40 SIGTERM -> engine down; venue: 33316 New (survives shutdown — no sweep)
+09:32 relaunch DIFFERENT label: foreign order untouched (T10 isolation ✓); [aborted: stale winStart consumed stages in warmup — procedural, rerun]
+09:40 relaunch SAME label prmB, winStart 09:42 (after launch), warmup complete pre-window:
+      startup: NO adoption/quarantine line for 33316; 09:45 cancel_all -> NOTHING dispatched
+      venue after: 33316 STILL New (stranded) -> manual _cancel_one -> Canceled
+Root cause: plugin has no store/recovery seam (no store_ctx, no reconcile/recovery modules).
+
+=== Live-L1-T17-ReplaceUnderAckLag — PASS 2026-08-18 09:48 (continuous) ===
+[t17A] PLACED id=85066 cat=NORMAL price=1786.0
+[t17] CANCEL A ack http=200
+[t17A2] PLACED id=85216 cat=NORMAL price=1786.0 (identical, inside ACK window)
+[t17] poll A=Canceled A'=New working=1
+VERDICT t17: PASS — exactly ONE working at every read; cleanup clean
+NEW VENUE CODE: re-cancel of Canceled NORMAL order -> 400 ORDER_CANCEL_STATUS_REJECTED
+("Order status is not valid to cancel") = NORMAL-book twin of CO-ORD-013 -> now classified TERMINAL (errors.py)

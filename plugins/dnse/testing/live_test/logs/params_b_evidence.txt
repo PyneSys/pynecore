@@ -1,0 +1,43 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] skipping startup size adoption (exchange=2.0, internal=0.0) — broker snapshot carries an unrecognised side label 'buy'
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[PRM] === PARAM MATRIX — window open. T19-T26/T30 continuous, T16 hold/restart, T14 ATC, T32 ATO. 1 contract unless flagged, >=4.5% away. startState=8  
+[PRM] bar=505 close=1883.1 candle=GREEN phase=CONT-AM state=8 step=0 pending=no pos=0
+[PRM] T26b PLACE phase=CONT-AM limit=1788.9 — NEXT bar calls strategy.close(T26) while it RESTS: close() targets POSITIONS and must NOT cancel the      
+[BROKER] dispatching ENTRY BUY id='T26' qty=1.0 type=limit limit=1788.9
+[BROKER] dispatched ENTRY BUY id='T26' qty=1.0 type=limit limit=1788.9 -> 
+[BROKER] event CREATED id=24426 side=buy qty=1.0 filled=0.0 pine='T26' leg=entry
+[PRM] bar=506 close=1882.3 candle=RED phase=CONT-AM state=8 step=0 pending=yes pos=0
+[PRM] T26b CLOSE ATTEMPT phase=CONT-AM — strategy.close(T26) with zero position: expect NO venue cancel; T26 must STILL be resting after this bar
+[PRM] bar=507 close=1880.8 candle=RED phase=CONT-AM state=8 step=1 pending=yes pos=0
+[PRM] T26b CANCEL id=T26 (explicit, after the close() no-op)
+[PRM] STAGE DONE phase=CONT-AM — state 8->9
+[BROKER] cancelling CANCEL id='T26'
+[BROKER] event CANCELLED id=24426 side=buy qty=1.0 filled=0.0 pine='T26' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=24426 side=buy qty=1.0 filled=0.0 pine='T26' leg=entry)
+[PRM] bar=508 close=1880.6 candle=RED phase=CONT-AM state=9 step=0 pending=no pos=0
+[PRM] bar=509 close=1880.5 candle=RED phase=CONT-AM state=9 step=0 pending=no pos=0
+[PRM] bar=510 close=1880.3 candle=RED phase=CONT-AM state=9 step=0 pending=no pos=0
+[PRM] bar=511 close=1880.7 candle=GREEN phase=CONT-AM state=9 step=0 pending=no pos=0
+[PRM] T30 PLACE phase=CONT-AM qty=5 limit=1786.7 with risk.max_position_size(2) — KEY: engine trims at placement; venue order must rest at qty 2, not 5
+[BROKER] dispatching ENTRY BUY id='T30' qty=2.0 type=limit limit=1786.6
+[BROKER] dispatched ENTRY BUY id='T30' qty=2.0 type=limit limit=1786.6 -> 
+[BROKER] event CREATED id=31816 side=buy qty=2.0 filled=0.0 pine='T30' leg=entry
+[PRM] bar=512 close=1879.8 candle=RED phase=CONT-AM state=9 step=0 pending=yes pos=0
+[PRM] T30 CANCEL
+[PRM] STAGE DONE phase=CONT-AM — state 9->10
+[BROKER] cancelling CANCEL id='T30'
+[BROKER] event CANCELLED id=31816 side=buy qty=2.0 filled=0.0 pine='T30' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=31816 side=buy qty=2.0 filled=0.0 pine='T30' leg=entry)
+[PRM] bar=513 close=1880 candle=GREEN phase=CONT-AM state=10 step=0 pending=no pos=0
+[PRM] T16a PLACE-AND-HOLD phase=CONT-AM limit=1786 — this state NEVER advances. Kill the engine now (run_t16_restart.sh drives this), then relaunch with
+[BROKER] dispatching ENTRY BUY id='T16' qty=1.0 type=limit limit=1786.0
+[BROKER] dispatched ENTRY BUY id='T16' qty=1.0 type=limit limit=1786.0 -> 
+[BROKER] event CREATED id=33316 side=buy qty=1.0 filled=0.0 pine='T16' leg=entry
+[PRM] bar=514 close=1879.6 candle=RED phase=CONT-AM state=10 step=0 pending=yes pos=0
+[PRM] T16a HOLDING phase=CONT-AM — order resting, awaiting kill
+[BROKER] run stopped (completed) position=2 equity=390,663,747.00 VND

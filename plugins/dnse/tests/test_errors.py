@@ -157,3 +157,13 @@ def __test_auction_cancel_refusals_are_transient_not_terminal__(code):
     assert classified is not None
     assert classified.disposition is errors.Disposition.CONNECTION, \
         f"{code} must be transient (retry after the phase flips), not a terminal reject"
+
+
+def __test_cancel_of_already_canceled_normal_order_is_terminal__():
+    """Observed live 2026-08-18 (Live-L1-T17): re-cancel of a Canceled NORMAL order
+    -> 400 ORDER_CANCEL_STATUS_REJECTED. Must classify TERMINAL (treated-gone) like
+    its conditional-book twin CO-ORD-013 — not a REJECT-with-ERROR."""
+    c = errors.classify(400, {"code": "ORDER_CANCEL_STATUS_REJECTED",
+                              "message": "Order status is not valid to cancel"}, is_write=True)
+    assert c.disposition is D.TERMINAL
+    assert c.level == "info"
