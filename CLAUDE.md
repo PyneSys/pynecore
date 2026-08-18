@@ -115,6 +115,29 @@ Fork-specific venue plugins, editable-installed (so they import as
   Live testing exists but is its own gated suite (see "DNSE testing" below). Docs mirror + sync tool:
   `docs/dnse-openapi-documentation/` (`fetch_docs.py`); plans in `docs/plan/`.
 
+## DNSE has TWO order books — and a triggered conditional MOVES between them (CRITICAL)
+
+Venue mechanic, operator-confirmed 2026-08-18:
+
+- **Conditional book** — STOP / STOP-LIMIT orders. Ids are **long strings**
+  (`da203hg6p09g1n1vipog`).
+- **Normal book** — plain LOs for derivatives and stocks. Ids are **integers**
+  (`437346`).
+
+A stop order rests on the CONDITIONAL book until its TTL expires or its trigger
+fires. On trigger the conditional order is **`Activated` — i.e. CLOSED, not
+filled** — and the venue creates a **NEW order on the NORMAL book** which is what
+actually executes. The activated conditional's detail carries metadata naming the
+child normal-order id (`externalOrderId`).
+
+**Consequence for the plugin:** a stop entry's fill NEVER appears on the id we
+placed. Anything that maps venue records to Pine ids by the placed id alone goes
+blind the moment a stop triggers — the strategy keeps believing `pos=0` while the
+account holds a real position (measured live, Live-L3-F11 → issue #39; the OCO
+exit path already tracks its child via `externalOrderId`, the stop-entry path does
+not). When reading order state: `Activated` on the conditional book means *look up
+the child on the normal book* — never treat it as terminal-without-fill.
+
 ## DNSE testing (read before touching the plugin or running anything live)
 
 Test cases are named **`Live-L<level>-<case>`** (e.g. `Live-L1-T11-OcaCancelMember`,

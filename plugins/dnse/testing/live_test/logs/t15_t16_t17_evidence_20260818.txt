@@ -31,3 +31,18 @@ NORMAL id=367226: place-ack=88ms book-visible=154ms cancel http=200 ack=31ms con
 STOP   id=da1vj506p09g1n1vim5g: place-ack=38ms book-visible=101ms cancel http=200 ack=100ms confirmed-gone=197ms
 VERDICT: PASS — no minimum-rest rule on either book; sub-second place->cancel->gone round trip.
 (cleanup double-cancels drew ORDER_CANCEL_STATUS_REJECTED / CO-ORD-013 -> both now info treated-gone)
+
+=== Live-L3-F10-CrossedStopAtPlacement — PASS 2026-08-18 13:27 (CONT-PM, flat account) ===
+[BROKER] crossed stop at placement -> immediate marketable LO (Pine: instant entry) | F10/entry stop=1857.6
+[BROKER] event FILLED id=377636 side=buy qty=1.0 filled=1.0 price=1876.3 pine='F10' leg=entry
+[BROKER] (next bar 13:28) dispatched CLOSE -> event FILLED id=379966 side=sell qty=1.0 price=1876.9 leg=close
+venue after: position None, working NONE. #34 fix verified live end-to-end.
+NOTE: the ~60 s between fill and flatten is Pine's bar clock (T18: venue allows ~250 ms) -> card #38.
+
+=== Live-L3-F11-OcaEntryGroupCancel — BLOCKED 2026-08-18 13:55 (see #39) ===
+placed: NEAR buy-stop da203hg6p09g1n1vipo0 trigger 1871.9 + FAR sell-stop da203hg6p09g1n1vipog trigger 1777.1 (oca.cancel g33)
+venue: NEAR -> Activated, externalOrderId=437346 (child on the NORMAL book) -> FILLED, account +1 @1871.9
+plugin: NO fill event for pine='NEAR' over 2+ min; strategy stayed pos=0; no cascade, no flatten
+operator flattened manually; FAR leg cancelled manually.
+=> F11's own question (does the #33 cascade fire on a real fill) remains UNANSWERED — re-run after #39.
+=> Two-book mechanic confirmed and recorded in CLAUDE.md.
