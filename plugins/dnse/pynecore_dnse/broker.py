@@ -506,6 +506,23 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._order_category[order.id] = tracked_category
         return [order]
 
+    def _resolve_stop_child(self, stop_id: str, attempts: int = 4, delay: float = 0.1
+                            ) -> "str | None":
+        """The NORMAL-book child id of an Activated STOP conditional (or None).
+
+        Only the DETAIL carries ``externalOrderId`` (the list view omits it).
+        Activation has already happened when this is called, so the id should be
+        present immediately; the brief retry covers the stale replica.
+        """
+        for _ in range(attempts):
+            status, body = self.client.get_order_detail(
+                self.account_id, stop_id, self.market_type, order_category="STOP")
+            external = body.get("externalOrderId") if isinstance(body, dict) else None
+            if external:
+                return str(external)
+            time.sleep(delay)
+        return None
+
     def _resolve_oco_lo(self, oco_id: str, attempts: int = 6, delay: float = 0.15
                         ) -> "ExchangeOrder | None":
         """Return the OCO's working NORMAL LO as an ``ExchangeOrder`` (or None).
@@ -833,13 +850,43 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 order_id = str(raw.get("id"))
                 order = self._to_exchange_order(raw)
                 cumulative = float(raw.get("fillQuantity") or 0)
+                # Dedup on the RAW venue status, not the mapped OrderStatus: the
+                # map collapses New and Activated to OPEN, which made a stop's
+                # trigger transition invisible — the exact moment the child
+                # normal-book order must be adopted (#39, measured live 08-18).
+                raw_status = str(raw.get("orderStatus") or "")
                 previous, prev_status = self._last_seen.get(order_id, (0.0, None))
-                if cumulative == previous and order.status is prev_status:
+                if cumulative == previous and raw_status == prev_status:
                     continue
-                self._last_seen[order_id] = (cumulative, order.status)
                 pine_id, from_entry, leg_type = self._identity_for(order_id)
                 if pine_id is None:
-                    continue  # not ours
+                    # NOT marked seen: identity can arrive later (a stop's child
+                    # is adopted only at the parent's Activated transition — #39),
+                    # and a row marked seen pre-adoption would dedup its fill away.
+                    continue  # not ours (yet)
+                self._last_seen[order_id] = (cumulative, raw_status)
+                if (raw_status.upper() == "ACTIVATED"
+                        and self._order_category.get(order_id) == "STOP"):
+                    # Two-book mechanic (CLAUDE.md): Activated = the conditional
+                    # CLOSED and a NEW order now works the NORMAL book. The fill
+                    # will arrive under the CHILD's id — adopt it into the
+                    # parent's identity so the scan's normal path reports it.
+                    child = await asyncio.to_thread(self._resolve_stop_child, order_id)
+                    if child and child not in self._identity:
+                        self._identity[child] = (pine_id, from_entry, leg_type)
+                        self._order_category[child] = "NORMAL"
+                        for ids in self._order_ids.values():
+                            if order_id in ids and child not in ids:
+                                ids.append(child)
+                        log.broker_info(
+                            "conditional ACTIVATED -> tracking child | parent=%s "
+                            "child=%s pine=%s", order_id, child, pine_id)
+                    elif not child:
+                        log.broker_warning(
+                            "conditional ACTIVATED but no externalOrderId yet | "
+                            "parent=%s pine=%s — child fill NOT yet trackable",
+                            order_id, pine_id)
+                    continue  # events come from the child row, not the shell
                 delta = max(cumulative - previous, 0.0)
                 event_type = ("filled" if order.status is OrderStatus.FILLED
                               else "partial" if order.status is OrderStatus.PARTIALLY_FILLED

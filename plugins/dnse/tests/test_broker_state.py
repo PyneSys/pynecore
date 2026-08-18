@@ -285,7 +285,9 @@ def __test_watch_orders_dedup_no_reyield_on_identical_poll__(fake_client, collec
         (200, {"orders": [seen_row, fresh_row]}), None))
     b._identity["O1"] = ("pineA", None, LegType.ENTRY)
     b._identity["O2"] = ("pineB", None, LegType.ENTRY)
-    b._last_seen["O1"] = (4.0, OrderStatus.PARTIALLY_FILLED)  # already reported last poll
+    # _last_seen keys on the RAW venue status since #39 (the mapped OrderStatus
+    # collapsed New/Activated and hid the stop-trigger transition).
+    b._last_seen["O1"] = (4.0, "PartiallyFilled")  # already reported last poll
     events = collect(b.watch_orders(), 1)
     assert len(events) == 1, "only the un-seen order should yield; O1 must be deduped"
     assert events[0].order.id == "O2", "dedup must be per-id, not a global freeze"
@@ -409,3 +411,60 @@ def __test_get_balance_non200_or_non_dict_returns_empty_dict__(fake_client, stat
     balance = asyncio.run(b.get_balance())
     assert balance == {}, "non-200/non-dict must yield the silent-{} contract"
     assert isinstance(balance, dict)
+
+
+def __test_watch_orders_activated_stop_adopts_child_and_reports_its_fill__(
+        fake_client, collect):
+    """#39 regression (measured live 2026-08-18, Live-L3-F11): a triggered STOP
+    conditional goes `Activated` (= CLOSED, not filled) and the venue creates a
+    CHILD order on the NORMAL book — the fill arrives under the CHILD's id. The
+    scan must adopt the child into the parent's Pine identity at the Activated
+    transition and then report the child's fill; before the fix the child row was
+    dropped at the identity check and the strategy stayed position-blind."""
+    stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
+    child_row = _order_row("437346", "Filled", fill=1.0, qty=1.0, avg_price=1871.9)
+    b = _broker(
+        fake_client,
+        get_orders=_books((200, {"orders": [child_row]}),
+                          (200, {"orders": [stop_row]})),
+        get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated",
+                                "externalOrderId": 437346}),
+    )
+    b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
+    b._order_category["COND1"] = "STOP"
+    b._order_ids["ik-stop"] = ["COND1"]
+
+    events = collect(b.watch_orders(), 1)
+
+    assert len(events) == 1, "exactly one event: the CHILD's fill (no parent-shell event)"
+    event = events[0]
+    assert event.order.id == "437346", "the fill must surface under the child id"
+    assert event.pine_id == "pineS", "…but carry the PARENT's Pine identity"
+    assert event.event_type == "filled"
+    assert event.fill_qty == 1.0 and event.fill_price == 1871.9
+    assert b._order_category["437346"] == "NORMAL", \
+        "cancels must route the child at the NORMAL book"
+    assert "437346" in b._order_ids["ik-stop"], \
+        "intent-keyed cancels must reach the live child"
+
+
+def __test_watch_orders_activation_without_external_id_warns_not_crashes__(
+        fake_client, collect):
+    """If the Activated detail has no externalOrderId yet (stale replica), the
+    scan must warn and keep polling — never crash, never emit a shell event."""
+    stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
+    fresh_row = _order_row("O2", "Filled", fill=3.0, qty=3.0)
+    b = _broker(
+        fake_client,
+        get_orders=_books((200, {"orders": [fresh_row]}),
+                          (200, {"orders": [stop_row]})),
+        get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}),
+    )
+    b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
+    b._identity["O2"] = ("pineB", None, LegType.ENTRY)
+    b._order_category["COND1"] = "STOP"
+
+    events = collect(b.watch_orders(), 1)
+
+    assert len(events) == 1 and events[0].order.id == "O2", \
+        "the unresolvable activation must not block other orders' events"
