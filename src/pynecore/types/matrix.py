@@ -50,10 +50,10 @@ class Matrix(Generic[T]):
         The row can consist of NA values, or an array can be used to provide values.
 
         :param row: The index where the new row will be inserted. If None, appends to the end.
-        :param array_id: Array to use for providing values to the new row. If shorter than matrix
-                        width, remaining cells are filled with NA. If longer, array is truncated.
+        :param array_id: Array to use for providing values to the new row.
                         If matrix is empty, the array size determines the column count.
         :raises IndexError: If row index is out of bounds.
+        :raises ValueError: If the array size does not match the matrix width.
         """
         row_idx: int = self.rows if row is None else row
 
@@ -64,13 +64,16 @@ class Matrix(Generic[T]):
             # If matrix is empty (0 columns), use array size to set column count
             if self.cols == 0 and len(array_id) > 0:
                 self.cols = len(array_id)
+            # Pine halts when the array's size does not match the matrix width --
+            # the expds_190 doc sample exists to demonstrate exactly that. Padding
+            # short arrays with na (the previous behavior) silently accepted what
+            # TradingView rejects.
+            elif len(array_id) != self.cols:
+                raise ValueError(
+                    f"Array size {len(array_id)} does not match the number of "
+                    f"columns ({self.cols})")
 
-            new_row = []
-            for i in range(self.cols):
-                if i < len(array_id):
-                    new_row.append(array_id[i])
-                else:
-                    new_row.append(NA(T))
+            new_row = list(array_id)
         else:
             new_row = [NA(T) for _ in range(self.cols)]
 
@@ -999,6 +1002,12 @@ class Matrix(Generic[T]):
         if self.rows == 0 and array_id and len(array_id) > 0:
             self.rows = len(array_id)
             self.data = [[] for _ in range(self.rows)]
+        # Same halt as add_row: a wrong-sized array is a runtime error in Pine,
+        # not something to pad or truncate.
+        elif array_id is not None and len(array_id) != self.rows:
+            raise ValueError(
+                f"Array size {len(array_id)} does not match the number of "
+                f"rows ({self.rows})")
 
         for i in range(self.rows):
             if array_id and i < len(array_id):

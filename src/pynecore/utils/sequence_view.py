@@ -18,9 +18,17 @@ class SequenceView(MutableSequence[T]):
     # giving 10,20,99,30,40), pop takes the slice's last element (20, not the parent's 40)
     # and clear() cuts the sliced elements out of the parent. The stored range never
     # follows the parent's content: removing the parent's first element leaves the [0, 2)
-    # view showing 20,30. It is only clipped to the parent's current length, and that
-    # clipping is not permanent -- a view shrunk to 0 elements comes back when the parent
-    # grows past its start again.
+    # view showing 20,30.
+    #
+    # Accessing a mapped index the parent no longer has HALTS the script. Measured
+    # 2026-08-18 (TradingView v6): slice(a, 3, 5) on a 5-element array, then
+    # array.remove(a, 0), then array.indexof on the slice -> runtime error. An earlier
+    # revision generalized the in-bounds observations above into silently clipping the
+    # view to the parent's length; that swallowed the error (an indexof over the stale
+    # view returned -1) and regressed the expds_160 doc sample, which exists to
+    # demonstrate the halt. The stored range is therefore used RAW: a dead index reaches
+    # the parent list and raises its native IndexError, matching both the measurement
+    # and the pre-clip behavior ("list index out of range").
 
     __slots__ = ('sequence', 'range')
 
@@ -38,9 +46,6 @@ class SequenceView(MutableSequence[T]):
 
     def __getitem__(self, key: int | slice) -> 'T | SequenceView[T]':
         r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            r = range(r.start, n if n > r.start else r.start)
         if isinstance(key, slice):
             return SequenceView(self.sequence, r[key])
         else:
@@ -54,9 +59,6 @@ class SequenceView(MutableSequence[T]):
 
     def __setitem__(self, key: int | slice, value: Any) -> None:
         r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            r = range(r.start, n if n > r.start else r.start)
         if isinstance(key, slice):
             # Slice assignment takes one value PER position, like a list's does.
             # Storing the iterable itself in every addressed slot instead turned
@@ -74,9 +76,6 @@ class SequenceView(MutableSequence[T]):
 
     def __delitem__(self, key: int | slice) -> None:
         r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            r = range(r.start, n if n > r.start else r.start)
         if isinstance(key, slice):
             # Delete from the parent at the mapped indices, highest first so the lower
             # ones stay valid, then shrink this view by as many positions
@@ -93,9 +92,6 @@ class SequenceView(MutableSequence[T]):
         # the view's own index maps to the parent index, and the view grows by one.
         # ``index`` is clamped like list.insert clamps its own.
         r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            r = range(r.start, n if n > r.start else r.start)
         size = len(r)
         if index < 0:
             index += size
@@ -107,17 +103,10 @@ class SequenceView(MutableSequence[T]):
         self.range = range(self.range.start, self.range.stop + 1)
 
     def __len__(self) -> int:
-        r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            return n - r.start if n > r.start else 0
-        return len(r)
+        return len(self.range)
 
     def __iter__(self) -> Iterator[T]:
         r = self.range
-        n = len(self.sequence)
-        if r.stop > n:  # clip_to_parent
-            r = range(r.start, n if n > r.start else r.start)
         for i in r:
             yield self.sequence[i]
 
