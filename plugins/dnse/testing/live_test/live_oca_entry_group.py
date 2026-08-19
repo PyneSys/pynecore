@@ -15,7 +15,7 @@ def main(
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
     farAwayPct=input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0)
 ):
-    OBSERVE_BARS = 2
+    OBSERVE_BARS = 0
 
     placedBar: PersistentSeries[int] = na(int)
     filledBar: PersistentSeries[int] = na(int)
@@ -37,12 +37,15 @@ def main(
         farTrig = close * (1 - farAwayPct / 100)
         strategy.entry("NEAR", strategy.long, stop=nearTrig, oca_name="g33", oca_type=strategy.oca.cancel, comment="F11near")
         strategy.entry("FAR", strategy.short, stop=farTrig, oca_name="g33", oca_type=strategy.oca.cancel, comment="F11far")
+        strategy.exit("P", from_entry="NEAR", stop=close * 0.997, comment_loss="F11-protect")
         placedBar = bar_index
         log.info("[OCA] PLACE near buy-stop={0} + far sell-stop={1} (oca.cancel 'g33') — " + "on the near FILL the far leg must be CANCELLED by the engine cascade; " + "watch [BROKER] for the cascade cancel, then verify at the venue", string.tostring(nearTrig, format.mintick), string.tostring(farTrig, format.mintick))
 
     if pending and na(filledBar) and strategy.position_size > 0:
         filledBar = bar_index
-        log.info("[OCA] NEAR FILLED pos={0} avg={1} — observing {2} bars: far leg must " + "now be GONE at the venue (pre-#33-fix it stays working = BUG)", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick), OBSERVE_BARS)
+        strategy.cancel_all()
+        strategy.close_all(comment="F11-flat")
+        log.info("[OCA] NEAR FILLED pos={0} avg={1} — FLATTENING IMMEDIATELY (same bar). " + "Grade the far leg from the VENUE RECORD afterwards: it must read " + "Canceled (the cascade fires at fill time; the record is permanent)", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
 
     if strategy.position_size < 0:
         log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — far leg FILLED after the " + "near fill: oca.cancel cascade ABSENT (#33 bug demonstrated). Flattening.", strategy.position_size)
@@ -50,8 +53,7 @@ def main(
         strategy.close_all(comment="F11-flipguard")
         done = True
 
-    if (not na(filledBar)) and bar_index - filledBar >= OBSERVE_BARS and (not done):
-        log.info("[OCA] OBSERVE window over — grade the far leg's venue state NOW " + "(must be Canceled). Cleaning up: close_all + cancel_all.")
+    if (not na(filledBar)) and bar_index > filledBar and (not done):
         strategy.cancel_all()
         strategy.close_all(comment="F11-clean")
         done = True

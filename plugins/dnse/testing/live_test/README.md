@@ -63,6 +63,28 @@ Live-L3 backtest mode (past window) is the ORACLE — a pre-launch gate, never a
 Live-L3 requires a FLAT account. Live-L4 is PASSIVE (no orders, no trading token) but must
 not run concurrently with order-placing tests (rate-limit contamination).
 
+### Poll cadence and the rate-limit budget
+
+DNSE limits are **per API key AND per endpoint**, with two thresholds (requests/hour
+and quota/day) — see `docs/dnse-openapi-documentation/guide-ratelimits.md`:
+
+| Feed | Endpoint limit | Our default | One strategy | Ten strategies |
+|---|---|---|---|---|
+| Order books (2 req/cycle) | 100,000/h · 1M/day | **0.5 s** | 14,400/h = 14% | 144,000/h = **OVER** |
+| Bars (1 req/cycle per symbol+TF) | 50,000/h · **100,000/day** | 3 s | 7,200/day = 7% | 72,000/day = **72%** |
+
+Both are `DNSEBrokerConfig` fields (`order_poll_interval`, `bar_poll_interval`) —
+raise them before running a fleet on one key. The budget is shared, so N strategies
+cost N×, and the duplication is total (order books are account-wide and identical
+for every strategy; same-symbol+TF bar polls are byte-identical). Pooling one poll
+per asset/account is the prerequisite for a fleet — not yet built.
+
+**Failure mode if exhausted:** 429s are treated as transient poll failures — bars
+and fills silently stop arriving while strategies keep looping. No crash, no alarm.
+
+Live smoke 2026-08-19: 98 order-book requests at 0.5 s → 98×200, zero 429, RTT
+median 55 ms.
+
 ### Grading orders from a PREVIOUS day
 
 The current-day detail endpoint returns `orderStatus: None` for yesterday's orders.

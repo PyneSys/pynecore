@@ -14,8 +14,17 @@
 //   PLACE  near buy-stop at high[1] (fills on a break) + far SELL-stop at
 //          close*(1-farAwayPct/100), same oca.cancel group, NO exit legs,
 //          NO explicit cancel of the far leg — the cascade is the subject.
-//   FILL   near fills -> observe for OBSERVE_BARS bars, logging the verdict
-//          criterion: the far leg's venue state IS the measurement.
+//          A protective exit IS armed on NEAR at placement (suite standard).
+//   FILL   near fills -> FLATTEN IMMEDIATELY (same bar). The far leg's venue
+//          state is graded AFTERWARDS from the venue record — the cascade fires
+//          at fill time and 'Canceled' is permanent, so nothing is gained by
+//          holding the position.
+//
+// SAFETY (learned the hard way, 2026-08-19): an earlier version held the
+// position for 2 bars 'to observe' the far leg. With Pine's bar clock that is
+// ~3 minutes of UNPROTECTED exposure (fill 09:37 -> planned flatten 09:40) and
+// the operator had to close manually. A live fill test must NEVER hold a
+// position for observation: flatten on sight, grade from records.
 //   CLEAN  close_all + cancel_all (explicit cleanup AFTER the grading window).
 //
 // farAwayPct: LIVE = 5.0 (far leg unfillable even if the bug leaves it working).
@@ -34,7 +43,7 @@ winStart   = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window ST
 winEnd     = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
 farAwayPct = input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0)
 
-OBSERVE_BARS = 2
+OBSERVE_BARS = 0   // FLATTEN ON SIGHT — see the safety note below
 
 var int  placedBar  = na
 var int  filledBar  = na
@@ -64,6 +73,12 @@ if canPlace and not pending and not done
                    oca_name="g33", oca_type=strategy.oca.cancel, comment="F11near")
     strategy.entry("FAR", strategy.short, stop=farTrig,
                    oca_name="g33", oca_type=strategy.oca.cancel, comment="F11far")
+    // PROTECTION ARMED AT PLACEMENT (suite standard, live-measured 2026-08-13:
+    // exits reach the venue pre-fill). Even with flatten-on-sight the Pine bar
+    // clock leaves ~1 bar between fill and close dispatch — this bounds the loss
+    // inside that window instead of leaving the position naked.
+    strategy.exit("P", from_entry="NEAR", stop=close * 0.997,
+                  comment_loss="F11-protect")
     placedBar := bar_index
     log.info("[OCA] PLACE near buy-stop={0} + far sell-stop={1} (oca.cancel 'g33') — " +
              "on the near FILL the far leg must be CANCELLED by the engine cascade; " +
@@ -73,10 +88,12 @@ if canPlace and not pending and not done
 // ---------------------------------------------------------------- fill -> observe
 if pending and na(filledBar) and strategy.position_size > 0
     filledBar := bar_index
-    log.info("[OCA] NEAR FILLED pos={0} avg={1} — observing {2} bars: far leg must " +
-             "now be GONE at the venue (pre-#33-fix it stays working = BUG)",
-             strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick),
-             OBSERVE_BARS)
+    strategy.cancel_all()
+    strategy.close_all(comment="F11-flat")
+    log.info("[OCA] NEAR FILLED pos={0} avg={1} — FLATTENING IMMEDIATELY (same bar). " +
+             "Grade the far leg from the VENUE RECORD afterwards: it must read " +
+             "Canceled (the cascade fires at fill time; the record is permanent)",
+             strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
 
 // FLIP GUARD (oracle observability + live safety): a short position here means the
 // far leg FILLED after the near fill — the cascade did not cancel it.
@@ -89,9 +106,9 @@ if strategy.position_size < 0
     done := true
 
 // ---------------------------------------------------------------- cleanup
-if not na(filledBar) and bar_index - filledBar >= OBSERVE_BARS and not done
-    log.info("[OCA] OBSERVE window over — grade the far leg's venue state NOW " +
-             "(must be Canceled). Cleaning up: close_all + cancel_all.")
+if not na(filledBar) and bar_index > filledBar and not done
+    // belt-and-braces: re-issue the sweep once in case the fill-bar dispatch
+    // was rejected; a no-op when the first flatten already worked.
     strategy.cancel_all()
     strategy.close_all(comment="F11-clean")
     done := true

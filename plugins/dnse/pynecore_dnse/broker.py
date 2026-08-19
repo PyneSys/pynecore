@@ -102,6 +102,18 @@ class DNSEBrokerConfig(DNSEConfig):
     trading_token: str = ""
     token_file: str = "workdir/state/dnse_trading_token.json"
     stop_slippage_ticks: int = 3
+    #: Order-book poll period (seconds). One cycle = 2 requests (NORMAL + STOP
+    #: books) and is how fast a fill becomes visible. DNSE allows 100,000
+    #: Get-Orders req/hour PER API KEY: 0.5 s = 4 req/s = 14,400/h = 14% of the
+    #: limit for ONE strategy. The budget is shared, so N concurrent strategies
+    #: cost N x that — 10 at 0.5 s would EXCEED the hourly limit (raise this, or
+    #: pool the poll, before running a fleet).
+    order_poll_interval: float = 0.5
+    #: Bar poll period (seconds), one request per cycle per (symbol, timeframe).
+    #: Binding constraint here is the DAILY quota (100,000 Get-OHLC/day): one
+    #: instance at 3 s over a ~6 h session = 7,200 (7%); ten instances = 72%.
+    #: Keep >= 1 s always, and >= 3 s when several instances share one key.
+    bar_poll_interval: float = 3.0
 
 
 class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
@@ -125,8 +137,11 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._order_category: dict[str, str] = {}
         #: venue order id -> (cumulative_fill, status) from the last poll.
         self._last_seen: dict[str, tuple] = {}
-        self._poll_interval: float = 2.0
-        self._bar_poll_interval: float = 3.0
+        _cfg = getattr(self, "config", None)
+        self._poll_interval: float = float(
+            getattr(_cfg, "order_poll_interval", None) or 0.5)
+        self._bar_poll_interval: float = float(
+            getattr(_cfg, "bar_poll_interval", None) or 3.0)
         #: Cancel-confirmation poll (see ``_cancel_took_effect``); tunable for tests.
         self._cancel_verify_attempts: int = 6
         self._cancel_verify_delay: float = 0.7

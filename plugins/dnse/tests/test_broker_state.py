@@ -468,3 +468,23 @@ def __test_watch_orders_activation_without_external_id_warns_not_crashes__(
 
     assert len(events) == 1 and events[0].order.id == "O2", \
         "the unresolvable activation must not block other orders' events"
+
+
+# --- poll cadence (rate-limit budget) ---------------------------------------
+
+def __test_poll_intervals_default_to_fast_order_scan__(fake_client):
+    """Order polling defaults to 0.5 s (fills visible ~4x sooner than the old
+    2 s); bars stay at 3 s because their DAILY quota is the binding limit."""
+    b = _broker(fake_client)
+    assert b._poll_interval == 0.5
+    assert b._bar_poll_interval == 3.0
+
+
+def __test_poll_intervals_are_operator_configurable__(fake_client):
+    """A fleet sharing one API key must be able to dial the cadence back —
+    the rate-limit budget is per key, not per strategy."""
+    cfg = broker.DNSEBrokerConfig(api_key="k", api_secret="s", account_no="ACC1",
+                                  order_poll_interval=2.0, bar_poll_interval=5.0)
+    b = broker.DNSEBroker(symbol="VN30F1M", timeframe="5", config=cfg)
+    assert b._poll_interval == 2.0
+    assert b._bar_poll_interval == 5.0
