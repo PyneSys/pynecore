@@ -11,9 +11,15 @@ Never start a session with a fill test. Escalate, and stop at the first failure:
 
 1. **Live-L0-Gate** — venue semantics (`level0_venue_semantics/l0_order_semantics.py`),
    must exit 0. Proves auth, both books, place/rest/cancel round trips.
-2. **NO-FILL tests** — the staged place/cancel ladder (`live_staged_place_cancel.py`,
-   T01–T13) and/or the params matrix. Proves the whole Pine→engine→plugin→venue
-   chain with orders that cannot fill.
+2. **NO-FILL smoke** — `live_staged_place_cancel.py` states **0–2 (T01–T03)**:
+   long limit place/cancel, short limit place/cancel, limit + `exit(stop)` with
+   both legs cancelled explicitly. ~10 min including warmup, and it touches BOTH
+   books (the exit leg is a conditional), so it proves the whole
+   Pine→engine→plugin→venue chain cheaply. Set `winEnd` so the run stops after
+   state 2.
+   *The full T01–T13 ladder is a periodic regression* — run it after plugin
+   changes or weekly, not before every fill session (operator decision
+   2026-08-19: the short smoke buys ~20 min of fill-window).
 3. **FILL tests LAST** — the staged fill ladder (operator-in-the-loop, below), F10,
    F11. Only after 1 and 2 are green in THIS session.
 
