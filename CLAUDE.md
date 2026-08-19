@@ -138,6 +138,40 @@ exit path already tracks its child via `externalOrderId`, the stop-entry path do
 not). When reading order state: `Activated` on the conditional book means *look up
 the child on the normal book* — never treat it as terminal-without-fill.
 
+## DNSE venue toolkit — use it instead of hand-writing probes (CRITICAL)
+
+`plugins/dnse/tools/venue.py` answers the questions every live session needs.
+**Use it. Do not re-type a `DNSEBroker(...)` heredoc to ask them** — that habit is
+what produced a false "account is FLAT" report on 2026-08-19 while the account
+held +2 contracts: the improvised probe called `fetch_position`, which is a
+CAPABILITY FLAG, not a method (the method is `get_position`), guarded it with
+`hasattr`, and read the resulting `None` as "no position".
+
+```bash
+.venv/bin/python plugins/dnse/tools/venue.py status      # phase, token, position, orders
+.venv/bin/python plugins/dnse/tools/venue.py flat        # exit 0 ONLY if truly flat+clean
+.venv/bin/python plugins/dnse/tools/venue.py order <id>  # detail, auto book, history fallback
+.venv/bin/python plugins/dnse/tools/venue.py cancel <id> # cancel AND verify terminal
+.venv/bin/python plugins/dnse/tools/venue.py sweep --yes # cancel everything (destructive)
+.venv/bin/python plugins/dnse/tools/venue.py history [--date YYYY-MM-DD]
+```
+
+**Exit codes are the point** — `0` answered affirmative, `1` answered negative,
+`2` COULD NOT DETERMINE (the read failed). A failed read never looks like "flat".
+Gate a live launch on `venue.py flat` rather than on anyone's summary.
+
+Two behaviours worth knowing:
+- **Phantom shells are separated from live orders.** A triggered conditional stays
+  `Activated` on the STOP book forever while its NORMAL-book child does the work
+  (#41), so it would otherwise make every post-fill cleanliness check cry wolf.
+  `status` lists them as `phantom -> child N did the work`; `flat` ignores them.
+- **`order` falls back to `/orders/history`** for previous-day ids, because the
+  detail endpoint answers `None` for them (rows are date-prefixed, under `data`).
+
+`sweep` cancels EVERY working order on the account, including the operator's own —
+DNSE nets per symbol and the venue has no notion of "this run's" orders. Hence
+`--yes`.
+
 ## DNSE testing (read before touching the plugin or running anything live)
 
 Test cases are named **`Live-L<level>-<case>`** (e.g. `Live-L1-T11-OcaCancelMember`,
