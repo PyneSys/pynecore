@@ -5,6 +5,22 @@ Four operational test types; every live verdict is graded from **DNSE's own reco
 (order details / books), never from the run log alone — the log claimed success twice
 while the venue disagreed (see findings below).
 
+## Run order for a live session — MANDATORY escalation (operator rule, 2026-08-19)
+
+Never start a session with a fill test. Escalate, and stop at the first failure:
+
+1. **Live-L0-Gate** — venue semantics (`level0_venue_semantics/l0_order_semantics.py`),
+   must exit 0. Proves auth, both books, place/rest/cancel round trips.
+2. **NO-FILL tests** — the staged place/cancel ladder (`live_staged_place_cancel.py`,
+   T01–T13) and/or the params matrix. Proves the whole Pine→engine→plugin→venue
+   chain with orders that cannot fill.
+3. **FILL tests LAST** — the staged fill ladder (operator-in-the-loop, below), F10,
+   F11. Only after 1 and 2 are green in THIS session.
+
+Rationale: a fill test is the only thing that puts real exposure on the account, so
+it runs only once everything cheaper has proven the plumbing is healthy today —
+token, session phase, both books, cancel paths, engine wiring.
+
 ## Risk tiers — what may run when (decided 2026-08-18)
 
 Case IDs are stable (never renamed); the TIER is the execution gate:
