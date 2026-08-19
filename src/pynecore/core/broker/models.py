@@ -715,10 +715,26 @@ class CloseIntent:
             return
         if self.synthetic_kind not in {
             'partial_trigger', 'marketable_exit', 'defensive_close',
+            'reversal_close',
         }:
             raise ValueError(
                 f"CloseIntent.synthetic_kind is invalid: {self.synthetic_kind!r}"
             )
+        if self.synthetic_kind == 'reversal_close':
+            # The close leg of a MARKET stop-and-reverse consumes the WHOLE
+            # symbol position (every Pine entry id, pyramids included), so
+            # it is symbol-wide by design and takes no targets. Plugins must
+            # dispatch it in a form that cannot open opposite exposure — a
+            # targeted position close or an exchange-native reduce-only
+            # order — because the engine deliberately does NOT wait for the
+            # old position's protective legs to confirm-cancel first.
+            if (self.target_entry_id is not None
+                    or self.target_position_coid is not None
+                    or self.target_exchange_id is not None):
+                raise ValueError(
+                    "CloseIntent reversal_close is symbol-wide and takes no targets."
+                )
+            return
         if self.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
             if (not self.target_entry_id
                     or self.target_position_coid is not None

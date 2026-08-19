@@ -46,6 +46,7 @@ from pynecore.core.broker.models import (
     CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
+    EntryIntent,
     ExchangeOrder,
     ExchangePosition,
     ExchangeCapabilities,
@@ -121,6 +122,7 @@ class MockBroker:
     # entry instead of hammering the venue every tick.
     always_raise_on_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
+    raise_on_next_close: Exception | None = None
     raise_on_next_modify_entry: Exception | None = None
     raise_on_next_modify_exit: Exception | None = None
     raise_on_next_cancel: Exception | None = None
@@ -200,6 +202,10 @@ class MockBroker:
 
     async def execute_close(self, envelope):
         self.close_calls.append(envelope)
+        if self.raise_on_next_close is not None:
+            err = self.raise_on_next_close
+            self.raise_on_next_close = None
+            raise err
         return self._mk_order(envelope, 'c')
 
     async def execute_cancel(self, envelope):
@@ -366,16 +372,34 @@ def __test_new_entry_dispatches_execute_entry__():
     assert engine.order_mapping["L"] == ["xchg-1"]
 
 
-def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
-    """The fill that reverses a position must retire the entry it closed.
+def _dispatched_close(envelope: DispatchEnvelope) -> CloseIntent:
+    """Narrow a recorded close dispatch's intent to :class:`CloseIntent`."""
+    intent = envelope.intent
+    assert isinstance(intent, CloseIntent)
+    return intent
 
-    Pine folds a reversal into ONE opposite-direction entry, so on a netting
-    venue the fill that ends the long arrives as an ENTRY leg and leaves the
-    book short — neither a closing leg nor a flat book, which is all the
-    close-fill cleanup looks for. Left behind, the dead entry's slot compares
-    equal to Pine's next long, so the diff calls a genuine re-entry
-    "unchanged": the bot stops entering without raising anything, and its
-    orphaned exit keeps being modified against a position the venue closed.
+
+def _reversal_close_fill(close_intent: CloseIntent, qty: float, price: float, *,
+                         xchg_id: str = "xchg-rc", fill_id: str = "rc-1"):
+    """The venue's fill for a dispatched ``reversal_close`` leg."""
+    return replace(
+        _fill_event('buy' if close_intent.side == 'buy' else 'sell',
+                    qty, price, pine_id="", leg=LegType.CLOSE,
+                    xchg_id=xchg_id, fill_id=fill_id),
+        pine_id=close_intent.pine_id,
+    )
+
+
+def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
+    """The close-then-open reversal must retire the entry it consumed.
+
+    On a netting venue the MARKET stop-and-reverse runs as a full-position
+    ``reversal_close`` plus the parked raw entry. Once the close settles and
+    the raw entry opens, the consumed entry's slot and bracket must be gone:
+    left behind, the dead slot compares equal to Pine's next same-id entry,
+    so the diff calls a genuine re-entry "unchanged" — the bot stops
+    entering, and its orphaned exit keeps being modified against a position
+    the venue closed.
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
@@ -388,13 +412,19 @@ def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
     assert pos.size == -1.0
     assert b.exit_calls and b.modify_exit_calls == []
 
-    # Pine reverses long with ONE folded double-size buy. Its order book still
-    # carries the short and the short's bracket: in broker mode nothing prunes
-    # them, the engine's close-fill cleanup is what has to.
-    pos.entry_orders["L"] = _entry_order("L", 2.0)
+    # Pine reverses long with the RAW quantity; the engine flattens first.
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
     engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.synthetic_kind == 'reversal_close'
     engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 2.0, 50_000.0, pine_id="L", xchg_id="xchg-2"))
+        _reversal_close_fill(close, 1.0, 50_000.0))
+    assert pos.size == 0.0
+    # The flat book dispatched the parked raw entry.
+    assert [call.intent.pine_id for call in b.entry_calls] == ["S", "L"]
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="xchg-2"))
     assert pos.size == 1.0
 
     assert "S" not in engine.active_intents
@@ -402,46 +432,93 @@ def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
                 if isinstance(intent, ExitIntent) and intent.from_entry == "S"]
     assert ("S-X", "S") not in pos.exit_orders
 
-    # Pine goes short again with a fresh bracket. It has to go out as a NEW
-    # exit: amending the retired one is a modify against a position the venue
-    # closed, which is the reject that halted the bot.
-    pos.entry_orders["S"] = _entry_order("S", -2.0)
-    pos.exit_orders[("S-X", "S")] = _exit_order("S", -2.0, "S-X", stop=51_500.0)
+    # Pine goes short again with a fresh bracket. Once its reversal close
+    # settles, the entry has to go out as a NEW dispatch: amending the
+    # retired one is a modify against a position the venue closed, which is
+    # the reject that halted the bot.
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -1.0, "S-X", stop=51_500.0)
     engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    close2 = _dispatched_close(b.close_calls[1])
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close2, 1.0, 50_100.0,
+                             xchg_id="xchg-rc2", fill_id="rc-2"))
 
     assert [call.intent.pine_id for call in b.entry_calls] == ["S", "L", "S"]
     assert b.modify_exit_calls == []
 
 
-def __test_racing_sl_fill_on_a_folded_reversal_closes_the_surplus__():
-    """A still-armed SL filling in flight must not leave the fold's surplus open.
-
-    The MARKET stop-and-reverse fold sizes the reversal as raw + |position|,
-    assuming the venue nets the consumed exposure. When the old position's
-    native SL fills concurrently (it stays armed at the venue until the flip
-    settles), BOTH executions land: the book goes to -2.0 where Pine holds
-    -1.0, and the next Pine-sized exit trips over the mismatch (measured on
-    the Capital.com demo lane, 2026-08-15: fatal full-row guard crash). The
-    engine must detect the double-settle and close the surplus defensively.
-    """
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-
+def _drive_hedge_reversal(b, engine, pos):
+    """Open long 1.0 with an SL bracket on a hedging-mode account
+    (``position_port`` set), then reverse short 1.0 raw: the close-then-open
+    protocol dispatches the full-position reversal close — fanned through
+    the port into a targeted ``close_leg`` — and parks the raw entry.
+    Returns the armed :class:`_PendingReversalOpen` marker."""
     pos.entry_orders["L"] = _entry_order("L", 1.0)
     pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
     engine.sync(BAR_TS)
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
     assert pos.size == 1.0
-
-    # Pine reverses short with the RAW quantity; the engine folds to 2.0.
+    b.raw_legs = [_pleg("7", "buy", 1.0, open_time=1.0)]
     pos.entry_orders["S"] = _entry_order("S", -1.0)
     engine.sync(BAR_TS + 60_000)
-    folded = b.entry_calls[-1].intent
-    assert folded.pine_id == "S" and folded.qty == 2.0
-    s_deal_id = engine.order_mapping["S"][0]
+    marker = engine._pending_reversal_opens.get("S")  # type: ignore[attr-defined]
+    assert marker is not None and marker.close_qty == 1.0
+    return marker
 
-    # The venue's still-armed SL closes the long concurrently...
+
+def _hedge_close_fill(marker, qty: float, price: float, *,
+                      xchg_id: str = "xchg-hc", fill_id: str = "hc-1"):
+    """A fill of the hedge reversal close's fanned ``close_leg`` child."""
+    return replace(
+        _fill_event(marker.entry_intent.side, qty, price, pine_id="",
+                    leg=LegType.CLOSE, xchg_id=xchg_id, fill_id=fill_id),
+        pine_id=marker.close_pine_id,
+    )
+
+
+def __test_hedge_market_reversal_fans_the_close_and_parks_the_entry__():
+    """A hedge-account MARKET reversal is close-then-open, never combined.
+
+    The close goes out as targeted per-leg ``close_leg`` calls through the
+    port — a form that cannot open opposite exposure — and the raw entry
+    is parked until the book settles flat. No combined-size order ever
+    reaches the venue, so a racing protective leg can no longer
+    double-settle the consumed exposure (the shape that over-opened the
+    book on the old combined dispatch).
+    """
+    b = MockBroker()
+    b.position_port = b
+    engine, pos = _mk_engine(b)
+    _drive_hedge_reversal(b, engine, pos)
+
+    # The close fanned onto the opposing leg, targeted; nothing opened
+    # (the single place_leg is the initial L open).
+    assert b.close_leg_calls == [("7", 1)]
+    assert b.close_calls == []  # port mode never uses execute_close
+    assert b.place_leg_calls == [1.0]
+    assert "S" not in engine.active_intents
+    assert "S" not in engine.order_mapping
+
+
+def __test_hedge_racing_sl_flattens_and_the_raw_entry_opens__():
+    """The venue-native SL winning the race cannot double-close on hedge.
+
+    The SL and the reversal close target the SAME leg — at most one of
+    them fills. When the SL wins, the book settles flat, the parked raw
+    entry opens with its raw size, and the final book is exactly the
+    reversal target — never over-sold.
+    """
+    b = MockBroker()
+    b.position_port = b
+    engine, pos = _mk_engine(b)
+    _drive_hedge_reversal(b, engine, pos)
+    n_close_legs = len(b.close_leg_calls)
+
+    # The still-armed SL closes the leg; the venue view goes flat.
+    b.raw_legs = []
     engine._route_event(replace(  # type: ignore[attr-defined]
         _fill_event('sell', 1.0, 49_000.0, pine_id="L",
                     leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
@@ -449,153 +526,64 @@ def __test_racing_sl_fill_on_a_folded_reversal_closes_the_surplus__():
         from_entry="L",
     ))
     assert pos.size == 0.0
-    assert b.close_calls == []  # nothing over-opened yet
-
-    # ...and the folded entry still fills in FULL: nothing was left to net.
+    # The flat book opened the parked entry with the RAW size through the
+    # port (pure add — no further close legs).
+    assert engine._pending_reversal_opens == {}
+    assert b.place_leg_calls[-1:] == [1.0]
+    assert len(b.close_leg_calls) == n_close_legs
     engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+        _fill_event('sell', 1.0, 48_990.0, pine_id="S", xchg_id="xchg-s",
                     fill_id="s-1"))
-    assert pos.size == -2.0
-
-    assert len(b.close_calls) == 1
-    corrective = b.close_calls[0].intent
-    assert isinstance(corrective, CloseIntent)
-    assert corrective.synthetic_kind == 'defensive_close'
-    assert corrective.side == 'buy'
-    assert corrective.qty == 1.0
-    assert corrective.target_exchange_id == s_deal_id
-
-    # The corrective fill converges the book back onto Pine's -1.0 and must
-    # not re-trigger the guard (its side is the reducing one).
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 48_995.0, pine_id="",
-                    leg=LegType.CLOSE, xchg_id="xchg-corr",
-                    fill_id="corr-1"),
-        pine_id=corrective.pine_id,
-    ))
     assert pos.size == -1.0
-    assert len(b.close_calls) == 1
 
 
-def __test_fold_surplus_corrects_when_the_entry_fill_lands_first__():
-    """Same double-settle, opposite delivery order: entry fill, then the SL."""
+def __test_hedge_close_fan_settles_flat_then_opens_the_raw_entry__():
+    """The clean path: the fanned close fills, then the raw entry opens."""
     b = MockBroker()
+    b.position_port = b
     engine, pos = _mk_engine(b)
+    marker = _drive_hedge_reversal(b, engine, pos)
 
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
+    b.raw_legs = []
     engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
-    s_deal_id = engine.order_mapping["S"][0]
-
+        _hedge_close_fill(marker, 1.0, 48_995.0))
+    assert pos.size == 0.0
+    assert engine._pending_reversal_opens == {}
+    assert b.place_leg_calls[-1:] == [1.0]
     engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
+        _fill_event('sell', 1.0, 48_990.0, pine_id="S", xchg_id="xchg-s",
                     fill_id="s-1"))
-    assert b.close_calls == []  # fully explained by the netting assumption
-
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    ))
-
-    assert len(b.close_calls) == 1
-    corrective = b.close_calls[0].intent
-    assert corrective.side == 'buy' and corrective.qty == 1.0
-    assert corrective.target_exchange_id == s_deal_id
-
-
-def __test_a_clean_fold_never_dispatches_a_corrective_close__():
-    """Without an external close the fold's fills are fully netted — no-op."""
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id="xchg-s",
-                    fill_id="s-1"))
-
     assert pos.size == -1.0
-    assert b.close_calls == []
 
 
-def __test_a_replayed_sl_fill_does_not_double_the_corrective_close__():
-    """The dedup gate must keep a redelivered SL fill out of the fold ledger."""
+def __test_hedge_same_bar_replacement_supersedes_the_parked_open__():
+    """A same-bar ``skip_flip`` re-placement must not flip a hedge account.
+
+    TV modifies the standing order with the raw quantity and does NOT
+    recompute the flip — the position must only be REDUCED. The fanned
+    close cannot be recalled, so the raw reduction is already covered:
+    the parked open is dropped, and when the close settles flat nothing
+    opens on the opposite side.
+    """
     b = MockBroker()
+    b.position_port = b
     engine, pos = _mk_engine(b)
+    marker = _drive_hedge_reversal(b, engine, pos)
+    n_places = len(b.place_leg_calls)
 
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    replaced = _entry_order("S", -1.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
     engine.sync(BAR_TS + 60_000)
-    s_deal_id = engine.order_mapping["S"][0]
+    assert marker.superseded is True
+    assert len(b.place_leg_calls) == n_places
 
-    sl_fill = replace(
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    )
-    engine._route_event(sl_fill)  # type: ignore[attr-defined]
+    b.raw_legs = []
     engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-1"))
-    assert len(b.close_calls) == 1
-
-    # WS replay of the same execution: same fill_id, dropped by the gate.
-    engine._route_event(sl_fill)  # type: ignore[attr-defined]
-    assert len(b.close_calls) == 1
-
-
-def __test_partial_fold_fills_correct_the_surplus_in_slices__():
-    """Overshoot accrues incrementally as the folded entry fills in parts."""
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
-    s_deal_id = engine.order_mapping["S"][0]
-
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    ))
-    # First half of the folded fill is still covered by the raw quantity.
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-1", event_type='partial', filled_qty=1.0,
-                    remaining_qty=1.0))
-    assert b.close_calls == []
-    # The second half is the surplus.
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 48_985.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-2"))
-    assert len(b.close_calls) == 1
-    assert b.close_calls[0].intent.qty == 1.0
+        _hedge_close_fill(marker, 1.0, 48_995.0))
+    assert pos.size == 0.0
+    assert engine._pending_reversal_opens == {}
+    assert len(b.place_leg_calls) == n_places  # nothing opened
 
 
 def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
@@ -629,15 +617,16 @@ def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
     assert "L" in engine.active_intents
 
 
-def __test_folded_close_labelled_with_the_reversing_id_spares_the_new_entry__():
-    """A fold's closing leg labelled with the REVERSING id must not wipe it.
+def __test_reversal_close_labelled_with_the_reversing_id_spares_the_new_entry__():
+    """A closing fill labelled with the REVERSING id must not wipe it.
 
-    On a netting fold some venues (cTrader) report the closing leg under the
-    reversing intent's ``from_entry`` — the id that is about to OPEN. The
-    label-derived cleanup would tear down the live new entry's tracking and
-    bracket; the FIFO evidence (``record_fill`` consumed 'L') is authoritative
-    and the label is only a fallback for fills with no FIFO walk. Measured on
-    the cTrader lane: the wiped 'S' later swallowed four re-entry signals.
+    On a netting reversal some venues (cTrader) attribute the closing fill
+    to the reversing intent's ``from_entry`` — the id that is about to
+    OPEN. The label-derived cleanup would tear down the live new entry's
+    tracking and bracket; the FIFO evidence (``record_fill`` consumed 'L')
+    is authoritative and the label is only a fallback for fills with no
+    FIFO walk. Measured on the cTrader lane: the wiped 'S' later swallowed
+    four re-entry signals.
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
@@ -648,33 +637,431 @@ def __test_folded_close_labelled_with_the_reversing_id_spares_the_new_entry__():
         _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
     assert pos.size == 1.0
 
-    # Pine reverses short: ONE folded SELL under 'S', with S's fresh bracket.
-    pos.entry_orders["S"] = _entry_order("S", -2.0)
-    pos.exit_orders[("S-X", "S")] = _exit_order("S", -2.0, "S-X", stop=51_000.0)
+    # Pine reverses short with S's fresh bracket: the engine dispatches the
+    # reversal close and parks the raw entry.
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -1.0, "S-X", stop=51_000.0)
     engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
 
-    # The venue reports the fold as TWO fills; the closing leg carries the
-    # reversing id 'S', not the entry it actually consumed ('L').
+    # The venue attributes the closing fill to the reversing id 'S', not
+    # the entry it actually consumed ('L').
     engine._route_event(replace(  # type: ignore[attr-defined]
         _fill_event('sell', 1.0, 50_100.0, pine_id="", leg=LegType.CLOSE,
                     xchg_id="xchg-2"),
         pine_id=None, from_entry="S",
     ))
     assert pos.size == 0.0
+    # The flat book dispatched the parked raw entry; the mislabelled close
+    # must not have torn down its tracking or its bracket.
     assert "L" not in engine.active_intents
     assert "S" in engine.active_intents, \
         "the mislabelled close tore down the live reversing entry"
-    assert ("S-X", "S") in pos.exit_orders
 
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('sell', 1.0, 50_100.0, pine_id="S", xchg_id="xchg-3"))
     assert pos.size == -1.0
 
-    # The next reversal back to long must dispatch — 'L' was retired, so the
-    # re-emitted entry is genuinely new to the diff.
-    pos.entry_orders["L"] = _entry_order("L", 2.0)
+    # The next reversal back to long must dispatch — 'L' was retired, so
+    # once its close settles, the re-emitted entry is genuinely new.
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
     engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[1]), 1.0, 50_050.0,
+                             xchg_id="xchg-rc2", fill_id="rc-2"))
     assert [call.intent.pine_id for call in b.entry_calls] == ["L", "S", "L"]
+
+
+def _open_long_with_bracket(b, engine, pos):
+    """Open long 1.0 with a resting SL exit on a netting engine."""
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+
+def __test_market_reversal_dispatches_the_close_leg_and_parks_the_entry__():
+    """A netting MARKET reversal runs close-then-open, never a folded entry.
+
+    The folded double-size entry raced the old position's still-armed
+    protective legs: a concurrent SL fill double-closed the consumed
+    exposure and the defensive surplus correction paid spread + fees twice
+    (Capital.com demo lane, 2026-08-18, three times in one cycle). The
+    engine instead retires the old closing surfaces best-effort, dispatches
+    a full-position ``reversal_close`` (a form that cannot open opposite
+    exposure) and parks the RAW entry until the book settles flat.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    n_cancels = len(b.cancel_calls)
+    n_entries = len(b.entry_calls)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+
+    # The old resting exit was cancelled best-effort and retired.
+    assert len(b.cancel_calls) == n_cancels + 1
+    cancelled = b.cancel_calls[-1].intent
+    assert cancelled.pine_id == "L-X" and cancelled.from_entry == "L"
+    assert "L-X\0L" not in engine.active_intents
+    # The close leg went out for the FULL position, flagged reversal_close.
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.synthetic_kind == 'reversal_close'
+    assert close.side == 'sell' and close.qty == 1.0
+    assert close.immediately is True
+    # No entry was dispatched: the raw entry is parked, not active, and the
+    # deferral is non-counting (free to re-emit every sync).
+    assert len(b.entry_calls) == n_entries
+    assert "S" not in engine.active_intents
+    assert "S" in engine._pending_reversal_opens
+    assert "S" not in engine._rejected_entry_intents
+
+
+def __test_parked_reversal_entry_opens_when_the_close_settles_flat__():
+    """The close leg's fill flattens the book and opens the raw entry."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    close = _dispatched_close(b.close_calls[0])
+    n_entries = len(b.entry_calls)
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 1.0, 49_995.0))
+    assert pos.size == 0.0
+    # The raw entry dispatched event-driven, with the RAW quantity.
+    assert len(b.entry_calls) == n_entries + 1
+    opened = b.entry_calls[-1].intent
+    assert opened.pine_id == "S" and opened.qty == 1.0
+    assert engine.active_intents["S"] is not None
+    assert engine._pending_reversal_opens == {}
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_990.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1.0
+
+
+def __test_racing_protective_fill_flattens_and_opens_the_parked_entry__():
+    """A venue-side protective leg racing the close leaves NO surplus.
+
+    This is the incident shape the close-then-open protocol exists for:
+    the old SL fires while the reversal is in flight. The close is
+    dispatched in a form that cannot open opposite exposure, so the SL
+    fill simply flattens the book — the close no-ops at the venue — and
+    the parked raw entry opens exactly once. No defensive surplus close,
+    no double-paid round-trip.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    n_entries = len(b.entry_calls)
+
+    # The still-armed venue SL fills concurrently instead of the close.
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
+                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
+                    fill_id="sl-1"),
+        from_entry="L",
+    ))
+    assert pos.size == 0.0
+    # The parked entry opened on the flat book; nothing else moved.
+    assert len(b.entry_calls) == n_entries + 1
+    assert b.entry_calls[-1].intent.qty == 1.0
+    assert engine._pending_reversal_opens == {}
+    assert engine._pending_flip_surplus_closes == {}
+    assert len(b.close_calls) == 1  # only the reversal close itself
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 48_990.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1.0
+
+
+def __test_reemitted_old_exit_is_suppressed_while_the_close_is_in_flight__():
+    """Pine re-emitting the old exit must not re-arm it against the close.
+
+    While the position has not flipped yet, the script still emits the old
+    side's exits; re-dispatching one after the retire sweep would recreate
+    the closing surface the sweep just removed — and it would fire against
+    the NEW position once the parked entry opens. The pending reversal
+    marker suppresses them; once the book flips the script stops emitting
+    them on its own.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    close = _dispatched_close(b.close_calls[0])
+    n_exits = len(b.exit_calls)
+
+    # The close is dispatched but unfilled; the script still emits L's exit.
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.exit_calls) == n_exits
+    assert "L-X\0L" not in engine.active_intents
+
+    # The close fills, the book flips — the suppression is moot from here.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 1.0, 49_900.0))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_900.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1.0
+
+
+def __test_declined_reversal_close_defers_and_the_next_sync_retries__():
+    """A declined close leg defers the reversal without counting a reject.
+
+    ``execute_close`` raising a venue reject commonly proves a racing
+    protective fill already emptied the position; the reversal is skipped
+    with the non-counting ``reversal_close_pending`` reason and Pine's
+    re-emission drives the retry, where the protocol re-reads the settled
+    book.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    b.raise_on_next_close = ExchangeOrderRejectedError("position not found")
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    n_entries = len(b.entry_calls)
+    engine.sync(BAR_TS + 60_000)
+
+    # No entry went out, nothing parked, nothing counted against the entry.
+    assert len(b.entry_calls) == n_entries
+    assert "S" not in engine.active_intents
+    assert engine._pending_reversal_opens == {}
+    assert "S" not in engine._rejected_entry_intents
+
+    # Next sync: the close confirms and the protocol proceeds normally.
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    assert "S" in engine._pending_reversal_opens
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[1]), 1.0, 49_950.0))
+    assert b.entry_calls[-1].intent.pine_id == "S"
+    assert pos.size == 0.0
+
+
+def __test_stale_reversal_close_redispatches_after_the_grace_syncs__():
+    """A close that never settles re-dispatches after the stale bound.
+
+    The marker defers the re-emitted entry sync after sync; once the
+    deferrals exceed the stale bound with the position still open, the
+    protocol re-runs with a fresh close dispatch — the close is dispatched
+    in a form that cannot open opposite exposure, so a surviving duplicate
+    at worst no-ops.
+    """
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    # The close never settles; the re-emitted entry defers, then redoes.
+    for i in range(_REVERSAL_CLOSE_STALE_SYNCS):
+        engine.sync(BAR_TS + 120_000 + i * 60_000)
+        assert len(b.close_calls) == 1
+    engine.sync(BAR_TS + 600_000)
+    assert len(b.close_calls) == 2
+    assert b.close_calls[1].intent.synthetic_kind == 'reversal_close'
+    assert "S" in engine._pending_reversal_opens
+
+
+def __test_reversal_retires_the_native_failsafe_with_a_confirmed_put__():
+    """The consumed parent's fail-safe stop is cleared best-effort.
+
+    The venue-side fail-safe stop would fire against the book mid-close
+    just like a resting exit leg; the retire sweep sends its clear PUT
+    synchronously and retires the state on success. Unlike the resting
+    legs this is pure noise-avoidance: the close cannot be double-crossed
+    by the stop (reduce-only contract), so the sweep never blocks.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    ref = engine._resolve_parent_opening_ref("L")  # type: ignore[attr-defined]
+    assert ref is not None
+    mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[49_000.0], now_ms=1000.0)
+    received = []
+    engine.set_native_bracket_dispatcher(received.append)
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert received and received[-1].stop_level == 49_000.0
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+
+    # The clear PUT went out and the state retired — and the close leg was
+    # dispatched in the same sync (the sweep never defers the protocol).
+    assert received[-1].stop_level is None
+    assert mgr.get_state(ref) is None
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.synthetic_kind == 'reversal_close'
+
+
+def __test_failed_failsafe_clear_put_does_not_block_the_reversal_close__():
+    """A failed fail-safe clear PUT is logged, never a deferral.
+
+    Under the close-then-open protocol the venue-side stop racing the
+    close merely empties the position early — the reduce-only close
+    no-ops and the parked entry still opens on the flat book. Blocking
+    the reversal on the PUT (the old confirm-cancel contract) would only
+    delay the flip for no safety gain.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    ref = engine._resolve_parent_opening_ref("L")  # type: ignore[attr-defined]
+    assert ref is not None
+    mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[49_000.0], now_ms=1000.0)
+
+    def _dispatcher(snapshot):
+        if snapshot.stop_level is None:
+            raise RuntimeError("PUT failed")
+
+    engine.set_native_bracket_dispatcher(_dispatcher)
+    engine.drive_native_failsafe(now_ms=1000.0)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+
+    # The close leg went out despite the failed PUT; the entry is parked.
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+    # The stop's state survives for the generic retry machinery.
+    assert mgr.get_state(ref) is not None
+
+
+def __test_same_bar_replacement_supersedes_the_parked_reversal_open__():
+    """A same-bar ``skip_flip`` re-placement demotes the reversal to a
+    reduction: the parked open must never fire.
+
+    TV modifies the standing order with the raw quantity and does NOT
+    recompute the flip — the position must only be REDUCED. The dispatched
+    close cannot be recalled, so the raw reduction is already covered;
+    the parked open is dropped and the book must NOT flip when the close
+    settles flat. The close overshooting the raw reduction is the same
+    accepted can't-take-back divergence as the old folded dispatch
+    filling past the raw replacement.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -4.0)
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.qty == 10.0
+    n_entries = len(b.entry_calls)
+
+    # Same bar, next tick: the script re-places the same entry raw.
+    replaced = _entry_order("S", -4.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
+    engine.sync(BAR_TS)
+
+    # No entry dispatched: raw 4 is over-covered by the in-flight close 10.
+    assert len(b.entry_calls) == n_entries
+    marker = engine._pending_reversal_opens["S"]
+    assert marker.superseded is True
+
+    # A further tick with the same re-placed order is a genuine no-op.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == n_entries
+    assert len(b.close_calls) == 1
+
+    # The close settles flat: the superseded parked open must NOT fire.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 10.0, 49_900.0))
+    assert pos.size == 0.0
+    assert len(b.entry_calls) == n_entries
+    assert engine._pending_reversal_opens == {}
+
+
+def __test_same_bar_replacement_past_the_close_reparks_the_remainder__():
+    """A raw re-placement LARGER than the dispatched close works the rest.
+
+    Raw 15 against a 10-long: TV executes the standing sell 15 and ends
+    5 short. The close already flattened 10; the remainder 5 is re-parked
+    (an immediate dispatch would race the close's still-settling fills)
+    and opens the moment the book settles flat, so the book converges on
+    TV's -5 without ever double-opening.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 10.0
+    pos.sign = 1.0
+    pos.entry_orders["S"] = _entry_order("S", -15.0)
+
+    engine.sync(BAR_TS)
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.qty == 10.0
+    n_entries = len(b.entry_calls)
+
+    replaced = _entry_order("S", -15.0)
+    replaced.skip_flip = True
+    pos.entry_orders["S"] = replaced
+    engine.sync(BAR_TS)
+
+    # Nothing dispatches while the close settles: the marker now carries
+    # the remainder past the close, with the RAW intent kept for the
+    # sticky slot.
+    assert len(b.entry_calls) == n_entries
+    marker = engine._pending_reversal_opens["S"]
+    assert marker.superseded is False
+    assert marker.open_qty == 5.0
+    assert marker.entry_intent.qty == 15.0
+
+    # The close settles flat — only the remainder opens, and the slot
+    # keeps the RAW quantity so the re-emitted Pine order diffs as
+    # unchanged.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[0]), 10.0, 49_900.0))
+    assert engine._pending_reversal_opens == {}
+    assert len(b.entry_calls) == n_entries + 1
+    assert b.entry_calls[-1].intent.qty == 5.0
+    active = engine.active_intents["S"]
+    assert isinstance(active, EntryIntent) and active.qty == 15.0
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 5.0, 49_890.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -5.0
+    assert len(b.entry_calls) == n_entries + 1
 
 
 def __test_external_flatten_is_detected_despite_an_armed_bracket__():
@@ -4740,154 +5127,110 @@ def __test_a_corrected_redelivery_discharges_the_dropped_slice__():
     assert pos.size == 1.0
 
 
-def __test_fills_during_a_parked_amend_reach_the_stashed_fold_guard__():
-    """An ambiguous entry->entry amend must not lose the fold ledger.
+def _arm_prior_run_surplus_close(engine, ctx, *, seq, expected_qty,
+                                 position_coid, target_exchange_id,
+                                 batch_outstanding_delta):
+    """Arm + persist one prior-run surplus-close marker, then dispatch it.
 
-    The guard is retired from the live ledger while the amend is
-    unresolved (a correction dispatched against the raw replacement's
-    legitimate exposure would be the wrong order), but the fills that
-    land meanwhile still have to be counted: a ``'rejected'`` resolution
-    proves the original folded order was live all along and re-arms the
-    guard.
+    Mirrors the arm ordering of the retired combined-dispatch correction:
+    marker first, durable ``flip_surplus_close_armed`` event second (when a
+    store ctx is present), corrective dispatch last — so every downstream
+    settle / replay / escalation contract sees exactly the state an older
+    build left behind.
     """
-    from pynecore.core.broker.sync_engine import _FlipFoldGuard
+    from pynecore.core.broker.sync_engine import _PendingFlipSurplusClose
 
-    b = MockBroker()
-    engine, _pos = _mk_engine(b)
-    guard = _FlipFoldGuard(
-        entry_intent_key='L',
-        entry_side='sell',
-        folded_qty=2.0,
-        consumed_qty=1.0,
-        consumed_entry_ids=frozenset({'Long'}),
+    close_intent = CloseIntent(
+        pine_id=f"__pyne_flip_surplus_close__{position_coid}__{seq}",
+        symbol=SYMBOL,
+        side='buy',
+        qty=expected_qty,
+        immediately=True,
+        synthetic_kind='defensive_close',
+        target_position_coid=position_coid,
+        target_exchange_id=target_exchange_id,
+        comment="flip-fold surplus close: prior-run correction",
     )
-    engine._modify_parked_fold_state['L'] = (None, guard)
-
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 50_000.0, pine_id='L', fill_id='folded-1'),
+    close_key = close_intent.intent_key
+    marker = _PendingFlipSurplusClose(
+        client_order_id=(
+            engine._build_envelope(close_intent).client_order_id('c')
+        ),
+        expected_qty=expected_qty,
+        close_side='buy',
+        position_coid=position_coid,
+        entry_intent_key="S",
+        pre_close_position_size=float(engine._position.size),
+        batch_outstanding_delta=batch_outstanding_delta,
+        pending_since=time.time(),
     )
-
-    assert guard.entry_filled_qty == 2.0, \
-        "fill during the parked amend was lost from the stashed ledger"
-    # No corrective order may be dispatched while the amend is unresolved.
-    assert not b.close_calls
-
-
-def __test_rejected_parked_amend_corrects_the_accumulated_overshoot__(tmp_path):
-    """The re-armed guard must still find a dispatch anchor.
-
-    A ``'rejected'`` resolution proves the original folded order was live
-    all along, so the overshoot booked while the amend was unresolved has
-    to be closed. The resolution branch tears the envelope down before
-    re-arming the guard — without capturing it first the correction finds
-    no dispatch anchor and only logs the divergence.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-    from pynecore.core.broker.run_identity import RunIdentity
-    from pynecore.core.broker.sync_engine import _FlipFoldGuard
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = store.open_run(
-            RunIdentity(
-                strategy_id="t025", symbol=SYMBOL, timeframe="60",
-                account_id="testbroker-demo", label=None,
-            ),
-            script_source="src",
-            script_path="t025.py",
+    engine._pending_flip_surplus_closes[close_key] = marker
+    if ctx is not None:
+        ctx.log_event(
+            kind='flip_surplus_close_armed',
+            intent_key=close_key,
+            client_order_id=position_coid,
+            payload=marker.to_payload(),
         )
-        b = MockBroker()
-        pos = BrokerPosition()
-        engine = OrderSyncEngine(
-            broker=b, position=pos,  # type: ignore[arg-type]
-            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
-        )
-        # Live entry dispatch — its envelope + mapping are the only
-        # anchor the corrective close can target.
-        pos.entry_orders["L"] = _entry_order("L", 2.0)
-        engine.sync(BAR_TS)
-        assert "L" in engine._envelopes
-        parked_coid = engine._envelopes["L"].client_order_id('e')
-
-        # A fold that over-opened by 1.0: the venue could only net 1.0 of
-        # the 2.0 folded quantity because the consumed position was closed
-        # externally, yet the folded entry filled in full.
-        guard = _FlipFoldGuard(
-            entry_intent_key='L',
-            entry_side='buy',
-            folded_qty=2.0,
-            consumed_qty=1.0,
-            consumed_entry_ids=frozenset({'Short'}),
-        )
-        guard.entry_filled_qty = 2.0
-        guard.external_closed_qty = 1.0
-        engine._modify_parked_fold_state['L'] = (None, guard)
-
-        ctx.record_park(
-            parked_coid, 'L', kind='modify',
-            order_ids=list(engine._order_mapping.get('L') or []),
-        )
-        ctx.record_resolution(parked_coid, 'rejected')
-        engine._consume_plugin_resolutions()
-
-        assert engine._flip_fold_guards.get('L') is guard, \
-            "the rejected amend did not re-arm the stashed fold guard"
-        assert b.close_calls, \
-            "the accumulated overshoot was not corrected — the dispatch " \
-            "anchor died with the envelope"
-        assert b.close_calls[-1].intent.qty == 1.0
-        assert guard.corrected_qty == 1.0
+    try:
+        engine._dispatch_new(close_intent)  # type: ignore[attr-defined]
+    except OrderDispositionUnknownError:
+        pass
+    return close_key, marker
 
 
 def _drive_fold_surplus_with_store(ctx, *, park_close: bool = False):
-    """Drive the racing-SL fold-surplus scenario on a store-backed engine.
+    """Arm a flip-fold surplus-close marker the way a PRIOR run did.
 
-    Long 1.0 with a native SL, stop-and-reverse fold to a 2.0 SELL, the SL
-    fills concurrently, the folded entry fills in full — the engine
-    dispatches the 1.0 surplus corrective close and arms its must-settle
-    marker. With ``park_close=True`` the corrective dispatch ends with an
+    New runs never arm these markers (the close-then-open reversal
+    protocol replaced the combined-size fold whose double-settle they
+    corrected), but the durable armed/progress/settle contract must keep
+    working for rows persisted by an older build. The driver reproduces
+    that state through the real machinery: a 2.0 short book holding a 1.0
+    surplus, the marker armed + persisted BEFORE the corrective dispatch,
+    and the corrective close fanned through the port onto the surplus
+    leg. With ``park_close=True`` the corrective dispatch ends with an
     unknown disposition instead (parked + persisted park row).
 
     Returns ``(broker, engine, close_key, marker)``.
     """
     b = MockBroker()
+    b.position_port = b
     pos = BrokerPosition()
     engine = OrderSyncEngine(
         broker=b, position=pos,  # type: ignore[arg-type]
         symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
     )
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    pos.entry_orders["S"] = _entry_order("S", -2.0)
     engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
     s_deal_id = engine.order_mapping["S"][0]
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    ))
-    if park_close:
-        async def _timeout_close(envelope):
-            b.close_calls.append(envelope)
-            raise OrderDispositionUnknownError(
-                "close link dropped",
-                client_order_id=envelope.client_order_id('c'),
-            )
-        b.execute_close = _timeout_close  # type: ignore[method-assign]
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
                     fill_id="s-1"))
-    assert len(engine._pending_flip_surplus_closes) == 1
-    close_key, marker = next(iter(engine._pending_flip_surplus_closes.items()))
+    assert pos.size == -2.0
+    b.raw_legs = [_pleg("8", "sell", 2.0, open_time=2.0)]
+
+    if park_close:
+        async def _timeout_close_leg(symbol, leg_id, volume, coid):
+            b.close_leg_calls.append((leg_id, volume))
+            raise OrderDispositionUnknownError(
+                "close link dropped", client_order_id=coid,
+            )
+        b.close_leg = _timeout_close_leg  # type: ignore[method-assign]
+    close_key, marker = _arm_prior_run_surplus_close(
+        engine, ctx, seq=1, expected_qty=1.0,
+        position_coid=engine._envelopes["S"].client_order_id('e'),
+        target_exchange_id=s_deal_id,
+        batch_outstanding_delta=1.0,
+    )
+    assert engine._pending_flip_surplus_closes == {close_key: marker}
     return b, engine, close_key, marker
 
 
 def _restarted_engine(ctx):
     """Fresh broker + engine on the same store ctx — a process restart."""
     b = MockBroker()
+    b.position_port = b
     pos = BrokerPosition()
     engine = OrderSyncEngine(
         broker=b, position=pos,  # type: ignore[arg-type]
@@ -4936,7 +5279,9 @@ def __test_parked_surplus_close_rejected_after_restart_still_halts__(tmp_path):
         assert replayed.client_order_id == marker.client_order_id
         assert replayed.expected_qty == marker.expected_qty
 
-        ctx.record_resolution(marker.client_order_id, 'rejected')
+        # The park row carries the fan CHILD's coid ({parent}:{leg_id}) —
+        # the one-way emulator parked the corrective's close leg.
+        ctx.record_resolution(f"{marker.client_order_id}:8", 'rejected')
         with pytest.raises(BrokerManualInterventionError):
             engine2._consume_plugin_resolutions()
 
@@ -4947,8 +5292,7 @@ def __test_restarted_surplus_close_settles_on_its_late_fill__(tmp_path):
 
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = _open_t025_run(store)
-        b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-        corrective = b1.close_calls[0].intent
+        _b1, _engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
 
         _b2, engine2, pos2 = _restarted_engine(ctx)
         pos2.size = -2.0
@@ -4957,12 +5301,8 @@ def __test_restarted_surplus_close_settles_on_its_late_fill__(tmp_path):
         engine2._replay_pending_flip_surplus_closes()
         assert close_key in engine2._pending_flip_surplus_closes
 
-        engine2._route_event(replace(  # type: ignore[attr-defined]
-            _fill_event('buy', 1.0, 48_995.0, pine_id="",
-                        leg=LegType.CLOSE, xchg_id="xchg-corr",
-                        fill_id="corr-1"),
-            pine_id=corrective.pine_id,
-        ))
+        engine2._route_event(  # type: ignore[attr-defined]
+            _fan_leg_fill(marker.client_order_id, 8, 1.0))
         assert engine2._pending_flip_surplus_closes == {}
         assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
 
@@ -4973,14 +5313,9 @@ def __test_surplus_close_settled_before_the_crash_is_not_rearmed__(tmp_path):
 
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = _open_t025_run(store)
-        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-        corrective = b1.close_calls[0].intent
-        engine1._route_event(replace(  # type: ignore[attr-defined]
-            _fill_event('buy', 1.0, 48_995.0, pine_id="",
-                        leg=LegType.CLOSE, xchg_id="xchg-corr",
-                        fill_id="corr-1"),
-            pine_id=corrective.pine_id,
-        ))
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        engine1._route_event(  # type: ignore[attr-defined]
+            _fan_leg_fill(marker.client_order_id, 8, 1.0))
         assert engine1._pending_flip_surplus_closes == {}
         assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
 
@@ -5069,14 +5404,8 @@ def __test_settled_surplus_close_fill_replayed_after_restart_is_dropped__(tmp_pa
 
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = _open_t025_run(store)
-        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-        corrective = b1.close_calls[0].intent
-        corrective_fill = replace(
-            _fill_event('buy', 1.0, 48_995.0, pine_id="",
-                        leg=LegType.CLOSE, xchg_id="xchg-corr",
-                        fill_id="corr-1"),
-            pine_id=corrective.pine_id,
-        )
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        corrective_fill = _fan_leg_fill(marker.client_order_id, 8, 1.0)
         engine1._route_event(corrective_fill)  # type: ignore[attr-defined]
         assert engine1._pending_flip_surplus_closes == {}
         assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
@@ -5239,14 +5568,8 @@ def __test_midfan_restart_still_accepts_a_fresh_partial_of_the_same_order__(tmp_
 
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = _open_t025_run(store)
-        b1, engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-        corrective = b1.close_calls[0].intent
-        first = replace(
-            _fill_event('buy', 0.5, 48_995.0, pine_id="",
-                        leg=LegType.CLOSE, xchg_id="xchg-corr",
-                        fill_id="corr-1"),
-            pine_id=corrective.pine_id,
-        )
+        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
+        first = _fan_leg_fill(marker.client_order_id, 8, 0.5)
         second = replace(first, fill_id="corr-2")
         engine1._route_event(first)  # type: ignore[attr-defined]
         assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
@@ -5322,27 +5645,8 @@ def __test_snapshot_settled_surplus_close_ignores_its_late_fill__():
     )
     import time as _time
 
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
-    s_deal_id = engine.order_mapping["S"][0]
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    ))
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-1"))
-    corrective = b.close_calls[0].intent
-    (_close_key, marker), = engine._pending_flip_surplus_closes.items()
+    b, engine, _close_key, marker = _drive_fold_surplus_with_store(None)
+    pos = engine._position
     marker.pending_since = (
         _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
     )
@@ -5355,10 +5659,8 @@ def __test_snapshot_settled_surplus_close_ignores_its_late_fill__():
     assert pos.size == -1.0
 
     engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 48_995.0, pine_id="",
-                    leg=LegType.CLOSE, xchg_id="xchg-corr",
-                    fill_id="corr-late"),
-        pine_id=corrective.pine_id,
+        _fan_leg_fill(marker.client_order_id, 8, 1.0),
+        fill_id="corr-late",
     ))
     assert pos.size == -1.0, \
         "the late corrective fill re-applied a correction the snapshot settled"
@@ -5383,54 +5685,60 @@ def __test_replayed_surplus_batch_settles_across_incrementally_armed_markers__(t
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = _open_t025_run(store)
         b = MockBroker()
+        b.position_port = b
+
+        # The fractional (0.2 / 0.5) corrective slices must survive the
+        # port's volume grid — the default int() quantizer would floor
+        # them to zero and skip the correction.
+        async def _fine_quantizer(_symbol):
+            return lambda u: round(u, 2)
+
+        b.get_volume_quantizer = _fine_quantizer  # type: ignore[method-assign]
         pos = BrokerPosition()
         engine = OrderSyncEngine(
             broker=b, position=pos,  # type: ignore[arg-type]
             symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
         )
-        pos.entry_orders["L"] = _entry_order("L", 1.0)
-        pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+        pos.entry_orders["S"] = _entry_order("S", -2.0)
         engine.sync(BAR_TS)
-        engine._route_event(  # type: ignore[attr-defined]
-            _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-        pos.entry_orders["S"] = _entry_order("S", -1.0)
-        engine.sync(BAR_TS + 60_000)
         s_deal_id = engine.order_mapping["S"][0]
-        engine._route_event(replace(  # type: ignore[attr-defined]
-            _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                        leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                        fill_id="sl-1"),
-            from_entry="L",
-        ))
-        # Folded 2.0 SELL fills in two slices; the SL already consumed the
-        # 1.0 the venue could net, so each slice past 1.0 is surplus.
+        position_coid = engine._envelopes["S"].client_order_id('e')
         engine._route_event(  # type: ignore[attr-defined]
             _fill_event('sell', 1.5, 48_990.0, pine_id="S", xchg_id=s_deal_id,
                         fill_id="s-1", event_type='partial',
                         filled_qty=1.5, remaining_qty=0.5))
         assert pos.size == -1.5
-        (key1, marker1), = engine._pending_flip_surplus_closes.items()
-        assert marker1.expected_qty == 0.5
-        corrective1 = b.close_calls[0].intent
+        # A prior-run correction for the first 0.5 surplus slice.
+        b.raw_legs = [_pleg("8", "sell", 1.5, open_time=2.0)]
+        key1, marker1 = _arm_prior_run_surplus_close(
+            engine, ctx, seq=1, expected_qty=0.5,
+            position_coid=position_coid, target_exchange_id=s_deal_id,
+            batch_outstanding_delta=0.5,
+        )
 
         # First correction partially fills BEFORE the second is armed —
         # this slice lands inside the second marker's anchor.
         engine._route_event(replace(  # type: ignore[attr-defined]
-            _fill_event('buy', 0.2, 48_995.0, pine_id="",
-                        leg=LegType.CLOSE, xchg_id="xchg-corr-1",
-                        fill_id="corr-1a", event_type='partial',
-                        filled_qty=0.2, remaining_qty=0.3),
-            pine_id=corrective1.pine_id,
+            _fan_leg_fill(marker1.client_order_id, 8, 0.2),
+            fill_id="corr-1a", event_type='partial',
         ))
         assert round(pos.size, 12) == -1.3
         assert engine._pending_flip_surplus_closes[key1].filled_qty == 0.2
 
+        b.raw_legs = [_pleg("9", "sell", 1.8, open_time=3.0)]
         engine._route_event(  # type: ignore[attr-defined]
             _fill_event('sell', 0.5, 48_985.0, pine_id="S", xchg_id=s_deal_id,
                         fill_id="s-2"))
         assert round(pos.size, 12) == -1.8
+        # The second prior-run correction: its anchor already contains the
+        # 0.2 slice above, and its batch delta carries its own 0.5 plus the
+        # 0.3 still outstanding on the first.
+        key2, _marker2 = _arm_prior_run_surplus_close(
+            engine, ctx, seq=2, expected_qty=0.5,
+            position_coid=position_coid, target_exchange_id=s_deal_id,
+            batch_outstanding_delta=0.8,
+        )
         assert len(engine._pending_flip_surplus_closes) == 2
-        key2 = [k for k in engine._pending_flip_surplus_closes if k != key1][0]
 
         _b2, engine2, _pos2 = _restarted_engine(ctx)
         engine2._replay_pending_flip_surplus_closes()
@@ -5462,7 +5770,7 @@ def __test_stale_in_process_surplus_close_settles_and_books_the_outstanding__():
 
     Same-process fill loss (WS gap on a polled broker): the reconcile
     grace probe proves the correction landed and must book the missing
-    slice exactly as the lost FILL would have — shrinking the folded
+    slice exactly as the lost FILL would have — shrinking the surplus
     trade and adopting the broker size — or the engine view keeps the
     surplus indefinitely (the periodic reconcile only acts on
     shrink-to-zero transitions).
@@ -5472,28 +5780,10 @@ def __test_stale_in_process_surplus_close_settles_and_books_the_outstanding__():
     )
     import time as _time
 
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    pos.entry_orders["L"] = _entry_order("L", 1.0)
-    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
-    engine.sync(BAR_TS)
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-    pos.entry_orders["S"] = _entry_order("S", -1.0)
-    engine.sync(BAR_TS + 60_000)
-    s_deal_id = engine.order_mapping["S"][0]
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fill_event('sell', 1.0, 49_000.0, pine_id="L",
-                    leg=LegType.STOP_LOSS, xchg_id="xchg-sl",
-                    fill_id="sl-1"),
-        from_entry="L",
-    ))
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-1"))
-    assert len(b.close_calls) == 1
-    assert pos.size == -2.0
-    (close_key, marker), = engine._pending_flip_surplus_closes.items()
+    b, engine, _close_key, marker = _drive_fold_surplus_with_store(None)
+    pos = engine._position
+    assert b.close_leg_calls == [("8", 1)]
+    n_close_legs = len(b.close_leg_calls)
     marker.pending_since = (
         _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
     )
@@ -5507,7 +5797,7 @@ def __test_stale_in_process_surplus_close_settles_and_books_the_outstanding__():
     assert engine._pending_flip_surplus_closes == {}
     assert pos.size == -1.0
     assert round(sum(t.size for t in pos.open_trades), 12) == -1.0
-    assert len(b.close_calls) == 1  # no re-dispatch of the correction
+    assert len(b.close_leg_calls) == n_close_legs  # no re-dispatch
 
 
 def __test_restart_between_fan_legs_keeps_the_defensive_close_armed__(tmp_path):
@@ -9192,13 +9482,23 @@ def __test_emulated_filled_entry_side_flip_dispatches_reversal_not_modify__():
     engine.sync(BAR_TS + 60_000)
 
     assert b.modify_entry_calls == []  # a filled market order is not amendable
-    assert b.close_leg_calls == [("7", 1000)]  # long leg FIFO-closed
-    # Stop-and-reverse fold: 1000 raw + 1000 long = 2000 combined; the
-    # reversal closes 1000 and opens the residual 1000 short.
+    assert b.close_leg_calls == [("7", 1000)]  # long leg closed, targeted
+    # Close-then-open: the raw entry is parked until the book settles flat
+    # — no combined-size dispatch, nothing opened yet.
+    assert b.place_leg_calls == [1000.0]
+    marker = engine._pending_reversal_opens["pos"]
+    b.raw_legs = []
+    engine._route_event(  # type: ignore[attr-defined]
+        _hedge_close_fill(marker, 1000.0, 1.0))
+    assert pos.size == 0.0
     assert b.place_leg_calls == [1000.0, 1000.0]
     active = engine.active_intents["pos"]
     assert isinstance(active, EntryIntent)
     assert active.side == 'sell'
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1000.0, 1.0, pine_id="pos", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1000.0
 
 
 def __test_emulated_same_bar_filled_entry_reversal_bumps_retry_sequence__():
@@ -9216,6 +9516,10 @@ def __test_emulated_same_bar_filled_entry_reversal_bumps_retry_sequence__():
     engine.sync(BAR_TS)
 
     assert b.close_leg_calls == [("7", 1000)]
+    marker = engine._pending_reversal_opens["pos"]
+    b.raw_legs = []
+    engine._route_event(  # type: ignore[attr-defined]
+        _hedge_close_fill(marker, 1000.0, 1.0))
     assert b.place_leg_calls == [1000.0, 1000.0]
     assert engine._envelopes["pos"].retry_seq == 1
 
@@ -10228,11 +10532,12 @@ def __test_partially_filled_inflight_close_reserves_only_working_qty_for_close_a
 
 # === MARKET stop-and-reverse fold at dispatch ===
 
-def __test_market_reversal_dispatch_folds_opposite_position__():
+def __test_market_reversal_dispatch_runs_close_then_open__():
     """A fresh MARKET entry against an opposite net position dispatches the
-    combined stop-and-reverse quantity (TV parity), while the active-intent
-    slot keeps the RAW qty so the next bar's re-emitted Pine order still
-    matches and never re-triggers the diff."""
+    full-position ``reversal_close`` and parks the RAW entry; once the book
+    settles flat the raw entry opens, and its active-intent slot keeps the
+    RAW qty so the next bar's re-emitted Pine order still matches and never
+    re-triggers the diff."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.size = 0.0004
@@ -10241,16 +10546,23 @@ def __test_market_reversal_dispatch_folds_opposite_position__():
 
     engine.sync(BAR_TS)
 
+    assert b.entry_calls == []
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.synthetic_kind == 'reversal_close'
+    assert close.side == 'sell'
+    assert close.qty == 0.0004  # the FULL position, artifact-free
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 0.0004, 50_000.0))
     assert len(b.entry_calls) == 1
     dispatched = b.entry_calls[0].intent
     assert dispatched.side == 'sell'
-    assert dispatched.qty == 0.0006  # 0.0002 + |0.0004|, artifact-free
-    # The registered active intent stays RAW — a re-emission of the same
-    # pending order next bar must diff as unchanged.
+    assert dispatched.qty == 0.0002  # RAW — never the folded combination
     assert engine.active_intents["S"].qty == 0.0002
     # Second sync with the same pending order: no new dispatch.
     engine.sync(BAR_TS + 60_000)
     assert len(b.entry_calls) == 1
+    assert len(b.close_calls) == 1
 
 
 def __test_market_add_dispatch_keeps_raw_qty__():
@@ -10285,105 +10597,11 @@ def __test_same_bar_replaced_market_entry_is_not_folded__():
     assert b.entry_calls[0].intent.qty == 4.0
 
 
-def __test_same_bar_replacement_unwinds_an_already_dispatched_fold__():
-    """``calc_on_every_tick``: the first sync of the bar dispatches the folded
-    reversal, a later sync of the SAME bar sees the order re-placed with the raw
-    quantity (``skip_flip``). ``skip_flip`` is excluded from intent equality, so
-    the diff would call it unchanged — the engine must still resize the working
-    order down to the raw quantity, or the live account reverses where TV and the
-    simulator merely reduce."""
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.entry_orders["S"] = _entry_order("S", -4.0)
-
-    engine.sync(BAR_TS)
-
-    assert len(b.entry_calls) == 1
-    assert b.entry_calls[0].intent.qty == 14.0  # 4 + |10|, the reversal fold
-
-    # Same bar, next tick: the script re-places the same entry. Nothing filled
-    # yet, so the position the fold was computed against is unchanged.
-    replaced = _entry_order("S", -4.0)
-    replaced.skip_flip = True
-    pos.entry_orders["S"] = replaced
-
-    engine.sync(BAR_TS)
-
-    assert len(b.entry_calls) == 1  # no second entry dispatch
-    assert len(b.modify_entry_calls) == 1
-    old_env, new_env = b.modify_entry_calls[0]
-    assert old_env.intent.qty == 14.0
-    assert new_env.intent.qty == 4.0
-    # A further tick with the same re-placed order is a genuine no-op.
-    engine.sync(BAR_TS)
-    assert len(b.modify_entry_calls) == 1
-
-
-def __test_partially_filled_fold_is_resized_to_the_remaining_raw_qty__():
-    """A slice of the fold already filled: the done part cannot be taken back,
-    but the working remainder must be cut to what the raw replacement still has
-    left to fill (raw - filled), never left at the reversal size."""
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.entry_orders["S"] = _entry_order("S", -4.0)
-
-    engine.sync(BAR_TS)
-    assert b.entry_calls[0].intent.qty == 14.0
-
-    engine._active_entry_filled_qty["S"] = 1.5  # noqa - partial fill landed
-
-    replaced = _entry_order("S", -4.0)
-    replaced.skip_flip = True
-    pos.entry_orders["S"] = replaced
-
-    engine.sync(BAR_TS)
-
-    assert len(b.entry_calls) == 1
-    assert len(b.modify_entry_calls) == 1
-    old_env, new_env = b.modify_entry_calls[0]
-    assert old_env.intent.qty == 14.0
-    assert new_env.intent.qty == 2.5  # raw 4 - filled 1.5
-    assert b.cancel_calls == []
-
-
-def __test_fold_filled_past_the_raw_qty_cancels_the_remainder__():
-    """The fold already filled more than the whole raw replacement, so nothing
-    is left for it to work: the remainder is cancelled outright instead of being
-    allowed to carry the account into the reversal."""
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.entry_orders["S"] = _entry_order("S", -4.0)
-
-    engine.sync(BAR_TS)
-    assert b.entry_calls[0].intent.qty == 14.0
-
-    engine._active_entry_filled_qty["S"] = 6.0  # noqa - partial fill landed
-
-    replaced = _entry_order("S", -4.0)
-    replaced.skip_flip = True
-    pos.entry_orders["S"] = replaced
-
-    engine.sync(BAR_TS)
-
-    assert b.modify_entry_calls == []
-    assert len(b.cancel_calls) == 1
-    assert b.cancel_calls[0].intent.pine_id == "S"
-    # The slot stays occupied: a further tick must not re-dispatch the very
-    # exposure that was just cancelled.
-    engine.sync(BAR_TS)
-    assert len(b.entry_calls) == 1
-    assert len(b.cancel_calls) == 1
-
-
 def __test_limit_reversal_dispatch_is_not_folded_again__():
-    """LIMIT/STOP entries fold at creation (``strategy.entry`` subtracts the
-    position size) — the dispatch fold must not double-count them."""
+    """LIMIT/STOP entries combine at creation (``strategy.entry`` subtracts
+    the position size) — the dispatch must send that Pine-visible quantity
+    as-is, and the close-then-open protocol (MARKET-only) must not touch
+    a resting reversal."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.size = 2.0

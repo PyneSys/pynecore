@@ -110,6 +110,8 @@ from pynecore.core.broker.models import (
     format_intent_key,
 )
 from pynecore.core.broker.native_failsafe_manager import (
+    FailsafeHealth,
+    FailsafeOwner,
     NativeBracketSnapshot,
     NativeFailsafeManager,
 )
@@ -512,57 +514,73 @@ def _str_tuple_from_payload(data: dict, field: str) -> tuple[str, ...]:
 
 
 @dataclasses.dataclass(slots=True)
-class _FlipFoldGuard:
-    """Fill ledger for one MARKET stop-and-reverse fold dispatch.
+class _PendingReversalOpen:
+    """One in-flight close-then-open reversal.
 
-    The fold sizes the reversing entry as ``qty + |opposite position|`` at
-    dispatch time, assuming the whole opposite exposure is still there for
-    the venue to net against. That assumption can break in flight: the
-    opposite position's own protective legs (native SL/TP/trailing) stay
-    armed at the venue until the flip settles, and one of them can fill
-    concurrently with the folded entry. Both executions then land — the
-    bracket closes the old position AND the folded quantity opens in full —
-    leaving the book over-exposed on the new side by exactly the amount the
-    bracket closed (measured on the Capital.com demo lane, 2026-08-15: SL
-    fill + folded SELL on the same bar → venue −0.02 where Pine holds
-    −0.01, and the next whole-row exit crashed the run).
+    A MARKET stop-and-reverse never dispatches the TV-style combined
+    ``qty + |position|`` entry: a venue-side protective leg filling while
+    such a combined order was in flight double-closed the consumed
+    exposure, and the defensive surplus correction paid spread + fees twice
+    (Capital.com demo lane, 2026-08-18). Instead the engine closes the
+    whole position with a ``synthetic_kind='reversal_close'``
+    :class:`CloseIntent` — a form that CANNOT open opposite exposure (on a
+    netting venue a targeted position close / exchange reduce-only order;
+    on a hedging venue (``position_port``) a fan of targeted per-leg
+    ``close_leg`` calls), so a racing SL fill merely turns the close into
+    a no-op — parks the RAW entry here, and dispatches it the moment the
+    book settles flat
+    (:meth:`OrderSyncEngine._maybe_open_after_reversal_close`).
 
-    The guard records what the fold consumed (``consumed_qty`` /
-    ``consumed_entry_ids`` — the open trades snapshot at dispatch) and
-    accumulates two independent fill streams: the folded entry's own fills
-    and any OTHER order's fills that close the consumed trades. Whenever
-    both streams together exceed what the venue could net, the engine
-    dispatches a targeted partial defensive close for the overshoot (see
-    :meth:`OrderSyncEngine._maybe_correct_flip_fold_surplus`).
-
-    In-memory only: a restart between the fold dispatch and its fills loses
-    the guard, in which case the startup adoption clamp and the cycle-end
-    reconciliation surface the residual divergence instead of this
-    corrective path. A correction that was already DISPATCHED is different:
-    its :class:`_PendingFlipSurplusClose` marker is durable (armed / progress
-    / settled audit events) and survives restart — see
-    :meth:`OrderSyncEngine._replay_pending_flip_surplus_closes`.
+    In-memory only: a crash between the two legs is self-healing because
+    Pine re-emits the entry every sync and a flat book dispatches it as a
+    plain raw entry. ``blocked_syncs`` bounds a stuck close — once the
+    marker has deferred more than :data:`_REVERSAL_CLOSE_STALE_SYNCS`
+    re-emissions with the position still open, the protocol re-runs with a
+    fresh close dispatch (the close is reduce-only, so a surviving
+    duplicate at worst no-ops).
     """
 
-    entry_intent_key: str
-    entry_side: str
-    folded_qty: float
-    consumed_qty: float
+    entry_intent: EntryIntent
+    close_pine_id: str
+    close_qty: float
     consumed_entry_ids: frozenset[str]
-    entry_filled_qty: float = 0.0
-    external_closed_qty: float = 0.0
-    corrected_qty: float = 0.0
-    correction_seq: int = 0
+    armed_bar_ts_ms: int
+    blocked_syncs: int = 0
+    #: Set when a same-bar ``skip_flip`` re-placement supersedes the parked
+    #: open: TV modifies the standing order with the raw quantity and does
+    #: NOT recompute the flip, so the position must only be REDUCED — the
+    #: parked entry must never open the opposite side. The marker stays
+    #: armed (its exit suppression and flat-settle cleanup still apply) but
+    #: the flat book pops it without dispatching. When the re-placed raw
+    #: quantity exceeds the dispatched close, the flag stays ``False`` and
+    #: ``open_qty`` carries the remainder instead — it opens on the flat
+    #: book like the primary path.
+    superseded: bool = False
+    #: Quantity the flat-settle dispatch opens when it differs from
+    #: ``entry_intent.qty``: a same-bar re-placement larger than the
+    #: dispatched close works only the remainder past the close, while
+    #: ``entry_intent`` keeps the RAW re-placed intent for the sticky
+    #: active-intent slot (the re-emitted Pine order must diff as
+    #: unchanged). ``None`` = open the full raw quantity.
+    open_qty: float | None = None
+
+
+#: Re-emission syncs a pending reversal close may stay unsettled before the
+#: protocol re-runs with a fresh close dispatch (see
+#: :class:`_PendingReversalOpen`).
+_REVERSAL_CLOSE_STALE_SYNCS = 3
 
 
 @dataclasses.dataclass(slots=True)
 class _PendingFlipSurplusClose:
     """Must-settle record of one in-flight flip-fold surplus correction.
 
-    The correction's overshoot is booked into
-    :attr:`_FlipFoldGuard.corrected_qty` at dispatch time, so nothing
-    re-dispatches it: the close MUST be proven settled or the run halts
-    for manual intervention.
+    Only ever populated by startup replay of a marker persisted by a PRIOR
+    process run: the close-then-open reversal protocol replaced the
+    combined-size fold dispatch whose double-settle these corrections
+    closed, so the current code never arms a new one. The overshoot was
+    booked as corrected at dispatch time, so nothing re-dispatches it: the
+    close MUST be proven settled or the run halts for manual intervention.
 
     ``expected_qty`` is the quantity the correction was dispatched for and
     ``filled_qty`` accumulates every usable fill slice matched to it. The
@@ -582,8 +600,7 @@ class _PendingFlipSurplusClose:
     ``rejected`` plugin resolution still escalates and the stale-grace
     reconcile (:meth:`OrderSyncEngine._raise_if_stale_pending_flip_surplus_close`)
     can prove the correction settled — or halt — against a broker
-    snapshot. The parent :class:`_FlipFoldGuard` stays process-local by
-    design; the marker carries everything its own settle proof needs.
+    snapshot. The marker carries everything its own settle proof needs.
 
     ``pre_close_position_size`` is the engine's signed
     :attr:`BrokerPosition.size` captured at arm time (the book still
@@ -1095,47 +1112,28 @@ class OrderSyncEngine:
         # conservatively reserves the full quantity — the safe direction on a
         # short-incapable venue.
         self._active_entry_filled_qty: dict[str, float] = {}
-        # Live MARKET entry dispatches that carry the stop-and-reverse fold
-        # (:meth:`_dispatch_new` sizes them as ``raw qty + |opposite
-        # position|``), keyed by ``intent_key``; the value is the FOLDED intent
-        # actually sent to the broker. ``_active_intents`` deliberately keeps
-        # the RAW intent, and ``EntryIntent.skip_flip`` is ``compare=False``, so
-        # a same-bar re-placement of that very order (TradingView amends the
-        # standing order with the raw quantity and does NOT recompute the flip)
-        # is invisible to the equality diff. This map is what lets
-        # :meth:`_diff_and_dispatch` still notice it and resize the working
-        # order back down to the raw quantity. Written on a fresh dispatch,
-        # retired when the order is amended (:meth:`_dispatch_modify`) or when
-        # its envelope dies (:meth:`_drop_envelope`).
-        self._flip_folded_entry_dispatches: dict[str, EntryIntent] = {}
-        # Per-fold fill ledgers guarding the netting fold's "the opposite
-        # position is still there to net against" assumption. Armed at the
-        # fold dispatch, consumed by :meth:`_track_flip_fold_fill`; the
-        # entry for a key is replaced when a fresh fold cycle dispatches
-        # under the same key. See :class:`_FlipFoldGuard`.
-        self._flip_fold_guards: dict[str, _FlipFoldGuard] = {}
-        # Fold state of a superseded dispatch whose amend parked with an
-        # unknown disposition: ``intent_key`` -> (folded dispatch, guard).
-        # The park retires the fold state eagerly (an applied amend carries
-        # the RAW quantity, so a folded-size guard could only mis-attribute
-        # the replacement's fills), but a ``'rejected'`` resolution proves
-        # the amend never landed and the ORIGINAL folded order is still
-        # live — :meth:`_process_plugin_resolutions` re-arms the stashed
-        # state there. Dropped on an ``'attached'`` resolution and with the
-        # envelope (:meth:`_drop_envelope`).
-        self._modify_parked_fold_state: \
-            dict[str, tuple[EntryIntent | None, _FlipFoldGuard | None]] = {}
-        # In-flight flip-fold surplus corrections: close ``intent_key`` ->
-        # :class:`_PendingFlipSurplusClose`. Armed right before the
-        # corrective close is dispatched
-        # (:meth:`_maybe_correct_flip_fold_surplus`), fed by
-        # :meth:`_track_flip_surplus_close_fill` and read by
+        # In-flight flip-fold surplus corrections replayed from a PRIOR
+        # process run: close ``intent_key`` ->
+        # :class:`_PendingFlipSurplusClose`. Runs on the current code never
+        # arm new markers (the close-then-open reversal protocol replaced
+        # the combined-size fold whose double-settle these corrected), but
+        # a restart may adopt an armed-without-settle record persisted by
+        # an older run (:meth:`_replay_pending_flip_surplus_closes`). Fed
+        # by :meth:`_track_flip_surplus_close_fill` and read by
         # :meth:`_halt_if_flip_surplus_close_terminal` /
         # :meth:`_escalate_rejected_flip_surplus_close` so a cancelled,
         # rejected or provably-absent correction halts instead of silently
-        # leaving the surplus exposure open (the guard's ``corrected_qty``
-        # already booked it, so nothing would retry).
+        # leaving the surplus exposure open.
         self._pending_flip_surplus_closes: dict[str, _PendingFlipSurplusClose] = {}
+        # In-flight close-then-open reversals: entry
+        # ``intent_key`` -> the parked raw entry and the close leg's
+        # identity. Armed by :meth:`_begin_close_then_open_reversal`,
+        # consumed by :meth:`_maybe_open_after_reversal_close` the moment
+        # the book settles flat. In-memory only ON PURPOSE: a crash between
+        # the close and the open is self-healing — Pine re-emits the entry
+        # every sync, and against the now-flat book it dispatches as a
+        # plain raw entry with no fold and no close leg.
+        self._pending_reversal_opens: dict[str, _PendingReversalOpen] = {}
         # Intents the engine decided to cancel but whose cancel did NOT
         # provably complete. Two feeders: the fill-time short-gate reconcile
         # (:meth:`_reconcile_short_gate_after_fill`) parks on a dropped link
@@ -1356,7 +1354,7 @@ class OrderSyncEngine:
         # unconditionally on any active intent left external-flatten
         # detection permanently dead for every protected bot (measured on
         # the Bybit lane: a venue-closed position kept a stale book for 47
-        # minutes and mis-sized the next folded reversal).
+        # minutes and mis-sized the next reversal).
         self._flat_observed_with_intents_since = 0.0
 
         # ``monotonic()`` moment the last fill was booked into the position
@@ -3067,10 +3065,10 @@ class OrderSyncEngine:
     ) -> bool:
         """Halt when a flip-fold surplus correction ends without filling.
 
-        Mirrors :meth:`_halt_if_defensive_close_terminal` for the
-        stop-and-reverse surplus close dispatched by
-        :meth:`_maybe_correct_flip_fold_surplus`. The overshoot is booked
-        into the guard's ``corrected_qty`` at dispatch time, so a
+        Mirrors :meth:`_halt_if_defensive_close_terminal` for a
+        stop-and-reverse surplus close replayed from a prior run's
+        persisted marker. The overshoot was booked as corrected at
+        dispatch time, so a
         cancelled / rejected correction is terminal for the automated
         path: the book keeps surplus exposure Pine does not know about
         and nothing would re-dispatch. Returns ``False`` (and lets the
@@ -3898,39 +3896,7 @@ class OrderSyncEngine:
                 # that turns a proven-missing correction into a halt, and it
                 # must not lose that evidence to envelope teardown.
                 surplus_close_was_armed = key in self._pending_flip_surplus_closes
-                # Same capture-before-teardown for the fold state stashed by
-                # an ambiguous entry->entry amend: ``_drop_envelope`` pops
-                # the stash, and a modify-rejected resolution is exactly the
-                # case where the original folded order survived the failed
-                # amend and its guard must come back.
-                parked_fold_state = self._modify_parked_fold_state.get(key)
-                # ``_maybe_correct_flip_fold_surplus`` resolves its
-                # corrective close against ``_envelopes[key]``, which
-                # ``_drop_envelope`` is about to pop — without the capture
-                # the re-armed guard below would find no dispatch anchor
-                # and log the overshoot instead of closing it.
-                parked_fold_anchor = self._envelopes.get(key)
                 self._drop_envelope(key)
-                if kind_is_modify and parked_fold_state is not None:
-                    # The amend never applied: the pre-amend folded order is
-                    # still live at the venue, so re-arm the guard that was
-                    # retired when the modify parked. ``_order_mapping[key]``
-                    # is deliberately kept above for the very same reason.
-                    parked_folded, parked_guard = parked_fold_state
-                    if parked_folded is not None:
-                        self._flip_folded_entry_dispatches[key] = parked_folded
-                    if parked_guard is not None:
-                        self._flip_fold_guards[key] = parked_guard
-                        # Fills that landed while the amend was unresolved
-                        # were booked onto the stashed ledger but could not
-                        # dispatch a correction (:meth:`_track_flip_fold_fill`).
-                        # Now that the original folded order is proven to
-                        # have been the live one all along, evaluate the
-                        # accumulated overshoot once: if no further fill
-                        # ever arrives for this key nothing else would.
-                        self._maybe_correct_flip_fold_surplus(
-                            parked_guard, anchor=parked_fold_anchor,
-                        )
                 # Drop any in-flight attached-adoption marker placed by
                 # an earlier sync (or this loop iteration before the
                 # grouping rewrite). Without this the next call to
@@ -3973,10 +3939,6 @@ class OrderSyncEngine:
             # rejected.
             if any(r.dispatch_kind == 'modify' for r in records):
                 self._modify_old_intents.pop(key, None)
-                # The amend DID land: the replacement carries the raw
-                # quantity, so the stashed fold state of the superseded
-                # dispatch is terminally dead — never re-arm it.
-                self._modify_parked_fold_state.pop(key, None)
             newly_consumed_any = False
             for record in records:
                 coid = record.coid
@@ -4537,7 +4499,7 @@ class OrderSyncEngine:
             # detection for every protected bot — a venue-closed position
             # whose fill the plugin failed to attribute then keeps a stale
             # book for the rest of the cycle and mis-sizes every later
-            # folded reversal. An in-flight fill of our own arrives within
+            # reversal close. An in-flight fill of our own arrives within
             # seconds; a venue still flat after the grace with the book
             # unmoved is an external flatten.
             #
@@ -5681,13 +5643,6 @@ class OrderSyncEngine:
                         if total > active_entry.qty:
                             total = active_entry.qty
                         self._active_entry_filled_qty[event.pine_id] = total
-            # Feed the stop-and-reverse fold guards: both the folded
-            # entry's own fills and any external close of the trades the
-            # fold consumed (a still-armed venue-native SL/TP/trailing leg
-            # filling in flight). Runs after the ``_seen_fill_ids`` dedup
-            # gate and after ``record_fill``, so a detected overshoot can
-            # be corrected against the already-updated book.
-            self._track_flip_fold_fill(event)
             # Feed the must-settle marker of a flip-fold surplus correction
             # with this slice. Every partial counts towards the dispatched
             # quantity and the marker is retired only when they add up (see
@@ -5803,10 +5758,10 @@ class OrderSyncEngine:
             # FIFO walk produced nothing (an adopted position with no
             # reconstructable parent, or a plugin event ``record_fill``
             # skipped). It must not run alongside the FIFO evidence: a
-            # netting fold's closing leg is labelled with the REVERSING
+            # reversal's closing leg is labelled with the REVERSING
             # intent's ``from_entry`` — the id that is about to open — so
             # trusting the label there tears down the live new entry's
-            # tracking (measured on the cTrader lane: the folded close fill
+            # tracking (measured on the cTrader lane: the reversal close fill
             # arrived as ``from_entry='S'`` while ``S`` was opening, wiping
             # ``S``'s intent and bracket and later swallowing four re-entry
             # signals as "unchanged").
@@ -5852,6 +5807,15 @@ class OrderSyncEngine:
                     )
                 else:
                     self._route_defensive_close_fill(event)
+            # A parked close-then-open reversal opens the moment the book
+            # settles flat — regardless of WHICH fill flattened it (the
+            # reversal close, a racing protective leg, an external close).
+            # Runs LAST in the fill branch, after the consumed entries'
+            # FIFO/label cleanup: a same-Pine-ID reversal re-registers the
+            # id this fill just consumed, and dispatching before the
+            # cleanup would let it wipe the fresh registration (engine
+            # loses the live venue order it just opened).
+            self._maybe_open_after_reversal_close()
         elif t == 'cancelled':
             # Terminal failure for an in-flight defensive close: the
             # synthetic flatten was cancelled by the broker (or an
@@ -6561,21 +6525,6 @@ class OrderSyncEngine:
         # reservation): seeded in :meth:`_dispatch_new`, read by
         # :meth:`_enforce_short_gate`, retired here with the envelope.
         self._active_entry_filled_qty.pop(key, None)
-        # Same lifecycle for the stop-and-reverse fold record: written in
-        # :meth:`_dispatch_new` when the folded MARKET entry goes live, read by
-        # :meth:`_diff_and_dispatch` to unwind a same-bar re-placement, retired
-        # here with the envelope.
-        self._flip_folded_entry_dispatches.pop(key, None)
-        # Same lifecycle for the fold's fill ledger: armed in
-        # :meth:`_dispatch_new` next to the fold record, fed by
-        # :meth:`_track_flip_fold_fill`. A guard outliving its entry
-        # envelope could only mis-attribute a later generation's fills (and
-        # its correction path has no dispatch anchor left anyway).
-        self._flip_fold_guards.pop(key, None)
-        # The ambiguous-amend fold stash dies with the envelope too: once the
-        # key is retired no ``'rejected'`` resolution can arrive for it, and a
-        # stale stash could only re-arm a dead fold onto a later generation.
-        self._modify_parked_fold_state.pop(key, None)
         # A surplus correction dispatched under this key is retired with it:
         # the terminal-halt lookups key off the close intent, and the close
         # envelope dying means the correction is no longer in flight.
@@ -7218,252 +7167,6 @@ class OrderSyncEngine:
                             or _is_composed_leg_coid(event_coid, marker_coid)):
                         return entry_id
         return None
-
-    def _track_flip_fold_fill(self, event: OrderEvent) -> None:
-        """Feed armed stop-and-reverse fold guards from a fill event.
-
-        Two independent streams per guard (see :class:`_FlipFoldGuard`):
-
-        * the folded entry's OWN fills (ENTRY leg under the fold's
-          ``intent_key``) — how much of the folded quantity actually
-          executed;
-        * EXTERNAL closes of the trades the fold consumed — a non-entry
-          leg (SL/TP/trailing/close) whose Pine attribution points at one
-          of the consumed entry ids, on the fold's own side. This is the
-          venue's still-armed protective leg racing the flip; its fill
-          removes exposure the fold was sized to net against.
-
-        The engine's own corrective close (see
-        :meth:`_maybe_correct_flip_fold_surplus`) can never re-enter the
-        external stream: it reduces the NEW position, so its side is the
-        opposite of ``entry_side`` and its attribution never matches a
-        consumed entry id.
-
-        Runs after the ``_seen_fill_ids`` dedup gate, so a replayed fill
-        cannot double-feed a ledger.
-
-        Guards stashed by an ambiguous entry->entry amend
-        (:attr:`_modify_parked_fold_state`) are fed too, but never
-        dispatch a correction: while the amend is unresolved nothing
-        proves which generation is live at the venue, and a corrective
-        market close against the raw replacement's legitimate exposure
-        would be the wrong order. The ledger still has to keep counting —
-        a ``'rejected'`` resolution proves the ORIGINAL folded order was
-        live the whole time, and its guard is re-armed with the fills
-        that landed meanwhile (see :meth:`_consume_plugin_resolutions`);
-        without this the deduped fills would be lost for good and the
-        restored ledger would under-report the overshoot.
-        """
-        if not self._flip_fold_guards and not self._modify_parked_fold_state:
-            return
-        fill_qty = event.fill_qty or 0.0
-        if fill_qty <= 0.0:
-            return
-        for guard in list(self._flip_fold_guards.values()):
-            if self._credit_flip_fold_guard(guard, event, fill_qty):
-                self._maybe_correct_flip_fold_surplus(guard)
-        for _parked_folded, parked_guard in self._modify_parked_fold_state.values():
-            if parked_guard is not None:
-                self._credit_flip_fold_guard(parked_guard, event, fill_qty)
-
-    @staticmethod
-    def _credit_flip_fold_guard(
-            guard: _FlipFoldGuard, event: OrderEvent, fill_qty: float,
-    ) -> bool:
-        """Book ``fill_qty`` onto ``guard``'s matching ledger stream.
-
-        Returns ``True`` when the event belonged to one of the guard's two
-        streams (the folded entry's own fills, or an external close of a
-        consumed trade) — the caller decides whether that warrants a
-        corrective dispatch.
-        """
-        if (event.leg_type is LegType.ENTRY
-                and event.pine_id == guard.entry_intent_key):
-            guard.entry_filled_qty = min(
-                guard.folded_qty,
-                round(guard.entry_filled_qty + fill_qty, 12),
-            )
-            return True
-        if (event.leg_type is not LegType.ENTRY
-                and event.order is not None
-                and event.order.side == guard.entry_side
-                and (event.pine_id in guard.consumed_entry_ids
-                     or event.from_entry in guard.consumed_entry_ids)):
-            guard.external_closed_qty = min(
-                guard.consumed_qty,
-                round(guard.external_closed_qty + fill_qty, 12),
-            )
-            return True
-        return False
-
-    def _maybe_correct_flip_fold_surplus(
-            self, guard: _FlipFoldGuard,
-            anchor: DispatchEnvelope | None = None,
-    ) -> None:
-        """Close the exposure a double-settled netting fold over-opened.
-
-        The fold dispatched ``folded_qty = raw + consumed_qty`` expecting
-        the venue to net ``consumed_qty`` of it against the opposite
-        position. Every unit of the consumed trades that an EXTERNAL fill
-        closed instead (``external_closed_qty``) shrinks what the venue
-        can still net, so the fold's fills beyond
-        ``folded_qty - min(external_closed_qty, consumed_qty)`` opened
-        surplus exposure on the new side. The book (venue and
-        ``_position`` alike) genuinely holds that surplus while Pine does
-        not — dispatch a targeted partial defensive close for it
-        immediately, before a later Pine-sized exit trips over the
-        mismatch (Capital.com's full-row-only bracket guard turned
-        exactly this into a fatal crash).
-
-        Incremental and idempotent: ``corrected_qty`` accumulates what was
-        already dispatched, so partial fill orderings correct in slices
-        and a re-derived overshoot of zero is a no-op.
-
-        ``anchor`` supplies the entry's dispatch envelope explicitly for
-        the one caller that evaluates a guard AFTER its envelope was torn
-        down: the modify-rejected resolution in
-        :meth:`_consume_plugin_resolutions` re-arms the stash that
-        :meth:`_drop_envelope` just popped. The rejected amend proves the
-        ORIGINAL folded order was live the whole time — the same reason
-        ``_order_mapping[key]`` is kept there — so its captured envelope
-        is exactly the right correction target.
-        """
-        nettable = guard.folded_qty - min(
-            guard.external_closed_qty, guard.consumed_qty,
-        )
-        overshoot = round(
-            guard.entry_filled_qty - nettable - guard.corrected_qty, 12,
-        )
-        if overshoot <= 1e-9:
-            return
-        entry_key = guard.entry_intent_key
-        envelope = anchor if anchor is not None else self._envelopes.get(entry_key)
-        refs = self._order_mapping.get(entry_key) or []
-        if envelope is None or not refs:
-            # No dispatch anchor to target — the entry envelope died (e.g.
-            # the key was retired between the fills). The overshoot is
-            # real; without a provable target a corrective close could hit
-            # the wrong exposure, so surface it loudly and let the
-            # reconciliation checks own the divergence.
-            _blog_error(
-                "stop-and-reverse fold for %s over-opened by %s (external "
-                "close of the consumed position raced the folded fill) but "
-                "no dispatch anchor survives to target a corrective close "
-                "— leaving the divergence to reconciliation",
-                format_intent_key(entry_key), overshoot,
-            )
-            return
-        guard.corrected_qty = round(guard.corrected_qty + overshoot, 12)
-        guard.correction_seq += 1
-        position_coid = envelope.client_order_id(KIND_ENTRY)
-        close_side = 'sell' if guard.entry_side == 'buy' else 'buy'
-        _blog_error(
-            "stop-and-reverse fold for %s double-settled: the consumed "
-            "position was closed externally (%s of %s) while the folded "
-            "entry filled %s of %s — closing the %s surplus defensively "
-            "(target deal %s)",
-            format_intent_key(entry_key), guard.external_closed_qty,
-            guard.consumed_qty, guard.entry_filled_qty, guard.folded_qty,
-            overshoot, refs[0],
-        )
-        close_intent = CloseIntent(
-            pine_id=(
-                f"__pyne_flip_surplus_close__{position_coid}"
-                f"__{guard.correction_seq}"
-            ),
-            symbol=self._symbol,
-            side=close_side,
-            qty=overshoot,
-            immediately=True,
-            synthetic_kind='defensive_close',
-            target_position_coid=position_coid,
-            target_exchange_id=refs[0],
-            comment="flip-fold surplus close: external close of the "
-                    "consumed position raced the folded reversal fill",
-        )
-        # Arm the must-settle marker BEFORE the dispatch, with the exact
-        # COID ``_dispatch_new`` will submit (``_build_envelope`` caches the
-        # envelope on ``intent_key``, so the id built here is the one that
-        # goes on the wire). Without it a cancelled / rejected / provably
-        # absent correction would be dropped by the generic terminal
-        # routing while ``corrected_qty`` blocks any re-dispatch, leaving
-        # the surplus exposure open and unnoticed.
-        close_key = close_intent.intent_key
-        # Anchor pair for the post-restart snapshot probe: the book as it
-        # stands right now, plus the signed delta every correction armed
-        # at this moment (this one included) would still apply once fully
-        # filled. Captured together so a replayed batch has ONE consistent
-        # (baseline, expectation) pair — ``_position.size`` here already
-        # contains the slices earlier corrections booked, so those must
-        # not be re-added from their markers' cumulative ``filled_qty``.
-        batch_outstanding_delta = (
-            -overshoot if close_side == 'sell' else overshoot
-        )
-        for armed in self._pending_flip_surplus_closes.values():
-            remaining = max(armed.expected_qty - armed.filled_qty, 0.0)
-            batch_outstanding_delta += (
-                -remaining if armed.close_side == 'sell' else remaining
-            )
-        marker = _PendingFlipSurplusClose(
-            client_order_id=self._build_envelope(close_intent).client_order_id(
-                KIND_CLOSE,
-            ),
-            expected_qty=overshoot,
-            close_side=close_side,
-            position_coid=position_coid,
-            entry_intent_key=entry_key,
-            pre_close_position_size=float(self._position.size),
-            batch_outstanding_delta=round(batch_outstanding_delta, 12),
-            pending_since=time.time(),
-        )
-        self._pending_flip_surplus_closes[close_key] = marker
-        if self._store_ctx is not None:
-            # Durable arm record, also BEFORE the dispatch: the marker
-            # itself is process-local, so without this event a restart
-            # while the correction is in flight (or parked with unknown
-            # disposition) would silently drop the must-settle contract —
-            # a post-restart ``rejected`` resolution would find no armed
-            # marker and skip the escalation while the surplus exposure
-            # stays open. Startup replay re-arms every armed-without-
-            # settle record from these events.
-            self._store_ctx.log_event(
-                kind='flip_surplus_close_armed',
-                intent_key=close_key,
-                client_order_id=position_coid,
-                payload=marker.to_payload(),
-            )
-        try:
-            self._dispatch_new(close_intent)
-        except OrderDispositionUnknownError:
-            # Parked (network-ambiguous). ``_park_pending`` owns the
-            # retry; the surplus stays booked as corrected so the ledger
-            # does not double-dispatch while the park resolves. The marker
-            # stays armed so a later ``rejected`` plugin resolution still
-            # escalates (:meth:`_escalate_rejected_flip_surplus_close`).
-            pass
-        except OrderSkippedByPlugin as skipped:
-            self._pending_flip_surplus_closes.pop(close_key, None)
-            # No order went out and none will — the surplus exposure is
-            # open and unprotected with no automated path left. Same
-            # escalation contract as the bracket-attach-reject defensive
-            # close.
-            halt = BrokerManualInterventionError(
-                f"Flip-fold surplus close for {entry_key} was skipped by "
-                f"the plugin (reason={skipped.reason!r}): the book holds "
-                f"{overshoot} surplus exposure on the {close_side} side "
-                f"that could not be closed — manual intervention "
-                f"required: {skipped}",
-                intent_key=entry_key,
-                context={
-                    'position_coid': position_coid,
-                    'target_exchange_id': refs[0],
-                    'symbol': self._symbol,
-                    'qty': overshoot,
-                    'skipped_reason': skipped.reason,
-                },
-            )
-            self._record_halt(halt)
-            raise halt from skipped
 
     @staticmethod
     def _discharge_dropped_close_slice(
@@ -12980,11 +12683,10 @@ class OrderSyncEngine:
                     # hedging venues reject that outright (cTrader:
                     # ORDER_NOT_FOUND on an amend of a filled market order)
                     # and the default cancel + re-execute path would skip the
-                    # MARKET stop-and-reverse fold and the one-way reversal
-                    # planner. Route through ``_dispatch_new`` instead: the
-                    # netting fold sizes the combined reversal qty and a
-                    # ``position_port`` plugin plans close-then-open legs via
-                    # ``run_reversal``. Only a FULLY consumed prior entry
+                    # MARKET stop-and-reverse protocol. Route through
+                    # ``_dispatch_new`` instead: a reversing entry enters the
+                    # close-then-open protocol there on every venue mode.
+                    # Only a FULLY consumed prior entry
                     # qualifies — a partially filled resting order still has
                     # a live working remainder that the modify path owns.
                     filled_prev = self._active_entry_filled_qty.get(key, 0.0)
@@ -13063,85 +12765,6 @@ class OrderSyncEngine:
                     # arming the engine legs.
                     continue
                 self._active_intents[key] = intent
-            elif (isinstance(intent, EntryIntent)
-                  and intent.skip_flip
-                  and key in self._flip_folded_entry_dispatches):
-                # Same-bar re-placement of the very MARKET entry whose live
-                # dispatch carries the stop-and-reverse fold. TradingView amends
-                # the standing order with the RAW quantity — it does not
-                # recompute the flip — and the simulator mirrors that through
-                # ``Order.skip_flip``. Reaching this branch means the raw intent
-                # compares EQUAL to the active slot (``skip_flip`` is
-                # ``compare=False``), so without it the diff would call the
-                # re-placement "unchanged" and leave the reversing quantity
-                # working at the broker: the live account flips to the opposite
-                # side where TV and the simulator merely reduce. The window is
-                # real under ``calc_on_every_tick``: the first tick dispatches
-                # the fold, a later tick on the same bar re-emits the same call
-                # and only then sets ``skip_flip``.
-                #
-                # Resizing is exactly what a same-bar qty CHANGE already does on
-                # this key (``_dispatch_modify`` dispatches the new intent raw,
-                # it never folds) — this branch only extends that to the
-                # quantity-identical case the equality diff cannot see.
-                folded = self._flip_folded_entry_dispatches[key]
-                if folded.qty <= intent.qty:
-                    # Nothing was actually added on the wire — leave it be.
-                    self._active_intents[key] = intent
-                    continue
-                # A slice of the folded dispatch may already be done. The done
-                # part cannot be taken back, but the excess REMAINDER must not
-                # keep working: it is what would carry the account past the
-                # reduction the script asked for into the reversal it did not.
-                # What may still work is the simulator's own notion of an
-                # entry's live remainder (``abs(order.size) - filled_qty``, see
-                # the bindable-size accounting in ``strategy.exit``): the raw
-                # quantity minus the confirmed fills. Once the fills reach the
-                # raw quantity that remainder is zero and the rest is cancelled
-                # outright.
-                filled = self._active_entry_filled_qty.get(key, 0.0)
-                remaining = round(intent.qty - filled, 12)
-                if remaining <= 1e-9:
-                    _blog_info(
-                        "same-bar re-placement of %s is already satisfied by "
-                        "the fold's fills (filled=%s raw=%s) — cancelling the "
-                        "working remainder of the stop-and-reverse fold",
-                        format_intent_key(key), filled, intent.qty,
-                    )
-                    self._dispatch_cancel(folded)
-                    # Keep the slot as the sticky diff sentinel (same role as
-                    # the consumed-market-entry slots above): dropping it would
-                    # make the next sync see a brand-new key and re-dispatch
-                    # the very exposure just cancelled.
-                    self._flip_folded_entry_dispatches.pop(key, None)
-                    self._active_intents[key] = intent
-                    continue
-                replacement = (intent if filled <= 0.0
-                               else dataclasses.replace(intent, qty=remaining))
-                _blog_info(
-                    "same-bar re-placement of %s unwinds the stop-and-reverse "
-                    "fold (working=%s -> raw=%s filled=%s -> dispatching %s)",
-                    format_intent_key(key), folded.qty, intent.qty, filled,
-                    replacement.qty,
-                )
-                try:
-                    self._dispatch_modify(folded, replacement)
-                except OrderSkippedByPlugin as e:
-                    # Same contract as the modify branch above: the old order is
-                    # already cancelled and the plugin declined the replacement,
-                    # so the exchange holds nothing for this key.
-                    _blog_warning("%s", e)
-                    self._active_intents.pop(key, None)
-                    continue
-                except (_QuarantineModifyDeferred,
-                        OrderDispositionUnknownError):
-                    # No replacement was dispatched and the folded order is
-                    # still working. Keep the slot on the OLD intent so the next
-                    # sync re-enters this branch and retries the unwind (the
-                    # fold record survives — only a successful amend retires
-                    # it).
-                    continue
-                self._active_intents[key] = intent
             # else: unchanged — skip
 
     def _build_envelope(self, intent: Intent) -> DispatchEnvelope:
@@ -13178,6 +12801,16 @@ class OrderSyncEngine:
             anchor = self._persisted_envelope_anchors.get(intent.intent_key)
         self._persisted_envelope_anchors.pop(intent.intent_key, None)
         reject_anchor = self._reject_anchor_bars.get(intent.intent_key)
+        if (anchor is None and reject_anchor is not None
+                and reject_anchor.bar_ts_ms == self._current_bar_ts_ms):
+            # The bump outlived its ``_persisted_envelope_anchors`` seed:
+            # a same-Pine-ID reversal parks the entry while the consumed
+            # cycle's fill cleanup drops the per-key envelope state (anchor
+            # included). Same bar → the consumed cycle's COID is still
+            # spent at the venue; honour the bump so the parked dispatch
+            # mints a fresh id instead of colliding with the idempotency
+            # cache.
+            anchor = reject_anchor
         if (anchor is not None and reject_anchor is not None
                 and reject_anchor.bar_ts_ms != self._current_bar_ts_ms):
             # A reject-bumped anchor only defends a same-bar retry. The bar
@@ -13733,11 +13366,12 @@ class OrderSyncEngine:
         conservatively reserves the full quantity (the safe direction — an
         over-reservation can only cause a graceful halt, never a short).
 
-        Runs AFTER the MARKET stop-and-reverse fold so a reversing
-        ``strategy.entry`` is judged on its true combined quantity. On a
-        hit the engine records a graceful halt and raises — a silent skip
-        would break Pine semantics (the script would believe it is short
-        while the venue holds the old long).
+        A reversing ``strategy.entry`` is judged on its true combined
+        quantity: :meth:`_begin_close_then_open_reversal` calls this gate
+        with ``qty + |position|`` before any venue action. On a hit the
+        engine records a graceful halt and raises — a silent skip would
+        break Pine semantics (the script would believe it is short while
+        the venue holds the old long).
 
         This proves the invariant at DISPATCH time only. A later fill can
         erode ``_position.size`` below the aggregate the gate admitted;
@@ -13745,7 +13379,7 @@ class OrderSyncEngine:
         at fill time and cancels the now-unbacked resting sells before they
         can leak an oversell through the async window.
 
-        :param intent: The (folded) entry intent about to dispatch.
+        :param intent: The entry intent about to dispatch.
         :param exclude_key: Active-intent key to leave out of the
             aggregation — the modify path passes the key being replaced so
             the OLD quantity is not double-counted against the NEW one.
@@ -13768,7 +13402,7 @@ class OrderSyncEngine:
         # lands; fold them back in so a fresh sell cannot be admitted against
         # inventory a still-live parked sell already reserves.
         reserved += self._parked_working_sell_qty(exclude_key=exclude_key)
-        # Same 12-decimal rounding as the reversal fold — kills float64
+        # Same 12-decimal rounding as the reversal gate hoist — kills float64
         # addition artifacts without hiding any real lot-sized deficit.
         projected = round(self._position.size - reserved - intent.qty, 12)
         if projected >= 0.0:
@@ -14005,7 +13639,7 @@ class OrderSyncEngine:
         # cancel lands, but they are NOT cancellation candidates (owned by
         # :meth:`_retry_forced_cancels`) — only the active sells above are.
         reserved += self._parked_working_sell_qty()
-        # Same 12-decimal rounding as the dispatch gate / reversal fold —
+        # Same 12-decimal rounding as the dispatch gate / reversal hoist —
         # kills float64 addition artifacts without hiding a real lot-sized
         # deficit.
         deficit = round(reserved - self._position.size, 12)
@@ -14222,14 +13856,300 @@ class OrderSyncEngine:
                 format_intent_key(key),
             )
 
+    def _retire_reversal_closing_surfaces(self, intent: EntryIntent) -> None:
+        """Best-effort teardown of the old position's closing surfaces.
+
+        Runs right before the ``reversal_close`` dispatch. Every active
+        exit whose ``from_entry`` is one of the consumed open trades is
+        cancelled through the self-retrying :meth:`_dispatch_cancel` and
+        retired from tracking, and the consumed parents' native fail-safe
+        stop is cleared with a synchronous PUT. Failures are logged and
+        NEVER block the reversal: the close leg is dispatched in a form
+        that cannot open opposite exposure, so a leg that survives this
+        sweep and fires mid-flight merely empties the position early — the
+        close no-ops and the parked entry still opens once the book is
+        flat. The sweep exists to avoid exactly that noise (a fired SL, an
+        orphan resting bracket), not for safety.
+        """
+        consumed_ids = {
+            trade.entry_id for trade in self._position.open_trades
+            if trade.entry_id is not None
+        }
+        for key, old in list(self._active_intents.items()):
+            if not isinstance(old, ExitIntent):
+                continue
+            if old.symbol != intent.symbol or old.from_entry not in consumed_ids:
+                continue
+            # noinspection PyBroadException
+            try:
+                self._dispatch_cancel(old)
+            except Exception:
+                _log.exception(
+                    "reversal pre-clear: cancel of closing leg %s failed; "
+                    "harmless for the reduce-only close — reconcile will "
+                    "re-drive", format_intent_key(key),
+                )
+            self._order_mapping.pop(key, None)
+            self._active_intents.pop(key, None)
+            self._drop_envelope(key)
+            self._remove_pine_order_for_intent(old)
+        manager = self._native_failsafe_manager
+        now_ms = float(self._current_bar_ts_ms)
+        for pine_entry_id in consumed_ids:
+            ref = self._resolve_parent_opening_ref(pine_entry_id)
+            if ref is None:
+                continue
+            state = manager.get_state(ref)
+            if state is None or state.health is FailsafeHealth.RETIRED:
+                continue
+            if (state.owner is not FailsafeOwner.ENGINE_FAILSAFE
+                    or state.health is FailsafeHealth.DEGRADED):
+                # Not the engine's stop to clear; it dies with the position
+                # (``on_deal_id_disappeared``) once the close settles.
+                continue
+            manager.recompute_worst_sl(
+                parent_entry_dispatch_ref=ref,
+                active_sl_levels=[],
+                now_ms=now_ms,
+            )
+            snapshot = manager.pop_pending(ref)
+            if snapshot is None:
+                if (state.desired_level is None
+                        and not state.pending_put
+                        and not state.outstanding):
+                    manager.unregister_parent(ref)
+                continue
+            if self._native_bracket_dispatcher is None:
+                manager.unregister_parent(ref)
+                continue
+            manager.mark_dispatch_in_flight(ref, now_ms=now_ms)
+            try:
+                self._native_bracket_dispatcher(snapshot)
+            except BrokerManualInterventionError as halt:
+                self._record_halt(halt)
+                raise
+            except Exception as e:  # noqa: BLE001 — mirror drive_native_failsafe
+                _blog_warning(
+                    "reversal pre-clear: fail-safe clear PUT for %s raised "
+                    "(%s); harmless for the reduce-only close — the stop "
+                    "retires with the position", ref, e,
+                )
+                manager.record_put_failure(
+                    ref,
+                    generation=snapshot.generation,
+                    reason=f'reversal-preclear:{type(e).__name__}',
+                    now_ms=now_ms,
+                )
+                continue
+            manager.record_put_success(
+                ref, generation=snapshot.generation, now_ms=now_ms,
+            )
+            manager.unregister_parent(ref)
+
+    @staticmethod
+    def _reversal_close_pending_skip(
+            intent: EntryIntent, message: str,
+    ) -> OrderSkippedByPlugin:
+        """Build the uniform non-counting skip for the reversal protocol."""
+        return OrderSkippedByPlugin(
+            message,
+            intent_key=intent.intent_key,
+            reason='reversal_close_pending',
+            context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
+        )
+
+    def _begin_close_then_open_reversal(self, intent: EntryIntent) -> None:
+        """Run the close leg of a MARKET stop-and-reverse.
+
+        Protocol (see :class:`_PendingReversalOpen` for the rationale):
+
+        1. best-effort teardown of the old position's closing surfaces;
+        2. dispatch a full-position ``synthetic_kind='reversal_close'``
+           :class:`CloseIntent` — a form that cannot open opposite
+           exposure: on a netting venue by plugin contract (targeted /
+           reduce-only), on a hedging venue (``position_port``) as a fan
+           of targeted per-leg ``close_leg`` calls;
+        3. park the RAW entry; :meth:`_maybe_open_after_reversal_close`
+           dispatches it the moment the book settles flat.
+
+        Raises :exc:`OrderSkippedByPlugin` with the non-counting
+        ``reversal_close_pending`` reason on every path that leaves the
+        book non-flat — the entry is neither registered nor counted as a
+        reject, and Pine's per-sync re-emission is the retry driver for
+        every failure shape (close reject, connection drop, stale marker).
+        Returns normally ONLY when the book settled flat during the sweep:
+        the caller dispatches the entry raw in this very call.
+        """
+        key = intent.intent_key
+        # Judge the short gate on the combined stop-and-reverse quantity
+        # BEFORE any venue action: on a short-incapable venue the parked
+        # raw entry would only ever dispatch into a flat book, so a
+        # reversal always projects negative — halt here, with the close
+        # leg not yet on the wire.
+        self._enforce_short_gate(dataclasses.replace(
+            intent, qty=round(intent.qty + abs(self._position.size), 12),
+        ))
+        marker = self._pending_reversal_opens.get(key)
+        if marker is not None:
+            marker.blocked_syncs += 1
+            if marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS:
+                raise self._reversal_close_pending_skip(
+                    intent,
+                    f"Reversal entry {format_intent_key(key)} deferred: the "
+                    f"close leg {marker.close_pine_id!r} has not settled "
+                    f"the book flat yet; re-evaluating next sync.",
+                )
+            _blog_warning(
+                "reversal close %r has not settled after %d syncs with the "
+                "position still open — re-running the close-then-open "
+                "protocol with a fresh close dispatch (the close is "
+                "reduce-only, so a surviving duplicate at worst no-ops)",
+                marker.close_pine_id, marker.blocked_syncs - 1,
+            )
+            self._pending_reversal_opens.pop(key, None)
+        self._retire_reversal_closing_surfaces(intent)
+        if self._position.size == 0.0:
+            # Fill events routed during the sweep's broker round-trips
+            # settled the book — no close leg is needed; the entry goes
+            # out raw right now into the flat book.
+            return
+        close_qty = round(abs(self._position.size), 12)
+        consumed_ids = frozenset(
+            trade.entry_id for trade in self._position.open_trades
+            if trade.entry_id is not None
+        )
+        close_intent = CloseIntent(
+            pine_id=f"__pyne_reversal_close__{intent.pine_id}",
+            symbol=self._symbol,
+            side=intent.side,
+            qty=close_qty,
+            immediately=True,
+            synthetic_kind='reversal_close',
+            comment="stop-and-reverse close leg: flatten before the raw "
+                    "reversing entry",
+        )
+        try:
+            self._dispatch_new(close_intent)
+        except OrderSkippedByPlugin as e:
+            _blog_warning(
+                "reversal close for %s was declined (%s); the re-emitted "
+                "entry retries the protocol next sync",
+                format_intent_key(key), e,
+            )
+            raise self._reversal_close_pending_skip(
+                intent,
+                f"Reversal entry {format_intent_key(key)} deferred: the "
+                f"close leg was declined; re-evaluating next sync.",
+            ) from e
+        except (ExchangeOrderRejectedError, OrderDispositionUnknownError) as e:
+            # A reject commonly proves a racing protective fill already
+            # emptied the position; an unknown disposition may leave the
+            # close live at the venue. Both defer to the next sync, where
+            # the protocol re-reads the settled book — and a duplicate
+            # close, if one ever goes out, no-ops by the reduce-only
+            # contract.
+            _blog_warning(
+                "reversal close for %s did not confirm (%s); the "
+                "re-emitted entry re-evaluates against the settled book "
+                "next sync", format_intent_key(key), e,
+            )
+            raise self._reversal_close_pending_skip(
+                intent,
+                f"Reversal entry {format_intent_key(key)} deferred: the "
+                f"close leg did not confirm; re-evaluating next sync.",
+            ) from e
+        self._pending_reversal_opens[key] = _PendingReversalOpen(
+            entry_intent=intent,
+            close_pine_id=close_intent.pine_id,
+            close_qty=close_qty,
+            consumed_entry_ids=consumed_ids,
+            armed_bar_ts_ms=self._current_bar_ts_ms,
+        )
+        raise self._reversal_close_pending_skip(
+            intent,
+            f"Reversal entry {format_intent_key(key)} parked: close leg "
+            f"{close_intent.pine_id!r} dispatched for {close_qty}; the raw "
+            f"entry opens the moment the book settles flat.",
+        )
+
+    def _maybe_open_after_reversal_close(self) -> None:
+        """Dispatch a parked reversal entry once the book settles flat.
+
+        Called from the fill-routing path after the book is updated. Flat
+        is the only condition — WHICH fill flattened the book does not
+        matter (the reversal close, a racing protective leg, an external
+        close): the reversal signal wants the old exposure gone and the
+        raw entry open, and both are satisfied exactly when the book is
+        flat. A declined dispatch is only logged — Pine re-emits the entry
+        next sync against the flat book and it goes out as a plain raw
+        entry.
+        """
+        if not self._pending_reversal_opens:
+            return
+        if self._position.size != 0.0:
+            return
+        for key, marker in list(self._pending_reversal_opens.items()):
+            self._pending_reversal_opens.pop(key, None)
+            if marker.superseded:
+                # A same-bar skip_flip re-placement demoted the reversal to
+                # a plain reduction; the close settling flat is the end of
+                # the protocol — nothing may open.
+                _blog_info(
+                    "reversal for %s: book settled flat; the superseded "
+                    "parked entry is dropped", format_intent_key(key),
+                )
+                continue
+            entry = marker.entry_intent
+            dispatch_entry = (
+                entry if marker.open_qty is None
+                else dataclasses.replace(entry, qty=marker.open_qty)
+            )
+            _blog_info(
+                "reversal for %s: book settled flat — dispatching the raw "
+                "entry (qty %s)", format_intent_key(key), dispatch_entry.qty,
+            )
+            try:
+                self._dispatch_new(dispatch_entry)
+            except OrderSkippedByPlugin as e:
+                _blog_warning(
+                    "reversal entry %s declined after the close settled "
+                    "(%s); the re-emitted entry retries next sync",
+                    format_intent_key(key), e,
+                )
+                continue
+            self._rejected_entry_intents.pop(key, None)
+            self._active_intents[key] = entry
+
     def _dispatch_new(self, intent: Intent, *, _coid_spent_retry: int = 0) -> None:
         # ``_coid_spent_retry`` counts the internal re-dispatches of the
         # :class:`ClientOrderIdSpentError` recovery below (never passed by
         # external callers): each pass re-anchors the envelope on a bumped
         # ``retry_seq`` and retries, so the counter both bounds the loop
-        # and suppresses the one-shot intent transforms (the MARKET
-        # reversal fold must not be applied twice to the same intent).
-        #
+        # and suppresses the one-shot intent transforms (the reversal
+        # protocol must not be entered twice for the same intent).
+        if isinstance(intent, ExitIntent):
+            # Exit suppression for a pending close-then-open reversal: the
+            # pre-clear sweep removed these legs on purpose; re-arming one
+            # while the close leg settles would close exposure the parked
+            # entry is waiting to see flattened — and then fire against the
+            # NEW position once it opens. Pine keeps re-emitting these exits
+            # while the position is still open; once the book settles and
+            # the parked entry opens, the script stops emitting them.
+            for marker in self._pending_reversal_opens.values():
+                if intent.from_entry in marker.consumed_entry_ids:
+                    raise OrderSkippedByPlugin(
+                        f"Exit {format_intent_key(intent.intent_key)} "
+                        f"skipped: it closes exposure consumed by the "
+                        f"in-flight reversal close "
+                        f"{marker.close_pine_id!r}; re-evaluating next "
+                        f"sync.",
+                        intent_key=intent.intent_key,
+                        reason='reversal_close_in_flight',
+                        context={
+                            'symbol': intent.symbol,
+                            'from_entry': intent.from_entry,
+                        },
+                    )
         # Quarantine gate: new entries are exactly the "new or
         # exposure-increasing dispatch" the quarantine invariant blocks.
         # Runs BEFORE the envelope is built, so there is nothing to clean
@@ -14257,41 +14177,92 @@ class OrderSyncEngine:
                     'quarantine_reason': self._quarantine_reason,
                 },
             )
-        # MARKET stop-and-reverse fold (TV parity): TV sizes a reversing
-        # market entry at first order processing as ``qty + |opposite
-        # position|`` — the simulator mirrors that at its own bar-open
-        # execution, but the intent snapshot is taken from the PENDING
-        # order, BEFORE that fold. Fold here, at the single point a fresh
-        # entry is dispatched, into a COPY: the caller's
-        # ``_active_intents`` slot keeps the raw intent, so the next
-        # bar's diff still matches the re-emitted (raw) Pine order and
-        # the fold can never re-trigger a dispatch. LIMIT/STOP entries
-        # are already folded at creation (``strategy.entry`` subtracts
-        # the position size), and a stop-fired market re-dispatch derives
-        # from such a creation-folded leg — both excluded. Without this a
-        # live reversal merely REDUCED the opposite position instead of
-        # flipping it (measured on the Capital.com demo E2E, 2026-07-10).
-        # ``strategy.order`` is excluded too: it never auto-reverses — its
-        # raw quantity simply nets against the venue position (an opposite-
-        # side order(qty=3) on a 5-long reduces to 2, it does not target a
-        # 3-short), so folding it would oversell by the position size.
-        # ``skip_flip`` excludes an entry that re-placed an unfilled same-bar
-        # order under the same id: TV modifies the standing order with the raw
-        # quantity and does NOT recompute the flip (the simulator mirrors this
-        # in ``strategy.entry``), so folding it here would open the opposite
-        # side where both TV and the simulator merely reduce.
-        if _coid_spent_retry == 0 and isinstance(intent, EntryIntent):
-            # A fresh dispatch cycle supersedes whatever the previous cycle on
-            # this key was folded to. The internal COID-spent retries below
-            # recurse with the ALREADY folded intent, so they must neither
-            # clear nor re-record it — hence the ``_coid_spent_retry == 0``
-            # guard on both halves.
-            self._flip_folded_entry_dispatches.pop(intent.intent_key, None)
-            self._flip_fold_guards.pop(intent.intent_key, None)
-            # A fresh dispatch also supersedes any fold state an earlier
-            # ambiguous amend stashed for a possible rejection re-arm: the
-            # order that state described is no longer the one on the wire.
-            self._modify_parked_fold_state.pop(intent.intent_key, None)
+        # MARKET stop-and-reverse (TV parity): TV sizes a reversing market
+        # entry at first order processing as ``qty + |opposite position|``
+        # and executes it as one combined order. Live, the engine reaches
+        # the same final book through the close-then-open protocol below
+        # (:meth:`_begin_close_then_open_reversal`) — a combined-size entry
+        # racing the old position's protective legs is what double-settled
+        # the consumed exposure. LIMIT/STOP entries are already combined at
+        # creation (``strategy.entry`` subtracts the position size — a
+        # Pine-visible quantity both TV and the simulator book in full),
+        # and a stop-fired market re-dispatch derives from such a
+        # creation-combined leg — both excluded. ``strategy.order`` is
+        # excluded too: it never auto-reverses — its raw quantity simply
+        # nets against the venue position (an opposite-side order(qty=3) on
+        # a 5-long reduces to 2, it does not target a 3-short).
+        # ``skip_flip`` excludes an entry that re-placed an unfilled
+        # same-bar order under the same id: TV modifies the standing order
+        # with the raw quantity and does NOT recompute the flip (the
+        # simulator mirrors this in ``strategy.entry``), so the position
+        # must only be reduced — handled by the supersede branch below.
+        if (_coid_spent_retry == 0
+                and isinstance(intent, EntryIntent)
+                and intent.skip_flip
+                and intent.intent_key in self._pending_reversal_opens):
+            # Same-bar re-placement of the entry whose close-then-open
+            # reversal is already in flight. TV modifies the standing order
+            # with the RAW quantity and does NOT recompute the flip — the
+            # position must only be REDUCED. The dispatched reversal close
+            # cannot be recalled, so the close quantity is the slice that
+            # already executed: supersede the parked open (the book must
+            # never flip) and work only the remainder the raw replacement
+            # still calls for. A close overshooting the raw quantity is an
+            # accepted can't-take-back divergence: the executed slice is
+            # gone whatever the re-placement asks for.
+            marker = self._pending_reversal_opens[intent.intent_key]
+            first_supersede = not marker.superseded
+            marker.superseded = True
+            remaining = round(intent.qty - marker.close_qty, 12)
+            if remaining <= 0.0:
+                if first_supersede:
+                    _blog_warning(
+                        "same-bar re-placement of %s (raw %s) supersedes the "
+                        "in-flight reversal: the parked open is dropped and "
+                        "the dispatched close for %s already covers the raw "
+                        "reduction",
+                        format_intent_key(intent.intent_key), intent.qty,
+                        marker.close_qty,
+                    )
+                raise OrderSkippedByPlugin(
+                    f"Entry {format_intent_key(intent.intent_key)} skipped: "
+                    f"its same-bar re-placement reduced the reversal to a "
+                    f"plain reduction already covered by the in-flight "
+                    f"close leg {marker.close_pine_id!r}.",
+                    intent_key=intent.intent_key,
+                    reason='reversal_superseded',
+                    context={'symbol': intent.symbol,
+                             'pine_id': intent.pine_id},
+                )
+            _blog_warning(
+                "same-bar re-placement of %s (raw %s) supersedes the "
+                "in-flight reversal: the parked open now carries only the "
+                "remainder %s past the dispatched close for %s",
+                format_intent_key(intent.intent_key), intent.qty, remaining,
+                marker.close_qty,
+            )
+            # Re-park the remainder instead of dispatching it into a book
+            # that is still settling: on a hedging venue an immediate raw
+            # dispatch would race the in-flight close legs (``run_reversal``
+            # would plan fresh close legs against the very positions the
+            # reversal close already targets), and on a netting venue it
+            # would net against exposure the close is about to remove. The
+            # marker stays armed with the remainder quantity and opens
+            # event-driven the moment the book settles flat — the same
+            # no-open-until-flat contract as the primary protocol path. The
+            # marker keeps the RAW re-placed intent for the sticky
+            # active-intent slot (the re-emitted Pine order must diff as
+            # unchanged); only the flat-settle dispatch is resized.
+            marker.superseded = False
+            marker.entry_intent = intent
+            marker.open_qty = remaining
+            raise self._reversal_close_pending_skip(
+                intent,
+                f"Entry {format_intent_key(intent.intent_key)} re-parked: "
+                f"its same-bar re-placement supersedes the in-flight "
+                f"reversal; the remainder {remaining} opens the moment the "
+                f"book settles flat.",
+            )
         if (_coid_spent_retry == 0
                 and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
@@ -14300,38 +14271,27 @@ class OrderSyncEngine:
                 and not intent.skip_flip
                 and self._position.size != 0.0
                 and ((intent.side == 'buy') == (self._position.size < 0.0))):
-            # Round to 12 decimals — finer than any real lot step, but
-            # enough to kill the float64 addition artifact.
-            intent = dataclasses.replace(
-                intent,
-                qty=round(intent.qty + abs(self._position.size), 12),
-            )
-            # Remember what actually went on the wire: the diff needs it to
-            # unwind the fold if the script re-places this very order on the
-            # same bar (see the ``skip_flip`` branch in
-            # :meth:`_diff_and_dispatch`).
-            self._flip_folded_entry_dispatches[intent.intent_key] = intent
-            # Arm the fold's fill ledger BEFORE the broker round-trip: the
-            # opposite position's protective legs are still live at the
-            # venue while the folded entry is in flight, and one of them
-            # filling concurrently double-closes the consumed exposure.
-            # :meth:`_track_flip_fold_fill` watches both fill streams and
-            # corrects the overshoot with a targeted partial defensive
-            # close. The snapshot of the consumed trades is taken here —
-            # after the fold's fills these ids are gone from
-            # ``open_trades``, so a later event could not reconstruct it.
-            self._flip_fold_guards[intent.intent_key] = _FlipFoldGuard(
-                entry_intent_key=intent.intent_key,
-                entry_side=intent.side,
-                folded_qty=intent.qty,
-                consumed_qty=abs(self._position.size),
-                consumed_entry_ids=frozenset(
-                    trade.entry_id for trade in self._position.open_trades
-                    if trade.entry_id is not None
-                ),
-            )
-        # Short gate: judged on the folded quantity, before the envelope is
-        # built (nothing to clean up on a halt).
+            # Every venue mode: the reversal is executed close-then-open,
+            # NEVER as a combined double-size entry. The full-position
+            # ``reversal_close`` cannot open opposite exposure by contract —
+            # on a netting venue the plugin dispatches it targeted /
+            # reduce-only, and on a hedging venue (``position_port``) it
+            # fans into targeted per-leg ``close_leg`` calls — so a
+            # venue-side protective leg racing it merely no-ops instead of
+            # double-closing (the shape that forced the defensive surplus
+            # correction to pay spread + fees twice; Capital.com demo lane,
+            # 2026-08-18). The raw entry is parked and dispatched
+            # event-driven the moment the book settles flat, which also
+            # gives a same-bar ``skip_flip`` re-placement a window to
+            # supersede the open before any opposite exposure exists.
+            # Raises the non-counting ``reversal_close_pending`` skip on
+            # every path that leaves the book non-flat (Pine's per-sync
+            # re-emission is the retry driver); returns normally only when
+            # the book settled flat during the pre-clear sweep — this entry
+            # then dispatches raw right here into the flat book.
+            self._begin_close_then_open_reversal(intent)
+        # Short gate: judged before the envelope is built (nothing to clean
+        # up on a halt).
         if isinstance(intent, EntryIntent):
             self._enforce_short_gate(intent)
         envelope = self._build_envelope(intent)
@@ -17591,23 +17551,6 @@ class OrderSyncEngine:
                 # amend that preserves ``filled_qty`` only over-reserves by the
                 # pre-amend slice — the safe direction, never a short.
                 self._active_entry_filled_qty[new.intent_key] = 0.0
-                # The amend replaced the working order with ``new`` verbatim —
-                # ``_dispatch_modify`` never folds — so whatever
-                # stop-and-reverse fold the superseded dispatch carried is no
-                # longer on the wire. Retire the record; leaving it would let a
-                # later same-bar re-placement try to unwind a fold that no
-                # longer exists.
-                self._flip_folded_entry_dispatches.pop(new.intent_key, None)
-                # Same lifecycle for the fold's fill ledger: it is sized against
-                # the folded quantity and the opposite exposure the fold was
-                # dispatched to net against. The replacement carries the RAW
-                # quantity, so keeping the guard armed would evaluate the
-                # replacement's fills against a folded quantity that is no
-                # longer on the wire and dispatch a bogus corrective close.
-                self._flip_fold_guards.pop(new.intent_key, None)
-                # An applied amend also invalidates any fold state a previous
-                # ambiguous amend stashed for a rejection re-arm.
-                self._modify_parked_fold_state.pop(new.intent_key, None)
                 # Keep the both-set entry's software STOP leg in step with the
                 # amended native LIMIT. modify_entry preserves the LIMIT's
                 # KIND_ENTRY coid (the envelope anchor is pinned across amend
@@ -17761,41 +17704,6 @@ class OrderSyncEngine:
             _blog_warning(
                 "modify parked (unknown disposition) for %s: %s", new, e,
             )
-            # Retire the stop-and-reverse fold state of the superseded
-            # dispatch, exactly as the success path does. The replacement
-            # carries the RAW quantity, so a guard sized against the folded
-            # quantity can only mis-attribute the replacement's fills and
-            # dispatch a corrective market close against legitimate
-            # exposure. Whichever way the park resolves the folded order is
-            # not what is on the wire under this key any more: 'attached'
-            # means the raw replacement landed, and 'rejected' retires the
-            # envelope (which pops these ledgers anyway). A fold overshoot
-            # that slips through in the meantime is left to the cycle-end
-            # reconciliation — the passive divergence report, never a wrong
-            # order.
-            #
-            # The retirement is not final though: a ``'rejected'``
-            # resolution proves the amend never applied, so the ORIGINAL
-            # folded order is still live at the venue and needs its guard
-            # back. Stash the popped state under the key;
-            # :meth:`_process_plugin_resolutions` re-arms it on rejection
-            # and drops it once the raw replacement is authoritatively
-            # attached.
-            #
-            # Entry->entry amends only, mirroring the success path: the
-            # cancel + re-execute branch reaches ``_dispatch_new``, which
-            # arms its OWN fold state for this key before it can park, and a
-            # keyed ``strategy.close`` shares its intent key with the parent
-            # entry — popping there would disarm a live, unrelated guard.
-            if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
-                parked_folded = self._flip_folded_entry_dispatches.pop(
-                    new.intent_key, None,
-                )
-                parked_guard = self._flip_fold_guards.pop(new.intent_key, None)
-                if parked_folded is not None or parked_guard is not None:
-                    self._modify_parked_fold_state[new.intent_key] = (
-                        parked_folded, parked_guard,
-                    )
             # The default plugin modify is cancel + re-execute
             # (:meth:`BrokerPlugin.modify_entry` / ``modify_exit``): by the
             # time the REPLACEMENT submission turned ambiguous, the

@@ -392,6 +392,18 @@ class NativeFailsafeManager:
     def get_state(self, parent_entry_dispatch_ref: str) -> NativeStopState | None:
         return self._states.get(parent_entry_dispatch_ref)
 
+    def pop_pending(
+            self, parent_entry_dispatch_ref: str,
+    ) -> NativeBracketSnapshot | None:
+        """Remove and return one parent's queued snapshot, if any.
+
+        Used by callers that dispatch a single parent's PUT synchronously
+        (the reversal pre-clear) instead of waiting for the next
+        :meth:`pending_dispatch` drain; the pop keeps the drain from
+        re-dispatching the same snapshot afterwards.
+        """
+        return self._pending.pop(parent_entry_dispatch_ref, None)
+
     def iter_states(self) -> Iterable[NativeStopState]:
         return self._states.values()
 
