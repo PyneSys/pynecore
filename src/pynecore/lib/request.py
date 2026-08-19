@@ -38,18 +38,21 @@ def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
       "last closed" in any mode. Functionally identical to
       ``lookahead_off`` in PyneCore; prefer it when "last closed" is the
       explicit intent (no reliance on the TV ``close[1]`` idiom).
-    - ``barmerge.lookahead_on``: TV-compatible. Same-symbol HTF: the
-      security context steps into the containing HTF bar. In live mode the
-      developing bar runs with ``barstate.isconfirmed=False`` and OHLCV
-      aggregated from the chart timeframe; in historical/backtest mode the
-      containing bar is already complete in the data file, so a bare
-      ``close`` reads its final value (TV's classical future-leak) while an
-      inner ``close[1]`` reads the just-closed prior period — the daily-pivot
-      idiom ``security(sym, "D", close[1], lookahead_on)``. Cross-symbol HTF:
-      the developing bar cannot be aggregated (wrong instrument), so the
-      chart bar inside an open HTF period reads as ``na``; ``close[1]`` at
-      the period boundary still delivers the just-closed cross-symbol HTF
-      close, so the idiom continues to work.
+    - ``barmerge.lookahead_on``: same-symbol HTF — the security context
+      steps into the containing HTF bar, which runs with
+      ``barstate.isconfirmed=False`` over OHLCV aggregated from the chart
+      timeframe. Historical and live mode behave identically. The
+      daily-pivot idiom ``security(sym, "D", close[1], lookahead_on)`` reads
+      the just-closed prior period, matching TradingView.
+
+      A bare ``close`` reads the containing period AS BUILT SO FAR, which
+      **differs from TradingView deliberately**: TV returns the period's
+      final close on every chart bar of the period, i.e. future data
+      everywhere but the period's last bar, and PyneCore does not reproduce
+      lookahead. Cross-symbol HTF: the developing bar cannot be aggregated
+      (wrong instrument), so a chart bar inside an open HTF period reads as
+      ``na``; ``close[1]`` at the period boundary still delivers the
+      just-closed cross-symbol HTF close, so the idiom continues to work.
 
     This function exists for IDE support only. In compiled scripts, the
     SecurityTransformer rewrites all calls into the signal/write/read

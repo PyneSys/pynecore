@@ -30,13 +30,18 @@ scripts; ``lookahead_last_closed`` is a PyneSys-native alternative.
   when you want explicit "last closed" semantics without depending on the TV
   ``close[1]`` idiom.
 
-- ``lookahead_on``: TV-compatible. In live mode the security subprocess steps
-  into the containing HTF bar with ``barstate.isconfirmed=False`` and OHLCV
-  aggregated from chart-timeframe data — matching TradingView's developing-bar
-  semantics, so the TV idiom ``request.security(..., lookahead_on)[1]`` returns
-  the latest closed value as it does on TV. In historical mode it falls back
-  to closed-only semantics (equivalent to ``lookahead_off``), so historical
-  backtests never expose a developing close.
+- ``lookahead_on``: the security subprocess steps into the containing HTF bar
+  with ``barstate.isconfirmed=False`` and OHLCV aggregated from chart-timeframe
+  data, in historical and live mode alike. The TV idiom
+  ``request.security(sym, tf, close[1], lookahead_on)`` returns the latest
+  closed value exactly as it does on TV.
+
+  A bare ``close`` reads the containing period as it has built up to the
+  current chart bar. This is a **deliberate divergence**: TradingView hands
+  back the period's FINAL close on every chart bar of the period, which is
+  future data on all but the period's last bar. PyneCore never reproduces
+  lookahead, so a historical backtest cannot see a value the bar could not
+  have known.
 
 Cross-symbol HTF ``lookahead_*`` in live mode is bounded by chart-symbol
 aggregation: only same-symbol HTF contexts get the live HTF transport. Cross-symbol

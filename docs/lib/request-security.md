@@ -263,20 +263,24 @@ and they raise a clear error.
 |------------------------------------|---------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `barmerge.lookahead_off` (default) | Most recently CLOSED security bar (TV-faithful)                                                   | Most recently CLOSED security bar; each HTF period close is shipped via the chart-side `HTFAggregator` (the static `.ohlcv` file cannot grow at runtime). No developing exposure.                                                                                                                                                     |
 | `barmerge.lookahead_last_closed`   | Most recently CLOSED security bar (functionally equivalent to `lookahead_off`)                    | Most recently CLOSED security bar — uses the same closed-bar transport as `lookahead_off`; repaint-free.                                                                                                                                                                                                                              |
-| `barmerge.lookahead_on`            | Most recently CLOSED security bar — historical falls back to `lookahead_off` to avoid future-leak | Developing (containing) HTF bar with `barstate.isconfirmed=False`; OHLCV is aggregated from the chart timeframe by `HTFAggregator`. On HTF period close the just-closed bar is delivered first (so the security `bar_index` advances), then the new developing bar. TV-compatible `close[1]` idiom returns the previously closed bar. |
+| `barmerge.lookahead_on`            | Developing (containing) HTF bar, built from the chart timeframe up to the current chart bar — never the period's final value | Same as historical: developing (containing) HTF bar with `barstate.isconfirmed=False`; OHLCV is aggregated from the chart timeframe by `HTFAggregator`. On HTF period close the just-closed bar is delivered first (so the security `bar_index` advances), then the new developing bar. TV-compatible `close[1]` idiom returns the previously closed bar. |
 
 **Why `lookahead_last_closed`** — in historical backtests it matches `lookahead_off`, and in
 live mode it stays repaint-free (it never shows the developing security bar). Prefer it when
 you want stable last-closed values without depending on the TV `close[1]` idiom.
 
-**Why historical `lookahead_on` is degraded to `lookahead_off`** — TV's classical historical
-`lookahead_on` behavior is to expose the containing HTF bar's close on every chart bar,
-producing a future-leak that silently inflates backtest results. PyneCore deliberately does
-not reproduce this leak: in historical mode the closed bar is the only bar the subprocess
-ever runs. The TV idiom `request.security(..., lookahead_on)[1]` still returns the correct
-last-closed value (since `close[1]` is always the previously closed bar). In live mode the
-subprocess additionally steps into the developing bar so `close[0]` exposes the in-progress
-close as TV does.
+**Why a bare `close` under `lookahead_on` differs from TradingView** — TV's classical
+`lookahead_on` behavior is to expose the containing HTF bar's *final* close on every chart bar
+of the period, producing a future-leak that silently inflates backtest results. PyneCore does
+not reproduce lookahead (see [No lookahead, ever](../overview/compatibility.md)), so the
+subprocess is given the containing period **as aggregated up to the current chart bar** rather
+than being allowed to read that period's completed bar from its own data file. Historical and
+live mode take the same path — the `HTFAggregator` is fed on every chart bar, warmup included.
+
+The daily-pivot idiom `request.security(sym, "D", close[1], lookahead_on)` is **unaffected and
+TV-exact**: `close[1]` names a period that has genuinely closed. Only the bare `close[0]` form
+differs, and only inside an open period — on a period's last chart bar the developing bar and
+the closed bar are the same bar, so the values coincide there too.
 
 **Cross-symbol HTF** — the chart-side `HTFAggregator` aggregates the *chart* symbol's
 OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF

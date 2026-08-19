@@ -11,8 +11,10 @@ def main():
     # daily bar, and the inner ``close[1]`` reads the prior (just-closed) day.
     prev_on: Series[float] = request.security(
         syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
-    # Bare ``close`` under ``lookahead_on`` exposes the containing day's own final
-    # close — TV's classical historical future-leak.
+    # Bare ``close`` under ``lookahead_on`` reads the containing day AS IT HAS
+    # BUILT SO FAR — the chart-aggregated developing bar, never that day's final
+    # close. TradingView returns the final close here; PyneCore does not
+    # reproduce lookahead.
     cur_on: Series[float] = request.security(
         syminfo.tickerid, "D", close, lookahead=barmerge.lookahead_on)
     # ``lookahead_off`` sees only the last CLOSED daily bar, so ``close[1]`` there
@@ -82,9 +84,14 @@ def __test_htf_lookahead_on_steps_into_containing_period__(runner, log):
     (last-closed) semantics, so the standard daily-pivot idiom
     ``request.security(sym, "D", close[1], lookahead_on)`` read the day-before-
     yesterday's close (D-2) instead of yesterday's (D-1). The fix steps into the
-    containing daily bar: the inner ``close[1]`` then reads D-1, a bare ``close``
-    reads the containing day's own final close (TV's future-leak), and
+    containing daily bar: the inner ``close[1]`` then reads D-1, and
     ``lookahead_off`` stays one day further back (D-2).
+
+    A bare ``close`` reads the containing day AS BUILT SO FAR, not its final
+    close. TradingView returns the final close there — measured, TV probe 8 —
+    but that is future data on every chart bar before the day's last, so
+    PyneCore ships the chart-aggregated developing bar instead. The idiom the
+    fix was written for is unaffected: it lives entirely in ``close[1]``.
     """
     import sys
     import tempfile
@@ -109,9 +116,11 @@ def __test_htf_lookahead_on_steps_into_containing_period__(runner, log):
     for day in range(_N_DAYS):
         prev_on, cur_on, prev_off = rows[(day, 12)]
 
-        # cur_on: the containing day's own final close, available all day (leak).
-        assert cur_on == _daily_close(day), \
-            f"day {day} h12: cur_on={cur_on} != {_daily_close(day)} (containing-day close)"
+        # cur_on: the containing day BUILT SO FAR — at h12 that is the h12
+        # close, NOT the day's final h23 close. This is the no-lookahead
+        # guarantee: nothing here may depend on an hour that has not happened.
+        assert cur_on == _close(day, 12), \
+            f"day {day} h12: cur_on={cur_on} != {_close(day, 12)} (developing close)"
 
         # prev_on: yesterday's close via the inner close[1]; day 0 has no prior.
         if day == 0:

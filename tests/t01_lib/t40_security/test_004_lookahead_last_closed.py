@@ -60,13 +60,21 @@ def __test_lookahead_modes_historical_equivalence__(csv_reader, runner, log):
     log.info("lookahead_off / lookahead_last_closed / lookahead_on agree historically")
 
 
-def __test_get_confirmed_time_on_live_returns_current_period__(log):
-    """Live ``Lookahead.ON`` targets the developing period; off/historical target the closed one.
+def __test_get_confirmed_time_targets_the_closed_period__(log):
+    """``_get_confirmed_time`` always targets the CLOSED period, in every mode.
 
-    Live ``Lookahead.ON`` targets the CONTAINING (developing) period so the
-    subprocess steps into the open HTF bar. Historical/off/last_closed target
-    the most recent period CLOSED by the chart bar's close instant — the HTF
-    period's last chart bar already confirms it (TV ``lookahead_off``).
+    Stepping into the containing (developing) period is the job of the
+    developing-bar transport in ``__sec_signal__``, which handles same-symbol
+    ``Lookahead.ON`` in BOTH live and historical mode and returns before the
+    closed-only flow ever calls this function. Letting the function step into
+    the containing period as well would make the subprocess read that period's
+    already-complete bar from its own data file — the future leak PyneCore does
+    not reproduce.
+
+    So every state that reaches here targets the most recent period CLOSED by
+    the chart bar's close instant: the HTF period's last chart bar confirms it
+    (TV ``lookahead_off``). That includes cross-symbol ``Lookahead.ON``, which
+    has no aggregator and is the only ON flavour still routed through here.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -89,31 +97,24 @@ def __test_get_confirmed_time_on_live_returns_current_period__(log):
     curr_chart_boundary = _ms(2026, 5, 21, 11, 5)
     expected_period_after_boundary = _ms(2026, 5, 21, 11, 0)
 
-    state_on_live = SecurityState(
-        sec_id='s1', timeframe=tf, gaps_on=False, same_timeframe=False,
-        resampler=Resampler.get_resampler(tf), tz=utc,
-        lookahead=Lookahead.ON,
-        htf_aggregator=HTFAggregator(tf, utc),
-        is_live=True,
-        last_confirmed=expected_prev_period, chart_off=chart_off,
-    )
-    assert _get_confirmed_time(state_on_live, curr_chart) == expected_current_period
-    assert _get_confirmed_time(state_on_live, curr_chart_boundary) == \
-        expected_period_after_boundary
-
-    state_on_historical = SecurityState(
-        sec_id='s2', timeframe=tf, gaps_on=False, same_timeframe=False,
-        resampler=Resampler.get_resampler(tf), tz=utc,
-        lookahead=Lookahead.ON,
-        htf_aggregator=HTFAggregator(tf, utc),
-        is_live=False,  # historical
-        last_confirmed=0, chart_off=chart_off,
-    )
-    # Historical lookahead_on falls back to OFF semantics — the 10:45 bar
-    # closes at 11:00, exactly when the 10:00-11:00 HTF bar closes, so that
-    # period is already confirmed here (not on the next chart bar).
-    assert _get_confirmed_time(state_on_historical, curr_chart) == \
-        expected_current_period
+    # Same-symbol ``Lookahead.ON`` (an aggregator exists) never reaches this
+    # function in production — the developing transport returns first, in live
+    # AND historical mode. Called directly it must NOT step into the containing
+    # period: the 10:45 bar closes at 11:00, exactly when the 10:00-11:00 HTF
+    # bar closes, so that period is confirmed here, and the 11:05 bar (closing
+    # 11:20) is still inside the 11:00 period, which has NOT closed yet.
+    for label, is_live in (('live', True), ('historical', False)):
+        state_on = SecurityState(
+            sec_id=f's1_{label}', timeframe=tf, gaps_on=False, same_timeframe=False,
+            resampler=Resampler.get_resampler(tf), tz=utc,
+            lookahead=Lookahead.ON,
+            htf_aggregator=HTFAggregator(tf, utc),
+            is_live=is_live,
+            last_confirmed=expected_prev_period, chart_off=chart_off,
+        )
+        assert _get_confirmed_time(state_on, curr_chart) == expected_current_period, label
+        assert _get_confirmed_time(state_on, curr_chart_boundary) == \
+            expected_current_period, label
 
     state_off_live = SecurityState(
         sec_id='s3', timeframe=tf, gaps_on=False, same_timeframe=False,

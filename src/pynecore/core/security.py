@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 from .datetime import parse_timezone
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
-    FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
+    FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
     write_result,
 )
@@ -66,21 +66,29 @@ class Lookahead(Enum):
 
     ON
         TV ``lookahead_on`` semantics — the security context steps into
-        the bar that *contains* the chart bar's time. In live mode the
-        bar runs with ``barstate.isconfirmed=False`` and OHLCV aggregated
-        from the chart timeframe by ``HTFAggregator``; on HTF period
-        boundaries the closed bar is delivered first (snapshot saved),
-        then the fresh developing bar. In historical/backtest mode the
-        containing period's bar is already complete in the child's data
-        file, so the child reads its final OHLCV: a bare ``close`` on the
-        developing period reproduces TV's classical historical future-leak,
-        and the inner-``[1]`` daily-pivot idiom
-        ``request.security(sym, "D", close[1], lookahead_on)`` reads the
-        just-closed prior period (yesterday) — matching TradingView. Use
-        ``LAST_CLOSED`` for the repaint-free alternative. The outer-``[1]``
-        form ``request.security(..., close, lookahead_on)[1]`` is also
-        TV-compatible because ``close[1]`` on the chart series is the
-        previously delivered value.
+        the bar that *contains* the chart bar's time, and that bar runs
+        with ``barstate.isconfirmed=False`` over OHLCV aggregated from the
+        chart timeframe by ``HTFAggregator``; on HTF period boundaries the
+        closed bar is delivered first (snapshot saved), then the fresh
+        developing bar. **Historical and live mode take the same path**:
+        the aggregator is fed on every chart bar including warmup, and the
+        subprocess is given the developing OHLCV rather than being allowed
+        to read the containing period's already-complete bar from its own
+        data file.
+
+        That last point is a deliberate divergence from TradingView. TV
+        exposes the containing period's FINAL close and high on every chart
+        bar of the period (measured), which is future data everywhere except
+        the period's last bar. PyneCore never reproduces lookahead, so a
+        bare ``close`` here reads the period as it has built so far.
+
+        The inner-``[1]`` daily-pivot idiom
+        ``request.security(sym, "D", close[1], lookahead_on)`` is unaffected
+        and matches TradingView: ``close[1]`` is the just-closed prior period
+        (yesterday) whether or not the current period is still developing.
+        The outer-``[1]`` form ``request.security(..., close, lookahead_on)[1]``
+        reads the previously delivered chart-series value. Use ``LAST_CLOSED``
+        when you want explicit last-closed semantics.
 
         **Cross-symbol HTF** — when the security symbol differs from the
         chart symbol there is no chart-side aggregator (the chart OHLCV
@@ -386,13 +394,12 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
         ``lookahead_off`` merge rule: an HTF bar's final value is carried already
         by the chart bar whose close coincides with the HTF bar's close (the
         period's last chart bar), not by the next period's first bar.
-      * ``ON`` (same-symbol HTF, an aggregator exists): target is the CONTAINING
-        period's opening time — the subprocess steps into the developing HTF bar.
-        Live mode supplies developing OHLCV via the SyncBlock; historical/backtest
-        mode reads the containing period's already-complete bar straight from the
-        child's data file (TV's lookahead_on future-leak for a bare ``close``, the
-        just-closed prior period for an inner ``close[1]``). Cross-symbol HTF has
-        no aggregator and keeps OFF (last-closed) semantics.
+      * ``ON`` never reaches this function on a same-symbol HTF: the developing
+        transport in ``__sec_signal__`` handles it in both live and historical
+        mode and returns before the closed-only flow. Cross-symbol ``ON`` has no
+        aggregator, so it lands here and keeps OFF (last-closed) semantics while
+        the chart-side read returns ``na`` inside an open period
+        (``na_on_developing``).
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
@@ -466,31 +473,7 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
                 return opens[-1]
         return state.last_confirmed
 
-    if (state.lookahead is Lookahead.ON
-            and state.htf_aggregator is not None):
-        # ``lookahead_on`` on a same-symbol HTF (an aggregator exists): step into
-        # the containing period rather than the last-closed one — TV faithful.
-        # In backtest/historical mode the containing period's bar is already
-        # complete in the child's data file, so the child reads its final OHLCV:
-        # a bare ``close`` reproduces TV's classical lookahead_on future-leak,
-        # while an ``<expr>[1]`` inside the security (the daily-pivot idiom
-        # ``security(sym, "D", close[1], lookahead_on)``) reads the just-closed
-        # prior period — the whole point of the idiom. ``lookahead_last_closed``
-        # remains the repaint-free alternative. Cross-symbol HTF has no
-        # aggregator (chart OHLCV is the wrong instrument), so it keeps
-        # closed-bar semantics and the chart-side read returns ``na`` while a
-        # period is open (``na_on_developing``). ``chart_time`` (not
-        # ``close_time``) selects the containing period so the last chart bar of
-        # a period still maps to that period, not the next.
-        if state.session_starts is not None:
-            # Off-grid intraday session → anchor HTF bars to the session open,
-            # using the security's own exchange timezone.
-            return resampler.get_bar_time(
-                chart_time, state.session_tz, state.session_starts,
-                state.session_opening_hours)
-        return resampler.get_bar_time(chart_time, state.tz)
-
-    # OFF / LAST_CLOSED (and the historical ON fallback): the period preceding
+    # OFF / LAST_CLOSED: the period preceding
     # the one ``close_time`` falls in. When the chart bar's close lands exactly
     # on a period boundary, ``get_bar_time`` floors it to that boundary and the
     # period ending there is returned — the just-closed HTF bar is confirmed on
@@ -850,7 +833,19 @@ def create_chart_protocol(
                 chart_confirmed=bool(lib.barstate.isconfirmed),
             )
 
-            if state.is_live:
+            # ``Lookahead.ON`` takes this transport in HISTORICAL mode too. The
+            # child's own data file holds the containing period's COMPLETE bar,
+            # so letting it read that bar hands the script the period's final
+            # close and high on the period's very first chart bar — TV does
+            # exactly that, and PyneCore does not reproduce lookahead (see the
+            # module docstring). The aggregator is already fed on every chart
+            # bar including warmup, so the partial bar needed to avoid the leak
+            # is available here at no extra cost. ``FLAG_DEV_HISTORICAL`` tells
+            # the subprocess to keep history barstate: the transport is the live
+            # one, the bar is not.
+            dev_transport = state.is_live or state.lookahead is Lookahead.ON
+            hist_phase = 0 if state.is_live else FLAG_DEV_HISTORICAL
+            if dev_transport:
                 # Phase 1: synchronously deliver any just-closed HTF bar
                 if closed_bar is not None:
                     sync_block.set_developing_bar(
@@ -860,8 +855,9 @@ def create_chart_protocol(
                         closed_bar.period_start,
                     )
                     base_flags = (
-                        sync_block.get_flags(sec_id) & ~FLAG_IS_DEVELOPING
-                    ) | FLAG_CLOSED_OVERRIDE
+                        sync_block.get_flags(sec_id)
+                        & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL)
+                    ) | FLAG_CLOSED_OVERRIDE | hist_phase
                     sync_block.set_flags(sec_id, base_flags)
                     sync_block.set_target_time(sec_id, closed_bar.period_start)
                     state.last_confirmed = closed_bar.period_start
@@ -885,8 +881,9 @@ def create_chart_protocol(
                         dev_bar.close, dev_bar.volume, dev_bar.period_start,
                     )
                     base_flags = (
-                        sync_block.get_flags(sec_id) & ~FLAG_CLOSED_OVERRIDE
-                    ) | FLAG_IS_DEVELOPING
+                        sync_block.get_flags(sec_id)
+                        & ~(FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL)
+                    ) | FLAG_IS_DEVELOPING | hist_phase
                     sync_block.set_flags(sec_id, base_flags)
                     sync_block.set_target_time(sec_id, dev_bar.period_start)
                     state.new_period = True
@@ -895,7 +892,9 @@ def create_chart_protocol(
                     state.needs_wait = True
                     return
 
-                # OFF / LAST_CLOSED in live mode: closed-bar transport only.
+                # Closed-bar transport only: live OFF / LAST_CLOSED, and ON on a
+                # chart bar that just completed the period (Phase 1 shipped it,
+                # no fresh developing bar exists yet).
                 # ``new_period`` reflects whether a fresh HTF close just landed
                 # (drives ``gaps_on`` na/value selection in ``__sec_read__``).
                 # We already waited synchronously inside Phase 1, so no further
@@ -910,9 +909,9 @@ def create_chart_protocol(
                     )
                     sync_block.set_flags(sec_id, stale_flags)
                 return
-            # Warmup with an HTF aggregator falls through to the closed-only
-            # flow below; the aggregator state has already advanced so the
-            # live transition starts with the correct in-progress HTF bar.
+            # Historical OFF / LAST_CLOSED warmup falls through to the
+            # closed-only flow below; the aggregator state has already advanced
+            # so the live transition starts with the correct in-progress HTF bar.
 
         # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
         target_time = _get_confirmed_time(state, chart_time)

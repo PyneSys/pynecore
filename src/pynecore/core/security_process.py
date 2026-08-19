@@ -58,7 +58,7 @@ from typing import TYPE_CHECKING, Callable, cast
 
 from .security_shm import (
     SyncBlock, ResultBlock, write_na,
-    FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE,
+    FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
@@ -1048,6 +1048,12 @@ def security_process_main(
             flags = sync_block.get_flags(sec_id)
             is_developing = bool(flags & FLAG_IS_DEVELOPING)
             closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
+            # ``Lookahead.ON`` uses the pushed-OHLCV transport in historical
+            # mode too (the child's file holds the containing period's COMPLETE
+            # bar, which would leak the future). The transport is the live one,
+            # the chart bar is not — so the phase comes from the flag, not from
+            # the fact that OHLCV arrived over the SyncBlock.
+            dev_is_history = bool(flags & FLAG_DEV_HISTORICAL)
 
             # ── (4) Live LTF window round ──
             # Checked first: a streaming request.security_lower_tf round carries
@@ -1096,8 +1102,8 @@ def security_process_main(
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = True
                 barstate.isconfirmed = False
-                barstate.ishistory = False
-                barstate.isrealtime = True
+                barstate.ishistory = dev_is_history
+                barstate.isrealtime = not dev_is_history
                 barstate.islastconfirmedhistory = False
                 barstate.isnew = is_new_dev_period
 
@@ -1158,8 +1164,8 @@ def security_process_main(
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = False
                 barstate.isconfirmed = True
-                barstate.ishistory = False
-                barstate.isrealtime = True
+                barstate.ishistory = dev_is_history
+                barstate.isrealtime = not dev_is_history
                 barstate.islastconfirmedhistory = False
                 barstate.isnew = is_new_closed_period
 

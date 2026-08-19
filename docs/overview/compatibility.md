@@ -95,7 +95,7 @@ implementation status of all major Pine Script features.
 | `barmerge.gaps_on`      | full   | Returns `na` between periods           |
 | `lookahead_off`         | full   | Confirmed previous period (default)    |
 | `ignore_invalid_symbol` | full   | Returns `na` for missing symbols       |
-| `lookahead_on`          | —      | Deliberate safety-first exclusion      |
+| `lookahead_on`          | partial | Steps into the containing period, so the `close[1]` idiom matches TV; a bare `close` reads the period as built so far instead of its final value — see [No lookahead, ever](#no-lookahead-ever) |
 | `currency` parameter    | full   | Auto-converts via `CurrencyRateProvider` |
 
 ## Drawing Objects
@@ -202,6 +202,32 @@ equivalent in PyneCore:
 |----------------------|--------------------------------------------------|
 | Chart rendering      | No visual chart — output is CSV                  |
 | `input()` UI widgets | Inputs are function parameters or TOML config    |
+
+## No lookahead, ever
+
+PyneCore is a backtest and live-trading runtime, not a chart-analysis tool. Where TradingView
+hands a script data the bar could not have known yet, **PyneCore diverges from TradingView on
+purpose** and returns what was actually knowable at that moment.
+
+The reasoning is asymmetric. On a chart, repaint is visible and recoverable — you watch it
+happen and re-read the chart. In a backtest it silently inflates results, and in a live bot it
+produces decisions the market never supported. A loud, safe divergence beats a quiet, dangerous
+match, so this rule outranks TV parity everywhere it applies.
+
+| Situation | TradingView | PyneCore |
+|-----------------------------------------------------|--------------------------------------------|------------------------------------------------|
+| `lookahead_on`, bare `close`, inside an open HTF period | the period's FINAL close and high | the period as built up to the current chart bar |
+| `lookahead_on` with the `close[1]` idiom             | the just-closed prior period               | identical — no divergence                       |
+| `lookahead_off` / `lookahead_last_closed`            | the last CLOSED period                     | identical — no divergence                       |
+| Cross-symbol HTF `lookahead_on` inside an open period | the developing bar                        | `na` (nothing can be aggregated from the wrong instrument) |
+
+Note what is *not* affected: the canonical daily-pivot idiom
+`request.security(sym, "D", close[1], lookahead_on)` lives entirely in `close[1]`, reads a period
+that has genuinely closed, and matches TradingView exactly. Only the bare form — which is future
+data on every chart bar except a period's last — differs.
+
+`barmerge.lookahead_last_closed` is a PyneSys-native mode for stating "last closed" intent
+explicitly, without relying on the TV `close[1]` idiom at all.
 
 ## Precision
 

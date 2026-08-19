@@ -65,6 +65,10 @@ FLAG_LTF_CHART_DEVELOPING = 0x20  # within an LTF-window round, the chart bar is
                                   # the chart bar has closed (finalize, publish full period)
 FLAG_LTF_LIVE_PHASE = 0x40  # within an LTF-window round, the chart has crossed the
                             # warmup->live transition (barstate realtime, not history)
+FLAG_DEV_HISTORICAL = 0x80  # the pushed developing/closed OHLCV was aggregated on a
+                            # HISTORICAL chart bar (backtest or live warmup), so the
+                            # subprocess must keep history barstate instead of the
+                            # realtime phase the live transport implies
 
 
 def is_ltf_window(flags: int) -> bool:
