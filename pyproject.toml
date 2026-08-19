@@ -82,5 +82,5 @@ replay = "pynecore.providers.replay:ReplayProvider"
 
 # Social
 "X" = "https://x.com/pynesys"
-"Discord" = "https://discord.com/invite/jegnhtq6gy"
+"Discord" = "https://discord.pynesys.io"
 "Discussions" = "https://github.com/PyneSys/pynecore/discussions"
