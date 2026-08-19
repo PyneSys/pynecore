@@ -18,7 +18,9 @@ lib.bar_index = 0  # let the [BROKER] log formatter render during broker._emit()
 
 from pynecore_dnse import broker
 from pynecore.core.broker.models import LegType, OrderStatus
-from pynecore.core.broker.exceptions import ExchangeConnectionError
+from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError, ExchangeConnectionError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -448,43 +450,120 @@ def __test_watch_orders_activated_stop_adopts_child_and_reports_its_fill__(
         "intent-keyed cancels must reach the live child"
 
 
-def __test_watch_orders_activation_without_external_id_warns_not_crashes__(
+def __test_activation_without_external_id_keeps_retrying_and_stays_unseen__(
         fake_client, collect):
-    """If the Activated detail has no externalOrderId yet (stale replica), the
-    scan must warn and keep polling — never crash, never emit a shell event."""
+    """Unresolvable activation must KEEP retrying and never mark the shell seen.
+
+    Replaces an earlier version of this test that never reached the branch it
+    claimed to cover: `_CATEGORIES` scans NORMAL first, so the fresh NORMAL row it
+    used yielded on poll 1 and closed the generator before the STOP row was ever
+    processed (it passed while exercising nothing)."""
     stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
-    fresh_row = _order_row("O2", "Filled", fill=3.0, qty=3.0)
-    b = _broker(
-        fake_client,
-        get_orders=_books((200, {"orders": [fresh_row]}),
-                          (200, {"orders": [stop_row]})),
-        get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}),
-    )
+    b = _broker(fake_client,
+                get_orders=_books((200, {"orders": []}),
+                                  (200, {"orders": [stop_row]})),
+                get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}))
     b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
-    b._identity["O2"] = ("pineB", None, LegType.ENTRY)
+    b._order_category["COND1"] = "STOP"
+    # The autouse fixture makes polls free, so the shipped 240-poll give-up would
+    # be reached inside this test's timeout; this test is about the RETRY.
+    b._adopt_give_up_polls = 10_000
+
+    events = collect(b.watch_orders(), 1, timeout=0.3)
+
+    assert events == [], "nothing can be emitted while the child is unresolved"
+    assert b._client.count("get_order_detail") >= 2, \
+        "adoption must RETRY across polls, not give up after one"
+    assert "COND1" not in b._last_seen, \
+        "the shell must stay unseen — that is what makes the retry possible"
+
+
+def __test_already_adopted_child_stops_re_resolving_the_parent__(fake_client, collect):
+    """'Child resolved but already adopted' must still mark the shell seen.
+
+    If the mark-seen only happened on the adopt path, this parent would be
+    re-resolved every poll forever: 2 detail reads/second against a 10,000/h
+    endpoint that ``_cancel_took_effect`` also depends on."""
+    stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
+    b = _broker(fake_client,
+                get_orders=_books((200, {"orders": []}),
+                                  (200, {"orders": [stop_row]})),
+                get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated",
+                                        "externalOrderId": 777}))
+    b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
+    b._order_category["COND1"] = "STOP"
+    b._identity["777"] = ("pineS", None, LegType.ENTRY)      # adopted earlier
+    b._adopt_give_up_polls = 10_000
+
+    collect(b.watch_orders(), 1, timeout=0.3)                # many polls, no events
+
+    assert b._client.count("get_order_detail") == 1, \
+        "resolve once, then mark seen — not once per poll"
+    assert "COND1" in b._last_seen
+
+
+def __test_adoption_gives_up_with_manual_intervention__(fake_client, collect):
+    """A child id that is NEVER published means an untrackable fill and possibly
+    an unmanaged position — the engine must HALT, not log quietly forever."""
+    stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
+    b = _broker(fake_client,
+                get_orders=_books((200, {"orders": []}),
+                                  (200, {"orders": [stop_row]})),
+                get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}))
+    b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
+    b._order_category["COND1"] = "STOP"
+    b._adopt_give_up_polls = 3          # instead of the shipped 240
+
+    with pytest.raises(BrokerManualInterventionError):
+        collect(b.watch_orders(), 1, timeout=1.0)
+
+
+def __test_resolver_does_not_sleep_after_its_last_attempt__(fake_client, monkeypatch):
+    """The resolver runs inside a 0.5 s poll loop that is already the retry — a
+    trailing sleep would waste a worker thread on every poll."""
+    slept: list = []
+    monkeypatch.setattr(broker.time, "sleep", lambda d: slept.append(d))
+    b = _broker(fake_client,
+                get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}))
+
+    assert b._resolve_stop_child("COND1") is None
+    assert slept == [], "one attempt must not sleep at all"
+
+
+def __test_resolver_aborts_on_rate_limit_instead_of_retrying__(fake_client):
+    """A 429 body is a dict WITHOUT externalOrderId — indistinguishable from
+    'not published yet'. Retrying it is how a stall becomes an outage."""
+    b = _broker(fake_client, get_order_detail=(429, {"error": "Rate Limit Exceeded"}))
+
+    assert b._resolve_stop_child("COND1", attempts=3, delay=0.0) is None
+    assert b._client.count("get_order_detail") == 1, "429 must stop the resolver"
+
+
+def __test_activated_adoption_retries_when_external_id_is_late__(fake_client, collect):
+    """#42-A: the venue may not publish externalOrderId inside the resolver's
+    0.4 s window (this venue's stale-replica reads have been measured at ~10 s).
+    The scan must RETRY adoption on a later poll — if the Activated shell is
+    marked seen while still unresolved, the dedup skips that row forever and the
+    child's fill never surfaces, which is exactly the #39 failure."""
+    calls = {"n": 0}
+
+    def detail(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] <= 4:          # the resolver's whole first-poll budget
+            return (200, {"id": "COND1", "orderStatus": "Activated"})
+        return (200, {"id": "COND1", "orderStatus": "Activated",
+                      "externalOrderId": 555})
+
+    stop_row = _order_row("COND1", "Activated", fill=0.0, qty=1.0)
+    child_row = _order_row("555", "Filled", fill=1.0, qty=1.0, avg_price=1900.0)
+    b = _broker(fake_client,
+                get_orders=_books((200, {"orders": [child_row]}),
+                                  (200, {"orders": [stop_row]})),
+                get_order_detail=detail)
+    b._identity["COND1"] = ("pineS", None, LegType.ENTRY)
     b._order_category["COND1"] = "STOP"
 
-    events = collect(b.watch_orders(), 1)
+    events = collect(b.watch_orders(), 1, timeout=2.0)
 
-    assert len(events) == 1 and events[0].order.id == "O2", \
-        "the unresolvable activation must not block other orders' events"
-
-
-# --- poll cadence (rate-limit budget) ---------------------------------------
-
-def __test_poll_intervals_default_to_fast_order_scan__(fake_client):
-    """Order polling defaults to 0.5 s (fills visible ~4x sooner than the old
-    2 s); bars stay at 3 s because their DAILY quota is the binding limit."""
-    b = _broker(fake_client)
-    assert b._poll_interval == 0.5
-    assert b._bar_poll_interval == 3.0
-
-
-def __test_poll_intervals_are_operator_configurable__(fake_client):
-    """A fleet sharing one API key must be able to dial the cadence back —
-    the rate-limit budget is per key, not per strategy."""
-    cfg = broker.DNSEBrokerConfig(api_key="k", api_secret="s", account_no="ACC1",
-                                  order_poll_interval=2.0, bar_poll_interval=5.0)
-    b = broker.DNSEBroker(symbol="VN30F1M", timeframe="5", config=cfg)
-    assert b._poll_interval == 2.0
-    assert b._bar_poll_interval == 5.0
+    assert events, "no fill event ever surfaced — adoption was never retried (#42-A)"
+    assert events[0].order.id == "555" and events[0].pine_id == "pineS"

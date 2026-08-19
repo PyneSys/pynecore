@@ -37,8 +37,9 @@ from pynecore.core.broker.models import (
 from pynecore.types.ohlcv import OHLCV
 from pynecore.lib import log
 from pynecore.core.broker.exceptions import (
-    AuthenticationError, ExchangeConnectionError, ExchangeOrderRejectedError,
-    ExchangeRateLimitError, InsufficientMarginError, OrderDispositionUnknownError,
+    AuthenticationError, BrokerManualInterventionError, ExchangeConnectionError,
+    ExchangeOrderRejectedError, ExchangeRateLimitError, InsufficientMarginError,
+    OrderDispositionUnknownError,
 )
 from pynecore.core.broker.idempotency import (
     KIND_ENTRY, KIND_EXIT_TP, KIND_EXIT_SL, KIND_CLOSE)
@@ -145,6 +146,21 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         #: Cancel-confirmation poll (see ``_cancel_took_effect``); tunable for tests.
         self._cancel_verify_attempts: int = 6
         self._cancel_verify_delay: float = 0.7
+        #: Child-adoption retry shape for an Activated conditional whose
+        #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
+        #: seconds, so the schedule is deterministic in tests and cannot hot-spin
+        #: on a wall clock. At the 0.5 s default cadence: retry every poll for
+        #: 10 s (the measured stale-replica lag is ~10 s), then once per 10 s so a
+        #: permanently unresolvable shell cannot drain the Get-Order-Detail budget
+        #: (10,000/h — shared with ``_cancel_took_effect``, so starving it would
+        #: turn a fill-visibility bug into a cancel-verification bug), and give up
+        #: at ~2 min by escalating for manual intervention.
+        self._adopt_fast_polls: int = 20
+        self._adopt_slow_every: int = 20
+        self._adopt_give_up_polls: int = 240
+        #: parent order id -> adoption attempts so far. ADVISORY only: losing it
+        #: (restart) costs a faster retry, never correctness.
+        self._adopt_attempts: dict[str, int] = {}
         self._last_bar_ts: int = 0
         self._loan_id: int | None = None
 
@@ -521,22 +537,76 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._order_category[order.id] = tracked_category
         return [order]
 
-    def _resolve_stop_child(self, stop_id: str, attempts: int = 4, delay: float = 0.1
+    def _resolve_stop_child(self, stop_id: str, attempts: int = 1, delay: float = 0.0
                             ) -> "str | None":
         """The NORMAL-book child id of an Activated STOP conditional (or None).
 
         Only the DETAIL carries ``externalOrderId`` (the list view omits it).
-        Activation has already happened when this is called, so the id should be
-        present immediately; the brief retry covers the stale replica.
+
+        ONE attempt by default — unlike :meth:`_resolve_oco_lo`, which polls 6x
+        because it runs at PLACE time inside a synchronous call with no outer
+        retry. This runs inside the ``watch_orders`` poll loop, which already
+        retries every cycle (see ``_adopt_stop_child``); a second retry nested
+        here would only burn a worker thread and the Detail budget.
         """
-        for _ in range(attempts):
+        for i in range(attempts):
             status, body = self.client.get_order_detail(
                 self.account_id, stop_id, self.market_type, order_category="STOP")
+            if status == 429:
+                # A 429 body is a dict WITHOUT externalOrderId, i.e. it looks
+                # exactly like "child not published yet". Retrying a rate-limited
+                # endpoint is how a stall becomes an outage — stop, let the poll
+                # loop come back later.
+                return None
             external = body.get("externalOrderId") if isinstance(body, dict) else None
             if external:
                 return str(external)
-            time.sleep(delay)
+            if delay and i + 1 < attempts:
+                time.sleep(delay)   # never after the LAST attempt
         return None
+
+    async def _adopt_stop_child(self, parent_id: str, pine_id, from_entry,
+                                leg_type) -> bool:
+        """Adopt the NORMAL-book child of an Activated conditional.
+
+        :return: ``True`` once the child id is known (adopted now, or already
+            adopted); ``False`` while it is not — and on ``False`` the caller MUST
+            leave the parent row out of ``_last_seen``, because the shell's status
+            and fill never change again: a row marked seen here would be deduped
+            forever and the child's fill would stay invisible (#42-A, the latent
+            form of #39).
+        """
+        attempts = self._adopt_attempts.get(parent_id, 0) + 1
+        self._adopt_attempts[parent_id] = attempts
+        # Degrade the cadence past the fast window instead of hammering forever.
+        if attempts > self._adopt_fast_polls and attempts % self._adopt_slow_every:
+            return False
+        child = await asyncio.to_thread(self._resolve_stop_child, parent_id)
+        if child:
+            if child not in self._identity:
+                self._identity[child] = (pine_id, from_entry, leg_type)
+                self._order_category[child] = "NORMAL"
+                for ids in self._order_ids.values():
+                    if parent_id in ids and child not in ids:
+                        ids.append(child)
+                log.broker_info(
+                    "conditional ACTIVATED -> tracking child | parent=%s child=%s "
+                    "pine=%s polls=%d", parent_id, child, pine_id, attempts)
+            self._adopt_attempts.pop(parent_id, None)
+            return True   # resolved (adopted now or already adopted)
+        if attempts == 1 or attempts == self._adopt_fast_polls:
+            log.broker_warning(
+                "conditional ACTIVATED but no externalOrderId after %d poll(s) | "
+                "parent=%s pine=%s — the child fill is NOT trackable yet; retrying",
+                attempts, parent_id, pine_id)
+        if attempts >= self._adopt_give_up_polls:
+            self._adopt_attempts.pop(parent_id, None)
+            raise BrokerManualInterventionError(
+                f"DNSE conditional {parent_id} (pine={pine_id}) reported Activated "
+                f"but never published its child order id after {attempts} polls: "
+                f"its fill CANNOT be tracked and the account may hold an unmanaged "
+                f"position — check the venue and flatten manually")
+        return False
 
     def _resolve_oco_lo(self, oco_id: str, attempts: int = 6, delay: float = 0.15
                         ) -> "ExchangeOrder | None":
@@ -879,29 +949,34 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                     # is adopted only at the parent's Activated transition — #39),
                     # and a row marked seen pre-adoption would dedup its fill away.
                     continue  # not ours (yet)
-                self._last_seen[order_id] = (cumulative, raw_status)
                 if (raw_status.upper() == "ACTIVATED"
                         and self._order_category.get(order_id) == "STOP"):
                     # Two-book mechanic (CLAUDE.md): Activated = the conditional
                     # CLOSED and a NEW order now works the NORMAL book. The fill
                     # will arrive under the CHILD's id — adopt it into the
                     # parent's identity so the scan's normal path reports it.
-                    child = await asyncio.to_thread(self._resolve_stop_child, order_id)
-                    if child and child not in self._identity:
-                        self._identity[child] = (pine_id, from_entry, leg_type)
-                        self._order_category[child] = "NORMAL"
-                        for ids in self._order_ids.values():
-                            if order_id in ids and child not in ids:
-                                ids.append(child)
-                        log.broker_info(
-                            "conditional ACTIVATED -> tracking child | parent=%s "
-                            "child=%s pine=%s", order_id, child, pine_id)
-                    elif not child:
+                    try:
+                        resolved = await self._adopt_stop_child(
+                            order_id, pine_id, from_entry, leg_type)
+                    except BrokerManualInterventionError:
+                        raise            # designed escalation: the engine halts
+                    except Exception as exc:                      # noqa: BLE001
+                        # One odd reply must never kill fill detection for every
+                        # other order (this loop has no other per-row guard).
                         log.broker_warning(
-                            "conditional ACTIVATED but no externalOrderId yet | "
-                            "parent=%s pine=%s — child fill NOT yet trackable",
-                            order_id, pine_id)
+                            "child adoption raised for parent=%s: %s: %s — retrying",
+                            order_id, type(exc).__name__, exc)
+                        resolved = False
+                    if not resolved:
+                        # Deliberately NOT marked seen: the shell never changes
+                        # again, so this is the only thing that makes the next
+                        # poll retry (#42-A).
+                        continue
+                    self._last_seen[order_id] = (cumulative, raw_status)
                     continue  # events come from the child row, not the shell
+                # Any other status retires a pending adoption for this parent.
+                self._adopt_attempts.pop(order_id, None)
+                self._last_seen[order_id] = (cumulative, raw_status)
                 delta = max(cumulative - previous, 0.0)
                 event_type = ("filled" if order.status is OrderStatus.FILLED
                               else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
