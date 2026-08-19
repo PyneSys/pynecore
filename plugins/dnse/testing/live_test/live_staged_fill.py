@@ -13,15 +13,19 @@ from pynecore.types import PersistentSeries, Series
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
-    startState=input.int(0, "Start at state (0=F1 .. 7=F8)", minval=0, maxval=7)
+    startState=input.int(0, "Start at state (0=F1 .. 7=F8)", minval=0, maxval=7),
+    operatorCloses=input.bool(True, "Operator closes the position manually")
 ):
     FILL_TIMEOUT_BARS = 6
     MAX_RETRIES = 1
+    CLOSE_WAIT_BARS = 5
 
     state: PersistentSeries[int] = startState
     placedBar: PersistentSeries[int] = na(int)
     retries: PersistentSeries[int] = 0
     flattening: PersistentSeries[bool] = False
+    waitBars: PersistentSeries[int] = 0
+    halted: PersistentSeries[bool] = False
     protLvl: PersistentSeries[float] = na(float)
     announced: PersistentSeries[bool] = False
 
@@ -67,11 +71,24 @@ def main(
         placedBar = bar_index
 
     if pending and (not flattening) and strategy.position_size != 0:
-        log.info("[F] F{0} FILLED pos={1} avg={2} -> FLATTEN now (close E, cancel P and B " + "explicitly — no reliance on any cascade)", state + 1, strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
-        strategy.close("E", comment="FLATTEN")
         strategy.cancel("P")
         strategy.cancel("B")
         flattening = True
+        waitBars = 0
+        if operatorCloses:
+            log.info("[F] F{0} FILLED pos={1} avg={2}  >>> OPERATOR: CLOSE THIS POSITION " + "NOW (DNSE app) <<<  the strategy will NOT close it — it waits for " + "flat, then advances", state + 1, strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
+        else:
+            log.info("[F] F{0} FILLED pos={1} avg={2} -> ORACLE mode: strategy closes itself", state + 1, strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
+            strategy.close("E", comment="FLATTEN")
+
+    if flattening and strategy.position_size != 0 and operatorCloses and (not halted):
+        waitBars += 1
+        if waitBars >= CLOSE_WAIT_BARS:
+            log.error("[F] F{0} HALTED — still pos={1} after {2} bars. Either the position " + "is still open (CLOSE IT), or you closed it and the ENGINE DID NOT " + "DETECT the external close — that is a FINDING, record it. The " + "strategy will not close on a possibly-stale view.", state + 1, strategy.position_size, CLOSE_WAIT_BARS)
+            halted = True
+            strategy.cancel_all()
+        else:
+            log.info("[F] F{0} waiting for the manual close ({1}/{2}) — engine still " + "sees pos={3}", state + 1, waitBars, CLOSE_WAIT_BARS, strategy.position_size)
 
     if flattening and strategy.position_size == 0:
         log.info("[F] F{0} DONE — flat again; state {1}->{2}", state + 1, state, state + 1)
@@ -99,9 +116,12 @@ def main(
     DOUBLE_CHECK_PCT = -0.3
     openPnlPct = (strategy.opentrades.profit_percent(strategy.opentrades - 1) if strategy.position_size != 0 else 0.0)
     if strategy.position_size != 0 and openPnlPct < DOUBLE_CHECK_PCT:
-        log.error("[F] !!! DOUBLE-CHECK at {0}% — cancel_all + close_all", string.tostring(openPnlPct, "#.##"))
         strategy.cancel_all()
-        strategy.close_all(comment="DOUBLECHECK")
+        if operatorCloses:
+            log.error("[F] !!! DOUBLE-CHECK at {0}% — all orders cancelled. >>> OPERATOR: " + "CLOSE THE POSITION NOW <<< (the strategy does not auto-close in live " + "mode: a close on a stale view could REVERSE the position)", string.tostring(openPnlPct, "#.##"))
+        else:
+            log.error("[F] !!! DOUBLE-CHECK at {0}% — cancel_all + close_all (oracle)", string.tostring(openPnlPct, "#.##"))
+            strategy.close_all(comment="DOUBLECHECK")
 
     plot(state, "state", display=display.data_window)
     plot(strategy.position_size, "pos", display=display.data_window)

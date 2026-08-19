@@ -63,6 +63,34 @@ Live-L3 backtest mode (past window) is the ORACLE — a pre-launch gate, never a
 Live-L3 requires a FLAT account. Live-L4 is PASSIVE (no orders, no trading token) but must
 not run concurrently with order-placing tests (rate-limit contamination).
 
+### FILL tests: the OPERATOR closes the position (protocol from 2026-08-19)
+
+Pine's bar clock means a strategy cannot react to its own fill until the next bar
+closes — measured 60–90 s (F10: filled 13:26, could only flatten 13:28), and F11's
+earlier "observe 2 bars" design stretched that to ~3 minutes of UNPROTECTED
+exposure until the operator flattened by hand. Faster polling does not help: the
+plugin sees the fill in ~0.5 s, the *strategy* still waits for the bar.
+
+So live fill tests now run **operator-in-the-loop** (`operatorCloses` input,
+default `true`):
+
+1. The strategy places the stage and, on seeing the fill, **cancels the resting
+   legs only** (a cancel can never open a position) and SHOUTS
+   `>>> OPERATOR: CLOSE THIS POSITION NOW <<<`.
+2. **You close it in the DNSE app, ~3 s after the fill.** The strategy never sends
+   a close — issuing one against a stale view *after* a manual close would
+   REVERSE the position.
+3. The stage advances when the engine sees flat. If it does not within
+   `CLOSE_WAIT_BARS` (5), the run HALTS once, cancels everything, and says so:
+   either the position is still open, or **the engine failed to detect an external
+   close — which is itself a finding worth recording**.
+4. `operatorCloses = false` restores self-closing for the BACKTEST oracle (no
+   operator exists there); the oracle still completes all 8 stages.
+
+Preconditions unchanged: FLAT account (or a dedicated sub-account), supervised,
+DNSE app open — plus: **do not trade this account manually while a fill test runs**
+(a netting venue cannot distinguish your fills from the test's).
+
 ### Poll cadence and the rate-limit budget
 
 DNSE limits are **per API key AND per endpoint**, with two thresholds (requests/hour

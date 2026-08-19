@@ -21,16 +21,30 @@
 //
 // Per-stage lifecycle: PLACE (entry "E" [+ sibling "B" for OCA] + protection exit "P",
 // armed at placement — exits reach the venue pre-fill, measured 2026-08-13) -> FILL
-// (position != 0) -> FLATTEN (close "E"; cancel "P" and "B" EXPLICITLY — the #19 interim
-// rule: never rely on a cascade) -> FLAT (position == 0) -> advance.
+// (position != 0) -> CLOSE -> FLAT (position == 0) -> advance.
+//
+// WHO CLOSES (operator decision 2026-08-19, input `operatorCloses`):
+//   LIVE  (operatorCloses=true, the default): the OPERATOR closes the position
+//         manually in the DNSE app ~3 s after seeing the fill. The strategy NEVER
+//         sends a close — Pine's bar clock would hold the position ~60-90 s
+//         (measured: F10 filled 13:26, could only flatten 13:28), and a
+//         strategy close issued against a stale view AFTER a manual close would
+//         REVERSE the position. The strategy only cancels the resting legs
+//         (cancelling can never open a position) and then WAITS for flat.
+//         This also measures something new: whether the engine detects a close
+//         it did not issue (external-edit detection).
+//   ORACLE (operatorCloses=false): backtest has no operator, so the strategy
+//         closes itself — keeping the oracle runnable and byte-comparable.
 //
 // A stage that does not fill within FILL_TIMEOUT_BARS cancels everything, re-places once
 // with fresh levels, then SKIPs with a log — a quiet tape cannot wedge the sequence.
 //
 // SAFETY: 1 contract, pyramiding=0, frozen levels (a moving level would amend — DNSE
-// 500s on conditional amends, #18), the -0.3% double-check (cancel_all THEN close_all),
-// and no new placements after winEnd (mid-flight stages still complete their flatten).
-// LIVE PRECONDITION: FLAT account, supervised, DNSE app open (see LIVE_TEST_PLAN_L3).
+// 500s on conditional amends, #18), a -0.3% double-check that CANCELS everything and
+// shouts for the operator (it never auto-closes in live mode — see above), and no new
+// placements after winEnd.
+// LIVE PRECONDITION: FLAT account, supervised, DNSE app OPEN, and the operator READY
+// to close within ~3 s of each fill (see LIVE_TEST_PLAN_L3).
 strategy("STAGED FILL (L3+oracle)", overlay=true, pyramiding=0, initial_capital=500000000,
      default_qty_type=strategy.fixed, default_qty_value=1,
      margin_long=18.48, margin_short=18.48, slippage=1,
@@ -39,14 +53,21 @@ strategy("STAGED FILL (L3+oracle)", overlay=true, pyramiding=0, initial_capital=
 winStart   = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
 winEnd     = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
 startState = input.int(0, "Start at state (0=F1 .. 7=F8)", minval=0, maxval=7)
+// true  = LIVE: the operator closes manually; the strategy never sends a close.
+// false = ORACLE/backtest: the strategy closes itself (no operator exists).
+operatorCloses = input.bool(true, "Operator closes the position manually")
 
 FILL_TIMEOUT_BARS = 6
 MAX_RETRIES       = 1
+//: bars to wait for the operator's manual close before halting the sequence
+CLOSE_WAIT_BARS   = 5
 
 var int   state      = startState
 var int   placedBar  = na       // na = nothing placed for this stage yet
 var int   retries    = 0
 var bool  flattening = false
+var int   waitBars   = 0
+var bool  halted     = false
 var float protLvl    = na
 var bool  announced  = false
 
@@ -118,16 +139,43 @@ if canPlace and not pending and not flattening and state < 8
 
 // ---------------------------------------------------------------- fill -> flatten
 if pending and not flattening and strategy.position_size != 0
-    log.info("[F] F{0} FILLED pos={1} avg={2} -> FLATTEN now (close E, cancel P and B " +
-             "explicitly — no reliance on any cascade)",
-             state + 1, strategy.position_size,
-             str.tostring(strategy.position_avg_price, format.mintick))
-    strategy.close("E", comment="FLATTEN")
+    // Cancel the resting legs in BOTH modes: a cancel can never open a position,
+    // and leaving "P" armed after the position is gone would orphan a stop that
+    // could later fire and OPEN one.
     strategy.cancel("P")
     strategy.cancel("B")
     flattening := true
+    waitBars   := 0
+    if operatorCloses
+        log.info("[F] F{0} FILLED pos={1} avg={2}  >>> OPERATOR: CLOSE THIS POSITION " +
+                 "NOW (DNSE app) <<<  the strategy will NOT close it — it waits for " +
+                 "flat, then advances",
+                 state + 1, strategy.position_size,
+                 str.tostring(strategy.position_avg_price, format.mintick))
+    else
+        log.info("[F] F{0} FILLED pos={1} avg={2} -> ORACLE mode: strategy closes itself",
+                 state + 1, strategy.position_size,
+                 str.tostring(strategy.position_avg_price, format.mintick))
+        strategy.close("E", comment="FLATTEN")
 
 // ---------------------------------------------------------------- flat -> advance
+if flattening and strategy.position_size != 0 and operatorCloses and not halted
+    waitBars := waitBars + 1
+    if waitBars >= CLOSE_WAIT_BARS
+        log.error("[F] F{0} HALTED — still pos={1} after {2} bars. Either the position " +
+                  "is still open (CLOSE IT), or you closed it and the ENGINE DID NOT " +
+                  "DETECT the external close — that is a FINDING, record it. The " +
+                  "strategy will not close on a possibly-stale view.",
+                  state + 1, strategy.position_size, CLOSE_WAIT_BARS)
+        halted := true
+        strategy.cancel_all()
+    else
+        // NOTE: no apostrophes in Pine format strings — a LONE ' opens an ICU
+        // literal section and every {n} after it prints raw (measured 2026-08-19).
+        log.info("[F] F{0} waiting for the manual close ({1}/{2}) — engine still " +
+                 "sees pos={3}", state + 1, waitBars, CLOSE_WAIT_BARS,
+                 strategy.position_size)
+
 if flattening and strategy.position_size == 0
     log.info("[F] F{0} DONE — flat again; state {1}->{2}", state + 1, state, state + 1)
     placedBar  := na
@@ -160,10 +208,16 @@ if pending and not flattening and strategy.position_size == 0 and
 DOUBLE_CHECK_PCT = -0.3
 openPnlPct = strategy.position_size != 0 ? strategy.opentrades.profit_percent(strategy.opentrades - 1) : 0.0
 if strategy.position_size != 0 and openPnlPct < DOUBLE_CHECK_PCT
-    log.error("[F] !!! DOUBLE-CHECK at {0}% — cancel_all + close_all",
-              str.tostring(openPnlPct, "#.##"))
     strategy.cancel_all()
-    strategy.close_all(comment="DOUBLECHECK")
+    if operatorCloses
+        log.error("[F] !!! DOUBLE-CHECK at {0}% — all orders cancelled. >>> OPERATOR: " +
+                  "CLOSE THE POSITION NOW <<< (the strategy does not auto-close in live " +
+                  "mode: a close on a stale view could REVERSE the position)",
+                  str.tostring(openPnlPct, "#.##"))
+    else
+        log.error("[F] !!! DOUBLE-CHECK at {0}% — cancel_all + close_all (oracle)",
+                  str.tostring(openPnlPct, "#.##"))
+        strategy.close_all(comment="DOUBLECHECK")
 
 plot(state, "state", display=display.data_window)
 plot(strategy.position_size, "pos", display=display.data_window)

@@ -167,6 +167,15 @@ Trading-token workflow (OTP mint, ~8h TTL, status check): `plugins/dnse/tools/RE
   `sed 's/\x1b\[[0-9;]*m//g' f.log | grep -aoE '\[(L1|F|BROKER)\][^[]*' > f_evidence.txt`
   and park the raw log in `backup/deleteable/`.
 
+## Pine format strings: NEVER use a lone apostrophe
+
+`log.*` / `str.format` follow ICU quoting — a single `'` opens a LITERAL section,
+so `"the operator's close {1}"` drops the apostrophe AND prints `{1}` raw
+(placeholders before it still work, so it looks like a partial bug). A balanced
+pair (`close('T26') phase={0}`) is harmless — quotes are consumed cosmetically and
+later placeholders still substitute. Escape a real quote as `''`. Measured
+2026-08-19; symptom: literal `{n}` in a log line.
+
 ## Pine Script language reference
 
 Authoritative Pine v6 reference (syntax, built-ins, `strategy.*` semantics):
