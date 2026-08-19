@@ -15,10 +15,16 @@
 //          close*(1-farAwayPct/100), same oca.cancel group, NO exit legs,
 //          NO explicit cancel of the far leg — the cascade is the subject.
 //          A protective exit IS armed on NEAR at placement (suite standard).
-//   FILL   near fills -> FLATTEN IMMEDIATELY (same bar). The far leg's venue
-//          state is graded AFTERWARDS from the venue record — the cascade fires
-//          at fill time and 'Canceled' is permanent, so nothing is gained by
-//          holding the position.
+//   FILL   near fills -> cancel ONLY the protective exit; the OPERATOR closes the
+//          position manually ~3 s later (operatorCloses=true, the live default —
+//          same protocol as the staged fill ladder).
+//
+// MEASUREMENT INTEGRITY (#42-B, found in review 2026-08-19): this script must
+// NEVER cancel the FAR leg. FAR's venue state IS the measurement — if the script
+// swept it (the earlier cancel_all did), the venue would read Canceled whether or
+// not the engine cascade worked, and the test could not fail. So: on a fill only
+// "P" is cancelled, FAR is left to the cascade, and if the cascade is broken FAR
+// stays working for the operator to cancel by hand AFTER grading.
 //
 // SAFETY (learned the hard way, 2026-08-19): an earlier version held the
 // position for 2 bars 'to observe' the far leg. With Pine's bar clock that is
@@ -42,8 +48,13 @@ strategy("LIVE OCA entry group", overlay=true, pyramiding=0, initial_capital=500
 winStart   = input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START")
 winEnd     = input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END")
 farAwayPct = input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0)
+// true  = LIVE: the operator closes the filled position manually (~3 s).
+// false = ORACLE/backtest: the strategy closes itself (no operator exists).
+operatorCloses = input.bool(true, "Operator closes the position manually")
 
-OBSERVE_BARS = 0   // FLATTEN ON SIGHT — see the safety note below
+//: no-fill hygiene (#42-D): if NEAR never triggers, sweep and finish rather than
+//: leaving three orders resting at the venue.
+NOFILL_TIMEOUT_BARS = 10
 
 var int  placedBar  = na
 var int  filledBar  = na
@@ -88,33 +99,56 @@ if canPlace and not pending and not done
 // ---------------------------------------------------------------- fill -> observe
 if pending and na(filledBar) and strategy.position_size > 0
     filledBar := bar_index
+    // Cancel NOTHING here: "P" stays armed as protection through the operator's
+    // close window (removing it at the fill would leave the position naked for
+    // exactly the seconds it is exposed), and FAR belongs to the cascade.
+    if operatorCloses
+        log.info("[OCA] NEAR FILLED pos={0} avg={1}  >>> OPERATOR: CLOSE THIS POSITION " +
+                 "NOW (DNSE app) <<<  this script cancels only the protective exit; " +
+                 "the FAR leg is left untouched because its venue state IS the " +
+                 "measurement",
+                 strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
+    else
+        log.info("[OCA] NEAR FILLED pos={0} avg={1} -> ORACLE mode: strategy closes itself",
+                 strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
+        strategy.close_all(comment="F11-flat")
+
+// NO-FILL TIMEOUT (#42-D): nothing filled, so nothing is being measured — sweeping
+// is safe and leaves the venue clean.
+if pending and na(filledBar) and bar_index - placedBar >= NOFILL_TIMEOUT_BARS and not done
+    log.info("[OCA] NO FILL after {0} bars — nothing to measure; cancelling NEAR, FAR " +
+             "and the protective exit, run over", NOFILL_TIMEOUT_BARS)
     strategy.cancel_all()
-    strategy.close_all(comment="F11-flat")
-    log.info("[OCA] NEAR FILLED pos={0} avg={1} — FLATTENING IMMEDIATELY (same bar). " +
-             "Grade the far leg from the VENUE RECORD afterwards: it must read " +
-             "Canceled (the cascade fires at fill time; the record is permanent)",
-             strategy.position_size, str.tostring(strategy.position_avg_price, format.mintick))
+    done := true
 
 // FLIP GUARD (oracle observability + live safety): a short position here means the
 // far leg FILLED after the near fill — the cascade did not cancel it.
 if strategy.position_size < 0
-    log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — far leg FILLED after the " +
-              "near fill: oca.cancel cascade ABSENT (#33 bug demonstrated). Flattening.",
-              strategy.position_size)
+    // The far leg FILLED after the near fill: the cascade is absent and the
+    // measurement is complete, so sweeping is now safe.
     strategy.cancel_all()
-    strategy.close_all(comment="F11-flipguard")
+    if operatorCloses
+        log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — the FAR leg FILLED after " +
+                  "the near fill: cascade ABSENT (#33 regression). Orders cancelled. " +
+                  ">>> OPERATOR: CLOSE THE POSITION NOW <<<", strategy.position_size)
+    else
+        log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — cascade ABSENT (#33 " +
+                  "regression). Flattening (oracle).", strategy.position_size)
+        strategy.close_all(comment="F11-flipguard")
     done := true
 
 // ---------------------------------------------------------------- cleanup
-if not na(filledBar) and bar_index > filledBar and not done
-    // belt-and-braces: re-issue the sweep once in case the fill-bar dispatch
-    // was rejected; a no-op when the first flatten already worked.
-    strategy.cancel_all()
-    strategy.close_all(comment="F11-clean")
+// Flat again (operator closed, or oracle self-closed) -> the run is over. Note we
+// deliberately do NOT cancel_all here either: FAR must be graded from the venue
+// first. If the cascade worked it is already Canceled; if it did not, it is still
+// working and the operator cancels it by hand after reading the record.
+if not na(filledBar) and strategy.position_size == 0 and not done
+    // Flat: NOW retire the protective exit — left armed it would be an orphan
+    // stop that could later fire and OPEN a position.
+    strategy.cancel("P")
     done := true
-
-if done and strategy.position_size == 0 and not na(filledBar)
-    log.info("[OCA] === F11 DONE — verify at the venue: flat, nothing working. ===")
-    filledBar := na
+    log.error("[OCA] === F11 DONE — GRADE NOW at the venue: FAR must read Canceled " +
+              "(engine cascade). If FAR is still WORKING the cascade failed (#33 " +
+              "regression) — record it, then cancel FAR manually. ===")
 
 plot(strategy.position_size, "pos", display=display.data_window)

@@ -71,7 +71,6 @@ def main(
         placedBar = bar_index
 
     if pending and (not flattening) and strategy.position_size != 0:
-        strategy.cancel("P")
         strategy.cancel("B")
         flattening = True
         waitBars = 0
@@ -91,6 +90,7 @@ def main(
             log.info("[F] F{0} waiting for the manual close ({1}/{2}) — engine still " + "sees pos={3}", state + 1, waitBars, CLOSE_WAIT_BARS, strategy.position_size)
 
     if flattening and strategy.position_size == 0:
+        strategy.cancel("P")
         log.info("[F] F{0} DONE — flat again; state {1}->{2}", state + 1, state, state + 1)
         placedBar = na
         flattening = False

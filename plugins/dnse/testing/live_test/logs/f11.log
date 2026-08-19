@@ -1,0 +1,45 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-18 06:50 ━━━━━━━━━━━━━━━━━ 0:00:23 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-18 13:51:23+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-18 13:51:23+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-18 13:51:23+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-18 13:51:23+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-18 13:50:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-18 13:50:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-18 13:51:00+0700] bar:    501 INFO     [OHLCV] O=1871.2 H=1871.5 L=1870.3 C=1871.4 V=473
+[2026-08-18 13:52:00+0700] bar:    502 INFO     [OHLCV] O=1871.4 H=1871.8 L=1870.5 C=1871.8 V=1098
+[2026-08-18 13:53:00+0700] bar:    503 INFO     [OHLCV] O=1871.7 H=1871.9 L=1870.9 C=1871.4 V=428
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [OHLCV] O=1871.0 H=1871.4 L=1869.7 C=1870.7 V=830
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [OCA] === F11 OCA entry-group cancel — near buy-stop + far sell-stop -5%, NO explicit far cancel. Oracle: far cancelled on near fill. ===
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [OCA] bar=504 close=1870.7 pos=0 pending=no filledBar=NaN
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [OCA] PLACE near buy-stop=1871.9 + far sell-stop=1777.2 (oca.cancel g33) — on the near FILL the far leg must be CANCELLED by the engine cascade; watch  
+                                                [BROKER] for the cascade cancel, then verify at the venue                                                                                               
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY BUY id='NEAR' qty=1.0 type=stop stop=1871.9
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY BUY id='NEAR' qty=1.0 type=stop stop=1871.9 -> ['da203hg6p09g1n1vipo0']
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY SELL id='FAR' qty=1.0 type=stop stop=1777.1
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY SELL id='FAR' qty=1.0 type=stop stop=1777.1 -> ['da203hg6p09g1n1vipog']
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] event CREATED id=da203hg6p09g1n1vipog side=sell qty=1.0 filled=0.0 pine='FAR' leg=entry
+[2026-08-18 13:54:00+0700] bar:    504 INFO     [BROKER] event CREATED id=da203hg6p09g1n1vipo0 side=buy qty=1.0 filled=0.0 pine='NEAR' leg=entry
+[2026-08-18 13:55:00+0700] bar:    505 INFO     [OHLCV] O=1870.3 H=1873.8 L=1869.3 C=1872.1 V=3494
+[2026-08-18 13:55:00+0700] bar:    505 INFO     [OCA] bar=505 close=1872.1 pos=0 pending=yes filledBar=NaN
+[2026-08-18 13:56:00+0700] bar:    506 INFO     [OHLCV] O=1872.3 H=1873.3 L=1871.1 C=1871.5 V=1168
+[2026-08-18 13:56:00+0700] bar:    506 INFO     [OCA] bar=506 close=1871.5 pos=0 pending=yes filledBar=NaN
+[2026-08-18 13:57:00+0700] bar:    507 INFO     [OHLCV] O=1871.5 H=1871.6 L=1868.0 C=1868.1 V=1664
+[2026-08-18 13:57:00+0700] bar:    507 INFO     [OCA] bar=507 close=1868.1 pos=0 pending=yes filledBar=NaN
+[2026-08-18 13:58:00+0700] bar:    508 INFO     [OHLCV] O=1868.1 H=1870.7 L=1866.3 C=1870.6 V=2722
+[2026-08-18 13:58:00+0700] bar:    508 INFO     [OCA] bar=508 close=1870.6 pos=0 pending=yes filledBar=NaN
+[2026-08-18 13:59:00+0700] bar:    509 INFO     [OHLCV] O=1870.6 H=1871.8 L=1868.8 C=1869.0 V=1416
+[2026-08-18 13:59:00+0700] bar:    509 INFO     [OCA] bar=509 close=1869 pos=0 pending=yes filledBar=NaN
+[2026-08-18 14:00:00+0700] bar:    510 INFO     [OHLCV] O=1868.9 H=1870.4 L=1866.9 C=1870.2 V=1745
+[2026-08-18 14:00:00+0700] bar:    510 INFO     [OCA] bar=510 close=1870.2 pos=0 pending=yes filledBar=NaN
+
+[2026-08-18 14:01:44+0700] bar:    510 INFO     [BROKER] run stopped (completed) position=flat equity=459,650,865.00 VND

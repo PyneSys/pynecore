@@ -1,0 +1,44 @@
+  ____
+ |  _ \ _   _ _ __   ___
+ | |_) | | | | '_ \ / _ \
+ |  __/| |_| | | | |  __/
+ |_|    \__, |_| |_|\___|
+        |___/       Core™
+
+✓ Fetching symbol info...
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+✓ Downloading OHLCV data... 2026-08-19 02:34 ━━━━━━━━━━━━━━━━━ 0:00:09 / 0:00:00
+✓ Loading PyneCore...
+[2026-08-19 09:34:11+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-08-19 09:34:11+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-08-19 09:34:11+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[2026-08-19 09:34:11+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-08-19 09:33:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-08-19 09:33:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-08-19 09:34:00+0700] bar:    501 INFO     [OHLCV] O=1873.5 H=1874.4 L=1873.1 C=1874.4 V=654
+[2026-08-19 09:35:00+0700] bar:    502 INFO     [OHLCV] O=1874.3 H=1875.2 L=1873.0 C=1873.5 V=1009
+[2026-08-19 09:36:00+0700] bar:    503 INFO     [OHLCV] O=1873.5 H=1874.2 L=1873.5 C=1874.0 V=250
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [OHLCV] O=1874.0 H=1874.4 L=1873.5 C=1873.9 V=626
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [OCA] === F11 OCA entry-group cancel — near buy-stop + far sell-stop -5%, NO explicit far cancel. Oracle: far cancelled on near fill. ===
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [OCA] bar=504 close=1873.9 pos=0 pending=no filledBar=NaN
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [OCA] PLACE near buy-stop=1874.2 + far sell-stop=1780.2 (oca.cancel g33) — on the near FILL the far leg must be CANCELLED by the engine cascade; watch  
+                                                [BROKER] for the cascade cancel, then verify at the venue                                                                                               
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY BUY id='NEAR' qty=1.0 type=stop stop=1874.2
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY BUY id='NEAR' qty=1.0 type=stop stop=1874.2 -> ['da2he286p09g1n1vkb7g']
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY SELL id='FAR' qty=1.0 type=stop stop=1780.2
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY SELL id='FAR' qty=1.0 type=stop stop=1780.2 -> ['da2he2g6p09g1n1vkb80']
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] event CREATED id=da2he2g6p09g1n1vkb80 side=sell qty=1.0 filled=0.0 pine='FAR' leg=entry
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] event CREATED id=da2he286p09g1n1vkb7g side=buy qty=1.0 filled=0.0 pine='NEAR' leg=entry
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] conditional ACTIVATED -> tracking child | parent=da2he286p09g1n1vkb7g child=49236 pine=NEAR
+[2026-08-19 09:37:00+0700] bar:    504 INFO     [BROKER] event FILLED id=49236 side=buy qty=1.0 filled=1.0 price=1874.3 pine='NEAR' leg=entry
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [OHLCV] O=1873.6 H=1874.5 L=1873.4 C=1874.0 V=299
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [BROKER] position size=1.0 sign=1.0 avg=1874.3 (after filled pine='NEAR')
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [BROKER] cancelling CANCEL id='FAR'
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [OCA] bar=505 close=1874 pos=1 pending=yes filledBar=NaN
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [OCA] NEAR FILLED pos=1 avg=1874.3 — observing 2 bars: far leg must now be GONE at the venue (pre-#33-fix it stays working = BUG)
+[2026-08-19 09:38:00+0700] bar:    505 INFO     [BROKER] event CANCELLED id=da2he2g6p09g1n1vkb80 side=sell qty=1.0 filled=0.0 pine='FAR' leg=entry
+[2026-08-19 09:39:00+0700] bar:    506 INFO     [OHLCV] O=1874.2 H=1874.4 L=1871.3 C=1871.6 V=1284
+[2026-08-19 09:39:00+0700] bar:    506 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=da2he2g6p09g1n1vkb80 side=sell qty=1.0 filled=0.0 pine='FAR' leg=entry)
+[2026-08-19 09:39:00+0700] bar:    506 INFO     [OCA] bar=506 close=1871.6 pos=1 pending=yes filledBar=505
+
+[2026-08-19 09:40:58+0700] bar:    506 INFO     [BROKER] run stopped (completed) position=1 equity=459,377,604.00 VND

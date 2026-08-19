@@ -13,7 +13,8 @@ from pynecore.types import PersistentSeries, Series
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
-    crossPct=input.float(1.0, "Trigger below market %", minval=0.1, maxval=5.0)
+    crossPct=input.float(1.0, "Trigger below market %", minval=0.1, maxval=5.0),
+    operatorCloses=input.bool(True, "Operator closes the position manually")
 ):
     FILL_TIMEOUT_BARS = 3
 
@@ -39,9 +40,12 @@ def main(
         log.info("[XS] PLACE buy-stop trigger={0} while close={1} — CROSSED at placement: " + "Pine fills IMMEDIATELY; a resting order here = the #34 gap", string.tostring(trig, format.mintick), string.tostring(close, format.mintick))
 
     if pending and (not flattening) and strategy.position_size > 0:
-        log.info("[XS] FILLED pos={0} avg={1} (bars-to-fill={2}, expect 1) -> flatten", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick), bar_index - placedBar)
-        strategy.close_all(comment="F10-flat")
         flattening = True
+        if operatorCloses:
+            log.info("[XS] FILLED pos={0} avg={1} (bars-to-fill={2}, expect 1)  >>> " + "OPERATOR: CLOSE THIS POSITION NOW (DNSE app) <<<  the strategy will " + "NOT close it", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick), bar_index - placedBar)
+        else:
+            log.info("[XS] FILLED pos={0} avg={1} (bars-to-fill={2}, expect 1) -> ORACLE " + "mode: strategy closes itself", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick), bar_index - placedBar)
+            strategy.close_all(comment="F10-flat")
 
     if flattening and strategy.position_size == 0:
         log.info("[XS] === F10 DONE — filled and flat. Verify at the venue: flat, nothing " + "working. ===")

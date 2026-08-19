@@ -1,0 +1,5 @@
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+[t14] 14:20:05 phase=continuous reference 1880.0 (daily close)
+[t14] 14:20:05 phase=continuous PLACED id=528386 cat=NORMAL price=1786.0 stop=None filled=0.0
+[t14r] 14:20:05 phase=continuous PLACED id=528396 cat=NORMAL price=1767.2 stop=None filled=0.0
+[t14] 14:20:05 phase=continuous resting into the auction: T14=528386 rider=528396 — cancel attempts start at 14:30:30

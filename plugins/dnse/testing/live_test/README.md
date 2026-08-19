@@ -93,8 +93,8 @@ earlier "observe 2 bars" design stretched that to ~3 minutes of UNPROTECTED
 exposure until the operator flattened by hand. Faster polling does not help: the
 plugin sees the fill in ~0.5 s, the *strategy* still waits for the bar.
 
-So live fill tests now run **operator-in-the-loop** (`operatorCloses` input,
-default `true`):
+All three live fill tests — the staged ladder, F10 and F11 — run
+**operator-in-the-loop** (`operatorCloses` input, default `true`):
 
 1. The strategy places the stage and, on seeing the fill, **cancels the resting
    legs only** (a cancel can never open a position) and SHOUTS
@@ -108,6 +108,13 @@ default `true`):
    close — which is itself a finding worth recording**.
 4. `operatorCloses = false` restores self-closing for the BACKTEST oracle (no
    operator exists there); the oracle still completes all 8 stages.
+5. **The protective exit stays armed until the position is actually flat** — it is
+   the only cover during the operator's close window — and is retired immediately
+   afterwards so it cannot linger as an orphan stop that later OPENS a position.
+6. **F11 never cancels its FAR leg.** That leg's venue state IS the measurement of
+   the engine cascade; a script-side sweep would make the test unfailable (#42-B).
+   If the cascade is broken, FAR is left working for the operator to cancel by
+   hand after grading.
 
 Preconditions unchanged: FLAT account (or a dedicated sub-account), supervised,
 DNSE app open — plus: **do not trade this account manually while a fill test runs**

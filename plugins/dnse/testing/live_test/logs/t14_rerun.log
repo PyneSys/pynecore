@@ -1,0 +1,16 @@
+[LIVE DNSE] rest=https://openapi.dnse.com.vn ws=wss://ws-openapi.dnse.com.vn
+[t14] 14:22:25 phase=continuous reference 1880.0 (daily close)
+[t14] 14:22:26 phase=continuous PLACED id=538916 cat=NORMAL price=1786.0 stop=None filled=0.0
+[t14r] 14:22:26 phase=continuous PLACED id=538926 cat=NORMAL price=1767.2 stop=None filled=0.0
+[t14] 14:22:26 phase=continuous resting into the auction: T14=538916 rider=538926 — cancel attempts start at 14:30:30
+[t14] 14:30:06 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 1)
+[t14] 14:32:06 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 2)
+[t14] 14:34:06 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 3)
+[t14] 14:36:06 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 4)
+[t14] 14:38:06 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 5)
+[t14] 14:40:07 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 6)
+[t14] 14:42:07 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 7)
+[t14] 14:44:07 phase=atc CANCEL REFUSED http=400 code=CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION msg={'status': 400, 'code': 'CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION', 'message': 'Can not cancel the (attempt 8)
+
+VERDICT t14 (provisional): refusals=8 unexpected-accepts=0 post-close T14=New rider=New
+GRADE NEXT MORNING at the venue: both orders must be Expired, nothing of ours working. Refusal code expected on every ATC attempt.

@@ -13,9 +13,10 @@ from pynecore.types import PersistentSeries, Series
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
-    farAwayPct=input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0)
+    farAwayPct=input.float(5.0, "Far leg distance %", minval=0.1, maxval=10.0),
+    operatorCloses=input.bool(True, "Operator closes the position manually")
 ):
-    OBSERVE_BARS = 0
+    NOFILL_TIMEOUT_BARS = 10
 
     placedBar: PersistentSeries[int] = na(int)
     filledBar: PersistentSeries[int] = na(int)
@@ -43,23 +44,29 @@ def main(
 
     if pending and na(filledBar) and strategy.position_size > 0:
         filledBar = bar_index
+        if operatorCloses:
+            log.info("[OCA] NEAR FILLED pos={0} avg={1}  >>> OPERATOR: CLOSE THIS POSITION " + "NOW (DNSE app) <<<  this script cancels only the protective exit; " + "the FAR leg is left untouched because its venue state IS the " + "measurement", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
+        else:
+            log.info("[OCA] NEAR FILLED pos={0} avg={1} -> ORACLE mode: strategy closes itself", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
+            strategy.close_all(comment="F11-flat")
+
+    if pending and na(filledBar) and bar_index - placedBar >= NOFILL_TIMEOUT_BARS and (not done):
+        log.info("[OCA] NO FILL after {0} bars — nothing to measure; cancelling NEAR, FAR " + "and the protective exit, run over", NOFILL_TIMEOUT_BARS)
         strategy.cancel_all()
-        strategy.close_all(comment="F11-flat")
-        log.info("[OCA] NEAR FILLED pos={0} avg={1} — FLATTENING IMMEDIATELY (same bar). " + "Grade the far leg from the VENUE RECORD afterwards: it must read " + "Canceled (the cascade fires at fill time; the record is permanent)", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
+        done = True
 
     if strategy.position_size < 0:
-        log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — far leg FILLED after the " + "near fill: oca.cancel cascade ABSENT (#33 bug demonstrated). Flattening.", strategy.position_size)
         strategy.cancel_all()
-        strategy.close_all(comment="F11-flipguard")
+        if operatorCloses:
+            log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — the FAR leg FILLED after " + "the near fill: cascade ABSENT (#33 regression). Orders cancelled. " + ">>> OPERATOR: CLOSE THE POSITION NOW <<<", strategy.position_size)
+        else:
+            log.error("[OCA] !!! POSITION FLIPPED SHORT pos={0} — cascade ABSENT (#33 " + "regression). Flattening (oracle).", strategy.position_size)
+            strategy.close_all(comment="F11-flipguard")
         done = True
 
-    if (not na(filledBar)) and bar_index > filledBar and (not done):
-        strategy.cancel_all()
-        strategy.close_all(comment="F11-clean")
+    if (not na(filledBar)) and strategy.position_size == 0 and (not done):
+        strategy.cancel("P")
         done = True
-
-    if done and strategy.position_size == 0 and (not na(filledBar)):
-        log.info("[OCA] === F11 DONE — verify at the venue: flat, nothing working. ===")
-        filledBar = na
+        log.error("[OCA] === F11 DONE — GRADE NOW at the venue: FAR must read Canceled " + "(engine cascade). If FAR is still WORKING the cascade failed (#33 " + "regression) — record it, then cancel FAR manually. ===")
 
     plot(strategy.position_size, "pos", display=display.data_window)

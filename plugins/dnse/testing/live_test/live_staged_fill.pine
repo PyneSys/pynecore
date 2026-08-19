@@ -139,10 +139,9 @@ if canPlace and not pending and not flattening and state < 8
 
 // ---------------------------------------------------------------- fill -> flatten
 if pending and not flattening and strategy.position_size != 0
-    // Cancel the resting legs in BOTH modes: a cancel can never open a position,
-    // and leaving "P" armed after the position is gone would orphan a stop that
-    // could later fire and OPEN one.
-    strategy.cancel("P")
+    // Cancel the OCA sibling now (the #19 interim rule: never rely on a cascade),
+    // but KEEP "P" armed — it is the only protection during the operator's close
+    // window; it is retired below once the position is actually flat.
     strategy.cancel("B")
     flattening := true
     waitBars   := 0
@@ -177,6 +176,9 @@ if flattening and strategy.position_size != 0 and operatorCloses and not halted
                  strategy.position_size)
 
 if flattening and strategy.position_size == 0
+    // Flat: retire the protection. Left armed it would be an orphan stop that
+    // could later fire and OPEN a position.
+    strategy.cancel("P")
     log.info("[F] F{0} DONE — flat again; state {1}->{2}", state + 1, state, state + 1)
     placedBar  := na
     flattening := false
