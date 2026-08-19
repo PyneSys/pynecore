@@ -118,6 +118,17 @@ def main() -> int:
         print(f"token file:  MISSING or empty  ({args.state})")
     else:
         minted_at = state.get("minted_at")
+        # A corrupt/hand-edited state file must read as NOT GOOD, never crash:
+        # a traceback here gives the caller no verdict line at all (measured
+        # 2026-08-19 with a string minted_at).
+        if isinstance(minted_at, str):
+            try:
+                minted_at = float(minted_at)
+            except ValueError:
+                print(f"minted:      (UNREADABLE — minted_at={minted_at!r})")
+                minted_at = None
+        if not isinstance(minted_at, (int, float)):
+            minted_at = None
         if minted_at:
             minted = datetime.fromtimestamp(minted_at, ICT)
             age_h = (time.time() - minted_at) / 3600

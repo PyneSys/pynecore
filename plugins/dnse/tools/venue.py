@@ -65,11 +65,16 @@ def session_phase() -> str:
         return f"UNKNOWN ({type(exc).__name__})"
 
 
-def token_verdict() -> str:
-    """The canonical check, run as its own tool rather than reimplemented."""
+def token_verdict(state: str | None = None) -> str:
+    """The canonical check, run as its own tool rather than reimplemented.
+
+    ``state`` overrides the token file (used to exercise the not-GOOD path
+    without touching the real token — see rule 2: a check must be red-first).
+    """
     tool = REPO / "plugins" / "dnse" / "tools" / "token_status.py"
+    cmd = [sys.executable, str(tool)] + (["--state", state] if state else [])
     try:
-        out = subprocess.run([sys.executable, str(tool)], capture_output=True,
+        out = subprocess.run(cmd, capture_output=True,
                              text=True, timeout=60, cwd=REPO)
         for line in reversed(out.stdout.splitlines()):
             if line.startswith("VERDICT:"):
@@ -118,7 +123,7 @@ def fmt_order(o) -> str:
 def cmd_status(args) -> int:
     b = broker(args.symbol)
     print(f"phase   : {session_phase()}   ({datetime.now(ICT):%Y-%m-%d %H:%M:%S} ICT)")
-    print(f"token   : {token_verdict()}")
+    print(f"token   : {token_verdict(args.token_state)}")
     try:
         position, working = read_state(b, args.symbol)
     except Exception as exc:                                          # noqa: BLE001
@@ -205,6 +210,15 @@ def cmd_order(args) -> int:
 
 
 def cmd_cancel(args) -> int:
+    # Writes need a live trading token (~8h TTL, so it expires most mornings).
+    # Refuse with a clear message rather than surfacing an AuthenticationError
+    # from inside the cancel loop after some ids were already attempted.
+    verdict = token_verdict(args.token_state)
+    if not verdict.startswith("GOOD"):
+        print(f"REFUSING to write — token is not GOOD: {verdict}\n"
+              f"mint one first: .venv/bin/python plugins/dnse/tools/refresh_token.py "
+              f"--send   (then --otp <code>)")
+        return EXIT_UNKNOWN
     b = broker(args.symbol)
     worst = EXIT_OK
     for oid in args.ids:
@@ -267,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbol", default=SYMBOL)
+    ap.add_argument("--token-state", default=None,
+                    help="override the trading-token state file (for testing the "
+                         "not-GOOD path without touching the real token)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     sub.add_parser("flat")
