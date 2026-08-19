@@ -132,6 +132,6 @@ The Pyne ecosystem combines open-source and commercial components:
 
 Join our community to get help and share your experiences:
 
-- [Discord Server](https://discord.com/invite/jegnhtq6gy)
+- [Discord Server](https://discord.pynesys.io)
 - [Reddit](https://www.reddit.com/r/PyneSys)
 - [GitHub Discussions](https://github.com/PyneSys/pynecore/discussions)
