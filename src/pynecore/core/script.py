@@ -77,6 +77,7 @@ class Script:
     pyramiding: int = 1
     calc_on_order_fills: bool = False
     calc_on_every_tick: bool = False
+    calc_on_every_history_tick: bool = False
     max_bars_back: int = 0
     timeframe: str | None = None
     timeframe_gaps: bool = True
@@ -351,6 +352,7 @@ class Script:
             pyramiding: int = 0,
             calc_on_order_fills=False,
             calc_on_every_tick=False,
+            calc_on_every_history_tick=False,
 
             max_bars_back=0,
 
@@ -399,6 +401,8 @@ class Script:
         :param pyramiding: The maximum number of entries allowed in the same direction
         :param calc_on_order_fills: Specifies whether the strategy should be recalculated after an order is filled
         :param calc_on_every_tick: Specifies whether the strategy should be recalculated on each realtime tick
+        :param calc_on_every_history_tick: Specifies whether the strategy should be recalculated on every
+                                          available tick of a historical bar instead of once at its close
         :param max_bars_back: The length of the historical buffer the script keeps for every
         :param backtest_fill_limits_assumption: Limit order execution threshold in ticks
         :param default_qty_type: Specifies the units used for `default_qty_value`
@@ -448,6 +452,7 @@ class Script:
         script.pyramiding = pyramiding
         script.calc_on_order_fills = calc_on_order_fills
         script.calc_on_every_tick = calc_on_every_tick
+        script.calc_on_every_history_tick = calc_on_every_history_tick
 
         script.max_bars_back = max_bars_back
 

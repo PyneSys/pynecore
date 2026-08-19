@@ -47,23 +47,24 @@ implementation status of all major Pine Script features.
 
 ## Strategy Simulator
 
-| Feature                 | Status | Notes                               |
-|-------------------------|--------|-------------------------------------|
-| Entry/exit orders       | full   | Market, limit, stop orders          |
-| Position management     | full   | Long, short, pyramiding             |
-| Take-profit / stop-loss | full   | Price, ticks, percent-based         |
-| Trailing stops          | full   | Offset-based trailing               |
-| OCA groups              | full   | One-Cancels-All order groups        |
-| Commission models       | full   | Fixed, percent, per-contract        |
-| Margin calls            | full   | TradingView-exact 10-step algorithm |
-| Slippage                | full   | Configurable tick-based slippage    |
-| Equity tracking         | full   | Equity curve, drawdown, P&L         |
-| Trade logging           | full   | CSV export with all trade fields    |
-| `strategy.close_all()`  | full   |                                     |
-| `strategy.cancel_all()` | full   |                                     |
-| Risk management         | full   | `strategy.risk.*` functions         |
-| `calc_on_order_fills`   | full   | Re-execution after fills, var rollback / varip persist |
-| `calc_on_every_tick`    | full   | Live mode only — no effect on historical bars          |
+| Feature                      | Status  | Notes                                                                                                                                       |
+|------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| Entry/exit orders            | full    | Market, limit, stop orders                                                                                                                  |
+| Position management          | full    | Long, short, pyramiding                                                                                                                     |
+| Take-profit / stop-loss      | full    | Price, ticks, percent-based                                                                                                                 |
+| Trailing stops               | full    | Offset-based trailing                                                                                                                       |
+| OCA groups                   | full    | One-Cancels-All order groups                                                                                                                |
+| Commission models            | full    | Fixed, percent, per-contract                                                                                                                |
+| Margin calls                 | full    | TradingView-exact 10-step algorithm                                                                                                         |
+| Slippage                     | full    | Configurable tick-based slippage                                                                                                            |
+| Equity tracking              | full    | Equity curve, drawdown, P&L                                                                                                                 |
+| Trade logging                | full    | CSV export with all trade fields                                                                                                            |
+| `strategy.close_all()`       | full    |                                                                                                                                             |
+| `strategy.cancel_all()`      | full    |                                                                                                                                             |
+| Risk management              | full    | `strategy.risk.*` functions                                                                                                                 |
+| `calc_on_order_fills`        | full    | Re-execution after fills, var rollback / varip persist                                                                                      |
+| `calc_on_every_tick`         | full    | Live mode only — no effect on historical bars                                                                                               |
+| `calc_on_every_history_tick` | partial | Four passes per bar (per sub-bar with the magnifier); each pass sees the bar as built so far — see [No lookahead, ever](#no-lookahead-ever) |
 
 ## Request Module
 
@@ -214,12 +215,13 @@ happen and re-read the chart. In a backtest it silently inflates results, and in
 produces decisions the market never supported. A loud, safe divergence beats a quiet, dangerous
 match, so this rule outranks TV parity everywhere it applies.
 
-| Situation | TradingView | PyneCore |
-|-----------------------------------------------------|--------------------------------------------|------------------------------------------------|
-| `lookahead_on`, bare `close`, inside an open HTF period | the period's FINAL close and high | the period as built up to the current chart bar |
-| `lookahead_on` with the `close[1]` idiom             | the just-closed prior period               | identical — no divergence                       |
-| `lookahead_off` / `lookahead_last_closed`            | the last CLOSED period                     | identical — no divergence                       |
-| Cross-symbol HTF `lookahead_on` inside an open period | the developing bar                        | `na` (nothing can be aggregated from the wrong instrument) |
+| Situation                                                               | TradingView                                    | PyneCore                                                   |
+|-------------------------------------------------------------------------|------------------------------------------------|------------------------------------------------------------|
+| `lookahead_on`, bare `close`, inside an open HTF period                 | the period's FINAL close and high              | the period as built up to the current chart bar            |
+| `lookahead_on` with the `close[1]` idiom                                | the just-closed prior period                   | identical — no divergence                                  |
+| `lookahead_off` / `lookahead_last_closed`                               | the last CLOSED period                         | identical — no divergence                                  |
+| Cross-symbol HTF `lookahead_on` inside an open period                   | the developing bar                             | `na` (nothing can be aggregated from the wrong instrument) |
+| An intra-bar pass (`calc_on_order_fills`, `calc_on_every_history_tick`) | the bar's COMPLETED open/high/low/close/volume | the bar as built up to that pass's point in it             |
 
 Note what is *not* affected: the canonical daily-pivot idiom
 `request.security(sym, "D", close[1], lookahead_on)` lives entirely in `close[1]`, reads a period
@@ -228,6 +230,17 @@ data on every chart bar except a period's last — differs.
 
 `barmerge.lookahead_last_closed` is a PyneSys-native mode for stating "last closed" intent
 explicitly, without relying on the TV `close[1]` idiom at all.
+
+The same rule governs every body execution that stands mid-bar. `calc_on_order_fills` re-runs
+the body when an order fills, and `calc_on_every_history_tick` runs it at every point of the
+bar the broker emulator walks: without the magnifier the four assumed nodes — open, the extreme
+nearest the open, the other extreme, close — and with it, the end of every sub-bar. TradingView
+hands all of those passes the bar's finished OHLCV, so a pass standing at the open can already
+read the high that only happens later; PyneCore gives each pass the bar truncated to its own
+point, with `volume` accrued to match and `hl2` / `hlc3` / `ohlc4` / `hlcc4` recomputed from the
+truncated values. Only the bar's last, definitive execution sees the completed bar — which is
+also the only execution a strategy without these flags ever gets, so default strategies are
+unaffected.
 
 ## Precision
 

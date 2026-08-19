@@ -2811,7 +2811,7 @@ class SimPosition(PositionBase):
         near, far = (self.h, self.l) if self.h - self.o < self.o - self.l else (self.l, self.h)
         return near if node == 1 else far
 
-    def _mark_to_last_fill(self) -> None:
+    def _mark_to_last_fill(self, price: float | None = None) -> None:
         """Reprice the emulator for a calc_on_order_fills re-execution.
 
         A COOF body execution sees the broker emulator AT THE POINT OF THE BAR
@@ -2826,10 +2826,16 @@ class SimPosition(PositionBase):
         ``process_orders`` re-anchors ``c`` and the open P&L to the bar close at
         the start of the next pass, so nothing needs undoing.
 
-        On the magnified path real sub-bars replace the assumed one, there is no
-        cursor, and the last fill stays the emulator's current price.
+        On the magnified path real sub-bars replace the assumed one and there is
+        no cursor: a fill-triggered pass marks at the last fill, while a
+        ``calc_on_every_history_tick`` pass — which owes nothing to a fill —
+        passes the sub-bar it stands at the end of as ``price``.
+
+        :param price: Explicit mark price, overriding both the cursor's path
+            node and the last fill.
         """
-        self.c = (self._path_price(self._coof_cursor) if self._coof_cursor >= 0
+        self.c = (price if price is not None
+                  else self._path_price(self._coof_cursor) if self._coof_cursor >= 0
                   else self._last_fill_price)
         if self.size != 0.0:
             self.openprofit = self.size * (self.c - self.avg_price) * _account_point_value()

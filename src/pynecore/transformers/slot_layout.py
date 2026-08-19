@@ -89,7 +89,7 @@ class _Slot:
     series_elem: str | None = None  # series slots only: element type name ('float') or None
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
-    varip: bool = False  # var slots only
+    varip: bool = False  # var and flag slots only
 
 
 @dataclass
@@ -115,13 +115,18 @@ class ScopeLayout:
         """
         return self._add(_Slot(len(self.slots), 'var', name, init, varip=varip))
 
-    def add_flag(self, name: str) -> int:
+    def add_flag(self, name: str, *, varip: bool = False) -> int:
         """Allocate a lazy-init flag slot (init ``False``).
 
         :param name: Name of the variable the flag belongs to.
+        :param varip: Whether the guarded variable is ``varip``. The flag then
+            has to survive the var rollback with it: rolled back to ``False`` on
+            the first bar, a discarded re-execution re-runs the initializer and
+            the ``varip`` loses what the earlier pass of that bar put there.
         :return: The allocated slot index.
         """
-        return self._add(_Slot(len(self.slots), 'flag', f'{name}·flag', ast.Constant(value=False)))
+        return self._add(_Slot(len(self.slots), 'flag', f'{name}·flag',
+                               ast.Constant(value=False), varip=varip))
 
     def add_series(self, name: str, max_bars_back: ast.expr, elem: str | None = None) -> int:
         """Allocate a series slot (``_make_state`` puts a fresh ``SeriesImpl`` here).

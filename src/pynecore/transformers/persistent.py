@@ -177,7 +177,7 @@ class PersistentTransformer(ast.NodeTransformer):
             # Lazy pattern: value slot + flag slot, initializer runs on first call
             slot = scope_layout.add_var(var_name, ast.Constant(value=None), varip=varip)
             self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
-            flag = scope_layout.add_flag(var_name)
+            flag = scope_layout.add_flag(var_name, varip=varip)
             value = cast(ast.expr, self.visit(node.value))
             return ast.If(
                 test=ast.UnaryOp(op=ast.Not(),

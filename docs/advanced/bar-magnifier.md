@@ -226,6 +226,25 @@ var_count += 1    # always bar_index+1 (rollback ensures no extra increments)
 varip_count += 1  # bar_index+1 + number of re-executions on fill bars
 ```
 
+## calc_on_every_history_tick
+
+`calc_on_every_history_tick=True` runs the body at every point of a historical bar the broker
+emulator walks, whether or not anything filled there. It uses the same rollback machinery as
+`calc_on_order_fills` above, and makes that flag redundant: every fill already has a pass
+standing on it.
+
+Without the magnifier the points are the assumed path's four nodes, so the body runs four times
+per bar. With the magnifier the real sub-bars replace the assumed path, and the body runs once
+at the end of every sub-bar — a 60m chart magnified by 1m data therefore executes it 60 times
+per bar.
+
+Each pass sees the bar **as built up to its own point**: `high` and `low` are the running
+extremes, `close` is the price there, `volume` is what has accrued, and the derived sources
+(`hl2`, `hlc3`, `ohlc4`, `hlcc4`) follow. TradingView hands every pass the completed bar
+instead, which is lookahead — see
+[No lookahead, ever](../overview/compatibility.md#no-lookahead-ever). Only the bar's last
+execution, the definitive one, sees the whole bar.
+
 ## Limitations
 
 - **Sub-bar data must align**: the LTF data must divide evenly into the chart TF (e.g., 10m into

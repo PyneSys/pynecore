@@ -189,6 +189,66 @@ def _round_price(price: float, tick_decimals: int | None):
     return round(price, precision)
 
 
+# noinspection PyShadowingNames
+def _set_path_bar(lib: ModuleType, node: int, bar: tuple[float, float, float, float, float],
+                  near_is_high: bool) -> None:
+    """
+    Show the bar as it had built at one node of the emulator's assumed path.
+
+    A body that runs mid-bar — a ``calc_on_order_fills`` re-execution, or a
+    ``calc_on_every_history_tick`` pass — must not see the bar's final extremes.
+    TradingView hands those out anyway; PyneCore does not reproduce lookahead,
+    so ``high``/``low`` here carry the running max/min over the nodes walked SO
+    FAR, ``close`` is this node's price, and ``volume`` is the quarter-by-quarter
+    share TradingView's 4-ticks-per-bar model implies (measured: cumulative
+    ``(node + 1) / 4`` of the bar's volume, exact on every probed bar).
+
+    ``open`` never moves — it is the one price the bar starts with.
+
+    :param lib: The ``pynecore.lib`` module whose price globals are rewritten
+    :param node: Path node, 0..3 (open, nearer extreme, farther extreme, close);
+                 ``>= 3`` restores the whole bar
+    :param bar: The bar's own ``(open, high, low, close, volume)``
+    :param near_is_high: Whether the emulator walks the high first. Decided by
+                         :meth:`SimPosition._path_price` on the TICK GRID, and
+                         passed in rather than recomputed, so what the script
+                         sees cannot disagree with where orders fill.
+    """
+    o, h, lo, c, v = bar
+    if node < 3:
+        walk = (o, h, lo) if near_is_high else (o, lo, h)
+        seen = walk[:node + 1]
+        h, lo, c = max(seen), min(seen), walk[node]
+        v *= (node + 1) / 4.0
+    _set_partial_bar(lib, o, h, lo, c, v)
+
+
+# noinspection PyShadowingNames
+def _set_partial_bar(lib: ModuleType, o: float, h: float, lo: float, c: float,
+                     v: float) -> None:
+    """
+    Rewrite the price globals to a bar built only up to some point inside it.
+
+    ``open`` is passed in unchanged — the bar starts with it — and the derived
+    sources are recomputed from the truncated OHLC so a mid-bar body cannot read
+    ``hlc3`` and get the completed bar back.
+
+    :param lib: The ``pynecore.lib`` module whose price globals are rewritten
+    :param o: Bar open
+    :param h: High so far
+    :param lo: Low so far
+    :param c: Price at this point of the bar
+    :param v: Volume accumulated so far
+    """
+    props = vars(lib)
+    props['open'], props['high'], props['low'] = o, h, lo
+    props['close'], props['volume'] = c, v
+    props['hl2'] = (h + lo) / 2.0
+    props['hlc3'] = (h + lo + c) / 3.0
+    props['ohlc4'] = (o + h + lo + c) / 4.0
+    props['hlcc4'] = (h + lo + 2 * c) / 4.0
+
+
 # noinspection PyShadowingNames,PyUnusedLocal
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
                         round_decimals: int | None, last_bar_index: int | None = None,
@@ -1873,13 +1933,20 @@ class ScriptRunner:
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
             coof_active = (is_strat and self.script.calc_on_order_fills
                            and not self.script.process_orders_on_close)
+            # `calc_on_every_history_tick` runs the body at every node of the
+            # emulator's assumed path of a HISTORICAL bar instead of once at its
+            # close. It subsumes `calc_on_order_fills`: every fill already has a
+            # pass standing on it, and TV adds no further execution when both are
+            # set. `process_orders_on_close` does NOT disable it (both measured
+            # 2026-08-18 on BINANCE:BTCUSDT 60m) — unlike COOF.
+            ceht_active = is_strat and self.script.calc_on_every_history_tick
             # Companion to the var snapshot: a discarded re-execution advances
             # the function instances' internal state too (``ta.tr``'s previous
             # close and friends), and the committed run must see the bar-start
             # state — dropping the instances via ``reset()`` loses their
             # history instead (see ``RootChildSnapshot``).
             child_snapshot: instance_state.RootChildSnapshot | None = None
-            if coof_active:
+            if coof_active or ceht_active:
                 var_snapshot = instance_state.RootVarSnapshot(root_keys)
                 child_snapshot = instance_state.RootChildSnapshot(root_keys)
             elif is_live:
@@ -2027,6 +2094,13 @@ class ScriptRunner:
                 # emulator there for the next. Past the second extreme only the
                 # closing leg is left, which belongs to the definitive execution
                 # below — that is what ends the loop, no arbitrary cap needed.
+                # A re-executing body stands mid-bar, so it must see the bar as
+                # built up to its node — not the completed bar's extremes, which
+                # are still in the future at nodes 0..2. The emulator decides on
+                # the tick grid which extreme it walks first; the visible bar
+                # follows that same decision so the two cannot disagree.
+                bar_prices = (lib.open, lib.high, lib.low, lib.close, lib.volume)
+                near_is_high = sim._path_price(1) == sim.h
                 cursor = sim._path_node
                 while new_fills > old_fills and cursor <= _LAST_PATH_NODE:
                     if var_snapshot.has_vars:  # type: ignore
@@ -2038,12 +2112,62 @@ class ScriptRunner:
                     # body sizes and what its orders fill at below.
                     sim._coof_cursor = cursor
                     sim._mark_to_last_fill()
+                    _set_path_bar(lib, cursor, bar_prices, near_is_high)
                     _run_libs_and_main()
+                    # Restore BEFORE processing orders: ``process_orders`` re-reads
+                    # the bar's OHLC from these globals, and a truncated bar would
+                    # hide the rest of the path from the emulator.
+                    _set_path_bar(lib, 3, bar_prices, near_is_high)
                     old_fills = new_fills
                     sim.process_orders()
                     bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
                     cursor = max(cursor + 1, sim._path_node)
+                sim._coof_cursor = -1
+                sim.new_closed_trades[:] = bar_closed_trades
+                # The real execution of this bar follows — it must see the
+                # bar-start instance state, not the discarded runs' advances.
+                _drop_discarded_run(drawing_snapshot)
+                child_snapshot.restore()  # type: ignore[union-attr]
+
+            # noinspection PyProtectedMember
+            def _ceht_loop():
+                """CEHT: run the body at every node of the bar's assumed path."""
+                # Broker mode has no assumed path — real exchange ticks drive
+                # execution there, and fills arrive asynchronously.
+                if broker_mode or not ceht_active:
+                    self._process_orders(position)
+                    return
+                sim = sim_position
+                sim._coof_cursor = -1
+                sim.process_orders()
+                # ``process_orders`` clears ``new_closed_trades`` on entry — it is
+                # this BAR's closes, not this pass's — so each pass's closes are
+                # collected before the next pass wipes them (see ``_coof_loop``).
+                bar_closed_trades = list(sim.new_closed_trades)
+                drawing_snapshot.save()
+                child_snapshot.save()  # type: ignore[union-attr]
+                # Unlike COOF, the passes do not depend on a fill: the body runs
+                # at nodes 0..2 whatever the emulator did, and the bar's
+                # definitive execution at node 3 follows at the call site.
+                bar_prices = (lib.open, lib.high, lib.low, lib.close, lib.volume)
+                near_is_high = sim._path_price(1) == sim.h
+                for cursor in range(_LAST_PATH_NODE + 1):
+                    if var_snapshot.has_vars:  # type: ignore
+                        var_snapshot.restore()  # type: ignore
+                    _drop_discarded_run(drawing_snapshot)
+                    child_snapshot.restore()  # type: ignore[union-attr]
+                    # Set BEFORE the body: the cursor prices both what this body
+                    # sizes and what its orders fill at (see ``_coof_loop``).
+                    sim._coof_cursor = cursor
+                    sim._mark_to_last_fill()
+                    _set_path_bar(lib, cursor, bar_prices, near_is_high)
+                    _run_libs_and_main()
+                    # Restore BEFORE processing orders: ``process_orders``
+                    # re-reads the bar's OHLC from these globals.
+                    _set_path_bar(lib, 3, bar_prices, near_is_high)
+                    sim.process_orders()
+                    bar_closed_trades.extend(sim.new_closed_trades)
                 sim._coof_cursor = -1
                 sim.new_closed_trades[:] = bar_closed_trades
                 # The real execution of this bar follows — it must see the
@@ -2152,11 +2276,17 @@ class ScriptRunner:
                     self.first_price = lib.close  # type: ignore
                 self.last_price = lib.close  # type: ignore
 
-                # calc_on_order_fills path: snapshot, process, re-execute on fills
+                # Intra-bar re-execution path: snapshot, process orders, run the
+                # body again per node (CEHT) or per fill (COOF)
                 if var_snapshot and position and not lib._strategy_suppressed:
                     if var_snapshot.has_vars:
                         var_snapshot.save()
-                    _coof_loop()
+                    # CEHT is a HISTORICAL-bar feature; the live loop below keeps
+                    # the COOF path, driven by `calc_on_every_tick` instead.
+                    if ceht_active:
+                        _ceht_loop()
+                    else:
+                        _coof_loop()
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                 elif is_strat and position and not lib._strategy_suppressed:
@@ -2800,9 +2930,12 @@ class ScriptRunner:
                             child_snapshot=None):
         """
         Magnified bar iteration: iterate sub-TF windows, process orders at sub-bar
-        resolution, execute script once per chart bar.
+        resolution, execute script once per chart bar — or, under
+        ``calc_on_every_history_tick``, once at the end of every sub-bar.
         """
         from .bar_magnifier import BarMagnifier
+
+        ceht_active = is_strat and self.script.calc_on_every_history_tick
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
@@ -2833,7 +2966,58 @@ class ScriptRunner:
             self.last_price = lib.close  # type: ignore
 
             # Process orders against each sub-bar for accurate fills
-            if var_snapshot and position:
+            if ceht_active and var_snapshot and position:
+                if var_snapshot.has_vars:
+                    var_snapshot.save()
+                position.process_orders_magnified(window.sub_bars, window.aggregated)
+                # See ``_coof_loop`` for why the bar's closes are collected here.
+                bar_closed_trades = list(position.new_closed_trades)
+                drawing_snapshot.save()
+                if child_snapshot:
+                    child_snapshot.save()
+                # With real sub-bars the assumed 4-node path is redundant: each
+                # sub-bar IS a point the chart bar provably passed through, so a
+                # pass stands at the end of each one and reads the chart bar
+                # aggregated only that far. The last sub-bar ends at the chart
+                # bar's own close — that point is the definitive execution below.
+                agg = window.aggregated
+                bar_prices = (lib.open, lib.high, lib.low, lib.close, lib.volume)
+                hi, lo, vol = float('-inf'), float('inf'), 0.0
+                for idx in range(len(window.sub_bars) - 1):
+                    sub_bar = window.sub_bars[idx]
+                    sub_high = _round_price(sub_bar.high, self._round_decimals)
+                    sub_low = _round_price(sub_bar.low, self._round_decimals)
+                    hi = max(hi, sub_high)
+                    lo = min(lo, sub_low)
+                    vol += (sub_bar.volume if self._lossless_volume
+                            else restore_f32_volume(sub_bar.volume))
+                    sub_close = _round_price(sub_bar.close, self._round_decimals)
+                    if var_snapshot.has_vars:
+                        var_snapshot.restore()
+                    _drop_discarded_run(drawing_snapshot)
+                    if child_snapshot:
+                        child_snapshot.restore()
+                    position._mark_to_last_fill(sub_close)
+                    _set_partial_bar(lib, bar_prices[0], hi, lo, sub_close, vol)
+                    lib._lib_semaphore = True
+                    for run_lib_main in lib_mains:
+                        run_lib_main()
+                    lib._lib_semaphore = False
+                    run_main()
+                    # Restore BEFORE processing orders: the emulator re-reads the
+                    # bar's OHLC, and a truncated bar would hide the rest of it.
+                    _set_partial_bar(lib, *bar_prices)
+                    position.process_orders_magnified(window.sub_bars, agg, idx)
+                    bar_closed_trades.extend(position.new_closed_trades)
+                position.new_closed_trades[:] = bar_closed_trades
+                # The real execution of this bar follows — it must see the
+                # bar-start instance state, not the discarded runs' advances.
+                _drop_discarded_run(drawing_snapshot)
+                if child_snapshot:
+                    child_snapshot.restore()
+                if var_snapshot.has_vars:
+                    var_snapshot.restore()
+            elif var_snapshot and position:
                 if var_snapshot.has_vars:
                     var_snapshot.save()
 

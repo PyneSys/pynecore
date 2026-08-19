@@ -116,6 +116,28 @@ def main():
     assert ns['main'](state) == 12
 
 
+def __test_varip_lazy_init_flag_is_varip__():
+    """ A lazily initialized IBPersistent marks its guard flag varip too """
+    ns, _ = _transform("""
+from pynecore.types import IBPersistent
+
+def main(seed):
+    v: IBPersistent[int] = -seed
+    v += 1
+    return v
+""")
+    layout = ns['__pyne_slot_layout__']['main']
+    # A non-literal initializer splits into a value slot and a guard flag. The
+    # flag has to sit in ``varip`` with the value it guards: rolled back by the
+    # var rollback of a discarded re-execution, the initializer would run again
+    # on the first bar and the varip would lose what the earlier pass put there.
+    assert layout['names'] == ('v', 'v·flag')
+    assert layout['varip'] == (0, 1)
+    state = _make_state(layout)
+    assert ns['main'](state, 5) == -4
+    assert ns['main'](state, 5) == -3
+
+
 def __test_nested_shadowing__():
     """ A nested def's own Persistent shadows the parent's in its own scope """
     ns, dump = _transform('''
