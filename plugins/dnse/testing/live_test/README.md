@@ -42,7 +42,7 @@ conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> L
 | **Live-L1-T12-OcaReduce** | `oca.reduce` pair rests full qty | ✅ **08-17** — both rested full qty; cancel_all swept both |
 | **Live-L1-T13-OcaNone** | `oca.none` shared name = independent | ✅ **08-17** — sibling untouched by member cancel |
 | **Live-L1-T16-RestartAdoption** | place-and-hold, kill engine, relaunch: the resting order must be adopted/quarantined EXPLICITLY and be reachable by cancel_all | ⚠️ **08-18 MEASURED — BUG FOUND**: TERM leaves the order at the venue (no shutdown sweep ✓); DIFFERENT-label relaunch correctly ignores it (T10 isolation ✓); SAME-label relaunch gives NO adoption line and cancel_all does NOT reach it → stranded working order, manual cleanup. Root cause (corrected 08-18 review): the store seam EXISTS and was active (broker.sqlite; same-label relaunch shares run_id) — but ordinary orders are never journaled (orders table holds only software-watch rows, order_refs empty) and idempotency=SOFTWARE sends no coid to the venue, so restart recognition has no bridge. Card #36 |
-| **Live-L1-T14-AtcCancelRefusal** | place late CONT-PM, cancel DURING ATC → venue must refuse every attempt; both orders expire at close. Direct probe (`direct_probes_t14_t15_t17.py --case t14`, launch 14:20–14:29) — Live-L4-T03 proved no bars arrive in ATC, so Pine cannot fire the cancel | ✅ **08-18 provisional PASS** — 8/8 attempts refused across the full ATC (14:30–14:44), all CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION http 400, zero accepts; orders 538916/538926 left to expire — FINAL grade next morning: both Expired |
+| **Live-L1-T14-AtcCancelRefusal** | place late CONT-PM, cancel DURING ATC → venue must refuse every attempt; both orders expire at close. Direct probe (`direct_probes_t14_t15_t17.py --case t14`, launch 14:20–14:29) — Live-L4-T03 proved no bars arrive in ATC, so Pine cannot fire the cancel | ✅ **08-18 provisional PASS** — 8/8 attempts refused across the full ATC (14:30–14:44), all CANNOT_CANCEL_THE_ORDER_IN_THE_ATC_SESSION http 400, zero accepts; orders 538916/538926 both **Expired** (fill=0) per venue history 08-19 — FINAL PASS. Operator-cancelled 1st-launch pair reads Canceled, confirming cancels work in CONT-PM and are refused only in ATC |
 | **Live-L1-T15-CancelReplace** | #18 evidence: conditional cancel-ACK → immediate replacement on the STOP book; measures the exposure gap (`--case t15`, continuous/lunch) | ✅ **08-18** — ack 35 ms, replacement accepted +99 ms, A=Canceled B=New first poll: cancel+replace IS a viable amend substitute (#18) |
 | **Live-L1-T17-ReplaceUnderAckLag** | identical NORMAL LO re-placed inside the ~10 s stale-replica window after a cancel ACK; final state must be exactly ONE working (`--case t17`, continuous) | ✅ **08-18** — exactly one working at every read; found ORDER_CANCEL_STATUS_REJECTED (double-cancel on NORMAL = terminal, classifier fixed) |
 | **Live-L1-T18-ImmediateCancel** | cancel the instant the order is visible on the live book — no bar-clock wait (`--case t18`, both books) | ✅ **08-18** — NO minimum-rest rule: NORMAL visible 154 ms/gone 61 ms after cancel-ack 31 ms; STOP visible 101 ms/gone 197 ms. The next-candle wait was Pine's bar clock, not the venue |
@@ -62,6 +62,14 @@ conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> L
 Live-L3 backtest mode (past window) is the ORACLE — a pre-launch gate, never a live result.
 Live-L3 requires a FLAT account. Live-L4 is PASSIVE (no orders, no trading token) but must
 not run concurrently with order-placing tests (rate-limit contamination).
+
+### Grading orders from a PREVIOUS day
+
+The current-day detail endpoint returns `orderStatus: None` for yesterday's orders.
+Use the history endpoint instead: `GET /accounts/{accountNo}/orders/history`
+(`?marketType=&orderCategory=&from=YYYY-MM-DD&to=YYYY-MM-DD`) — note it answers with
+a **`data`** array (not `orders`) and ids are **date-prefixed** (`20260818_538916`).
+Measured 2026-08-19 while grading Live-L1-T14.
 
 ## The four test types
 

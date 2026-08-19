@@ -54,3 +54,9 @@ operator flattened manually; FAR leg cancelled manually.
 unexpected-accepts=0; rider never touched. Post-close reads: both still 'New' (settle lag).
 FINAL GRADE next morning: both must read Expired, nothing of ours working.
 Note: first launch's orders (528386/528396) were operator-cancelled at ~14:21 (CONT-PM) — probe relaunched inside the window; measurement unaffected.
+
+--- Live-L1-T14 FINAL GRADE (venue history, read 2026-08-19 09:26) ---
+  538916 (8 ATC cancel attempts, all refused) -> Expired, fill=0
+  538926 (rider, never touched)               -> Expired, fill=0
+  528386 / 528396 (1st launch, operator-cancelled in CONT-PM) -> Canceled, fill=0
+=> Live-L1-T14-AtcCancelRefusal: PASS (refusal-through-ATC + expiry-at-close both confirmed).
