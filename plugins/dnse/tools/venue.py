@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -171,21 +170,18 @@ def _detail_today(b: DNSEBroker, oid: str):
 
 def _detail_history(b: DNSEBroker, oid: str, days: int = 7):
     """Previous-day orders are NOT on the detail endpoint (it answers None) —
-    they live in /orders/history, whose rows are date-prefixed (20260818_538916)
-    and arrive under 'data', not 'orders'. Measured 2026-08-19."""
+    they live in /orders/history — the vendored SDK's ``get_order_history`` (one
+    call covers BOTH books; rows are date-prefixed, 20260818_538916, and arrive
+    under 'data', not 'orders'). Measured 2026-08-19."""
     today = datetime.now(ICT).date()
-    for book in ("NORMAL", "STOP"):
-        st, raw = b.client._sdk._request(
-            "GET", f"/accounts/{b.account_id}/orders/history",
-            query={"marketType": b.market_type, "orderCategory": book,
-                   "from": str(today - timedelta(days=days)), "to": str(today),
-                   "pageSize": 200})
-        body = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
-        if st != 200 or not isinstance(body, dict):
-            continue
-        for row in body.get("data") or []:
-            if str(row.get("id", "")).split("_")[-1] == str(oid):
-                return f"{book}/history", row
+    st, body = b.client.get_order_history(
+        b.account_id, b.market_type, from_date=str(today - timedelta(days=days)),
+        to_date=str(today), page_size=200)
+    if st != 200 or not isinstance(body, dict):
+        return None, None
+    for row in body.get("data") or []:
+        if str(row.get("id", "")).split("_")[-1] == str(oid):
+            return "history", row
     return None, None
 
 
@@ -253,22 +249,17 @@ def cmd_sweep(args) -> int:
 def cmd_history(args) -> int:
     b = broker(args.symbol)
     day = args.date or str(datetime.now(ICT).date())
-    found = 0
-    for book in ("NORMAL", "STOP"):
-        st, raw = b.client._sdk._request(
-            "GET", f"/accounts/{b.account_id}/orders/history",
-            query={"marketType": b.market_type, "orderCategory": book,
-                   "from": day, "to": day, "pageSize": 200})
-        body = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
-        if st != 200 or not isinstance(body, dict):
-            print(f"[{book}] history read FAILED: HTTP {st}")
-            return EXIT_UNKNOWN
-        for row in body.get("data") or []:
-            found += 1
-            print(f"[{book}] {str(row.get('id')):24s} {row.get('side'):3s} "
-                  f"{str(row.get('orderStatus')):10s} price={row.get('price')} "
-                  f"filled={row.get('fillQuantity')}")
-    print(f"-- {found} order(s) on {day}")
+    st, body = b.client.get_order_history(b.account_id, b.market_type,
+                                          from_date=day, to_date=day, page_size=200)
+    if st != 200 or not isinstance(body, dict):
+        print(f"history read FAILED: HTTP {st} — UNDETERMINED, not 'no orders'")
+        return EXIT_UNKNOWN
+    rows = body.get("data") or []
+    for row in rows:
+        print(f"{str(row.get('id')):24s} {str(row.get('side')):3s} "
+              f"{str(row.get('orderStatus')):10s} price={row.get('price')} "
+              f"filled={row.get('fillQuantity')}")
+    print(f"-- {len(rows)} order(s) on {day}")
     return EXIT_OK
 
 
