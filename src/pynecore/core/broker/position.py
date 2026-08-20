@@ -625,6 +625,46 @@ class BrokerPosition(PositionBase):
 
         return self.sign != old_sign
 
+    def flatten_nontradable_dust(
+            self, fill_price: float, event: 'OrderEvent',
+    ) -> list[str]:
+        """Book every remaining open trade closed as non-tradable dust.
+
+        Called by the sync engine when a closing fill leaves the aggregate
+        below the venue's minimum tradable quantity: order quantities are
+        grid-quantized, so no venue order can ever close the residual.
+        Keeping the slice open would also keep its entry out of the
+        closed-entry cleanup, leaving the entry's full-size protective
+        legs resting against inventory the account no longer holds.
+
+        :param fill_price: Exit price the dust slices are booked at (the
+            closing fill's own price).
+        :param event: The closing :class:`OrderEvent` whose fill left the
+            sub-step residual.
+        :return: The distinct entry ids the flatten consumed, oldest first.
+        """
+        consumed: list[str] = []
+        for trade in list(self.open_trades):
+            self._close_trade(trade, fill_price, event, fee_share=0.0)
+            profit = trade.profit
+            self.netprofit += profit
+            if profit > 0.0:
+                self.grossprofit += profit
+                self.wintrades += 1
+            elif profit < 0.0:
+                self.grossloss += profit
+                self.losstrades += 1
+            else:
+                self.eventrades += 1
+            if trade.entry_id is not None and trade.entry_id not in consumed:
+                consumed.append(trade.entry_id)
+        self.size = 0.0
+        self.sign = 0.0
+        self.avg_price = na_float
+        self.openprofit = 0.0
+        self.open_commission = 0.0
+        return consumed
+
     def update_unrealized_pnl(self, current_price: float) -> None:
         """Mark-to-market: recompute :attr:`openprofit` at the given price.
 

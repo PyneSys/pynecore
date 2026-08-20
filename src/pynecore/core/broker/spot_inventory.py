@@ -30,8 +30,9 @@ core bookkeeping a spot broker plugin needs:
 - **Quarantine, not adoption**: external intervention in the bot's
   inventory is unsupported by contract. A confirmed conflict stops
   trading via the engine quarantine latch (process stays alive as an
-  observer); the explicit ``halt`` policy exits instead. Recovery is an
-  operator ``rebaseline`` (new epoch, one transaction) plus restart.
+  observer); the explicit ``halt`` policy exits instead. Recovery is a
+  restart: the fresh startup retires the corrupt ledger stretch and
+  re-anchors a fresh epoch on the venue's measured balance.
 
 The manager takes explicit ``now_ms`` timestamps so reconciliation
 timing is fully deterministic under test, mirroring
@@ -45,7 +46,6 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
 from pynecore.core.broker.models import ExchangePosition
-from pynecore.core.broker.store_helpers import PENDING_DISPATCH_STATES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -559,9 +559,12 @@ class SpotInventoryManager:
 
         1. **Lease claim** — a live foreign lease on the base asset
            means another logical run owns it: quarantine, touch nothing.
-        2. **Persisted quarantine check** — a ``quarantined`` epoch
-           survives restarts; only an operator :meth:`rebaseline`
-           clears it.
+        2. **Persisted quarantine recovery** — a ``quarantined`` epoch
+           survives crashes mid-run, but a fresh startup can re-measure
+           the one truth it protected (the venue's balance):
+           :meth:`_recover_quarantined_epoch` retires the corrupt
+           ledger stretch and re-anchors a fresh epoch on that balance.
+           Only a failed measurement keeps the quarantine.
         3. **Execution catch-up** from the epoch's durable cursor (the
            crash window between a venue fill and its local persist is
            closed here). Paged; each page commits its fills and the
@@ -600,20 +603,19 @@ class SpotInventoryManager:
             )
             return self._startup_result()
 
-        # (2) Persisted quarantine from a previous run.
+        # (2) Persisted quarantine from a previous run: recover. A spot
+        # run's own book is rebuilt from scratch on every startup, so
+        # the only truth a quarantined ledger protected is measurable
+        # right here — the venue's actual balance. Retire the corrupt
+        # history and re-anchor on that measurement; stay quarantined
+        # only when the measurement itself fails.
         epoch = self._store.get_latest_spot_epoch(port.product_id)
         self._epoch = epoch
         if epoch is not None and epoch.state == 'quarantined':
-            self._refresh_fold()
-            self._enter_quarantine(
-                'spot_epoch_quarantined',
-                {
-                    'product_id': port.product_id,
-                    'epoch_seq': epoch.epoch_seq,
-                    'pending_conflict': epoch.pending_conflict,
-                },
-            )
-            return self._startup_result()
+            epoch = await self._recover_quarantined_epoch(epoch)
+            if epoch is None:
+                return self._startup_result()
+            self._epoch = epoch
         if epoch is not None and epoch.cursor_scope != port.cursor_scope:
             # A plugin upgrade changed what the persisted cursor means —
             # trusting it could silently skip history. Fail closed.
@@ -785,7 +787,7 @@ class SpotInventoryManager:
         dedup makes a re-fetch safe), but its ``next_cursor`` is NOT
         persisted and the returned cursor stays at the last conclusive
         position — persisting a cursor past history the venue could not
-        vouch for would let a later retry or rebaseline skip the
+        vouch for would let a later retry or recovery skip the
         uncertain range and launder the omitted fills into a baseline.
 
         :return: ``(recovered_count, conclusive, final_cursor)`` —
@@ -1125,117 +1127,118 @@ class SpotInventoryManager:
 
     # --- Rebaseline (operator recovery) ---------------------------------------
 
-    async def rebaseline(self) -> 'SpotEpochRow':
-        """Freeze a new baseline epoch after an operator intervened.
+    async def _recover_quarantined_epoch(
+            self, epoch: 'SpotEpochRow',
+    ) -> 'SpotEpochRow | None':
+        """Re-anchor a quarantined product on the venue's actual balance.
 
-        Preconditions (all fail-closed, raising ``ValueError``):
+        Whatever poisoned the old epoch — a negative fold, drift, a
+        crash mid-conflict — the account's spot wallet is the ground
+        truth, and a fresh startup can measure it before a single
+        dispatch goes out. Sequence (fail-closed at every step):
 
-        - dispatch is frozen — the run is quarantined (rebaselining a
-          live-trading run would launder in-flight drift);
-        - no unresolved dispatches: no parked verifications and no live
-          order rows in a pending dispatch state (their eventual fills
-          would land on the wrong side of the new baseline);
-        - a FRESH conclusive execution catch-up and balance read succeed
-          right here.
+        1. execution catch-up from the old epoch's cursor (a cursor
+           whose scope no longer matches the port restarts from the
+           beginning — the fill-id dedup absorbs the replay);
+        2. fresh balance read;
+        3. ONE transaction: the old epoch flips ``closed``, every live
+           ledger row retires (audit kept, fold excluded, adoption
+           suppressed via ``delivered``), and a fresh ``active`` epoch
+           freezes ``foreign_baseline = balance`` — the bot owns
+           nothing, the account owns everything.
 
-        The new epoch (bumped ``epoch_seq``, recomputed
-        ``foreign_baseline``, ``state='active'``) and the old epoch's
-        ``closed`` flip commit in ONE transaction. The engine's
-        quarantine latch is in-memory by design — the operator restarts
-        the run after a successful rebaseline; the fresh startup then
-        finds the active epoch and trades again.
+        A fill that lands between the catch-up and the balance read is
+        counted by the balance and retired with the history, so the
+        invariant still holds; a fill that lands after the balance read
+        re-enters as a live event on the clean ledger and, if it proves
+        the account inconsistent again, re-quarantines — the next
+        restart repeats the recovery against the then-current balance.
 
-        :return: The freshly activated epoch row.
+        :return: The fresh active epoch, or ``None`` when a measurement
+            failed and the quarantine latched instead.
         """
-        if not self._quarantined:
-            raise ValueError(
-                "rebaseline requires the run to be quarantined — "
-                "dispatch must be frozen while the baseline moves"
-            )
         port = self._port
-        unresolved = self._unresolved_dispatches()
-        if unresolved:
-            raise ValueError(
-                f"rebaseline blocked: unresolved dispatches remain "
-                f"({', '.join(unresolved)}) — their eventual fills would "
-                f"land on the wrong side of the new baseline"
-            )
-        old_epoch = self._store.get_latest_spot_epoch(port.product_id)
-        recovered, conclusive, final_cursor = await self._catch_up(
-            old_epoch.exec_cursor if old_epoch is not None else None,
+        cursor = (
+            epoch.exec_cursor
+            if epoch.cursor_scope == port.cursor_scope else None
         )
+        try:
+            recovered, conclusive, final_cursor = await self._catch_up(cursor)
+        except SpotInventoryConflictError:
+            # _catch_up already quarantined (foreign ledger row).
+            return None
         if not conclusive:
-            raise ValueError(
-                "rebaseline blocked: execution catch-up was inconclusive"
+            self._refresh_fold()
+            self._enter_quarantine(
+                'spot_recovery_catchup_inconclusive',
+                {'product_id': port.product_id,
+                 'epoch_seq': epoch.epoch_seq},
             )
-        self._refresh_fold()
-        if self._fold.violation is not None:
-            raise ValueError(
-                f"rebaseline blocked: ledger corrupt "
-                f"({self._fold.violation})"
+            return None
+        # noinspection PyBroadException
+        try:
+            balance = await port.fetch_base_balance()
+        except Exception as exc:
+            logger.exception(
+                "spot inventory: recovery balance read failed for %r",
+                port.product_id,
             )
-        balance = await port.fetch_base_balance()
+            self._refresh_fold()
+            self._enter_quarantine(
+                'spot_recovery_balance_unavailable',
+                {'product_id': port.product_id, 'error': repr(exc)},
+            )
+            return None
         if not isinstance(balance, Decimal) or not balance.is_finite():
-            raise ValueError(
-                f"rebaseline blocked: invalid base balance {balance!r}"
+            self._refresh_fold()
+            self._enter_quarantine(
+                'spot_recovery_balance_invalid',
+                {'product_id': port.product_id, 'balance': repr(balance)},
             )
-        baseline = balance - self._fold.net_base
-        if baseline < -port.base_tolerance:
-            # A negative foreign baseline would launder exactly the
-            # withdrawal / external-sale conflict that forced the
-            # quarantine: it would make the invariant hold while the
-            # synthesized position exceeds what the account owns. Refuse
-            # until the operator restores enough base holdings.
-            raise ValueError(
-                f"rebaseline blocked: base balance {balance} is below the "
-                f"ledger's bot inventory {self._fold.net_base} — restore "
-                f"the missing base holdings before rebaselining"
-            )
+            return None
+        self._refresh_fold()
+        retired_fold = self._fold
         with self._store.transaction():
-            if old_epoch is not None:
-                self._store.set_spot_epoch_state(
-                    port.product_id, old_epoch.epoch_seq, 'closed',
-                )
-            epoch = self._store.insert_spot_epoch(
+            self._store.set_spot_epoch_state(
+                port.product_id, epoch.epoch_seq, 'closed',
+            )
+            retired = self._store.retire_spot_executions(
+                self._account_id, port.product_id,
+            )
+            fresh = self._store.insert_spot_epoch(
                 account_id=self._account_id,
                 base_asset=port.base_asset,
                 product_id=port.product_id,
-                foreign_baseline=canonical_decimal(baseline),
+                foreign_baseline=canonical_decimal(balance),
                 cursor_scope=port.cursor_scope,
                 exec_cursor=final_cursor,
                 state='active',
             )
-            self._store.mark_spot_executions_delivered(
-                self._account_id, port.product_id,
-            )
             self._store.log_event(
-                'spot_epoch_rebaselined',
+                'spot_epoch_recovered',
                 payload={
                     'product_id': port.product_id,
-                    'old_epoch_seq': (
-                        None if old_epoch is None else old_epoch.epoch_seq
-                    ),
-                    'epoch_seq': epoch.epoch_seq,
-                    'foreign_baseline': epoch.foreign_baseline,
-                    'bot_inventory': canonical_decimal(self._fold.net_base),
-                    'current_total': canonical_decimal(balance),
+                    'old_epoch_seq': epoch.epoch_seq,
+                    'old_pending_conflict': epoch.pending_conflict,
+                    'epoch_seq': fresh.epoch_seq,
+                    'foreign_baseline': fresh.foreign_baseline,
+                    'retired_fills': retired,
+                    'retired_net_base': canonical_decimal(
+                        retired_fold.net_base),
+                    'retired_violation': retired_fold.violation,
                     'recovered_fills': recovered,
                 },
             )
-        self._epoch = epoch
-        return epoch
-
-    def _unresolved_dispatches(self) -> list[str]:
-        """Names of dispatches whose outcome is still in flight."""
-        unresolved: list[str] = []
-        _envelopes, pending = self._store.replay()
-        unresolved.extend(
-            f"parked:{coid}" for coid in sorted(pending)
+        logger.warning(
+            "spot inventory: quarantined epoch %d for %r recovered at "
+            "startup — %d ledger row(s) retired (net %s, violation: %s), "
+            "fresh baseline anchored on the venue balance %s",
+            epoch.epoch_seq, port.product_id, retired,
+            canonical_decimal(retired_fold.net_base),
+            retired_fold.violation, canonical_decimal(balance),
         )
-        for row in self._store.iter_live_orders():
-            if row.state in PENDING_DISPATCH_STATES:
-                unresolved.append(f"order:{row.client_order_id}({row.state})")
-        return unresolved
+        self._refresh_fold()
+        return fresh
 
     # --- Teardown -------------------------------------------------------------
 
@@ -1302,7 +1305,7 @@ class SpotInventoryManager:
             )
         message = (
             f"spot inventory conflict ({reason}): trading stops; "
-            f"operator rebaseline + restart required"
+            f"restart the run to recover on a fresh venue-balance baseline"
         )
         quarantined = False
         if self._policy == 'quarantine' and self._request_quarantine is not None:

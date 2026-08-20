@@ -191,6 +191,7 @@ class SpotExecutionRow:
     ts_ms: int
     delivered: bool
     venue_seq: int | None = None
+    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -465,6 +466,16 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             heartbeat_ts_ms INTEGER NOT NULL,
             UNIQUE (plugin_name, account_id, base_asset)
         );
+    """),
+    (6, "spot_executions retired column", """
+        -- Startup quarantine recovery closes the corrupt stretch of the
+        -- ledger by flagging its rows retired: they stay on disk as the
+        -- audit trail, but the inventory fold excludes them, so the
+        -- fresh epoch (baseline = the venue's actual balance) starts
+        -- from a clean zero bot inventory. The fill-id primary key still
+        -- dedups venue re-serves against retired rows.
+        ALTER TABLE spot_executions
+            ADD COLUMN retired INTEGER NOT NULL DEFAULT 0;
     """),
 ]
 
@@ -2145,7 +2156,7 @@ class RunContext:
             self, account_id: str, product_id: str, *,
             undelivered_only: bool = False,
     ) -> list[SpotExecutionRow]:
-        """Fetch this logical run's ledger rows, oldest first.
+        """Fetch this logical run's LIVE ledger rows, oldest first.
 
         Deterministic order: ``(ts_ms, venue_seq, fill_id)`` — venue
         timestamps can tie, so the venue's own execution-sequence key
@@ -2154,10 +2165,15 @@ class RunContext:
         and prevents a same-millisecond buy/sell pair from reordering
         into a false oversell. Returns a list (not a lazy iterator) so
         the read lock is not held while the caller processes rows.
+
+        Rows retired by a startup quarantine recovery stay on disk as
+        the audit trail but never surface here: they belong to a closed
+        epoch whose net effect the fresh baseline already carries.
         """
         sql = (
             "SELECT * FROM spot_executions "
-            "WHERE run_id = ? AND account_id = ? AND product_id = ?"
+            "WHERE run_id = ? AND account_id = ? AND product_id = ? "
+            "  AND retired = 0"
         )
         if undelivered_only:
             sql += " AND delivered = 0"
@@ -2167,6 +2183,27 @@ class RunContext:
                 sql, (self.run_id, account_id, product_id),
             ).fetchall()
         return [_row_to_spot_execution(row) for row in rows]
+
+    # noinspection SqlResolve
+    def retire_spot_executions(self, account_id: str, product_id: str) -> int:
+        """Close out the run's live ledger rows during quarantine recovery.
+
+        Retired rows leave the inventory fold (their net effect is
+        absorbed into the fresh epoch's venue-balance baseline) and are
+        flipped delivered so startup adoption never re-emits them; they
+        stay on disk as the audit trail and keep serving the fill-id
+        dedup against venue re-serves.
+
+        :return: Number of rows retired.
+        """
+        with self._store.transaction():
+            cursor = self._store._conn.execute(
+                "UPDATE spot_executions SET retired = 1, delivered = 1 "
+                "WHERE run_id = ? AND account_id = ? AND product_id = ? "
+                "  AND retired = 0",
+                (self.run_id, account_id, product_id),
+            )
+            return cursor.rowcount
 
     # noinspection SqlResolve
     def mark_spot_executions_delivered(
@@ -2233,7 +2270,7 @@ class RunContext:
 
         ``epoch_seq`` continues from this run's newest existing epoch
         (1 for the first). Runs inside the caller's transaction when one
-        is open — the rebaseline path relies on this to make "write new
+        is open — the recovery path relies on this to make "write new
         epoch + activate" a single atomic span.
 
         :return: The freshly inserted row.
@@ -2591,6 +2628,7 @@ def _row_to_spot_execution(row: sqlite3.Row) -> SpotExecutionRow:
         venue_seq=(
             None if row['venue_seq'] is None else int(row['venue_seq'])
         ),
+        retired=bool(row['retired']),
     )
 
 

@@ -4581,6 +4581,92 @@ def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(c
     )
 
 
+def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
+    """A grid-floored full close must not leave a dust-kept bracket resting.
+
+    Spot entries are fee-netted (off the venue's qty grid) while the close
+    order is grid-quantized: three 0.009995 entries closed with a floored
+    0.02998 sell leave 5e-06 on the newest entry. The venue cannot trade
+    the residual, but the surviving trade used to keep its entry out of
+    the closed-entry cleanup — its full-size protective legs stayed
+    resting, and when one later triggered it sold inventory the account
+    no longer held (negative spot ledger -> quarantine on the Bybit spot
+    lane). The residual must be booked flat as dust and the entry retired
+    with the rest.
+    """
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+
+    for i, (pine_id, price) in enumerate(
+            [("L1", 1918.0), ("L2", 1919.0), ("L3", 1920.0)], start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 0.009995, f"{pine_id}-X", stop=1900.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 0.009995, price, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+    assert pos.size == pytest.approx(0.029985)
+    assert {"L1", "L2", "L3"} <= set(engine.active_intents)
+
+    # Flat signal: the venue floors the close to the qty grid.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.02998, 1920.53, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    assert "L3" not in engine.active_intents
+    assert not any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "L3"
+        for intent in engine.active_intents.values()
+    )
+
+
+def __test_close_fill_keeps_a_tradable_remainder_and_its_bracket__():
+    """A partial close leaving a tradable remainder must not be dust-flattened.
+
+    The dust rule applies only below the venue's qty step: a genuine
+    partial close (pyramid reduce) keeps the surviving entry, its trade
+    and its protective legs untouched.
+    """
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+
+    for i, pine_id in enumerate(["L1", "L2"], start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 0.009995, f"{pine_id}-X", stop=1900.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 0.009995, 1918.0, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+
+    # Reduce by the OLDER entry's grid-floored size: L2 survives with a
+    # tradable remainder well above the dust threshold.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.00999, 1920.0, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+    assert pos.size == pytest.approx(0.01)
+    assert any(trade.entry_id == "L2" for trade in pos.open_trades)
+    assert "L2" in engine.active_intents
+    assert any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "L2"
+        for intent in engine.active_intents.values()
+    )
+
+
 def __test_reconcile_clears_open_trades_when_exchange_flat__():
     """When the exchange goes flat externally, open_trades MUST be wiped.
 
@@ -9393,6 +9479,29 @@ def __test_emulated_close_routes_through_position_port__():
     assert b.close_leg_calls == [("1", 2)]
     assert b.close_calls == []
     assert engine.order_mapping[close.intent_key] == ["close-leg:1"]
+
+
+def __test_emulated_close_transient_fault_halts_controlled_not_raw__():
+    """A raw ``TimeoutError`` escaping a port-path dispatch must become the
+    controlled manual-intervention halt, never a naked crash.
+
+    The port-path dispatches (run_close / run_reversal / run_exit_bracket)
+    ride the same classified write bridge as their ``execute_*`` siblings —
+    a bybit reversal close once let the raw bridge ``TimeoutError`` escape
+    and kill the run outright.
+    """
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 2.0)]
+    engine, _pos = _mk_engine(b)
+
+    async def _timeout_close(symbol, leg_id, volume, coid):
+        raise TimeoutError
+
+    b.close_leg = _timeout_close
+    close = CloseIntent(pine_id="x", symbol=SYMBOL, side="sell", qty=2.0)
+    with pytest.raises(BrokerManualInterventionError):
+        engine._dispatch_new(close)
 
 
 def __test_emulated_exit_routes_through_position_port__():

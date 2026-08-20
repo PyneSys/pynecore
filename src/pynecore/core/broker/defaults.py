@@ -72,7 +72,7 @@ class BrokerDefaults:
 
     Only used by plugins that opt into the core spot inventory layer.
     ``"quarantine"`` (default) — trading stops, the process stays alive
-    as an observer; recovery is an operator rebaseline plus restart.
+    as an observer; a restart recovers on a fresh venue-balance baseline.
     ``"halt"`` — exit via the graceful manual-intervention path.
     The set is deliberately narrower than ``on_unexpected_cancel``:
     an attribution conflict has no safe ``re_place`` or ``ignore``

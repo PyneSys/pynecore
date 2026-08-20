@@ -5551,6 +5551,44 @@ class OrderSyncEngine:
                 for trade in self._position.new_closed_trades[closed_count_before:]
                 if trade.entry_id is not None
             ]
+            # A closing fill can leave a sub-step residual on the LAST FIFO
+            # trade: spot entries are fee-netted (off the venue's qty grid)
+            # while the close order is grid-quantized, so a full close of a
+            # pyramid floors away up to one step of exposure (measured on the
+            # Bybit spot lane: 3 x 0.009995 entries, close floored to
+            # 0.02998, 5e-06 left on the newest entry). The venue cannot
+            # trade the residual — but the surviving trade keeps its entry
+            # out of the closed-entry cleanup below, so the entry's FULL-size
+            # protective legs stay resting and a later trigger sells
+            # inventory the account no longer holds (negative spot ledger →
+            # quarantine). Book the residual closed as dust so the cleanup
+            # retires the entry and cancels its brackets.
+            if (self._position.size != 0.0
+                    and (event.fill_price or 0.0) > 0.0
+                    and event.leg_type in (
+                        LegType.CLOSE, LegType.TAKE_PROFIT,
+                        LegType.STOP_LOSS, LegType.TRAILING_STOP,
+                    )):
+                spot_port = getattr(self._broker, 'spot_inventory_port', None)
+                dust_threshold = getattr(
+                    spot_port, 'position_dust_threshold', Decimal(0),
+                )
+                if (isinstance(dust_threshold, Decimal)
+                        and dust_threshold > 0
+                        and Decimal(str(abs(self._position.size)))
+                        < dust_threshold):
+                    dust_size = self._position.size
+                    dust_consumed = self._position.flatten_nontradable_dust(
+                        event.fill_price or 0.0, event,
+                    )
+                    for entry_id in dust_consumed:
+                        if entry_id not in self._last_fifo_closed_entry_ids:
+                            self._last_fifo_closed_entry_ids.append(entry_id)
+                    _blog_warning(
+                        "closing fill left non-tradable dust %s (< step %s) — "
+                        "booked flat, retiring entries %s",
+                        dust_size, dust_threshold, dust_consumed,
+                    )
             # Accumulate the fill against the in-flight ``CloseIntent`` ledger so
             # :meth:`_clamp_close_intents` reserves only the close's still-working
             # qty (``active.qty - filled``) rather than its full dispatched qty.
@@ -14395,7 +14433,7 @@ class OrderSyncEngine:
                     # close at placement). run_reversal reads the legs and plans
                     # internally, so the engine needs no net-position tracking; it
                     # returns the opened order(s) — register their real ids.
-                    reversal = self._run_async(
+                    reversal = self._run_async_write(
                         self._one_way_emulator.run_reversal(envelope, port),
                     )
                     orders = list(reversal.opened_orders)
@@ -14570,7 +14608,7 @@ class OrderSyncEngine:
                         # Hedging-mode emulation: the one-way bracket is
                         # replicated onto every position-side leg (persist-first
                         # ownership index), not sent as a single whole-row order.
-                        bracket = self._run_async(
+                        bracket = self._run_async_write(
                             self._one_way_emulator.run_exit_bracket(envelope, port),
                         )
                         if bracket.skipped:
@@ -14608,7 +14646,7 @@ class OrderSyncEngine:
                     # per-leg reduction FILLs flow back through the ordinary
                     # natural-close path; the engine only needs a representative
                     # handle here.
-                    fan = self._run_async(
+                    fan = self._run_async_write(
                         self._one_way_emulator.run_close(envelope, port),
                     )
                     if fan.skipped:
@@ -17593,7 +17631,7 @@ class OrderSyncEngine:
                     # the ownership rows upsert on their stable per-(exit, leg)
                     # key, so no stale rows accrete and the amend overwrites the
                     # old protection wholesale.
-                    bracket = self._run_async(
+                    bracket = self._run_async_write(
                         self._one_way_emulator.run_exit_bracket(new_env, port),
                     )
                     if bracket.skipped:

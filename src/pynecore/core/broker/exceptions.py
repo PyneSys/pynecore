@@ -327,8 +327,8 @@ class SpotInventoryConflictError(BrokerManualInterventionError):
     or foreign ledger row, an inconclusive execution catch-up, or a
     lost asset-ownership lease. External intervention in the bot's
     inventory is not supported — there is no adoption path, so the safe
-    terminal signal is manual intervention followed by an operator
-    ``rebaseline``.
+    terminal signal is manual intervention followed by a restart, whose
+    startup recovery re-anchors on the venue's measured balance.
     """
 
 

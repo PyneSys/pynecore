@@ -7,7 +7,7 @@ Covers the plan's M4 matrix: crash windows around fill persistence
 restarts, fee handling in base/quote/third currency, the fail-closed
 balance invariant in BOTH directions (a deposit must not mask an
 external sale), the asset-ownership lease (concurrent claim, stale
-takeover), corrupt/quarantined epochs surviving restarts, rebaseline
+takeover), startup recovery of quarantined epochs, measurement-gated
 preconditions, paged catch-up crash resume, and retention exemption of
 the ledger.
 """
@@ -29,7 +29,6 @@ from pynecore.core.broker.spot_inventory import (
     fold_inventory,
 )
 from pynecore.core.broker.storage import BrokerStore, RunContext
-from pynecore.core.broker.store_helpers import STATE_SUBMITTED
 
 PLUGIN = "TestSpotBroker"
 ACCOUNT = "testspot-demo-001"
@@ -486,9 +485,9 @@ def __test_startup_drift_quarantines_strictly__(tmp_path: Path):
     store.close()
 
 
-def __test_quarantined_epoch_survives_restart__(tmp_path: Path):
-    """Persisted quarantine: an operator restart alone must NOT resume
-    trading — only rebaseline clears the epoch."""
+def __test_startup_recovers_a_quarantined_epoch_on_the_venue_balance__(tmp_path: Path):
+    """Persisted quarantine: the next startup re-anchors on the venue's
+    measured balance — the restart itself is the recovery."""
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('10'))
@@ -501,18 +500,117 @@ def __test_quarantined_epoch_survives_restart__(tmp_path: Path):
     assert _run(mgr2.startup()).quarantined
     ctx2.close()
 
-    # Third start: balance happens to match again (e.g. the intruder
-    # sold what they deposited) — the epoch still says quarantined.
+    # Third start: whatever the account holds NOW is the new baseline —
+    # the corrupt epoch closes and trading resumes.
     ctx3 = _open_run(store)
-    port3 = FakeSpotPort(balance=Decimal('10'))
+    port3 = FakeSpotPort(balance=Decimal('12'))
     calls: list = []
     mgr3 = _manager(ctx3, port3, hook=lambda r, c: calls.append((r, c)))
     result = _run(mgr3.startup())
+    assert not result.quarantined
+    assert calls == []
+    assert result.epoch is not None
+    assert result.epoch.epoch_seq == 2 and result.epoch.state == 'active'
+    assert Decimal(result.epoch.foreign_baseline) == Decimal('12')
+    # noinspection SqlResolve
+    old = ctx3._store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT state FROM spot_inventory_epoch WHERE epoch_seq = 1",
+    ).fetchone()
+    assert old['state'] == 'closed'
+    assert len(_read_events(ctx3, 'spot_epoch_recovered')) == 1
+
+    # The clean ledger trades on: a fresh fill folds from zero and the
+    # invariant holds against the recovered baseline.
+    mgr3.record_live_fill(_fill("post1", base='1', price='100'))
+    port3.balance = Decimal('13')
+    _run(mgr3.reconcile(T0_MS))
+    assert not mgr3.quarantined
+    store.close()
+
+
+def __test_startup_recovery_retires_a_corrupt_ledger__(tmp_path: Path):
+    """The #123 incident shape: an oversell drove the fold negative and
+    quarantined the epoch; the restart retires the corrupt rows (audit
+    kept, fold excluded) and re-anchors on the balance."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+    mgr.record_live_fill(_fill("b1", base='1', price='100'))
+    mgr.record_live_fill(
+        _fill("s1", side='sell', base='-2', quote='200', price='100',
+              ts_ms=T0_MS + 1),
+    )
+    assert mgr.quarantine_reason == 'spot_ledger_negative_inventory'
+    ctx.close()
+
+    ctx2 = _open_run(store)
+    port2 = FakeSpotPort(balance=Decimal('0.5'))
+    mgr2 = _manager(ctx2, port2)
+    result = _run(mgr2.startup())
+    assert not result.quarantined
+    assert result.epoch is not None
+    assert Decimal(result.epoch.foreign_baseline) == Decimal('0.5')
+    # The corrupt rows survive on disk as the audit trail but left the
+    # fold: the fresh epoch starts from zero bot inventory.
+    assert result.fold.fill_count == 0 and result.fold.violation is None
+    # noinspection SqlResolve
+    kept = ctx2._store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT COUNT(*) AS n FROM spot_executions WHERE retired = 1",
+    ).fetchone()
+    assert kept['n'] == 2
+    events = _read_events(ctx2, 'spot_epoch_recovered')
+    assert events and events[0]['retired_fills'] == 2
+    assert events[0]['retired_net_base'] == '-1'
+    store.close()
+
+
+def __test_startup_recovery_stays_quarantined_when_measurement_fails__(tmp_path: Path):
+    """Recovery is measurement-gated: a failed balance read or an
+    inconclusive catch-up keeps the quarantine; the next restart with a
+    working venue recovers."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+    ctx.close()
+    ctx2 = _open_run(store)
+    port2 = FakeSpotPort(balance=Decimal('15'))
+    mgr2 = _manager(ctx2, port2)
+    assert _run(mgr2.startup()).quarantined
+    ctx2.close()
+
+    # Balance read down: still quarantined, epoch untouched.
+    ctx3 = _open_run(store)
+    port3 = FakeSpotPort(balance=Decimal('15'))
+    port3.balance_error = RuntimeError("venue down")
+    mgr3 = _manager(ctx3, port3)
+    result = _run(mgr3.startup())
     assert result.quarantined
-    assert result.reason == 'spot_epoch_quarantined'
-    assert len(calls) == 1
-    # No venue reads happened: quarantine short-circuits before catch-up.
-    assert port3.fetch_calls == [] and port3.balance_calls == 0
+    assert result.reason == 'spot_recovery_balance_unavailable'
+    ctx3.close()
+
+    # Inconclusive catch-up: still quarantined.
+    ctx4 = _open_run(store)
+    port4 = FakeSpotPort(balance=Decimal('15'))
+    port4.batches[None] = SpotExecutionBatch(conclusive=False)
+    port4.batches["anchor-0"] = SpotExecutionBatch(conclusive=False)
+    mgr4 = _manager(ctx4, port4)
+    result = _run(mgr4.startup())
+    assert result.quarantined
+    assert result.reason == 'spot_recovery_catchup_inconclusive'
+    ctx4.close()
+
+    # Venue back: the same restart path recovers.
+    ctx5 = _open_run(store)
+    port5 = FakeSpotPort(balance=Decimal('15'))
+    mgr5 = _manager(ctx5, port5)
+    result = _run(mgr5.startup())
+    assert not result.quarantined
+    assert result.epoch is not None
+    assert Decimal(result.epoch.foreign_baseline) == Decimal('15')
     store.close()
 
 
@@ -897,74 +995,6 @@ def __test_synthesize_position_long_and_flat__(tmp_path: Path):
 
 
 # noinspection SqlResolve
-def __test_rebaseline_requires_quarantine_and_no_unresolved__(tmp_path: Path):
-    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
-    ctx = _open_run(store)
-    port = FakeSpotPort(balance=Decimal('10'))
-    mgr = _manager(ctx, port)
-    assert not _run(mgr.startup()).quarantined
-
-    # Not quarantined: refused.
-    with pytest.raises(ValueError, match="quarantined"):
-        _run(mgr.rebaseline())
-
-    # Quarantine via drift.
-    port.balance = Decimal('15')
-    _run(mgr.reconcile(T0_MS))
-    _run(mgr.reconcile(T0_MS + 31_000))
-    assert mgr.quarantined
-
-    # A parked dispatch blocks the rebaseline.
-    ctx.record_park("coid-parked", "Long")
-    with pytest.raises(ValueError, match="parked:coid-parked"):
-        _run(mgr.rebaseline())
-    ctx.record_unpark("coid-parked")
-
-    # A live order in a pending dispatch state blocks it too.
-    ctx.upsert_order(
-        "coid-pending", symbol="BTCUSD", side='buy', qty=1.0,
-        state=STATE_SUBMITTED,
-    )
-    with pytest.raises(ValueError, match="coid-pending"):
-        _run(mgr.rebaseline())
-    ctx.close_order("coid-pending")
-
-    # Clean now: the new epoch freezes the drifted total as baseline.
-    epoch = _run(mgr.rebaseline())
-    assert epoch.epoch_seq == 2 and epoch.state == 'active'
-    assert Decimal(epoch.foreign_baseline) == Decimal('15')
-    old = ctx._store._conn.execute(  # type: ignore[attr-defined]
-        "SELECT state FROM spot_inventory_epoch WHERE epoch_seq = 1",
-    ).fetchone()
-    assert old['state'] == 'closed'
-
-    # After the operator restart the fresh run trades again.
-    ctx.close()
-    ctx2 = _open_run(store)
-    port2 = FakeSpotPort(balance=Decimal('15'))
-    mgr2 = _manager(ctx2, port2)
-    result = _run(mgr2.startup())
-    assert not result.quarantined
-    assert result.epoch is not None and result.epoch.epoch_seq == 2
-    store.close()
-
-
-def __test_rebaseline_inconclusive_catchup_refused__(tmp_path: Path):
-    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
-    ctx = _open_run(store)
-    port = FakeSpotPort(balance=Decimal('10'))
-    mgr = _manager(ctx, port)
-    assert not _run(mgr.startup()).quarantined
-    port.balance = Decimal('15')
-    _run(mgr.reconcile(T0_MS))
-    _run(mgr.reconcile(T0_MS + 31_000))
-    assert mgr.quarantined
-    port.batches["anchor-0"] = SpotExecutionBatch(conclusive=False)
-    with pytest.raises(ValueError, match="inconclusive"):
-        _run(mgr.rebaseline())
-    store.close()
-
-
 # === Retention exemption =====================================================
 
 
@@ -1178,30 +1208,6 @@ def __test_startup_negative_baseline_quarantines__(tmp_path: Path):
     assert len(calls) == 1
     # No epoch was frozen with an impossible negative baseline.
     assert ctx.get_latest_spot_epoch(port.product_id) is None
-    store.close()
-
-
-def __test_rebaseline_negative_baseline_refused__(tmp_path: Path):
-    """F3: rebaseline must not launder a withdrawal into a negative
-    baseline — refuse until the operator restores the holdings."""
-    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
-    ctx = _open_run(store)
-    port = FakeSpotPort(balance=Decimal('10'))
-    mgr = _manager(ctx, port)
-    assert not _run(mgr.startup()).quarantined
-    mgr.record_live_fill(_fill("b1", base='3', price='100'))  # bot holds 3
-    port.balance = Decimal('13')
-    _run(mgr.reconcile(T0_MS))
-    assert not mgr.quarantined
-
-    # A large external withdrawal: total 1, but the ledger says the bot
-    # still holds 3 -> baseline would be 1-3 = -2.
-    port.balance = Decimal('1')
-    _run(mgr.reconcile(T0_MS + 60_000))
-    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
-    assert mgr.quarantined
-    with pytest.raises(ValueError, match="below the ledger"):
-        _run(mgr.rebaseline())
     store.close()
 
 
