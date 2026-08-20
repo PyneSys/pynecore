@@ -693,10 +693,14 @@ class PositionBase(ABC):
         allowed = self.risk_allowed_direction
         if allowed is None:
             return True
+        # Tested against the OPPOSITE direction: the third value, ``strategy.direction.all``,
+        # is neither ``long`` nor ``short``, so an equality test against the intended side
+        # rejects every entry of a strategy that passes it (the default of every
+        # direction-filter input).
         if intent_sign > 0:
-            return allowed == long
+            return allowed != short
         if intent_sign < 0:
-            return allowed == short
+            return allowed != long
         return True
 
     def _seed_trail_at_issue(self, order: 'Order', *, fold_extreme: bool = True) -> None:
@@ -5683,6 +5687,22 @@ def position_avg_price() -> PyneFloat:
     if lib._script is None:
         return 0.0
     return lib._script.position.avg_price
+
+
+# noinspection PyProtectedMember
+@module_property
+def position_entry_name() -> PyneStr:
+    if lib._script is None:
+        return na_str
+    open_trades = lib._script.position.open_trades
+    if not open_trades:
+        return na_str
+    # MEASURED (probe m600, BINANCE:BTCUSDT 30m): the id of the OLDEST still-open
+    # entry, not the latest one -- with A and B pyramided it stays "A", and only
+    # after `strategy.close("A")` does it become "B". A reversal leaves the
+    # flipping entry as the sole open trade, so it names that one. Flat is `na`.
+    entry_id_ = open_trades[0].entry_id
+    return entry_id_ if entry_id_ is not None else na_str
 
 
 # noinspection PyProtectedMember
