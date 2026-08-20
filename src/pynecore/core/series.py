@@ -31,7 +31,11 @@ class SeriesImpl(Generic[T]):
                  '_capacity', '_write_pos', '_size',
                  '_last_bar_index', '_na', '_compacted')
 
-    DEFAULT_MAX_BARS_BACK = 500  # This can be set globally by indicator or strategy commands
+    # MEASURED (probes m601/m602, BINANCE:BTCUSDT 30m): TradingView serves 5000 bars of
+    # history for EVERY series — builtin, user-defined and ``ta.*`` output alike, under
+    # both constant and dynamic subscripts — without the script declaring anything. A
+    # smaller default silently returns na for deeper reads instead of the value TV shows.
+    DEFAULT_MAX_BARS_BACK = 5000  # This can be set globally by indicator or strategy commands
     MAXIMUM_MAX_BARS_BACK = 5000  # This is the maximum allowed value
 
     _lib: ModuleType = None  # Placeholder for the lib module
@@ -68,10 +72,12 @@ class SeriesImpl(Generic[T]):
         # Internal capacity is max_bars_back + 1 (for current candle + historical bars)
         self._capacity = self._max_bars_back + 1
 
-        # Pre-allocated buffer for better performance. The None placeholders
-        # only ever fill the unused tail (positions >= _size are never read),
-        # so the element type can omit None and reads stay cast-free.
-        self._buffer: list[T | NA[T]] = cast('list[T | NA[T]]', [None] * self._capacity)
+        # Grown by append until it reaches ``_capacity``, then written circularly.
+        # Allocating the full capacity up front would cost every series the deepest
+        # lookback TradingView allows no matter how few bars the run actually has;
+        # while the buffer is filling ``_write_pos == _size == len(_buffer)``, so the
+        # append lands exactly where the indexed store into a pre-allocated list did.
+        self._buffer: list[T | NA[T]] = []
 
         # The next logical write position in a circular manner.
         self._write_pos = 0
@@ -118,9 +124,6 @@ class SeriesImpl(Generic[T]):
             self._max_bars_back = new_max_bars_back
             self._max_bars_back_set = new_max_bars_back
             self._capacity = new_capacity
-            # Extend pre-allocated buffer with None placeholders (unused tail)
-            self._buffer.extend(cast('list[T | NA[T]]',
-                                     [None] * (new_capacity - len(self._buffer))))
             return
 
         old_buffer = self._buffer
@@ -129,8 +132,9 @@ class SeriesImpl(Generic[T]):
         # Number of items to keep: either all old items or new_capacity, whichever is smaller.
         items_to_keep = min(old_size, new_capacity)
 
-        # Build a new pre-allocated buffer (None placeholders in the unused tail).
-        new_buffer: list[T | NA[T]] = cast('list[T | NA[T]]', [None] * new_capacity)
+        # Only the kept items are materialised; the rest of the capacity is filled by
+        # later appends, exactly as on a freshly constructed buffer.
+        new_buffer: list[T | NA[T]] = cast('list[T | NA[T]]', [None] * items_to_keep)
 
         if items_to_keep > 0 and old_buffer:
             # The newest item is at (old_write_pos - 1) in a circular manner.
@@ -189,7 +193,7 @@ class SeriesImpl(Generic[T]):
         # copy so a drift between the two is visible at a glance — a wrap one of
         # them makes and the other does not corrupts a full buffer silently.
         if self._size < self._capacity:
-            self._buffer[self._write_pos] = value
+            self._buffer.append(value)
             self._size += 1
             self._write_pos += 1
         else:
@@ -212,8 +216,8 @@ class SeriesImpl(Generic[T]):
         overwriting the oldest entry afterwards.
         """
         if self._size < self._capacity:
-            # The buffer is not yet full - use direct indexing to pre-allocated buffer
-            self._buffer[self._write_pos] = value
+            # The buffer is not yet full - grow it by one slot
+            self._buffer.append(value)
             self._size += 1
             self._write_pos += 1
         else:
@@ -446,10 +450,10 @@ class ReadOnlySeriesView(Generic[T]):
         # a second time just to re-check identity. (The call stays outside that
         # guard, so the list below was built once either way.) An attribute read
         # carries no call site at all.
-        # Slice with an explicit upper bound everywhere: the buffer list may be
-        # physically longer than ``_capacity`` (a shrink through the
-        # ``max_bars_back`` fast path keeps the old allocation), so an open-ended
-        # slice would run into the unused ``None`` tail.
+        # Slice with an explicit upper bound everywhere: the wrap branches index
+        # relative to ``_capacity``, which the still-growing buffer has not reached
+        # yet — they are only taken once it has, and an open-ended slice would tie
+        # the result to the physical length instead of the logical one.
         cap = self._capacity
         lo = self._write_pos - self._stop
         hi = self._write_pos - self._start
@@ -482,6 +486,12 @@ def _inline_series_instance() -> Callable[..., SeriesImpl]:
         series.add(value)
         return cast(SeriesImpl[T], series[idx])
 
+    # The whole instance state is this one buffer, and it lives in a closure
+    # cell that the generic child-slot walker cannot reach. Publishing it lets
+    # ``RootChildSnapshot`` roll the buffer back instead of dropping the
+    # instance: a dropped ``inline_series`` re-binds EMPTY, so every ``expr[n]``
+    # with n >= 1 reads na for the rest of the run.
+    setattr(bound, '__pyne_series__', series)
     return bound
 
 

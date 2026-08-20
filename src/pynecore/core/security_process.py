@@ -41,8 +41,11 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
       with ``barstate.isconfirmed=False`` against the same ``bar_index`` as the
       first developing tick of this period (Series.add → set, no new bar push).
       ``RootVarSnapshot`` rolls the root vectors' var slots back to the period
-      baseline before each such re-execution; ``instance_state.reset()`` drops
-      the function instances.
+      baseline before each such re-execution, and ``RootChildSnapshot`` rolls
+      the function instances back with it — the builtin machines carry state
+      across periods (``ta.rma``'s accumulator, ``ta.tr``'s previous close), so
+      dropping the instances would restart every ``ta.*`` from scratch on every
+      re-tick and leave the expression permanently ``na``.
 """
 from __future__ import annotations
 
@@ -814,6 +817,15 @@ def security_process_main(
     # the warmup->live transition so the first replay has a baseline.
     series_snapshot: instance_state.RootSeriesSnapshot | None = None
 
+    # Companion to ``var_snapshot`` for the function instances. A re-tick of the
+    # same HTF period is a discarded re-execution, and the next one must start
+    # from the period baseline — including the builtin machines' internal state.
+    # ``instance_state.reset()`` DROPS those instances instead of rolling them
+    # back, so a stateful expression never accumulates across periods:
+    # MEASURED (Saty ATR Levels, wild corpus) — ``ta.atr(14)`` inside a
+    # ``lookahead_on`` security context stayed ``na`` on all 28366 bars.
+    child_snapshot: instance_state.RootChildSnapshot | None = None
+
     # Tracks the last developing HTF period start (ms) the subprocess
     # advanced into. Used to distinguish "new dev period" (allocate a new
     # bar_index) from "another tick within the same dev period" (re-run
@@ -838,6 +850,12 @@ def security_process_main(
         if series_snapshot is None:
             series_snapshot = instance_state.RootSeriesSnapshot(root_keys)
         return series_snapshot if series_snapshot.has_series else None
+
+    def _ensure_child_snapshot() -> instance_state.RootChildSnapshot:
+        nonlocal child_snapshot
+        if child_snapshot is None:
+            child_snapshot = instance_state.RootChildSnapshot(root_keys)
+        return child_snapshot
 
     # Append a streamer bar to ``bar_buffer``, deduped against ``last_warmup_ts``:
     # the WS was subscribed before the REST warmup ran, so the initial batch may
@@ -936,6 +954,7 @@ def security_process_main(
             _snap = _ensure_snapshot()
             if _snap is not None:
                 _snap.save()
+            _ensure_child_snapshot().save()
             # Series rollback is needed only in the live phase, where a reordered
             # feed can trigger a backward replay; the warmup path is forward-only
             # and never restores, so copying buffers there would be wasted work.
@@ -950,7 +969,7 @@ def security_process_main(
                 _snap.restore()
             if series_snapshot is not None and series_snapshot.saved:
                 series_snapshot.restore()
-            instance_state.reset()
+            _ensure_child_snapshot().restore()
 
         _ltf_collector = LiveLtfCollector(
             _run_ltf_intrabar, _save_ltf_baseline, _restore_ltf_baseline,
@@ -1086,13 +1105,14 @@ def security_process_main(
                     seen_live_bar = True
                     last_dev_period_start = dev_time_ms
                 else:
-                    # Same dev period: restore var globals to the period
-                    # baseline (saved either after the prior closed run or
-                    # at the start of this dev period) and re-run.
+                    # Same dev period: restore var globals AND the function
+                    # instances to the period baseline (saved either after the
+                    # prior closed run or at the start of this dev period) and
+                    # re-run.
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.restore()
-                    instance_state.reset()
+                    _ensure_child_snapshot().restore()
 
                 _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
                                     lossless_volume=lossless_volume,
@@ -1100,7 +1120,12 @@ def security_process_main(
                 lib.last_bar_index = current_bar
 
                 barstate.isfirst = (current_bar == 0)
-                barstate.islast = True
+                # Only the developing period at the live edge is the chart's last bar.
+                # A historical developing period sits in the middle of the run, and
+                # claiming ``islast`` there fires every ``if barstate.islast`` block on
+                # EVERY chart bar -- including on the child's first, where the arrays
+                # such a block indexes hold a single element.
+                barstate.islast = not dev_is_history
                 barstate.isconfirmed = False
                 barstate.ishistory = dev_is_history
                 barstate.isrealtime = not dev_is_history
@@ -1111,6 +1136,7 @@ def security_process_main(
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.save()
+                    _ensure_child_snapshot().save()
 
                 _run_script_main()
                 # Commit the developing HA open/close AFTER the run and the
@@ -1142,12 +1168,13 @@ def security_process_main(
                 # very first live bar reuses the next-unprocessed index the
                 # historical loop left in ``current_bar``.
                 if last_dev_period_start == dev_time_ms:
-                    # Same HTF bar — restore var baseline, then re-run as
-                    # confirmed close. Series writes overwrite the dev value.
+                    # Same HTF bar — restore the var and instance baseline,
+                    # then re-run as confirmed close. Series writes overwrite
+                    # the dev value.
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.restore()
-                    instance_state.reset()
+                    _ensure_child_snapshot().restore()
                     is_new_closed_period = False
                 else:
                     if seen_live_bar:
@@ -1179,6 +1206,7 @@ def security_process_main(
                 snap = _ensure_snapshot()
                 if snap is not None:
                     snap.save()
+                _ensure_child_snapshot().save()
 
                 data_ready_event.set()
                 done_event.set()
@@ -1271,6 +1299,7 @@ def security_process_main(
                 snap = _ensure_snapshot()
                 if snap is not None:
                     snap.save()
+                _ensure_child_snapshot().save()
 
             if is_ltf:
                 flush_fn(ltf_prefix_len)

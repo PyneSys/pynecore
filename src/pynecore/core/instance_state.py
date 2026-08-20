@@ -608,9 +608,11 @@ def _snap_child(entry: Any) -> tuple:
     A bare list is a fast-path child state vector (its layout rides in the
     trailing element, see :func:`_make_state`); an anchored ``(callee, bound)``
     pair whose bound is a state-carrying partial exposes its vector as
-    ``bound.args[0]``. Anything else (an overload dispatcher's or method
-    binder's opaque closure) cannot be walked — it is DROPPED on restore, which
-    re-binds it fresh, exactly what :func:`reset` did for every child.
+    ``bound.args[0]``; a bound closure whose entire state is one series
+    publishes it as ``__pyne_series__`` (``inline_series``). Anything else (an
+    overload dispatcher's or method binder's opaque closure) cannot be walked —
+    it is DROPPED on restore, which re-binds it fresh, exactly what
+    :func:`reset` did for every child.
     """
     if entry is None:
         return ('none',)
@@ -622,6 +624,11 @@ def _snap_child(entry: Any) -> tuple:
             layout = getattr(bound.func, '__pyne_layout__', None)
             if layout is not None:
                 return ('pair', entry, bound.args[0], _snap_vector(bound.args[0], layout))
+        # A closure-held series must be ROLLED BACK, never dropped: re-binding
+        # gives an empty buffer, and ``expr[n]`` then reads na forever.
+        series = getattr(bound, '__pyne_series__', None)
+        if series is not None:
+            return ('series', entry, series, series._snapshot())
     return ('drop',)
 
 
@@ -656,6 +663,9 @@ def _restore_children(state: list, child_vals: tuple) -> None:
             elif kind == 'vec':
                 state[slot] = child_snap[1]
                 _restore_vector(child_snap[1], child_snap[2])
+            elif kind == 'series':
+                state[slot] = child_snap[1]
+                child_snap[2]._restore(child_snap[3])
             else:  # pair
                 state[slot] = child_snap[1]
                 _restore_vector(child_snap[2], child_snap[3])
@@ -672,6 +682,10 @@ def _restore_child(lst: list, index: int, saved: tuple) -> bool:
     if kind == 'pair':
         lst[index] = saved[1]
         _restore_vector(saved[2], saved[3])
+        return True
+    if kind == 'series':
+        lst[index] = saved[1]
+        saved[2]._restore(saved[3])
         return True
     return False
 

@@ -18,6 +18,7 @@ from pynecore.types.na import na_float
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
+from pynecore.core.lookahead import ALLOW_LOOKAHEAD
 from pynecore.core.ohlcv import restore_f32_volume
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
@@ -205,6 +206,14 @@ def _set_path_bar(lib: ModuleType, node: int, bar: tuple[float, float, float, fl
 
     ``open`` never moves — it is the one price the bar starts with.
 
+    That TradingView leaks the whole bar here is measured, not assumed: a
+    ``varip`` probe recording ``open``/``high``/``low``/``close`` on a bar's FIRST
+    body run and plotting them against the definitive run's reports a zero
+    difference on all 296 fill bars of BINANCE:BTCUSDT 30m. Under
+    ``PYNE_ALLOW_LOOKAHEAD`` the bar is therefore handed out whole, which is what
+    makes a strategy's dependence on that leak measurable as a difference between
+    the two runs.
+
     :param lib: The ``pynecore.lib`` module whose price globals are rewritten
     :param node: Path node, 0..3 (open, nearer extreme, farther extreme, close);
                  ``>= 3`` restores the whole bar
@@ -215,7 +224,7 @@ def _set_path_bar(lib: ModuleType, node: int, bar: tuple[float, float, float, fl
                          sees cannot disagree with where orders fill.
     """
     o, h, lo, c, v = bar
-    if node < 3:
+    if node < 3 and not ALLOW_LOOKAHEAD:
         walk = (o, h, lo) if near_is_high else (o, lo, h)
         seen = walk[:node + 1]
         h, lo, c = max(seen), min(seen), walk[node]

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
+from .lookahead import ALLOW_LOOKAHEAD
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
@@ -362,6 +363,13 @@ class SecurityState:
     needs_wait: bool = False
     new_period: bool = False
 
+    # ``Lookahead.ON``: set once the one-time historical prefill in
+    # ``__sec_signal__`` has replayed the child's own ``.ohlcv`` bars that
+    # closed before the first containing period. The developing transport
+    # never reads that file, so without the prefill the child's HTF series
+    # would begin at the chart's first bar.
+    htf_prefilled: bool = False
+
     # Set by ``__sec_signal__`` when an LTF chart bar precedes the feed (see
     # ``ltf_first_ms``): no handshake ran this bar, so ``__sec_read__`` returns
     # the empty-array default directly instead of waiting on shared memory.
@@ -445,6 +453,21 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
 
     resampler = state.resampler
     assert resampler is not None
+
+    if (ALLOW_LOOKAHEAD and state.lookahead is Lookahead.ON
+            and state.htf_aggregator is not None):
+        # ``PYNE_ALLOW_LOOKAHEAD`` only: step into the period CONTAINING the
+        # chart bar instead of the last closed one. The containing period's bar
+        # is already complete in the child's data file, so a bare expression
+        # reads its final OHLCV — TradingView's future-leak, reproduced on
+        # purpose so a script can be measured with and without it. ``chart_time``
+        # (not the close instant) selects the period, so the period's last chart
+        # bar still maps to that period rather than the next.
+        if state.session_starts is not None:
+            return resampler.get_bar_time(
+                chart_time, state.session_tz, state.session_starts,
+                state.session_opening_hours)
+        return resampler.get_bar_time(chart_time, state.tz)
 
     # The chart bar's close instant. ``chart_off`` is span-1 for intraday and
     # seconds charts; D/W/M chart bars have no fixed arithmetic span
@@ -664,6 +687,20 @@ def create_chart_protocol(
                 state.data_ready.clear()
             return
 
+        # One outstanding round per context. ``__sec_wait__`` normally collects
+        # the previous round, but it only runs where the script actually reads
+        # the context — a read behind a conditional leaves the round in flight,
+        # and the writes below would then overwrite the SyncBlock slot the
+        # subprocess is still unpacking. ``set_developing_bar`` packs 48 bytes
+        # in one call, not one atomic store, so the child can observe a mix of
+        # both bars: MEASURED on ICT Master Suite — parent wrote
+        # (o=115055.03 h=115127.81 l=112650.0 c=113848.3 t=1754352000000), the
+        # child read (o=115055.03 h=0 l=0 c=0 t=0) and the script divided by it.
+        if state.needs_wait:
+            _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
+            state.done_event.clear()
+            state.needs_wait = False
+
         # noinspection PyProtectedMember
         chart_time = lib._time
 
@@ -843,8 +880,51 @@ def create_chart_protocol(
             # is available here at no extra cost. ``FLAG_DEV_HISTORICAL`` tells
             # the subprocess to keep history barstate: the transport is the live
             # one, the bar is not.
-            dev_transport = state.is_live or state.lookahead is Lookahead.ON
+            # With ``ALLOW_LOOKAHEAD`` a historical ``ON`` falls through to the
+            # closed-only flow instead, where ``_get_confirmed_time`` steps into
+            # the containing period and the child reads its complete bar. Live
+            # mode keeps the developing transport either way — a live bar has no
+            # completed future to read.
+            dev_transport = state.is_live or (
+                state.lookahead is Lookahead.ON and not ALLOW_LOOKAHEAD)
             hist_phase = 0 if state.is_live else FLAG_DEV_HISTORICAL
+
+            # Phase 0 (one-time historical prefill): the developing transport
+            # never lets the child read its own ``.ohlcv`` file, so on its own
+            # the child's HTF series would begin at the chart's first bar and
+            # every ``[1]`` read inside the first period would return na.
+            # MEASURED on the daily-pivot idiom
+            # ``security(tickerid, "D", close[1], lookahead_on)``: a 30m chart
+            # opening 2025-01-01 got TV's 2024-12-31 pivot but na from PyneCore
+            # for that whole first day.
+            #
+            # Replaying the periods that closed BEFORE the containing one leaks
+            # nothing — they are complete past bars, exactly the ones the
+            # closed-only flow below would have delivered. Only the containing
+            # period stays on the aggregated developing bar, so the no-lookahead
+            # rule is untouched. ``last_confirmed`` guards the live case, where
+            # the closed-only warmup already advanced the child further.
+            if dev_transport and not state.htf_prefilled:
+                state.htf_prefilled = True
+                containing = dev_bar if dev_bar is not None else closed_bar
+                prefill_target = (containing.period_start - 1
+                                  if containing is not None else 0)
+                if prefill_target > state.last_confirmed:
+                    sync_block.set_flags(
+                        sec_id,
+                        sync_block.get_flags(sec_id) & ~(
+                            FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                            | FLAG_DEV_HISTORICAL
+                        ),
+                    )
+                    sync_block.set_target_time(sec_id, prefill_target)
+                    state.last_confirmed = prefill_target
+                    state.data_ready.clear()
+                    state.advance_event.set()
+                    _wait_with_liveness(state.done_event, sec_id, sec_processes,
+                                        failed_children)
+                    state.done_event.clear()
+
             if dev_transport:
                 # Phase 1: synchronously deliver any just-closed HTF bar
                 if closed_bar is not None:
