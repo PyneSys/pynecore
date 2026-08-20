@@ -15,10 +15,11 @@ Two consumers share this definition:
 * the builtins in ``lib`` that were *measured* to compare tolerantly
   (``ta.rising``, ``ta.falling``, ``ta.cmo``, ``ta.mfi``, ``array.percentrank``,
   ``array.indexof`` and friends). The rest of the builtins are bit-exact on
-  TradingView — ``ta.highest``/``lowest``, ``ta.crossover``, ``ta.pivothigh``,
+  TradingView — ``ta.highest``/``lowest``, ``ta.pivothigh``,
   ``math.max``/``min``/``sign``, ``array.binary_search`` among them — so the
   tolerance must never be applied blindly to a builtin that has not been
-  measured.
+  measured. ``ta.crossover``/``crossunder`` mix the two: strict bar-to-bar
+  comparisons gated by a tolerant armed state (see their bodies).
 
 Hot per-bar paths inline the arithmetic instead of calling ``equal``: the call
 would cost more than the comparison it wraps.

@@ -449,14 +449,26 @@ def crossover(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed over the given series
     """
-    # Pine has no na bool: with no previous relation to compare against there is
-    # no cross, so the first bar where both sources are defined yields false, not na
-    l1_lte_l2: Persistent[bool] = False
-    res = source1 > source2 and l1_lte_l2
-    # Only refresh the relation on bars where it is defined; TV compares against the
-    # last bar with both sources present, so na gaps must not reset the state
+    # Three measured conditions (probe_cross_state A-H + 821 BHP saturation
+    # plateaus + probes m547/m548, 2026-08): the bar-to-bar comparisons are
+    # STRICT -- a 1e-12 step both fires and blocks -- while the third, the
+    # armed state, is the last TOLERANTLY-unequal relation (|diff| > 1e-10):
+    # a run of exact equality entered from tolerantly-above does not arm the
+    # exit jump, but sources that were never tolerantly apart count as armed.
+    # Pine has no na bool: with no previous relation to compare against there
+    # is no cross, so the first defined bar yields false, not na.
+    was_le: Persistent[bool] = False
+    armed_below: Persistent[bool] = True
+    res = source1 > source2 and was_le and armed_below
+    # Only refreshed on bars where both sources are defined; TV compares
+    # against the last such bar, so na gaps must not reset the state
     if source1 == source1 and source2 == source2:
-        l1_lte_l2 = source1 <= source2
+        was_le = source1 <= source2
+        diff = source1 - source2
+        if diff < -_EPSILON:
+            armed_below = True
+        elif diff > _EPSILON:
+            armed_below = False
     return res
 
 
@@ -469,14 +481,18 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed under the given series
     """
-    # Pine has no na bool: with no previous relation to compare against there is
-    # no cross, so the first bar where both sources are defined yields false, not na
-    l1_gte_l2: Persistent[bool] = False
-    res = source1 < source2 and l1_gte_l2
-    # Only refresh the relation on bars where it is defined; TV compares against the
-    # last bar with both sources present, so na gaps must not reset the state
+    # Strict bar-to-bar comparisons plus the tolerant armed state -- the
+    # measured rule mirrors crossover, see there
+    was_ge: Persistent[bool] = False
+    armed_above: Persistent[bool] = True
+    res = source1 < source2 and was_ge and armed_above
     if source1 == source1 and source2 == source2:
-        l1_gte_l2 = source1 >= source2
+        was_ge = source1 >= source2
+        diff = source1 - source2
+        if diff > _EPSILON:
+            armed_above = True
+        elif diff < -_EPSILON:
+            armed_above = False
     return res
 
 

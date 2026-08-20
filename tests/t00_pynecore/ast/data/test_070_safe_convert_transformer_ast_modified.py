@@ -11,4 +11,4 @@ def main():
     na_int = lib.na(int)
     int_val = safe_convert.safe_int(na_int)
     regular_val = 3.14
-    regular_float = safe_convert.safe_float(regular_val)
+    regular_float = safe_convert.safe_float(3.14)

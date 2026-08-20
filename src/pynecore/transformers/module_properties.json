@@ -1580,6 +1580,9 @@
     "exp": {
       "type": "variable"
     },
+    "fdlibm": {
+      "type": "variable"
+    },
     "floor": {
       "type": "variable"
     },
@@ -1605,6 +1608,9 @@
       "type": "variable"
     },
     "pi": {
+      "type": "variable"
+    },
+    "pine_math": {
       "type": "variable"
     },
     "pow": {
@@ -2368,6 +2374,9 @@
       "type": "variable"
     },
     "position_avg_price": {
+      "type": "property"
+    },
+    "position_entry_name": {
       "type": "property"
     },
     "position_size": {

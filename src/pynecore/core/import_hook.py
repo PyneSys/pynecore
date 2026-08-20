@@ -279,6 +279,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
             from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
             from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+            from pynecore.transformers.const_fold import ConstFoldTransformer
             from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
             from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
             from pynecore.transformers.security import SecurityTransformer
@@ -313,6 +314,14 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # so the lib.<ns>.<name> chains it emits get their imports added there
             transformed = BuiltinShadowTransformer().visit(transformed)
             transformed = ImportNormalizerTransformer().visit(transformed)
+            # TradingView folds constant subtrees at parse time with fdlibm
+            # transcendentals and a 16-decimal embedding cap, while runtime
+            # series-fed calls use the Intel-LIBM intrinsics (lib.math /
+            # core.pine_math); the fold pass replays that split. It needs the
+            # normalized lib.math.* chains, and only user/compiled scripts get
+            # it -- pynecore's own lib modules must keep their raw expressions
+            if not path.is_relative_to(Path(__file__).parent.parent):
+                transformed = ConstFoldTransformer().visit(transformed)
             # Per-call evaluation of lib.*-referencing parameter defaults; must
             # precede the series/isolation passes so the moved expressions get
             # their series slots and call-site anchors like any body statement

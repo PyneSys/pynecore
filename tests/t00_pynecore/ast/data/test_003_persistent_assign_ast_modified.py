@@ -7,5 +7,6 @@ def main(__state__):
     if not __state__[2]:
         __state__[1] = __state__[0] + 1
         __state__[2] = True
+    __state__[0] = __state__[0] + 1
     print(__state__[1])
 main.__pyne_layout__ = __pyne_slot_layout__['main']

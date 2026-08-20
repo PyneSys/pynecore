@@ -2,6 +2,7 @@ from typing import TypeVar, cast, overload
 import builtins
 import math
 
+from ..core import fdlibm, pine_math
 from ..types.na import NA, na_float
 from ..types import PyneFloat, PyneInt
 
@@ -49,7 +50,8 @@ def acos(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.acos(angle)
+    # TV's JVM has no JIT intrinsic for acos/asin: their runtime is StrictMath (fdlibm)
+    return fdlibm.acos(angle)
 
 
 def asin(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -61,7 +63,7 @@ def asin(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.asin(angle)
+    return fdlibm.asin(angle)
 
 
 def atan(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -136,7 +138,10 @@ def cos(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.cos(angle)
+    # TV's JIT evaluates runtime cos/sin/exp with the Intel-LIBM intrinsics,
+    # which pine_math ports bit-exactly (parse-time constants fold with
+    # fdlibm instead -- see transformers/const_fold.py)
+    return pine_math.cos(angle)
 
 
 def exp(number: TFI | NA[TFI]) -> PyneFloat:
@@ -148,7 +153,7 @@ def exp(number: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (number == number):  # is_na_arg
         return na_float
-    return math.exp(number)
+    return pine_math.exp(number)
 
 
 def floor(number: TFI | NA[TFI]) -> PyneInt:
@@ -381,7 +386,7 @@ def sin(angle: float | int | NA) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.sin(angle)
+    return pine_math.sin(angle)
 
 
 def sqrt(number: float | int | NA) -> PyneFloat:

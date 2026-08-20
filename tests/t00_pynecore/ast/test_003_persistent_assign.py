@@ -7,6 +7,9 @@ from pynecore import Persistent
 def main():
     p1: Persistent[float] = 1
     p2: Persistent[float] = p1 + 1
+    # The mutation keeps p1 out of the const-fold pass, so p2's dependent
+    # initializer stays a real lazy-init (flagged) persistent assignment
+    p1 = p1 + 1
     print(p2)
 
 

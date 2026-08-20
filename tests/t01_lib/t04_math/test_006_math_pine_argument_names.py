@@ -7,6 +7,7 @@ that halts the script at runtime.
 """
 import math as _pymath
 
+from pynecore.core import fdlibm
 from pynecore.lib import math
 
 
@@ -17,8 +18,10 @@ def main():
 
 def __test_math_inverse_trig_argument_is_named_angle__():
     """math.acos/asin/atan take ``angle``, not ``value``."""
-    assert math.acos(angle=0.5) == _pymath.acos(0.5)
-    assert math.asin(angle=0.5) == _pymath.asin(0.5)
+    # acos/asin route through the fdlibm port (TV's runtime for them), which
+    # may differ from the platform libm by an ulp -- compare against it
+    assert math.acos(angle=0.5) == fdlibm.acos(0.5)
+    assert math.asin(angle=0.5) == fdlibm.asin(0.5)
     assert math.atan(angle=0.5) == _pymath.atan(0.5)
 
 
