@@ -135,6 +135,7 @@ _EXP_TBL = bytes.fromhex(
     '9dcd914d3b89773cd8909e81c1a70f00'
 )
 
+
 def _u32(table: bytes, off: int) -> int:
     return _unpack('<I', table[off:off + 4])[0]
 
@@ -145,16 +146,16 @@ def _u64(table: bytes, off: int) -> int:
 
 # --- cos/sin scalar constants ------------------------------------------------
 
-_PI32INV = _b2f(0x40245f306dc9c883)         # 32/pi
-_P1 = _b2f(0x3fb921fb54400000)              # pi/32 head
-_P2 = _b2f(0x3d90b4611a600000)              # pi/32 middle
-_P3 = _b2f(0x3b63198a2e037073)              # pi/32 tail
+_PI32INV = _b2f(0x40245f306dc9c883)  # 32/pi
+_P1 = _b2f(0x3fb921fb54400000)  # pi/32 head
+_P2 = _b2f(0x3d90b4611a600000)  # pi/32 middle
+_P3 = _b2f(0x3b63198a2e037073)  # pi/32 tail
 _SC1_LO, _SC1_HI = _b2f(0xbfc5555555555555), _b2f(0xbfe0000000000000)
 _SC2_LO, _SC2_HI = _b2f(0x3f81111111111111), _b2f(0x3fa5555555555555)
 _SC3_LO, _SC3_HI = _b2f(0xbf2a01a01a01a01a), _b2f(0xbf56c16c16c16c17)
 _SC4_LO, _SC4_HI = _b2f(0x3ec71de3a556c734), _b2f(0x3efa01a01a01a01a)
-_PI_4_HEAD = _b2f(0x3fe921fb40000000)       # pi/4 split head
-_PI_4_TAIL = _b2f(0x3e64442d18469899)       # pi/4 split tail
+_PI_4_HEAD = _b2f(0x3fe921fb40000000)  # pi/4 split head
+_PI_4_TAIL = _b2f(0x3e64442d18469899)  # pi/4 split tail
 
 _CT0 = [_u64(_CTABLE, j * 32) for j in range(64)]
 _CT8 = [_b2f(_u64(_CTABLE, j * 32 + 8)) for j in range(64)]
@@ -217,7 +218,7 @@ def _reduce_huge(x_bits: int, quad_add: int, cvt64: bool) -> float:
     into the table index.
     """
     exp16 = (x_bits >> 48) & 0x7FF0
-    if exp16 == 0x7FF0:                     # Inf or NaN
+    if exp16 == 0x7FF0:  # Inf or NaN
         return _b2f(x_bits) * -0.0
 
     off = ((exp16 - 16224) >> 7) & 0xFFFC
@@ -232,17 +233,18 @@ def _reduce_huge(x_bits: int, quad_add: int, cvt64: bool) -> float:
         s += ((m_hi << 32) + m_lo) * w[k] << (192 - 32 * k)
     s += m_hi * w[6] << 32
     prod = s >> 32
-    low = prod & _M64                       # bits [0:64)
-    mid = (prod >> 64) & _M64               # bits [64:128)
-    up32 = (prod >> 128) & _M32             # bits [128:160)
-    top = (prod >> 160) & _M64              # bits [160:224)
+    low = prod & _M64  # bits [0:64)
+    mid = (prod >> 64) & _M64  # bits [64:128)
+    up32 = (prod >> 128) & _M32  # bits [128:160)
+    top = (prod >> 160) & _M64  # bits [160:224)
 
     sign16 = 32768 if x_bits >> 63 else 0
     expo = ((x_bits >> 52) & 2047) - 1023
-    point = off * 8 + 19 - expo             # binary-point offset
+    point = off * 8 + 19 - expo  # binary-point offset
     e_ctr = point + 32
     sign_flip = 0
 
+    # noinspection PyShadowingNames
     def _complement(borrow_hi, lo, md, tp):
         """(borrow_hi - fraction): three-limb negate with borrow chain."""
         lo2 = (0 - lo) & _M64
@@ -253,20 +255,20 @@ def _reduce_huge(x_bits: int, quad_add: int, cvt64: bool) -> float:
         tp2 = (borrow_hi - tp - cf) & _M64
         return lo2, md2, tp2
 
-    if point >= 1:                          # binary point inside the top word
+    if point >= 1:  # binary point inside the top word
         sh = (29 - point) & 31
         t32 = ((top & _M32) << sh) & _M32
         quad_acc = t32
         frac29 = t32 & 0x1FFFFFFF
         f = (frac29 >> sh) & _M32
         top = ((f << 32) | up32) & _M64
-        if frac29 & 0x10000000:             # fraction >= 1/2: complement, bump
+        if frac29 & 0x10000000:  # fraction >= 1/2: complement, bump
             low, mid, top = _complement(((0x20000000 >> sh) & _M32) << 32,
                                         low, mid, top)
             sign_flip = 32768
             quad_acc = (quad_acc + 0x20000000) & _M32
         quad_base = quad_acc >> 29
-    else:                                   # point below the top word
+    else:  # point below the top word
         sh = (-point) & 63
         full = (((top << 32) | up32) << sh) & _M64
         quad_acc = full
@@ -339,9 +341,9 @@ def cos(x: float) -> float:
     x_bits = _f2b(x)
     band = (((x_bits >> 32) & 2147418112) - 808452096) & _M32
     if band > 281346048:
-        if band - 281346048 < 0x80000000:   # |x| >= 90112 (signed positive)
+        if band - 281346048 < 0x80000000:  # |x| >= 90112 (signed positive)
             return _reduce_huge(x_bits, 1865232, True)
-        return 1.0 - abs(x)                 # |x| < 2^-252
+        return 1.0 - abs(x)  # |x| < 2^-252
     n = _round_n(x)
     return _sincos_poly(x, n, (n + 16) & 63, 0.0)
 
@@ -351,7 +353,7 @@ def sin(x: float) -> float:
     x_bits = _f2b(x)
     band = (((x_bits >> 32) & 2147418112) - 808452096) & _M32
     if band > 281346048:
-        if band - 281346048 < 0x80000000:   # |x| >= 90112
+        if band - 281346048 < 0x80000000:  # |x| >= 90112
             return _reduce_huge(x_bits, 1865216, False)
         if (band >> 20) == 3325:
             return x * _b2f(0x3fefffffffffffff)
@@ -362,13 +364,13 @@ def sin(x: float) -> float:
 
 # --- exp ---------------------------------------------------------------------
 
-_E_LOG2_64 = _b2f(0x40571547652b82fe)       # 64/ln2
-_E_LN2_64_HEAD = _b2f(0x3f862e42fefa0000)   # ln2/64 head
-_E_LN2_64_TAIL = _b2f(0x3d1cf79abc9e3b3a)   # ln2/64 tail
-_E_HALF = _b2f(0x3fdffffffffffffe)          # 0.5 - 1/4 ulp
+_E_LOG2_64 = _b2f(0x40571547652b82fe)  # 64/ln2
+_E_LN2_64_HEAD = _b2f(0x3f862e42fefa0000)  # ln2/64 head
+_E_LN2_64_TAIL = _b2f(0x3d1cf79abc9e3b3a)  # ln2/64 tail
+_E_HALF = _b2f(0x3fdffffffffffffe)  # 0.5 - 1/4 ulp
 _E_P3_LO, _E_P3_HI = _b2f(0x3f56c15ce3289860), _b2f(0x3fa55555555b9e25)
 _E_P5_LO, _E_P5_HI = _b2f(0x3f811115c090cf0f), _b2f(0x3fc5555555548ba1)
-_E_SHIFTER = _b2f(0x4338000000000000)       # 1.5 * 2^52
+_E_SHIFTER = _b2f(0x4338000000000000)  # 1.5 * 2^52
 _E_XMAX = _b2f(0x7fefffffffffffff)
 _E_XMIN = _b2f(0x0010000000000000)
 _E_INF_BITS = 0x7ff0000000000000
@@ -385,17 +387,17 @@ def exp(x: float) -> float:
     if (((16527 - top15) | (top15 - 15504)) & _M32) >= 0x80000000:
         # outside the main range: special and small-argument handling
         mag = hi32 & 2147483647
-        if mag >= 1083179008:               # |x| >= ~709.78 or non-finite
+        if mag >= 1083179008:  # |x| >= ~709.78 or non-finite
             if mag < 2146435072:
-                if hi32 >= 0x80000000:      # underflow to zero
+                if hi32 >= 0x80000000:  # underflow to zero
                     return _E_XMIN * _E_XMIN
-                return _E_XMAX * _E_XMAX    # overflow to inf
+                return _E_XMAX * _E_XMAX  # overflow to inf
             if mag > 2146435072 or (x_bits & _M32) != 0:
-                return x + x                # NaN
+                return x + x  # NaN
             if hi32 == 2146435072:
-                return _b2f(_E_INF_BITS)    # exp(+inf)
-            return 0.0                      # exp(-inf)
-        return x + 1.0                      # tiny |x|
+                return _b2f(_E_INF_BITS)  # exp(+inf)
+            return 0.0  # exp(-inf)
+        return x + 1.0  # tiny |x|
 
     s = x * _E_LOG2_64 + _E_SHIFTER
     nd = s - _E_SHIFTER
@@ -428,7 +430,7 @@ def exp(x: float) -> float:
         dropped = _b2f(_f2b(res2_adj) & mask)
         low_part = res2_adj - dropped
         acc2 = acc2 + low_part
-        if n >= 1023:                       # overflow side
+        if n >= 1023:  # overflow side
             return (acc2 + dropped) * scale3
         neg = (_f2b(acc2) >> 48) & 32768
         if (shift | neg) == 0:
@@ -436,7 +438,7 @@ def exp(x: float) -> float:
         saved = acc2
         result = (acc2 + dropped) * scale3
         if (_f2b(result) >> 48) & 32752:
-            return result                   # still a normal number
+            return result  # still a normal number
         # denormal result: redo the last step in fixed point to get the
         # correctly rounded significand
         a = saved * scale3
