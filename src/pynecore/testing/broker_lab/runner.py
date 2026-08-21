@@ -13,7 +13,9 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.sync_engine import OrderSyncEngine
-from pynecore.lib.strategy import Order, _order_type_close, _order_type_entry, oca
+from pynecore.lib.strategy import (
+    Order, _exit_key, _exit_order_key, _order_type_close, _order_type_entry, oca,
+)
 
 from .model import Scenario, ScenarioInvariantError, ScenarioResult, Step, VenueProfile
 from .scheduler import DeterministicScheduler
@@ -234,7 +236,7 @@ class ScenarioRunner:
         elif step.kind == "amend_exit":
             exit_id = str(values.get("id", "X"))
             from_entry = values.get("from_entry")
-            key = (exit_id, from_entry)
+            key = _exit_key(exit_id, from_entry)
             old = runtime.position.exit_orders.get(key)
             if old is None:
                 raise ValueError(f"cannot amend unknown exit {key!r}")
@@ -250,7 +252,7 @@ class ScenarioRunner:
             )
             order.from_entry_na = from_entry is None
             order.rest_leg = bool(values.get("rest_leg", old.rest_leg))
-            runtime.position.exit_orders[key] = order
+            runtime.position.exit_orders[_exit_order_key(order)] = order
         elif step.kind in ("exit", "close", "close_percent"):
             is_exit = step.kind == "exit"
             pine_id = str(values.get("id", "X" if is_exit else "L"))
@@ -276,8 +278,7 @@ class ScenarioRunner:
             )
             order.from_entry_na = from_entry is None
             order.rest_leg = bool(values.get("rest_leg", False))
-            key = (exit_id, from_entry if is_exit else pine_id)
-            runtime.position.exit_orders[key] = order
+            runtime.position.exit_orders[_exit_order_key(order)] = order
         elif step.kind == "cancel":
             cancel_id = values.get("id")
             runtime.position.entry_orders.pop(cancel_id, None)

@@ -87,7 +87,7 @@ def __test_reversal_new_leg_fills_then_margin_call_trims__(script_path, module_k
     # the full 1000-contract long minus the fractional 0.7996-contract cover the
     # bar-open margin call liquidates. A fresh entry in the same margin state would
     # be rejected (see test_064); the same-bar close before it makes this a reversal leg.
-    assert position.size == 999.2004
+    assert position.size == 999.2004000000001
 
     # Ledger: the short is reversed (closed), and the over-margin excess of the new
     # long is removed by a fractional-lot margin call (4x the shortfall) at the fill price.

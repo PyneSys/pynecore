@@ -207,7 +207,7 @@ class BrokerPosition(PositionBase):
         order.bar_index = int(lib.bar_index)
         # noinspection PyProtectedMember
         from pynecore.lib.strategy import (
-            _order_type_close, _order_type_entry, _order_type_normal,
+            _exit_order_key, _order_type_close, _order_type_entry, _order_type_normal,
         )
         if order.order_type in (_order_type_entry, _order_type_normal):
             if self._is_intraday_filled_cap_reached():
@@ -219,7 +219,7 @@ class BrokerPosition(PositionBase):
             if self.size == 0.0 and not self._is_direction_allowed(order.sign):
                 return
         if order.order_type == _order_type_close:
-            key = (order.exit_id, order.order_id)
+            key = _exit_order_key(order)
             existing = self.exit_orders.get(key)
             # Netting is for market closes only (``strategy.close(id)`` /
             # ``strategy.close_all()``), identified by their reserved exit-id
@@ -255,9 +255,9 @@ class BrokerPosition(PositionBase):
         """Cancel an order locally."""
         order.cancelled = True
         # noinspection PyProtectedMember
-        from pynecore.lib.strategy import _order_type_close
+        from pynecore.lib.strategy import _exit_order_key, _order_type_close
         if order.order_type == _order_type_close:
-            self.exit_orders.pop((order.exit_id, order.order_id), None)
+            self.exit_orders.pop(_exit_order_key(order), None)
         else:
             self.entry_orders.pop(order.order_id, None)
 
@@ -331,7 +331,7 @@ class BrokerPosition(PositionBase):
             firing across the restart.
         """
         # noinspection PyProtectedMember
-        from pynecore.lib.strategy import Order, _order_type_close, oca as _oca
+        from pynecore.lib.strategy import Order, _exit_order_key, _order_type_close, oca as _oca
         signed_size = qty if side == "buy" else -qty
         order = Order(
             from_entry,
@@ -345,7 +345,7 @@ class BrokerPosition(PositionBase):
             oca_name=oca_name,
             oca_type=_oca.Oca(oca_type) if oca_type is not None else None,
         )
-        self.exit_orders[(pine_id, from_entry)] = order
+        self.exit_orders[_exit_order_key(order)] = order
 
     def reconstruct_entry_order(
             self,

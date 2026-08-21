@@ -87,13 +87,16 @@ _trail_filled = 0
 _trail_deferred = 1
 _trail_pending = 2
 
-# Order-book dict key shapes. A close placed by ``strategy.close()`` /
-# ``strategy.close_all()`` in BACKTEST carries a unique ``book_seq`` stamp so
-# that multiple same-bar partial closes on one entry STACK instead of colliding
-# on a shared key; that stamp becomes the optional last tuple element. Sticky
-# ``strategy.exit`` brackets, risk/defensive closes and the live broker path
-# leave ``book_seq`` None and keep the bare 2-/3-tuple key unchanged.
-_ExitOrderKey: _TypeAlias = tuple[str | None, str | None] | tuple[str | None, str | None, int]
+# Order-book dict key shapes. A sticky ``strategy.exit`` leg carries the
+# ``entry_seq`` of the single filled entry it is bound to, so two pyramid adds
+# sharing a ``from_entry`` id get one leg each. A close placed by
+# ``strategy.close()`` / ``strategy.close_all()`` in BACKTEST carries a unique
+# ``book_seq`` stamp so that multiple same-bar partial closes on one entry STACK
+# instead of colliding on a shared key. Both elements are None for the orders
+# that use neither, which keeps their dedup-by-id semantics intact.
+_ExitOrderKey: _TypeAlias = (tuple[str | None, str | None]
+                            | tuple[str | None, str | None, int]
+                            | tuple[str | None, str | None, int | None, int])
 _MarketOrderKey: _TypeAlias = (tuple[_OrderType, str | None, str | None]
                                | tuple[_OrderType, str | None, str | None, int])
 
@@ -125,19 +128,36 @@ def _na_to_none(value):  # type: ignore[misc]
     return value
 
 
-def _exit_order_key(order_: 'Order') -> '_ExitOrderKey':
-    """Order-book key for an exit/close order.
+def _exit_key(exit_id: str | None, order_id: str | None,
+              entry_seq: int | None = None, book_seq: int | None = None) -> '_ExitOrderKey':
+    """Build an exit/close order-book key. THE single construction rule.
 
-    A backtest partial close stamped with a ``book_seq`` (see
-    :meth:`PositionBase._next_close_seq`) appends it as a 3rd element so several
-    same-bar closes on one entry get distinct keys and STACK; every other order
-    (sticky ``strategy.exit``, risk/defensive close, live broker close) keeps the
-    bare ``(exit_id, order_id)`` key, leaving their dedup-by-id semantics intact.
+    Trailing Nones are dropped, so an order that uses neither discriminator keeps
+    the bare ``(exit_id, order_id)`` key and its dedup-by-id semantics.
+
+    ``entry_seq`` is the individual filled entry a sticky ``strategy.exit`` leg is
+    bound to: TradingView issues ONE leg per entry, not per ``from_entry`` id, so
+    two pyramid adds sharing an id each get their own leg and each is consumed on
+    its own. It stays None for a leg still waiting on a pending entry order, for
+    every id-bound close, and on the live broker path, which has no binding book.
+
+    ``book_seq`` (see :meth:`PositionBase._next_close_seq`) stamps a backtest
+    partial close so several same-bar closes on one entry get distinct keys and
+    STACK instead of the later call evicting the earlier one.
+    """
+    if book_seq is not None:
+        return exit_id, order_id, entry_seq, book_seq
+    if entry_seq is not None:
+        return exit_id, order_id, entry_seq
+    return exit_id, order_id
+
+
+def _exit_order_key(order_: 'Order') -> '_ExitOrderKey':
+    """Order-book key of an exit/close order (see :func:`_exit_key`).
+
     Insert and pop sites MUST both route through this helper so they never drift.
     """
-    if order_.book_seq is None:
-        return order_.exit_id, order_.order_id
-    return order_.exit_id, order_.order_id, order_.book_seq
+    return _exit_key(order_.exit_id, order_.order_id, order_.entry_seq, order_.book_seq)
 
 
 def _market_order_key(order_: 'Order') -> '_MarketOrderKey':
@@ -178,6 +198,7 @@ class Order:
         "bound_size",  # Size of everything bound to the entry when this leg reserved its slice
         "rest_leg",  # Exit leg with no explicit qty/qty_percent: closes the WHOLE bound entry
         "consumed",  # True once an exit leg fired its slice while its entry is still open
+        "entry_seq",  # The single filled entry this sticky exit leg is bound to (_EntryBinding)
         "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
                      # (backtest only); None for non-stacking sticky-exit / risk / live orders
         "comm_booking",  # Commission pool shared by the two legs of a reversal (see _fill_order)
@@ -263,6 +284,10 @@ class Order:
         self.bound_size = 0.0
         self.rest_leg = False
         self.consumed = False
+        # The single filled entry a sticky strategy.exit leg is bound to (see
+        # _EntryBinding); None while the leg still waits on a pending entry order
+        # and for every id-bound close.
+        self.entry_seq: int | None = None
         # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
         # left None everywhere else so the order-book key keeps its bare shape.
         self.book_seq: int | None = None
@@ -350,6 +375,46 @@ class Trade:
         elif isinstance(v, float):
             v = round(v, 10)
         return v
+
+
+class _EntryBinding:
+    """One filled entry, in the book the pyramiding limit counts.
+
+    TradingView keeps TWO views of an open position and they drift apart. The
+    trade rows -- and with them ``strategy.opentrades``, ``opentrades.size()``
+    and ``position_avg_price`` -- settle FIFO across the whole position, oldest
+    entry first, no matter which entry the filling order belonged to. Every
+    exit/close order, meanwhile, settles against the entry it was BOUND to, and
+    an entry keeps its pyramiding slot until its OWN bound quantity is spent --
+    even after the FIFO view already consumed its rows under another entry's
+    fill.
+
+    Measured on BINANCE:BTCUSDT 30m (359 cycles per variant): with A(1u, id 'A')
+    and B(3u, id 'B') open under ``pyramiding=2``, shedding exactly 1 unit lands
+    the reported book on ``opentrades=1`` / ``position_size=3`` whichever way it
+    is shed -- yet a third entry is REJECTED when the unit went through an order
+    bound to B (``strategy.exit('X','B',qty=1)`` or ``strategy.close('B',qty=1)``,
+    which FIFO-consume A's row) and ACCEPTED when it went through an order bound
+    to A, or through an unbound reduction (``strategy.order``) that settles both
+    books FIFO.
+
+    ``init_size`` is frozen at the fill: a qty_percent exit leg reserves off the
+    entry's ORIGINAL quantity, not off what is left of it.
+    """
+
+    __slots__ = ('seq', 'entry_id', 'init_size', 'bound', 'sign', 'entry_price')
+
+    def __init__(self, seq: int, entry_id: str | None, size: PyneFloat, entry_price: PyneFloat):
+        self.seq: int = seq
+        self.entry_id: str | None = entry_id
+        self.init_size: float = abs(size)
+        self.bound: float = abs(size)
+        self.sign: float = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
+        self.entry_price: PyneFloat = entry_price
+
+    def __repr__(self):
+        return (f"_EntryBinding(seq={self.seq}; entry_id={self.entry_id}; "
+                f"init_size={self.init_size}; bound={self.bound})")
 
 
 # noinspection PyShadowingNames,DuplicatedCode
@@ -560,6 +625,15 @@ class PositionBase(ABC):
         self._close_seq_counter += 1
         return self._close_seq_counter
 
+    def _pyramid_count(self) -> int:
+        """Number of entries counted against the ``pyramiding`` limit.
+
+        The live broker knows only the reported FIFO view, so it counts that.
+        :class:`SimPosition` overrides this with its binding book, which is what
+        TradingView actually gates on (see :class:`_EntryBinding`).
+        """
+        return len(self.open_trades)
+
     def begin_evaluation(self) -> None:
         """Hook fired once per script evaluation; overridden in broker mode.
 
@@ -752,7 +826,7 @@ class SimPosition(PositionBase):
         'size', 'sign', 'avg_price', 'cum_profit',
         'entry_equity', 'max_equity', 'min_equity', 'max_realized_equity',
         'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
-        'entry_summ', 'open_commission',
+        'open_commission',
         'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
         'risk_max_drawdown_value', 'risk_max_drawdown_type', 'risk_max_drawdown_alert',
         'risk_max_intraday_filled_orders', 'risk_max_intraday_filled_orders_alert',
@@ -761,7 +835,7 @@ class SimPosition(PositionBase):
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
         '_deferred_margin_call', '_fill_counter', '_last_fill_price', '_partial_close_bar',
-        '_entry_open_ledger', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
+        '_entry_book', '_entry_seq', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node'
     )
 
@@ -795,9 +869,11 @@ class SimPosition(PositionBase):
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)  # 9000 is the limit of TV
         self.new_closed_trades: list[Trade] = []
-        # Per-entry bound open quantity — drives the exit-order lifecycle (see
-        # _reduce_entry_ledger); the trade rows themselves are attributed FIFO.
-        self._entry_open_ledger: dict[str, float] = {}
+        # The binding book: one live entry per FILL, oldest first. It drives the
+        # exit-order lifecycle and the pyramiding limit, while ``open_trades``
+        # above is the FIFO view TradingView reports (see _EntryBinding).
+        self._entry_book: list[_EntryBinding] = []
+        self._entry_seq: int = 0
 
         # Trade statistics
         self.closed_trades_count: int = 0
@@ -816,7 +892,6 @@ class SimPosition(PositionBase):
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
         self.max_runup: float = 0.0
-        self.entry_summ: PyneFloat = 0.0
         self.open_commission: float = 0.0
 
         # Risk management settings
@@ -872,25 +947,26 @@ class SimPosition(PositionBase):
         # so position series stay constant for the rest of the bar (TV semantics).
         self._deferred_immediate_closes: list[Order] = []
 
-    def _snap_size_to_lot_grid(self):
+    def _recalc_avg_price(self):
         """
-        Snap the accumulated position size back onto the lot grid after a fill.
+        Re-derive the average entry price from the open trades.
         """
-        # Every simulated fill is lot-quantized, so the position is an exact
-        # lot multiple; only float summation dirties it. TV keeps the position
-        # clean across CLOSE fills: fresh Trend Trader-Remastered pslots
-        # exports show clean lot-decimal doubles through whole TP cascades
-        # (990.0000000000001 = 0.0099*1e5 etc.), while raw += accumulation
-        # drifts ULPs below (0.004289999999999998) and flips the
-        # decimal-floor of a later qty = (position/100)*rate close one lot
-        # low. The ENTRY/flip accumulation is NOT cleaned: snapping there
-        # breaks the barupdn reference (TV's reversal chain keeps the dirty
-        # 88180.78899999999). Nearest-lot snap is exact because the true
-        # value IS the integer lot sum.
-        rfactor = syminfo._size_round_factor  # noqa
-        scaled = self.size * rfactor
-        if abs(scaled) < 2 ** 53:
-            self.size = round(scaled) / rfactor
+        # The cost basis is summed over the open trades oldest-first on every
+        # fill; the divisor is the running position size, NOT the sum of the
+        # leg sizes (the two differ by ULPs once a leg is partially closed).
+        # Measured on BINANCE:BTCUSDT 30m (pyramiding 2, TP cascade): this form
+        # reproduces position_avg_price on all 19581 in-position bars, while a
+        # cost accumulator carried across fills (cost -= closed_price *
+        # closed_size) only matches the 14888 where no leg is a partial
+        # remainder, and dividing by the summed leg sizes matches 17739.
+        size = abs(self.size)
+        if size == 0.0:
+            self.avg_price = na_float
+            return
+        summ = 0.0
+        for trade in self.open_trades:
+            summ += trade.entry_price * abs(trade.size)
+        self.avg_price = summ / size
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
@@ -992,30 +1068,98 @@ class SimPosition(PositionBase):
                 else:
                     order.size = new_size * order.sign
 
-    def _reduce_entry_ledger(self, entry_id: str | None, qty: float) -> None:
-        """Settle a closing fill against the entry it was bound to.
+    def _bind_entry(self, entry_id: str | None, size: PyneFloat,
+                    entry_price: PyneFloat) -> None:
+        """Open a binding for a just-filled entry and hand it any waiting exit legs.
 
-        TradingView keeps two ledgers: closed TRADES are attributed FIFO
-        across the whole position, but each exit/close order still settles
-        against its own ``from_entry``. Only when that bound quantity is
-        exhausted are the entry's remaining exit legs cancelled — a bracket
-        survives its entry's trade rows being consumed FIFO by another
-        entry's close, and conversely dies once its entry's quantity is
-        spent even while those rows still sit open under other entries.
+        A leg issued while the entry order was still pending carries no
+        ``entry_seq`` yet; it belongs to the fill that order just produced, so it
+        is re-keyed onto the new binding. Without the hand-over the script's next
+        ``strategy.exit`` call would find the binding uncovered and add a SECOND
+        leg beside the pending-bound one, and the pair would over-close.
         """
+        self._entry_seq += 1
+        binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price)
+        self._entry_book.append(binding)
         if entry_id is None:
             return
-        left = self._entry_open_ledger.get(entry_id)
-        if left is None:
+        for exit_order in list(self.exit_orders.values()):
+            if (exit_order.entry_seq is None and exit_order.book_seq is None
+                    and exit_order.order_id == entry_id):
+                self.exit_orders.pop(_exit_order_key(exit_order), None)
+                exit_order.entry_seq = binding.seq
+                self.exit_orders[_exit_order_key(exit_order)] = exit_order
+
+    def _binding(self, seq: int | None) -> '_EntryBinding | None':
+        """The live binding with this sequence number, or None once it is spent."""
+        if seq is None:
+            return None
+        for binding in self._entry_book:
+            if binding.seq == seq:
+                return binding
+        return None
+
+    def _bound_qty(self, entry_id: str | None) -> float:
+        """Open bound quantity across every live binding of an entry id."""
+        return sum(b.bound for b in self._entry_book if b.entry_id == entry_id)
+
+    def _has_bound(self, entry_id: str | None) -> bool:
+        """True while any binding of this entry id still holds quantity."""
+        for binding in self._entry_book:
+            if binding.entry_id == entry_id:
+                return True
+        return False
+
+    def _pyramid_count(self) -> int:
+        """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
+        return len(self._entry_book)
+
+    def _drop_binding(self, binding: '_EntryBinding') -> None:
+        """Retire a spent binding and cancel the exit legs that were bound to it."""
+        try:
+            self._entry_book.remove(binding)
+        except ValueError:
             return
-        left -= qty
-        if _size_round(left) <= 0.0:
-            del self._entry_open_ledger[entry_id]
-            for exit_order in list(self.exit_orders.values()):
-                if exit_order.order_id == entry_id:
-                    self._remove_order(exit_order)
-        else:
-            self._entry_open_ledger[entry_id] = left
+        for exit_order in list(self.exit_orders.values()):
+            if (exit_order.entry_seq == binding.seq
+                    or (exit_order.entry_seq is None
+                        and exit_order.order_id == binding.entry_id
+                        and not self._has_bound(binding.entry_id))):
+                self._remove_order(exit_order)
+
+    def _reduce_binding(self, binding: '_EntryBinding', qty: float) -> float:
+        """Take up to ``qty`` off one binding; return what it could not absorb."""
+        take = min(binding.bound, qty)
+        binding.bound -= take
+        if _size_round(binding.bound) <= 0.0:
+            self._drop_binding(binding)
+        return qty - take
+
+    def _settle_entry_book(self, order: Order, qty: float) -> None:
+        """Settle a closing fill against the entries it was bound to.
+
+        A sticky ``strategy.exit`` leg is bound to ONE fill and settles exactly
+        that one. An id-bound ``strategy.close`` settles that id's entries
+        oldest-first. Everything unbound (``close_all``, a reversal, a margin
+        call, ``strategy.order``) walks the whole book oldest-first, mirroring the
+        trade rows. Only when a binding's quantity is exhausted are its remaining
+        exit legs cancelled — a bracket survives its own trade rows being consumed
+        FIFO by another entry's close, and conversely dies once its entry's
+        quantity is spent even while those rows still sit open under other entries.
+        """
+        if qty <= 0.0:
+            return
+        binding = self._binding(order.entry_seq)
+        if binding is not None:
+            self._reduce_binding(binding, qty)
+            return
+        bound_id = order.order_id if order.order_type == _order_type_close else None
+        for candidate in list(self._entry_book):
+            if qty <= 0.0:
+                break
+            if bound_id is not None and candidate.entry_id != bound_id:
+                continue
+            qty = self._reduce_binding(candidate, qty)
 
     def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat,
                     counts_as_filled_order: bool = True):
@@ -1189,22 +1333,18 @@ class SimPosition(PositionBase):
                         closed_trade.profit_percent = 0.0
 
                     # Modify sizes
-                    self.size += size
-                    self._snap_size_to_lot_grid()
+                    self.size = _size_units(self.size + size)
                     # Handle too small sizes because of floating point inaccuracy and rounding
                     position_flat = _size_round(self.size) == 0.0
                     if position_flat:
                         size -= self.size
                         self.size = 0.0
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
-                    trade.size += size
-                    # Keep the residual open-trade size on the lot grid with the
-                    # position (see _snap_size_to_lot_grid): a snapped position
-                    # with a dirty trade residue would leave ±1e-18 dust open
-                    # after the final close and export a ghost 0-qty trade.
-                    trade_scaled = trade.size * syminfo._size_round_factor  # noqa
-                    if abs(trade_scaled) < 2 ** 53:
-                        trade.size = round(trade_scaled) / syminfo._size_round_factor  # noqa
+                    # Keep the residual open-trade size on the unit grid with
+                    # the position: a snapped position with a dirty trade
+                    # residue would leave ±1e-18 dust open after the final close
+                    # and export a ghost 0-qty trade.
+                    trade.size = _size_units(trade.size + size)
                     if position_flat:
                         # `size` already absorbed the position residual above, so the
                         # trade that flattened the position is fully closed. Snap off
@@ -1230,15 +1370,12 @@ class SimPosition(PositionBase):
                             self.grossloss -= closed_trade.profit
 
                     # Average entry price
+                    self._recalc_avg_price()
                     if self.size:
-                        self.entry_summ -= closed_trade.entry_price * abs(closed_trade.size)
-                        self.avg_price = self.entry_summ / abs(self.size)
-
                         # Unrealized P&L
                         self.openprofit = self.size * (self.c - self.avg_price) * pv
                     else:
                         # If position has just closed
-                        self.avg_price = na_float
                         self.openprofit = 0.0
 
                     # Exit equity
@@ -1258,22 +1395,11 @@ class SimPosition(PositionBase):
 
             self.open_trades = new_open_trades
 
-            # Settle the closed quantity against the entry ledger. A close
-            # bound to a from_entry settles that entry regardless of which
-            # trades the FIFO fill consumed; an unbound close (close_all,
-            # reversal, margin call) settles entries oldest-first, mirroring
-            # the trade rows.
+            # Settle the closed quantity against the binding book, which the FIFO
+            # trade rows above have no say over (see _settle_entry_book).
             closed_qty = filled_size - abs(order.size)
             if closed_qty > 0.0:
-                if order.order_type == _order_type_close and order.order_id is not None:
-                    self._reduce_entry_ledger(order.order_id, closed_qty)
-                else:
-                    for eid in list(self._entry_open_ledger):
-                        if closed_qty <= 0.0:
-                            break
-                        take = min(self._entry_open_ledger[eid], closed_qty)
-                        self._reduce_entry_ledger(eid, take)
-                        closed_qty -= take
+                self._settle_entry_book(order, closed_qty)
 
             if delete:
                 # A partial-exit leg that fired its whole slice while its entry's
@@ -1281,10 +1407,12 @@ class SimPosition(PositionBase):
                 # exit_orders (so its reservation still counts against sibling
                 # "rest" legs and a per-bar strategy.exit() re-call cannot
                 # resurrect it) and only pulled from the order book. It is purged
-                # when the entry's bound quantity is exhausted (_reduce_entry_ledger).
+                # when the entry's bound quantity is exhausted (_drop_binding).
                 if (order.order_type == _order_type_close and order.order_id is not None
                         and _size_round(order.size) == 0.0
-                        and self._entry_open_ledger.get(order.order_id, 0.0) > 0.0):
+                        and (self._binding(order.entry_seq) is not None
+                             if order.entry_seq is not None
+                             else self._bound_qty(order.order_id) > 0.0)):
                     order.consumed = True
                     self.orderbook.remove_order(order)
                 else:
@@ -1344,13 +1472,10 @@ class SimPosition(PositionBase):
                     entry_equity=self.equity
                 )
                 self.open_trades.append(overshoot_trade)
-                if entry_id is not None:
-                    self._entry_open_ledger[entry_id] = (
-                        self._entry_open_ledger.get(entry_id, 0.0) + abs(overshoot_trade.size))
-                self.size += overshoot_trade.size
+                self._bind_entry(entry_id, overshoot_trade.size, price)
+                self.size = _size_units(self.size + overshoot_trade.size)
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
-                self.entry_summ = price * abs(overshoot_trade.size)
-                self.avg_price = self.entry_summ / abs(self.size)
+                self._recalc_avg_price()
                 self.openprofit = self.size * (self.c - self.avg_price) * pv
                 if not new_closed_trades:
                     self.entry_equity = self.equity
@@ -1400,26 +1525,15 @@ class SimPosition(PositionBase):
             )
 
             self.open_trades.append(trade)
-            if entry_id is not None:
-                self._entry_open_ledger[entry_id] = (
-                    self._entry_open_ledger.get(entry_id, 0.0) + abs(order.size))
-            self.size += trade.size
+            self._bind_entry(entry_id, order.size, price)
+            self.size = _size_units(self.size + trade.size)
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
-            # Average entry price: the accumulated cost divided by the position
-            # size, re-derived on every fill. Measured on BINANCE:BTCUSDT 30m
-            # (pyramiding 3, 22720 in-position bars): position_avg_price equals
-            # `sum(entry_price * size) / sum(size)` over the open trades on every
-            # single bar, while an incremental re-weighting of the previous
-            # average -- algebraically the same -- only reproduces the 13440
-            # single-leg ones. The division is also what a partial close falls
-            # back to, so both paths stay on the same form.
-            self.entry_summ += price * abs(order.size)
-            new_size = abs(self.size)
-            if new_size == 0.0:
-                self.avg_price = na_float
-            else:
-                self.avg_price = self.entry_summ / new_size
+            # Average entry price (see _recalc_avg_price). Measured on
+            # BINANCE:BTCUSDT 30m (pyramiding 3, 22720 in-position bars): an
+            # incremental re-weighting of the previous average -- algebraically
+            # the same -- only reproduces the 13440 single-leg bars.
+            self._recalc_avg_price()
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
             # Commission summ
@@ -1431,11 +1545,10 @@ class SimPosition(PositionBase):
         # If position has just closed
         if not self.open_trades:
             # Reset position variables
-            self.entry_summ = 0.0
             self.avg_price = na_float
             self.openprofit = 0.0
             self.open_commission = 0.0
-            self._entry_open_ledger.clear()
+            self._entry_book.clear()
 
             # Cancel all exit orders when position is closed (TradingView behavior)
             # Skip exits that have a pending entry (needed during position flips)
@@ -1501,7 +1614,7 @@ class SimPosition(PositionBase):
                     # Check if the order has the same direction
                     if self.sign == order.sign:
                         # Check pyramiding limit for entry orders adding to existing position
-                        if lib._script.pyramiding <= len(self.open_trades):
+                        if lib._script.pyramiding <= self._pyramid_count():
                             # Pyramiding limit reached - don't fill the entry order
                             self._remove_order(order)
                             return False
@@ -1768,14 +1881,24 @@ class SimPosition(PositionBase):
         """
         if order.order_type != _order_type_close or order.order_id is None or order.from_entry_na:
             return False
-        return order.order_id not in self._entry_open_ledger
+        return not self._has_bound(order.order_id)
 
-    def _entry_fill_price(self, entry_id: str | None) -> float | None:
-        """Fill price of the open trade that ``entry_id`` opened, if it has one.
+    def _entry_fill_price(self, entry_id: str | None,
+                          entry_seq: int | None = None) -> float | None:
+        """Fill price the entry an exit leg is bound to was opened at.
+
+        A leg carrying an ``entry_seq`` prices off THAT entry, so two pyramid adds
+        sharing a ``from_entry`` id resolve their tick offsets from their own fill
+        instead of both from the oldest one. A leg still waiting on a pending entry
+        order falls back to the first open trade under the id.
 
         :param entry_id: The ``from_entry`` an exit leg is bound to
+        :param entry_seq: The bound entry, when the leg already has one
         :return: The entry price, or None while the entry has no open trade
         """
+        binding = self._binding(entry_seq)
+        if binding is not None:
+            return binding.entry_price
         for trade in self.open_trades:
             if trade.entry_id == entry_id:
                 return trade.entry_price
@@ -1826,7 +1949,7 @@ class SimPosition(PositionBase):
             return False
         resolved = False
         for order in self.exit_orders.values():
-            entry_price = self._entry_fill_price(order.order_id)
+            entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
             if entry_price is not None and self._resolve_tick_exit(order, entry_price):
                 resolved = True
         return resolved
@@ -3024,7 +3147,7 @@ class SimPosition(PositionBase):
                     # Exit order gaps through — check if its bound entry still
                     # has open quantity on the ledger (the FIFO fill may have
                     # consumed its trade rows while the binding stays live)
-                    has_open_trade = order.order_id in self._entry_open_ledger
+                    has_open_trade = self._has_bound(order.order_id)
                     if not has_open_trade:
                         associated_entry = self.entry_orders.get(order.order_id)
                         if associated_entry is not None:
@@ -3077,7 +3200,7 @@ class SimPosition(PositionBase):
                     # We need to check pyramiding and flip quantity here for market orders :-/
                     # Check pyramiding limit for entry orders adding to existing position
                     if self.sign == order.sign:
-                        if lib._script.pyramiding <= len(self.open_trades):
+                        if lib._script.pyramiding <= self._pyramid_count():
                             # Pyramiding limit reached - don't add the order
                             self._remove_order(order)
                             continue
@@ -3198,7 +3321,7 @@ class SimPosition(PositionBase):
                     continue
                 # Skip exits whose bound entry still has open quantity on the
                 # ledger (they belong to the current position)
-                if order.order_id in self._entry_open_ledger:
+                if self._has_bound(order.order_id):
                     continue
                 # Skip exits whose entry is still pending
                 if order.order_id in self.entry_orders:
@@ -3265,7 +3388,7 @@ class SimPosition(PositionBase):
         for order in (list(self.exit_orders.values()) if self.exit_orders else ()):
             if order.is_market_order:
                 continue
-            if order.order_id not in self._entry_open_ledger:
+            if not self._has_bound(order.order_id):
                 continue
             # Check limit gap-through
             if order.limit is not None:
@@ -3595,7 +3718,7 @@ class SimPosition(PositionBase):
                     return
                 # Exits submitted during this bar's main() still carry raw tick
                 # offsets — the trigger check below needs concrete price levels.
-                entry_price = self._entry_fill_price(order.order_id)
+                entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
                 if entry_price is not None:
                     self._resolve_tick_exit(order, entry_price)
             trigger: str | None = None
@@ -3642,7 +3765,7 @@ class SimPosition(PositionBase):
                 if order.limit is None and order.stop is None:
                     # Pyramiding and flip-quantity handling — mirror `_process_at_bar_open`.
                     if self.sign == order.sign:
-                        if script.pyramiding <= len(self.open_trades):
+                        if script.pyramiding <= self._pyramid_count():
                             self._remove_order(order)
                             return
                     elif self.size != 0.0 and not order.skip_flip:
@@ -3687,7 +3810,7 @@ class SimPosition(PositionBase):
                 continue
             if order.profit_ticks is None and order.loss_ticks is None:
                 continue
-            entry_price = self._entry_fill_price(order.order_id)
+            entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
             if entry_price is not None:
                 self._resolve_tick_exit(order, entry_price)
             trigger2: str | None = None
@@ -4062,6 +4185,39 @@ def _tick_snap(price: float) -> float:
 _explicit_qty_grid: tuple[float, Decimal] | None = None
 
 
+def _size_units(qty: PyneFloat) -> PyneFloat:
+    """
+    Materialize a quantity on TradingView's 1e-8 unit grid.
+
+    :param qty: The quantity in contracts
+    :return: The quantity as an exact multiple of 1e-8
+    """
+    # TV carries every quantity as an integer count of 1e-8 units and hands out
+    # ``units * 1e-8``. Measured on BINANCE:BTCUSDT 30m (pyramiding 2, full TP
+    # cascade): all 19581 in-position bars report position_size and every
+    # opentrades.size as an exact ``round(q * 1e8) * 1e-8`` double -- including
+    # the ones that differ from the shortest decimal (104 lots of 1e-5 is
+    # 0.0010400000000000001, not the 0.00104 that 104 / 1e5 yields). The run's
+    # 91 distinct lot counts pin the materialization to this grid alone: no
+    # ``n / 10**k`` or ``n * 10**-k`` pairing reproduces the whole table, and
+    # the grid also explains the position/open-trade sums, which are integer
+    # unit arithmetic. It is not a crypto quirk: CAPITALCOM:EURUSD (lot step
+    # 0.1), CAPITALCOM:US500 (0.1) and OANDA:XAUUSD (0.01) report the same grid
+    # on every one of their 141940 in-position quantities, 13-15% of which the
+    # lot grid gets wrong (TV says 5294.900000000001, not 5294.9). On a
+    # whole-contract symbol every quantity is an integer, which is always an
+    # exact unit multiple, so this is a no-op there. Quantities are left alone
+    # beyond the exact-integer range and on a symbol whose lot step is finer
+    # than the grid.
+    rfactor = syminfo._size_round_factor  # noqa
+    if rfactor > 1e8:
+        return qty
+    scaled = qty * 1e8
+    if not (abs(scaled) < 2 ** 53):  # NaN or beyond exact integer range
+        return qty
+    return round(scaled) * 1e-8
+
+
 def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
     """
     Quantize a user-supplied order quantity down to the mincontract grid.
@@ -4092,7 +4248,7 @@ def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
     grid = cached_grid[1]
     lots = int((Decimal(repr(abs(qty))) / grid).to_integral_value(rounding=ROUND_FLOOR))
     sign = 1 if qty > 0 else -1
-    return sign * lots / rfactor
+    return _size_units(sign * lots / rfactor)
 
 
 def _size_round(qty: PyneFloat) -> PyneFloat:
@@ -4125,7 +4281,7 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     if lots == 0:
         return 0.0
     sign = 1 if qty > 0 else -1
-    return sign * lots / rfactor
+    return _size_units(sign * lots / rfactor)
 
 
 # noinspection PyShadowingNames
@@ -4218,7 +4374,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # — sizing off the whole position would flatten unrelated entries.
     if isinstance(position, SimPosition):
         # noinspection PyProtectedMember
-        bound_size = position.sign * position._entry_open_ledger.get(id, 0.0)
+        bound_size = position.sign * position._bound_qty(id)
     else:
         bound_size = 0.0
         adopted_size = 0.0
@@ -5001,7 +5157,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         # Check if the order has the same direction
         if position.sign == direction_sign:
             # Check pyramiding limit for entry orders adding to existing position
-            if lib._script.pyramiding <= len(position.open_trades):
+            if lib._script.pyramiding <= position._pyramid_count():
                 # Pyramiding limit reached - don't add the order
                 return
 
@@ -5082,38 +5238,42 @@ def exit(id: str, from_entry: str = "",
     direction = 0
     size = 0.0
     init_size = 0.0
+    entry_seq: int | None = None
 
     # noinspection PyProtectedMember,PyShadowingNames
     def _exit():
-        nonlocal limit, stop, trail_price, from_entry, direction, size, oca_name
+        nonlocal limit, stop, trail_price, from_entry, direction, size
 
-        # Sticky bracket (TV semantics): a leg is identified by (id, from_entry).
+        # Sticky bracket (TV semantics): a leg is identified by (id, from_entry,
+        # entry_seq) — TradingView issues one leg per FILLED ENTRY, so two pyramid
+        # adds sharing a from_entry id get a leg each and each is consumed on its
+        # own. ``entry_seq`` is None only while the leg still waits on a pending
+        # entry order; :meth:`SimPosition._bind_entry` hands it over on the fill.
         # Re-issuing it every bar updates its prices, but a leg that already fired
         # its slice must not be resurrected (the ``consumed`` tombstone). The
         # reservation is recomputed from ``init_size`` on every issue: that is the
-        # ORIGINAL size of everything bound to ``from_entry`` — open pyramid adds
-        # at their entry size plus a still-pending entry order at its CURRENT
-        # size — so a pyramid add grows the slice, margin-call shrinkage does not
-        # erode it, and a pending entry re-sized bar-to-bar keeps being tracked
-        # (locking the first bar's size would under-close the eventual fill and
-        # strand a sliver).
-        exit_key = (id, from_entry)
+        # ORIGINAL size of the entry it is bound to — frozen at the fill, so
+        # margin-call shrinkage does not erode it — or, for a leg still waiting on
+        # an entry order, that order's CURRENT size, so a pending entry re-sized
+        # bar-to-bar keeps being tracked (locking the first bar's size would
+        # under-close the eventual fill and strand a sliver).
+        exit_key = _exit_key(id, from_entry, entry_seq)
         existing = position.exit_orders.get(exit_key)
         if existing is not None and existing.consumed:
             return
 
         is_rest_leg = not (qty == qty) and not (qty_percent == qty_percent)  # is_na_arg
-        # Sibling legs reserve slices of the entry first-come-first-served
+        # Sibling legs reserve slices of the SAME entry first-come-first-served
         # (consumed siblings keep their reservation until the entry fully
         # closes). Only sticky exit legs (book_seq is None) count as siblings;
         # a stacked strategy.close()/close_all() partial (book_seq set) is an
         # immediate market close, not a reservation against this leg.
         # A sibling that reserved its slice against a DIFFERENT bound size holds a
-        # stale share: the entry it is bound to has since grown (a pyramid add) or
-        # shrunk (an entry order re-placed at a smaller size). It re-derives its own
-        # slice the next time the script issues it, so it must not block this leg in
-        # the meantime -- otherwise a shrunk bracket stays frozen at its first size
-        # and stops tracking the stop level the script keeps moving.
+        # stale share: the entry order it waits on was re-placed at a smaller size.
+        # It re-derives its own slice the next time the script issues it, so it must
+        # not block this leg in the meantime -- otherwise a shrunk bracket stays
+        # frozen at its first size and stops tracking the stop level the script
+        # keeps moving.
         # A leg restored by ``BrokerPosition.reconstruct_exit_order`` after a restart
         # carries no basis at all (``bound_size`` stays 0.0, which no issued leg can
         # have -- a zero bound reserves nothing and returns above). It still holds a
@@ -5122,7 +5282,8 @@ def exit(id: str, from_entry: str = "",
         # reserve the whole entry and protect more exposure than the script allocated.
         bound = abs(init_size)
         sibling = sum(o.reserved_size for o in position.exit_orders.values()
-                      if o.order_id == from_entry and o is not existing
+                      if o.entry_seq == entry_seq and o.order_id == from_entry
+                      and o is not existing
                       and o.book_seq is None
                       and (o.bound_size == bound or o.bound_size == 0.0))
         unreserved = bound - sibling
@@ -5197,10 +5358,15 @@ def exit(id: str, from_entry: str = "",
 
         # Default OCA settings for strategy.exit() - matches TradingView behavior.
         # Pine's strategy.exit() has no oca_type parameter: its legs always form a
-        # reduce group. If no oca_name is specified, create a default one.
-        if isinstance(oca_name, NA):
+        # reduce group. If no oca_name is specified, create a default one. It is
+        # per ENTRY as well as per exit id: the legs TradingView issues for two
+        # pyramid adds are independent, so one add's fill must not reduce the
+        # other's leg. The name is built into a local -- assigning the caller's
+        # ``oca_name`` would leak the first entry's group onto every later leg.
+        leg_oca = oca_name
+        if isinstance(leg_oca, NA):
             # Use a unique name based on the exit id and from_entry
-            oca_name = f"__exit_{id}_{from_entry}_oca__"
+            leg_oca = f"__exit_{id}_{from_entry}_{entry_seq}_oca__"
 
         # Add order
         order = Order(
@@ -5208,7 +5374,7 @@ def exit(id: str, from_entry: str = "",
             limit=_limit, stop=_stop,
             trail_price=_trail_price, trail_offset=_trail_offset,
             profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
-            oca_name=_na_to_none(oca_name), oca_type=_oca.reduce,
+            oca_name=_na_to_none(leg_oca), oca_type=_oca.reduce,
             comment=_na_to_none(comment),
             alert_message=_na_to_none(alert_message),
             comment_profit=_na_to_none(comment_profit),
@@ -5255,6 +5421,7 @@ def exit(id: str, from_entry: str = "",
 
         order.rest_leg = is_rest_leg
         order.bound_size = bound
+        order.entry_seq = entry_seq
         position._add_order(order)
         # A brand-new trailing leg (first issue, or trailing added to a live
         # bracket) and an identical re-issue fold the issue bar's extreme into
@@ -5263,12 +5430,39 @@ def exit(id: str, from_entry: str = "",
         position._seed_trail_at_issue(order, fold_extreme=not had_trail or trail_unchanged)
 
     # noinspection PyProtectedMember
-    def _bound_size(entry_id: str) -> tuple[float, float]:
-        """Combined sign and ORIGINAL size of everything bound to an entry id:
-        open pyramid adds at their entry size plus a still-pending entry order at
-        its current size. TradingView's exit covers each of them, so the leg is
-        reserved off the combined size and the FIFO fill allocation then closes
-        the bound trades the way TV's per-entry exit brackets do."""
+    def _filled_targets(entry_id: str | None) -> list[tuple[int | None, str, float, float]]:
+        """``(entry_seq, entry_id, sign, ORIGINAL size)`` per entry an exit binds to.
+
+        TradingView issues ONE leg per FILLED ENTRY, so two pyramid adds sharing a
+        ``from_entry`` id each get their own leg reserved off their own entry size
+        — and each is consumed on its own, which is why a bracket can fire again
+        for a later add after it already fired for the first. The live broker has
+        no binding book, so it keeps the pre-fan-out shape: one target per entry
+        id, reserved off that id's combined open size.
+
+        :param entry_id: The ``from_entry`` to bind to, or None for all entries
+        """
+        if isinstance(position, SimPosition):
+            return [(b.seq, b.entry_id or "", b.sign, b.init_size)
+                    for b in position._entry_book
+                    if entry_id is None or b.entry_id == entry_id]
+        grouped: dict[str, list[float]] = {}
+        for open_trade in position.open_trades:
+            trade_id = open_trade.entry_id or ""
+            if entry_id is not None and open_trade.entry_id != entry_id:
+                continue
+            slot = grouped.setdefault(trade_id, [0.0, 0.0])
+            slot[0] = open_trade.sign
+            slot[1] += abs(open_trade.init_size)
+        return [(None, trade_id, slot[0], slot[1]) for trade_id, slot in grouped.items()]
+
+    # noinspection PyProtectedMember
+    def _pending_size(entry_id: str) -> tuple[float, float]:
+        """Sign and bindable size of a still-pending entry order, at its CURRENT size.
+
+        A leg issued against it carries no ``entry_seq`` until the order fills;
+        :meth:`SimPosition._bind_entry` then hands it to the entry it produced.
+        """
         sign = 0.0
         total = 0.0
         pending = position.entry_orders.get(entry_id)
@@ -5293,7 +5487,7 @@ def exit(id: str, from_entry: str = "",
             # ``GoShort`` fires again while the short is already open.
             rejected_pyramid = (pending.limit is None and pending.stop is None
                                 and position.sign == pending.sign
-                                and lib._script.pyramiding <= len(position.open_trades))
+                                and lib._script.pyramiding <= position._pyramid_count())
             unfilled = 0.0 if rejected_pyramid else abs(pending.size) - pending.filled_qty
             # Only the part of a reversal order that actually OPENS is bindable: the
             # rest closes the opposite position, which carries its own bracket. A
@@ -5309,54 +5503,56 @@ def exit(id: str, from_entry: str = "",
                 unfilled -= abs(position.size)
             if unfilled > 0.0:
                 total += unfilled
-        for open_trade in position.open_trades:
-            if open_trade.entry_id == entry_id:
-                sign = open_trade.sign
-                total += abs(open_trade.init_size)
         return sign, total
 
     # Find direction and size
     if from_entry:
-        direction, init_size = _bound_size(from_entry)
-        # The position should be open, or an entry order should exist
-        if not direction:
-            return
-        _exit()
+        # One leg per filled entry, plus one for a still-pending entry order.
+        # The position should be open, or an entry order should exist.
+        for entry_seq, _target_id, direction, init_size in _filled_targets(from_entry):
+            _exit()
+        direction, init_size = _pending_size(from_entry)
+        if direction:
+            entry_seq = None
+            _exit()
 
     else:
-        # A from_entry-less exit binds to the OPEN position; a still-pending entry
-        # order is only its target when the strategy is flat. The distinction shows
-        # up on a REVERSAL, where both exist at once with different ids: the exit
-        # covers the position being reversed out of, and the position the reversal
-        # opens gets its own bracket from the NEXT bar's script run -- so its stop
-        # cannot fire on the bar the reversal filled.
+        for entry_seq, from_entry, direction, init_size in _filled_targets(None):
+            _exit()
+        in_position = bool(direction)
+
+        # A still-pending entry order is a target too -- but only one that OPENS
+        # from flat or ADDS in the position's own direction, so its bracket is
+        # already live on the bar it fills. The opposite leg of a REVERSAL is not:
+        # that exit covers the position being reversed out of, and the position
+        # the reversal opens gets its own bracket from the NEXT bar's script run,
+        # so its stop cannot fire on the bar the reversal filled.
         # MEASURED on TradingView (CAPITALCOM:EURUSD 60, "Technical Ratings
         # Strategy", 580 trades). Of the entries whose stop level was breached on
         # their own fill bar, all 5 that were opened from FLAT exited on that bar,
         # and the 1 opened by a reversal held -- a clean 6/6 split.
         # Binding pending entries first also left the position being reversed out
         # of with no bracket at all for the length of that bar.
-        seen_ids: set[str] = set()
-        for trade in position.open_trades:
-            from_entry = trade.entry_id or ""
-            if from_entry in seen_ids:
+        # The same-direction ADD is measured on BINANCE:BTCUSDT 30m (the "MACD
+        # Strategy with trailing ATR stop" reference): its from_entry-less
+        # qty_percent leg fires on the pyramid add's OWN fill bar, exactly like
+        # the from_entry-bound leg beside it.
+        entry_seq = None
+        for order in list(position.entry_orders.values()):
+            if in_position and order.sign != position.sign:
                 continue
-            seen_ids.add(from_entry)
-            direction, init_size = _bound_size(from_entry)
+            from_entry = order.order_id or ""
+            direction, init_size = _pending_size(from_entry)
+            if not direction:
+                continue
+            # Only mark as from_entry_na on first creation (not replacement)
+            exit_key = _exit_key(id, from_entry)
+            had_existing_exit = exit_key in position.exit_orders
             _exit()
-
-        if not direction:
-            for order in list(position.entry_orders.values()):
-                from_entry = order.order_id or ""
-                direction, init_size = _bound_size(from_entry)
-                # Only mark as from_entry_na on first creation (not replacement)
-                exit_key = (id, from_entry)
-                had_existing_exit = exit_key in position.exit_orders
-                _exit()
-                if not had_existing_exit:
-                    exit_order = position.exit_orders.get(exit_key)
-                    if exit_order is not None:
-                        exit_order.from_entry_na = True
+            if not had_existing_exit:
+                exit_order = position.exit_orders.get(exit_key)
+                if exit_order is not None:
+                    exit_order.from_entry_na = True
 
 
 # noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode

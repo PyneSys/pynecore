@@ -8510,7 +8510,7 @@ class OrderSyncEngine:
         """Mutate the Pine-side exit :class:`Order` to match the amended qty.
 
         Without this, the next :meth:`sync` rebuilds the ExitIntent from the
-        unchanged ``pos.exit_orders[(exit_id, from_entry)]`` (whose ``size``
+        unchanged ``pos.exit_orders`` entry (keyed by ``_exit_order_key``; whose ``size``
         still equals the original full qty), the diff engine sees a mismatch
         against the amended active intent, and emits a *second* ``modify_exit``
         back to the original qty — undoing the partial-fill cascade we just did.
@@ -11169,7 +11169,7 @@ class OrderSyncEngine:
         startup pass) and the parent-fill promotion path
         (:meth:`_promote_pending_partial_bracket_legs`). Extracts the TP/SL/TRAIL
         levels from the live leg ledger and seeds
-        ``position.exit_orders[(pine_id, from_entry)]`` so ``build_intents``
+        ``position.exit_orders`` under its ``_exit_order_key`` so ``build_intents``
         re-derives the partial bracket and the cross-restart adoption branch
         adopts the live legs instead of letting the orphan sweep tear them down.
 
