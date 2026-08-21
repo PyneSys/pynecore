@@ -750,7 +750,7 @@ class SimPosition(PositionBase):
         'open_trades', 'closed_trades', 'new_closed_trades',
         'closed_trades_count', 'wintrades', 'eventrades', 'losstrades',
         'size', 'sign', 'avg_price', 'cum_profit',
-        'entry_equity', 'max_equity', 'min_equity',
+        'entry_equity', 'max_equity', 'min_equity', 'max_realized_equity',
         'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
         'entry_summ', 'open_commission',
         'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
@@ -811,6 +811,7 @@ class SimPosition(PositionBase):
         self.entry_equity: PyneFloat = 0.0
         self.max_equity: PyneFloat = -float("inf")
         self.min_equity: PyneFloat = float("inf")
+        self.max_realized_equity: PyneFloat = -float("inf")
         self.drawdown_summ: float = 0.0
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
@@ -1597,16 +1598,41 @@ class SimPosition(PositionBase):
 
             return False
 
-    def _peak_equity(self) -> float:
-        """Running high-water mark equity for percent-based drawdown threshold.
+    def _max_drawdown_reference(self) -> float:
+        """Peak equity for ``max_drawdown``: the realized (closed-equity) high-water mark.
 
-        Falls back to initial capital before any fill — ``max_equity`` is
-        ``-inf`` until the first ``_fill_order`` updates it.
+        TradingView's ``strategy.risk.max_drawdown`` measures the drop from the
+        largest value among the initial capital and the equity recorded at each
+        closed trade — a *realized* peak that open-position paper profit never
+        lifts. ``max_realized_equity`` tracks exactly that; before the first bar
+        priming it, the initial capital is the reference.
         """
         initial = float(lib._script.initial_capital)
-        if self.max_equity == -float("inf"):
+        if self.max_realized_equity == -float("inf"):
             return initial
-        return max(initial, float(self.max_equity))
+        return max(initial, float(self.max_realized_equity))
+
+    def _is_max_drawdown_breached(self) -> bool:
+        """Sim ``max_drawdown`` breach test: realized-peak reference, mark-to-market drop.
+
+        The drawdown is ``realized_peak - mark_to_market_equity`` — the numerator
+        includes the open position's floating loss, but the peak is realized-only
+        (see :meth:`_max_drawdown_reference`). Enforcement is gated on close fills
+        in :meth:`_enforce_post_bar_risk`, so this predicate only runs on a bar
+        that booked realized P&L. Measured against TV on ``BINANCE:BTCUSDT`` 30m:
+        a single long carried to a 50% floating drawdown never halts (no close
+        order), while the same position force-closes the instant any reducing
+        order fills while the drop is past the threshold.
+        """
+        if self.risk_max_drawdown_value is None:
+            return False
+        peak = self._max_drawdown_reference()
+        if self.risk_max_drawdown_type == percent_of_equity:
+            threshold = peak * self.risk_max_drawdown_value * 0.01
+        else:
+            threshold = float(self.risk_max_drawdown_value)
+        drawdown = peak - float(self.equity)
+        return drawdown >= threshold > 0.0
 
     def _trigger_risk_halt(self, reason: str, price: float, h: float, l: float) -> None:
         """Cancel pending orders, close any open position at ``price``, halt trading.
@@ -1687,7 +1713,12 @@ class SimPosition(PositionBase):
             return
         # Use the bar-close price for the synthetic close — the bar is over.
         price, h, l = self.c, self.h, self.l
-        if self._is_max_drawdown_breached():
+        # ``max_drawdown`` is evaluated only on a bar that booked realized P&L
+        # (a close/reduce fill). TV never halts on open-position paper drawdown
+        # alone: a long carried to a 50% floating drawdown with no closing order
+        # keeps riding, and force-closes the instant a reducing order fills while
+        # past the threshold — see ``_is_max_drawdown_breached``.
+        if self.new_closed_trades and self._is_max_drawdown_breached():
             self._trigger_risk_halt("Max drawdown reached", price, h, l)
             return
         if self._is_max_intraday_loss_breached():
@@ -3464,6 +3495,13 @@ class SimPosition(PositionBase):
         if self.drawdown_summ or self.runup_summ:
             self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
             self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
+
+        # Realized-equity high-water mark for the ``max_drawdown`` risk rule.
+        # netprofit holds closed P&L only, so this is the closed-equity peak TV
+        # measures the drawdown threshold against — open paper profit never lifts it.
+        realized_equity = float(lib._script.initial_capital) + self.netprofit
+        if realized_equity > self.max_realized_equity:
+            self.max_realized_equity = realized_equity
 
     def _finalize_new_closed_trades(self) -> None:
         """Apply cumulative stats to every trade closed on this bar.
