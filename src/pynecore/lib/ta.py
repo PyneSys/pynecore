@@ -423,6 +423,7 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     return cov / math.sqrt(var_product)
 
 
+# noinspection PyUnusedLocal
 def cross(source1: float, source2: float) -> PyneBool:
     """
     Check if the source series crossed over or under the given series.
@@ -431,13 +432,26 @@ def cross(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed over the given series
     """
-    # Both halves carry their own Persistent relation to the previous bar, so both
-    # must run on every bar. A short-circuiting ``or`` would leave crossunder's
-    # relation stale on every bar crossover fires, and the crossunder on the next
-    # bar would then be missed.
-    crossed_over = crossover(source1, source2)
-    crossed_under = crossunder(source1, source2)
-    return crossed_over or crossed_under
+    # Measured: ``ta.cross`` is NOT ``crossover or crossunder``. It remembers the
+    # last TOLERANTLY-unequal relation in a three-state armed flag and fires only on
+    # a STRICT jump out of it. Unlike crossover/crossunder, whose armed state starts
+    # engaged (they fire on the first jump out of a from-the-start equality plateau),
+    # cross starts UNARMED: with no prior strict relation there is no direction to
+    # cross, so a from-the-start equality plateau never fires either way. An equality
+    # run (|diff| <= EPSILON) preserves the armed direction, so a strict relation
+    # before the plateau still arms the jump after it. Probes U/D/E/F/G/H/I on
+    # BINANCE:BTCUSDT 30m, 2026-08.
+    armed: Persistent[int] = 0  # 0 unarmed, -1 last strictly below, +1 last strictly above
+    res = (armed < 0 and source1 > source2) or (armed > 0 and source1 < source2)
+    # Only refreshed on bars where both sources are defined; TV compares against the
+    # last such bar, so na gaps must not reset the state
+    if source1 == source1 and source2 == source2:
+        diff = source1 - source2
+        if diff < -_EPSILON:
+            armed = -1
+        elif diff > _EPSILON:
+            armed = 1
+    return res
 
 
 # noinspection PyUnusedLocal
@@ -449,26 +463,20 @@ def crossover(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed over the given series
     """
-    # Three measured conditions (probe_cross_state A-H + 821 BHP saturation
-    # plateaus + probes m547/m548, 2026-08): the bar-to-bar comparisons are
-    # STRICT -- a 1e-12 step both fires and blocks -- while the third, the
-    # armed state, is the last TOLERANTLY-unequal relation (|diff| > 1e-10):
-    # a run of exact equality entered from tolerantly-above does not arm the
-    # exit jump, but sources that were never tolerantly apart count as armed.
-    # Pine has no na bool: with no previous relation to compare against there
-    # is no cross, so the first defined bar yields false, not na.
+    # Measured EXACT rule (no tolerance, immediate previous bar only): fire when
+    # source1 was at or below source2 on the last bar where both were defined and
+    # is STRICTLY above now -- a 5e-11 step at the previous bar both fires and
+    # blocks, so the comparison is raw, not tolerant. A from-the-start equality
+    # plateau AND an equality run entered from above both arm the jump (probes
+    # S1-S9 on BINANCE:BTCUSDT 30m, 2026-08); crossover has no armed direction to
+    # lose, unlike ta.cross. Pine has no na bool: with no previous relation to
+    # compare against there is no cross, so the first defined bar yields false.
     was_le: Persistent[bool] = False
-    armed_below: Persistent[bool] = True
-    res = source1 > source2 and was_le and armed_below
-    # Only refreshed on bars where both sources are defined; TV compares
-    # against the last such bar, so na gaps must not reset the state
+    res = source1 > source2 and was_le
+    # Only refreshed on bars where both sources are defined; TV compares against the
+    # last such bar, so na gaps must not reset the state
     if source1 == source1 and source2 == source2:
         was_le = source1 <= source2
-        diff = source1 - source2
-        if diff < -_EPSILON:
-            armed_below = True
-        elif diff > _EPSILON:
-            armed_below = False
     return res
 
 
@@ -481,18 +489,12 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     :param source2: The second source series
     :return: True if the source series crossed under the given series
     """
-    # Strict bar-to-bar comparisons plus the tolerant armed state -- the
-    # measured rule mirrors crossover, see there
+    # Measured EXACT rule, the mirror of crossover: fire when source1 was at or
+    # above source2 on the last defined bar and is STRICTLY below now.
     was_ge: Persistent[bool] = False
-    armed_above: Persistent[bool] = True
-    res = source1 < source2 and was_ge and armed_above
+    res = source1 < source2 and was_ge
     if source1 == source1 and source2 == source2:
         was_ge = source1 >= source2
-        diff = source1 - source2
-        if diff > _EPSILON:
-            armed_above = True
-        elif diff < -_EPSILON:
-            armed_above = False
     return res
 
 
