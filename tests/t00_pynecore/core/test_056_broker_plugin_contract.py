@@ -316,6 +316,9 @@ def __test_spot_inventory_port_surface_checked__():
         async def fetch_base_balance(self):
             return Decimal(0)
 
+        async def min_sellable_base(self):
+            return Decimal(0)
+
     plugin.spot_inventory_port = _FullSpotPort()
     errors, _ = validate_plugin_contract(plugin)
     assert errors == []
