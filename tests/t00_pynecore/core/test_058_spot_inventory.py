@@ -99,6 +99,8 @@ class FakeSpotPort:
         self.batches: dict[str | None, SpotExecutionBatch | Exception] = {}
         self.fetch_calls: list[str | None] = []
         self.balance_calls = 0
+        self.min_sellable: Decimal | None = None
+        self.min_sellable_error: Exception | None = None
 
     async def fetch_executions(self, cursor: str | None) -> SpotExecutionBatch:
         self.fetch_calls.append(cursor)
@@ -114,6 +116,11 @@ class FakeSpotPort:
         if self.balance_error is not None:
             raise self.balance_error
         return self.balance
+
+    async def min_sellable_base(self) -> Decimal | None:
+        if self.min_sellable_error is not None:
+            raise self.min_sellable_error
+        return self.min_sellable
 
 
 def _manager(
@@ -1233,6 +1240,128 @@ def __test_reconcile_recovered_fills_returned_for_delivery__(tmp_path: Path):
     rows = ctx.iter_spot_executions(ACCOUNT, port.product_id)
     assert [(r.fill_id, r.delivered) for r in rows] == [("lag-1", True)]
     assert _run(mgr.reconcile(T0_MS + 1_000)) == []
+    store.close()
+
+
+def __test_reconcile_compacts_unsellable_dust_into_the_baseline__(tmp_path: Path):
+    """A fold that is pure unsellable fee dust rolls into the baseline.
+
+    Fee residues accumulate across round trips (close orders are sized
+    from FIFO exposure, not the wallet), so an engine-flat book's fold
+    climbs above the grid step and every "flat means fold ≈ 0" consumer
+    breaks. The clean-pass compaction must retire the rows and grow the
+    baseline by EXACTLY the retired net — never re-anchor on the venue
+    balance, which would absorb a real drift.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+
+    # Two round trips, each stranding 0.000005 of base-coin fee dust.
+    mgr.record_live_fill(_fill("b-1", base='0.009995', price='100'))
+    mgr.record_live_fill(_fill("s-1", side='sell', base='-0.00999', price='100'))
+    mgr.record_live_fill(_fill("b-2", base='0.009995', price='100', ts_ms=T0_MS + 1))
+    mgr.record_live_fill(_fill("s-2", side='sell', base='-0.00999', price='100',
+                               ts_ms=T0_MS + 2))
+    port.balance = Decimal('10.00001')
+    port.min_sellable = Decimal('0.00125')
+    assert _run(mgr.reconcile(T0_MS + 10_000)) == []
+
+    assert mgr.fold.net_base == 0
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.state == 'active'
+    assert epoch.epoch_seq == 2
+    assert Decimal(epoch.foreign_baseline) == Decimal('10.00001')
+    assert ctx.iter_spot_executions(ACCOUNT, port.product_id) == []
+    events = _read_events(ctx, 'spot_dust_compacted')
+    assert len(events) == 1
+    assert events[0]['dust_net_base'] == '0.00001'
+    assert events[0]['retired_fills'] == 4
+    # The invariant still holds on the fresh epoch: a follow-up clean
+    # pass neither re-compacts nor arms a conflict.
+    assert _run(mgr.reconcile(T0_MS + 20_000)) == []
+    assert not mgr.quarantined
+    fresh = ctx.get_latest_spot_epoch(port.product_id)
+    assert fresh is not None
+    assert fresh.epoch_seq == 2 and fresh.pending_conflict_ts_ms is None
+    store.close()
+
+
+def __test_reconcile_never_compacts_a_sellable_net__(tmp_path: Path):
+    """A net at or above the sell floor is a position, not dust."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+    mgr.record_live_fill(_fill("b-1", base='0.00125', price='100'))
+    port.balance = Decimal('10.00125')
+    port.min_sellable = Decimal('0.00125')
+    assert _run(mgr.reconcile(T0_MS + 10_000)) == []
+    assert mgr.fold.net_base == Decimal('0.00125')
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.epoch_seq == 1
+    assert _read_events(ctx, 'spot_dust_compacted') == []
+    store.close()
+
+
+def __test_reconcile_compaction_needs_a_known_floor__(tmp_path: Path):
+    """No sell floor (no price yet) or a failing read skips the pass.
+
+    Compaction is opportunistic — a skipped pass costs nothing, while an
+    assumed floor could compact away sellable inventory.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+    mgr.record_live_fill(_fill("b-1", base='0.00001', price='100'))
+    port.balance = Decimal('10.00001')
+
+    port.min_sellable = None
+    assert _run(mgr.reconcile(T0_MS + 10_000)) == []
+    assert mgr.fold.net_base == Decimal('0.00001')
+
+    port.min_sellable_error = RuntimeError("venue hiccup")
+    assert _run(mgr.reconcile(T0_MS + 20_000)) == []
+    assert mgr.fold.net_base == Decimal('0.00001')
+    assert not mgr.quarantined
+    assert _read_events(ctx, 'spot_dust_compacted') == []
+    store.close()
+
+
+def __test_reconcile_compaction_waits_for_undelivered_rows__(tmp_path: Path):
+    """A recovered-but-undelivered fill still owes its OrderEvent.
+
+    Retiring flips ``delivered``, so compacting under it would swallow
+    the event and leave the engine position stale. The pass that
+    recovers a fill returns it for delivery — the NEXT clean pass may
+    compact.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+    port.min_sellable = Decimal('0.00125')
+
+    # Book the dust row bypassing delivery: simulate the crash window in
+    # which a recovered row exists with ``delivered = 0``.
+    ctx.record_spot_execution(
+        ACCOUNT, port.product_id, fill_id="lag-1", side='buy',
+        base_delta='0.00001', quote_delta='-0.001', price='100',
+        fee_amount='0', fee_currency='USD', ts_ms=T0_MS,
+        client_order_id='c-lag-1', delivered=False,
+    )
+    mgr._refresh_fold()  # noqa: SLF001 — test drives the internal state
+    port.balance = Decimal('10.00001')
+    _run(mgr.reconcile(T0_MS + 10_000))
+    assert _read_events(ctx, 'spot_dust_compacted') == []
+    rows = ctx.iter_spot_executions(ACCOUNT, port.product_id)
+    assert [(r.fill_id, r.retired) for r in rows] == [("lag-1", False)]
     store.close()
 
 

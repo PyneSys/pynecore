@@ -298,6 +298,24 @@ class SpotInventoryPort(Protocol):
     no engine position. This is normally the product's minimum quantity
     increment. A zero value disables dust-to-flat reconciliation."""
 
+    async def min_sellable_base(self) -> Decimal | None:
+        """Smallest base quantity the venue would accept as a sell NOW.
+
+        The bound folds every venue-side sell constraint together: the
+        quantity grid step, the product's minimum order quantity and the
+        minimum order notional converted at a current price. A net
+        inventory strictly below this bound cannot be sold at all — not
+        even in aggregate — so it can never represent a strategy
+        position; the manager retires it into the epoch baseline as fee
+        dust (:meth:`SpotInventoryManager.reconcile`).
+
+        Return ``None`` when the bound cannot be computed right now
+        (typically: no price observed yet) — the manager then simply
+        skips compaction until a later pass. MUST err low, never high: an
+        overestimated bound would compact away sellable inventory.
+        """
+        ...
+
     async def fetch_executions(self, cursor: str | None) -> SpotExecutionBatch:
         """Read the BOT's execution history from ``cursor``.
 
@@ -1004,6 +1022,7 @@ class SpotInventoryManager:
                     'spot_inventory_conflict_resolved',
                     payload={'product_id': port.product_id},
                 )
+            await self._maybe_compact_dust()
             return []
 
         # Mismatch. Try the innocent explanation first: fills we have
@@ -1074,6 +1093,101 @@ class SpotInventoryManager:
         if now_ms - pending_since >= port.settlement_grace_s * 1000.0:
             self._enter_quarantine('spot_inventory_conflict', context)
         return delivered
+
+    async def _maybe_compact_dust(self) -> None:
+        """Retire an unsellable-dust ledger into the epoch baseline.
+
+        The venue charges the buy-side fee in the BASE coin while the
+        engine's close orders are sized from FIFO exposure, so every
+        buy→sell round trip strands a sub-step residue in the ledger.
+        The residues accumulate: after a handful of round trips the fold
+        of an engine-flat book sits several grid steps above zero, which
+        silently breaks every "flat means fold ≈ 0" consumer — the
+        plugin's entry-row flat sweep never fires again, ``get_position``
+        reports a perpetual micro-long, and the next startup adopts the
+        dust as a position (measured on the Bybit spot lane: 0.0001 ETH
+        of pure fee dust after ~20 round trips, cycle 12 MISMATCH).
+
+        Compaction runs only on a clean-invariant pass and only when the
+        ENTIRE fold is provably unsellable (strictly below the port's
+        :meth:`~SpotInventoryPort.min_sellable_base`): such a net cannot
+        be a strategy position by definition. The epoch rolls exactly
+        like the quarantine recovery — old epoch ``closed``, rows
+        retired, fresh ``active`` epoch — except the new baseline is
+        ``old_baseline + fold.net_base`` (NOT the venue balance): the
+        expected total is unchanged by construction, so a real drift can
+        never be absorbed by a compaction. The dust's residual cost
+        basis is dropped with the rows — an unsellable residue has no
+        realizable P&L.
+        """
+        epoch = self._epoch
+        fold = self._fold
+        if (self._quarantined or epoch is None
+                or epoch.pending_conflict_ts_ms is not None
+                or fold.violation is not None
+                or fold.net_base <= 0):
+            return
+        port = self._port
+        # noinspection PyBroadException
+        try:
+            floor = await port.min_sellable_base()
+        except Exception:
+            # Transient venue/read failure — compaction is opportunistic,
+            # the next clean pass retries.
+            logger.warning(
+                "spot inventory: min-sellable read failed for %r; "
+                "dust compaction skipped this pass", port.product_id,
+                exc_info=True,
+            )
+            return
+        if (not isinstance(floor, Decimal) or not floor.is_finite()
+                or floor <= 0 or fold.net_base >= floor):
+            return
+        rows = self._store.iter_spot_executions(
+            self._account_id, port.product_id,
+        )
+        if any(not row.delivered for row in rows):
+            # An undelivered recovered fill still owes its OrderEvent to
+            # the engine; retiring would flip it ``delivered`` and
+            # swallow the event. Let delivery finish first.
+            return
+        new_baseline = Decimal(epoch.foreign_baseline) + fold.net_base
+        with self._store.transaction():
+            self._store.set_spot_epoch_state(
+                port.product_id, epoch.epoch_seq, 'closed',
+            )
+            retired = self._store.retire_spot_executions(
+                self._account_id, port.product_id,
+            )
+            fresh = self._store.insert_spot_epoch(
+                account_id=self._account_id,
+                base_asset=port.base_asset,
+                product_id=port.product_id,
+                foreign_baseline=canonical_decimal(new_baseline),
+                cursor_scope=epoch.cursor_scope,
+                exec_cursor=epoch.exec_cursor,
+                state='active',
+            )
+            self._store.log_event(
+                'spot_dust_compacted',
+                payload={
+                    'product_id': port.product_id,
+                    'old_epoch_seq': epoch.epoch_seq,
+                    'epoch_seq': fresh.epoch_seq,
+                    'retired_fills': retired,
+                    'dust_net_base': canonical_decimal(fold.net_base),
+                    'min_sellable_base': canonical_decimal(floor),
+                    'foreign_baseline': fresh.foreign_baseline,
+                },
+            )
+        self._epoch = fresh
+        self._refresh_fold()
+        logger.info(
+            "spot inventory: %s unsellable fee dust on %r compacted into "
+            "the epoch baseline (epoch %d -> %d, %d ledger row(s) retired)",
+            canonical_decimal(fold.net_base), port.product_id,
+            epoch.epoch_seq, fresh.epoch_seq, retired,
+        )
 
     def _invariant_drift(self, balance: Decimal) -> Decimal:
         """``actual − (foreign_baseline + bot_inventory)``, exact."""

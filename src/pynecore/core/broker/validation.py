@@ -40,6 +40,7 @@ _POSITION_PORT_METHODS = (
 _SPOT_INVENTORY_PORT_METHODS = (
     'fetch_executions',
     'fetch_base_balance',
+    'min_sellable_base',
 )
 _SPOT_INVENTORY_PORT_ATTRS = (
     'product_id',
