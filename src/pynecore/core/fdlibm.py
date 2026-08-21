@@ -154,7 +154,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int, prec: int) -> tuple[int, 
     fq = [0.0] * 20
     q = [0.0] * 20
 
-    jk = _INIT_JK[prec]
+    jk: int = _INIT_JK[prec]
     jp = jk
     jx = nx - 1
     jv = (e0 - 3) // 24 if e0 >= 3 else 0   # C int division truncates; e0>=?
@@ -414,7 +414,6 @@ def exp(x: float) -> float:
     hx &= 0x7fffffff
 
     hi = lo = 0.0
-    k = 0
     if hx >= 0x40862E42:                    # |x| >= 709.78...
         if hx >= 0x7ff00000:
             if ((hx & 0xfffff) | _lo(x)) != 0:
