@@ -449,6 +449,125 @@ def __test_reversal_retires_the_entry_it_consumed_so_a_re_entry_dispatches__():
     assert b.modify_exit_calls == []
 
 
+def __test_reissued_same_parameter_pyramid_entry_dispatches_fresh__():
+    """A same-id, same-parameter re-issue over a consumed fill pyramids again.
+
+    The filled entry stays in ``_active_intents`` as the sticky diff
+    sentinel, and the retained book order re-derives a VALUE-equal intent
+    every sync — that re-emission must stay a no-op. But a fresh
+    ``strategy.entry`` call replaces the book slot with a NEW ``Order``
+    instance; the simulator would fill it as another pyramid slice, so the
+    engine must dispatch it as a fresh cycle under a bumped client order id
+    (measured live: bybit-spot cycle 14, the swallowed add left the
+    ``from_entry`` bracket sized over a fill that never came).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    assert pos.size == 1.0
+    assert len(b.entry_calls) == 1
+
+    # Sticky re-emission: the SAME retained order instance stays a no-op.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    # A fresh strategy.entry call replaces the slot with a NEW instance.
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+
+    assert [c.intent.pine_id for c in b.entry_calls] == ["L1", "L1"]
+    # Same-bar re-issue: the consumed cycle's COID is spent, so the fresh
+    # dispatch must mint the bumped retry instead of the deduped original.
+    assert b.entry_calls[1].retry_seq == 1
+    # The new cycle's fill ledger restarts from zero.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_050.0, pine_id="L1",
+                    xchg_id="xchg-9", fill_id="l1b-1"))
+    assert pos.size == 2.0
+
+
+def __test_reissued_entry_at_pyramiding_cap_is_dropped_like_the_simulator__():
+    """A same-direction re-issue at the pyramiding cap never dispatches.
+
+    The simulator drops the add when it processes the re-issued order
+    (pyramiding <= open trades); the live diff must mirror the drop and
+    consume the generation — one evaluation per fresh instance, no
+    per-sync churn.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # No ``pyramiding`` attribute on the stub script -> defaults to 1.
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    assert pos.size == 1.0
+
+    reissued = _entry_order("L1", 1.0)
+    pos.entry_orders["L1"] = reissued
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+    # The generation is consumed: the pin now anchors the dropped instance.
+    assert engine._entry_backing_orders["L1"] is reissued  # type: ignore[attr-defined]
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+
+def __test_filled_close_all_retires_so_a_later_close_all_dispatches__():
+    """A filled ``close_all`` slot must retire at flat, not swallow successors.
+
+    ``close_all`` has no owning entry, so the per-entry flat teardown never
+    pops its slot: left in place, every later ``close_all`` diffs against
+    the already-filled slot and is silently dropped by the
+    irreversible-market-close guard (measured live: bybit-spot cycle 14,
+    only the run's FIRST flatten ever reached the venue).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    close_id = engine.order_mapping[""][0]
+    # The venue reports a close_all fill with NO entry id in either field.
+    engine._route_event(  # type: ignore[attr-defined]
+        replace(
+            _fill_event('sell', 1.0, 50_100.0, pine_id="",
+                        leg=LegType.CLOSE, xchg_id=close_id, fill_id="ca-1"),
+            pine_id=None,
+        ))
+    assert pos.size == 0.0
+    # The filled close_all state is fully retired.
+    assert "" not in engine.active_intents
+    assert ("Close position order", None) not in pos.exit_orders
+
+    # Next ladder, next flatten: the second close_all must reach the venue.
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    engine.sync(BAR_TS + 120_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_200.0, pine_id="L2",
+                    xchg_id="xchg-8", fill_id="l2-1"))
+    assert pos.size == 1.0
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 180_000)
+
+    assert len(b.close_calls) == 2
+    assert _dispatched_close(b.close_calls[1]).qty == 1.0
+
+
 def _drive_hedge_reversal(b, engine, pos):
     """Open long 1.0 with an SL bracket on a hedging-mode account
     (``position_port`` set), then reverse short 1.0 raw: the close-then-open

@@ -1091,6 +1091,16 @@ class OrderSyncEngine:
         # meantime untouched — the ``(exit_id, order_id)`` book key cannot
         # distinguish the two generations, but object identity can.
         self._close_backing_orders: dict[str, Any] = {}
+        # The Pine entry ``Order`` instance each live ``EntryIntent`` dispatch
+        # was built from, keyed by ``intent_key``. A fully filled market entry
+        # stays in ``position.entry_orders`` for intent stability, so
+        # ``build_intents`` re-derives a VALUE-equal intent every sync — while
+        # a fresh ``strategy.entry`` with the same id and same parameters
+        # overwrites the slot with a NEW ``Order`` instance. Only object
+        # identity separates the sticky re-emission from a genuine re-issue
+        # (a pyramiding add the simulator would fill again); consumed by
+        # :meth:`_maybe_redispatch_reissued_entry`.
+        self._entry_backing_orders: dict[str, Any] = {}
         # Cumulative fill qty already applied to each in-flight ``EntryIntent``,
         # keyed by ``EntryIntent.intent_key`` (== ``pine_id``). A filled entry
         # deliberately STAYS in ``_active_intents`` — the slot doubles as the
@@ -5618,6 +5628,17 @@ class OrderSyncEngine:
             # fallback pair :meth:`_cleanup_closed_position` resolves on. The
             # keyed ``CloseIntent`` slot is keyed by that entry id.
             close_key = event.from_entry or event.pine_id
+            if (close_key is None
+                    and event.leg_type == LegType.CLOSE
+                    and event.order is not None):
+                # A ``strategy.close_all`` fill carries no entry id in either
+                # field. Attribute it to the in-flight close_all slot (empty
+                # intent key) iff the venue order id belongs to that dispatch
+                # — never by default, so an engine-synthesised close (partial
+                # trigger, defensive close) cannot be miscredited here.
+                close_all_orders = self._order_mapping.get("")
+                if close_all_orders and event.order.id in close_all_orders:
+                    close_key = ""
             if event.leg_type == LegType.CLOSE and close_key is not None:
                 active_close = self._active_intents.get(close_key)
                 if isinstance(active_close, CloseIntent):
@@ -5657,7 +5678,18 @@ class OrderSyncEngine:
                             event.event_type == "filled"
                             or total >= active_close.qty - 1e-9
                         )
-                        if close_complete and self._position.size != 0.0:
+                        # A keyed close retires only while the position stays
+                        # open (the flat teardown owns per-entry cleanup). A
+                        # ``close_all`` (empty key) has NO owning entry — the
+                        # flat teardown never pops its slot — so it must
+                        # retire on completion regardless of flatness, or the
+                        # filled slot swallows every later ``close_all`` via
+                        # the irreversible-market-close guard in the diff
+                        # (measured live: bybit-spot cycle 14, every flatten
+                        # after the first was silently dropped).
+                        if close_complete and (
+                                close_key == ""
+                                or self._position.size != 0.0):
                             self._retire_completed_keyed_close(
                                 close_key, active_close,
                             )
@@ -6571,6 +6603,10 @@ class OrderSyncEngine:
         # later close cycle on the same key re-captures its own instance in
         # :meth:`_dispatch_new`.
         self._close_backing_orders.pop(key, None)
+        # The entry-side backing pin follows the same lifecycle: a later
+        # entry cycle on the same key re-captures its own instance in
+        # :meth:`_dispatch_new`.
+        self._entry_backing_orders.pop(key, None)
         # Same lifecycle for the entry-side fill ledger (short-gate residual
         # reservation): seeded in :meth:`_dispatch_new`, read by
         # :meth:`_enforce_short_gate`, retired here with the envelope.
@@ -10652,7 +10688,7 @@ class OrderSyncEngine:
     def _retire_completed_keyed_close(
             self, key: str, active_close: CloseIntent,
     ) -> None:
-        """Retire a fully-filled keyed close while the position is non-flat.
+        """Retire a fully-filled script close whose slot no teardown owns.
 
         A keyed ``strategy.close(id)`` whose working qty reached zero is
         terminal, but the whole-position flat teardown never runs while the
@@ -10664,6 +10700,13 @@ class OrderSyncEngine:
         CloseIntent guard, or is zero-clamped by the working==0 reservation —
         and the key collision with the retained parent ``EntryIntent`` can
         even route a ``CLOSE -> ENTRY`` modify that re-opens exposure.
+
+        A ``strategy.close_all`` (empty key) is the mirror case at FLAT: it
+        has no owning entry, so the per-entry flat teardown
+        (:meth:`_cleanup_closed_position`) never pops its slot either. The
+        caller therefore retires it on completion regardless of flatness —
+        without that, the filled slot swallows every later ``close_all``
+        through the diff's irreversible-market-close guard.
 
         Retirement drops the slot, the envelope/anchors/fill ledger
         (:meth:`_drop_envelope`) and the STALE backing Pine order — matched
@@ -10701,9 +10744,8 @@ class OrderSyncEngine:
         if entry_filled is not None:
             self._active_entry_filled_qty[key] = entry_filled
         _blog_info(
-            "keyed close %s fully filled (qty=%s) with the position still "
-            "open — close state retired; a later close on this id "
-            "dispatches fresh",
+            "script close %s fully filled (qty=%s) — close state retired; "
+            "a later close on this id dispatches fresh",
             format_intent_key(key), active_close.qty,
         )
 
@@ -12815,7 +12857,107 @@ class OrderSyncEngine:
                     # arming the engine legs.
                     continue
                 self._active_intents[key] = intent
+            elif isinstance(intent, EntryIntent):
+                # Value-equal re-emission of an active entry: either the
+                # sticky sentinel of a consumed fill, or a genuine
+                # same-parameter re-issue (a pyramiding add). Only object
+                # identity of the backing Pine order can tell them apart.
+                self._maybe_redispatch_reissued_entry(
+                    key, intent, skipped_entry_ids_this_sync,
+                )
             # else: unchanged — skip
+
+    def _maybe_redispatch_reissued_entry(
+            self, key: str, intent: EntryIntent,
+            skipped_entry_ids_this_sync: set[str],
+    ) -> None:
+        """Dispatch a same-parameter Pine entry re-issued over a consumed fill.
+
+        A fully filled market entry stays in ``_active_intents`` as the diff
+        sentinel for the sticky re-emitted Pine order, and its backing
+        ``Order`` is retained in ``position.entry_orders`` for intent
+        stability — so ``build_intents`` re-derives a VALUE-equal intent
+        every sync without any new script call. A fresh ``strategy.entry``
+        with the SAME id and SAME parameters is indistinguishable by value,
+        yet the simulator processes it as a NEW order (its fill removed the
+        old one), so a pyramiding script legitimately adds another slice
+        this way. ``_add_order`` replaces the book slot with a new ``Order``
+        instance on every script call, while the sticky re-emission keeps
+        the pinned one — object identity is the generation signal.
+
+        Measured live (bybit-spot cycle 14, pyramid bot, 2026-08-21): the
+        swallowed same-id add left the strategy runtime counting a pending
+        fill that never came, so the ``from_entry`` bracket was sized at
+        fill+pending (0.019995) over a ~0.01 holding — the SL leg then sold
+        into the wallet baseline and tripped the spot inventory quarantine.
+
+        Gates, mirroring the simulator's fill-time processing:
+
+        - the prior cycle must be FULLY filled — a working residual is owned
+          by the modify path;
+        - the backing order must be a new generation (identity mismatch); a
+          missing pin (restart adoption) anchors the current instance and
+          treats this sync as the sticky re-emission;
+        - a real ``strategy.entry`` adding to a same-direction position is
+          dropped at the pyramiding cap exactly like the simulator drops it
+          at processing time (the pin is re-anchored so the drop consumes
+          this generation); ``strategy.order`` carries no pyramiding gate.
+        """
+        active = self._active_intents.get(key)
+        if not isinstance(active, EntryIntent):
+            return
+        filled_prev = self._active_entry_filled_qty.get(key, 0.0)
+        if filled_prev < active.qty - 1e-9:
+            return
+        current_order = self._position.entry_orders.get(intent.pine_id)
+        if current_order is None:
+            return
+        backing = self._entry_backing_orders.get(key)
+        if backing is None:
+            self._entry_backing_orders[key] = current_order
+            return
+        if current_order is backing:
+            return
+        if self._quarantined:
+            # Entry dispatch is blocked wholesale under quarantine; leave the
+            # sentinel and the pin untouched so a recovered engine (operator
+            # restart) re-evaluates from a clean diff.
+            return
+        if not intent.is_strategy_order and self._position.size != 0.0:
+            is_buy = intent.side == 'buy'
+            if is_buy == (self._position.size > 0.0):
+                pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)  # noqa
+                if len(self._position.open_trades) >= max(1, pyramiding):
+                    self._entry_backing_orders[key] = current_order
+                    return
+        if self._entry_reject_retry_exhausted(key, intent):
+            skipped_entry_ids_this_sync.add(intent.pine_id)
+            self._entry_backing_orders[key] = current_order
+            return
+        _blog_info(
+            "re-emitted entry %s is a fresh same-parameter cycle over a "
+            "consumed fill (filled=%s) — dispatching a new entry instead of "
+            "keeping the sticky sentinel",
+            format_intent_key(key), filled_prev,
+        )
+        # The consumed cycle's client order ID is spent — a same-bar re-issue
+        # must mint ``retry_seq + 1`` or an idempotency-caching venue dedupes
+        # the new order into the filled one (mirrors the supersede branch of
+        # the modify path above).
+        self._reanchor_envelope_after_reject(key)
+        try:
+            self._dispatch_new(intent)
+        except OrderSkippedByPlugin as e:
+            _blog_warning("%s", e)
+            skipped_entry_ids_this_sync.add(intent.pine_id)
+            self._record_entry_reject(key, intent, e)
+            # Consume this generation: a deterministic venue decline would
+            # fail identically on every sticky re-derivation of the same
+            # order instance.
+            self._entry_backing_orders[key] = current_order
+            return
+        self._rejected_entry_intents.pop(key, None)
+        self._active_intents[key] = intent
 
     def _build_envelope(self, intent: Intent) -> DispatchEnvelope:
         """Wrap an intent in a :class:`DispatchEnvelope`.
@@ -14481,6 +14623,14 @@ class OrderSyncEngine:
                 # below). The fills themselves arrive through
                 # :meth:`_route_event` and accumulate from zero.
                 self._active_entry_filled_qty[intent.intent_key] = 0.0
+                # Pin the Pine ``Order`` instance this dispatch was built
+                # from: once the entry fills, a value-equal re-emission is
+                # the sticky sentinel while a NEW instance under the same
+                # key is a genuine same-parameter re-issue (see
+                # :meth:`_maybe_redispatch_reissued_entry`).
+                self._entry_backing_orders[intent.intent_key] = (
+                    self._position.entry_orders.get(intent.pine_id)
+                )
                 # Both-set Pine entry: the dispatch above placed the native
                 # LIMIT leg. Arm the software price-watch for the STOP leg so
                 # a stop cross cancels the LIMIT and fires a MARKET order. The
