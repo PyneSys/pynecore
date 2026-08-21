@@ -885,6 +885,146 @@ def __test_stale_reversal_close_redispatches_after_the_grace_syncs__():
     assert "S" in engine._pending_reversal_opens
 
 
+def __test_flat_snapshot_during_a_pending_reversal_only_starts_the_clock__():
+    """A glitched flat /positions read must not clear a reversing book.
+
+    The parked reversal's close leg lives in ``_pending_reversal_opens``,
+    not ``_active_intents`` — the old exit was cancelled and the raw entry
+    is parked, so the intent slots are empty. Gated on intents alone, a
+    flat venue snapshot arriving seconds before the close's own fill
+    cleared the book instantly; the fill then walked an empty FIFO into a
+    phantom opposite position (Capital.com pyramid lane, cycle 47). The
+    marker must start the same bounded confirmation clock.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    # Pine flips to the short: it stops emitting the consumed long.
+    del pos.entry_orders["L"]
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    close = _dispatched_close(b.close_calls[0])
+    assert "S" in engine._pending_reversal_opens
+    assert not engine.active_intents, \
+        "the marker must be the only in-flight signal for this test"
+    # Age the entry fill out of the recent-fill grace so only the marker
+    # can gate the flat observation.
+    engine._last_position_fill_monotonic = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+
+    # The venue glitches flat before the close's fill arrives.
+    b.position = None
+    engine.reconcile()
+    assert pos.size == 1.0, "flat observation must not clear immediately"
+
+    # The close's own fill lands on the INTACT book, settles it flat and
+    # opens the parked raw entry — no phantom, no external clear.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 1.0, 49_995.0))
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    assert b.entry_calls[-1].intent.pine_id == "S"
+    assert engine._pending_reversal_opens == {}
+
+
+def __test_late_close_labelled_with_the_entry_pine_id_is_dropped_after_the_clear__():
+    """A late close fill keyed by the entry's own pine id cannot phantom-book.
+
+    Some venues label a close leg with the consumed entry's pine id and no
+    ``from_entry`` (the ``close_key`` convention). The drop guard matched
+    ``from_entry`` alone, so such a fill walked the already-cleared book
+    into a phantom opposite position (Capital.com pyramid lane, cycle 47).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    b.position = None
+    engine.reconcile()
+    engine._flat_observed_with_intents_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine.reconcile()
+    assert pos.size == 0.0
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_500.0, pine_id="L", leg=LegType.CLOSE,
+                    xchg_id="xchg-9", fill_id="cl-1"))
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+
+
+def __test_declined_close_arms_the_marker_and_the_retry_waits_a_bar__():
+    """A persistent close decline must not re-dispatch every sync pass.
+
+    Sync passes are event-driven and can run many times per second; the
+    declined close left no marker behind, so every pass re-ran the
+    protocol straight into the same ``close_already_in_flight`` decline —
+    a five-hour ~10/s dispatch loop (Capital.com pyramid lane, cycle 47).
+    The decline now arms the marker, and the fresh re-dispatch waits for
+    both the stale bound and the NEXT bar.
+    """
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    b.raise_on_next_close = OrderSkippedByPlugin(
+        "close already in flight",
+        intent_key="__pyne_reversal_close__S",
+        reason="close_already_in_flight",
+    )
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+    assert "S" not in engine._rejected_entry_intents
+
+    # A same-bar sync storm defers every pass — no re-dispatch even past
+    # the stale bound.
+    for _ in range(_REVERSAL_CLOSE_STALE_SYNCS + 3):
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    # The next bar re-runs the protocol with a fresh close dispatch, and
+    # its fill settles the book and opens the parked entry as usual.
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    close = _dispatched_close(b.close_calls[1])
+    assert close.synthetic_kind == 'reversal_close'
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 1.0, 49_950.0))
+    assert pos.size == 0.0
+    assert b.entry_calls[-1].intent.pine_id == "S"
+
+
+def __test_stale_redispatch_waits_for_the_next_bar__():
+    """Same-bar sync passes never re-drive the close, however many run."""
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    for _ in range(_REVERSAL_CLOSE_STALE_SYNCS + 5):
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+
+
 def __test_reversal_retires_the_native_failsafe_with_a_confirmed_put__():
     """The consumed parent's fail-safe stop is cleared best-effort.
 

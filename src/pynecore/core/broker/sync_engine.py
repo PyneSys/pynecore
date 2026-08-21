@@ -4513,10 +4513,19 @@ class OrderSyncEngine:
             # instantly, leaving a live venue leg nobody owned (measured on
             # the Bybit resting lane). A fill recorded within the grace
             # therefore starts the SAME bounded confirmation clock.
+            #
+            # A parked reversal is bot-initiated work in flight too: its
+            # close leg lives in ``_pending_reversal_opens``, NOT in
+            # ``_active_intents`` (the close dispatches synchronously and
+            # only the marker survives), so gating on intents alone let a
+            # glitched flat /positions read clear the book seconds before
+            # the reversal close's own fill arrived — the fill then walked
+            # an empty FIFO (measured on the Capital.com pyramid lane).
             now = time.monotonic()
             recent_fill = (now - self._last_position_fill_monotonic
                            < EXTERNAL_FLATTEN_CONFIRM_GRACE_S)
-            if self._active_intents or recent_fill:
+            if (self._active_intents or recent_fill
+                    or self._pending_reversal_opens):
                 if self._flat_observed_with_intents_since == 0.0:
                     self._flat_observed_with_intents_since = now
                 if (now - self._flat_observed_with_intents_since
@@ -5032,17 +5041,20 @@ class OrderSyncEngine:
             elif (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
                                      LegType.TRAILING_STOP, LegType.CLOSE)
                     and self._external_flatten_cleared_entry_ids
-                    and ((event.from_entry or '')
+                    and ((event.from_entry or event.pine_id or '')
                          in self._external_flatten_cleared_entry_ids)):
                 # The id stays in the set: the venue-side close may arrive
                 # as several partial slices, and every one of them belongs
                 # to the already-cleared exposure. Only a fresh ENTRY fill
-                # (above) re-arms the id.
+                # (above) re-arms the id. The ``pine_id`` fallback matches
+                # venues that label a close leg with the entry's own pine
+                # id and no ``from_entry`` (the ``close_key`` convention
+                # used by the closing-fill router below).
                 _blog_warning(
                     "late close fill for externally flattened entry %r "
                     "dropped — its exposure was already cleared from the "
                     "book by the external-flatten reconcile",
-                    event.from_entry,
+                    event.from_entry or event.pine_id,
                 )
                 return
             # Post-restart settling-close guard. When a defensive close
@@ -14030,7 +14042,14 @@ class OrderSyncEngine:
         marker = self._pending_reversal_opens.get(key)
         if marker is not None:
             marker.blocked_syncs += 1
-            if marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS:
+            # The sync counter alone is no staleness clock: event-driven
+            # sync passes can run many times per second, so a persistent
+            # plugin decline would re-drive the close at that same rate
+            # (measured live: a five-hour ~10/s dispatch loop). A bar
+            # boundary is the venue-paced beat — the fresh re-dispatch
+            # additionally waits for the NEXT bar after arming.
+            if (marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS
+                    or marker.armed_bar_ts_ms == self._current_bar_ts_ms):
                 raise self._reversal_close_pending_skip(
                     intent,
                     f"Reversal entry {format_intent_key(key)} deferred: the "
@@ -14073,6 +14092,21 @@ class OrderSyncEngine:
                 "reversal close for %s was declined (%s); the re-emitted "
                 "entry retries the protocol next sync",
                 format_intent_key(key), e,
+            )
+            # Arm the marker even though nothing dispatched: a decline
+            # commonly means an earlier close for the same exposure is
+            # still in flight, and without the marker every sync pass
+            # would re-dispatch straight into the same decline (the
+            # tight-loop failure mode above). The deferred branch now
+            # throttles the retry to the stale window on the next bar,
+            # and a fill settling the book flat opens the parked entry
+            # through :meth:`_maybe_open_after_reversal_close` as usual.
+            self._pending_reversal_opens[key] = _PendingReversalOpen(
+                entry_intent=intent,
+                close_pine_id=close_intent.pine_id,
+                close_qty=close_qty,
+                consumed_entry_ids=consumed_ids,
+                armed_bar_ts_ms=self._current_bar_ts_ms,
             )
             raise self._reversal_close_pending_skip(
                 intent,
