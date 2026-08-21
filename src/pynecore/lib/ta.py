@@ -28,7 +28,7 @@ from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_
 # is a runner internal, like ``_time`` or ``_script``.
 # noinspection PyProtectedMember
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
-                          max_bars_back, math as lib_math, _last_close)
+                          max_bars_back, math as lib_math, _last_close, _stale_on_gap)
 
 TFIB = TypeVar('TFIB', float, int, bool)
 TFI = TypeVar('TFI', float, int)
@@ -688,8 +688,31 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    _stale_on_gap(source, True)
+    capacity: Persistent[int] = 0
+    # TradingView sizes this window to the deepest read it has needed so far, and a
+    # bar that skips the call reads the slot from one capacity back (see
+    # ``_stale_on_gap``), so the capacity is part of the RESULT here, not just of the
+    # storage: it decides how old that stale value is. The growth is monotonic, like
+    # TradingView's own on-demand resize.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
+
     last_max: Persistent[float] = na_float
     last_max_index: Persistent[int] = 0
+    last_bar: Persistent[int] = -1
+
+    # The kept extreme ages in BARS, not in calls. A conditionally called window only
+    # takes a stale slot into account when its rescan fires, so both halves of the
+    # measurement have to hold together: with the bar-aged index over a ``length + 1``
+    # ring, ``ta.lowest(low, 40)`` inside the else branch of the wild-corpus script
+    # "Leledc levels (IS)" reproduces TradingView on all 28302 bars it runs on, while
+    # call-aging misses 257 of them.
+    gap = bar_index - last_bar - 1
+    if last_bar >= 0 and gap > 0:
+        last_max_index += gap
+    last_bar = bar_index
 
     if last_max < source or not (last_max == last_max) or (_check_eq and last_max == source):
         last_max = source
@@ -937,8 +960,25 @@ def lowest(source: Series[float], length: int,
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    _stale_on_gap(source, True)
+    capacity: Persistent[int] = 0
+    # See ``highest``: the window capacity decides how old the stale value a skipped
+    # bar leaves behind is, so it must be the length TradingView sizes it to.
+    if length > capacity:
+        capacity = length
+        max_bars_back(source, capacity)
+
     last_min: Persistent[float] = na_float
     last_min_index: Persistent[int] = 0
+    last_bar: Persistent[int] = -1
+
+    # The kept extreme ages in BARS, not in calls: a bar that skips the call still
+    # moves the window on, so the rescan that lets a stale slot in has to fire on the
+    # same bar TradingView fires it (see ``highest``).
+    gap = bar_index - last_bar - 1
+    if last_bar >= 0 and gap > 0:
+        last_min_index += gap
+    last_bar = bar_index
 
     if last_min > source or not (last_min == last_min) or (_check_eq and last_min == source):
         last_min = source

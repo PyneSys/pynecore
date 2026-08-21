@@ -14,7 +14,8 @@ addresses the buffer with a literal index:
 - ``s[idx]``                   -> ``__state__[N][idx]``,
 - ``lib.max_bars_back(s, num)`` in statement position
                                -> ``__state__[N].max_bars_back = num``
-  (other positions are left to the ``lib.max_bars_back`` runtime no-op),
+  (other positions are left to the ``lib.max_bars_back`` runtime no-op), and the
+  same for the other buffer setters in ``_BUFFER_SETTERS``,
 - a ``Series``-annotated parameter loses the Series wrapper from its
   annotation and gets ``s = __state__[N].add(s)`` prepended to the body.
 
@@ -32,6 +33,15 @@ import ast
 from .slot_layout import ModuleLayout, scope_for_function
 
 __all__ = ['SeriesTransformer']
+
+#: ``lib`` no-ops that address a series buffer itself instead of its value, mapped
+#: to the :class:`~pynecore.core.series.SeriesImpl` attribute they set. Only a
+#: statement-position call on a series NAME is converted; every other position is
+#: left to the runtime no-op in :mod:`pynecore.lib`.
+_BUFFER_SETTERS = {
+    'max_bars_back': 'max_bars_back',
+    '_stale_on_gap': 'stale_on_gap',
+}
 
 
 class SeriesTransformer(ast.NodeTransformer):
@@ -257,11 +267,11 @@ class SeriesTransformer(ast.NodeTransformer):
         return cast(ast.AST, self.generic_visit(node))
 
     def visit_Expr(self, node: ast.Expr) -> ast.AST:
-        """Convert statement-position ``lib.max_bars_back(s, n)`` calls into
-        a ``max_bars_back`` attribute assignment on the buffer."""
+        """Convert a statement-position buffer setter call into an attribute
+        assignment on the buffer (see :data:`_BUFFER_SETTERS`)."""
         call = node.value
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-                and call.func.attr == 'max_bars_back'
+                and call.func.attr in _BUFFER_SETTERS
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == 'lib'
                 and len(call.args) >= 2 and isinstance(call.args[0], ast.Name)):
@@ -270,6 +280,6 @@ class SeriesTransformer(ast.NodeTransformer):
                 scope, slot = found
                 return ast.Assign(
                     targets=[ast.Attribute(value=self._state_ref(scope, slot),
-                                           attr='max_bars_back', ctx=ast.Store())],
+                                           attr=_BUFFER_SETTERS[call.func.attr], ctx=ast.Store())],
                     value=cast(ast.expr, self.visit(call.args[1])))
         return cast(ast.AST, self.generic_visit(node))

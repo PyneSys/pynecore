@@ -29,7 +29,7 @@ class SeriesImpl(Generic[T]):
     __slots__ = ('_buffer',
                  '_max_bars_back', '_max_bars_back_set',
                  '_capacity', '_write_pos', '_size',
-                 '_last_bar_index', '_na', '_compacted')
+                 '_last_bar_index', '_na', '_compacted', 'stale_on_gap')
 
     # MEASURED (probes m601/m602, BINANCE:BTCUSDT 30m): TradingView serves 5000 bars of
     # history for EVERY series — builtin, user-defined and ``ta.*`` output alike, under
@@ -87,6 +87,10 @@ class SeriesImpl(Generic[T]):
 
         # The last bar index that was accessed
         self._last_bar_index = -1
+
+        # Opt-in for the window buffers of TradingView's native builtins, set through
+        # ``lib._stale_on_gap`` — see :meth:`add` for the measured behaviour.
+        self.stale_on_gap = False
 
     @property
     def max_bars_back(self) -> int:
@@ -182,11 +186,24 @@ class SeriesImpl(Generic[T]):
         # fill: before the first value there is nothing to repeat, and the reads
         # are na there either way.
         missed = bar_index - last_bar_index - 1
-        if missed > 0 and self._size > 0 and not self._compacted:
-            fill = self._buffer[self._write_pos - 1]
-            # Filling more than the whole buffer would only overwrite itself
-            for _ in range(missed if missed < self._capacity else self._capacity):
-                self._push(fill)
+        if missed > 0 and self._size > 0:
+            if self.stale_on_gap:
+                # A native TradingView window buffer holds ``length + 1`` slots and
+                # steps one slot per BAR, but a bar that does not call the builtin
+                # writes nothing — the slot keeps what was put there a whole
+                # capacity earlier, and the extreme is then taken over that stale
+                # value. MEASURED (probes probe_cond3..5, BINANCE:BTCUSDT 30m):
+                # skipping ``lowest(bar_index + 1000, L)`` on bar 100 alone freezes
+                # it on the value of bar 100-(L+1) for exactly L-1 bars, for
+                # L = 3, 5 and 10; skipping bar 106 as well — one capacity later,
+                # L = 5 — serves bar 94's value again on bars 107..110.
+                for _ in range(missed if missed < self._capacity else self._capacity):
+                    self._advance()
+            elif not self._compacted:
+                fill = self._buffer[self._write_pos - 1]
+                # Filling more than the whole buffer would only overwrite itself
+                for _ in range(missed if missed < self._capacity else self._capacity):
+                    self._push(fill)
 
         # _push, inlined verbatim: this is THE per-bar write of every series in
         # the script, and its call frame costs more than the body. Kept a literal
@@ -229,6 +246,23 @@ class SeriesImpl(Generic[T]):
             else:
                 self._write_pos += 1
             self._buffer[pos] = value
+
+    def _advance(self) -> None:
+        """
+        Step the write position by one slot without writing anything.
+
+        On a full buffer the slot keeps the value written a capacity ago; while the
+        buffer is still growing there is nothing to keep, and the na placeholder is
+        what TradingView's own uninitialised slots read as — an extreme ignores them.
+        """
+        if self._size < self._capacity:
+            self._buffer.append(self._na)
+            self._size += 1
+            self._write_pos += 1
+        elif self._write_pos >= self._capacity:
+            self._write_pos = 1
+        else:
+            self._write_pos += 1
 
     def set(self, value: T | NA[T]) -> T | NA[T]:
         """
