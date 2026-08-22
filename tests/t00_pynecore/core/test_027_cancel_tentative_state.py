@@ -467,7 +467,13 @@ def __test_reconcile_cancel_confirmed_resolves_and_clears__():
 
 
 def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
-    """Stale-grace expiry ⇒ ManualInterventionRequiredEvent + halt latched."""
+    """Stale-grace expiry after an in-session retry ⇒ halt latched.
+
+    ``retry_count=1`` records that one ``execute_cancel_with_outcome``
+    attempt already ran in this session — the precondition the halt
+    promotion requires (a zero-retry expired entry gets probed first,
+    see ``__test_stale_anchor_restart_probes_before_halt__``).
+    """
     events: list[BrokerEvent] = []
     broker = _MockBroker()
     engine = _mk_engine(broker, events=events,
@@ -476,7 +482,7 @@ def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
     from pynecore.core.broker.sync_engine import _CancelTentativeMeta
     # Anchor 5s in the past — well beyond the 1s stale grace.
     engine._cancel_disposition_pending[intent.intent_key] = _CancelTentativeMeta(
-        since_ts_ms=BAR_TS - 5_000, reason='broker_timeout',
+        since_ts_ms=BAR_TS - 5_000, reason='broker_timeout', retry_count=1,
     )
     engine._drive_cancel_tentative(now_ms=BAR_TS)
     # Halt latched.
@@ -944,13 +950,14 @@ def __test_cancel_tentative_already_filled_purges_journal_row__(tmp_path):
 
 
 def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
-    """Stale-grace expiry keeps the journal row: a restart re-halts.
+    """Stale-grace expiry keeps the journal row: a restart probes, then re-halts.
 
     Expiry latches the manual-intervention halt and deliberately KEEPS
-    the ``cancel_tentative`` row — parity with the leg-extras rehydrate
-    path, which re-arms legful parents with the original (already
-    expired) anchor and re-halts until the operator resolves the broker
-    ambiguity. Deleting the row would let a leg-less parent's
+    the ``cancel_tentative`` row. A restart re-arms the entry with the
+    original (already expired) anchor; the retry loop must then probe
+    the venue at least once IN THE NEW SESSION before it may re-halt —
+    a definite outcome resolves the entry, only a persistent ``UNKNOWN``
+    re-latches the halt. Deleting the row would let a leg-less parent's
     unresolved disposition silently vanish across the restart instead.
     """
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
@@ -968,7 +975,12 @@ def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
         intent = _seed_parent_intent_and_leg(engine, with_leg=False)
         engine._dispatch_cancel(intent)
         meta = engine._cancel_disposition_pending[intent.intent_key]
+        # First drive past the grace: probes once (UNKNOWN), no halt yet.
         engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 5_000)
+        assert engine.halted is False
+        assert len(broker.cancel_with_outcome_calls) == 1
+        # Second drive: retry already ran, grace still expired — halt.
+        engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 6_000)
         assert engine.halted is True
         # The obligation must not vanish across a restart: row kept.
         _, pending = ctx.replay()
@@ -979,14 +991,64 @@ def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
         ctx2 = store.open_run(
             _run_identity(), script_source="src", script_path="t027.py",
         )
+        broker2 = _MockBroker()
         engine2 = _mk_engine(
-            _MockBroker(), store_ctx=ctx2, cancel_tentative_stale_grace_s=1.0,
+            broker2, store_ctx=ctx2, cancel_tentative_stale_grace_s=1.0,
         )
         assert intent.intent_key in engine2._cancel_disposition_pending
+        # Fresh session: the expired anchor alone must NOT halt — the
+        # venue is probed once first (persistent UNKNOWN here).
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 10_000)
+        assert engine2.halted is False
+        assert len(broker2.cancel_with_outcome_calls) == 1
+        engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 11_000)
         assert engine2.halted is True
         assert (engine2._halted_reason
                 == 'partial_bracket_cancel_disposition_unresolved')
+
+
+def __test_stale_anchor_restart_probes_before_halt__(tmp_path):
+    """Restart with a long-expired anchor resolves via the venue, no halt.
+
+    Regression for the bybit-spot cycle 18-66 restart churn (measured
+    2026-08-22): a rotation shutdown stranded a cancel-tentative parent,
+    and every restarted run re-armed the entry with the original anchor,
+    saw the 10s grace long expired with ``retry_count == 0`` and promoted
+    straight to ``DEGRADED_HALT`` — no venue probe ever ran, so the loop
+    could never terminate even though ``execute_cancel_with_outcome``
+    resolves the disposition authoritatively on the first attempt.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            _run_identity(), script_source="src", script_path="t027.py",
+        )
+        broker = _MockBroker(
+            raise_on_cancel=[OrderDispositionUnknownError(
+                "cancel timed out", client_order_id='xchg-parent',
+            )],
+        )
+        engine = _mk_engine(broker, store_ctx=ctx)
+        intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._dispatch_cancel(intent)
+        meta = engine._cancel_disposition_pending[intent.intent_key]
+        ctx.close()
+
+        # Restart 20 minutes later — far beyond the 10s stale grace.
+        ctx2 = store.open_run(
+            _run_identity(), script_source="src", script_path="t027.py",
+        )
+        broker2 = _MockBroker(
+            cancel_outcomes=[CancelDispositionOutcome.CANCEL_CONFIRMED],
+        )
+        engine2 = _mk_engine(broker2, store_ctx=ctx2)
+        assert intent.intent_key in engine2._cancel_disposition_pending
+        engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_200_000)
+        assert engine2.halted is False
+        assert engine2._cancel_disposition_pending == {}
+        assert len(broker2.cancel_with_outcome_calls) == 1
+        # The resolved obligation purged its journal row.
+        _, pending2 = ctx2.replay()
+        assert pending2 == {}
 
 
 # === Pre-park crash-window durability (cancel_probe rows) ================

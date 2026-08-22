@@ -9340,8 +9340,8 @@ class OrderSyncEngine:
 
         For each tentative entry, either:
 
-        - the stale-grace deadline has passed → promote to
-          ``DEGRADED_HALT`` via
+        - the stale-grace deadline has passed AND at least one retry
+          already ran in this session → promote to ``DEGRADED_HALT`` via
           :meth:`_handle_cancel_tentative_stale_grace_expiry`, OR
         - re-invoke :meth:`BrokerPlugin.execute_cancel_with_outcome`
           with the retained envelope and act on the outcome via
@@ -9364,7 +9364,18 @@ class OrderSyncEngine:
             meta = self._cancel_disposition_pending.get(intent_key)
             if meta is None:
                 continue
-            if now_ms - meta.since_ts_ms >= stale_grace_ms:
+            if now_ms - meta.since_ts_ms >= stale_grace_ms and meta.retry_count > 0:
+                # Halting is a last resort: it requires at least one actual
+                # ``execute_cancel_with_outcome`` attempt IN THIS SESSION.
+                # A restart re-arm (journal / leg-extras) carries the
+                # ORIGINAL mark-time anchor, so a run that starts minutes
+                # later sees the grace long expired with ``retry_count == 0``
+                # — promoting straight to ``DEGRADED_HALT`` would skip the
+                # authoritative venue probe entirely and every restart would
+                # re-halt in a loop even though the venue can answer. Fall
+                # through to the retry below instead; a definite outcome
+                # resolves the entry, an ``UNKNOWN`` bumps ``retry_count``
+                # and the next pass (grace still expired) halts here.
                 self._handle_cancel_tentative_stale_grace_expiry(
                     intent_key, meta, now_ms=now_ms,
                 )
@@ -9433,11 +9444,12 @@ class OrderSyncEngine:
         The durable ``'cancel_tentative'`` journal row is deliberately
         KEPT: a restart re-arms the entry
         (:meth:`_absorb_journal_retry_rows`) with the original expired
-        anchor and immediately re-halts — the same re-halt-until-the-
-        operator-resolves loop the leg-extras rehydrate path has always
-        produced for legful parents. Deleting the row would instead let
-        a leg-less parent's unresolved disposition silently vanish
-        across the restart. No in-session re-arm can follow this pop:
+        anchor, probes the venue once (:meth:`_drive_cancel_tentative`
+        requires an in-session retry before this promotion can fire) and
+        re-halts only when that probe stays ``UNKNOWN``. Deleting the
+        row would instead let a leg-less parent's unresolved disposition
+        silently vanish across the restart. No in-session re-arm can
+        follow this pop:
         the halt latch makes every subsequent :meth:`sync` return before
         the journal replay runs.
         """
